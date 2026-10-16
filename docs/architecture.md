@@ -152,6 +152,14 @@ then plan removal. Any current hazards or stage destruction need a further
 confirmation of the fresh plan. If HEAD is unavailable, a local information
 menu opens without a removal action. No host scan runs before the menu opens.
 
+Accepted removals have repository-scoped SQLite records keyed by checkout and
+job ID. The metadata source reconciles interrupted result publication from the
+durable worker journal. Inventory projects active and failed records into the
+Removing section, including records whose checkout is absent. Only the current
+job can publish its result. A failed attempt remains until a reviewed retry
+succeeds; no retry can replace an active attempt. Worker liveness checks and
+SQLite reads stay in the metadata source, off the terminal input path.
+
 Commits from a menu carry a witness of what it showed: `Seen<T>`, `PrPin`,
 `LiveSessionIdentity`, removal identity, or ledger timestamps. The owning host
 compares the witness with current state and refuses a mismatch with

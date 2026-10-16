@@ -172,6 +172,61 @@ pub(crate) fn normalize_state(value: Value) -> WtState {
 }
 
 impl Store {
+    /// Claim one accepted removal. A failed attempt can be replaced by a retry.
+    pub fn begin_removal(
+        &mut self,
+        key: &str,
+        job_id: &str,
+        path: &str,
+        branch: &str,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let removals = object_mut(state, "removals");
+            if removals
+                .get(key)
+                .is_some_and(|entry| entry["error"].is_null())
+            {
+                return Ok((false, false));
+            }
+            let mut entry = removals
+                .get(key)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            entry.insert("jobId".into(), json!(job_id));
+            entry.insert("path".into(), json!(path));
+            entry.insert("branch".into(), json!(branch));
+            entry.insert("error".into(), Value::Null);
+            removals.insert(key.into(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Only the current attempt can publish its result. Keep failed attempts
+    /// even when inventory no longer contains their partly removed checkout.
+    pub fn finish_removal(
+        &mut self,
+        key: &str,
+        job_id: &str,
+        error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let removals = object_mut(state, "removals");
+            let Some(entry) = removals.get_mut(key) else {
+                return Ok((false, false));
+            };
+            if entry["jobId"].as_str() != Some(job_id) {
+                return Ok((false, false));
+            }
+            if let Some(error) = error {
+                entry["error"] = json!(error);
+            } else {
+                removals.remove(key);
+            }
+            Ok((true, true))
+        })
+    }
+
     pub fn read_slug_dev_port(&mut self, slug: &str) -> Result<Option<u16>, StoreError> {
         let state = self.read_wt_state()?;
         Ok(state

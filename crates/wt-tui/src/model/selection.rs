@@ -235,7 +235,12 @@ impl Model {
             .sections
             .iter()
             .enumerate()
-            .partition(|(_, section)| section.key == ARCHIVED_SECTION);
+            .partition(|(_, section)| {
+                matches!(
+                    section.key.as_str(),
+                    ARCHIVED_SECTION | super::REMOVING_SECTION
+                )
+            });
         let push_section = |items: &mut Vec<VisualItem>,
                             (index, section): (usize, &BoardSection)| {
             let rows: Vec<_> = section

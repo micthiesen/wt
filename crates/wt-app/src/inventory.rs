@@ -129,6 +129,7 @@ pub fn board(
             ..BoardRow::default()
         });
     }
+    apply_removals(&mut rows, state);
     let mut board = Board {
         name: clean_text(&config.repo_id),
         automations_paused: state["automationsPaused"].as_bool().unwrap_or(false),
@@ -139,6 +140,57 @@ pub fn board(
     };
     crate::board_layout::prepare(&mut board, state, &config.branch.base, config.ui.sort);
     board
+}
+
+/// Keep accepted jobs visible until the worker records success, even when
+/// partial deletion removes the checkout from Git inventory.
+fn apply_removals(rows: &mut Vec<BoardRow>, state: &Value) {
+    let Some(removals) = state["removals"].as_object() else {
+        return;
+    };
+    for (key, removal) in removals {
+        let (Some(path), Some(branch)) = (removal["path"].as_str(), removal["branch"].as_str())
+        else {
+            continue;
+        };
+        let index = if let Some(index) = rows.iter().position(|row| row.key == *key) {
+            // A reused name cannot transfer a job to another checkout.
+            if rows[index].path != path || rows[index].branch != branch {
+                continue;
+            }
+            index
+        } else {
+            rows.push(BoardRow {
+                key: key.clone(),
+                slug: clean_text(key),
+                title: clean_text(&crate::issue_identity::slug_title(key)),
+                path: clean_text(path),
+                branch: clean_text(branch),
+                archived: true,
+                ..BoardRow::default()
+            });
+            rows.len() - 1
+        };
+        let row = &mut rows[index];
+        let error = removal["error"].as_str().map(clean_text);
+        row.removal = Some(wt_tui::RemovalView {
+            error: error.clone(),
+        });
+        if let Some(error) = error {
+            row.badge = "Removal failed".into();
+            row.needs_attention = true;
+            row.details.push(format!("Removal failed: {error}"));
+            row.details
+                .push("Press d to review a retry. Current safety checks still apply.".into());
+        } else {
+            row.badge = "Removing".into();
+            row.busy = Some(wt_tui::BusyView {
+                op: "remove".into(),
+                label: "removing".into(),
+                ..Default::default()
+            });
+        }
+    }
 }
 
 /// Configuration the renderer needs, resolved once per board.
@@ -179,6 +231,44 @@ fn issue_id(stored: &serde_json::Value, slug: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_removal_remains_without_inventory_and_success_clears_it() {
+        let mut state = serde_json::json!({"removals": {"one": {
+            "jobId": "1-a", "path": "/one", "branch": "feature/one", "error": null
+        }}});
+        let mut rows = Vec::new();
+        apply_removals(&mut rows, &state);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].busy.as_ref().unwrap().op, "remove");
+
+        state["removals"]["one"]["error"] = serde_json::json!("permission denied");
+        let mut restarted = Vec::new();
+        apply_removals(&mut restarted, &state);
+        assert_eq!(
+            restarted[0].removal.as_ref().unwrap().error.as_deref(),
+            Some("permission denied")
+        );
+        assert!(restarted[0].busy.is_none());
+        assert!(restarted[0].needs_attention);
+
+        state["removals"] = serde_json::json!({});
+        let mut completed = Vec::new();
+        apply_removals(&mut completed, &state);
+        assert!(completed.is_empty());
+    }
+
+    #[test]
+    fn removal_does_not_transfer_to_a_reused_key_at_another_path() {
+        let mut rows = vec![BoardRow {
+            key: "one".into(),
+            path: "/new".into(),
+            branch: "feature/one".into(),
+            ..Default::default()
+        }];
+        let state = serde_json::json!({"removals": {"one": {"path": "/old", "branch": "feature/one", "error": null}}});
+        apply_removals(&mut rows, &state);
+        assert!(rows[0].removal.is_none());
+    }
     #[test]
     fn issue_resolution_keeps_asserted_none_distinct_from_absence() {
         assert_eq!(

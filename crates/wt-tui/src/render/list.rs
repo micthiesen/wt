@@ -15,7 +15,7 @@ use unicode_width::UnicodeWidthStr;
 use super::text::{fit, truncate_end};
 use crate::{
     BoardRow, BoardSection, Model, ReviewRequestRow, SectionRollup, badges, glyphs,
-    model::{ARCHIVED_SECTION, VisualItem},
+    model::{ARCHIVED_SECTION, REMOVING_SECTION, VisualItem},
     theme,
 };
 
@@ -141,7 +141,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
         return lines;
     }
     for (index, section) in board.sections.iter().enumerate() {
-        if section.key == ARCHIVED_SECTION {
+        if matches!(section.key.as_str(), ARCHIVED_SECTION | REMOVING_SECTION) {
             continue;
         }
         context.section(&mut lines, index, section, &positions, true);
@@ -172,12 +172,10 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
             }
         }
     }
-    if let Some((index, section)) = board
-        .sections
-        .iter()
-        .enumerate()
-        .find(|(_, section)| section.key == ARCHIVED_SECTION && !section.rows.is_empty())
-    {
+    for (index, section) in board.sections.iter().enumerate().filter(|(_, section)| {
+        matches!(section.key.as_str(), REMOVING_SECTION | ARCHIVED_SECTION)
+            && !section.rows.is_empty()
+    }) {
         if !bottom.is_empty() {
             bottom.push(blank());
         }
@@ -326,7 +324,7 @@ impl RowContext<'_> {
 /// The row's title with its issue number in front, so an identifier
 /// survives truncation: `ENG-1234` reads as `1234: title`.
 pub(crate) fn row_label(row: &BoardRow) -> String {
-    match row.issue_id.as_deref() {
+    let title = match row.issue_id.as_deref() {
         Some(id) if !id.is_empty() => {
             let number = id
                 .split_once('-')
@@ -335,6 +333,11 @@ pub(crate) fn row_label(row: &BoardRow) -> String {
             format!("{number}: {}", row.title)
         }
         _ => row.title.clone(),
+    };
+    match &row.removal {
+        Some(removal) if removal.error.is_some() => format!("{title} · Removal failed"),
+        Some(_) => format!("{title} · Removing"),
+        None => title,
     }
 }
 
@@ -617,6 +620,76 @@ mod tests {
             assert!(bottom.contains("Archived"), "{height}: {bottom:?}");
             assert_eq!(model.selected, selected);
         }
+    }
+
+    #[test]
+    fn removing_and_failed_rows_render_above_archive_in_cursor_order() {
+        let rows = vec![
+            BoardRow {
+                key: "active".into(),
+                title: "Active task".into(),
+                ..Default::default()
+            },
+            BoardRow {
+                key: "running".into(),
+                title: "Running task".into(),
+                removal: Some(crate::RemovalView::default()),
+                ..Default::default()
+            },
+            BoardRow {
+                key: "failed".into(),
+                title: "Failed task".into(),
+                removal: Some(crate::RemovalView {
+                    error: Some("denied".into()),
+                }),
+                ..Default::default()
+            },
+            BoardRow {
+                key: "old".into(),
+                title: "Old task".into(),
+                archived: true,
+                ..Default::default()
+            },
+        ];
+        let sections = vec![
+            BoardSection {
+                key: "\0inbox".into(),
+                title: "Inbox".into(),
+                rows: vec![0],
+                ..Default::default()
+            },
+            BoardSection {
+                key: REMOVING_SECTION.into(),
+                title: "Removing".into(),
+                rows: vec![1, 2],
+                ..Default::default()
+            },
+            BoardSection {
+                key: ARCHIVED_SECTION.into(),
+                title: "Archived".into(),
+                rows: vec![3],
+                ..Default::default()
+            },
+        ];
+        let mut model = Model::default();
+        model.apply(wt_runtime::SourceSnapshot::test_live(
+            Some(crate::Board {
+                rows,
+                sections,
+                ..Default::default()
+            }),
+            wt_runtime::SourceState::Ready,
+            wt_core::Domain::Metadata,
+        ));
+        let lines = build(&model, 80, 20);
+        let text: Vec<_> = lines.iter().map(|line| line.line.to_string()).collect();
+        let position = |needle: &str| text.iter().position(|line| line.contains(needle)).unwrap();
+        assert!(position("Active task") < position("Running task"));
+        assert!(position("Running task") < position("Failed task"));
+        assert!(position("Failed task") < position("Archived"));
+        assert!(text[position("Failed task")].contains("Removal failed"));
+        let cursor_items: Vec<_> = lines.iter().filter_map(|line| line.item).collect();
+        assert_eq!(cursor_items, [0, 1, 2, 3]);
     }
 
     #[test]

@@ -95,6 +95,9 @@ pub(crate) fn work_status_badge(work: Option<&WorkPresentation>) -> Badge {
 /// flight, a vanished path, a deleted remote branch, or landed work. Dirty
 /// lives in the badge cluster and clean renders nothing.
 pub(crate) fn loud_status_badge(row: &BoardRow) -> Option<Badge> {
+    if row.removal.is_some() {
+        return Some(badge(glyphs::TRASH, theme::ERR));
+    }
     if let Some(busy) = &row.busy {
         return Some(busy_badge(&busy.op));
     }
@@ -122,6 +125,13 @@ pub(crate) fn is_dirty(row: &BoardRow) -> bool {
 /// Mechanical status as a verb for the details git line: every state has a
 /// glyph, colored when active and dim when quiet.
 pub(crate) fn status_verb(row: &BoardRow) -> (Badge, String) {
+    if row
+        .removal
+        .as_ref()
+        .is_some_and(|removal| removal.error.is_some())
+    {
+        return (badge(glyphs::TRASH, theme::ERR), "Removal failed".into());
+    }
     if let Some(busy) = &row.busy {
         let text = match &busy.age {
             Some(age) => format!("{} · {age}", busy.label),

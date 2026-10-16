@@ -561,9 +561,18 @@ pub struct PreparedDetailGroup {
 pub(crate) const INBOX_SECTION: &str = "\0inbox";
 /// Board key of the archived block, prepared by the host.
 pub(crate) const ARCHIVED_SECTION: &str = "\0archived";
+pub(crate) const REMOVING_SECTION: &str = "\0removing";
+
+/// An accepted removal, read from durable state on the owning host.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemovalView {
+    pub error: Option<String>,
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoardRow {
+    #[serde(default)]
+    pub removal: Option<RemovalView>,
     /// Optimistic creation has no actionable inventory identity yet. Only the
     /// pending projection sets this; sources publish real rows with false.
     #[serde(default)]

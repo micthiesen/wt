@@ -362,10 +362,32 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
     job["workerPid"] = json!(std::process::id());
     job["workerStartIdentity"] =
         json!(process_start_identity(std::process::id(), &ctx.processes).await);
+    atomic_write(&job_path, &job).await?;
     let archive_key = job["target"]["key"]
         .as_str()
         .context("job missing worktree key")?
         .to_owned();
+    let key = archive_key.clone();
+    let job_id = args.job_id.clone();
+    let path = job["target"]["path"]
+        .as_str()
+        .context("job missing path")?
+        .to_owned();
+    let branch = job["target"]["branch"]
+        .as_str()
+        .context("job missing branch")?
+        .to_owned();
+    let accepted = ctx
+        .database
+        .call(move |store| Ok(store.begin_removal(&key, &job_id, &path, &branch)?))
+        .await?;
+    if !accepted {
+        job["state"] = json!("failed");
+        job["error"] = json!("another removal is already active for this worktree");
+        job["completedAt"] = json!(now_string());
+        atomic_write(&job_path, &job).await?;
+        bail!("another removal is already active for this worktree");
+    }
     if job["wasArchived"].is_boolean() {
         let key = archive_key;
         ctx.database
@@ -385,6 +407,7 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             job["error"] = Value::Null;
             job["completedAt"] = json!(now_string());
             atomic_write(&job_path, &job).await?;
+            publish_removal_result(ctx, &job).await?;
             tracing::info!(
                 target: "wt_attention",
                 event_channel = "attention",
@@ -401,6 +424,7 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             job["error"] = json!(format!("{error:#}"));
             job["completedAt"] = json!(now_string());
             atomic_write(&job_path, &job).await?;
+            publish_removal_result(ctx, &job).await?;
             tracing::error!(
                 target: "wt_attention",
                 event_channel = "attention",
@@ -411,6 +435,83 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
             Err(error)
         }
     }
+}
+
+async fn publish_removal_result(ctx: &AppContext, job: &Value) -> Result<()> {
+    let (Some(key), Some(job_id)) = (job["target"]["key"].as_str(), job["id"].as_str()) else {
+        return Ok(());
+    };
+    let key = key.to_owned();
+    let job_id = job_id.to_owned();
+    let error = match job["state"].as_str() {
+        Some("succeeded") => None,
+        Some("failed") => Some(job["error"].as_str().unwrap_or("removal failed").to_owned()),
+        _ => return Ok(()),
+    };
+    ctx.database
+        .call(move |store| {
+            store.finish_removal(&key, &job_id, error.as_deref())?;
+            Ok(())
+        })
+        .await
+}
+
+/// Repair interrupted result publication from the durable job. This runs in
+/// the metadata source, never on the terminal input path. Unknown workers
+/// remain active; only a proven exit permits retry.
+pub async fn reconcile_removals(ctx: &AppContext, state: &Value) -> Result<()> {
+    let Some(removals) = state["removals"].as_object() else {
+        return Ok(());
+    };
+    for (key, removal) in removals {
+        if !removal["error"].is_null() {
+            continue;
+        }
+        let Some(job_id) = removal["jobId"].as_str() else {
+            continue;
+        };
+        validate_job_id(job_id)?;
+        let path = job_dir(ctx).join(format!("{job_id}.json"));
+        let mut job = match read_job(&path).await {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!(%job_id, %error, "cannot reconcile accepted removal; retaining its state");
+                continue;
+            }
+        };
+        if job["id"].as_str() != Some(job_id) || job["target"]["key"].as_str() != Some(key) {
+            tracing::warn!(%job_id, "removal journal identity mismatch; retaining its state");
+            continue;
+        }
+        if matches!(job["state"].as_str(), Some("succeeded" | "failed")) {
+            publish_removal_result(ctx, &job).await?;
+            continue;
+        }
+        let Some(pid) = job["workerPid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            continue;
+        };
+        let expected = job["workerStartIdentity"].as_str().unwrap_or_default();
+        let actual = process_start_identity(pid, &ctx.processes).await;
+        let exited =
+            pid_is_gone(pid) || (!expected.is_empty() && !actual.is_empty() && expected != actual);
+        if !exited {
+            continue;
+        }
+        job = read_job(&path).await?;
+        if matches!(job["state"].as_str(), Some("starting" | "running")) {
+            job["state"] = json!("failed");
+            job["error"] = json!(
+                "worker process disappeared before recording completion; inspect the checkout before retrying"
+            );
+            job["completedAt"] = json!(now_string());
+            atomic_write(&path, &job).await?;
+        }
+        publish_removal_result(ctx, &job).await?;
+    }
+    Ok(())
 }
 
 async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
@@ -515,7 +616,7 @@ async fn read_job(path: &Path) -> Result<Value> {
 }
 
 async fn atomic_write(path: &Path, value: &Value) -> Result<()> {
-    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let tmp = path.with_extension(format!("json.{}.tmp", new_id()));
     let encoded = serde_json::to_vec_pretty(value)?;
     tokio::fs::write(&tmp, encoded)
         .await
@@ -572,11 +673,12 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
         job["error"] = json!("worker process disappeared before recording completion");
         job["completedAt"] = json!(now_string());
         atomic_write(&entry.path(), &job).await?;
+        publish_removal_result(ctx, &job).await?;
         tracing::error!(
             target: "wt_attention",
             event_channel = "attention",
             event_source = job["target"]["key"].as_str().unwrap_or("wt"),
-            event_text = "Removal failed: worker process disappeared before recording completion; checkout remains archived",
+            event_text = "Removal failed: worker process disappeared before recording completion; checkout remains in Removing",
             "background removal worker disappeared"
         );
     }
@@ -630,6 +732,79 @@ mod tests {
     use crate::commands::test_support::CommandFixture;
 
     #[tokio::test]
+    async fn accepted_failure_is_published_and_a_lost_success_reply_is_reconciled() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let row = crate::lifecycle_ops::resolve_key(ctx, "one").await.unwrap();
+        let revision = crate::lifecycle_ops::service(ctx)
+            .unwrap()
+            .removal_revision(&row.target, false, &ctx.cancellation)
+            .await
+            .unwrap();
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let path = jobs.join("1-a.json");
+        let job = json!({
+            "version": VERSION, "id": "1-a", "state": "starting",
+            "wasArchived": false, "operation": "remove",
+            "target": {
+                "key": "one", "path": row.target.path, "branch": row.target.branch,
+                "head": "old-head", "revision": revision,
+            }
+        });
+        atomic_write(&path, &job).await.unwrap();
+        let error = run_worker(
+            ctx,
+            &DestroyWorkerArgs {
+                job_id: "1-a".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("HEAD changed"));
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(
+            state["removals"]["one"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("HEAD changed")
+        );
+        assert!(Path::new(&row.target.path).exists());
+
+        let target_path = row.target.path.clone();
+        let branch = row.target.branch.clone();
+        ctx.database
+            .call(move |store| {
+                assert!(store.begin_removal("one", "2-b", &target_path, &branch)?);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let success =
+            json!({"id": "2-b", "state": "succeeded", "target": {"key": "one"}, "error": null});
+        atomic_write(&jobs.join("2-b.json"), &success)
+            .await
+            .unwrap();
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        reconcile_removals(ctx, &state).await.unwrap();
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(state["removals"]["one"].is_null());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn completion_wait_does_not_treat_startup_as_success() {
         let fixture = CommandFixture::new().await.unwrap();
         let jobs = job_dir(&fixture.ctx);
@@ -668,6 +843,7 @@ mod tests {
         let live = jobs.join("2-b.json");
         let running = |pid: u32| {
             json!({
+                "id": "1-a",
                 "state": "running",
                 "workerPid": pid,
                 "workerStartIdentity": "ps:an earlier start",
@@ -679,16 +855,29 @@ mod tests {
         // A live worker whose identity probe works is never reaped.
         let own = process_start_identity(std::process::id(), &fixture.ctx.processes).await;
         let mut alive = running(std::process::id());
+        alive["id"] = json!("2-b");
+        alive["target"]["key"] = json!("two");
         alive["workerStartIdentity"] = json!(own);
         atomic_write(&live, &alive).await.unwrap();
         fixture
             .ctx
             .database
-            .call(|store| Ok(store.set_archived("one", true)?))
+            .call(|store| {
+                store.set_archived("one", true)?;
+                store.begin_removal("one", "1-a", "/one", "feature/one")?;
+                store.begin_removal("two", "2-b", "/two", "feature/two")?;
+                Ok(())
+            })
             .await
             .unwrap();
 
-        reap_abandoned(&fixture.ctx, &jobs).await.unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        reconcile_removals(&fixture.ctx, &state).await.unwrap();
 
         let job = read_job(&path).await.unwrap();
         assert_eq!(job["state"], "failed");
@@ -700,6 +889,19 @@ mod tests {
             .await
             .unwrap();
         assert!(archived.contains("one"));
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(
+            state["removals"]["one"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("disappeared")
+        );
+        assert!(state["removals"]["two"]["error"].is_null());
         fixture.close().await.unwrap();
     }
 

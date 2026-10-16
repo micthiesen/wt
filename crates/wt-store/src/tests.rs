@@ -14,6 +14,48 @@ fn identity(id: &str, path: &str) -> RepositoryIdentity {
 }
 
 #[test]
+fn removal_survives_restart_and_only_its_current_job_can_finish() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut store = Store::open(&path, identity("repo", "/repo")).unwrap();
+    assert!(
+        store
+            .begin_removal("one", "first", "/one", "feature/one")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .begin_removal("one", "duplicate", "/one", "feature/one")
+            .unwrap()
+    );
+    store
+        .finish_removal("one", "first", Some("permission denied"))
+        .unwrap();
+    drop(store);
+
+    let mut store = Store::open(&path, identity("repo", "/repo")).unwrap();
+    store.reap_wt_state(&BTreeSet::new()).unwrap();
+    assert_eq!(
+        store.read_wt_state().unwrap()["removals"]["one"]["error"],
+        "permission denied"
+    );
+    assert!(
+        store
+            .begin_removal("one", "retry", "/one", "feature/one")
+            .unwrap()
+    );
+    assert!(!store.finish_removal("one", "first", None).unwrap());
+    assert!(
+        !store
+            .finish_removal("one", "first", Some("old error"))
+            .unwrap()
+    );
+    assert!(store.read_wt_state().unwrap()["removals"]["one"]["error"].is_null());
+    assert!(store.finish_removal("one", "retry", None).unwrap());
+    assert!(store.read_wt_state().unwrap()["removals"]["one"].is_null());
+}
+
+#[test]
 fn fork_base_write_checks_fresh_anchor_and_cycle_in_one_transaction() {
     let temp = tempdir().unwrap();
     let path = temp.path().join("state.sqlite");

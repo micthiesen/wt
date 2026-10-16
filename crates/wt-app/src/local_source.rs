@@ -32,11 +32,17 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
         }
     });
     let metadata = start_source(scope, metadata_spec(), {
-        let database = context.database.clone();
+        let context = context.clone();
         move |_cancel| {
-            let database = database.clone();
+            let context = context.clone();
             async move {
-                database
+                let state = context
+                    .database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await?;
+                crate::commands::_destroy::reconcile_removals(&context, &state).await?;
+                context
+                    .database
                     .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
                     .await
             }

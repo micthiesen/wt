@@ -13,7 +13,22 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
     if row.is_main || row.pending_creation || row.key.starts_with('\0') {
         return Menu::Local(LocalMenu::Notice("This checkout cannot be removed.".into()));
     }
+    if row
+        .removal
+        .as_ref()
+        .is_some_and(|removal| removal.error.is_none())
+    {
+        return Menu::Local(LocalMenu::Notice("Removal is already in progress.".into()));
+    }
     let mut lines = vec![format!("{} ({})", row.slug, row.branch)];
+    if let Some(error) = row
+        .removal
+        .as_ref()
+        .and_then(|removal| removal.error.as_ref())
+    {
+        lines.push(format!("Previous removal failed: {error}"));
+        lines.push("Retry repeats the current safety checks.".into());
+    }
     if let Some(host) = &row.host {
         lines.push(format!("Host: {host}"));
         if let Some(error) = board.host_errors.get(host) {
@@ -70,6 +85,31 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
 mod tests {
     use super::*;
     use crate::{BoardRow, GitPresentation, LandingKind, UiAction};
+
+    #[test]
+    fn active_removal_cannot_be_submitted_again_and_failure_retries_with_a_witness() {
+        let mut row = clean("one");
+        row.removal = Some(crate::RemovalView::default());
+        let mut board = Board {
+            rows: vec![row],
+            ..Board::default()
+        };
+        assert!(matches!(
+            menu(&board, "one"),
+            Menu::Local(LocalMenu::Notice(_))
+        ));
+        board.rows[0].removal.as_mut().unwrap().error = Some("denied".into());
+        let (_, lines, action) = confirm(menu(&board, "one"));
+        assert!(lines.iter().any(|line| line.contains("denied")));
+        assert!(matches!(
+            action,
+            ConfirmAction::Remove {
+                seen: Some(_),
+                revision: None,
+                ..
+            }
+        ));
+    }
 
     fn clean(slug: &str) -> BoardRow {
         BoardRow {

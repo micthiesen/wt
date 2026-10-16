@@ -25,14 +25,14 @@ use wt_runtime::SourceState;
 
 use crate::UiAction;
 
-pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION};
+pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION, REMOVING_SECTION};
 pub use board::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
     DisplayPolicy, GitPresentation, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
     PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
-    PreparedDetailGroup, PreparedPalette, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
-    ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView,
-    TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
+    PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot,
+    ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView,
+    TerminalSlotView, TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use interaction::{
     ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,

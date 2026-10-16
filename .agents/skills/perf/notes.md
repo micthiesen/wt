@@ -307,6 +307,20 @@ footprint: wt measured about 209 MB footprint despite roughly 900 MB RSS.
 
 ## Open issues
 
+- **Existing tmux session attachment waits for fleet Git status (2026-10-14).**
+  Installed build `06ced1a` calls `inventory_status` in both
+  `session_commands::resolve_target` and `harness::ui_session_with_harness`
+  before checking the selected live tmux slot. This runs Git status for every
+  checkout although attachment only needs target identity and its directory.
+  Read-only tmux has-session/list-sessions/list-panes took 6.6–7.6 ms;
+  `wt ls --json` took 2.245 seconds for 28 rows (22 live). The latter includes
+  CLI setup and is not a measured attachment interval. Use prepared target
+  identity and a narrow live-slot recheck; retain exact conversation and
+  tmux slot guards. Keep fleet Git status off the attachment dependency path.
+  wt PID 55019 used 4.0% CPU in the second two-second top sample, with 62.8%
+  machine idle CPU. The previous two-core Codex scan was not present in this
+  sample. Evidence: `/tmp/wt-session-open-sample-20261014.txt` and
+  `/tmp/wt-session-open-perf-20261014.json`. No session was switched or stopped.
 - **Cozee creation delay with OpenCode selected (2026-10-14 UTC).** Installed
   build `ece782f` uses Rift with `--copy-all`. Recent `secrets-script` and
   `secrets-script-manager` checkouts completed at 00:11:00Z and 00:10:19Z.

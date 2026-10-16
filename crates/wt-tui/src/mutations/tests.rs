@@ -610,7 +610,7 @@ fn creation_projection_replaces_placeholder_with_the_exact_inventory_row() {
 }
 
 #[test]
-fn removal_stays_in_place_until_the_worker_archives_it() {
+fn removal_stays_in_place_until_the_worker_accepts_it() {
     let removing = whole(LifecycleChange::Remove {
         keys: vec!["a".into()],
     });
@@ -623,7 +623,7 @@ fn removal_stays_in_place_until_the_worker_archives_it() {
 }
 
 #[test]
-fn removal_waits_for_inventory_even_after_the_worker_archives_the_row() {
+fn removal_waits_for_inventory_after_worker_acceptance() {
     let removal = LifecycleChange::Remove {
         keys: vec!["a".into()],
     };
@@ -631,9 +631,26 @@ fn removal_waits_for_inventory_even_after_the_worker_archives_the_row() {
     let mut latest = board();
     assert!(!removal.observed(&target, &latest));
     latest.rows[0].archived = true;
+    latest.rows[0].removal = Some(crate::RemovalView::default());
     assert!(!removal.observed(&target, &latest));
     removal.apply(&target, &mut latest);
     assert_eq!(latest.rows[0].badge, "removing");
     latest.rows.clear();
     assert!(removal.observed(&target, &latest));
+}
+
+#[test]
+fn pending_removal_does_not_hide_a_durable_failure() {
+    let removal = LifecycleChange::Remove {
+        keys: vec!["a".into()],
+    };
+    let target = Target::row(None, "a");
+    let mut latest = board();
+    latest.rows[0].removal = Some(crate::RemovalView {
+        error: Some("denied".into()),
+    });
+    latest.rows[0].badge = "Removal failed".into();
+    removal.apply(&target, &mut latest);
+    assert_eq!(latest.rows[0].badge, "Removal failed");
+    assert!(latest.rows[0].busy.is_none());
 }

@@ -83,9 +83,14 @@ when preparation or creation finishes. Worktree actions, including F12, become
 available when the real checkout is ready; F12 is never queued automatically.
 Dependency installation continues as a background action. A removal request
 keeps the row in place with a dim gray, struck-through name while safety
-checks run. When the worker starts, the row leaves Inbox and file cleanup
-continues in the background. Failed cleanup stays in Archived and reports an
-error in the attention panel. It does not put the row back in Inbox. A request
+checks run. When the worker accepts removal, the row moves to **Removing**, directly
+above **Archived**, and file cleanup continues in the background. Active
+removals reject duplicate requests. Failed rows stay in Removing with a
+**Removal failed** label and an error in the details and attention panels.
+Press `d` to inspect the failure and review a retry; the host repeats all
+safety checks. If checkout identity is missing, the menu permits inspection
+only. Removing rows survive restart, even after partial deletion. A row leaves
+the list only after the worker confirms success and inventory drops it. A request
 cancelled before worker startup restores the normal name style. Delayed hazard reviews are queued separately for each checkout
 and host. They appear one at a time after the current menu closes; navigation
 does not discard them. Each confirmation still rechecks its checkout witness.

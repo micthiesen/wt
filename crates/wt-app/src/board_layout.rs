@@ -11,6 +11,7 @@ use wt_core::{
 use wt_tui::{Board, BoardSection, SectionRollup, WorkRiskCount, WorkStateCount};
 
 pub const INBOX: &str = "\0inbox";
+pub const REMOVING: &str = "\0removing";
 pub const ARCHIVED: &str = "\0archived";
 
 pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
@@ -45,7 +46,9 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             let section = state["slugs"][&row.key]["section"]
                 .as_str()
                 .filter(|name| !name.is_empty());
-            if row.archived {
+            if row.removal.is_some() {
+                REMOVING.to_owned()
+            } else if row.archived {
                 ARCHIVED.to_owned()
             } else {
                 section.map_or_else(|| INBOX.to_owned(), str::to_owned)
@@ -155,6 +158,8 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         let position = |section: &BoardSection| {
             if section.key == ARCHIVED {
                 usize::MAX
+            } else if section.key == REMOVING {
+                usize::MAX - 1
             } else {
                 order
                     .iter()
@@ -216,6 +221,7 @@ fn section_title(key: &str) -> String {
     match key {
         INBOX => "Inbox".to_owned(),
         ARCHIVED => "Archived".to_owned(),
+        REMOVING => "Removing".to_owned(),
         _ => wt_core::sanitize_terminal_text(key),
     }
 }
@@ -469,5 +475,32 @@ mod tests {
         );
         assert_eq!(board.sections[0].rows, [1]);
         assert_eq!(board.sections[1].rows, [0]);
+    }
+
+    #[test]
+    fn removals_follow_manual_sections_and_precede_archived() {
+        let mut removing = row("removing");
+        removing.archived = true;
+        removing.removal = Some(wt_tui::RemovalView::default());
+        let mut failed = row("failed");
+        failed.removal = Some(wt_tui::RemovalView {
+            error: Some("denied".into()),
+        });
+        let mut archived = row("archived");
+        archived.archived = true;
+        let mut board = Board {
+            rows: vec![row("active"), removing, failed, archived],
+            ..Board::default()
+        };
+        let state = json!({"slugs": {"removing": {"section": "Batch"}}, "sectionsOrder": [ARCHIVED, REMOVING, "Batch"]});
+        prepare(&mut board, &state, "main", UiSort::Status);
+        let keys: Vec<_> = board
+            .sections
+            .iter()
+            .map(|section| section.key.as_str())
+            .collect();
+        assert_eq!(keys, ["Batch", INBOX, REMOVING, ARCHIVED]);
+        assert_eq!(board.sections[2].rows, [2, 1]);
+        assert!(!board.sections[2].folded);
     }
 }

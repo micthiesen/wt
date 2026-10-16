@@ -144,12 +144,24 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
     let board = &model.board;
     let base = Style::new().bg(theme::BG_ALT);
     frame.render_widget(Block::new().style(base), area);
-    let archived = board.rows.iter().filter(|row| row.archived).count();
-    let active = board.rows.len() - archived;
+    let removing = board
+        .rows
+        .iter()
+        .filter(|row| row.removal.is_some())
+        .count();
+    let archived = board
+        .rows
+        .iter()
+        .filter(|row| row.archived && row.removal.is_none())
+        .count();
+    let active = board.rows.len() - archived - removing;
     let mut title = format!(
         "wt · {active} worktree{}",
         if active == 1 { "" } else { "s" }
     );
+    if removing > 0 {
+        title.push_str(&format!(" · {removing} removing"));
+    }
     if archived > 0 {
         title.push_str(&format!(" · {archived} archived"));
     }

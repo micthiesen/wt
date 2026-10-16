@@ -96,8 +96,15 @@ impl Family for LifecycleChange {
                 for key in keys {
                     if let Some(index) = board.rows.iter().position(|row| &row.key == key) {
                         let row = &mut board.rows[index];
-                        // Only the worker can archive after accepting removal.
-                        let label = if row.archived {
+                        // Durable worker state owns placement and terminal failure.
+                        if row
+                            .removal
+                            .as_ref()
+                            .is_some_and(|removal| removal.error.is_some())
+                        {
+                            continue;
+                        }
+                        let label = if row.removal.is_some() {
                             REMOVING
                         } else {
                             "checking removal"
