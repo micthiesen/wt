@@ -389,7 +389,7 @@ async fn run_inner<'a>(
                                 let id = model.next_op_id();
                                 let action = model.resolve(action);
                                 let feedback = action.clone();
-                                let cancellation = action.is_preparation().then(CancellationToken::new);
+                                let cancellation = action.is_cancellable().then(CancellationToken::new);
                                 match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }) {
                                     Ok(()) => {
                                         model.begin_action(id, &feedback);
@@ -432,7 +432,7 @@ async fn run_inner<'a>(
                         let id = model.next_op_id();
                         let action = model.resolve(action);
                         let feedback = action.clone();
-                        let cancellation = action.is_preparation().then(CancellationToken::new);
+                        let cancellation = action.is_cancellable().then(CancellationToken::new);
                         if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }).is_err() {
                             model.request_not_sent();
                             model.toast = Some(("Action queue is busy; retry the action".into(), ToastTone::Failed));

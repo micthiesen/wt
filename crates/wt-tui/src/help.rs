@@ -23,7 +23,7 @@ pub(crate) const LINES: &[&str] = &[
     "  s                  Open deployed stage or dev server",
     "  y                  Copy picker: b s S d p n i I r, j/k, y/Enter, 1-9",
     "  y on folded        Copy section name (n), slugs (s), branches (b), list (l)",
-    "  t / T              Edit title / regenerate AI title",
+    "  t / T              Rename worktree title manually / regenerate AI title",
     "  V                  Show / hide this row's verify-after-merge steps",
     "  a                  Archive / restore",
     "  d                  Remove worktree (confirmation)",

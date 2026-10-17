@@ -1,5 +1,24 @@
 # Performance notes
 
+### Remote memory limits proposal (2026-10-16)
+
+The user reports memory exhaustion during concurrent type checks on an 8 GB
+Linux worker. No server measurements or OOM logs were collected in this review.
+Current remote configuration has no command memory budget. Agent sessions and
+tracked actions start through tmux, so limiting only the SSH worker client
+would not reliably contain commands launched by an existing tmux server.
+
+Proposed design: a shared host workload cgroup budget, separate command scopes,
+and a host-wide queue for memory-heavy checks. Keep the control service outside
+the workload limit. Agent-issued shell commands need an explicit execution
+boundary; a cap on wt actions alone does not cover them. Go runtime memory
+settings are soft tuning controls, not a replacement for cgroup limits. Choose
+limits after measuring idle server use and check peak memory. No remote
+configuration or process was changed.
+
+References: https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+and https://go.dev/doc/gc-guide.
+
 ### OpenCode V2 validation and watcher shutdown (2026-10-15 UTC)
 
 The first integrated gate hit the existing notify 8.2 FSEvents signature:

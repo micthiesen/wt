@@ -503,7 +503,9 @@ Intermediate terminal handoffs carry the originating request ID and input
 generation. A newer prompt or selection can decline the ticket before terminal
 suspension; no attach client starts, the prepared session remains alive, and a
 declined sign-in does not execute its continuation. Navigation that declines a
-pending connection reports its cancellation. A late empty completion cannot
+pending connection cancels its controller wait and releases terminal admission.
+A current handoff transfers ownership to the terminal before the request ends,
+so completing the request does not cancel an active attach client. A late empty completion cannot
 erase feedback from newer input, including a worktree still being created.
 
 The SSH protocol is framed and versioned. The controller probes the worker,

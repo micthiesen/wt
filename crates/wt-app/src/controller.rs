@@ -92,7 +92,7 @@ pub fn start(
                 let wt_tui::UiRequest { id, generation, action: command, cancellation } = request;
                 busy.insert(lane.clone());
                 let operation_cancellation = command
-                    .is_preparation()
+                    .is_cancellable()
                     .then(|| cancellation.unwrap_or_else(|| shutdown.child_token()));
                 let mut request_context = (*context).clone();
                 if let Some(cancellation) = &operation_cancellation {
@@ -111,7 +111,7 @@ pub fn start(
                     let retry = create_retry(&command);
                     let request_replies = RequestReplies { sender: replies, id, generation };
                     let result = if let Some(cancellation) = operation_cancellation {
-                        run_preparation_or_cancel(
+                        run_request_or_cancel(
                             &shutdown,
                             &cancellation,
                             crate::host_dispatch::execute(
@@ -149,10 +149,9 @@ pub fn start(
                     draining = true;
                     port.requests.close();
                     progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
-                    // Pending prompts and pickers have no accepted side effect
-                    // to preserve. Drop them so shutdown drains only work the
-                    // user already committed.
-                    pending.retain(|(_, (request, _))| !request.action.is_preparation());
+                    // Pending menus and session entry can stop before handoff.
+                    // Drop them so shutdown drains only accepted work.
+                    pending.retain(|(_, (request, _))| !request.action.is_cancellable());
                 },
                 finished = running.join_next_with_id(), if !running.is_empty() => match finished {
                     Some(Ok((id, (lane, reply)))) => {
@@ -642,7 +641,7 @@ fn unobserved_reply_status(reply: &UiReply) -> Option<&'static str> {
     }
 }
 
-async fn run_preparation_or_cancel<F>(
+async fn run_request_or_cancel<F>(
     shutdown: &CancellationToken,
     cancellation: &CancellationToken,
     operation: F,
@@ -652,8 +651,8 @@ where
 {
     tokio::select! {
         biased;
-        _ = shutdown.cancelled() => Ok(UiReply::no_change("Preparation cancelled during shutdown")),
-        _ = cancellation.cancelled() => Ok(UiReply::no_change("Preparation cancelled")),
+        _ = shutdown.cancelled() => Ok(UiReply::no_change("Request cancelled during shutdown")),
+        _ = cancellation.cancelled() => Ok(UiReply::no_change("Request cancelled")),
         result = operation => result,
     }
 }
@@ -1312,7 +1311,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        let result = run_preparation_or_cancel(
+        let result = run_request_or_cancel(
             &shutdown,
             &cancellation,
             std::future::pending::<Result<UiReply>>(),
@@ -1324,6 +1323,51 @@ mod tests {
         let reply = action_reply(Ok(result), None);
         assert!(!reply.failed);
         assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::NoChange));
+    }
+
+    #[tokio::test]
+    async fn cancelled_remote_entry_releases_terminal_admission_for_local_entry() {
+        let remote = wt_tui::UiAction::OnHost {
+            host: Some("offline".into()),
+            action: Box::new(wt_tui::UiAction::Session {
+                key: Some("remote-tree".into()),
+                target: wt_tui::SessionTarget::Shell,
+            }),
+        };
+        let local = wt_tui::UiAction::Session {
+            key: Some("local-tree".into()),
+            target: wt_tui::SessionTarget::Shell,
+        };
+        assert!(remote.is_cancellable());
+        let remote_lane = lane_for(&remote).unwrap();
+        let local_lane = lane_for(&local).unwrap();
+        let mut busy = BTreeSet::from([remote_lane.clone()]);
+        let mut pending = VecDeque::from([(local_lane.clone(), local)]);
+        assert!(take_available(&mut pending, &busy).is_none());
+
+        let shutdown = CancellationToken::new();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let worker = tokio::spawn(async move {
+            run_request_or_cancel(
+                &shutdown,
+                &worker_cancellation,
+                std::future::pending::<Result<UiReply>>(),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        let reply = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!reply.failed);
+        assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::NoChange));
+
+        busy.remove(&remote_lane);
+        assert_eq!(take_available(&mut pending, &busy).unwrap().0, local_lane);
     }
 
     #[test]
@@ -1382,7 +1426,7 @@ mod tests {
         };
         assert_eq!(unobserved_reply_status(&ongoing), Some("was accepted"));
         assert_eq!(
-            unobserved_reply_status(&UiReply::no_change("Preparation cancelled")),
+            unobserved_reply_status(&UiReply::no_change("Request cancelled")),
             None
         );
     }

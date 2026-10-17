@@ -229,3 +229,53 @@ fn all_foreground_requests_keep_feedback_until_their_own_reply() {
     });
     assert_eq!(model.toast.as_ref().unwrap().0, "Done");
 }
+
+#[test]
+fn leaving_session_entry_cancels_the_connection() {
+    for key in [KeyCode::Esc, KeyCode::Down, KeyCode::F(10)] {
+        let mut model = Model::default();
+        model.apply(board(&["one", "two"]));
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::F(12)), 20) else {
+            panic!("session action")
+        };
+        assert!(action.is_cancellable());
+        model.begin_action(7, &action);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        model.pending_request.as_mut().unwrap()._cancel_on_drop =
+            Some(cancellation.clone().drop_guard());
+
+        model.input(KeyEvent::from(key), 20);
+
+        assert!(cancellation.is_cancelled(), "{key:?}");
+        assert!(model.pending_request.is_none());
+    }
+}
+
+#[test]
+fn accepted_terminal_handoff_keeps_the_attach_client_alive() {
+    let mut model = Model::default();
+    model.apply(board(&["one"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::F(12)), 20) else {
+        panic!("session action")
+    };
+    model.begin_action(7, &action);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    model.pending_request.as_mut().unwrap()._cancel_on_drop =
+        Some(cancellation.clone().drop_guard());
+    let (ready, mut suspended) = tokio::sync::oneshot::channel();
+    let (_resume, resumed) = tokio::sync::oneshot::channel();
+
+    let handoff = model
+        .reply(UiReply {
+            operation_id: Some(7),
+            ui_generation: Some(model.ui_generation),
+            handoff: Some(crate::TerminalHandoff { ready, resumed }),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(model.pending_request.is_none());
+    assert!(!cancellation.is_cancelled());
+    handoff.ready.send(()).unwrap();
+    assert_eq!(suspended.try_recv(), Ok(()));
+}

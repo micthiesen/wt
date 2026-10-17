@@ -39,7 +39,7 @@ impl Model {
             self.creation_prepared(reply.operation_id, prepared);
             return None;
         }
-        let completed_request = if self
+        let mut completed_request = if self
             .pending_request
             .as_ref()
             .is_some_and(|request| Some(request.id) == reply.operation_id)
@@ -98,6 +98,14 @@ impl Model {
             // Dropping the unacknowledged ticket releases its controller wait
             // without suspending this newer interaction or attaching a client.
             return None;
+        }
+        if reply.handoff.is_some()
+            && let Some(request) = &mut completed_request
+            && let Some(guard) = request._cancel_on_drop.take()
+        {
+            // The terminal now owns the session. Completing the UI request
+            // must not cancel its attach client.
+            guard.disarm();
         }
         let selection_current = presentation_current
             || (selected_create

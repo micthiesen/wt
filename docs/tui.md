@@ -241,7 +241,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `d` | Remove the selected worktree after confirmation |
 | `c` | Open cleanup review from background results, including archived rows |
 | `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
-| `t` / `T` | Edit title / regenerate its AI title |
+| `t` / `T` | Rename worktree title manually / regenerate its AI title |
 | `#` | Set or clear the worktree's issue identity |
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
@@ -312,6 +312,10 @@ armed or the unconfirmed attempt expires.
 | `,` / `.` / `/` | Enter the wt repo / main clone / dotfiles session when configured |
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
+
+While session entry waits for a host, `Esc` cancels that connection attempt.
+Navigation or another session request also cancels the wait. A cancelled remote
+connection does not block entry to a local session.
 
 Most menus open at once from the board on screen: status `u`, fork base `b`,
 section move, sessions `;`, start agent Shift+F12, stop a running terminal

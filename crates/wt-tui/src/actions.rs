@@ -350,6 +350,16 @@ impl UiAction {
         }
     }
 
+    /// Menu reads and session entry can stop when the user leaves them.
+    /// Session entry stops only before the terminal accepts its handoff.
+    pub fn is_cancellable(&self) -> bool {
+        match self {
+            Self::OnHost { action, .. } => action.is_cancellable(),
+            Self::Session { .. } | Self::SelectSession { .. } | Self::EnterHarness { .. } => true,
+            _ => self.is_preparation(),
+        }
+    }
+
     /// Whether this request prepares a prompt, picker, or other presentation
     /// from read-only data. Controllers may cancel these requests during
     /// shutdown without cancelling an accepted mutation. Derived from
@@ -852,7 +862,7 @@ pub struct UiRequest {
     pub id: u64,
     pub generation: u64,
     pub action: UiAction,
-    /// Only read-only preparations may be abandoned by their presentation owner.
+    /// Cancels menu reads or session entry before the terminal handoff.
     pub cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
