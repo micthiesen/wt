@@ -195,6 +195,48 @@ fn wt_session_harness_is_opt_in_validated_and_must_stay_visible() {
 }
 
 #[test]
+fn wt_session_claude_token_command_is_an_optional_argv() {
+    let root = tempfile::tempdir().unwrap();
+    let opts = options(root.path(), root.path(), &[]);
+    let base = minimal_config(root.path());
+    let unset = Config::from_raw(toml_value(&base), &opts).unwrap();
+    assert_eq!(unset.harness.wt_session_claude_token_command, None);
+
+    let set = format!(
+        "{base}\n[harness]\nwt_session = 'claude'\nwt_session_claude_token_command = ['/usr/bin/security', 'find-generic-password', '-s', 'wt-claude', '-w']\n"
+    );
+    let config = Config::from_raw(toml_value(&set), &opts).unwrap();
+    assert_eq!(
+        config.harness.wt_session_claude_token_command.as_deref(),
+        Some(
+            &[
+                "/usr/bin/security".to_owned(),
+                "find-generic-password".into(),
+                "-s".into(),
+                "wt-claude".into(),
+                "-w".into()
+            ][..]
+        )
+    );
+    // The account selector is independent of the harness pin.
+    let unpinned = format!("{base}\n[harness]\nwt_session_claude_token_command = ['helper']\n");
+    let config = Config::from_raw(toml_value(&unpinned), &opts).unwrap();
+    assert_eq!(config.harness.wt_session, None);
+    assert!(config.harness.wt_session_claude_token_command.is_some());
+
+    for invalid in ["[]", "['']", "['  ', 'x']"] {
+        let raw = format!("{base}\n[harness]\nwt_session_claude_token_command = {invalid}\n");
+        let error = Config::from_raw(toml_value(&raw), &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("harness.wt_session_claude_token_command"),
+            "{invalid}: {error}"
+        );
+    }
+}
+
+#[test]
 fn defaults_are_typed_and_repository_derived() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

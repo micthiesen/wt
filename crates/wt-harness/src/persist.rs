@@ -10,6 +10,46 @@ use serde_json::Value;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Write a secret that one pane consumes at launch. The directory is private
+/// and must not be a symlink; the file is created 0600 under a temporary name
+/// and renamed into place, so a reader never sees a partial secret.
+#[cfg(unix)]
+pub(crate) fn write_private_launch_file(
+    directory: &Path,
+    file_name: &str,
+    contents: &[u8],
+) -> io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "private launch directory is not a directory",
+        ));
+    }
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    let path = directory.join(file_name);
+    let temporary = directory.join(format!("{file_name}.tmp"));
+    let result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map(|()| path)
+}
+
 pub(crate) struct FileLock(File);
 
 impl FileLock {

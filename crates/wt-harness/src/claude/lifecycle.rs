@@ -7,10 +7,15 @@ use std::{
 
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
-use wt_tmux::{CreateSession, PaneTarget, TmuxClient, TmuxError};
+use wt_tmux::{CreateSession, OptionScope, PaneTarget, TmuxClient, TmuxError};
 
 use super::{
-    ClaudeHarness, ClaudePaths, RegistrySession, RegistryStatus, claude_tmux_name,
+    ClaudeHarness, ClaudePaths, RegistrySession, RegistryStatus,
+    auth::{
+        self, CLAUDE_OAUTH_TOKEN_ENV, ClaudeAuthError, ClaudeLaunchAuth, LAUNCH_AUTH_OPTION,
+        LAUNCH_AUTH_TOKEN_COMMAND, OVERRIDING_AUTH_ENV, REDIRECTING_ENV, TokenHandoff,
+    },
+    claude_tmux_name,
     identity::claude_session_id,
     inspector_socket_path,
     names::reap_claude_names,
@@ -62,6 +67,8 @@ pub enum ClaudeSessionManagerError {
     Tmux(#[from] TmuxError),
     #[error("Claude session lock: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Auth(#[from] ClaudeAuthError),
 }
 
 /// Owns wt's deterministic Claude slots on one explicit tmux server.
@@ -74,6 +81,7 @@ pub struct ClaudeSessionManager {
     tmux: TmuxClient,
     start_timeout: Duration,
     spawn_path: Option<String>,
+    launch_auth: Option<ClaudeLaunchAuth>,
 }
 
 impl ClaudeSessionManager {
@@ -85,6 +93,7 @@ impl ClaudeSessionManager {
             tmux,
             start_timeout: START_TIMEOUT,
             spawn_path: None,
+            launch_auth: None,
         }
     }
 
@@ -96,6 +105,49 @@ impl ClaudeSessionManager {
     pub fn with_spawn_path(mut self, path: impl Into<String>) -> Self {
         self.spawn_path = Some(path.into());
         self
+    }
+
+    /// Select the account of the slot `auth` names for each process this
+    /// manager creates there. Other slots and live processes are untouched.
+    pub fn with_launch_auth(mut self, auth: Option<ClaudeLaunchAuth>) -> Self {
+        self.launch_auth = auth;
+        self
+    }
+
+    /// Explain when a live slot's account differs from the configured
+    /// selection. Auth is fixed when Claude starts, so the slot keeps its
+    /// account until it is restarted; wt never restarts it to change that.
+    pub async fn launch_auth_restart_notice(
+        &self,
+        target: &ClaudeSessionTarget,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, ClaudeSessionManagerError> {
+        let name = self.tmux_name(target);
+        if !self.tmux.session_exists(&name, cancel).await? {
+            return Ok(None);
+        }
+        let selected = self
+            .launch_auth
+            .as_ref()
+            .is_some_and(|auth| auth.applies_to(target));
+        let started = self
+            .tmux
+            .get_option(
+                &OptionScope::Session(name.clone()),
+                LAUNCH_AUTH_OPTION,
+                cancel,
+            )
+            .await?
+            .is_some_and(|value| value == LAUNCH_AUTH_TOKEN_COMMAND);
+        Ok(match (selected, started) {
+            (true, false) => Some(format!(
+                "{name} was started before harness.wt_session_claude_token_command applied and still uses the normal Claude login; stop and restart it to use the selected account"
+            )),
+            (false, true) if self.launch_auth.is_none() => Some(format!(
+                "{name} still uses the token from harness.wt_session_claude_token_command, which is no longer configured; stop and restart it to use the normal Claude login"
+            )),
+            _ => None,
+        })
     }
 
     pub(super) fn paths(&self) -> &ClaudePaths {
@@ -308,6 +360,12 @@ impl ClaudeSessionManager {
     ) -> Result<Vec<PathBuf>, ClaudeSessionManagerError> {
         reap_claude_names(&self.paths.cache_dir, live_slugs)
             .map_err(|error| operation("reap", error.to_string()))?;
+        // A handoff outlives its launch only if wt or tmux died before the
+        // pane read it. Registration has long finished by this age.
+        auth::reap_stale_handoffs(
+            &self.paths.cache_dir.join("auth"),
+            self.start_timeout.max(Duration::from_secs(60)) * 2,
+        );
         self.reap_inspector_sockets(cancel).await
     }
 
@@ -327,10 +385,16 @@ impl ClaudeSessionManager {
         if !existed {
             self.prepare_inspector(&name)?;
         }
+        // A token handoff lives until Claude registers or the start fails.
+        let mut handoff = if existed {
+            None
+        } else {
+            self.select_account(target, &name, cancel).await?
+        };
         let started = if existed {
             true
         } else {
-            match self.create(target, &name, cancel).await {
+            match self.create(target, &name, handoff.as_ref(), cancel).await {
                 Ok(()) => false,
                 Err(error) => {
                     if self.tmux.session_exists(&name, cancel).await? {
@@ -346,9 +410,12 @@ impl ClaudeSessionManager {
         }
         if started {
             let before = self.pane_tail(&name, cancel).await;
+            // Select the account before stopping the unregistered slot, so a
+            // failing helper leaves it exactly as it was.
+            handoff = self.select_account(target, &name, cancel).await?;
             self.tmux.kill_session(&name, cancel).await?;
             self.prepare_inspector(&name)?;
-            self.create(target, &name, cancel).await?;
+            self.create(target, &name, handoff.as_ref(), cancel).await?;
             if let Some(session) = self.wait_for_registry(target, cancel).await? {
                 return Ok((session, false));
             }
@@ -388,10 +455,40 @@ impl ClaudeSessionManager {
         }
     }
 
+    /// Run the slot's token helper, if one applies, and write the handoff
+    /// before anything is created or stopped, so a failing helper leaves no
+    /// session that could run with another login.
+    async fn select_account(
+        &self,
+        target: &ClaudeSessionTarget,
+        tmux_name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<TokenHandoff>, ClaudeSessionManagerError> {
+        let Some(auth) = self
+            .launch_auth
+            .as_ref()
+            .filter(|auth| auth.applies_to(target))
+        else {
+            return Ok(None);
+        };
+        let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        auth::check_settings(&auth::settings_files(
+            &self.paths.home,
+            &canonical(&target.cwd),
+            config_dir.as_deref(),
+        ))?;
+        let token = auth.fetch(cancel).await?;
+        Ok(Some(
+            TokenHandoff::write(&self.paths.cache_dir.join("auth"), tmux_name, &token)
+                .map_err(ClaudeAuthError::handoff)?,
+        ))
+    }
+
     async fn create(
         &self,
         target: &ClaudeSessionTarget,
         tmux_name: &str,
+        handoff: Option<&TokenHandoff>,
         cancel: &CancellationToken,
     ) -> Result<(), ClaudeSessionManagerError> {
         let spawn = self
@@ -442,20 +539,41 @@ impl ClaudeSessionManager {
         {
             command.extend(["-u".to_owned(), (*var).to_owned()]);
         }
+        // Only the selected launch drops credentials Claude ranks above the
+        // token; every other session keeps its environment as it was.
+        if handoff.is_some() {
+            for var in OVERRIDING_AUTH_ENV
+                .iter()
+                .chain(REDIRECTING_ENV)
+                .chain(&[CLAUDE_OAUTH_TOKEN_ENV])
+            {
+                command.extend(["-u".to_owned(), (*var).to_owned()]);
+            }
+        }
         command.push(format!("PATH={shim_path}"));
         command.push(format!("HOME={}", self.paths.home.to_string_lossy()));
         command.push(format!("WT_AGENT={}", target.slug));
         if let Some(url) = inspector_url {
             command.push(format!("BUN_INSPECT={url}"));
         }
-        command.extend([
-            "bash".into(),
-            "-c".into(),
-            "p=$1; shift; exec \"$@\" 2> \"$p\"".into(),
-            "_".into(),
-            stderr_path.to_string_lossy().into_owned(),
-            spawn.program.to_string_lossy().into_owned(),
-        ]);
+        match handoff {
+            Some(handoff) => command.extend([
+                "bash".into(),
+                "-c".into(),
+                auth::pane_script(),
+                "_".into(),
+                stderr_path.to_string_lossy().into_owned(),
+                handoff.path().to_string_lossy().into_owned(),
+            ]),
+            None => command.extend([
+                "bash".into(),
+                "-c".into(),
+                "p=$1; shift; exec \"$@\" 2> \"$p\"".into(),
+                "_".into(),
+                stderr_path.to_string_lossy().into_owned(),
+            ]),
+        }
+        command.push(spawn.program.to_string_lossy().into_owned());
         command.extend(spawn.args);
         let create = CreateSession {
             name: tmux_name.into(),
@@ -465,6 +583,18 @@ impl ClaudeSessionManager {
             height: Some(50),
         };
         self.tmux.create_session(&create, cancel).await?;
+        if handoff.is_some() {
+            // Recorded for the restart notice only; Claude has its token.
+            let _ = self
+                .tmux
+                .set_option(
+                    &OptionScope::Session(tmux_name.to_owned()),
+                    LAUNCH_AUTH_OPTION,
+                    Some(LAUNCH_AUTH_TOKEN_COMMAND),
+                    cancel,
+                )
+                .await;
+        }
         Ok(())
     }
 
@@ -612,6 +742,8 @@ mod tests {
     use tempfile::tempdir;
     use wt_platform::process::ProcessRunner;
     use wt_tmux::TmuxServer;
+
+    use super::super::TOKEN_HELPER_TIMEOUT;
 
     #[test]
     fn claude_environment_url_safety_and_path_prepend_are_deterministic() {
@@ -776,5 +908,354 @@ exec /bin/sleep 30
         );
         assert_eq!(started_status, RegistryStatus::Idle);
         assert!(exists);
+    }
+
+    #[cfg(unix)]
+    fn executable(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn tmux_output(socket: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(socket)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr)
+    }
+
+    /// Exercises the real tmux spawn boundary: only the selected slot gets
+    /// the helper's token, stronger inherited credentials are cleared there
+    /// alone, the token never reaches argv or tmux state, and every helper
+    /// failure refuses the launch without creating a session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_auth_selects_one_slot_account_without_exposing_the_token() {
+        const TOKEN: &str = "sk-ant-oat01-fake-token-123";
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bin = tmp.path().join("bin");
+        let wt_source = tmp.path().join("wt-source");
+        let other = tmp.path().join("other");
+        for dir in [&bin, &wt_source, &other, &home.join(".claude/sessions")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        executable(
+            &bin.join("claude"),
+            r##"#!/bin/sh
+id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id|--resume) id="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s|%s|%s\n' "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY-unset}" "${ANTHROPIC_AUTH_TOKEN-unset}" > "$HOME/auth-$WT_AGENT-${PWD##*/}"
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","status":"idle","startedAt":1,"updatedAt":2}\n' "$$" "$id" "$PWD" > "$HOME/.claude/sessions/$$.json"
+exec /bin/sleep 30
+"##,
+        );
+        let runs = tmp.path().join("helper-runs");
+        let helper = tmp.path().join("helper-ok");
+        executable(
+            &helper,
+            &format!(
+                "#!/bin/sh\necho run >> '{}'\necho 'debug {TOKEN}' >&2\nprintf '%s\\n' '{TOKEN}'\n",
+                runs.display()
+            ),
+        );
+        let failing = tmp.path().join("helper-fail");
+        executable(
+            &failing,
+            &format!("#!/bin/sh\necho 'keychain said {TOKEN}' >&2\necho '{TOKEN}'\nexit 3\n"),
+        );
+        let slow = tmp.path().join("helper-slow");
+        executable(&slow, "#!/bin/sh\nexec /bin/sleep 5\n");
+        let empty = tmp.path().join("helper-empty");
+        executable(&empty, "#!/bin/sh\nexit 0\n");
+
+        let socket = tmp.path().join("tmux.sock");
+        let runner = ProcessRunner::new(NonZeroUsize::new(4).unwrap());
+        // Inherited work credentials reach every pane through the session
+        // environment, as an exported shell variable would.
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            TmuxServer::at(&socket)
+                .with_cwd(tmp.path())
+                .with_config_file("/dev/null"),
+        )
+        .with_failure_retention()
+        .with_session_environment([
+            ("ANTHROPIC_API_KEY".to_owned(), "work-api-key".to_owned()),
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_owned(),
+                "work-auth-token".to_owned(),
+            ),
+        ]);
+        let paths = ClaudePaths::new(&home, tmp.path().join("cache"));
+        let manager_with = |command: &Path, timeout: Duration| {
+            ClaudeSessionManager::new(ClaudeHarness::new(paths.clone()), tmux.clone())
+                .with_start_timeout(Duration::from_secs(5))
+                .with_spawn_path(format!("{}:/usr/bin:/bin", bin.display()))
+                .with_launch_auth(Some(
+                    ClaudeLaunchAuth::token_command(
+                        "wt",
+                        &wt_source,
+                        vec![command.to_string_lossy().into_owned()],
+                        runner.clone(),
+                    )
+                    .with_timeout(timeout),
+                ))
+        };
+        let cancel = CancellationToken::new();
+        let wt = ClaudeSessionTarget {
+            slug: "wt".into(),
+            cwd: wt_source.clone(),
+            managed_name: None,
+        };
+        // Same slug, other checkout: an ordinary worktree, not the wt slot.
+        let lookalike = ClaudeSessionTarget {
+            slug: "wt".into(),
+            cwd: other.clone(),
+            managed_name: Some("review".into()),
+        };
+        let ordinary = ClaudeSessionTarget {
+            slug: "repo-one".into(),
+            cwd: other.clone(),
+            managed_name: None,
+        };
+
+        let result: Result<(), String> = async {
+            // Every failure refuses the launch, names the helper, and keeps
+            // its output (including stderr that echoes the token) private.
+            for (command, timeout, expected) in [
+                (&failing, TOKEN_HELPER_TIMEOUT, "exited with status 3"),
+                (&slow, Duration::from_millis(300), "did not finish within"),
+                (&empty, TOKEN_HELPER_TIMEOUT, "printed no token"),
+                (
+                    &tmp.path().join("missing"),
+                    TOKEN_HELPER_TIMEOUT,
+                    "could not be run",
+                ),
+            ] {
+                let error = manager_with(command, timeout)
+                    .ensure(&wt, &cancel)
+                    .await
+                    .err()
+                    .ok_or("helper failure started Claude")?
+                    .to_string();
+                if !error.contains(expected) || !error.contains("did not fall back") {
+                    return Err(format!("{expected}: {error}"));
+                }
+                if error.contains(TOKEN) {
+                    return Err(format!("error exposed the token: {error}"));
+                }
+                if tmux
+                    .session_exists("wt", &cancel)
+                    .await
+                    .map_err(|e| e.to_string())?
+                {
+                    return Err(format!("{expected}: a session was created"));
+                }
+            }
+
+            // Settings that outrank the token refuse before the helper runs.
+            let settings = home.join(".claude/settings.json");
+            fs::write(&settings, r#"{"apiKeyHelper":"/bin/work-key"}"#).unwrap();
+            let manager = manager_with(&helper, TOKEN_HELPER_TIMEOUT);
+            let error = manager
+                .ensure(&wt, &cancel)
+                .await
+                .err()
+                .ok_or("conflict started")?;
+            if !error.to_string().contains("apiKeyHelper") || runs.exists() {
+                return Err(format!("settings conflict: {error}"));
+            }
+            fs::remove_file(&settings).unwrap();
+
+            let (_, cold) = manager
+                .ensure(&wt, &cancel)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (_, other_cold) = manager
+                .ensure(&ordinary, &cancel)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (_, lookalike_cold) = manager
+                .ensure(&lookalike, &cancel)
+                .await
+                .map_err(|e| e.to_string())?;
+            if !(cold && other_cold && lookalike_cold) {
+                return Err("expected three cold starts".into());
+            }
+            let seen = |agent: &str| {
+                fs::read_to_string(home.join(format!("auth-{agent}")))
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned()
+            };
+            if seen("wt-wt-source").split('|').collect::<Vec<_>>() != [TOKEN, "unset", "unset"] {
+                return Err(format!("wt slot saw {:?}", seen("wt-wt-source")));
+            }
+            for other in ["repo-one-other", "wt-other"] {
+                if seen(other) != "unset|work-api-key|work-auth-token" {
+                    return Err(format!("{other} saw {:?}", seen(other)));
+                }
+            }
+            // Adopting a live slot never reruns the helper.
+            manager
+                .ensure(&wt, &cancel)
+                .await
+                .map_err(|e| e.to_string())?;
+            if fs::read_to_string(&runs)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                != 1
+            {
+                return Err("the helper ran more than once for one launch".into());
+            }
+
+            let auth_dir = paths.cache_dir.join("auth");
+            if fs::read_dir(&auth_dir)
+                .map(|d| d.count())
+                .unwrap_or_default()
+                != 0
+            {
+                return Err("the token handoff outlived the launch".into());
+            }
+            let tmux_state = [
+                tmux_output(&socket, &["show-environment", "-t", "=wt"]),
+                tmux_output(&socket, &["show-environment", "-g"]),
+                tmux_output(
+                    &socket,
+                    &["list-panes", "-a", "-F", "#{pane_start_command}"],
+                ),
+            ]
+            .join("\n");
+            if tmux_state.contains(TOKEN) || !tmux_state.contains("auth/wt.") {
+                return Err(format!("tmux state: {tmux_state}"));
+            }
+            let argv = std::process::Command::new("ps")
+                .args(["-axww", "-o", "args="])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&argv.stdout).contains(TOKEN) {
+                return Err("the token appears in a process argv".into());
+            }
+            let stderr_log =
+                fs::read_to_string(paths.cache_dir.join("sessions/wt.err")).unwrap_or_default();
+            if stderr_log.contains(TOKEN) {
+                return Err("the token reached Claude's stderr log".into());
+            }
+
+            // The live slot's account is reported, never changed.
+            let notice = |manager: &ClaudeSessionManager, target: &ClaudeSessionTarget| {
+                let manager = manager.clone();
+                let target = target.clone();
+                let cancel = cancel.clone();
+                async move { manager.launch_auth_restart_notice(&target, &cancel).await }
+            };
+            if notice(&manager, &wt)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_some()
+                || notice(&manager, &ordinary)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+            {
+                return Err("matching sessions need no restart".into());
+            }
+            let unconfigured =
+                ClaudeSessionManager::new(ClaudeHarness::new(paths.clone()), tmux.clone());
+            let message = notice(&unconfigured, &wt)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("removing the selector must explain the restart")?;
+            if !message.contains("restart") {
+                return Err(message);
+            }
+            let unselected = notice(&manager, &ordinary)
+                .await
+                .map_err(|e| e.to_string())?;
+            if unselected.is_some() {
+                return Err("an ordinary slot never needs an auth restart".into());
+            }
+            Ok(())
+        }
+        .await;
+        let _ = tmux.kill_server(&cancel).await;
+        result.unwrap();
+    }
+
+    /// A slot started before the selector was configured keeps its login;
+    /// wt explains the restart instead of killing it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_slot_started_without_the_selector_is_kept_and_explained() {
+        let tmp = tempdir().unwrap();
+        let wt_source = tmp.path().join("wt-source");
+        fs::create_dir_all(&wt_source).unwrap();
+        let socket = tmp.path().join("tmux.sock");
+        let runner = ProcessRunner::new(NonZeroUsize::new(4).unwrap());
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            TmuxServer::at(&socket)
+                .with_cwd(tmp.path())
+                .with_config_file("/dev/null"),
+        );
+        let cancel = CancellationToken::new();
+        tmux.create_session(
+            &CreateSession {
+                name: "wt".into(),
+                cwd: wt_source.clone(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                width: None,
+                height: None,
+            },
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let manager = ClaudeSessionManager::new(
+            ClaudeHarness::new(ClaudePaths::new(
+                tmp.path().join("home"),
+                tmp.path().join("cache"),
+            )),
+            tmux.clone(),
+        )
+        .with_start_timeout(Duration::from_millis(500))
+        .with_launch_auth(Some(ClaudeLaunchAuth::token_command(
+            "wt",
+            &wt_source,
+            vec!["/nonexistent-helper".into()],
+            runner,
+        )));
+        let target = ClaudeSessionTarget {
+            slug: "wt".into(),
+            cwd: wt_source,
+            managed_name: None,
+        };
+        let notice = manager.launch_auth_restart_notice(&target, &cancel).await;
+        // The slot never registered, so `ensure` would recycle it. The helper
+        // fails, and the slot must survive: the account is selected first.
+        let recycle = manager
+            .ensure(&target, &cancel)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        let alive = tmux.session_exists("wt", &cancel).await;
+        let _ = tmux.kill_server(&cancel).await;
+        let notice = notice.unwrap().expect("restart notice");
+        assert!(notice.contains("normal Claude login"), "{notice}");
+        let recycle = recycle.expect("a failing helper refuses the recycle");
+        assert!(recycle.contains("could not be run"), "{recycle}");
+        assert!(alive.unwrap());
     }
 }

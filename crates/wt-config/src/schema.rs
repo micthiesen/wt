@@ -522,6 +522,10 @@ pub struct HarnessConfig {
     /// checkout). When set it replaces the primary and any persisted Tab
     /// selection for that one slot; `None` keeps the ordinary selection.
     pub wt_session: Option<HarnessId>,
+    /// Optional argv run each time wt creates a Claude process for the `wt`
+    /// special session. Its stdout becomes that one launch's
+    /// `CLAUDE_CODE_OAUTH_TOKEN`; other sessions keep their normal login.
+    pub wt_session_claude_token_command: Option<Vec<String>>,
 }
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -529,6 +533,7 @@ impl Default for HarnessConfig {
             primary: HarnessId::Claude,
             hidden: BTreeSet::new(),
             wt_session: None,
+            wt_session_claude_token_command: None,
         }
     }
 }

@@ -157,6 +157,9 @@ async fn send_route(
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let outcome = app.send(route, body, sender.as_deref(), context).await?;
+    if let Some(notice) = app.claude_auth_restart_notice(route, context).await {
+        eprintln!("note: {notice}");
+    }
     print_delivery(context, route, outcome)
 }
 

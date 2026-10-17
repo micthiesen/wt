@@ -6,10 +6,10 @@ use wt_platform::process::ProcessRunner;
 use wt_tmux::TmuxClient;
 
 use crate::{
-    ClaudeHarness, ClaudeHarnessError, ClaudeInjector, ClaudeMessageOutcome, ClaudeMessenger,
-    ClaudePaths, ClaudeSessionManager, ClaudeSessionManagerError, ClaudeSessionTarget,
-    CodexHarness, CodexHarnessError, CodexMessageOutcome, CodexMessageTarget, CodexPaths,
-    DiscoveryRequest, HarnessId, HarnessSession, HarnessSpawnRequest, OpenCodeError,
+    ClaudeHarness, ClaudeHarnessError, ClaudeInjector, ClaudeLaunchAuth, ClaudeMessageOutcome,
+    ClaudeMessenger, ClaudePaths, ClaudeSessionManager, ClaudeSessionManagerError,
+    ClaudeSessionTarget, CodexHarness, CodexHarnessError, CodexMessageOutcome, CodexMessageTarget,
+    CodexPaths, DiscoveryRequest, HarnessId, HarnessSession, HarnessSpawnRequest, OpenCodeError,
     OpenCodeHarness, OpenCodePaths, OpenCodeSendOutcome, PiError, PiHarness, PiPaths,
     PiSendOutcome, SpawnCommand,
 };
@@ -93,7 +93,42 @@ impl HarnessService {
     /// it through their tmux session environment.
     pub fn with_spawn_path(mut self, path: impl Into<String>) -> Self {
         self.claude_sessions = self.claude_sessions.with_spawn_path(path);
+        self.rebuild_claude_messenger()
+    }
+
+    /// Select the account of one exact Claude slot at each cold start, both
+    /// for explicit starts and for message wakes.
+    pub fn with_claude_launch_auth(mut self, auth: Option<ClaudeLaunchAuth>) -> Self {
+        self.claude_sessions = self.claude_sessions.with_launch_auth(auth);
+        self.rebuild_claude_messenger()
+    }
+
+    /// The messenger cold-starts through its own manager copy, so it must
+    /// see every launch setting applied to `claude_sessions`.
+    fn rebuild_claude_messenger(mut self) -> Self {
+        self.claude_messenger = ClaudeMessenger::new(
+            self.claude_sessions.clone(),
+            ClaudeInjector::new(self.claude.paths().cache_dir.clone()),
+        );
         self
+    }
+
+    pub async fn claude_launch_auth_restart_notice(
+        &self,
+        request: &HarnessSpawnRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, HarnessServiceError> {
+        Ok(self
+            .claude_sessions
+            .launch_auth_restart_notice(
+                &ClaudeSessionTarget {
+                    slug: request.slug.clone(),
+                    cwd: request.worktree_path.clone(),
+                    managed_name: request.managed_name.clone(),
+                },
+                cancel,
+            )
+            .await?)
     }
 
     pub fn build_spawn_command(
@@ -313,5 +348,65 @@ mod tests {
         );
         assert_eq!(stamp_sender("hello", None), "hello");
         assert_eq!(stamp_sender("hello", Some("agent")), "[agent] hello");
+    }
+
+    /// The messenger cold-starts through its own manager copy; it must use
+    /// the launch settings applied after construction (account and PATH).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn message_wakes_use_the_configured_launch_auth_and_spawn_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let wt_source = tmp.path().join("wt-source");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&wt_source).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        // A `claude` on the spawn path that must never run.
+        let started = tmp.path().join("claude-started");
+        let fake = bin.join("claude");
+        std::fs::write(&fake, format!("#!/bin/sh\ntouch '{}'\n", started.display())).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runner = ProcessRunner::default();
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            wt_tmux::TmuxServer::at(tmp.path().join("tmux.sock"))
+                .with_cwd(tmp.path())
+                .with_config_file("/dev/null"),
+        );
+        let home = tmp.path().join("home");
+        let cache = tmp.path().join("cache");
+        let service = HarnessService::new(
+            ClaudePaths::new(&home, &cache),
+            CodexPaths::new(&home, &cache),
+            OpenCodePaths::new(&home, &cache),
+            PiPaths::new(&home, &cache),
+            runner.clone(),
+            tmux.clone(),
+        )
+        .with_claude_launch_auth(Some(ClaudeLaunchAuth::token_command(
+            "wt",
+            &wt_source,
+            vec!["/bin/false".into()],
+            runner,
+        )))
+        .with_spawn_path(format!("{}:/usr/bin:/bin", bin.display()));
+        let error = service
+            .send(
+                &HarnessTarget {
+                    id: HarnessId::Claude,
+                    slug: "wt".into(),
+                    cwd: wt_source,
+                    managed_name: None,
+                    sender: None,
+                    text: "hello".into(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        let _ = tmux.kill_server(&CancellationToken::new()).await;
+        assert!(error.contains("did not fall back"), "{error}");
+        assert!(!started.exists());
     }
 }
