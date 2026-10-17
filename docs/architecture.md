@@ -355,9 +355,9 @@ An expiry while confirmed data still disagrees shows one notice.
   uses a durable background action, so
   it does not delay agent entry. When a selected row disappears, cursor fallback
   uses the current visual row identity and section, not a stale position.
-  Selection follows an active row across sections even when unchanged snapshots
-  arrive before the move. Archiving or removing
-  the selected row keeps the cursor on a surviving neighbor in its old section.
+  J/K selection follows the pending reorder through unchanged snapshots and
+  its confirming layout. Filing through the section picker, archiving, or
+  removing a row keeps the cursor on a surviving neighbor in its old section.
 - The GitHub action worker keeps a private ledger of its own accepted and
   uncertain writes for its no-op guards (disarm is sent whenever the ledger
   shows the PR armed; enable is refused while an earlier enable is

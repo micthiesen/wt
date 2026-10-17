@@ -61,13 +61,11 @@ impl Model {
         let previous_index = self.selected.unwrap_or_default();
         self.board = board;
         self.rebuild_items();
-        // Unchanged snapshots can consume a reorder's pending selection before
-        // the move arrives. Keep the active row selected across section changes.
-        let left_active_rows = previous_key.is_some()
+        let left_section = previous_key.is_some()
             && previous_section.as_deref().is_some_and(|old| {
                 old != ARCHIVED_SECTION
                     && !self.board.sections.iter().any(|section| {
-                        section.key != ARCHIVED_SECTION
+                        section.key == old
                             && section.rows.iter().any(|&index| {
                                 self.board
                                     .rows
@@ -76,7 +74,7 @@ impl Model {
                             })
                     })
             });
-        let neighbor = left_active_rows
+        let neighbor = left_section
             .then(|| {
                 previous_neighbors.iter().find_map(|key| {
                     self.row_position(key).filter(|_| {
@@ -95,7 +93,7 @@ impl Model {
             .flatten();
         self.selected = neighbor
             .or_else(|| {
-                (!left_active_rows)
+                (!left_section)
                     .then_some(previous_key.as_deref())
                     .flatten()
                     .and_then(|key| self.row_position(key))

@@ -39,6 +39,22 @@ impl Model {
     /// with the remaining ones applied.
     pub(crate) fn reproject(&mut self, now: tokio::time::Instant) {
         let source = self.source_board.clone();
+        // Keep J/K selection until the confirming layout arrives. Capture it
+        // before settlement removes the completed mutation. Filing through the
+        // section picker keeps its separate neighbor-selection behavior.
+        let reordered_selection = self.selected_row().and_then(|row| {
+            self.pending.mutations().find_map(|mutation| {
+                let reordering = matches!(
+                    mutation.kind,
+                    crate::MutationKind::Unprojected {
+                        label: "reordering",
+                        ..
+                    }
+                );
+                (reordering && mutation.target.key.as_deref() == Some(row.key.as_str()))
+                    .then(|| row.key.clone())
+            })
+        });
         let mut pending = std::mem::take(&mut self.pending);
         let expired = pending.settle(&source, |target, domain| self.observed(target, domain), now);
         self.pending = pending;
@@ -66,6 +82,9 @@ impl Model {
             board.pending_views.extend(self.pending.views());
             Arc::new(board)
         };
+        if let Some(key) = reordered_selection {
+            self.pending_selection = Some(key);
+        }
         self.present(board);
         self.rebuild_local_menu();
     }
