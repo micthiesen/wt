@@ -152,40 +152,12 @@ impl OpenCodeHarness {
         &self.paths
     }
     fn write_launch_auth(&self, password: &str) -> Result<PathBuf, OpenCodeError> {
-        use std::io::Write;
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-        let directory = self.paths.cache_dir.join("opencode-launch-auth");
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&directory)?;
-        let metadata = std::fs::symlink_metadata(&directory)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(operation_error(
-                "start",
-                "private launch directory is not a directory",
-            ));
-        }
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
-        let path = directory.join(format!("{}.sh", unique_id()));
-        let temporary = path.with_extension("tmp");
-        let result = (|| -> io::Result<()> {
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temporary)?;
-            let quoted = password.replace('\'', "'\\''");
-            writeln!(file, "export OPENCODE_PASSWORD='{quoted}'")?;
-            file.sync_all()?;
-            std::fs::rename(&temporary, &path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
-        result?;
-        Ok(path)
+        let quoted = password.replace('\'', "'\\''");
+        Ok(crate::persist::write_private_launch_file(
+            &self.paths.cache_dir.join("opencode-launch-auth"),
+            &format!("{}.sh", unique_id()),
+            format!("export OPENCODE_PASSWORD='{quoted}'\n").as_bytes(),
+        )?)
     }
     pub fn tmux_session_name(&self, slug: &str) -> String {
         format!("{slug}{SLOT_INFIX}")

@@ -1,4 +1,5 @@
 mod activity;
+mod auth;
 mod identity;
 mod injection;
 mod inspector;
@@ -14,6 +15,10 @@ mod trust;
 mod usage;
 
 pub use activity::{ActivityDelta, ActivityKind, ActivityLine, ActivityPatch, ClaudeEventParser};
+pub use auth::{
+    CLAUDE_OAUTH_TOKEN_ENV, ClaudeAuthError, ClaudeLaunchAuth, LAUNCH_AUTH_OPTION,
+    OVERRIDING_AUTH_ENV, TOKEN_HELPER_TIMEOUT,
+};
 pub use identity::{claude_session_id, project_dir, session_jsonl_path};
 pub use injection::{
     ClaudeInjectFailureKind, ClaudeInjectOutcome, ClaudeInjector, ClaudeSelftestOutcome,

@@ -272,6 +272,24 @@ fn harness_session_environment(
     environment
 }
 
+/// The `wt` special session's account selector. It names the configured
+/// `paths.wt_source` checkout, so a worktree that shares the slug never
+/// matches, and it applies to whichever path starts Claude there.
+pub(crate) fn claude_launch_auth(context: &AppContext) -> Option<wt_harness::ClaudeLaunchAuth> {
+    let command = context
+        .config
+        .harness
+        .wt_session_claude_token_command
+        .clone()?;
+    let wt_source = context.config.paths.wt_source.as_ref()?;
+    Some(wt_harness::ClaudeLaunchAuth::token_command(
+        "wt",
+        wt_source,
+        command,
+        context.processes.clone(),
+    ))
+}
+
 /// Codex keeps sessions and its control socket under `$CODEX_HOME`. Managed
 /// workers point it at their own directory; otherwise it is `~/.codex`.
 pub fn codex_paths(home: &Path, cache_root: &Path) -> CodexPaths {
@@ -399,9 +417,11 @@ impl AppHarness {
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
         let claude_paths = ClaudePaths::new(&context.home, &cache_root);
+        let launch_auth = claude_launch_auth(context);
         let claude_sessions =
             ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone())
-                .with_spawn_path(spawn_path.clone());
+                .with_spawn_path(spawn_path.clone())
+                .with_launch_auth(launch_auth.clone());
         let claude_injector = ClaudeInjector::new(cache_root.clone());
         let service = HarnessService::new(
             claude_paths,
@@ -411,7 +431,8 @@ impl AppHarness {
             context.processes.clone(),
             tmux.clone(),
         )
-        .with_spawn_path(spawn_path);
+        .with_spawn_path(spawn_path)
+        .with_claude_launch_auth(launch_auth);
         Self {
             service,
             tmux,
@@ -686,6 +707,32 @@ impl AppHarness {
             )
             .await
             .context("deliver agent message")
+    }
+
+    /// A live Claude `wt` slot keeps the account it started with. Name the
+    /// restart that would apply the configured selection, if one is needed.
+    pub(crate) async fn claude_auth_restart_notice(
+        &self,
+        route: &AgentRoute,
+        context: &AppContext,
+    ) -> Option<String> {
+        if route.target.remote || route.choice.selected != Some(HarnessId::Claude) {
+            return None;
+        }
+        self.service
+            .claude_launch_auth_restart_notice(
+                &HarnessSpawnRequest {
+                    worktree_path: route.target.cwd.clone(),
+                    slug: route.target.slug.clone(),
+                    managed_name: route.target.managed_name.clone(),
+                    resume_session_id: None,
+                    display_label: None,
+                },
+                &context.cancellation,
+            )
+            .await
+            .ok()
+            .flatten()
     }
 
     pub(crate) async fn ensure_started(
@@ -1780,5 +1827,100 @@ mod tests {
         );
         known.insert("branch-pi".into());
         assert!(live_harnesses("branch", &names, &known, &[]).is_empty());
+    }
+
+    /// Every cold-start entry for the `wt` slot runs the configured helper
+    /// before creating anything, and a failing helper refuses the start
+    /// rather than launching Claude on the normal login. The helper fails, so
+    /// no real Claude process or account is involved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wt_slot_cold_starts_select_the_account_and_refuse_on_helper_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let root = fixture._root.path().to_owned();
+        let wt_source = root.join("wt-source");
+        fs::create_dir_all(&wt_source).unwrap();
+        let runs = root.join("helper-runs");
+        let helper = root.join("token-helper");
+        fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\necho run >> '{}'\necho 'stderr sk-secret' >&2\nexit 9\n",
+                runs.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.tmux.socket = format!("wt-auth-{}", root.file_name().unwrap().to_string_lossy());
+            config.paths.wt_source = Some(wt_source.clone());
+            config.harness.wt_session = Some(HarnessId::Claude);
+            config.harness.wt_session_claude_token_command =
+                Some(vec![helper.to_string_lossy().into_owned()]);
+        }
+        let ctx = &fixture.ctx;
+        let auth = claude_launch_auth(ctx).expect("configured selector");
+        let target = |slug: &str, cwd: &Path| wt_harness::ClaudeSessionTarget {
+            slug: slug.into(),
+            cwd: cwd.to_owned(),
+            managed_name: None,
+        };
+        assert!(auth.applies_to(&target("wt", &wt_source)));
+        assert!(!auth.applies_to(&target("main", &ctx.config.paths.main_clone)));
+        assert!(!auth.applies_to(&target("wt", &ctx.cwd)));
+        assert!(!auth.applies_to(&target("one", &wt_source)));
+
+        let app = AppHarness::new(ctx);
+        let result: Result<()> = async {
+            // TUI slot entry.
+            let entry = ui_session_with_harness(ctx, None, SessionTarget::WtSource, None)
+                .await
+                .err()
+                .context("slot entry started without a token")?;
+            // `wt agent send wt`, prompt actions and automations all deliver
+            // through `AppHarness::send`, which cold-starts via the messenger.
+            let route = AgentRoute {
+                target: special_target("wt", wt_source.clone(), None),
+                choice: HarnessChoice {
+                    selected: Some(HarnessId::Claude),
+                    source: SelectionSource::Pinned,
+                    live: Some(Vec::new()),
+                },
+            };
+            let send = app
+                .send(&route, "hello", None, ctx)
+                .await
+                .err()
+                .context("message wake started without a token")?;
+            for error in [format!("{entry:#}"), format!("{send:#}")] {
+                assert!(error.contains("exited with status 9"), "{error}");
+                assert!(error.contains("did not fall back"), "{error}");
+                assert!(!error.contains("sk-secret"), "{error}");
+            }
+            assert_eq!(fs::read_to_string(&runs)?.lines().count(), 2);
+            assert!(!app.tmux.session_exists("wt", &ctx.cancellation).await?);
+            Ok(())
+        }
+        .await;
+        let _ = app.tmux.kill_server(&ctx.cancellation).await;
+
+        // Without the selector, or without a wt source, nothing is selected.
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.harness.wt_session_claude_token_command = None;
+        }
+        assert!(claude_launch_auth(&fixture.ctx).is_none());
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.harness.wt_session_claude_token_command = Some(vec!["helper".into()]);
+            config.paths.wt_source = None;
+        }
+        assert!(claude_launch_auth(&fixture.ctx).is_none());
+        fixture.close().await.unwrap();
+        result.unwrap();
     }
 }

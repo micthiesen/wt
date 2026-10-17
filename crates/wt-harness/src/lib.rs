@@ -15,13 +15,14 @@ mod status;
 mod types;
 
 pub use claude::{
-    ActivityDelta, ActivityKind, ActivityLine, ActivityPatch, ClaudeEventParser, ClaudeHarness,
-    ClaudeHarnessError, ClaudeInjectFailureKind, ClaudeInjectOutcome, ClaudeInjector,
-    ClaudeMessageOutcome, ClaudeMessageTransport, ClaudeMessenger, ClaudePaths,
-    ClaudeSelftestOutcome, ClaudeSessionInfo, ClaudeSessionManager, ClaudeSessionManagerError,
-    ClaudeSessionPickerEntry, ClaudeSessionTarget, ClaudeStatus, ClaudeUsage, InspectorClient,
-    InspectorError, LastEntryKind, RegistrySession, RegistryStatus, SessionContextUsage,
-    SessionTail, TranscriptFollower, TrustError, UsagePeriod, add_claude_name,
+    ActivityDelta, ActivityKind, ActivityLine, ActivityPatch, CLAUDE_OAUTH_TOKEN_ENV,
+    ClaudeAuthError, ClaudeEventParser, ClaudeHarness, ClaudeHarnessError, ClaudeInjectFailureKind,
+    ClaudeInjectOutcome, ClaudeInjector, ClaudeLaunchAuth, ClaudeMessageOutcome,
+    ClaudeMessageTransport, ClaudeMessenger, ClaudePaths, ClaudeSelftestOutcome, ClaudeSessionInfo,
+    ClaudeSessionManager, ClaudeSessionManagerError, ClaudeSessionPickerEntry, ClaudeSessionTarget,
+    ClaudeStatus, ClaudeUsage, InspectorClient, InspectorError, LAUNCH_AUTH_OPTION, LastEntryKind,
+    OVERRIDING_AUTH_ENV, RegistrySession, RegistryStatus, SessionContextUsage, SessionTail,
+    TOKEN_HELPER_TIMEOUT, TranscriptFollower, TrustError, UsagePeriod, add_claude_name,
     build_claude_session_entries, claude_session_id, claude_tmux_name, ensure_inspect_shims,
     ensure_trusted_paths, ensure_trusted_paths_retry, inspector_socket_path, list_claude_names,
     next_auto_name, parse_claude_tmux_name, parse_claude_usage, project_dir, read_claude_usage,

@@ -278,6 +278,22 @@ impl Config {
                 }
             },
         };
+        // The helper is executed directly, never through a shell, so its
+        // argv must name a program. An empty list is a mistake, not "off".
+        let wt_session_claude_token_command = match harness_raw.wt_session_claude_token_command {
+            None => None,
+            Some(argv) if argv.first().is_none_or(|program| program.trim().is_empty()) => {
+                errors.push("harness.wt_session_claude_token_command must be a non-empty argv list whose first entry names the helper program".into());
+                None
+            }
+            Some(argv) if argv.iter().any(|arg| arg.contains('\0')) => {
+                errors.push(
+                    "harness.wt_session_claude_token_command arguments cannot contain NUL".into(),
+                );
+                None
+            }
+            Some(argv) => Some(argv),
+        };
 
         let mut branch: BranchConfig = section(&raw, "branch", &mut errors);
         required(&branch.prefix, "branch.prefix", &mut errors);
@@ -736,6 +752,7 @@ impl Config {
                 primary: harness_raw.primary,
                 hidden,
                 wt_session,
+                wt_session_claude_token_command,
             },
             naming,
             diff,
@@ -1317,6 +1334,7 @@ struct HarnessRaw {
     primary: HarnessId,
     hidden: Vec<String>,
     wt_session: Option<String>,
+    wt_session_claude_token_command: Option<Vec<String>>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default)]

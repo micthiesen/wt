@@ -626,6 +626,8 @@ selection use this configured default.
 primary = "codex"
 hidden = ["opencode"]
 wt_session = "claude"   # optional: the wt session always runs Claude Code
+# optional: the wt session's Claude uses another account's token
+wt_session_claude_token_command = ["/usr/bin/security", "find-generic-password", "-s", "wt-claude-personal-oauth-token", "-w"]
 ```
 
 | key | required | default | meaning |
@@ -633,6 +635,91 @@ wt_session = "claude"   # optional: the wt session always runs Claude Code
 | `primary` | no | `"claude"` | `"claude"`, `"codex"`, `"opencode"`, or `"pi"`. Used when this repository has no persisted override. |
 | `hidden` | no | `[]` | Harnesses omitted from Tab cycling, automatic live-session routing, TUI session discovery, picker entries, and activity polling. Messaging has no harness override, so a hidden harness is not selected for a new send. The configured `primary` cannot be hidden, and at least one harness must remain visible. |
 | `wt_session` | no | *(unset)* | Opt-in harness for the `wt` special session (the `paths.wt_source` checkout) only: `"claude"`, `"codex"`, `"opencode"`, or `"pi"`. When set, every path that starts, attaches to, routes to, or messages that slot (its slot key, `wt agent send wt`, slot prompt actions and automations, cold start) uses this harness regardless of `primary`, the saved Tab selection, or a live session of another harness in the slot. That other session is left running and still listed as active by `wt agent ls`, which reports the selection as `pinned`; slot prompts render with this harness's skill prefix. It cannot name a `hidden` harness, because hidden harnesses are omitted from TUI session discovery and activity polling and the wt session would never appear on the board. Unset keeps the ordinary selection. An explicit harness passed to `wt _session` still wins. |
+| `wt_session_claude_token_command` | no | *(unset)* | Argv of a helper that prints the Claude account token for the `wt` special session. It selects the account, not the harness: it applies whenever wt creates a Claude process in that slot, whichever way Claude was chosen there. See [Claude account for the wt session](#claude-account-for-the-wt-session). |
+
+### Claude account for the wt session
+
+`wt_session_claude_token_command` lets the `wt` special session use a
+different Claude subscription than every other session, for example a personal
+subscription beside a work login. Only inference authentication differs: the
+session runs the real `claude` executable with the same config directory,
+settings, tools, MCP servers, skills, plugins, hooks and history as every
+other session.
+
+Each time wt creates a Claude process for the `wt` slot (`paths.wt_source`,
+slug `wt`), whether from slot entry, `wt agent send wt`, a slot prompt action
+or automation, or recreation of the slot, it runs the helper once. It then
+exports the printed token as `CLAUDE_CODE_OAUTH_TOKEN` for that one process.
+Worktree sessions, the manager, `main`, `dotfiles`, a worktree that happens to
+be named `wt`, and every non-Claude harness are unaffected. Adopting or
+attaching to a slot that is already running never runs the helper.
+
+Helper contract:
+
+- wt executes the argv directly, not through a shell. Stdin is closed, and
+  stdout and stderr are captured. It inherits wt's environment without
+  `CLAUDE_CODE_OAUTH_TOKEN`. It must never prompt.
+- It must exit 0 within 10 seconds and print the token on stdout as one line.
+  One trailing newline (LF or CRLF) is allowed. The token must be visible
+  ASCII with no spaces, and output is capped at 8 KiB.
+- Nonzero exit, a timeout, empty output, more than one line, other bytes, or a
+  helper that cannot be run all fail the launch. wt never falls back to the
+  normal login. The error names the helper and the failure, but never its
+  output: stdout is the secret and stderr is discarded, because it may repeat
+  the secret.
+
+The token never appears in configuration, argv, tmux's session environment,
+logs or error text. wt hands it to the new pane through a one-shot file in a
+private (0700) cache directory, `auth/`, created 0600. The pane reads the
+file, deletes it, and exports the token only to the `exec`ed Claude process.
+If the file is missing, the pane exits without starting Claude. wt also
+removes it once Claude registers or the start fails.
+
+Claude ranks some credentials above `CLAUDE_CODE_OAUTH_TOKEN`: every
+`CLAUDE_CODE_USE_*` provider switch (Bedrock, Vertex, Foundry and others),
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` and `apiKeyHelper`. The selected
+launch alone unsets those variables, any inherited `CLAUDE_CODE_OAUTH_TOKEN`,
+and `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`, so a gateway
+configured for the normal login never receives the selected token. If a
+Claude settings file that the session reads sets `apiKeyHelper`, or sets any
+of those variables in `env`, wt refuses the launch instead of letting it
+replace the selected account. It checks `~/.claude/settings.json`,
+`$CLAUDE_CONFIG_DIR/settings.json` (using wt's own environment), the
+checkout's `.claude/settings.json` and `.claude/settings.local.json`, and
+managed `managed-settings.json` and `managed-settings.d/*.json`. Settings
+delivered by MDM profiles are not inspected.
+
+wt sweeps leftover handoff files that are more than a few minutes old, which
+happens only if wt or tmux died mid-launch. Like any environment variable,
+the token is visible in the running Claude process's environment to processes
+of the same user and is inherited by the processes Claude starts, such as
+tools, hooks and MCP servers.
+
+A Claude process keeps the account it started with. wt never restarts or
+changes a live session to apply this setting. When a `wt` slot exists but
+Claude never registered in it, wt replaces it as it always has, but only after
+the helper has succeeded. After adding, changing or
+removing it, or after replacing the stored token, stop the `wt` session and
+start it again. A `wt` slot started before the setting applied keeps the normal
+login; `wt agent send wt` prints a note naming the needed restart in either
+direction. Tokens from `claude setup-token` can make model requests only: such
+a session has no Remote Control and no claude.ai connectors, while locally
+configured MCP servers work. wt does not check token expiry; an expired token
+shows up as an authentication error inside Claude.
+
+The token and its storage belong outside wt. A macOS setup can keep it in the
+login Keychain:
+
+1. Run `claude setup-token`, and approve the browser authorization as the
+   account the `wt` session should use.
+2. Store the printed token without putting it in argv, for example with
+   `security add-generic-password -U -s wt-claude-personal-oauth-token -a "$USER" -T /usr/bin/security -w`,
+   which prompts for the value. Listing `/usr/bin/security` in the item's
+   access list lets the helper read it without a dialog.
+3. Point the helper at it, as in the example above.
+4. When the token expires (currently after one year) or is replaced, repeat
+   steps 1 and 2 (a dotfiles refresh command can wrap them), then restart the
+   `wt` session.
 
 ## `[naming]` — optional generated worktree names
 
