@@ -477,6 +477,9 @@ fn reorder_across_sections_keeps_the_cursor_on_the_moved_row() {
         ch(&mut model, 'J'),
         InputResult::Action(UiAction::Reorder { .. })
     ));
+    // Request setup and unrelated reads can present the old layout first.
+    model.apply(ready(first.clone()));
+    model.apply(ready(first.clone()));
     let mut moved = first;
     moved.sections = vec![
         section("One", vec![0], false),
@@ -484,6 +487,50 @@ fn reorder_across_sections_keeps_the_cursor_on_the_moved_row() {
     ];
     model.apply(ready(moved));
     assert_eq!(model.selected_row().unwrap().key, "b");
+}
+
+#[test]
+fn reorder_follows_the_row_up_into_the_previous_section() {
+    let mut model = Model::default();
+    let mut first = board(&["a", "b", "c"]);
+    first.sections = vec![
+        section("One", vec![0], false),
+        section("Two", vec![1, 2], false),
+    ];
+    model.apply(ready(first.clone()));
+    model.select(model.row_position("b").unwrap());
+    assert!(matches!(
+        ch(&mut model, 'K'),
+        InputResult::Action(UiAction::Reorder { .. })
+    ));
+    model.apply(ready(first.clone()));
+    first.sections = vec![
+        section("One", vec![0, 1], false),
+        section("Two", vec![2], false),
+    ];
+    model.apply(ready(first));
+    assert_eq!(model.selected_row().unwrap().key, "b");
+}
+
+#[test]
+fn reorder_does_not_take_selection_back_after_manual_navigation() {
+    let mut model = Model::default();
+    let mut first = board(&["a", "b", "c"]);
+    first.sections = vec![
+        section("One", vec![0, 1], false),
+        section("Two", vec![2], false),
+    ];
+    model.apply(ready(first.clone()));
+    model.select(model.row_position("b").unwrap());
+    ch(&mut model, 'J');
+    ch(&mut model, 'k');
+    assert_eq!(model.selected_row().unwrap().key, "a");
+    first.sections = vec![
+        section("One", vec![0], false),
+        section("Two", vec![1, 2], false),
+    ];
+    model.apply(ready(first));
+    assert_eq!(model.selected_row().unwrap().key, "a");
 }
 
 #[test]
