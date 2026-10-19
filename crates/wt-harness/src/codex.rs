@@ -472,7 +472,9 @@ struct Rollout {
     size: u64,
     /// `session_meta.payload.timestamp`: when Codex created the thread.
     created_ms: Option<i64>,
-    /// Created by an interactive terminal TUI, not the desktop app or wt.
+    /// Possibly created by an interactive terminal TUI: anything but the
+    /// desktop app. Daemon-backed TUI threads carry the daemon's first
+    /// client name, so callers still prove the pane runs the only TUI.
     from_tui: bool,
 }
 
@@ -608,7 +610,14 @@ fn read_rollout_uncached(
     ) else {
         return Ok(None);
     };
-    if !matches!(originator, "codex-tui" | "wt" | "Codex Desktop") || source != "user" {
+    // A shared `codex app-server` daemon records every thread under the
+    // client name of whichever process connected to it first (a TUI, wt, or
+    // any other tool), so an unfamiliar originator is still an interactive
+    // thread. Only exec runs and other apps' own servers name themselves.
+    if NON_TERMINAL_ORIGINATORS.contains(&originator)
+        || payload["source"].as_str() == Some("exec")
+        || source != "user"
+    {
         return Ok(None);
     }
     let modified = metadata
@@ -623,9 +632,14 @@ fn read_rollout_uncached(
         mtime_ms: modified.as_millis().min(i64::MAX as u128) as i64,
         size: metadata.len(),
         created_ms: parse_ts(payload["timestamp"].as_str()),
-        from_tui: originator == "codex-tui",
+        from_tui: originator != DESKTOP_ORIGINATOR,
     }))
 }
+
+/// Originators that never belong to a terminal TUI. The desktop app runs its
+/// own app-server, so its threads keep this name.
+const DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+const NON_TERMINAL_ORIGINATORS: &[&str] = &["exec", "codex_exec", "codex_vscode"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SlotOwner {
@@ -1135,6 +1149,23 @@ mod tests {
             "codex-tui",
             "automation",
         );
+        // Shared-daemon threads carry the daemon's first client name.
+        write_rollout(
+            &sessions_dir,
+            "2026/10/03",
+            "daemon",
+            &cwd,
+            "dotfiles_health",
+            "user",
+        );
+        write_rollout(
+            &sessions_dir,
+            "2026/10/03",
+            "exec",
+            &cwd,
+            "codex_exec",
+            "user",
+        );
         let old = write_rollout(&sessions_dir, "2021/01/01", "old-live", &cwd, "wt", "user");
         for day in 5..=31 {
             fs::create_dir_all(sessions_dir.join("2026/10").join(format!("{day:02}"))).unwrap();
@@ -1147,8 +1178,10 @@ mod tests {
             live_session_id: None,
         };
         let recent = harness.discover_sync(&request, None).unwrap();
-        assert_eq!(recent.len(), 2);
+        assert_eq!(recent.len(), 3);
         assert!(recent.iter().any(|s| s.session_id == "current"));
+        assert!(recent.iter().any(|s| s.session_id == "daemon"));
+        assert!(!recent.iter().any(|s| s.session_id == "exec"));
         assert!(recent.iter().any(|s| s.session_id == "desktop"));
         assert!(!recent.iter().any(|s| s.session_id == "automation"));
         assert!(!recent.iter().any(|s| s.session_id == "old-live"));

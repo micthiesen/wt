@@ -1634,6 +1634,10 @@ mod tests {
 
         /// A rollout created `age_secs` before now, owned by `cwd`.
         fn rollout(&self, id: &str, cwd: &Path, age_secs: i64) {
+            self.rollout_from(id, cwd, age_secs, "codex-tui");
+        }
+
+        fn rollout_from(&self, id: &str, cwd: &Path, age_secs: i64, originator: &str) {
             let created = time::OffsetDateTime::now_utc() - time::Duration::seconds(age_secs);
             let stamp = created
                 .format(&time::format_description::well_known::Rfc3339)
@@ -1644,7 +1648,7 @@ mod tests {
                 .join("2026/10/16")
                 .join(format!("rollout-{id}.jsonl"));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let header = serde_json::json!({"type":"session_meta","payload":{"id":id,"timestamp":stamp,"cwd":cwd.to_string_lossy(),"originator":"codex-tui","thread_source":"user"}});
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":id,"timestamp":stamp,"cwd":cwd.to_string_lossy(),"originator":originator,"thread_source":"user"}});
             let done = serde_json::json!({"type":"event_msg","timestamp":stamp,"payload":{"type":"task_complete"}});
             std::fs::write(&path, format!("{header}\n{done}\n")).unwrap();
         }
@@ -1757,7 +1761,9 @@ mod tests {
             .slot("history\n› Ask a follow-up question\n", None)
             .await;
         fixture.rollout("old-thread", &fixture.cwd, 3600);
-        fixture.rollout("new-thread", &fixture.cwd, 0);
+        // A daemon-backed TUI's thread carries the client name that first
+        // connected to the shared app-server, not `codex-tui`.
+        fixture.rollout_from("new-thread", &fixture.cwd, 0, "dotfiles_health");
         let outcome = fixture
             .messenger()
             .send_target(&fixture.target("Address review"), &fixture.cancel)
