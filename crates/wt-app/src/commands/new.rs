@@ -50,6 +50,7 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
     let branch = match parse_branch(ctx, &raw, args, true).await {
         Ok(branch) => branch,
         Err(message) => {
+            log_failure(&raw, &message);
             eprintln!("{message}");
             return Ok(1);
         }
@@ -91,6 +92,7 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
     {
         Ok(created) => created,
         Err(error) => {
+            log_failure(&branch, &error.to_string());
             eprintln!("{error}");
             return Ok(1);
         }
@@ -113,6 +115,17 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
         open_editor(ctx, Path::new(&created.target.path)).await?;
     }
     Ok(0)
+}
+
+/// CLI creations (often run by agents) otherwise report failures only on
+/// their own stderr; record them in the app log like TUI action failures.
+fn log_failure(request: &str, message: &str) {
+    tracing::error!(
+        target: "wt::creation",
+        request = %wt_core::sanitize_terminal_text(request),
+        error = %wt_core::sanitize_terminal_text(message),
+        "wt new failed"
+    );
 }
 
 fn should_open(args: &NewArgs) -> bool {

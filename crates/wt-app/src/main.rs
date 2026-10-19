@@ -253,6 +253,12 @@ enum Command {
 }
 
 fn main() {
+    // wt runs inside the Claude sessions it starts, which carry BUN_INSPECT
+    // for their own inspector socket. Every Bun program wt would run (hooks,
+    // dev-server commands, actions) would otherwise try to bind that socket
+    // and fail to start. wt sets it explicitly for each Claude it creates.
+    // SAFETY: no other thread exists yet.
+    unsafe { std::env::remove_var("BUN_INSPECT") };
     let cli = Cli::parse();
     if cli.boot_probe {
         println!("wt-build-id:{}:{}", env!("WT_BUILD_ID"), env!("WT_TARGET"));
