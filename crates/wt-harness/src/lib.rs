@@ -17,7 +17,7 @@ mod types;
 pub use claude::{
     ActivityDelta, ActivityKind, ActivityLine, ActivityPatch, CLAUDE_OAUTH_TOKEN_ENV,
     ClaudeAuthError, ClaudeEventParser, ClaudeHarness, ClaudeHarnessError, ClaudeInjectFailureKind,
-    ClaudeInjectOutcome, ClaudeInjector, ClaudeLaunchAuth, ClaudeMessageOutcome,
+    ClaudeInjectOutcome, ClaudeInjector, ClaudeLaunchArgs, ClaudeLaunchAuth, ClaudeMessageOutcome,
     ClaudeMessageTransport, ClaudeMessenger, ClaudePaths, ClaudeSelftestOutcome, ClaudeSessionInfo,
     ClaudeSessionManager, ClaudeSessionManagerError, ClaudeSessionPickerEntry, ClaudeSessionTarget,
     ClaudeStatus, ClaudeUsage, InspectorClient, InspectorError, LAUNCH_AUTH_OPTION, LastEntryKind,

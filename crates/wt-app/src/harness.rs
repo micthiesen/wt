@@ -290,6 +290,14 @@ pub(crate) fn claude_launch_auth(context: &AppContext) -> Option<wt_harness::Cla
     ))
 }
 
+/// Extra `claude` arguments for the `wt` special session, scoped like
+/// [`claude_launch_auth`].
+pub(crate) fn claude_launch_args(context: &AppContext) -> Option<wt_harness::ClaudeLaunchArgs> {
+    let args = &context.config.harness.wt_session_claude_args;
+    let wt_source = context.config.paths.wt_source.as_ref()?;
+    (!args.is_empty()).then(|| wt_harness::ClaudeLaunchArgs::new("wt", wt_source, args.clone()))
+}
+
 /// Codex keeps sessions and its control socket under `$CODEX_HOME`. Managed
 /// workers point it at their own directory; otherwise it is `~/.codex`.
 pub fn codex_paths(home: &Path, cache_root: &Path) -> CodexPaths {
@@ -418,10 +426,12 @@ impl AppHarness {
             );
         let claude_paths = ClaudePaths::new(&context.home, &cache_root);
         let launch_auth = claude_launch_auth(context);
+        let launch_args = claude_launch_args(context);
         let claude_sessions =
             ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone())
                 .with_spawn_path(spawn_path.clone())
-                .with_launch_auth(launch_auth.clone());
+                .with_launch_auth(launch_auth.clone())
+                .with_launch_args(launch_args.clone());
         let claude_injector = ClaudeInjector::new(cache_root.clone());
         let service = HarnessService::new(
             claude_paths,
@@ -432,7 +442,8 @@ impl AppHarness {
             tmux.clone(),
         )
         .with_spawn_path(spawn_path)
-        .with_claude_launch_auth(launch_auth);
+        .with_claude_launch_auth(launch_auth)
+        .with_claude_launch_args(launch_args);
         Self {
             service,
             tmux,

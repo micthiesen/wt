@@ -25,7 +25,8 @@ pub use injection::{
 };
 pub use inspector::{InspectorClient, InspectorError, inspector_socket_path};
 pub use lifecycle::{
-    ClaudeSessionInfo, ClaudeSessionManager, ClaudeSessionManagerError, ClaudeSessionTarget,
+    ClaudeLaunchArgs, ClaudeSessionInfo, ClaudeSessionManager, ClaudeSessionManagerError,
+    ClaudeSessionTarget,
 };
 pub use messaging::{ClaudeMessageOutcome, ClaudeMessageTransport, ClaudeMessenger};
 pub use names::{

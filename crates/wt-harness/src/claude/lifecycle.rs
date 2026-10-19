@@ -44,6 +44,30 @@ pub struct ClaudeSessionTarget {
     pub managed_name: Option<String>,
 }
 
+/// Extra `claude` arguments for one exact slot, appended each time a manager
+/// creates its process. Live processes keep the arguments they started with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeLaunchArgs {
+    slug: String,
+    cwd: PathBuf,
+    args: Vec<String>,
+}
+
+impl ClaudeLaunchArgs {
+    pub fn new(slug: impl Into<String>, cwd: &Path, args: Vec<String>) -> Self {
+        Self {
+            slug: slug.into(),
+            cwd: canonical(cwd),
+            args,
+        }
+    }
+
+    /// Both identity parts must match, as for [`ClaudeLaunchAuth`].
+    pub fn applies_to(&self, target: &ClaudeSessionTarget) -> bool {
+        target.slug == self.slug && canonical(&target.cwd) == self.cwd
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeSessionInfo {
     pub session_id: String,
@@ -82,6 +106,7 @@ pub struct ClaudeSessionManager {
     start_timeout: Duration,
     spawn_path: Option<String>,
     launch_auth: Option<ClaudeLaunchAuth>,
+    launch_args: Option<ClaudeLaunchArgs>,
 }
 
 impl ClaudeSessionManager {
@@ -94,6 +119,7 @@ impl ClaudeSessionManager {
             start_timeout: START_TIMEOUT,
             spawn_path: None,
             launch_auth: None,
+            launch_args: None,
         }
     }
 
@@ -111,6 +137,12 @@ impl ClaudeSessionManager {
     /// manager creates there. Other slots and live processes are untouched.
     pub fn with_launch_auth(mut self, auth: Option<ClaudeLaunchAuth>) -> Self {
         self.launch_auth = auth;
+        self
+    }
+
+    /// Append `args` to each `claude` this manager creates in their slot.
+    pub fn with_launch_args(mut self, args: Option<ClaudeLaunchArgs>) -> Self {
+        self.launch_args = args;
         self
     }
 
@@ -575,6 +607,13 @@ impl ClaudeSessionManager {
         }
         command.push(spawn.program.to_string_lossy().into_owned());
         command.extend(spawn.args);
+        if let Some(extra) = self
+            .launch_args
+            .as_ref()
+            .filter(|extra| extra.applies_to(target))
+        {
+            command.extend(extra.args.iter().cloned());
+        }
         let create = CreateSession {
             name: tmux_name.into(),
             cwd: canonical(&target.cwd),
@@ -1257,5 +1296,73 @@ exec /bin/sleep 30
         let recycle = recycle.expect("a failing helper refuses the recycle");
         assert!(recycle.contains("could not be run"), "{recycle}");
         assert!(alive.unwrap());
+    }
+
+    /// Extra arguments reach only the configured slot's new `claude`, after
+    /// wt's own identity flags; other slots start exactly as before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn launch_args_are_appended_only_in_their_slot() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let bin = tmp.path().join("bin");
+        let wt_source = tmp.path().join("wt-source");
+        let other = tmp.path().join("other");
+        for dir in [&bin, &wt_source, &other, &home.join(".claude/sessions")] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        executable(
+            &bin.join("claude"),
+            r##"#!/bin/sh
+printf '%s\n' "$*" > "$HOME/args-$WT_AGENT-${PWD##*/}"
+id=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id|--resume) id="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","status":"idle","startedAt":1,"updatedAt":2}\n' "$$" "$id" "$PWD" > "$HOME/.claude/sessions/$$.json"
+exec /bin/sleep 30
+"##,
+        );
+        let tmux = TmuxClient::new(
+            ProcessRunner::new(NonZeroUsize::new(4).unwrap()),
+            TmuxServer::at(tmp.path().join("tmux.sock"))
+                .with_cwd(tmp.path())
+                .with_config_file("/dev/null"),
+        );
+        let manager = ClaudeSessionManager::new(
+            ClaudeHarness::new(ClaudePaths::new(&home, tmp.path().join("cache"))),
+            tmux.clone(),
+        )
+        .with_start_timeout(Duration::from_secs(5))
+        .with_spawn_path(format!("{}:/usr/bin:/bin", bin.display()))
+        .with_launch_args(Some(ClaudeLaunchArgs::new(
+            "wt",
+            &wt_source,
+            vec!["--permission-mode".into(), "accept edits".into()],
+        )));
+        let cancel = CancellationToken::new();
+        let target = |slug: &str, cwd: &Path| ClaudeSessionTarget {
+            slug: slug.into(),
+            cwd: cwd.to_owned(),
+            managed_name: None,
+        };
+        let started = async {
+            manager.ensure(&target("wt", &wt_source), &cancel).await?;
+            manager.ensure(&target("repo-one", &other), &cancel).await
+        }
+        .await;
+        let _ = tmux.kill_server(&cancel).await;
+        started.unwrap();
+        let wt = fs::read_to_string(home.join("args-wt-wt-source")).unwrap();
+        let ordinary = fs::read_to_string(home.join("args-repo-one-other")).unwrap();
+        assert!(wt.starts_with("--name wt "), "{wt}");
+        assert!(
+            wt.trim_end().ends_with("--permission-mode accept edits"),
+            "{wt}"
+        );
+        assert!(!ordinary.contains("--permission-mode"), "{ordinary}");
     }
 }

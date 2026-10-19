@@ -237,6 +237,40 @@ fn wt_session_claude_token_command_is_an_optional_argv() {
 }
 
 #[test]
+fn wt_session_claude_args_are_appended_flags_that_leave_identity_to_wt() {
+    let root = tempfile::tempdir().unwrap();
+    let opts = options(root.path(), root.path(), &[]);
+    let base = minimal_config(root.path());
+    let unset = Config::from_raw(toml_value(&base), &opts).unwrap();
+    assert!(unset.harness.wt_session_claude_args.is_empty());
+
+    let set = format!(
+        "{base}\n[harness]\nwt_session_claude_args = ['--permission-mode', 'acceptEdits', '--model=opus']\n"
+    );
+    let config = Config::from_raw(toml_value(&set), &opts).unwrap();
+    assert_eq!(
+        config.harness.wt_session_claude_args,
+        ["--permission-mode", "acceptEdits", "--model=opus"]
+    );
+
+    for invalid in [
+        "['--resume', 'x']",
+        "['--session-id=x']",
+        "['-p']",
+        "['--bare']",
+    ] {
+        let raw = format!("{base}\n[harness]\nwt_session_claude_args = {invalid}\n");
+        let error = Config::from_raw(toml_value(&raw), &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("harness.wt_session_claude_args cannot include"),
+            "{invalid}: {error}"
+        );
+    }
+}
+
+#[test]
 fn defaults_are_typed_and_repository_derived() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

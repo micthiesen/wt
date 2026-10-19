@@ -6,12 +6,12 @@ use wt_platform::process::ProcessRunner;
 use wt_tmux::TmuxClient;
 
 use crate::{
-    ClaudeHarness, ClaudeHarnessError, ClaudeInjector, ClaudeLaunchAuth, ClaudeMessageOutcome,
-    ClaudeMessenger, ClaudePaths, ClaudeSessionManager, ClaudeSessionManagerError,
-    ClaudeSessionTarget, CodexHarness, CodexHarnessError, CodexMessageOutcome, CodexMessageTarget,
-    CodexPaths, DiscoveryRequest, HarnessId, HarnessSession, HarnessSpawnRequest, OpenCodeError,
-    OpenCodeHarness, OpenCodePaths, OpenCodeSendOutcome, PiError, PiHarness, PiPaths,
-    PiSendOutcome, SpawnCommand,
+    ClaudeHarness, ClaudeHarnessError, ClaudeInjector, ClaudeLaunchArgs, ClaudeLaunchAuth,
+    ClaudeMessageOutcome, ClaudeMessenger, ClaudePaths, ClaudeSessionManager,
+    ClaudeSessionManagerError, ClaudeSessionTarget, CodexHarness, CodexHarnessError,
+    CodexMessageOutcome, CodexMessageTarget, CodexPaths, DiscoveryRequest, HarnessId,
+    HarnessSession, HarnessSpawnRequest, OpenCodeError, OpenCodeHarness, OpenCodePaths,
+    OpenCodeSendOutcome, PiError, PiHarness, PiPaths, PiSendOutcome, SpawnCommand,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,6 +100,12 @@ impl HarnessService {
     /// for explicit starts and for message wakes.
     pub fn with_claude_launch_auth(mut self, auth: Option<ClaudeLaunchAuth>) -> Self {
         self.claude_sessions = self.claude_sessions.with_launch_auth(auth);
+        self.rebuild_claude_messenger()
+    }
+
+    /// Append extra arguments to each `claude` created in one exact slot.
+    pub fn with_claude_launch_args(mut self, args: Option<ClaudeLaunchArgs>) -> Self {
+        self.claude_sessions = self.claude_sessions.with_launch_args(args);
         self.rebuild_claude_messenger()
     }
 

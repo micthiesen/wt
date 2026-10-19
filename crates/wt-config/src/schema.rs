@@ -526,6 +526,9 @@ pub struct HarnessConfig {
     /// special session. Its stdout becomes that one launch's
     /// `CLAUDE_CODE_OAUTH_TOKEN`; other sessions keep their normal login.
     pub wt_session_claude_token_command: Option<Vec<String>>,
+    /// Extra arguments appended to each `claude` wt creates for the `wt`
+    /// special session, such as `--permission-mode`. Empty by default.
+    pub wt_session_claude_args: Vec<String>,
 }
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -534,6 +537,7 @@ impl Default for HarnessConfig {
             hidden: BTreeSet::new(),
             wt_session: None,
             wt_session_claude_token_command: None,
+            wt_session_claude_args: Vec::new(),
         }
     }
 }

@@ -294,6 +294,20 @@ impl Config {
             }
             Some(argv) => Some(argv),
         };
+        let wt_session_claude_args = harness_raw.wt_session_claude_args;
+        if wt_session_claude_args.iter().any(|arg| arg.contains('\0')) {
+            errors.push("harness.wt_session_claude_args cannot contain NUL".into());
+        }
+        // wt owns the session's identity and keeps it interactive; `--bare`
+        // would also ignore the selected account's token.
+        for arg in &wt_session_claude_args {
+            if let Some(flag) = RESERVED_CLAUDE_FLAGS
+                .iter()
+                .find(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
+            {
+                errors.push(format!("harness.wt_session_claude_args cannot include {flag}: wt sets the session's name and conversation and keeps it interactive"));
+            }
+        }
 
         let mut branch: BranchConfig = section(&raw, "branch", &mut errors);
         required(&branch.prefix, "branch.prefix", &mut errors);
@@ -753,6 +767,7 @@ impl Config {
                 hidden,
                 wt_session,
                 wt_session_claude_token_command,
+                wt_session_claude_args,
             },
             naming,
             diff,
@@ -1335,7 +1350,23 @@ struct HarnessRaw {
     hidden: Vec<String>,
     wt_session: Option<String>,
     wt_session_claude_token_command: Option<Vec<String>>,
+    wt_session_claude_args: Vec<String>,
 }
+
+/// `claude` flags wt sets itself, or that would make the slot non-interactive.
+const RESERVED_CLAUDE_FLAGS: &[&str] = &[
+    "--name",
+    "-n",
+    "--resume",
+    "-r",
+    "--session-id",
+    "--continue",
+    "-c",
+    "--fork-session",
+    "--print",
+    "-p",
+    "--bare",
+];
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RawStage {

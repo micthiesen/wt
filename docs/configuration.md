@@ -628,6 +628,8 @@ hidden = ["opencode"]
 wt_session = "claude"   # optional: the wt session always runs Claude Code
 # optional: the wt session's Claude uses another account's token
 wt_session_claude_token_command = ["/usr/bin/security", "find-generic-password", "-s", "wt-claude-personal-oauth-token", "-w"]
+# optional: extra flags for the wt session's Claude
+wt_session_claude_args = ["--permission-mode", "acceptEdits"]
 ```
 
 | key | required | default | meaning |
@@ -636,6 +638,7 @@ wt_session_claude_token_command = ["/usr/bin/security", "find-generic-password",
 | `hidden` | no | `[]` | Harnesses omitted from Tab cycling, automatic live-session routing, TUI session discovery, picker entries, and activity polling. Messaging has no harness override, so a hidden harness is not selected for a new send. The configured `primary` cannot be hidden, and at least one harness must remain visible. |
 | `wt_session` | no | *(unset)* | Opt-in harness for the `wt` special session (the `paths.wt_source` checkout) only: `"claude"`, `"codex"`, `"opencode"`, or `"pi"`. When set, every path that starts, attaches to, routes to, or messages that slot (its slot key, `wt agent send wt`, slot prompt actions and automations, cold start) uses this harness regardless of `primary`, the saved Tab selection, or a live session of another harness in the slot. That other session is left running and still listed as active by `wt agent ls`, which reports the selection as `pinned`; slot prompts render with this harness's skill prefix. It cannot name a `hidden` harness, because hidden harnesses are omitted from TUI session discovery and activity polling and the wt session would never appear on the board. Unset keeps the ordinary selection. An explicit harness passed to `wt _session` still wins. |
 | `wt_session_claude_token_command` | no | *(unset)* | Argv of a helper that prints the Claude account token for the `wt` special session. It selects the account, not the harness: it applies whenever wt creates a Claude process in that slot, whichever way Claude was chosen there. See [Claude account for the wt session](#claude-account-for-the-wt-session). |
+| `wt_session_claude_args` | no | `[]` | Extra arguments appended, after wt's own flags, to each `claude` wt creates in the `wt` special session, such as `--permission-mode`, `--dangerously-skip-permissions`, `--model`, `--allowedTools`, or `--settings`. Each list entry is one argument, so values need no shell quoting. Like the token command it applies whenever wt creates a Claude process in that slot, and a running session keeps the arguments it started with until it is stopped and started again. Flags wt sets itself or that would make the slot non-interactive are refused: `--name`/`-n`, `--resume`/`-r`, `--session-id`, `--continue`/`-c`, `--fork-session`, `--print`/`-p`, and `--bare` (which would also ignore the selected account's token). The contents of a `--settings` file passed here are not checked against the account selection below. |
 
 ### Claude account for the wt session
 
