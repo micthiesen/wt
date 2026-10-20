@@ -153,6 +153,9 @@ impl Config {
             errors.push("configuration root must be a table".to_owned());
         }
 
+        let resources: crate::ResourcesConfig = section(&raw, "resources", &mut errors);
+        resources.linux.validate(&mut errors);
+
         let paths_raw: RawPaths = section(&raw, "paths", &mut errors);
         required(&paths_raw.main_clone, "paths.main_clone", &mut errors);
         required(&paths_raw.worktree_root, "paths.worktree_root", &mut errors);
@@ -587,7 +590,27 @@ impl Config {
                         "{field}.config must be an absolute worker path or start with ~/"
                     ));
                 }
+                let worker_resources = r.resources.and_then(|overrides| {
+                    if !r.managed {
+                        errors.push(format!("{field}.resources requires managed = true; configure resources in the selected worker config for an unmanaged host"));
+                    }
+                    let mut selected = toml::Value::try_from(&resources).expect("resource settings serialize");
+                    merge(&mut selected, &overrides);
+                    match selected.try_into::<crate::ResourcesConfig>() {
+                        Ok(policy) => {
+                            let mut resource_errors = Vec::new();
+                            policy.linux.validate(&mut resource_errors);
+                            errors.extend(resource_errors.into_iter().map(|error| format!("{field}.{error}")));
+                            Some(policy)
+                        }
+                        Err(error) => {
+                            errors.push(format!("{field}.resources: {error}"));
+                            None
+                        }
+                    }
+                });
                 RemoteConfig {
+                    resources: worker_resources,
                     label: nonempty(r.label).unwrap_or_else(|| r.host.clone()),
                     wt_path: wt_path.unwrap_or_else(|| "~/.wt/bin/wt".into()),
                     host: r.host,
@@ -750,6 +773,7 @@ impl Config {
             repo_path,
             paths,
             tmux,
+            resources,
             branch,
             stage,
             lifecycle,
@@ -1395,6 +1419,7 @@ struct RawRemote {
     wt_path: String,
     config: String,
     managed: bool,
+    resources: Option<toml::Value>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]

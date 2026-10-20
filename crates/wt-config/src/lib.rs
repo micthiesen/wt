@@ -7,10 +7,12 @@
 mod discovery;
 mod error;
 mod load;
+mod resources;
 mod schema;
 
 pub use error::ConfigError;
 pub use load::{LoadOptions, RESERVED_MANAGED_ENV};
+pub use resources::{LinuxResources, ResourceLimits, ResourcesConfig, memory_bytes};
 pub use schema::*;
 
 /// The stable namespace used for repository caches, state and tmux sockets.

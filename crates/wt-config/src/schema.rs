@@ -138,6 +138,8 @@ pub struct RemoteConfig {
     /// The controller provisions this worker: it generates the worker config,
     /// clones the repository, and supplies credentials on every connection.
     pub managed: bool,
+    /// Complete selected resource policy for a managed worker, when overridden.
+    pub resources: Option<crate::ResourcesConfig>,
     /// Home-relative directory that holds everything a managed worker owns.
     /// Derived from the controller repository identity; never configured.
     #[serde(skip)]
@@ -608,6 +610,7 @@ pub struct Config {
     pub repo_path: PathBuf,
     pub paths: PathsConfig,
     pub tmux: TmuxConfig,
+    pub resources: crate::ResourcesConfig,
     pub branch: BranchConfig,
     pub stage: StageConfig,
     pub lifecycle: LifecycleConfig,

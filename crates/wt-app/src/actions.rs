@@ -16,5 +16,6 @@ pub fn service(context: &AppContext) -> Result<ActionService> {
             TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(&context.home),
         ),
     })
+    .with_command_prefix(crate::workload::prefix(context))
     .with_history_path(context.config.paths.cache_root.join("action-history.json")))
 }

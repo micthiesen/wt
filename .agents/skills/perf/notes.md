@@ -1,5 +1,29 @@
 # Performance notes
 
+### Configured Linux workload budgets (2026-10-19)
+
+The `alex/cpu-memory-limits` implementation adds optional shared and per-job
+CPU/RAM limits under `resources.linux`. Defaults remain uncapped. A helper
+joins its own systemd user scope, verifies the effective cgroup files, then
+executes the original command. Action recorders and dev supervisors stay
+outside the limits so they can record failures and manage restarts.
+
+The final native check passed on a temporary Ubuntu 26.04 machine with
+Linux `7.0.14-orbstack-00380-ga7e0a2dc9535`, capped at two CPUs and 3 GB RAM.
+The configured dev job had a 25% CPU quota, a 256 MiB RAM cap, and the same
+cgroup as its child. CPU throttling increased by 26 events. A separate
+64 MiB job was killed when it allocated too much memory. Signal exit status,
+unchanged process identity, shared limits, and refusal without control tools
+also passed. Evidence: `/tmp/wt-cpu-memory-limits-validation/linux-report.json`.
+
+The full macOS gate found Codex fixture startup failures (`slot did not
+start`) and the fsmonitor removal assertion (`daemon IPC must be gone after
+stop`). The same individual tests failed in the original checkout without
+this feature. These are unresolved baseline failures, not passing checks.
+The Linux harness fixtures also failed to start their stand-in Codex slots.
+No change to the live Cozee VM, installed wt build, or user resource settings
+was made during implementation.
+
 ### Remote memory limits proposal (2026-10-16)
 
 The user reports memory exhaustion during concurrent type checks on an 8 GB

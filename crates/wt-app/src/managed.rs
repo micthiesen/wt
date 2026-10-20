@@ -212,7 +212,11 @@ async fn prepare(context: &AppContext, remote: &RemoteConfig) -> Result<Prepared
     })?;
 
     let mut files = vec![
-        file("config.toml", worker_config(context)?.into_bytes(), 0o600),
+        file(
+            "config.toml",
+            worker_config(context, remote)?.into_bytes(),
+            0o600,
+        ),
         file("env.sh", environment_script(&root).into_bytes(), 0o600),
         file(
             "bin/git-credential-wt",
@@ -443,11 +447,23 @@ fn first_line(text: &str) -> &str {
 
 /// The worker's configuration is this controller's merged configuration with
 /// worker-local paths and controller-only integrations removed.
-fn worker_config(context: &AppContext) -> Result<String> {
+fn worker_config(context: &AppContext, remote: &wt_config::RemoteConfig) -> Result<String> {
     let raw = context
         .config
         .raw_layers(&LoadOptions::default())
         .context("read this controller's configuration layers")?;
+    worker_config_with_resources(raw, remote.resources.as_ref())
+}
+
+fn worker_config_with_resources(
+    mut raw: toml::Value,
+    resources: Option<&wt_config::ResourcesConfig>,
+) -> Result<String> {
+    if let Some(resources) = resources {
+        raw.as_table_mut()
+            .context("configuration root must be a table")?
+            .insert("resources".into(), toml::Value::try_from(resources)?);
+    }
     worker_config_from(raw)
 }
 
@@ -1225,5 +1241,28 @@ env_files_to_copy = [".env"]
         let mut warnings = Vec::new();
         assert!(collect_tree(&[temp.path().to_owned()], &mut warnings).is_none());
         assert!(warnings[0].contains("keeping the previous complete tree"));
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    #[test]
+    fn selected_worker_resource_limits_replace_controller_limits() {
+        let raw: toml::Value = toml::from_str("[resources.linux]\ngroup = 'controller'\n[resources.linux.shared]\ncpu_quota_percent = 700\n").unwrap();
+        let selected: wt_config::ResourcesConfig = toml::from_str("[linux]\ngroup = 'worker'\n[linux.shared]\ncpu_quota_percent = 300\nmemory_max = '6G'\n").unwrap();
+        let result = super::worker_config_with_resources(raw, Some(&selected)).unwrap();
+        let result: toml::Value = toml::from_str(&result).unwrap();
+        assert_eq!(
+            result["resources"]["linux"]["group"].as_str(),
+            Some("worker")
+        );
+        assert_eq!(
+            result["resources"]["linux"]["shared"]["cpu_quota_percent"].as_integer(),
+            Some(300)
+        );
+        assert_eq!(
+            result["resources"]["linux"]["shared"]["memory_max"].as_str(),
+            Some("6G")
+        );
     }
 }

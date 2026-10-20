@@ -252,6 +252,7 @@ pub struct DevServerService {
     config: DevServerConfig,
     repository: GitRepository,
     processes: ProcessRunner,
+    command_prefix: Vec<String>,
 }
 
 impl DevServerService {
@@ -264,7 +265,13 @@ impl DevServerService {
             config,
             repository,
             processes,
+            command_prefix: Vec::new(),
         }
+    }
+
+    pub fn with_command_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.command_prefix = prefix;
+        self
     }
 
     pub fn config(&self) -> &DevServerConfig {
@@ -1156,6 +1163,7 @@ impl DevServerService {
             SupervisorConfig {
                 slug: worktree.slug.clone(),
                 path: worktree.path.clone(),
+                command_prefix: self.command_prefix.clone(),
                 command: self
                     .config
                     .settings

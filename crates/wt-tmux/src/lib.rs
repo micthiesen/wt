@@ -329,6 +329,7 @@ pub struct TmuxClient {
     server: TmuxServer,
     session_environment: Vec<(String, String)>,
     retain_failure: bool,
+    command_prefix: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -464,6 +465,7 @@ impl TmuxClient {
             server,
             session_environment: Vec::new(),
             retain_failure: false,
+            command_prefix: Vec::new(),
         }
     }
 
@@ -476,6 +478,13 @@ impl TmuxClient {
         environment: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         self.session_environment = environment.into_iter().collect();
+        self
+    }
+
+    /// Wrap the command inside the pane, including retained-command retries.
+    /// An empty command keeps tmux's normal default-shell behavior.
+    pub fn with_command_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.command_prefix = prefix;
         self
     }
 
@@ -627,6 +636,12 @@ impl TmuxClient {
             args.extend(["-y".into(), height.to_string().into()]);
         }
         if !session.command.is_empty() {
+            let workload_command = self
+                .command_prefix
+                .iter()
+                .chain(&session.command)
+                .cloned()
+                .collect::<Vec<_>>();
             let session_command = if self.retain_failure {
                 // Decide retention before the pane process exits instead of
                 // relying on tmux's `failed` status reaper. Linux tmux with
@@ -650,10 +665,10 @@ exit "$wt_terminal_status""#;
                     "sh".to_owned(),
                 ]
                 .into_iter()
-                .chain(session.command.iter().cloned())
+                .chain(workload_command.iter().cloned())
                 .collect::<Vec<_>>()
             } else {
-                session.command.clone()
+                workload_command
             };
             // `new-session -e` records the session environment, but tmux runs
             // explicit commands through the user's configured shell first.
@@ -788,9 +803,10 @@ exit "$wt_terminal_status""#;
             args.extend(["-c".into(), cwd.as_os_str().to_owned()]);
         }
         if !window.command.is_empty() {
-            let command = window
-                .command
+            let command = self
+                .command_prefix
                 .iter()
+                .chain(&window.command)
                 .map(|arg| shell_quote(arg))
                 .collect::<Vec<_>>()
                 .join(" ");

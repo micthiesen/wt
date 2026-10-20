@@ -59,6 +59,9 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         check("overlapping removal and prompt responsiveness", "ui", "--binary", binary,
               "--removal", "--output", str(output / "wt-native-removal")),
     ]
+    if system == "Linux":
+        checks.append(check("Linux CPU and RAM workload limits", "workload", "--binary", binary,
+                            "--output", str(output / "wt-native-workload")))
     if system == "Darwin":
         checks.append(check("webhooks and service ownership", "events", "--binary", binary))
     return checks

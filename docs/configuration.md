@@ -439,6 +439,92 @@ Omit the whole section to disable SST awareness entirely — the stage row, `wt 
 | `aws_profile` | **yes** | — | AWS CLI profile with read access to the state bucket. |
 | `auto_regen_paths` | no | `["sst-env.d.ts"]` | Tracked generated paths in the main clone, restored before fast-forwarding. Paths are literal and relative to the clone; staged edits are preserved and prevent the fast-forward. |
 
+## `[resources.linux]` — optional CPU and memory limits
+
+Linux hosts can apply kernel limits to new agent terminals, shell and diff
+terminals, tracked action commands, and dev-server commands. Their child
+processes inherit the limits. Omit this section for no limits. macOS ignores
+this Linux-only section.
+
+```toml
+[resources.linux]
+group = "project"
+
+[resources.linux.shared]
+cpu_quota_percent = 600
+memory_high = "10G"
+memory_max = "12G"
+
+[resources.linux.job]
+cpu_quota_percent = 200
+memory_max = "4G"
+# Optional: prevent these jobs from using swap.
+# memory_swap_max = "0"
+```
+
+`100` CPU percent is one CPU's worth of time. A shared quota of `600` gives
+all jobs in the group six CPUs of time in total. A job quota of `200` gives
+one terminal, action command, or dev command two CPUs of time in total,
+including its children. CPU quotas throttle work; they do not terminate it.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Set `false` to disable limits inherited from user configuration. Without any limits, this section is inactive. |
+| `group` | required when active | 1–64 ASCII letters, digits or underscores. Equal names share one budget for the same Unix user on the same host, even across repositories. Use the same shared values for every configuration in a group. |
+| `shared.cpu_quota_percent`, `job.cpu_quota_percent` | unset | Positive integer. `100` means one CPU. Values above `100` permit several CPUs. |
+| `shared.memory_high`, `job.memory_high` | unset | Memory threshold that causes reclaim and throttling. Must not exceed `memory_max`. |
+| `shared.memory_max`, `job.memory_max` | unset | Hard memory limit. If reclaim cannot keep usage below it, the kernel can kill processes within the group. |
+| `shared.memory_swap_max`, `job.memory_swap_max` | unset | Maximum swap use. `"0"` disables swap for the group. |
+
+Memory values are quoted whole numbers in bytes, optionally followed by
+`K`, `M`, `G`, or `T`. Suffixes use powers of 1024. Zero is valid only for
+`memory_swap_max`. Linux can round memory limits up to a system page boundary.
+A shared limit covers the full group; a job limit covers
+one launch. These are limits, not reserved capacity.
+
+The ordinary user/repository merge applies. Put personal defaults in
+`~/.config/wt/config.toml` and repository overrides in `.wt.toml`. Each
+unmanaged remote reads its own selected worker configuration, so set its
+limits there. Managed remotes inherit the controller's policy and can
+merge a host-specific override:
+
+```toml
+[[remotes]]
+host = "small-worker"
+managed = true
+
+[remotes.resources.linux.shared]
+cpu_quota_percent = 200
+memory_high = "4G"
+memory_max = "6G"
+```
+
+The worker needs cgroup v2, `systemctl`, `busctl`, and a running systemd user
+manager with delegated CPU and memory controllers. Set up the user manager
+and its lifetime through the host's normal administration tools. wt does not
+use sudo or change host delegation. An unavailable controller or a limit that
+the kernel did not apply prevents the job from starting; wt does not fall
+back to an unlimited launch.
+
+The helper enters a user scope inside the tmux pane before it executes the
+job. It then replaces itself, preserving the terminal's process identity and
+signals. The shared slice is `wtworkloads-<group>.slice`; each launch gets a
+separate `wtjob-*.scope`. Generated slice files and settings live under
+`/run/user/<uid>/systemd` and expire at reboot. Configuration remains the source
+of the requested values.
+
+Restart wt after changing configuration. Shared settings update on the next
+limited launch and also affect existing jobs in that group. Existing terminal
+processes keep their per-job limits; reconnecting does not move them. Start a
+new terminal or deliberately restart its job to apply new per-job limits.
+
+The board, SSH host service, tmux server, action recorders, and dev supervisors
+remain outside the workload group.
+Limits do not cover work delegated to a separate daemon, such as Docker or an
+existing OpenCode service. Configure such services separately. Headless naming
+and controller reads also remain outside these terminal/action/dev budgets.
+These limits control cooperative workloads; they are not a security boundary.
+
 ## `[dev_server]` — optional per-worktree dev server
 
 Omit to disable. When configured, each worktree can run one supervised dev server: started/stopped from the `!` picker (pinned "dev server" group below the always-present "agent" pair `u`/`g` — `d` starts/restarts, `s` stops, `l` opens a live scrollable log overlay; pinned-builtin quick-pick letters are claimed before user `[[actions]]` keys, which fall back to auto-derivation) or `wt dev`, shown in the `dev` row and the bolt badge (the local twin of the SST deploy bolt), opened with `s` (when no SST stage is deployed) and yanked with `y d`.

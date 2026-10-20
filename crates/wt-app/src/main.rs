@@ -76,6 +76,7 @@ mod updates;
 mod watcher;
 mod watcher_cleanup;
 mod work_presentation;
+mod workload;
 mod worktree_facts;
 
 use std::sync::Arc;
@@ -146,6 +147,8 @@ mod cli_tests {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(name = "_workload", hide = true)]
+    Workload(workload::WorkloadArgs),
     /// Coordinate account changes on managed workers.
     Auth(commands::auth::AuthArgs),
     /// Serve explicitly configured controller capabilities to managed workers.
@@ -329,6 +332,7 @@ fn run(cli: Cli) -> Result<i32> {
                 boot.confirm().await?;
             }
             match &cli.command {
+                Some(Command::Workload(args)) => return workload::run(args, &token).await,
                 Some(Command::ClaudeHook(args)) => {
                     return commands::_claude_hook::run(args).await;
                 }
@@ -508,6 +512,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::Perf(args) => commands::perf::run(context, args).await,
         Command::Dev(args) => commands::dev::run(context, args).await,
         Command::DevSupervisor(args) => commands::dev::run_supervisor_command(context, args).await,
+        Command::Workload(_) => unreachable!("workload helper runs before app composition"),
         Command::DevGiveup(args) => commands::_dev_giveup::run(context, args).await,
         Command::ClaudeHook(args) => commands::_claude_hook::run(args).await,
         Command::Skills(args) => commands::skills::run(context, args).await,

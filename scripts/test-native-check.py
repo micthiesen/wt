@@ -123,11 +123,11 @@ class NativeCheckTests(unittest.TestCase):
     def test_complete_order_and_platform_selection(self):
         linux = runner.plan(Path("/candidate/wt"), Path("/diagnostics"), "Linux")
         expected = ["install", "release", "ui", "ui", "session", "lifecycle", "cleanup",
-                    "resource-cleanup", "dev", "actions", "controller", "remote", "host", "command", "stages", "ui", "ui"]
+                    "resource-cleanup", "dev", "actions", "controller", "remote", "host", "command", "stages", "ui", "ui", "workload"]
         self.assertEqual([check.args[1] for check in linux],
                          [f"scripts/native-{name}-check.py" for name in expected])
         mac = runner.plan(Path("/candidate/wt"), Path("/diagnostics"), "Darwin")
-        self.assertEqual(mac[:-1], linux)
+        self.assertEqual(mac[:-1], linux[:-1])
         self.assertEqual(mac[-1].args[1:], ("scripts/native-events-check.py", "--binary", "/candidate/wt"))
         with self.assertRaises(ValueError):
             runner.plan(Path("wt"), Path("out"), "Windows")
@@ -139,8 +139,9 @@ class NativeCheckTests(unittest.TestCase):
         self.assertEqual(checks[1].args[-2:], ("--launcher", "/candidate path/wt-launcher"))
         self.assertIn("--sections", checks[2].args)
         self.assertIn("--feeds", checks[2].args)
-        self.assertIn("--create", checks[-2].args)
-        self.assertIn("--removal", checks[-1].args)
+        self.assertIn("--create", checks[-3].args)
+        self.assertIn("--removal", checks[-2].args)
+        self.assertEqual(checks[-1].args[-1], "/diagnostic path/wt-native-workload")
         self.assertEqual(checks[3].args[-4:], ("--exit-signal", "TERM", "--output", "/diagnostic path/wt-native-signal"))
         for index, leaf in [(2, "ui"), (4, "session"), (9, "actions")]:
             self.assertEqual(checks[index].args[-1], f"/diagnostic path/wt-native-{leaf}")

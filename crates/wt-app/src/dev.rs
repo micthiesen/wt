@@ -38,5 +38,6 @@ pub fn service(context: &AppContext) -> Result<DevServerService> {
         },
         (*context.repository).clone(),
         processes,
-    ))
+    )
+    .with_command_prefix(crate::workload::prefix(context)))
 }

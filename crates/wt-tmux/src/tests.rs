@@ -1406,3 +1406,70 @@ async fn shutdown_reobservation_never_replays_mutations_and_obeys_budget_and_can
     ));
     assert_eq!(attempts, 1);
 }
+
+#[test]
+fn workload_prefix_executes_inside_retention_and_preserves_literal_arguments() {
+    let temp = tempdir().unwrap();
+    let output = temp.path().join("args");
+    let prefix = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "exec \"$@\"".into(),
+        "prefix".into(),
+    ];
+    let client = TmuxClient::new(ProcessRunner::default(), TmuxServer::named("fixture"))
+        .with_command_prefix(prefix);
+    let argument = "a '$HOME; touch injected\nsecond line";
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf '%s' \"$1\" > \"$2\"".into(),
+        "job".into(),
+        argument.into(),
+        output.to_string_lossy().into_owned(),
+    ];
+    let session = CreateSession {
+        name: "job".into(),
+        cwd: temp.path().to_path_buf(),
+        command: command.clone(),
+        width: None,
+        height: None,
+    };
+    let args = client.create_session_args(&session);
+    let result = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(args.last().unwrap())
+        .current_dir(temp.path())
+        .status()
+        .unwrap();
+    assert!(result.success());
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), argument);
+    assert!(!temp.path().join("injected").exists());
+    let args = client
+        .clone()
+        .with_failure_retention()
+        .create_session_args(&session);
+    let shell = args.last().unwrap().to_string_lossy();
+    let supervisor_position = shell.find("@wt-terminal-supervisor").unwrap();
+    let workload_position = shell.find("prefix").unwrap();
+    assert!(
+        supervisor_position < workload_position,
+        "the pane supervisor must remain outside the job"
+    );
+    let window = CreateWindow {
+        session: "job".into(),
+        name: None,
+        cwd: None,
+        command,
+    };
+    let args = client.create_window_args(&window);
+    assert!(
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(args.last().unwrap())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), argument);
+}

@@ -120,6 +120,7 @@ pub enum ActionServiceError {
 pub struct ActionService {
     config: ActionServiceConfig,
     history_path: Option<PathBuf>,
+    command_prefix: Vec<String>,
     opencode_service: Option<wt_harness::OpenCodeService>,
 }
 
@@ -160,8 +161,15 @@ impl ActionService {
         Self {
             config,
             history_path: None,
+            command_prefix: Vec::new(),
             opencode_service: wt_harness::OpenCodeService::from_environment().ok(),
         }
+    }
+
+    /// Limit only the job command. The durable worker remains outside it.
+    pub fn with_command_prefix(mut self, prefix: Vec<String>) -> Self {
+        self.command_prefix = prefix;
+        self
     }
 
     /// Enable successful-run argument label refinement in the shared picker
@@ -561,6 +569,18 @@ impl ActionService {
                     }
                 })?;
                 connection.pin_command(&mut command);
+            }
+            if let Some(program) = self.command_prefix.first() {
+                let arguments = self
+                    .command_prefix
+                    .iter()
+                    .skip(1)
+                    .map(OsString::from)
+                    .chain(std::iter::once(command.program))
+                    .chain(command.args)
+                    .collect();
+                command.program = program.into();
+                command.args = arguments;
             }
             self.config
                 .runner
@@ -1614,6 +1634,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(durable.status, ActionRunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn rejected_workload_setup_records_failure_without_running_the_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("must-not-run");
+        let job = prepared_job(
+            temp.path(),
+            request(temp.path(), &["touch", marker.to_str().unwrap()]),
+        )
+        .await;
+        let worker = service(temp.path()).with_command_prefix(vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf 'resource controller unavailable' >&2; exit 42".into(),
+            "limits".into(),
+        ]);
+        let done = worker
+            .run_worker(&job, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(done.status, ActionRunStatus::Failed);
+        assert_eq!(done.exit_code, Some(42));
+        assert!(!marker.exists());
+        let durable: ActionDone = read_json(&job.parent().unwrap().join("done.json"))
+            .await
+            .unwrap();
+        assert_eq!(durable.status, ActionRunStatus::Failed);
+        assert_eq!(durable.exit_code, Some(42));
     }
 
     #[tokio::test]

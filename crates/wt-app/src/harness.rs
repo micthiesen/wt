@@ -418,6 +418,7 @@ impl AppHarness {
             server = server.with_config_file(config_path);
         }
         let tmux = TmuxClient::new(context.processes.clone(), server)
+            .with_command_prefix(crate::workload::prefix(context))
             .with_failure_retention()
             .with_session_environment(
                 session_environment

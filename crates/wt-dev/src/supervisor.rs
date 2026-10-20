@@ -30,6 +30,7 @@ pub struct SupervisorConfig {
     pub slug: String,
     pub path: PathBuf,
     pub command: String,
+    pub command_prefix: Vec<String>,
     pub stop_command: Option<String>,
     pub port: u16,
     pub dev_dir: PathBuf,
@@ -225,9 +226,16 @@ async fn release_session(config: &SupervisorConfig) -> Result<(), SupervisorErro
 }
 
 fn spawn_dev_command(config: &SupervisorConfig) -> Result<Child, SupervisorError> {
-    let mut command = Command::new(&config.shell);
+    let mut arguments = config
+        .command_prefix
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    arguments.push(config.shell.as_os_str().to_owned());
+    arguments.extend(["-lc".into(), config.command.clone().into()]);
+    let mut command = Command::new(&arguments[0]);
     command
-        .args(["-lc", config.command.as_str()])
+        .args(&arguments[1..])
         .current_dir(&config.path)
         .env("PORT", config.port.to_string())
         .stdin(Stdio::inherit())

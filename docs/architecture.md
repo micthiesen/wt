@@ -555,6 +555,30 @@ login-status verification and daemon recovery acknowledge that generation.
 Terminal preparation rechecks stale or pending sign-in reports before entry.
 Existing tmux sessions and unrelated account homes remain owned by their users.
 
+## Linux workload resource limits
+
+`wt-config` owns the optional `resources.linux` policy and validates every
+limit before app composition. `wt-app::workload` converts the selected policy
+into explicit helper arguments. Managed-worker generation merges each host's
+resource override into its worker config. An unmanaged worker owns its own
+configuration.
+
+Agent, shell, and diff tmux clients receive a command prefix. Action workers
+and dev supervisors apply the same prefix to their job commands, retaining
+their durable completion and restart control outside the resource group.
+Terminal prefixes run inside the pane and inside the retained-command
+supervisor, so an existing tmux server cannot bypass the job boundary. The
+config-free `_workload` helper uses `wt-platform::resources` to configure the
+shared systemd user slice, place its own PID in a transient scope, and check
+its membership and effective cgroup CPU/memory files. It then executes the
+original argv in the same process. Configuration is not loaded a second time
+in this helper. A failed setup never executes the workload.
+
+A host-local file lock serializes shared slice changes and scope entry for
+one resource group. Shared settings are runtime settings; user and repository
+configuration remain authoritative. The board, host service, and tmux server
+are not moved. Separate service daemons require their own resource policy.
+
 ## Durable state, caches, and operation safety
 
 `wt-store` is the authority for repository-scoped status, sections, issue

@@ -85,6 +85,12 @@ cargo build --workspace --bins --examples --locked
 python3 scripts/native-check.py --binary target/debug/wt --output /tmp/wt-native-validation
 ```
 
+On Linux, the runner includes `scripts/native-workload-check.py`. CI starts
+the systemd user manager before the suite. It checks a configured dev launch, child cgroup membership,
+CPU throttling, hard memory-limit termination, signal propagation, and refusal
+to start without resource tools. Its fixture uses a private repository, home,
+tmux server and resource group.
+
 The runner requires `WT_BUILD_ID` and existing `wt` and `wt-launcher` binaries.
 It probes the candidate and refuses a build identity that differs from
 `WT_BUILD_ID`, so an older local binary cannot silently pass as the candidate.
