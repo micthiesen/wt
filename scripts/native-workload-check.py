@@ -128,8 +128,16 @@ command = {quote(shlex.join([sys.executable, str(worker), str(report)]))}
             assert identity.stdout.strip() == "same PID", identity
             terminated = run(*helper, "--", "/bin/sh", "-c", "kill -TERM $$", check=False)
             assert terminated.returncode == -signal.SIGTERM, terminated
-            memory = run(*helper, "--job-memory-max", str(64 * 1024**2), "--", "python3", "-c",
-                         "data=[]\nfor i in range(160): data.append(bytearray(1024*1024))",
+            # Touch every page and disable swap to test the resident RAM cap.
+            memory_probe = """data = []
+for _ in range(160):
+    block = bytearray(1024 * 1024)
+    for offset in range(0, len(block), 4096):
+        block[offset] = 1
+    data.append(block)
+"""
+            memory = run(*helper, "--job-memory-max", str(64 * 1024**2),
+                         "--job-memory-swap-max", "0", "--", "python3", "-c", memory_probe,
                          check=False)
             assert memory.returncode == -signal.SIGKILL, memory
             marker = root / "must-not-exist"
