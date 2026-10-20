@@ -23,7 +23,7 @@ pub type UpdateNotice = Option<String>;
 
 pub fn overlay(
     scope: &TaskScope,
-    context: &AppContext,
+    checks_enabled: bool,
     board: SourceHandle<Board>,
 ) -> SourceHandle<Board> {
     let (notice, publisher) = leaf_channel(
@@ -38,9 +38,18 @@ pub fn overlay(
         },
     );
     publisher.publish_live(None, Stamp::now());
-    if enabled(context) {
-        let cancellation = scope.token();
-        scope.spawn(async move {
+    // The checker owns the publisher for the scope's whole life, even when
+    // checks are disabled: a dropped publisher closes the channel, and the
+    // overlay below would read that as shutdown and stop forwarding boards.
+    let enabled = checks_enabled;
+    let cancellation = scope.token();
+    scope.spawn(async move {
+        if !enabled {
+            cancellation.cancelled().await;
+            drop(publisher);
+            return;
+        }
+        {
             let mut wait = FIRST_CHECK;
             loop {
                 tokio::select! {
@@ -58,8 +67,8 @@ pub fn overlay(
                 }
                 wait = CHECK_EVERY;
             }
-        });
-    }
+        }
+    });
     let (output, mut board_publisher) = derived_channel(scope, "update-board");
     let cancellation = scope.token();
     let notice_view = notice.view();
@@ -95,7 +104,7 @@ pub fn overlay(
 
 /// Workers run the build their controller installs, and `WT_UPDATE=off`
 /// disables release checks entirely.
-fn enabled(context: &AppContext) -> bool {
+pub fn enabled(context: &AppContext) -> bool {
     context.config.instance.role != wt_config::InstanceRole::Worker
         && std::env::var("WT_UPDATE").as_deref() != Ok("off")
 }
@@ -138,6 +147,48 @@ mod tests {
 
     fn version(release: &str, build: &str) -> wt_update::VersionId {
         wt_update::VersionId::new(release, build, "aarch64-apple-darwin").unwrap()
+    }
+
+    /// With checks disabled (`WT_UPDATE=off`, remote workers) the overlay
+    /// must keep forwarding boards; it once stopped at the first one.
+    #[tokio::test]
+    async fn disabled_checks_still_forward_every_board() {
+        let scope = TaskScope::new();
+        let (base, base_publisher) = leaf_channel(
+            &scope,
+            SourceSpec {
+                name: "test-board",
+                domain: Domain::Git,
+                persistence: Persistence::Never("test fixture"),
+                policy: Default::default(),
+            },
+        );
+        let board = overlay(&scope, false, base.view());
+        let mut updates = board.subscribe();
+        for name in ["first", "second", "third"] {
+            base_publisher.publish_live(
+                Board {
+                    name: name.into(),
+                    ..Board::default()
+                },
+                Stamp::now(),
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if updates
+                        .borrow_and_update()
+                        .data()
+                        .is_some_and(|board| board.name == name && board.update_notice.is_none())
+                    {
+                        return;
+                    }
+                    updates.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("board {name} was not forwarded"));
+        }
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
     }
 
     #[test]

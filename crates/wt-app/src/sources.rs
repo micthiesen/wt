@@ -142,7 +142,11 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
             edits: local_sources.edits,
         },
     );
-    let board = crate::update_source::overlay(scope, context, automations.board);
+    let board = crate::update_source::overlay(
+        scope,
+        crate::update_source::enabled(context),
+        automations.board,
+    );
     let perf = crate::perf_source::start(scope, context, board);
     let hard_refresh = crate::hard_refresh::HardRefreshCommands::new(
         perf.board.clone(),
