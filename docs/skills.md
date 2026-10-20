@@ -166,6 +166,10 @@ prefers the native `~/.pi/agent` directory over legacy Pi locations.
   once and credits every tool it serves. Resolution works on paths that
   don't exist yet — an instructions file a pipeline hasn't generated is
   resolved through its parent, so it can't be mistaken for a native file.
+  A skill or instructions *file* that is itself a symlink (dotfiles that link
+  each `SKILL.md` into a real directory) is written through: the update lands
+  in the link's target and the link stays. A dangling file link is reported
+  as blocked and left alone.
 - **rulesync pipelines are first-class**: if the resolved location lives
   inside a repo with a `.rulesync/` dir, the generated output is a wipe-on-
   regenerate artifact — so wt writes to the durable SOURCE instead
