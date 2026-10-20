@@ -331,14 +331,29 @@ fn evaluate_merged(
     } else {
         "branch landed on trunk".into()
     };
-    let key = format!(
-        "{}:merged:{}:{}",
-        rule.id,
-        row.slug,
-        row.pr
-            .as_ref()
-            .map_or_else(|| "local".into(), |pr| pr.number.to_string())
-    );
+    // One landing can be observed through the merged PR or, once that PR
+    // drops out of the snapshot, through trunk containment alone. The PR key
+    // differs between those observations, so the landing key (this
+    // worktree's branch in this incarnation) is what keeps an issue a human
+    // reopened from being closed again. `wt next` moves to a new branch, so
+    // a follow-up PR is a new landing.
+    let keys = vec![
+        format!(
+            "{}:merged:{}:{}",
+            rule.id,
+            row.slug,
+            row.pr
+                .as_ref()
+                .map_or_else(|| "local".into(), |pr| pr.number.to_string())
+        ),
+        format!(
+            "{}:landed:{}:{}:{}",
+            rule.id,
+            row.slug,
+            row.branch,
+            row.created_at.as_deref().unwrap_or("unknown")
+        ),
+    ];
     if closes_issue {
         let issue = row
             .github_issue
@@ -347,7 +362,7 @@ fn evaluate_merged(
             rule: rule.clone(),
             slug: row.slug.clone(),
             quiesce_slugs: Vec::new(),
-            fire_keys: vec![key],
+            fire_keys: keys.clone(),
             stack_id: None,
             close_issue: Some(issue),
             delete_branch: None,
@@ -366,7 +381,7 @@ fn evaluate_merged(
             rule: rule.clone(),
             slug: row.slug.clone(),
             quiesce_slugs: Vec::new(),
-            fire_keys: vec![key],
+            fire_keys: keys.clone(),
             stack_id: None,
             close_issue: None,
             delete_branch: Some(row.branch.clone()),
@@ -382,7 +397,7 @@ fn evaluate_merged(
             rule: rule.clone(),
             slug: row.slug.clone(),
             quiesce_slugs: Vec::new(),
-            fire_keys: vec![key],
+            fire_keys: keys,
             stack_id: None,
             close_issue: None,
             delete_branch: None,
@@ -396,7 +411,9 @@ fn evaluate_merged(
             detail: landed,
         });
     }
-    Some(single(rule, row, key, &landed))
+    let mut fire = single(rule, row, keys[0].clone(), &landed);
+    fire.fire_keys = keys;
+    Some(fire)
 }
 
 fn evaluate_stack(
@@ -873,6 +890,77 @@ mod tests {
         let fire = evaluate(&[rule], &[row], &context).pop().unwrap();
         assert_eq!(fire.close_issue, Some(73));
         assert!(fire.quiesce_slugs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_landing_closes_its_issue_once_whether_or_not_the_pr_is_observed() {
+        use crate::ledger::{AutomationLedger, DispatchKind};
+        use tokio_util::sync::CancellationToken;
+
+        let rule = rule("close", AutomationTrigger::WtMerged, "builtin:close-issue");
+        let mut row = row();
+        row.created_at = Some("2026-10-20T17:56:35Z".into());
+        row.github_issue = Some(2642);
+        row.local_merged = Some(true);
+        row.clean_candidate = true;
+        let context = AutomationEvalContext {
+            github_fresh: true,
+            ..AutomationEvalContext::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let cancel = CancellationToken::new();
+        // The ledger prunes against the wall clock.
+        let now = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let claim = |fire: AutomationFire| {
+            let ledger = &ledger;
+            let cancel = &cancel;
+            async move {
+                ledger
+                    .claim_dispatch(
+                        &fire.fire_keys,
+                        &fire.rule.id,
+                        &fire.slug,
+                        DispatchKind::HeadlessAction,
+                        now,
+                        cancel,
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Landed on trunk while the open PR is still in the snapshot.
+        let first = evaluate(
+            std::slice::from_ref(&rule),
+            std::slice::from_ref(&row),
+            &context,
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(first.close_issue, Some(2642));
+        let delivered = claim(first).await.unwrap();
+        ledger
+            .mark_delivered(&delivered, now, &cancel)
+            .await
+            .unwrap();
+
+        // A human reopens the issue; the PR then drops out of the snapshot.
+        // The same landing seen without its PR must not close it again.
+        row.pr = None;
+        let again = evaluate(
+            std::slice::from_ref(&rule),
+            std::slice::from_ref(&row),
+            &context,
+        )
+        .pop()
+        .unwrap();
+        assert!(claim(again).await.is_none());
+
+        // `wt next` lands a follow-up on a new branch: that is a new landing.
+        row.branch = "feature-1-2".into();
+        let follow_up = evaluate(&[rule], &[row], &context).pop().unwrap();
+        assert!(claim(follow_up).await.is_some());
     }
 
     #[test]
