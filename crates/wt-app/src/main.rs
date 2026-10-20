@@ -71,6 +71,7 @@ mod session_ui;
 mod skills;
 mod sources;
 mod terminal_palette;
+mod update_source;
 mod updates;
 mod watcher;
 mod watcher_cleanup;

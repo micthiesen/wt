@@ -56,6 +56,15 @@ The startup offer checks at most once per day. `[update] startup_check = false`
 or `WT_UPDATE=off` disables it. A declined build remains suppressed until a
 newer build appears; explicitly running `wt update` is the reapply path.
 
+While the TUI is open it also checks quietly, a minute after launch and then
+every six hours, and shows a dim `↑ v0.1.40 available` at the right of the
+title bar when a newer release exists, or `↑ restart for v0.1.40` when it is
+already installed but this process still runs the older build. This check only
+reads install state: it does not stamp the daily check, download anything, or
+honor a declined build, and a failed check shows nothing. `WT_UPDATE=off` and
+remote workers (`[instance] role = "worker"`) disable it; a source build run
+outside a native install shows nothing.
+
 ## Contributor validation and release gate
 
 The complete native end-to-end suite has one entry point shared with the Linux

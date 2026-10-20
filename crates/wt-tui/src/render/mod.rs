@@ -198,6 +198,13 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             base.fg(theme::FG_DIM),
         ));
     }
+    if let Some(notice) = &board.update_notice {
+        // Low priority by design: dim, no color, refreshed every few hours.
+        right.push(Span::styled(
+            format!("↑ {}  ", wt_core::sanitize_terminal_text(notice)),
+            base.fg(theme::FG_DIM),
+        ));
+    }
     let usage = usage_spans(model, base);
     if !usage.is_empty() {
         right.extend(usage);

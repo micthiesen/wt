@@ -50,6 +50,9 @@ pub struct Board {
     /// Queued automation fires waiting to dispatch.
     #[serde(default)]
     pub automations_pending: usize,
+    /// A newer wt release ("v0.1.40 available", "restart for v0.1.40").
+    #[serde(default)]
+    pub update_notice: Option<String>,
     /// Provenance and observation stamps of each remote host's domains, keyed
     /// by `BoardRow::host`. The local host's come with the snapshot itself.
     #[serde(default)]
