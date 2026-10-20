@@ -57,7 +57,8 @@ The fields that decide the pass, at their exact paths:
 | `.pr` | `null` with `.pr_note` null means no PR yet; `null` with a note means GitHub could not be asked, which is not the same thing |
 | `.pr.draft` | a draft; most review bots will not look at it |
 | `.pr.checks` | CI rollup: `pass` / `fail` / `pending` / `none` |
-| `.pr.merge_state` | GitHub's own verdict; `CONFLICTING` is yours to fix |
+| `.pr.merge_state` | GitHub's verdict, lowercased: `clean`, `blocked`, `behind`, `dirty` (conflicts), or `computing` |
+| `.pr.mergeable` | `conflicting` means the branch no longer merges cleanly; that is yours to fix |
 | `.pr.review_bot.state` | `pending` / `unresolved` / `clean` / `none` |
 | `.pr.review_bot.unresolved` | open findings, meaningful when `unresolved` |
 | `.pr.review_bot.stale` | **the bot has not reviewed your current head** |
@@ -86,7 +87,8 @@ looking at, and then you two disagree with nothing to say which is right.
 | `clean` + `stale: true` | wait for the review of the current head |
 | `clean`, not stale, checks pass | nothing is outstanding — merge it (below) |
 | `checks: fail` | read the failure before touching anything (see *four shapes*) |
-| `merge_state: CONFLICTING` | rebase onto the base and resolve; `wt restack` if stacked |
+| `mergeable: conflicting` | rebase onto the base and resolve; `wt restack` if stacked |
+| `state: MERGED` with new work asked of you | continue in this worktree: see *Another PR from the same worktree* |
 | open human threads | reply and resolve them; a human's thread is not the bot's |
 
 ### 3. Wait, then read again
@@ -168,7 +170,7 @@ Merge once all of these hold against your **current** head:
 - the bot's checklist is empty and `review_bot.stale` is false
 - `.pr.checks` is `pass`
 - no open threads, bot or human
-- `.pr.merge_state` is not `CONFLICTING`
+- `.pr.mergeable` is not `conflicting`
 - none of the four cases below applies
 
 Assert the status first, so the record says what landed and at what risk:
@@ -231,6 +233,18 @@ note you would rather they read first — is something to write down and merge.
   exactly this.
 - Otherwise you are done. The merge cleanup archives the row; do not destroy the
   worktree yourself.
+
+### Another PR from the same worktree
+
+When the human asks for more work here after the PR merged, keep the worktree
+and start the next PR in it with `wt next`. It refuses unless the merged branch's
+work has landed and the checkout has no tracked changes, then puts the worktree
+on a fresh branch from the latest base: its sessions, section and status history
+stay, and the merged PR stops being "this worktree's PR". Then
+`wt status working`, commit, `git push -u origin HEAD`, open the PR, and run
+this loop on it. Pass `--issue <ID>|none` or `--gh <N>|none` when the next PR
+belongs to another issue. Never reset the merged branch onto the base by hand:
+that leaves the merged PR attached and can make the row look landed and clean.
 
 ## Stopping
 

@@ -116,6 +116,13 @@ worktree with no tracker issue; attaching one later makes it eligible on the
 next evaluation. Frozen post-merge fires retain their separate terminal-skip
 behavior because their inputs cannot change.
 
+The title bar shows `auto N queued` (or a paused chip), and
+[`wt automations`](cli.md#wt-automations---json) lists each queued fire with
+what it is waiting for, or says the engine is not running. The app log records
+each fire as it queues (with its first wait reason) and as it leaves the queue,
+whether dispatched or dropped because its condition cleared, so a fire that
+waited on a busy session until it was no longer needed is visible afterward.
+
 Dispatch goes through the exact same paths keystrokes use (the action launcher, the clean flow, the restack flow) — automations have no special powers.
 
 ## Failure handling and the breaker

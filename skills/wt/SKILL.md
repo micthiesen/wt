@@ -119,6 +119,9 @@ in each one.
   reason, which reads as a permission problem and is not one. Exit 75 means
   a required check has not reported yet: wait and re-run, do not escalate.
   `--cancel` disarms and dequeues.
+- `wt next [branch] [--issue <ID>|none] [--gh <N>|none]` — keep a worktree
+  whose PR landed and start its next PR there, on a fresh branch from the
+  latest trunk (see *Another PR from the same worktree*).
 - `wt clean` — bulk-remove merged/gone worktrees.
 - `wt doctor [slug]` — health report (dirty, sync, PR, merged).
 - `wt open [slug]` — open a worktree in the editor.
@@ -165,6 +168,22 @@ commits are redundant before discarding them: `git cherry origin/<base>
 <branch>` marks patch-id matches `-`, and commits whose conflict resolution
 changed the patch still show `+`, so subject-match those few against the
 base's log. Then `git reset --hard origin/<base>` rather than rebasing.
+
+## Another PR from the same worktree
+
+When the human wants more work in a worktree whose PR already merged, run
+`wt next` there instead of opening a new worktree or resetting the branch by
+hand. It refuses while a PR from the branch is open, the branch has commits
+that did not land, or tracked files have changes. Otherwise it fetches the
+trunk, switches the checkout to a fresh branch at its tip (`<prefix>/<slug>-2`,
+the next unused number, or the name you pass), records that tip as the fork
+base, and deletes the landed local branch. The slug, directory, sessions,
+section and any owed `--verify-after-merge` stay. The new branch has no PR, so
+the board, automations and `wt fleet` stop showing the merged one, and the PR
+you open next becomes the worktree's PR. Set the status (`wt status working`)
+and push with `git push -u origin HEAD` as for a fresh worktree. When the next
+PR belongs to another issue, pass `--issue <ID>` / `--issue none` and
+`--gh <N>` / `--gh none` (the same records `wt issue` edits).
 
 ## Don't suggest cleanup
 

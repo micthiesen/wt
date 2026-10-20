@@ -295,7 +295,7 @@ pub async fn prepare(
         });
         let issue_override = stored["issueId"].as_str();
         let issue_id = crate::issue_identity::resolve(&slug, issue_override);
-        let github_issue = stored["ghIssue"].as_u64();
+        let github_issue = stored["githubIssue"].as_u64();
         let lifecycle = input.lifecycle.get(&slug).copied().unwrap_or_default();
         let clean_candidate = lifecycle.clean_candidate;
         let local_merged = lifecycle.local_merged;

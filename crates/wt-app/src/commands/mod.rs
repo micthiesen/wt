@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod archive;
 pub mod auth;
+pub mod automations;
 pub mod base;
 pub mod claude;
 pub mod cleanup;
@@ -21,6 +22,7 @@ pub mod logs;
 pub mod manager;
 pub mod merge;
 pub mod new;
+pub mod next;
 pub mod open;
 pub mod perf;
 pub mod remote;

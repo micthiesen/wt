@@ -102,6 +102,16 @@ impl ClaimedFire {
     }
 }
 
+/// One queued fire and why the latest pass did not dispatch it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct QueuedFire {
+    pub rule: String,
+    pub target: String,
+    pub detail: String,
+    pub queued_at_ms: i64,
+    pub waiting_for: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AutomationTick {
     pub pending: usize,
@@ -130,6 +140,11 @@ pub struct AutomationEngine {
     cancellation: CancellationToken,
     intents: BTreeMap<String, AutomationIntent>,
     active: BTreeMap<String, ActiveFire>,
+    /// Why each still-queued intent waited in the latest pass.
+    waiting: BTreeMap<String, String>,
+    /// Intents held only by unmet row-backed requirements. They stay queued
+    /// with their settle age but are not reported as queued.
+    unmet: BTreeSet<String>,
 }
 
 impl AutomationEngine {
@@ -139,11 +154,38 @@ impl AutomationEngine {
             cancellation,
             intents: BTreeMap::new(),
             active: BTreeMap::new(),
+            waiting: BTreeMap::new(),
+            unmet: BTreeSet::new(),
         }
     }
 
+    /// Every retained intent, including requirement-held ones.
+    #[cfg(test)]
     pub fn pending_count(&self) -> usize {
         self.intents.len()
+    }
+
+    /// The queue as of the latest pass, oldest first, without intents held
+    /// only by unmet requirements (docs/automations.md does not count those).
+    pub fn queued(&self) -> Vec<QueuedFire> {
+        let mut queued = self
+            .intents
+            .iter()
+            .filter(|(id, _)| !self.unmet.contains(*id))
+            .map(|(id, intent)| QueuedFire {
+                rule: intent.fire.rule.id.clone(),
+                target: pair_target(&intent.fire),
+                detail: intent.fire.detail.clone(),
+                queued_at_ms: intent.queued_at_ms,
+                waiting_for: self
+                    .waiting
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| "its turn in the queue".into()),
+            })
+            .collect::<Vec<_>>();
+        queued.sort_by(|a, b| (a.queued_at_ms, &a.rule).cmp(&(b.queued_at_ms, &b.rule)));
+        queued
     }
 
     /// Mark a persisted `dispatched` entry delivered only when a durable
@@ -161,6 +203,9 @@ impl AutomationEngine {
     }
 
     pub async fn tick(&mut self, input: AutomationPassInput<'_>) -> Result<AutomationTick> {
+        // Reasons describe this pass only; an early return reports none.
+        self.waiting.clear();
+        self.unmet.clear();
         self.release_finished_slots(input.now_ms, input.activity);
         if !input.state_ready {
             // A transient store read failure must pause dispatch, not silently
@@ -245,7 +290,11 @@ impl AutomationEngine {
         let mut report = AutomationTick::default();
         for intent in queue {
             if self.active.len() >= MAX_CONCURRENT {
-                break;
+                self.waiting.insert(
+                    fire_identity(&intent.fire),
+                    format!("{MAX_CONCURRENT} automations already running"),
+                );
+                continue;
             }
             let fire = intent.fire;
             let id = fire_identity(&fire);
@@ -268,6 +317,8 @@ impl AutomationEngine {
                 .iter()
                 .any(|slug| occupied_slugs.contains(slug))
             {
+                self.waiting
+                    .insert(id, "another automation on the same worktree".into());
                 continue;
             }
             if rule.run == "builtin:restack"
@@ -276,9 +327,12 @@ impl AutomationEngine {
                     .as_ref()
                     .is_some_and(|id| restack_stacks.contains(id))
             {
+                self.waiting
+                    .insert(id, "a restack of the same stack".into());
                 continue;
             }
             if manager_run && manager_in_flight {
+                self.waiting.insert(id, "another manager prompt".into());
                 continue;
             }
 
@@ -286,6 +340,7 @@ impl AutomationEngine {
             if matches!(requirements, Some(RequirementState::Waiting)) {
                 // Preserve the original settle age while a row-backed
                 // prerequisite changes. The trigger still has to remain true.
+                self.unmet.insert(id);
                 continue;
             }
             if matches!(requirements, Some(RequirementState::FrozenUnmet(_))) {
@@ -306,6 +361,8 @@ impl AutomationEngine {
             if requirements.is_none() && !rule.run.starts_with("builtin:") {
                 // Unknown action data is never treated as satisfied. A source
                 // adapter must explicitly publish a requirement decision.
+                self.waiting
+                    .insert(id, "action requirements to be evaluated".into());
                 continue;
             }
 
@@ -343,9 +400,11 @@ impl AutomationEngine {
                     .last_dispatch(&rule.id, &pair)
                     .is_some_and(|last| input.now_ms < last.saturating_add(cooldown))
             }) {
+                self.waiting.insert(id, "its cooldown".into());
                 continue;
             }
             if input.now_ms < intent.settle_at_ms {
+                self.waiting.insert(id, "its settle delay".into());
                 continue;
             }
 
@@ -364,6 +423,8 @@ impl AutomationEngine {
                         .context("persist busy-skipped automation")?;
                     self.intents.remove(&id);
                     tracing::info!(rule = %rule.id, %reason, "automation skipped while target busy");
+                } else {
+                    self.waiting.insert(id, reason);
                 }
                 continue;
             }
@@ -391,8 +452,13 @@ impl AutomationEngine {
                 DispatchClaimResult::AlreadyHandled => {
                     self.intents.remove(&id);
                 }
-                DispatchClaimResult::CoolingDown { .. }
-                | DispatchClaimResult::BreakerReserved { .. } => {}
+                DispatchClaimResult::CoolingDown { .. } => {
+                    self.waiting.insert(id, "its cooldown".into());
+                }
+                DispatchClaimResult::BreakerReserved { .. } => {
+                    self.waiting
+                        .insert(id, "an earlier attempt to be confirmed".into());
+                }
                 DispatchClaimResult::BreakerOpen { .. } => {
                     self.ledger
                         .mark_skipped(
@@ -752,6 +818,61 @@ mod tests {
                 .await
                 .unwrap()
                 .has_handled("test:created:worktree:2026-10-09T12:00:00Z", start + 1)
+        );
+    }
+
+    /// `wt automations` and the queue log name why each fire still waits.
+    #[tokio::test]
+    async fn queued_fires_report_what_they_wait_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let rules = [rule("custom-action", 0.0)];
+        let rows = [row()];
+        let context = AutomationEvalContext::default();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let mut requirements =
+            BTreeMap::from([("test|worktree".into(), RequirementState::Waiting)]);
+        let busy = BTreeMap::from([(
+            "worktree".to_owned(),
+            WorktreeQuiescence {
+                session_busy: true,
+                ..WorktreeQuiescence::default()
+            },
+        )]);
+        let mut waiting_for = Vec::new();
+        for (step, quiescence) in [&BTreeMap::new(), &busy].into_iter().enumerate() {
+            if step == 1 {
+                requirements.insert("test|worktree".into(), RequirementState::Ready);
+            }
+            let tick = engine
+                .tick(input(
+                    &rules,
+                    &rows,
+                    &context,
+                    &requirements,
+                    quiescence,
+                    &activity,
+                    start + step as i64,
+                ))
+                .await
+                .unwrap();
+            assert!(tick.claims.is_empty());
+            let queued = engine.queued();
+            waiting_for.push(queued.first().map(|fire| {
+                assert_eq!(
+                    (fire.rule.as_str(), fire.target.as_str()),
+                    ("test", "worktree")
+                );
+                fire.waiting_for.clone()
+            }));
+        }
+        // An unmet requirement is not reported as queued (docs/automations.md);
+        // once met, the fire waits visibly for the busy session.
+        assert_eq!(
+            waiting_for,
+            [None, Some("session busy on worktree".to_owned())]
         );
     }
 

@@ -211,6 +211,8 @@ enum Command {
     Manager(commands::manager::ManagerArgs),
     /// Inspect or assert a bounded maintenance hold.
     Hold(commands::hold::HoldArgs),
+    /// Show whether automations are running and what is queued.
+    Automations(commands::automations::AutomationsArgs),
     /// Initialize repository configuration without an existing wt installation.
     Init(commands::init::InitArgs),
     /// Execute an acknowledged, durable background removal job.
@@ -218,6 +220,8 @@ enum Command {
     Destroy(commands::_destroy::DestroyWorkerArgs),
     /// Create a worktree from an issue, branch or slug.
     New(commands::new::NewArgs),
+    /// Keep a worktree whose PR landed and start its next PR on a fresh branch.
+    Next(commands::next::NextArgs),
     /// Remove a worktree after checking for work that would be lost.
     #[command(name = "rm", alias = "remove")]
     Remove(commands::remove::RemoveArgs),
@@ -511,8 +515,10 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::Codex(args) => commands::codex::run(context, args).await,
         Command::Manager(args) => commands::manager::run(context, args).await,
         Command::Hold(args) => commands::hold::run(context, args).await,
+        Command::Automations(args) => commands::automations::run(context, args).await,
         Command::Destroy(args) => commands::_destroy::run_worker(context, args).await,
         Command::New(args) => commands::new::run(context, args).await,
+        Command::Next(args) => commands::next::run(context, args).await,
         Command::Remove(args) => commands::remove::run(context, args).await,
         Command::Cleanup(args) => commands::cleanup::run(context, args).await,
         Command::List(args) => commands::list::run(context, args).await,

@@ -218,8 +218,10 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             .collect::<Vec<_>>();
         let pr_json = pr.map(|pr| json!({
             "number":pr.number,"url":pr.url,"title":pr.title,"state":pr.state,"isDraft":pr.is_draft,
+            "draft":pr.is_draft,
             "checks":pr.checks,"failedChecks":pr.failed_checks,
             "mergeStateStatus":merge_field(pr.merge_state_status.as_deref(), &pr.state),
+            "merge_state":merge_field(pr.merge_state_status.as_deref(), &pr.state),
             "mergeable":merge_field(pr.mergeable.as_deref(), &pr.state),
             "unresolved_threads":pr.unresolved_threads_total,"unresolved_human_threads":pr.unresolved_threads,
             "review_bot":pr.review_bot.as_ref().map(|status| json!({"state":status.state,"unresolved":status.unresolved,"stale":status.stale.unwrap_or(false)})),

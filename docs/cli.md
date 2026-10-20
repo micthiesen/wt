@@ -119,6 +119,46 @@ Tabs the human attached by hand are released rather than closed — except on th
 
 And it reaps hand-started servers: any process holding a **listening TCP socket** whose cwd is inside the worktree (an agent's backgrounded `pnpm preview`, a stray vite) is SIGTERM'd — SIGKILL'd if it lingers — before the checkout is removed, with a `reaped …` line in the destroy log per kill. The listening-socket filter is the safety boundary: an editor or shell sitting in the directory holds no socket and is never touched. This is the cleanup half of the process contract — the managed half (`wt dev`) covers the one process meant to *outlive* an agent's session; everything else may run unmanaged precisely because destroy guarantees it can't outlive the worktree. Best-effort and silent when nothing is listening, which is the common case.
 
+### `wt next [branch] [--slug <slug>] [--issue <ID>|none] [--gh <n>|none]`
+
+Keep a worktree whose PR landed and start its next PR there. An opt-in step for
+continuing in the same checkout; worktrees that are never reused are unaffected.
+
+It refuses, changing nothing, while a PR from the current branch is open,
+while tracked files have changes, and unless the branch's work is proven
+landed: origin's trunk (freshly fetched) contains its head, or a merged PR from
+it has exactly that head (the squash-merge case). Then it switches the checkout
+to a fresh branch at the trunk tip, records that tip as the fork base, and
+deletes the landed local branch. The branch name is the argument (a name
+without `/` gets the `[branch] prefix`), or `<prefix>/<slug>-<n>` with the
+first `n` from 2 that is unused locally and on origin.
+
+The slug, directory, sessions, section, status history and any owed
+`--verify-after-merge` stay with the worktree; only the branch changes.
+Because PRs are matched by branch, the new branch has none: the board,
+automations and [`wt fleet`](#wt-fleet) stop treating the merged PR as this
+worktree's, and the PR opened from the new branch becomes its PR. With no
+commits of its own yet, the worktree is neither landed nor a cleanup
+candidate. `--issue` and `--gh` set the same records as
+[`wt issue`](#wt-issue-slug----id-id----no-id----clear-id----gh-n----clear-gh)
+(`none` asserts no tracker issue, or clears the GitHub link); without them the
+links carry over. It holds the worktree's operation lock and refuses rather
+than waiting when another operation holds it.
+
+### `wt automations [--json]`
+
+Report whether automations are running for this repository and what is
+queued. The engine runs in the wt TUI's host while it is open and rewrites
+`<cache_root>/automations-queue.<repo_id>.json` when its queue changes and at least once
+a minute. This command reads that file: it says automations are not running
+when the writer has exited or the report is more than three minutes old, and
+otherwise lists each queued fire with what it is waiting for (the target's
+session to go idle, recent edits to settle, a cooldown, an action's
+requirements, another automation on the same worktree). `--json` prints the
+report as written. The app log records when each fire queues and when it
+leaves the queue. The TUI title bar shows the same count as `auto N queued`,
+or a paused chip while automations are paused.
+
 ### `wt clean`
 
 Remove every worktree that is merged or whose remote branch is gone. "Gone" is only auto-cleaned when a merged PR confirms the content actually landed; anything riskier is left for an explicit `wt rm`.
@@ -334,7 +374,7 @@ The [manager session](manager.md)'s single audit surface: one row per live workt
 
 - `--json` — the contract. Live rows carry `section` plus nested `work`, `session`, and `pr` objects. **The `work` block is nested here and flat in `wt status --all --json`** (this surface joins three domains and has to namespace them; that one is status-only). So the asserter is `.work.by` here and `.by` there, and getting it backwards returns `null` rather than an error — indistinguishable from the `null` that legitimately means "unattributed", which reads as "the field isn't populated" instead of "I asked for the wrong path". Review state is **three separate numbers**, because collapsing them made the field lie: `unresolved_threads` is every open review thread (what GitHub's PR page shows), `unresolved_human_threads` excludes bot-opened ones, and `review_bot` is the bot's own rollup — in `checklist` mode the unticked-box count from its summary comment, which thread resolution does **not** affect. `review_bot.stale` is the half that decides what `state` is worth: it means the bot has not reviewed the CURRENT head, so `clean` there says "found nothing in an older commit", not "passed". The TUI already refuses to paint that green, and this surface used to omit the flag entirely, handing every JSON reader exactly the reading the badge withholds. It matters most to whoever acts on it rather than displays it: an agent working through a bot's follow-up reviews (`/babysit`) stops at the first stale clean, believing the commit it just pushed came back empty. Checklist mode only; `false` otherwise, which is what every reader already inferred from the absent field. On a repo where all review is done by a bot, the human count is permanently 0, so reporting only it reads as "nothing to chase" while the bot sits on unaddressed findings; when GitHub is unreachable (no `gh`, not authenticated, fetch failure) rows still emit with `pr: null` plus a `pr_note` saying why — so "no PR" (`pr` and `pr_note` both null) stays distinguishable from "couldn't ask". Removed rows are the same `kind: "merged"|"removed"` entries as `wt ls --json`, and live rows are `kind: "live"` — branch on the value before reading `work`, which only live rows have. **The stack and its ordering ride the row too**: `base` is the effective merge target (the recorded fork base, else `[branch] base`; never null, same derivation and value as `wt ls --json`) and `edges` are the merge edges touching that slug, the same objects `wt edge --json` prints plus `stale`. An edge rides **both** of its endpoint rows, so dedupe on `from`/`to`, and ignore stale ones for ordering as every other consumer does. Neither field existed here until 2026-08-31, which cost exactly what a missing field on a primary sense costs: a real four-deep stack carrying three `blocks` edges read as four independent branches with no constraints, and the manager reported to the human that no ordering existed — twice. `wt edge --help` had promised this surface read edges the whole time, and the omission was undetectable from the output, because absence of an edge is *defined* to mean "no known constraint".
 
-Merge fields (`merge_state` from GitHub's `mergeStateStatus`, `mergeable`) are lowercased GitHub enums with one twist: GitHub computes mergeability **lazily**, so its `UNKNOWN` is reported as `"computing"` and wt never polls — re-run after a few seconds if you need the answer (the query itself is what triggers the computation). On terminal (merged/closed) PRs the merge fields are null rather than eternally "computing".
+A PR's `draft` and `merge_state` are also emitted under their older names `isDraft` and `mergeStateStatus`. Merge fields (`merge_state` from GitHub's `mergeStateStatus`, `mergeable`) are lowercased GitHub enums with one twist: GitHub computes mergeability **lazily**, so its `UNKNOWN` is reported as `"computing"` and wt never polls — re-run after a few seconds if you need the answer (the query itself is what triggers the computation). On terminal (merged/closed) PRs the merge fields are null rather than eternally "computing".
 
 ### `wt manager` / `wt manager send <text…>` / `wt manager report [--ok|--warn|--err|--info] <text…>`
 

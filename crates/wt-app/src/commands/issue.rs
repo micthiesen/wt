@@ -231,7 +231,7 @@ async fn read_issue(ctx: &AppContext, cwd: &Path, id: Option<&str>) -> Result<i3
     Ok(if code == 3 { 1 } else { code })
 }
 
-fn valid_issue_id(raw: &str) -> bool {
+pub(crate) fn valid_issue_id(raw: &str) -> bool {
     let Some((prefix, number)) = raw.split_once('-') else {
         return false;
     };

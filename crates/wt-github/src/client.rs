@@ -1114,7 +1114,9 @@ fn build_query(
         .map(|i| format!("$b{i}: String!"))
         .collect::<Vec<_>>()
         .join(", ");
-    let aliases = (0..branches.len()).map(|i| format!("wt_{i}: pullRequests(first:2,headRefName:$b{i},orderBy:{{field:UPDATED_AT,direction:DESC}}) {{ nodes {{ ...PrFields }} }}")).collect::<Vec<_>>().join("\n");
+    // Newest-created first: a branch reused after a merge has its current PR
+    // (open, or the latest merged) first however recently older ones changed.
+    let aliases = (0..branches.len()).map(|i| format!("wt_{i}: pullRequests(first:2,headRefName:$b{i},orderBy:{{field:CREATED_AT,direction:DESC}}) {{ nodes {{ ...PrFields }} }}")).collect::<Vec<_>>().join("\n");
     let merge_queue = if with_queue {
         "mergeQueue(branch:$mergeQueueBranch) { entries(first:50) { nodes { enqueuedAt estimatedTimeToMerge position state pullRequest { headRefName } } } }"
     } else {

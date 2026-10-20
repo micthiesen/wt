@@ -16,7 +16,9 @@ use wt_runtime::{Confirmed, LeafHandle, SourceHandle, SourceState, TaskScope, de
 use wt_tui::Board;
 
 use crate::{
-    automation_engine::{AutomationEngine, AutomationOutcome, AutomationPassInput, ClaimedFire},
+    automation_engine::{
+        AutomationEngine, AutomationOutcome, AutomationPassInput, ClaimedFire, QueuedFire,
+    },
     automation_facts::{self, AutomationInputs, PreparedAutomationFacts},
     context::AppContext,
     local_source::Metadata,
@@ -106,7 +108,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         clippy::disallowed_methods,
         reason = "engine status signal folded into the derived automations board, not board data itself"
     )]
-    let (status_tx, status_rx) = watch::channel((0usize, None::<String>));
+    let (status_tx, status_rx) = watch::channel(EngineStatus::default());
     let board = overlay(scope, sources.board.clone(), status_rx);
     let token = scope.token();
     let accepted_context = ctx.clone();
@@ -154,6 +156,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut facts_current = false;
         let mut dispatches: JoinSet<(ClaimedFire, AutomationOutcome, Option<String>)> = JoinSet::new();
         let mut active_dispatches = HashMap::new();
+        let mut reported = Vec::new();
+        let mut queue_report = QueueReport::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -196,7 +200,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                     Err(error) => latest_error = Some(format!("cannot persist branch tip after dispatch: {error:#}")),
                                 }
                             }
-                            let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
+                            let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
                         }
                         Some(Err(error)) => {
                             latest_error = Some(format!("automation dispatch task failed: {error}"));
@@ -209,7 +213,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             {
                                 latest_error = Some(format!("automation ledger finish: {finish:#}"));
                             }
-                            let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
+                            let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
                         }
                         None => {}
                     }
@@ -294,7 +298,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             cache_key = Some(key);
                             facts_current = false;
                             latest_error = Some(format!("automation facts unavailable: lifecycle evidence: {error:#}"));
-                            let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
+                            let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
                             continue;
                         }
                     }
@@ -322,7 +326,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                 cache_key = Some(key);
                                 facts_current = false;
                                 latest_error = Some(format!("automation facts unavailable: cannot persist branch tip baseline: {error:#}"));
-                                let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
+                                let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
                                 continue;
                             }
                             persisted_tips.extend(next.initial_branch_tips.clone());
@@ -345,10 +349,14 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             // A dispatch error may since have replaced the message; the
             // flag, not the text, keeps stale facts from ticking.
             if !facts_current {
-                let _ = status_tx.send((engine.pending_count(), latest_error.clone()));
+                let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
+                queue_report.write(&context, &engine.queued(), paused(&facts), latest_error.as_deref());
                 continue;
             }
-            let Some(facts) = facts.as_mut() else { continue; };
+            let Some(facts) = facts.as_mut() else {
+                queue_report.write(&context, &engine.queued(), queue_report.paused(), latest_error.as_deref());
+                continue;
+            };
             let current_edits = merged_edits(edits.data().map(|edits| &**edits), &last_edit);
             automation_facts::refresh_quiescence_edits(
                 facts,
@@ -368,7 +376,11 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let pass = pass_input(&context, facts, facts.context.now_ms);
             let tick = match engine.tick(pass).await {
                 Ok(tick) => tick,
-                Err(error) => { latest_error = Some(format!("automation engine: {error:#}")); continue; }
+                Err(error) => {
+                    latest_error = Some(format!("automation engine: {error:#}"));
+                    queue_report.write(&context, &engine.queued(), facts.globally_paused, latest_error.as_deref());
+                    continue;
+                }
             };
             for claim in tick.claims {
                 let context = accepted_context.clone();
@@ -378,7 +390,11 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 let task = dispatches.spawn(async move { dispatch_claim(context, claim, github, board).await });
                 active_dispatches.insert(task.id(), (tracked, Instant::now()));
             }
-            let _ = status_tx.send((tick.pending, latest_error.clone()));
+            let queued = engine.queued();
+            let _ = status_tx.send(EngineStatus::new(queued.len(), latest_error.clone()));
+            report_queue_changes(&reported, &queued);
+            reported = queued;
+            queue_report.write(&context, &reported, facts.globally_paused, latest_error.as_deref());
         }
         let mut progress = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(3),
@@ -516,7 +532,7 @@ async fn dispatch_claim(
 fn overlay(
     scope: &TaskScope,
     input: SourceHandle<Board>,
-    mut status_rx: watch::Receiver<(usize, Option<String>)>,
+    mut status_rx: watch::Receiver<EngineStatus>,
 ) -> SourceHandle<Board> {
     let (source, mut publisher) = derived_channel(scope, "automations");
     let cancel = scope.token();
@@ -537,10 +553,13 @@ fn overlay(
                 changed = status_rx.changed() => if changed.is_err() { break; },
             }
             let snapshot = updates.borrow_and_update().clone();
-            let (pending, error) = status_rx.borrow_and_update().clone();
+            let EngineStatus { pending, error } = status_rx.borrow_and_update().clone();
             let Some(mut board) = snapshot.data().map(|board| (**board).clone()) else {
                 continue;
             };
+            // The paused chip stays the inventory's: it reads durable state
+            // and is the witness the pause toggle's Pending settles against.
+            board.automations_pending = pending;
             board.activity.retain(|line| {
                 !line.text.starts_with("Automations:")
                     && !line.text.starts_with("Automation error:")
@@ -571,6 +590,124 @@ fn overlay(
         }
     });
     source
+}
+
+/// What the engine reports to the board's title bar and activity pane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EngineStatus {
+    pending: usize,
+    error: Option<String>,
+}
+
+impl EngineStatus {
+    fn new(pending: usize, error: Option<String>) -> Self {
+        Self { pending, error }
+    }
+}
+
+fn paused(facts: &Option<PreparedAutomationFacts>) -> bool {
+    facts.as_ref().is_some_and(|facts| facts.globally_paused)
+}
+
+/// Log a fire when it first queues and when it leaves the queue without
+/// being claimed, so a fire that waits forever leaves a trace.
+fn report_queue_changes(before: &[QueuedFire], after: &[QueuedFire]) {
+    let key = |fire: &QueuedFire| (fire.rule.clone(), fire.target.clone());
+    let previous = before
+        .iter()
+        .map(key)
+        .collect::<std::collections::BTreeSet<_>>();
+    let current = after
+        .iter()
+        .map(key)
+        .collect::<std::collections::BTreeSet<_>>();
+    for fire in after.iter().filter(|fire| !previous.contains(&key(fire))) {
+        tracing::info!(
+            rule = %fire.rule,
+            target = %fire.target,
+            detail = %fire.detail,
+            waiting_for = %fire.waiting_for,
+            "automation queued"
+        );
+    }
+    for fire in before.iter().filter(|fire| !current.contains(&key(fire))) {
+        tracing::info!(rule = %fire.rule, target = %fire.target, "automation left the queue");
+    }
+}
+
+/// The queue snapshot `wt automations` prints. Rewritten when it changes and
+/// at least once a minute, so a reader can tell a live engine from a dead one.
+#[derive(Default)]
+struct QueueReport {
+    last: Option<(String, Instant)>,
+    paused: bool,
+}
+
+/// Per repository: a cache root can be shared by repositories identified by
+/// their main clone.
+pub fn queue_report_path(config: &wt_config::Config) -> std::path::PathBuf {
+    let id = config
+        .repo_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    config
+        .paths
+        .cache_root
+        .join(format!("automations-queue.{id}.json"))
+}
+const QUEUE_REPORT_HEARTBEAT: Duration = Duration::from_secs(60);
+
+impl QueueReport {
+    fn write(
+        &mut self,
+        ctx: &AppContext,
+        queued: &[QueuedFire],
+        paused: bool,
+        error: Option<&str>,
+    ) {
+        let body = serde_json::json!({
+            "paused": paused,
+            "error": error,
+            "queued": queued,
+        })
+        .to_string();
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|(last, at)| *last == body && at.elapsed() < QUEUE_REPORT_HEARTBEAT)
+        {
+            return;
+        }
+        let report = serde_json::json!({
+            "pid": std::process::id(),
+            "updated_at_ms": now_ms(),
+            "paused": paused,
+            "error": error,
+            "queued": queued,
+        });
+        let path = queue_report_path(&ctx.config);
+        let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        let written =
+            std::fs::write(&temp, report.to_string()).and_then(|()| std::fs::rename(&temp, &path));
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temp);
+            tracing::warn!(%error, path = %path.display(), "cannot write automation queue report");
+        }
+        self.last = Some((body, Instant::now()));
+        self.paused = paused;
+    }
+
+    /// The last reported pause state, for passes that have no facts yet.
+    fn paused(&self) -> bool {
+        self.paused
+    }
 }
 
 fn pass_input<'a>(
@@ -662,7 +799,7 @@ fn metadata_facts_key(metadata: Option<&crate::local_source::Metadata>) -> serde
                 "createdAt",
                 "work",
                 "issueId",
-                "ghIssue",
+                "githubIssue",
                 "automationsPaused",
             ] {
                 if let Some(value) = record.get(field) {
