@@ -23,6 +23,81 @@ use crate::{
     worktree_facts::push_facts,
 };
 
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{summary}\n{details}")]
+pub(crate) struct MissingRemoteBuild {
+    pub summary: String,
+    pub details: String,
+}
+
+impl MissingRemoteBuild {
+    fn new(build: &str, target: &str, release: Option<&str>, cause: &str) -> Self {
+        let platform = if target.contains("linux") {
+            "Linux"
+        } else if target.contains("apple-darwin") {
+            "macOS"
+        } else {
+            target
+        };
+        let custom = release.is_none_or(|release| {
+            !release.starts_with('v')
+                && !release.starts_with("preview-")
+                && !release.starts_with("rust-test-")
+        });
+        let summary = if custom {
+            format!(
+                "Your local wt build is custom. Its matching {platform} build is not available."
+            )
+        } else {
+            format!("The matching {platform} build for your local wt build is not available.")
+        };
+        Self {
+            summary,
+            details: format!(
+                "Local build: {build}\nLocal platform: {}\nRemote platform: {target}\nRelease: {}\nCause: {cause}",
+                env!("WT_TARGET"),
+                release.unwrap_or("no published release identity"),
+            ),
+        }
+    }
+
+    pub fn reply(&self) -> wt_tui::UiReply {
+        wt_tui::UiReply {
+            modal: Some(wt_tui::UiModal::Confirm {
+                action: wt_tui::ConfirmAction::CopyDetails {
+                    details: self.details.clone(),
+                },
+                title: "Cannot open remote session".into(),
+                lines: vec![
+                    self.summary.clone(),
+                    String::new(),
+                    "Install a published wt release or provide a matching remote build.".into(),
+                ],
+                cancel_key: None,
+            }),
+            ..wt_tui::UiReply::failure("Cannot open remote session")
+        }
+    }
+}
+
+fn remote_release_error(
+    error: wt_update::ArtifactError,
+    build: &str,
+    target: &str,
+    release: &str,
+) -> anyhow::Error {
+    let missing = match &error {
+        wt_update::ArtifactError::HttpStatus(status) => status.as_u16() == 404,
+        wt_update::ArtifactError::MissingAsset(_) => true,
+        _ => false,
+    };
+    if missing {
+        MissingRemoteBuild::new(build, target, Some(release), &error.to_string()).into()
+    } else {
+        error.into()
+    }
+}
+
 pub fn worker_info(role: InstanceRole) -> WorkerInfo {
     WorkerInfo {
         role: match role {
@@ -117,11 +192,12 @@ async fn native_candidate_for_platform(
         env!("WT_BUILD_ID"),
         env!("WT_TARGET"),
     )
-    .with_context(|| {
-        format!(
-            "cannot provision {} for remote: running build {} has no matching published native release",
-            platform.target,
-            env!("WT_BUILD_ID")
+    .map_err(|error| {
+        MissingRemoteBuild::new(
+            env!("WT_BUILD_ID"),
+            &platform.target,
+            None,
+            &error.to_string(),
         )
     })?;
     let source = wt_update::ReleaseSource::new(crate::updates::repository(&options)?)?;
@@ -131,7 +207,9 @@ async fn native_candidate_for_platform(
         result = tokio::time::timeout(
             std::time::Duration::from_secs(100),
             source.by_tag(version.release_version()),
-        ) => result.context("matching native release lookup timed out")??,
+        ) => result.context("matching native release lookup timed out")?.map_err(|error| {
+            remote_release_error(error, env!("WT_BUILD_ID"), &platform.target, version.release_version())
+        })?,
     };
     if release.build_id() != env!("WT_BUILD_ID") {
         bail!(
@@ -147,7 +225,9 @@ async fn native_candidate_for_platform(
         result = tokio::time::timeout(
             std::time::Duration::from_secs(100),
             source.download_verified(&release, &platform.target),
-        ) => result.context("matching native worker artifact download timed out")??,
+        ) => result.context("matching native worker artifact download timed out")?.map_err(|error| {
+            remote_release_error(error, env!("WT_BUILD_ID"), &platform.target, version.release_version())
+        })?,
     };
     if verified.version().build_id() != env!("WT_BUILD_ID")
         || verified.version().target() != platform.target
@@ -899,5 +979,74 @@ mod tests {
         assert_eq!(value["dev"], serde_json::Value::Null);
         assert_eq!(value["devError"], "status read failed");
         assert!(value.get("dev_error").is_none());
+    }
+}
+
+#[cfg(test)]
+mod missing_build_tests {
+    use super::*;
+
+    #[test]
+    fn missing_custom_release_reports_build_platform_and_github_404() {
+        let error = remote_release_error(
+            wt_update::ArtifactError::HttpStatus(404_u16.try_into().unwrap()),
+            "custom-build-123",
+            "x86_64-unknown-linux-gnu",
+            "local-test",
+        );
+        let missing = error.downcast_ref::<MissingRemoteBuild>().unwrap();
+        assert_eq!(
+            missing.summary,
+            "Your local wt build is custom. Its matching Linux build is not available."
+        );
+        for detail in [
+            "custom-build-123",
+            "x86_64-unknown-linux-gnu",
+            "local-test",
+            "GitHub returned HTTP status 404",
+        ] {
+            assert!(missing.details.contains(detail), "missing detail: {detail}");
+        }
+        let reply = missing.reply();
+        assert!(reply.failed);
+        assert!(reply.handoff.is_none());
+        let Some(wt_tui::UiModal::Confirm {
+            action: wt_tui::ConfirmAction::CopyDetails { details },
+            title,
+            ..
+        }) = reply.modal
+        else {
+            panic!("missing dismiss/copy dialog");
+        };
+        assert_eq!(title, "Cannot open remote session");
+        assert_eq!(details, missing.details);
+    }
+
+    #[test]
+    fn missing_published_artifact_does_not_call_the_local_build_custom() {
+        let error = remote_release_error(
+            wt_update::ArtifactError::MissingAsset("Linux artifact".into()),
+            "published-build",
+            "aarch64-unknown-linux-gnu",
+            "v0.1.32",
+        );
+        let missing = error.downcast_ref::<MissingRemoteBuild>().unwrap();
+        assert!(!missing.summary.contains("custom"));
+        assert!(missing.summary.contains("matching Linux build"));
+    }
+
+    #[test]
+    fn network_and_checksum_failures_are_not_missing_builds() {
+        for error in [
+            wt_update::ArtifactError::HttpStatus(503_u16.try_into().unwrap()),
+            wt_update::ArtifactError::Transport("network offline".into()),
+            wt_update::ArtifactError::ChecksumMismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+        ] {
+            let error = remote_release_error(error, "build", "linux", "local-test");
+            assert!(error.downcast_ref::<MissingRemoteBuild>().is_none());
+        }
     }
 }

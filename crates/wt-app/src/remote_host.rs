@@ -76,6 +76,23 @@ enum Request {
     Wake,
 }
 
+#[derive(Clone, Debug, Default)]
+enum ConnectionReadiness {
+    #[default]
+    Preparing,
+    Ready(u64),
+    UnavailableBuild(Arc<crate::remote::MissingRemoteBuild>),
+}
+
+impl ConnectionReadiness {
+    fn connection(&self) -> Option<u64> {
+        match self {
+            Self::Ready(connection) => Some(*connection),
+            Self::Preparing | Self::UnavailableBuild(_) => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RemoteHost {
     pub endpoint: RemoteConfig,
@@ -86,7 +103,7 @@ pub struct RemoteHost {
     pub managed: watch::Receiver<Option<Arc<crate::managed::ManagedStatus>>>,
     managed_status: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
     requests: mpsc::Sender<Request>,
-    ready: watch::Receiver<Option<u64>>,
+    ready: watch::Receiver<ConnectionReadiness>,
     client: watch::Receiver<Option<RemoteClient>>,
     views: watch::Sender<protocol::HostViews>,
 }
@@ -111,7 +128,7 @@ impl RemoteHost {
             clippy::disallowed_methods,
             reason = "connection readiness control signal, not board data"
         )]
-        let (ready, readiness) = watch::channel(None);
+        let (ready, readiness) = watch::channel(ConnectionReadiness::Preparing);
         #[expect(
             clippy::disallowed_methods,
             reason = "prepared SSH client handle, not board data"
@@ -186,13 +203,13 @@ impl RemoteHost {
     /// Wait until the worker stream is ready, up to `limit`.
     pub async fn wait_ready(&self, limit: Duration) -> bool {
         let mut ready = self.ready.clone();
-        tokio::time::timeout(limit, ready.wait_for(Option::is_some))
+        tokio::time::timeout(limit, ready.wait_for(|state| state.connection().is_some()))
             .await
             .is_ok_and(|result| result.is_ok())
     }
 
     pub fn is_ready(&self) -> bool {
-        self.ready.borrow().is_some()
+        self.ready.borrow().connection().is_some()
     }
 
     /// Preparation can require authentication before a stream can exist.
@@ -207,7 +224,10 @@ impl RemoteHost {
         let mut managed = self.managed.clone();
         tokio::time::timeout(limit, async {
             loop {
-                if ready.borrow().is_some()
+                if matches!(*ready.borrow(), ConnectionReadiness::UnavailableBuild(_)) {
+                    return false;
+                }
+                if ready.borrow().connection().is_some()
                     || managed.borrow().as_ref().is_some_and(|status| {
                         crate::managed::required_sign_in(&status.report, action, primary).is_some()
                     })
@@ -224,6 +244,13 @@ impl RemoteHost {
         .unwrap_or(false)
     }
 
+    pub fn missing_remote_build(&self) -> Option<Arc<crate::remote::MissingRemoteBuild>> {
+        match &*self.ready.borrow() {
+            ConnectionReadiness::UnavailableBuild(error) => Some(error.clone()),
+            ConnectionReadiness::Preparing | ConnectionReadiness::Ready(_) => None,
+        }
+    }
+
     pub fn connection_detail(&self) -> String {
         match self.snapshot.snapshot().state() {
             SourceState::Failed(detail) => detail.to_string(),
@@ -232,7 +259,7 @@ impl RemoteHost {
     }
 
     pub fn refresh(&self) -> bool {
-        let Some(connection) = *self.ready.borrow() else {
+        let Some(connection) = self.ready.borrow().connection() else {
             return false;
         };
         matches!(
@@ -256,7 +283,7 @@ impl RemoteHost {
     }
 
     pub async fn execute(&self, action: UiAction) -> Result<UiReply, RemoteHostError> {
-        let Some(connection) = *self.ready.borrow() else {
+        let Some(connection) = self.ready.borrow().connection() else {
             return Err(RemoteHostError::NotStarted {
                 host: self.endpoint.key(),
                 detail: self.connection_detail(),
@@ -295,7 +322,7 @@ impl RemoteHost {
     /// The selected runtime path is immutable for this connection. Callers
     /// prepare interactive session handoff from the same pinned client.
     pub async fn session_client(&self) -> Result<RemoteClient> {
-        if self.ready.borrow().is_none() {
+        if self.ready.borrow().connection().is_none() {
             anyhow::bail!("remote host {} is not connected", self.endpoint.key());
         }
         self.client
@@ -327,7 +354,7 @@ pub(crate) fn source_name(endpoint: &RemoteConfig) -> &'static str {
 struct HostChannels {
     requests: mpsc::Receiver<Request>,
     publisher: LeafPublisher<HostSnapshot>,
-    readiness: watch::Sender<Option<u64>>,
+    readiness: watch::Sender<ConnectionReadiness>,
     prepared_client: watch::Sender<Option<RemoteClient>>,
     views: watch::Receiver<protocol::HostViews>,
     managed: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
@@ -414,7 +441,14 @@ async fn run_host_actor(
                 }
                 Err(error) => {
                     publish_failed(&publisher, format!("worker preparation: {error:#}"));
-                    mark_not_ready(&readiness);
+                    if let Some(missing) = error.downcast_ref::<crate::remote::MissingRemoteBuild>()
+                    {
+                        readiness.send_replace(ConnectionReadiness::UnavailableBuild(Arc::new(
+                            missing.clone(),
+                        )));
+                    } else {
+                        mark_not_ready(&readiness);
+                    }
                     if !wait_offline(
                         &mut requests,
                         backoff,
@@ -1012,11 +1046,11 @@ fn stderr_text(connection: &Connection) -> String {
         .to_owned()
 }
 
-fn mark_ready(readiness: &watch::Sender<Option<u64>>, connection: u64) {
-    readiness.send_replace(Some(connection));
+fn mark_ready(readiness: &watch::Sender<ConnectionReadiness>, connection: u64) {
+    readiness.send_replace(ConnectionReadiness::Ready(connection));
 }
-fn mark_not_ready(readiness: &watch::Sender<Option<u64>>) {
-    readiness.send_replace(None);
+fn mark_not_ready(readiness: &watch::Sender<ConnectionReadiness>) {
+    readiness.send_replace(ConnectionReadiness::Preparing);
 }
 
 fn belongs_to_connection(request_connection: u64, active_connection: u64) -> bool {
@@ -1036,7 +1070,10 @@ mod tests {
     )]
     fn waiting_host(
         scope: &TaskScope,
-    ) -> (super::RemoteHost, tokio::sync::watch::Sender<Option<u64>>) {
+    ) -> (
+        super::RemoteHost,
+        tokio::sync::watch::Sender<super::ConnectionReadiness>,
+    ) {
         let (snapshot, _) = leaf_channel(
             scope,
             SourceSpec {
@@ -1046,7 +1083,7 @@ mod tests {
                 policy: RefreshPolicy::default(),
             },
         );
-        let (readiness, ready) = tokio::sync::watch::channel(None);
+        let (readiness, ready) = tokio::sync::watch::channel(super::ConnectionReadiness::Preparing);
         let (managed_status, managed) = tokio::sync::watch::channel(None);
         let (requests, _) = tokio::sync::mpsc::channel(1);
         let (_, client) = tokio::sync::watch::channel(None);
@@ -1068,6 +1105,43 @@ mod tests {
             },
             readiness,
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn missing_build_ends_session_wait_without_the_connection_timeout() {
+        let scope = TaskScope::new();
+        let (host, readiness) = waiting_host(&scope);
+        let missing = crate::remote::MissingRemoteBuild {
+            summary: "matching Linux build is not available".into(),
+            details: "GitHub returned HTTP status 404".into(),
+        };
+        let started = tokio::time::Instant::now();
+        let waiter = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            readiness.send_replace(super::ConnectionReadiness::UnavailableBuild(
+                std::sync::Arc::new(missing),
+            ));
+        });
+        assert!(
+            !host
+                .wait_for_action(
+                    &wt_tui::UiAction::Session {
+                        key: Some("one".into()),
+                        target: wt_tui::SessionTarget::Harness
+                    },
+                    wt_core::HarnessId::Codex,
+                    std::time::Duration::from_secs(90),
+                )
+                .await
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(host.missing_remote_build().is_some());
+        assert!(!host.is_ready());
+        waiter.await.unwrap();
+        scope
+            .shutdown(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
     }
 
     fn github_sign_in_report() -> wt_remote::managed::ManagedReport {

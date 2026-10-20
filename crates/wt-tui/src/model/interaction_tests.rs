@@ -1358,3 +1358,36 @@ fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
         })
     );
 }
+
+#[test]
+fn missing_remote_build_dialog_dismisses_and_copies_on_this_device() {
+    let details = "Local build: custom\nRemote platform: Linux\nGitHub returned HTTP status 404";
+    for code in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('c')] {
+        let mut model = model_with(&["one"]);
+        model.reply(UiReply {
+            modal: Some(UiModal::Confirm {
+                action: ConfirmAction::CopyDetails {
+                    details: details.into(),
+                },
+                title: "Cannot open remote session".into(),
+                lines: vec!["Your local wt build is custom.".into()],
+                cancel_key: None,
+            }),
+            ..UiReply::failure("Cannot open remote session")
+        });
+        let result = press(&mut model, code);
+        if code == KeyCode::Char('c') {
+            assert_eq!(
+                result,
+                InputResult::Action(UiAction::Copy {
+                    value: details.into(),
+                    label: "error details".into()
+                })
+            );
+        } else {
+            assert_eq!(result, InputResult::Draw);
+        }
+        assert!(matches!(model.interaction, Interaction::None));
+        assert_eq!(model.selected, Some(0));
+    }
+}

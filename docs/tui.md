@@ -318,6 +318,12 @@ While session entry waits for a host, `Esc` cancels that connection attempt.
 Navigation or another session request also cancels the wait. A cancelled remote
 connection does not block entry to a local session.
 
+When a matching remote build is unavailable, session entry stops without waiting
+for the connection timeout. A “Cannot open remote session” dialog offers
+Dismiss (Enter or Esc) and Copy details (`c`). Dismiss returns control to the
+board. The copied details include the local build, remote platform, and release
+lookup error, including GitHub 404 when that is the cause.
+
 Most menus open at once from the board on screen: status `u`, fork base `b`,
 section move, sessions `;`, start agent Shift+F12, stop a running terminal
 Shift+F10/F11, GitHub `e`/`E`, review checkout `w`, history restore, hard

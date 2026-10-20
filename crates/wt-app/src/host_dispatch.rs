@@ -147,6 +147,9 @@ pub async fn execute(
     if let Some(remote) = remote
         && !remote.is_ready()
     {
+        if let Some(missing) = remote.missing_remote_build() {
+            return Ok(missing.reply());
+        }
         replies
             .send(UiReply::message(format!(
                 "Connecting to {}…",
@@ -160,6 +163,9 @@ pub async fn execute(
             ready = remote.wait_for_action(&action, context.config.harness.primary, std::time::Duration::from_secs(90)) => ready,
         };
         if !ready {
+            if let Some(missing) = remote.missing_remote_build() {
+                return Ok(missing.reply());
+            }
             bail!(
                 "{} is not ready; no command was sent: {}",
                 remote.endpoint.label,

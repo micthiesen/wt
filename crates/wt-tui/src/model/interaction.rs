@@ -272,6 +272,23 @@ impl Model {
                 }
             }
             Interaction::Confirm(confirm) => {
+                if let ConfirmAction::CopyDetails { details } = &confirm.action {
+                    if matches!(
+                        code,
+                        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q' | 'n')
+                    ) || (control && code == KeyCode::Char('c'))
+                    {
+                        return InputResult::Draw;
+                    }
+                    if code == KeyCode::Char('c') && !control {
+                        return InputResult::Action(UiAction::Copy {
+                            value: details.clone(),
+                            label: "error details".into(),
+                        });
+                    }
+                    self.interaction = interaction;
+                    return InputResult::Unchanged;
+                }
                 if confirm_scroll(code, &mut confirm.selected, confirm.lines.len()) {
                     self.interaction = interaction;
                     return InputResult::Draw;
@@ -286,6 +303,10 @@ impl Model {
                 }
                 if code == KeyCode::Enter || code == KeyCode::Char('y') {
                     return InputResult::Action(match &confirm.action {
+                        ConfirmAction::CopyDetails { details } => UiAction::Copy {
+                            value: details.clone(),
+                            label: "error details".into(),
+                        },
                         ConfirmAction::HardRefresh => UiAction::HardRefresh,
                         ConfirmAction::StopTerminal {
                             key,

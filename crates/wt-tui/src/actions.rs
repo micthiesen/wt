@@ -473,6 +473,10 @@ pub struct CleanupTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfirmAction {
+    /// A local failure dialog. Copying its details performs no host command.
+    CopyDetails {
+        details: String,
+    },
     HardRefresh,
     StopTerminal {
         key: String,

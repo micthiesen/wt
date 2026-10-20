@@ -865,6 +865,7 @@ fn yank(frame: &mut Frame<'_>, model: &Model, area: Rect, selected: usize) {
 
 fn confirm_verb(action: &ConfirmAction) -> &'static str {
     match action {
+        ConfirmAction::CopyDetails { .. } => "Copy details",
         ConfirmAction::HardRefresh => "clear caches",
         ConfirmAction::StopTerminal { .. } => "stop",
         ConfirmAction::KillAction { .. } => "kill",
@@ -884,7 +885,8 @@ fn confirm_verb(action: &ConfirmAction) -> &'static str {
 fn destructive(action: &ConfirmAction) -> bool {
     !matches!(
         action,
-        ConfirmAction::ReviewCheckout { .. }
+        ConfirmAction::CopyDetails { .. }
+            | ConfirmAction::ReviewCheckout { .. }
             | ConfirmAction::RestoreRemoved { .. }
             | ConfirmAction::Github { .. }
             | ConfirmAction::DismissFailedRemoval { .. }
@@ -1057,10 +1059,14 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
         .map_or("n / esc / q".to_owned(), |key| {
             format!("n / {key} / esc / q")
         });
-    let mut hints = vec![
-        hint("y / ⏎", confirm_verb(&confirm.action)),
-        hint(cancel, "cancel"),
-    ];
+    let mut hints = if matches!(confirm.action, ConfirmAction::CopyDetails { .. }) {
+        vec![hint("⏎ / esc", "Dismiss"), hint("c", "Copy details")]
+    } else {
+        vec![
+            hint("y / ⏎", confirm_verb(&confirm.action)),
+            hint(cancel, "cancel"),
+        ]
+    };
     let widest = confirm
         .lines
         .iter()
@@ -2507,6 +2513,36 @@ mod tests {
                 (x, y as u16)
             })
         })
+    }
+
+    #[test]
+    fn missing_build_dialog_shows_dismiss_and_copy_details() {
+        let mut model = Model {
+            interaction: Interaction::Confirm(ConfirmPrompt {
+                action: ConfirmAction::CopyDetails {
+                    details: "GitHub 404".into(),
+                },
+                title: "Cannot open remote session".into(),
+                lines: vec![
+                    "Your local wt build is custom. Its matching Linux build is not available."
+                        .into(),
+                    String::new(),
+                    "Install a published wt release or provide a matching remote build.".into(),
+                ],
+                selected: 0,
+                cancel_key: None,
+            }),
+            ..Default::default()
+        };
+        let buffer = draw(&mut model, 100, 25);
+        for text in [
+            "Cannot open remote session",
+            "Dismiss",
+            "Copy details",
+            "matching Linux build",
+        ] {
+            assert!(find(&buffer, text).is_some(), "dialog omitted {text}");
+        }
     }
 
     fn remove_confirm() -> ConfirmPrompt {

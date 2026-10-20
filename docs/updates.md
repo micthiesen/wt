@@ -195,3 +195,11 @@ on the worker.
 
 See [configuration.md](configuration.md#remote--optional-ssh-worktree-host)
 for worker setup and [backends.md](backends.md) for worktree storage behavior.
+
+A custom local build can lack a matching binary for a remote platform. If
+release lookup returns GitHub 404, or the release has no required artifact,
+remote session entry stops as soon as that failure is known. The board shows
+“Cannot open remote session” with Dismiss (Enter or Esc) and Copy details (`c`).
+The details include the local build and platform, remote platform, release,
+and GitHub error. Install a published release or supply a matching worker build.
+Network errors, invalid checksums, and build mismatches remain distinct errors.
