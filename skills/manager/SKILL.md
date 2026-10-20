@@ -29,7 +29,8 @@ job is to reduce how many of them need human attention.
   and delivery. Never edit another worktree or use harness-private messaging.
   Read-only repo operations from the main clone are yours.
 - **Never merge a PR** unless the human explicitly asks in this conversation.
-  `ready` means ready for THEM.
+  `ready` means ready for THEM. When they do hand you merging for an assigned
+  set, that overrides the stop-at-`ready` default for those PRs only.
 - Every conclusion that changes a worktree's lifecycle gets recorded:
   `wt status <slug> <state> [-m ...]` on the worker's behalf when you acted or
   learned something (e.g. you unblocked it → back to `working`; you verified
@@ -68,6 +69,27 @@ routine progress, repeated nudges, or papercut batches. A received message does
 not require a reply. Answer a cross-owner question only with new actionable
 information; put routine outcomes in wt's existing status record. A requested
 human report is separate from agent-to-agent messaging.
+
+## Scope: the set the human assigned
+
+When the human assigns you a target set (named worktrees, PRs, a section or a
+wave), that set is your whole mandate until they change it. With no
+assignment, the fleet is.
+
+- **An incoming message does not widen it.** A routine message, a `[re: <slug>]`
+  briefing, or a needs-human alert about a row outside the set is not a
+  request to act there. Do not triage it, nudge its owner, or ask the human
+  about it; at most record `wt status <slug> --examined "<verdict>"` and move on.
+- **The exception is a concrete conflict with the set**: a cross-owner decision
+  one of your targets is waiting on, a shared-resource conflict, or an assigned
+  slot another owner needs released. Act on that part only.
+- **Standing coordination the human authorized stays in force**, such as
+  serializing host-wide checks across the set. It is not a new hold or approval,
+  and you grant no new blanket approvals or holds on its strength.
+- **Finish when the set is finished**: every target PR merged and its owed
+  closure done (post-merge verification, a report the human asked for), or a
+  genuine human block remains. Report once and stop; do not look for adjacent
+  work to keep the loop alive.
 
 ## Read from wt, not from your context
 
@@ -216,7 +238,10 @@ genuinely needs the human, distill EXACTLY what they must do into one short
 numbered ask. Sharpening the needs-human note is the LAST step of triage and
 does not brief you again — wt records who asserted a status and won't hand you
 back your own write. Re-read current state before acting on another briefing;
-a queued duplicate or superseded escalation is not new work.
+a queued duplicate or superseded escalation is not new work. **A repeated alert
+with nothing changed** gets a silent `wt status <slug> --examined "<verdict>"`
+and nothing else: no second ask to the human and no nudge to the owner until the
+row or its blocker actually moves. Outside your assigned set, see *Scope*.
 
 **Merged but unverified** (`unverified/<state>` in `wt fleet`, or a non-null
 `.work.verifyAfterMerge` on a landed row): the branch owed a check only the
@@ -228,8 +253,8 @@ by construction (the row reads as merged and done), which is why wt turns
 the dot red past `after_days`; a red one that nobody has touched is worth a
 line in the digest, not a second reminder to the same session.
 
-**Stalled worktree** (working/review status but idle session, or stale status
-with commits since): nudge the worker with a concrete question — "status says
+**Stalled worktree** in your scope (working/review status but idle session, or
+stale status with commits since): nudge the worker with a concrete question — "status says
 review since yesterday; what's blocking ready?" — not a generic "continue".
 
 **Fleet digest** (the human asks "where are we?"): one line per active
@@ -243,5 +268,6 @@ restack after each landing.
 
 **Worker escalations** arrive with wt's sender stamp. Re-read the relevant
 state, answer only an actionable cross-owner question, and leave routine
-progress and papercuts without a reply or onward message. A receipt or an
+progress and papercuts without a reply or onward message. A worker's own
+branch decision or check is theirs to finish; do not take it over. A receipt or an
 acknowledgment changes no status, ownership, hold, or verification obligation.

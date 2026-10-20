@@ -19,6 +19,12 @@ A sweep you run on a timer from the manager session. Each pass looks at the
 whole fleet, does the small things that move rows toward mergeable, and stops
 short of merging — that stays the human's.
 
+**Sweep the set the human assigned, or the fleet when none was named.** An
+alert or message about a row outside the set is not a reason to sweep it; act
+there only on a concrete conflict with the set (see the manager playbook's
+*Scope*). When every target PR is merged and its owed closure is done, or only
+a genuine human block remains, stop.
+
 **Inside a single worktree, driving your OWN branch through review, you want
 `babysit` instead.** Same destination, opposite ownership: this skill acts
 across rows and implements nothing, that one acts on one row and does the
@@ -285,7 +291,8 @@ A serviceable default, adjust with the human:
 
 ## What you never do
 
-- **Merge.** Always the human's.
+- **Merge**, unless the human handed you merging for the assigned set. Otherwise
+  always the human's.
 - **Change code.** Every fix goes to the owning worktree via `wt agent send`.
   Operate the repository only from the main clone, read-only.
 - **Push to make a check pass.** Nudging a rebase produces one push by the
@@ -339,7 +346,11 @@ fleet went quiet, with everyone including the human believing it had stopped.
 A workable one:
 
 > Stop after N consecutive passes with zero dispatched actions, zero non-clean
-> PRs, and zero non-busy stale rows.
+> PRs, and zero non-busy stale rows. For an assigned set, stop as soon as every
+> target PR is merged with its owed closure done, or only a human block remains.
+
+A repeated alert with nothing changed is not a dispatched action: record the
+`--examined` verdict silently and do not re-ask the human or re-nudge the owner.
 
 On stopping: clear the timer, then report what changed across the run and what
 is now waiting on the human. Say explicitly that the loop is off — nobody can

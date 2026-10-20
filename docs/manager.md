@@ -10,6 +10,10 @@ Codex separates these slots using a fixed opening user message saved in each new
 
 On upgrade from cwd-only Codex discovery, existing unmarked conversations remain available under `.`. The first `m` creates a new dedicated manager conversation; old conversation files are preserved. Restart the wt TUI to load the new discovery code. Existing live sessions are not stopped or reassigned.
 
+## Scope
+
+The manager's mandate is the target set the human assigns (worktrees, PRs, a section or wave), or the fleet when none is named. Incoming routine messages, `[re: <slug>]` briefings and needs-human alerts about rows outside that set do not widen it: the manager records at most a silent `--examined` verdict and does not intervene in, nudge or ask about unrelated active worktrees. It acts outside the set only on a concrete conflict with it: a cross-owner decision a target waits on, a shared-resource conflict, or an assigned slot another owner needs released. Repeated unchanged alerts get the same silent verdict rather than another ask or nudge. An assigned run ends when every target PR has merged and its owed closure is done, or only a genuine human block remains; a human's merge delegation for the set replaces the default stop at `ready`. Coordination the human authorized for the set, such as serializing host-wide checks, stays valid and grants no new approvals or holds. The full contract is in [fleet.md](fleet.md#agency-levels); the playbook is the bundled `manager` skill.
+
 ## Entry points
 
 - **`m`** in the TUI attaches it (F12 detaches back), creating it on first use with the Shift+TAB-selected primary harness.

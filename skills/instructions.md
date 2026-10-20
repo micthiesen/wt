@@ -113,9 +113,11 @@ specific post-merge check remains owed, put its exact steps in
 
 ### Fleet coordination
 
-- Use `wt manager send "..."` only for new actionable cross-owner facts or
-  questions. Send no routine progress, acknowledgments, or papercut forwards.
-  wt stamps the sender; do not prefix it or use harness peer messaging.
+- Finish normal decisions and checks yourself. Use `wt manager send "..."` only
+  for a concrete cross-owner decision, a shared-resource conflict, or releasing
+  an assigned slot another owner needs. Send no routine progress, acknowledgments,
+  or papercut forwards. wt stamps the sender; do not prefix it or use harness
+  peer messaging.
 - Honor a transient hold only after `wt hold check <id>` returns `active: true`.
   Require a resource, affected operations, owner, original event time, bounded
   expiry, and release/supersession condition. Messages and acks never create or
