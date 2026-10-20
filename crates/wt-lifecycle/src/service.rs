@@ -2632,6 +2632,11 @@ impl LifecycleService {
         if status.dirty {
             hazards.push(UNCOMMITTED_HAZARD.to_owned());
         }
+        // Commits a stopped rebase already replayed exist only on its
+        // detached HEAD, which removal would discard.
+        if wt_vcs::operation_in_progress(row.git_dir.as_deref()).await {
+            hazards.push(IN_PROGRESS_HAZARD.to_owned());
+        }
         let slug = row.target.slug().to_owned();
         let state = self.read_slug_state(&slug, cancellation).await?;
         let work = state.as_ref().and_then(|value| value.get("work"));
@@ -3348,6 +3353,7 @@ async fn quarantine_checkout(
 
 /// Removal hazard for a dirty worktree.
 pub const UNCOMMITTED_HAZARD: &str = "uncommitted changes";
+pub const IN_PROGRESS_HAZARD: &str = "a rebase, merge or cherry-pick is in progress";
 
 /// Removal hazard for commits that exist only locally.
 pub fn unpushed_hazard(count: u32) -> String {
@@ -3359,6 +3365,7 @@ pub fn unpushed_hazard(count: u32) -> String {
 /// an obligation or an unknown that the confirm states on its own line.
 pub fn is_lost_work_hazard(hazard: &str) -> bool {
     hazard == UNCOMMITTED_HAZARD
+        || hazard == IN_PROGRESS_HAZARD
         || hazard.split_once(' ').is_some_and(|(count, rest)| {
             count.parse::<u64>().is_ok()
                 && (rest == "unpushed commit" || rest == "unpushed commits")
@@ -3387,6 +3394,7 @@ mod tests {
         assert_eq!(unpushed_hazard(1), "1 unpushed commit");
         assert_eq!(unpushed_hazard(3), "3 unpushed commits");
         assert!(is_lost_work_hazard(UNCOMMITTED_HAZARD));
+        assert!(is_lost_work_hazard(super::IN_PROGRESS_HAZARD));
         assert!(is_lost_work_hazard(&unpushed_hazard(1)));
         assert!(is_lost_work_hazard(&unpushed_hazard(12)));
         assert!(!is_lost_work_hazard("post-merge verification still owed"));
@@ -4160,6 +4168,55 @@ mod tests {
         ));
         assert!(!cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
         assert!(Path::new(&created.target.path).exists());
+    }
+
+    /// Commits a stopped rebase already replayed live only on its detached
+    /// HEAD; a clean, pushed branch mid-rebase must not be removable.
+    #[tokio::test]
+    async fn a_stopped_rebase_refuses_removal_without_explicit_force() {
+        let (_scratch, service, runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let created = service
+            .create(
+                "michael/ENG-10-rebasing",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = Path::new(&created.target.path);
+        let git_dir = runner
+            .run(
+                CommandSpec::new("git")
+                    .args(["rev-parse", "--absolute-git-dir"])
+                    .cwd(path),
+                &cancellation,
+            )
+            .await
+            .unwrap()
+            .stdout_text();
+        let clean = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert!(!clean.hazards.iter().any(|h| h == IN_PROGRESS_HAZARD));
+        fs::create_dir(Path::new(git_dir.trim()).join("rebase-merge"))
+            .await
+            .unwrap();
+        let rebasing = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert!(rebasing.hazards.iter().any(|h| h == IN_PROGRESS_HAZARD));
+        assert!(matches!(
+            service.remove(&created.target, RemoveOptions::default(), &cancellation).await,
+            Err(LifecycleError::Refused(message)) if message.contains("rebase")
+        ));
+        assert!(path.exists());
     }
 
     #[tokio::test]

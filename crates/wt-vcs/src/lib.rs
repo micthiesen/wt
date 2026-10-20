@@ -7,6 +7,6 @@ mod status;
 pub use origin::{FetchOriginOptions, FetchOriginReport};
 pub use repository::{
     DiffStats, GitRepository, RepositoryConfig, RepositoryError, RepositoryKind, StageConfig,
-    WorktreeRecord, WorktreeSnapshot,
+    WorktreeRecord, WorktreeSnapshot, operation_in_progress,
 };
 pub use status::GitStatus;

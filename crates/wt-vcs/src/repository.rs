@@ -737,6 +737,29 @@ pub(crate) async fn git_metadata_paths(path: &Path) -> (Option<PathBuf>, Option<
     (git_dir, common_dir)
 }
 
+/// A rebase, merge, cherry-pick or revert is stopped in this checkout. Its
+/// HEAD is then transient (a rebase starts by checking out its target), so
+/// no landing or cleanup decision may be read from it. Without a known git
+/// directory this answers false and callers keep their other evidence.
+pub async fn operation_in_progress(git_dir: Option<&Path>) -> bool {
+    let Some(git_dir) = git_dir else {
+        return false;
+    };
+    for marker in [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "sequencer",
+    ] {
+        if fs::try_exists(git_dir.join(marker)).await.unwrap_or(true) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn rebase_branch(git_dir: Option<&Path>) -> Option<String> {
     let git_dir = git_dir?;
     for metadata in ["rebase-merge/head-name", "rebase-apply/head-name"] {

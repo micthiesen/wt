@@ -108,7 +108,7 @@ still require the initial dirty-work confirmation. Do not put hand-edited
 source files in this list.
 
 - `--yes` / `-y` — skip confirmations.
-- `--force` — remove despite uncommitted / unpushed work, or an outstanding post-merge verification.
+- `--force` — remove despite uncommitted / unpushed work, a stopped rebase, merge or cherry-pick, or an outstanding post-merge verification. A stopped rebase is a hazard on its own because the commits it already replayed exist only on its detached HEAD; while one is in progress the row is also never shown or treated as landed, since a rebase starts by checking out its target and that transient HEAD is often the base tip.
 - `--destroy-stage` / `--no-destroy-stage` — force the SST stage decision (default: prompt when your stage looks deployed).
 - `--keep-branch` — keep the branch. Deleting it is the default, so `--delete-branch` is accepted but changes nothing; the two conflict.
 - `--background` / `-b` — dispatch as a background job (watch with `wt logs <slug>`).

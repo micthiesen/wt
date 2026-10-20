@@ -251,6 +251,13 @@ async fn landing_evidence(
     warning: &mut Option<String>,
 ) -> Result<Landing> {
     let path = Path::new(&row.target.path);
+    // A stopped rebase or merge has a transient HEAD; it proves nothing.
+    if wt_vcs::operation_in_progress(row.git_dir.as_deref()).await {
+        return Ok(Landing {
+            pr_landed: false,
+            local_merged: false,
+        });
+    }
     let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
         .await?
         .checked("git")?

@@ -878,7 +878,10 @@ async fn enrich(
         } else {
             0
         };
-        if own_commits > 0 {
+        // Mid-rebase HEAD is the rebase target (often the base tip itself),
+        // so it would read as landed; wait for the rebase to finish.
+        let mid_operation = wt_vcs::operation_in_progress(row.worktree.git_dir.as_deref()).await;
+        if own_commits > 0 && !mid_operation {
             let pr_is_for_current_head =
                 pr.is_some_and(|pr| pr.head_ref_oid.as_deref() == Some(head));
             let pr_landed_on_base = pr_is_for_current_head
@@ -1886,6 +1889,77 @@ mod tests {
         // An unresolvable base also exits 1, but writes no tree.
         assert_eq!(parse_merge_tree(Some(1), b""), None);
         assert_eq!(parse_merge_tree(Some(128), b"abc\0"), None);
+    }
+
+    /// A rebase starts by checking out its target, so mid-rebase HEAD can be
+    /// the base tip itself: past the recorded anchor and contained in the
+    /// base. That transient HEAD must not paint the row landed.
+    #[tokio::test]
+    async fn a_stopped_rebase_does_not_read_as_landed() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let anchor = git(&main, &["rev-parse", "HEAD"]);
+        std::fs::write(main.join("tracked.txt"), "trunk moved\n").unwrap();
+        git(&main, &["commit", "-qam", "trunk moved"]);
+        let tip = git(&main, &["rev-parse", "HEAD"]);
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.worktree.target.branch == "feature/one")
+            .unwrap()
+            .clone();
+        let worktree = PathBuf::from(&row.worktree.target.path);
+        // The state `git rebase` leaves while stopped: HEAD detached at the
+        // new base, rebase metadata present.
+        git(&worktree, &["checkout", "-q", "--detach", &tip]);
+        let rows = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|candidate| candidate.worktree.target.path == row.worktree.target.path)
+            .unwrap()
+            .clone();
+        let git_dir = row.worktree.git_dir.clone().unwrap();
+        let slug = row.worktree.target.slug().to_owned();
+        let state = serde_json::json!({"slugs": {slug: {"baseBranch": "main", "baseSha": anchor}}});
+        let probe = || async {
+            enrich(
+                &fixture.ctx,
+                &row,
+                &state,
+                None,
+                &ConflictCache::default(),
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .0
+            .landed_on
+        };
+        // Without rebase metadata the same HEAD is genuinely landed.
+        assert_eq!(probe().await, Some(LandingKind::Base));
+        std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
+        assert_eq!(probe().await, None);
+        assert!(wt_vcs::operation_in_progress(Some(&git_dir)).await);
     }
 
     /// A recorded base that exists only as a remote-tracking ref, or not at
