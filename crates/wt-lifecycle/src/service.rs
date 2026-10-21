@@ -789,6 +789,17 @@ impl LifecycleService {
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
         let row = self.find_live_target(target, cancellation).await?;
+        if checkout_missing(&row).await {
+            return Ok(RemovalRevision {
+                key: wt_core::worktree_target_key(&row.target),
+                path: row.target.path.clone(),
+                branch: row.target.branch.clone(),
+                head: String::new(),
+                digest: MISSING_CHECKOUT_DIGEST.into(),
+                hazards: vec![MISSING_CHECKOUT_HAZARD.into()],
+                published_base: None,
+            });
+        }
         let phase = RemovalPhase::new(Path::new(&target.path), "prepare-revision");
         let result = self
             .stable_removal_revision(&row, landed, cancellation)
@@ -901,7 +912,19 @@ impl LifecycleService {
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
         let main = canonicalize(&self.config.main_clone, "resolve main clone").await?;
         let requested = PathBuf::from(&target.path);
-        let path = canonicalize(&requested, "resolve target checkout").await?;
+        // A checkout that is already gone keeps its registered path, which
+        // is also how the inventory reports it.
+        let path = match fs::canonicalize(&requested).await {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => requested.clone(),
+            Err(source) => {
+                return Err(LifecycleError::Io {
+                    operation: "resolve target checkout",
+                    path: requested,
+                    source,
+                });
+            }
+        };
         if path == main {
             return Err(LifecycleError::Refused(
                 "cannot remove the configured main clone".into(),
@@ -925,6 +948,18 @@ impl LifecycleService {
             return Err(LifecycleError::Refused(
                 "removed-history snapshot no longer matches this worktree".into(),
             ));
+        }
+        if checkout_missing(&row).await {
+            return self
+                .finish_missing_checkout(
+                    &row,
+                    &main,
+                    options,
+                    expected_revision,
+                    &lock,
+                    cancellation,
+                )
+                .await;
         }
         if let Some(expected) = expected_revision {
             timed(
@@ -1136,7 +1171,15 @@ impl LifecycleService {
                     "git-worktree-remove",
                     self.remove_git_worktree(&path, &main, force, cancellation),
                 )
-                .await?
+                .await?;
+                // Git can exit 0 with the checkout gone and its metadata still
+                // registered; that row would stay on the board as live.
+                if let Err(error) = self
+                    .prune_registration(&row, &main, &CancellationToken::new())
+                    .await
+                {
+                    warnings.push(error.to_string());
+                }
             }
             BackendKind::Rift => warnings.extend(
                 timed(
@@ -1149,6 +1192,22 @@ impl LifecycleService {
         }
         // The checkout removal is the irreversible commit point. Finish branch
         // cleanup and durable bookkeeping even if cancellation arrives now.
+        Ok(self
+            .finish_removal(&row, &main, backend, &options, destroyed_stage, warnings)
+            .await)
+    }
+
+    /// Branch cleanup and durable bookkeeping after the checkout is gone.
+    async fn finish_removal(
+        &self,
+        row: &WorktreeRecord,
+        main: &Path,
+        backend: BackendKind,
+        options: &RemoveOptions,
+        destroyed_stage: bool,
+        mut warnings: Vec<String>,
+    ) -> RemoveResult {
+        let slug = row.target.slug();
         let durable_write = CancellationToken::new();
         let mut deleted_branch = false;
         if options.delete_branch
@@ -1156,7 +1215,7 @@ impl LifecycleService {
             && !row.target.branch.is_empty()
         {
             match self
-                .delete_branch(&main, &row.target.branch, &durable_write)
+                .delete_branch(main, &row.target.branch, &durable_write)
                 .await
             {
                 Ok(deleted) => deleted_branch = deleted,
@@ -1182,14 +1241,17 @@ impl LifecycleService {
         {
             warnings.push(format!("reparent stack references: {error}"));
         }
-        let removed = options.removed_snapshot.unwrap_or_else(|| RemovedWorktree {
-            slug: slug.to_owned(),
-            branch: row.target.branch.clone(),
-            removed_at: now_iso(),
-            work: None,
-            automations_paused: None,
-            extra: Default::default(),
-        });
+        let removed = options
+            .removed_snapshot
+            .clone()
+            .unwrap_or_else(|| RemovedWorktree {
+                slug: slug.to_owned(),
+                branch: row.target.branch.clone(),
+                removed_at: now_iso(),
+                work: None,
+                automations_paused: None,
+                extra: Default::default(),
+            });
         let removed = RemovedWorktree {
             removed_at: now_iso(),
             ..removed
@@ -1204,12 +1266,121 @@ impl LifecycleService {
         {
             warnings.push(format!("record removed worktree: {error}"));
         }
-        Ok(RemoveResult {
+        RemoveResult {
             removed: true,
             deleted_branch,
             destroyed_stage,
             warnings,
-        })
+        }
+    }
+
+    /// Finish removing a worktree whose checkout is already gone (Git lists
+    /// it as prunable). Nothing in the checkout can be lost, so this only
+    /// stops what still runs for it, prunes Git's registration and records
+    /// the removal. The branch can't be checked for unpushed commits without
+    /// a checkout, so deleting it needs `force`.
+    async fn finish_missing_checkout(
+        &self,
+        row: &WorktreeRecord,
+        main: &Path,
+        options: RemoveOptions,
+        expected_revision: Option<&RemovalRevision>,
+        lock: &FileLock,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoveResult, LifecycleError> {
+        if expected_revision.is_some_and(|expected| expected.digest != MISSING_CHECKOUT_DIGEST) {
+            return Err(LifecycleError::Refused(
+                "checkout changed after the removal warning; review the new state before removing"
+                    .into(),
+            ));
+        }
+        if options.delete_branch && !options.force {
+            return Err(LifecycleError::Refused(format!(
+                "{}; keep the branch, or force to delete it unchecked",
+                MISSING_CHECKOUT_HAZARD
+            )));
+        }
+        let trace = Path::new(&row.target.path);
+        let mut warnings = Vec::new();
+        if let Some(before_remove) = &self.before_remove {
+            warnings.extend(before_remove(row.target.clone(), cancellation.clone()).await);
+            if cancellation.is_cancelled() {
+                return Err(LifecycleError::Cancelled);
+            }
+        }
+        if let Some(dev) = &self.dev {
+            timed(trace, "dev-server-stop", async {
+                dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(row), lock, cancellation)
+                    .await
+                    .map_err(LifecycleError::from)
+            })
+            .await?;
+        }
+        // Both run inside the checkout; without it they can't run safely.
+        if self.config.destroy_command.is_some() {
+            warnings.push("skipped the destroy command: the checkout is already gone".into());
+        }
+        if options.destroy_stage {
+            warnings.push("skipped sst remove: the checkout is already gone".into());
+        }
+        timed(
+            trace,
+            "prune-registration",
+            self.prune_registration(row, main, cancellation),
+        )
+        .await?;
+        Ok(self
+            .finish_removal(
+                row,
+                main,
+                BackendKind::GitWorktree,
+                &options,
+                false,
+                warnings,
+            )
+            .await)
+    }
+
+    /// Make sure Git no longer registers `row`'s checkout, pruning metadata
+    /// left behind for a checkout that no longer exists.
+    async fn prune_registration(
+        &self,
+        row: &WorktreeRecord,
+        main: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LifecycleError> {
+        if !self.still_registered(row, cancellation).await? {
+            return Ok(());
+        }
+        tracing::warn!(target: "wt::removal", path = %row.target.path,
+            "Git still registers a removed checkout; pruning its metadata");
+        self.run_git(
+            main,
+            ["worktree", "prune"],
+            cancellation,
+            "prune Git worktree metadata",
+        )
+        .await?;
+        if self.still_registered(row, cancellation).await? {
+            return Err(LifecycleError::Refused(format!(
+                "Git still registers {} after pruning; run `git worktree prune` in the main clone",
+                row.target.path
+            )));
+        }
+        Ok(())
+    }
+
+    async fn still_registered(
+        &self,
+        row: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, LifecycleError> {
+        Ok(self
+            .repository
+            .inventory(cancellation)
+            .await?
+            .iter()
+            .any(|record| !record.is_main && record.target.path == row.target.path))
     }
 
     pub async fn archive(
@@ -2272,7 +2443,18 @@ impl LifecycleService {
         cancellation: &CancellationToken,
     ) -> Result<WorktreeRecord, LifecycleError> {
         let inventory = self.repository.inventory(cancellation).await?;
-        let expected = canonicalize(Path::new(&target.path), "resolve requested target").await?;
+        let requested = Path::new(&target.path);
+        let expected = match fs::canonicalize(requested).await {
+            Ok(path) => path,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => requested.to_path_buf(),
+            Err(source) => {
+                return Err(LifecycleError::Io {
+                    operation: "resolve requested target",
+                    path: requested.to_path_buf(),
+                    source,
+                });
+            }
+        };
         inventory
             .into_iter()
             .find(|row| {
@@ -2888,6 +3070,14 @@ fn truncate_slug(slug: String, limit: usize) -> String {
     slug[..byte_end].to_owned()
 }
 
+/// Git still registers this linked worktree, but its checkout is gone.
+pub async fn checkout_missing(row: &WorktreeRecord) -> bool {
+    !row.is_main
+        && row.kind == wt_vcs::RepositoryKind::LinkedWorktree
+        && row.prunable
+        && matches!(fs::try_exists(&row.target.path).await, Ok(false))
+}
+
 async fn canonicalize(path: &Path, operation: &'static str) -> Result<PathBuf, LifecycleError> {
     fs::canonicalize(path)
         .await
@@ -3354,6 +3544,12 @@ async fn quarantine_checkout(
 /// Removal hazard for a dirty worktree.
 pub const UNCOMMITTED_HAZARD: &str = "uncommitted changes";
 pub const IN_PROGRESS_HAZARD: &str = "a rebase, merge or cherry-pick is in progress";
+/// Removal hazard for a registration whose checkout is already gone: its
+/// branch could not be checked for unpushed commits.
+pub const MISSING_CHECKOUT_HAZARD: &str =
+    "the checkout is already gone, so its branch was not checked for unpushed commits";
+/// Revision digest that witnesses a plan made against a missing checkout.
+const MISSING_CHECKOUT_DIGEST: &str = "missing-checkout";
 
 /// Removal hazard for commits that exist only locally.
 pub fn unpushed_hazard(count: u32) -> String {
@@ -3366,6 +3562,7 @@ pub fn unpushed_hazard(count: u32) -> String {
 pub fn is_lost_work_hazard(hazard: &str) -> bool {
     hazard == UNCOMMITTED_HAZARD
         || hazard == IN_PROGRESS_HAZARD
+        || hazard == MISSING_CHECKOUT_HAZARD
         || hazard.split_once(' ').is_some_and(|(count, rest)| {
             count.parse::<u64>().is_ok()
                 && (rest == "unpushed commit" || rest == "unpushed commits")
@@ -4217,6 +4414,88 @@ mod tests {
             Err(LifecycleError::Refused(message)) if message.contains("rebase")
         ));
         assert!(path.exists());
+    }
+
+    /// A checkout deleted while Git kept its registration stays on the board
+    /// as live. `rm` must finish it without the checkout, keeping the branch
+    /// unless forced, since its commits can no longer be checked.
+    #[tokio::test]
+    async fn a_registration_whose_checkout_is_gone_can_still_be_removed() {
+        let (_scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let created = service
+            .create(
+                "michael/ENG-11-orphaned",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        fs::remove_dir_all(&created.target.path).await.unwrap();
+        let registered = |service: &LifecycleService| {
+            let cancellation = cancellation.clone();
+            let slug = created.target.slug().to_owned();
+            let service = service.clone();
+            async move {
+                service
+                    .repository
+                    .inventory(&cancellation)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.target.slug() == slug)
+            }
+        };
+        assert!(registered(&service).await);
+
+        let revision = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(revision.hazards, [MISSING_CHECKOUT_HAZARD]);
+        assert!(is_lost_work_hazard(MISSING_CHECKOUT_HAZARD));
+        let delete_branch = RemoveOptions {
+            delete_branch: true,
+            ..RemoveOptions::default()
+        };
+        assert!(matches!(
+            service
+                .remove_with_revision(&created.target, delete_branch, &revision, &cancellation)
+                .await,
+            Err(LifecycleError::Refused(message)) if message.contains("already gone")
+        ));
+        assert!(registered(&service).await);
+
+        let result = service
+            .remove_with_revision(
+                &created.target,
+                RemoveOptions::default(),
+                &revision,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(result.removed && !result.deleted_branch);
+        assert!(!registered(&service).await);
+        let branch = runner
+            .run(
+                CommandSpec::new("git")
+                    .args([
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        "refs/heads/michael/ENG-11-orphaned",
+                    ])
+                    .cwd(&main),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(branch.status.success());
     }
 
     #[tokio::test]

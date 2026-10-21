@@ -8,6 +8,7 @@ mod service;
 
 pub use service::{
     CleanupCandidate, CreateOptions, CreateResult, LifecycleError, LifecycleService,
-    REMOVED_CHANGED, RemovalRevision, RemoveOptions, RemoveResult, ServiceConfig, StoreLocation,
-    UNCOMMITTED_HAZARD, is_lost_work_hazard, unpushed_hazard,
+    MISSING_CHECKOUT_HAZARD, REMOVED_CHANGED, RemovalRevision, RemoveOptions, RemoveResult,
+    ServiceConfig, StoreLocation, UNCOMMITTED_HAZARD, checkout_missing, is_lost_work_hazard,
+    unpushed_hazard,
 };

@@ -252,7 +252,10 @@ async fn landing_evidence(
 ) -> Result<Landing> {
     let path = Path::new(&row.target.path);
     // A stopped rebase or merge has a transient HEAD; it proves nothing.
-    if wt_vcs::operation_in_progress(row.git_dir.as_deref()).await {
+    // Without a checkout there is no HEAD to prove anything with.
+    if wt_vcs::operation_in_progress(row.git_dir.as_deref()).await
+        || wt_lifecycle::checkout_missing(row).await
+    {
         return Ok(Landing {
             pr_landed: false,
             local_merged: false,

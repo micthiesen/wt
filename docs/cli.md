@@ -107,6 +107,8 @@ concurrent generator to rewrite those paths during teardown. Existing changes
 still require the initial dirty-work confirmation. Do not put hand-edited
 source files in this list.
 
+After removing a checkout, wt confirms that Git no longer registers it and runs `git worktree prune` if it still does, so a removed row cannot stay on the board as live. A row whose checkout is already gone (Git lists it as `prunable`) can still be removed: wt stops its sessions and dev server, prunes the registration and records the removal, skipping the destroy command and SST removal because both run inside the checkout. Its branch cannot be checked for unpushed commits without a checkout, so this needs `--keep-branch`, or `--force` to delete the branch unchecked.
+
 - `--yes` / `-y` — skip confirmations.
 - `--force` — remove despite uncommitted / unpushed work, a stopped rebase, merge or cherry-pick, or an outstanding post-merge verification. A stopped rebase is a hazard on its own because the commits it already replayed exist only on its detached HEAD; while one is in progress the row is also never shown or treated as landed, since a rebase starts by checking out its target and that transient HEAD is often the base tip.
 - `--destroy-stage` / `--no-destroy-stage` — force the SST stage decision (default: prompt when your stage looks deployed).
