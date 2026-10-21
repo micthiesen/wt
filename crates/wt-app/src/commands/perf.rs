@@ -94,7 +94,14 @@ pub async fn snapshot(ctx: &AppContext, root_at_wt_instances: bool) -> Result<Sn
         .processes
         .run(spec, &ctx.cancellation)
         .await
-        .context("snapshot processes")?;
+        .with_context(|| {
+            if std::env::var_os("CODEX_SANDBOX").is_some() {
+                "snapshot processes: agent sandboxes deny process inspection; rerun on the host \
+                 (Codex: sandbox_permissions=\"require_escalated\")"
+            } else {
+                "snapshot processes"
+            }
+        })?;
     let output = output.checked("ps")?;
     let own_pid = std::process::id();
     let mut rows = output

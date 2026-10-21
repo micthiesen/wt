@@ -57,6 +57,12 @@ pub fn ensure_trusted_project(
         Err(error) if error.kind() == io::ErrorKind::NotFound => config_path.to_owned(),
         Err(error) => return Err(io_error(config_path, error)),
     };
+    // Already-trusted roots need no lock or write. Sandboxed agents can read
+    // but not write Codex's config directory, so the fast path keeps their
+    // routine wt commands from failing on the lock file.
+    if fs::read_to_string(&path).is_ok_and(|raw| is_trusted(&raw, key)) {
+        return Ok(());
+    }
     let mut lock_path = path.as_os_str().to_owned();
     lock_path.push(".wt-lock");
     let _lock = FileLock::acquire(Path::new(&lock_path)).map_err(|error| io_error(&path, error))?;
@@ -107,6 +113,19 @@ pub fn ensure_trusted_project(
         Err(error) => return Err(io_error(&path, error)),
     }
     write_atomic(&path, document.to_string().as_bytes()).map_err(|error| io_error(&path, error))
+}
+
+fn is_trusted(raw: &str, key: &str) -> bool {
+    raw.parse::<DocumentMut>().is_ok_and(|document| {
+        document
+            .get("projects")
+            .and_then(Item::as_table_like)
+            .and_then(|projects| projects.get(key))
+            .and_then(Item::as_table_like)
+            .and_then(|project| project.get("trust_level"))
+            .and_then(Item::as_str)
+            == Some("trusted")
+    })
 }
 
 fn write_atomic(path: &Path, content: &[u8]) -> io::Result<()> {
@@ -184,6 +203,22 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn already_trusted_root_needs_no_write_access_to_the_config_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_scratch, root, config) = fixture();
+        let directory = config.parent().unwrap();
+        fs::create_dir_all(directory).unwrap();
+        ensure_trusted_project(&config, &root).unwrap();
+        let saved = fs::read_to_string(&config).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o500)).unwrap();
+        let result = ensure_trusted_project(&config, &root);
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&config).unwrap(), saved);
     }
 
     #[test]
