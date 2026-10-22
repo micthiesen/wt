@@ -259,7 +259,9 @@ pub async fn execute_with_shutdown(
         UiAction::ManagedSignIn { .. } => bail!("sign-in belongs to a managed remote host"),
         // Ctrl+N builds its host picker and name prompt from the board. This
         // arm answers only a host the user already chose, with the same prompt.
-        UiAction::PrepareCreate { initial } => Ok(modal(wt_tui::new_worktree_prompt(&initial))),
+        UiAction::PrepareCreate { initial, placement } => {
+            Ok(modal(wt_tui::new_worktree_prompt(&initial, placement)))
+        }
         UiAction::KillAction { action_key, run_id } => {
             let killed = crate::actions::service(ctx)?
                 .kill_run(&action_key, &run_id, &ctx.cancellation)
@@ -356,7 +358,7 @@ pub async fn execute_with_shutdown(
                 .checked(name)?;
             Ok(message(format!("Copied {label}")))
         }
-        UiAction::Create { input } => {
+        UiAction::Create { input, .. } => {
             create_resolved(ctx, resolve_creation(ctx, &input).await?).await
         }
         UiAction::ResolveCreation { input } => Ok(UiReply {
@@ -735,6 +737,7 @@ async fn resolve_creation(ctx: &AppContext, input: &str) -> Result<wt_tui::Creat
         .into_iter()
         .find(|row| !row.is_main && row.target.branch == branch);
     Ok(wt_tui::CreatePlan {
+        already_exists: existing.is_some(),
         key: existing
             .as_ref()
             .map(|row| wt_core::worktree_target_key(&row.target))
@@ -763,6 +766,7 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
         expected == plan.key,
         "Creation identity changed; submit the request again"
     );
+    let reused = existing.is_some();
     let install = existing.is_none() && plan.install;
     let target = if let Some(row) = existing {
         row.target
@@ -836,6 +840,7 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
             target.slug(),
             setup_warning.unwrap_or_default()
         ),
+        creation_reused: reused,
         select_when_visible: Some(wt_core::worktree_target_key(&target)),
         ..Default::default()
     })

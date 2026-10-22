@@ -261,10 +261,13 @@ def main():
     parser.add_argument("--sections", action="store_true", help="also exercise filing and renaming through the terminal")
     parser.add_argument("--feeds", action="store_true", help="also verify log backfill, seen state and searchable help")
     parser.add_argument("--create", action="store_true", help="verify immediate creation feedback and background setup")
+    parser.add_argument("--create-section", action="store_true", help="create below the cursor in a custom section")
     parser.add_argument("--removal", action="store_true", help="verify overlapping removal menus and quit while a durable removal is held")
     args = parser.parse_args()
     if args.removal and (args.create or args.sections or args.exit_signal != "quit"):
         parser.error("--removal uses its own quit scenario; do not combine with --create, --sections or --exit-signal")
+    if args.create_section and not args.create:
+        parser.error("--create-section requires --create")
     binary = args.binary.resolve()
     root = args.output.resolve()
     spec = importlib.util.spec_from_file_location("wt_perf", Path(__file__).with_name("perf-baseline.py"))
@@ -339,6 +342,10 @@ def main():
     for key in ("WT_REPO_CONFIG", "WT_REPO_ID", "WT_AGENT", "BUN_INSPECT", "XDG_CONFIG_HOME",
                 "XDG_CACHE_HOME", "XDG_STATE_HOME", "NO_COLOR"):
         env.pop(key, None)
+    if args.create_section:
+        subprocess.run([str(binary), "section", "mv", "--only", "--",
+                        "bench-000", "bench-001", "bench-002", "Creation batch"],
+                       env=env, cwd=main_clone, check=True, capture_output=True, text=True, timeout=10)
     pid, master = pty.fork()
     if pid == 0:
         os.chdir(main_clone)
@@ -635,6 +642,13 @@ def main():
             os.write(master, b"created-feedback\r")
             wait_for(lambda data: b"created-feedback" in data, timeout=0.5)
             create_feedback_ms = (time.monotonic() - injected_create) * 1000
+            if args.create_section:
+                def pending_below_cursor(_):
+                    lines = [re.sub(r"\s+", "", "".join(row[:55])) for row in screen.cells]
+                    return any("NativeUItitle" in lines[index] and "created-feedback" in lines[index + 1]
+                               for index in range(len(lines) - 1))
+                wait_for(pending_below_cursor)
+
             # The submitted row is selected immediately, before Git resolves
             # its canonical identity. F12 reports its pending state instead of
             # attaching a different row or queueing an eventual attachment.
@@ -659,6 +673,10 @@ def main():
             delay_inventory.unlink()
             wait_for(lambda _: screen.contains("Created created-feedback"), timeout=15)
             assert (root / "worktrees/created-feedback").exists()
+            if args.create_section:
+                assert stored_slug("created-feedback").get("section") == "Creation batch"
+                assert stored_slug("created-feedback").get("creationAfter") == "bench-001"
+
             wait_for(lambda _: install_started.exists())
             assert not install_finished.exists(), "creation waited for dependency setup"
             wait_for(lambda _: install_finished.exists(), timeout=12)
@@ -666,6 +684,15 @@ def main():
             wait_for(lambda _: any(stored_slug(f"bench-{index:03}").get("manualTitle")
                                    == "Creation did not steal selection" for index in range(3)))
             assert stored_slug("created-feedback").get("manualTitle") != "Creation did not steal selection"
+            if args.create_section:
+                subprocess.run([str(binary), "section", "mv", "--only", "--", "bench-002", "Other batch"],
+                               env=env, cwd=main_clone, check=True, capture_output=True, text=True, timeout=10)
+                wait_for(lambda _: screen.contains("Other batch"))
+                os.write(master, b"n")
+                wait_for(lambda _: screen.contains("New worktree name"))
+                os.write(master, b"bench-002 --no-install\r")
+                wait_for(lambda _: screen.contains("Created bench-002"), timeout=10)
+                assert stored_slug("bench-002").get("section") == "Other batch", "reopening an existing name moved it"
             os.write(master, b"q")
         elif args.exit_signal == "quit":
             # The action has been admitted but its inventory read has not
@@ -707,6 +734,11 @@ def main():
             assert any(job["state"] == "succeeded" for job in jobs), jobs
             assert not (root / "worktrees" / first_removed).exists()
             assert (root / "worktrees" / second_retained).exists(), "cancelled second prompt removed its target"
+        if args.create_section:
+            reopened = subprocess.run([str(binary), "ls", "--json"], env=env, cwd=main_clone,
+                                      check=True, capture_output=True, text=True, timeout=10)
+            created = next(row for row in json.loads(reopened.stdout) if row["slug"] == "created-feedback")
+            assert created["section"] == "Creation batch", "a new process lost the creation section"
         assert b"\x1b[?1049l" in capture, "alternate screen was not restored"
         result = dict(slow_git_seconds=2, injected_key_to_output_ms=latency_ms,
                       idle_no_unexpected_frames=True, idle_clock_frames=idle_clock_frames,
@@ -724,6 +756,7 @@ def main():
                       durable_removal_completed_after_exit=args.removal,
                       create_feedback_ms=create_feedback_ms if args.create else None,
                       background_setup=args.create,
+                      creation_section_and_position=args.create_section,
                       clean_shutdown=True, exit_signal=args.exit_signal)
         (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))

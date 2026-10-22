@@ -65,6 +65,11 @@ it. The start and completion playbooks repeat this ownership rule. A PR or an
 idle session does not establish disuse, and no automatic shutdown is tied to
 either signal.
 
+The handoff skill puts the new worktree in the source worktree's section when
+that section can be read. It moves only the new row before agent launch. Inbox
+stays Inbox. A worker without access to controller-owned sections keeps the
+default and reports that limit. Section choice does not change the Git base.
+
 The start skill reads a primary tracker task through `wt issue --read`, alongside
 the brief and any attached GitHub issue. `[issue_tracker] read_command` supplies
 the provider implementation; no provider name or credential belongs in managed

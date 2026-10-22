@@ -13,6 +13,8 @@ pub enum UiAction {
     },
     PrepareCreate {
         initial: String,
+        #[serde(default)]
+        placement: Option<CreatePlacement>,
     },
     ResolveCreation {
         input: String,
@@ -195,6 +197,8 @@ pub enum UiAction {
     },
     Create {
         input: String,
+        #[serde(default)]
+        placement: Option<CreatePlacement>,
     },
     OpenEditor {
         key: String,
@@ -619,7 +623,9 @@ pub enum TextAction {
         id: String,
         arg: Option<String>,
     },
-    Create,
+    Create {
+        placement: Option<CreatePlacement>,
+    },
     NewSection {
         key: String,
         #[serde(default)]
@@ -715,10 +721,16 @@ pub struct UiReply {
     /// Read-only host preparation; never starts a checkout by itself.
     #[serde(default)]
     pub creation_plan: Option<CreatePlan>,
+    /// A concurrent or repeated request used an existing checkout.
+    #[serde(default)]
+    pub creation_reused: bool,
     /// The controller waits for presentation to bind the optimistic row to
     /// its exact host-owned key before a checkout can enter inventory.
     #[serde(skip)]
     pub creation_prepared: Option<CreationPrepared>,
+    /// The controller accepted the new row's layout on its own clock.
+    #[serde(skip)]
+    pub creation_placement: Option<CreationPlacementAccepted>,
     #[serde(skip)]
     pub operation_id: Option<u64>,
     #[serde(skip)]
@@ -754,8 +766,17 @@ pub struct UiReply {
     pub stale: bool,
 }
 
+/// The section and row where the create prompt opened.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreatePlacement {
+    pub section: Option<String>,
+    pub after: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreatePlan {
+    #[serde(default)]
+    pub already_exists: bool,
     pub key: String,
     pub branch: String,
     pub base: Option<String>,
@@ -765,8 +786,16 @@ pub struct CreatePlan {
 }
 
 #[derive(Debug)]
+pub struct CreationPlacementAccepted {
+    pub key: String,
+    pub placement: CreatePlacement,
+    pub accepted_at: wt_runtime::Stamp,
+}
+
+#[derive(Debug)]
 pub struct CreationPrepared {
     pub key: String,
+    pub already_exists: bool,
     pub ready: oneshot::Sender<()>,
 }
 

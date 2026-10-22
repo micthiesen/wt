@@ -72,6 +72,7 @@ fn default_harness_key_remains_available_while_creation_is_pending() {
     model.begin_action(
         1,
         &crate::UiAction::Create {
+            placement: None,
             input: "new".into(),
         },
     );

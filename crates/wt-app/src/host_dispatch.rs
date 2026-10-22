@@ -426,7 +426,8 @@ pub async fn execute(
     } else {
         None
     };
-    let action = if let UiAction::Create { input } = action {
+    let mut created_placement = None;
+    let action = if let UiAction::Create { input, placement } = action {
         // Resolving identity has not accepted a filesystem mutation. It must
         // remain cancellable even though the outer user request is Create.
         let preparation = async {
@@ -458,10 +459,16 @@ pub async fn execute(
             || plan.key.clone(),
             |host| wt_core::remote_worktree_ledger_key(host, &plan.key),
         );
-        if !replies.prepare_creation(key, shutdown).await? {
+        if !replies
+            .prepare_creation(key.clone(), plan.already_exists, shutdown)
+            .await?
+        {
             return Ok(UiReply::no_change(
                 "Creation cancelled before checkout started",
             ));
+        }
+        if !plan.already_exists {
+            created_placement = placement.map(|placement| (key, placement));
         }
         UiAction::CreateResolved { plan }
     } else {
@@ -476,6 +483,47 @@ pub async fn execute(
                 .await?
         }
     };
+    if !reply.failed
+        && !reply.creation_reused
+        && let Some((key, placement)) = created_placement
+    {
+        let snapshot = fleet.board.snapshot();
+        match crate::creation_placement::accept(
+            context,
+            snapshot.data().map(|board| board.as_ref()),
+            key,
+            placement,
+        )
+        .await
+        {
+            Ok(accepted) => {
+                // The checkout and layout are accepted. Closing the board
+                // must not turn them into a failed creation or block its drain.
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {}
+                    result = replies.send(UiReply {
+                        creation_placement: Some(accepted),
+                        ..Default::default()
+                    }) => {
+                        if let Err(error) = result {
+                            tracing::debug!(%error, "creation layout accepted after the terminal closed");
+                        }
+                    }
+                }
+                fleet.local.sources.metadata.refresh();
+            }
+            Err(error) => {
+                // The checkout exists. Report the layout failure without
+                // turning an accepted creation into a retry of that write.
+                tracing::warn!(error = %format!("{error:#}"), "created worktree could not keep the requested position");
+                reply
+                    .message
+                    .push_str(&format!("; section placement failed: {error:#}"));
+                reply.notice = true;
+            }
+        }
+    }
     if !reply.failed
         && let Some((key, revision)) = migrated_pin
     {

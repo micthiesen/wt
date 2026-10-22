@@ -55,7 +55,7 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         check("state migration and diagnostics", "command", binary),
         check("SST cleanup", "stages", "--binary", binary),
         check("optimistic creation and navigation", "ui", "--binary", binary,
-              "--create", "--output", str(output / "wt-native-create")),
+              "--create", "--create-section", "--output", str(output / "wt-native-create")),
         check("overlapping removal and prompt responsiveness", "ui", "--binary", binary,
               "--removal", "--output", str(output / "wt-native-removal")),
     ]

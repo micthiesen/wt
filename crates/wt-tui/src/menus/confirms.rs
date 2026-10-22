@@ -78,7 +78,11 @@ pub(super) fn review_checkout(
 /// `Ctrl+N`: choose a host when remote hosts are configured, then name the
 /// worktree. The host list is the board's own, so the choice is local; the
 /// chosen host answers the name prompt through its controller.
-pub(super) fn create(board: &Board, initial: &str) -> Menu {
+pub(super) fn create(
+    board: &Board,
+    initial: &str,
+    placement: Option<crate::CreatePlacement>,
+) -> Menu {
     if board.hosts.is_empty() {
         // Without the host list the picker cannot be built; the host answers
         // with the same name prompt.
@@ -87,7 +91,7 @@ pub(super) fn create(board: &Board, initial: &str) -> Menu {
         };
     }
     if board.hosts.len() <= 1 {
-        return Menu::Local(LocalMenu::modal(new_worktree_prompt(initial)));
+        return Menu::Local(LocalMenu::modal(new_worktree_prompt(initial, placement)));
     }
     let options = board
         .hosts
@@ -105,6 +109,7 @@ pub(super) fn create(board: &Board, initial: &str) -> Menu {
     Menu::Local(LocalMenu::modal(UiModal::Picker {
         action: PickerAction::Host {
             action: Box::new(UiAction::PrepareCreate {
+                placement: placement.clone(),
                 initial: initial.to_owned(),
             }),
         },
@@ -115,9 +120,9 @@ pub(super) fn create(board: &Board, initial: &str) -> Menu {
 }
 
 /// The name prompt for a new worktree on the host that answers it.
-pub fn new_worktree_prompt(initial: &str) -> UiModal {
+pub fn new_worktree_prompt(initial: &str, placement: Option<crate::CreatePlacement>) -> UiModal {
     UiModal::Text {
-        action: TextAction::Create,
+        action: TextAction::Create { placement },
         prompt: "New worktree name: ".into(),
         initial: initial.to_owned(),
         allow_empty: false,
@@ -236,7 +241,10 @@ mod tests {
     #[test]
     fn create_asks_for_a_host_only_when_remotes_exist() {
         // Empty board: the host answers.
-        assert!(matches!(create(&Board::default(), ""), Menu::Host { .. }));
+        assert!(matches!(
+            create(&Board::default(), "", None),
+            Menu::Host { .. }
+        ));
         // Local only: the name prompt opens directly.
         let local = Board {
             hosts: vec![HostChoice {
@@ -246,13 +254,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        let Menu::Local(LocalMenu::Modal { modal, .. }) = create(&local, "--base main") else {
+        let Menu::Local(LocalMenu::Modal { modal, .. }) = create(&local, "--base main", None)
+        else {
             panic!("expected the name prompt");
         };
         assert_eq!(
             *modal,
             UiModal::Text {
-                action: TextAction::Create,
+                action: TextAction::Create { placement: None },
                 prompt: "New worktree name: ".into(),
                 initial: "--base main".into(),
                 allow_empty: false,
@@ -275,7 +284,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let Menu::Local(LocalMenu::Modal { modal, .. }) = create(&remote, "") else {
+        let Menu::Local(LocalMenu::Modal { modal, .. }) = create(&remote, "", None) else {
             panic!("expected the host picker");
         };
         let UiModal::Picker {
@@ -308,6 +317,7 @@ mod tests {
             action,
             PickerAction::Host {
                 action: Box::new(UiAction::PrepareCreate {
+                    placement: None,
                     initial: String::new(),
                 }),
             }

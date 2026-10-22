@@ -614,7 +614,7 @@ fn n_is_always_local_and_ctrl_n_needs_a_remote() {
     assert!(matches!(
         &model.interaction,
         Interaction::Text(TextPrompt {
-            action: TextAction::Create,
+            action: TextAction::Create { placement: None },
             ..
         })
     ));
@@ -672,6 +672,7 @@ fn tab_moves_a_new_worktree_between_hosts_and_n_remembers_the_choice() {
         InputResult::Action(UiAction::OnHost {
             host: Some("beast".into()),
             action: Box::new(UiAction::Create {
+                placement: None,
                 input: "fix".into()
             }),
         })
@@ -685,7 +686,10 @@ fn tab_moves_a_new_worktree_between_hosts_and_n_remembers_the_choice() {
     ch(&mut model, 'x');
     assert_eq!(
         press(&mut model, KeyCode::Enter),
-        InputResult::Action(UiAction::Create { input: "x".into() })
+        InputResult::Action(UiAction::Create {
+            placement: None,
+            input: "x".into()
+        })
     );
 }
 
@@ -1088,7 +1092,7 @@ fn failed_remote_create_keeps_host_name_and_retry_input() {
         message: "MaxBook worker is not connected; no command was sent".into(),
         modal_host: Some("maxbook".into()),
         modal: Some(UiModal::Text {
-            action: TextAction::Create,
+            action: TextAction::Create { placement: None },
             prompt: "New worktree name: ".into(),
             initial: "remote-task".into(),
             allow_empty: false,
@@ -1126,6 +1130,7 @@ fn failed_remote_create_keeps_host_name_and_retry_input() {
 fn deferred_remote_create_confirms_sign_in_with_original_input_and_host() {
     let mut model = model_with(&["one"]);
     let create = UiAction::Create {
+        placement: None,
         input: "remote-task --no-install".into(),
     };
     model.begin_action(

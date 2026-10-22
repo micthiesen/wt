@@ -285,6 +285,7 @@ mod tests {
         model.begin_action(
             1,
             &crate::UiAction::PrepareCreate {
+                placement: None,
                 initial: String::new(),
             },
         );

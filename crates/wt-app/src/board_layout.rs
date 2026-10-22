@@ -10,6 +10,38 @@ use wt_core::{
 };
 use wt_tui::{Board, BoardSection, SectionRollup, WorkRiskCount, WorkStateCount};
 
+/// Apply explicit positions for unstarted rows. Invalid cycles retain every row.
+fn apply_creation_positions(rows: &mut Vec<usize>, positions: &[(usize, Option<usize>)]) {
+    if positions.is_empty() {
+        return;
+    }
+    let anchored = positions
+        .iter()
+        .map(|(row, _)| *row)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut children = BTreeMap::<Option<usize>, Vec<usize>>::new();
+    for &(row, anchor) in positions {
+        children.entry(anchor).or_default().push(row);
+    }
+    let mut roots = children.get(&None).cloned().unwrap_or_default();
+    roots.extend(rows.iter().copied().filter(|row| !anchored.contains(row)));
+    // A malformed cycle has no root. These fallbacks keep the function total.
+    roots.extend(rows.iter().copied());
+    let mut pending = roots.into_iter().rev().collect::<Vec<_>>();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut placed = Vec::with_capacity(rows.len());
+    while let Some(row) = pending.pop() {
+        if !visited.insert(row) {
+            continue;
+        }
+        placed.push(row);
+        if let Some(next) = children.get(&Some(row)) {
+            pending.extend(next.iter().rev().copied());
+        }
+    }
+    *rows = placed;
+}
+
 pub const INBOX: &str = "\0inbox";
 pub const REMOVING: &str = "\0removing";
 pub const ARCHIVED: &str = "\0archived";
@@ -55,6 +87,16 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             }
         })
         .collect();
+    for (index, row) in board.rows.iter_mut().enumerate() {
+        let entry = &state["slugs"][&row.key];
+        row.creation_placement = entry
+            .get("creationAfter")
+            .filter(|_| !entry["order"].is_number())
+            .map(|after| wt_tui::CreatePlacement {
+                section: (section_keys[index] != INBOX).then(|| section_keys[index].clone()),
+                after: after.as_str().map(str::to_owned),
+            });
+    }
     let index_by_branch: BTreeMap<String, usize> = board
         .rows
         .iter()
@@ -138,6 +180,36 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 .then_with(|| a.2.cmp(b.2))
                 .then_with(|| a.3.cmp(&b.3))
         });
+        let positions = indices
+            .iter()
+            .filter_map(|&index| {
+                let entry = &state["slugs"][&board.rows[index].key];
+                let after = entry.get("creationAfter")?;
+                if entry["order"].is_number()
+                    || anchor_of(index) != index
+                    || (sort == UiSort::Status && parse_work_status(&entry["work"]).is_some())
+                {
+                    return None;
+                }
+                let anchor = after
+                    .as_str()
+                    .and_then(|key| {
+                        indices
+                            .iter()
+                            .copied()
+                            .find(|&row| board.rows[row].key == key)
+                    })
+                    .and_then(|row| {
+                        let root = anchor_of(row);
+                        indices
+                            .iter()
+                            .copied()
+                            .rfind(|&member| anchor_of(member) == root)
+                    });
+                Some((index, anchor.filter(|anchor| *anchor != index)))
+            })
+            .collect::<Vec<_>>();
+        apply_creation_positions(indices, &positions);
     }
     board.section_order = crate::commands::section::manual_sections(state);
     let folded = state["foldedSections"]
@@ -404,6 +476,58 @@ mod tests {
             title: slug.into(),
             ..BoardRow::default()
         }
+    }
+
+    #[test]
+    fn creation_stays_after_the_selected_stack_until_status_or_manual_order_changes() {
+        let mut board = Board {
+            rows: vec![row("new"), row("root"), row("child"), row("other")],
+            ..Default::default()
+        };
+        let mut state = json!({"sectionsOrder":["Batch"],"slugs":{
+            "root":{"section":"Batch","order":1,"work":{"state":"working","at":"now"}},
+            "child":{"section":"Batch","baseBranch":"root"},
+            "other":{"section":"Batch","order":2,"work":{"state":"working","at":"now"}},
+            "new":{"section":"Batch","order":null,"creationAfter":"root"}
+        }});
+        let keys = |board: &Board| {
+            board
+                .sections
+                .iter()
+                .find(|section| section.key == "Batch")
+                .unwrap()
+                .rows
+                .iter()
+                .map(|&index| board.rows[index].key.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        prepare(&mut board, &state, "main", UiSort::Status);
+        assert_eq!(keys(&board), "root,child,new,other");
+        state["slugs"]["new"]["work"] = json!({"state":"todo","at":"now"});
+        prepare(&mut board, &state, "main", UiSort::Status);
+        assert_eq!(keys(&board), "root,child,other,new");
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(keys(&board), "root,child,new,other");
+        state["slugs"]["new"]["order"] = json!(3);
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(keys(&board), "root,child,other,new");
+    }
+
+    #[test]
+    fn creation_positions_handle_empty_sections_chains_and_invalid_cycles() {
+        let mut rows = vec![0, 1, 2, 3];
+        apply_creation_positions(&mut rows, &[(1, Some(0)), (2, Some(1)), (3, None)]);
+        assert_eq!(rows, [3, 0, 1, 2]);
+        let mut rows = vec![0, 1, 2];
+        apply_creation_positions(&mut rows, &[(0, Some(1)), (1, Some(0))]);
+        assert_eq!(
+            rows.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3
+        );
     }
 
     #[test]

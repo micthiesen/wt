@@ -125,7 +125,7 @@ impl Model {
             Interaction::Text(prompt) => {
                 // Tab moves a new worktree between hosts. A stacked create
                 // (`--base`) stays on its parent's host.
-                if matches!(prompt.action, TextAction::Create)
+                if matches!(prompt.action, TextAction::Create { .. })
                     && code == KeyCode::Tab
                     && !control
                     && self.board.hosts.len() > 1
@@ -233,7 +233,10 @@ impl Model {
                                 arg: arg.clone(),
                                 extras: text,
                             },
-                            TextAction::Create => UiAction::Create { input: text },
+                            TextAction::Create { placement } => UiAction::Create {
+                                placement: placement.clone(),
+                                input: text,
+                            },
                             TextAction::NewSection { key, seen } => {
                                 self.last_section_target = Some(Some(text.clone()));
                                 UiAction::MoveSection {

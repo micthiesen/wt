@@ -1302,6 +1302,7 @@ mod tests {
         assert!(
             host.wait_for_action(
                 &wt_tui::UiAction::Create {
+                    placement: None,
                     input: "test".into()
                 },
                 wt_core::HarnessId::Codex,
@@ -1317,6 +1318,7 @@ mod tests {
         let scope = TaskScope::new();
         let (host, _readiness) = waiting_host(&scope);
         let action = wt_tui::UiAction::Create {
+            placement: None,
             input: "test".into(),
         };
         let mut waiting = Box::pin(host.wait_for_action(
@@ -1339,6 +1341,7 @@ mod tests {
         let scope = TaskScope::new();
         let (host, readiness) = waiting_host(&scope);
         let action = wt_tui::UiAction::Create {
+            placement: None,
             input: "test".into(),
         };
         let mut waiting = Box::pin(host.wait_for_action(

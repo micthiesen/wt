@@ -130,7 +130,14 @@ impl UiMutation {
     /// row, or the harness a cycle switched to.
     pub(crate) fn on_accepted(&mut self, reply: &UiReply) {
         match &mut self.kind {
-            MutationKind::Lifecycle(LifecycleChange::Create { resolved, .. }) => {
+            MutationKind::Lifecycle(LifecycleChange::Create {
+                resolved,
+                placement,
+                ..
+            }) => {
+                if reply.creation_reused {
+                    *placement = None;
+                }
                 *resolved = reply.select_when_visible.clone();
                 self.target.key = resolved.clone().or_else(|| self.target.key.clone());
             }

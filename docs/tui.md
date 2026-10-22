@@ -74,6 +74,14 @@ yellow "blocked on" group with external gates. A review request's details show i
 author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
 shows a scrollbar when it overflows.
 
+Creation uses the section where the name prompt opened, including Inbox.
+The new row appears below the selected row or stack. A folded section opens
+and receives the new row at the top. This position is stored on the controller,
+including for a remote checkout. An unstarted row keeps this position across
+restarts. Under status sorting, its work status takes precedence once assigned;
+manual reordering also replaces the initial position. An existing worktree keeps
+its section when its name is entered again.
+
 Creation immediately selects one optimistic row with its title and a progress
 glyph. Normal list navigation, attention controls and default-harness switching
 remain available. The

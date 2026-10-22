@@ -917,10 +917,12 @@ fn cleanup_conflicts(targets: &BTreeSet<(Option<String>, String)>, other: &Lane)
     }
 }
 
-fn create_retry(action: &wt_tui::UiAction) -> Option<(Option<String>, String)> {
+fn create_retry(
+    action: &wt_tui::UiAction,
+) -> Option<(Option<String>, String, Option<wt_tui::CreatePlacement>)> {
     let (host, action, _) = crate::host_routing::resolve(action.clone()).ok()?;
     match action {
-        wt_tui::UiAction::Create { input } => Some((host, input)),
+        wt_tui::UiAction::Create { input, placement } => Some((host, input, placement)),
         _ => None,
     }
 }
@@ -973,13 +975,16 @@ pub fn error_reply(error: &anyhow::Error) -> UiReply {
 }
 
 #[cfg(test)]
-fn action_reply(result: Result<UiReply>, retry: Option<(Option<String>, String)>) -> UiReply {
+fn action_reply(
+    result: Result<UiReply>,
+    retry: Option<(Option<String>, String, Option<wt_tui::CreatePlacement>)>,
+) -> UiReply {
     action_reply_with_context(result, retry, None)
 }
 
 fn action_reply_with_context(
     result: Result<UiReply>,
-    retry: Option<(Option<String>, String)>,
+    retry: Option<(Option<String>, String, Option<wt_tui::CreatePlacement>)>,
     context: Option<&ActionLogContext>,
 ) -> UiReply {
     let (mut reply, ambiguous) = match result {
@@ -1020,11 +1025,11 @@ fn action_reply_with_context(
     if reply.failed
         && !ambiguous
         && reply.modal.is_none()
-        && let Some((host, input)) = retry
+        && let Some((host, input, placement)) = retry
     {
         reply.modal_host = host;
         reply.modal = Some(wt_tui::UiModal::Text {
-            action: wt_tui::TextAction::Create,
+            action: wt_tui::TextAction::Create { placement },
             prompt: "New worktree name: ".into(),
             initial: input,
             allow_empty: false,
@@ -1143,11 +1148,16 @@ impl RequestReplies {
     pub(crate) async fn prepare_creation(
         &self,
         key: String,
+        already_exists: bool,
         shutdown: &CancellationToken,
     ) -> Result<bool> {
         let (ready, received) = tokio::sync::oneshot::channel();
         let reply = UiReply {
-            creation_prepared: Some(wt_tui::CreationPrepared { key, ready }),
+            creation_prepared: Some(wt_tui::CreationPrepared {
+                key,
+                already_exists,
+                ready,
+            }),
             ..Default::default()
         };
         tokio::select! {
@@ -1164,7 +1174,10 @@ impl RequestReplies {
 
     pub(crate) async fn send(&self, mut reply: UiReply) -> Result<()> {
         reply.ui_generation = Some(self.generation);
-        if reply.handoff.is_some() || reply.creation_prepared.is_some() {
+        if reply.handoff.is_some()
+            || reply.creation_prepared.is_some()
+            || reply.creation_placement.is_some()
+        {
             reply.operation_id = Some(self.id);
         }
         self.sender
@@ -1443,7 +1456,7 @@ mod tests {
             let shutdown = CancellationToken::new();
             let worker = tokio::spawn(async move {
                 replies
-                    .prepare_creation("canonical-key".into(), &shutdown)
+                    .prepare_creation("canonical-key".into(), false, &shutdown)
                     .await
                     .unwrap()
             });
@@ -1477,7 +1490,7 @@ mod tests {
         let cancel = shutdown.clone();
         let worker = tokio::spawn(async move {
             replies
-                .prepare_creation("canonical-key".into(), &cancel)
+                .prepare_creation("canonical-key".into(), false, &cancel)
                 .await
                 .unwrap()
         });
@@ -1642,7 +1655,7 @@ mod tests {
 
     #[test]
     fn remote_create_failure_restores_input_but_ambiguous_outcome_does_not() {
-        let retry = Some((Some("builder".into()), "keep my title".into()));
+        let retry = Some((Some("builder".into()), "keep my title".into(), None));
         let failed = UiReply {
             failed: true,
             message: "branch already exists".into(),
@@ -2190,6 +2203,7 @@ mod tests {
         let active = Lane::Removal(None, "old-worktree".into());
         let other_remove = Lane::Removal(None, "other-worktree".into());
         let create = lane_for(&UiAction::Create {
+            placement: None,
             input: "new".into(),
         })
         .unwrap();
@@ -2243,6 +2257,7 @@ mod tests {
         );
         assert_eq!(
             action_target(&UiAction::Create {
+                placement: None,
                 input: "potentially sensitive title".into(),
             }),
             None
@@ -2398,6 +2413,7 @@ mod tests {
             (
                 creation_lane.clone(),
                 UiAction::Create {
+                    placement: None,
                     input: "new-row".into(),
                 },
             ),
@@ -2411,6 +2427,7 @@ mod tests {
             Some((
                 creation_lane.clone(),
                 UiAction::Create {
+                    placement: None,
                     input: "new-row".into()
                 }
             ))
@@ -2465,12 +2482,13 @@ mod tests {
         let action = UiAction::OnHost {
             host: Some("builder".into()),
             action: Box::new(UiAction::Create {
+                placement: None,
                 input: "retry title".into(),
             }),
         };
         assert_eq!(
             create_retry(&action),
-            Some((Some("builder".into()), "retry title".into()))
+            Some((Some("builder".into()), "retry title".into(), None))
         );
     }
 

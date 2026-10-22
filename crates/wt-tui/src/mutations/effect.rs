@@ -249,12 +249,13 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 title: title.clone(),
             },
         ),
-        UiAction::Create { input } => on_board(
+        UiAction::Create { input, placement } => on_board(
             host,
             LifecycleChange::Create {
                 request_id: 0,
                 input: input.clone(),
                 resolved: None,
+                placement: placement.clone(),
             },
         ),
         UiAction::CreateResolved { plan } => on_board(
@@ -263,6 +264,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 request_id: 0,
                 input: plan.branch.clone(),
                 resolved: Some(plan.key.clone()),
+                placement: None,
             },
         ),
         UiAction::Remove { key, .. } => on_row(

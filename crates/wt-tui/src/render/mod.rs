@@ -924,7 +924,7 @@ mod tests {
             failed: true,
             message: "MaxBook worker is not connected; no command was sent".into(),
             modal: Some(crate::UiModal::Text {
-                action: crate::TextAction::Create,
+                action: crate::TextAction::Create { placement: None },
                 prompt: "New worktree name: ".into(),
                 initial: "remote-task".into(),
                 allow_empty: false,

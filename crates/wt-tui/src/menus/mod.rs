@@ -86,7 +86,9 @@ impl UiAction {
                 },
                 menu => menu,
             },
-            A::PrepareCreate { initial } => confirms::create(board, initial),
+            A::PrepareCreate { initial, placement } => {
+                confirms::create(board, initial, placement.clone())
+            }
             A::ResolveCreation { .. } => Menu::Host {
                 reason: "parses the request against the host's branches",
             },

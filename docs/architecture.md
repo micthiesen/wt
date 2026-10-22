@@ -355,6 +355,13 @@ An expiry while confirmed data still disagrees shows one notice.
   uses a durable background action, so
   it does not delay agent entry. When a selected row disappears, cursor fallback
   uses the current visual row identity and section, not a stale position.
+  Creation captures that section and an anchor key. After checkout creation,
+  the controller records the new layout and sends its own acceptance stamp to
+  the TUI before the final creation reply. Layout and remote checkout creation use separate pending mutations,
+  so neither host's clock confirms the other write. The `creationAfter` layout
+  field applies while the row has no explicit order and, under status sorting,
+  no work status. The projection preserves stack units and handles missing or
+  cyclic anchors without dropping rows.
   J/K selection follows the pending reorder through unchanged snapshots and
   its confirming layout. Filing through the section picker, archiving, or
   removing a row keeps the cursor on a surviving neighbor in its old section.

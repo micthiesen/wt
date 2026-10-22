@@ -17,6 +17,7 @@ mod context;
 mod controller;
 mod controller_actions;
 mod controller_tunnels;
+mod creation_placement;
 mod database;
 mod dev;
 mod dev_source;

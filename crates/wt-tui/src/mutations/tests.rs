@@ -200,6 +200,7 @@ async fn every_mutation_kind_meets_the_contract() {
         ),
         (
             whole(LifecycleChange::Create {
+                placement: None,
                 request_id: 1,
                 input: "new".into(),
                 resolved: Some("new".into()),
@@ -521,7 +522,10 @@ fn every_declared_domain_can_settle() {
             key: "a".into(),
             title: "t".into(),
         },
-        UiAction::Create { input: "n".into() },
+        UiAction::Create {
+            placement: None,
+            input: "n".into(),
+        },
         UiAction::Remove {
             key: "a".into(),
             force: false,
@@ -585,6 +589,7 @@ fn every_declared_domain_can_settle() {
 #[test]
 fn creation_projection_replaces_placeholder_with_the_exact_inventory_row() {
     let mut creating = whole(LifecycleChange::Create {
+        placement: None,
         request_id: 1,
         input: "new".into(),
         resolved: None,

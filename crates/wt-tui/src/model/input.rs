@@ -601,7 +601,9 @@ impl Model {
                 });
                 self.interaction_host = host.clone();
                 self.interaction = Interaction::Text(TextPrompt {
-                    action: TextAction::Create,
+                    action: TextAction::Create {
+                        placement: self.creation_placement(),
+                    },
                     prompt: self.create_prompt(host.as_deref()),
                     editor: LineEditor::default(),
                     allow_empty: false,
@@ -613,6 +615,7 @@ impl Model {
                     return self.notify("[remote] is not configured");
                 }
                 InputResult::Action(UiAction::PrepareCreate {
+                    placement: self.creation_placement(),
                     initial: String::new(),
                 })
             }
@@ -636,11 +639,16 @@ impl Model {
                 if let Some(host) = self.actionable_row().and_then(|row| row.host.as_ref()) {
                     return InputResult::Action(UiAction::OnHost {
                         host: Some(host.clone()),
-                        action: Box::new(UiAction::PrepareCreate { initial }),
+                        action: Box::new(UiAction::PrepareCreate {
+                            initial,
+                            placement: self.creation_placement(),
+                        }),
                     });
                 }
                 self.interaction = Interaction::Text(TextPrompt {
-                    action: TextAction::Create,
+                    action: TextAction::Create {
+                        placement: self.creation_placement(),
+                    },
                     prompt: "New worktree name: ".into(),
                     editor: LineEditor::new(&initial),
                     allow_empty: false,

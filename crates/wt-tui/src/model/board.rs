@@ -605,6 +605,9 @@ pub struct BoardRow {
     pub needs_attention: bool,
     #[serde(default)]
     pub work_rank: u8,
+    /// Stored position of a row created from the board.
+    #[serde(default)]
+    pub creation_placement: Option<crate::CreatePlacement>,
     #[serde(default)]
     pub verify_steps: Option<String>,
     pub issue_id: Option<String>,

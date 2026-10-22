@@ -132,6 +132,7 @@ fn stale_special_session_completion_cannot_erase_pending_creation_feedback() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "new".into(),
         },
     );
@@ -804,6 +805,7 @@ fn bind_creation(model: &mut Model, id: u64, key: &str) {
     model.reply(UiReply {
         operation_id: Some(id),
         creation_prepared: Some(crate::CreationPrepared {
+            already_exists: false,
             key: key.into(),
             ready,
         }),
@@ -819,6 +821,7 @@ fn creation_immediately_selects_one_pending_row_and_f12_never_queues_entry() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "new".into(),
         },
     );
@@ -908,6 +911,7 @@ fn pending_creation_does_not_block_quit() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "new".into(),
         },
     );
@@ -1119,6 +1123,7 @@ fn create_prompt_preserves_raw_cli_text_and_shift_n_seeds_base() {
     assert_eq!(
         model.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 20),
         InputResult::Action(UiAction::Create {
+            placement: None,
             input: "ENG-123 --attach --gh 12 --base origin/main".into()
         })
     );
@@ -1126,6 +1131,7 @@ fn create_prompt_preserves_raw_cli_text_and_shift_n_seeds_base() {
     assert_eq!(
         model.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 20),
         InputResult::Action(UiAction::Create {
+            placement: None,
             input: "--base feature/base".into()
         })
     );
@@ -1438,6 +1444,7 @@ fn remote_inventory_before_create_reply_never_duplicates_rows_or_blocks_attentio
         &UiAction::OnHost {
             host: Some(host.into()),
             action: Box::new(UiAction::Create {
+                placement: None,
                 input: "42 --no-install".into(),
             }),
         },
@@ -1482,7 +1489,13 @@ fn manual_navigation_survives_delayed_creation_plan_reply_and_inventory() {
     let mut model = Model::default();
     model.apply(snapshot(&["first", "second"]));
     let generation = model.ui_generation;
-    model.begin_action(1, &UiAction::Create { input: "42".into() });
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            placement: None,
+            input: "42".into(),
+        },
+    );
     assert_eq!(model.selected_row().unwrap().title, "42");
     model.input(KeyEvent::from(KeyCode::Char('k')), 20);
     assert_eq!(model.selected_row().unwrap().key, "second");
@@ -1508,6 +1521,7 @@ fn failed_or_expired_creation_does_not_acknowledge_a_late_plan() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "new".into(),
         },
     );
@@ -1521,6 +1535,7 @@ fn failed_or_expired_creation_does_not_acknowledge_a_late_plan() {
     model.reply(UiReply {
         operation_id: Some(1),
         creation_prepared: Some(crate::CreationPrepared {
+            already_exists: false,
             key: "new".into(),
             ready,
         }),
@@ -1540,6 +1555,7 @@ fn failed_creation_cannot_replace_a_new_prompt_on_the_same_selected_row() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "first".into(),
         },
     );
@@ -1551,7 +1567,7 @@ fn failed_creation_cannot_replace_a_new_prompt_on_the_same_selected_row() {
         ui_generation: Some(generation),
         failed: true,
         modal: Some(UiModal::Text {
-            action: TextAction::Create,
+            action: TextAction::Create { placement: None },
             prompt: "retry".into(),
             initial: "first".into(),
             allow_empty: false,
@@ -1570,6 +1586,7 @@ fn paste_invalidates_pending_presentation_but_ignored_paste_does_not() {
     model.begin_action(
         1,
         &UiAction::PrepareCreate {
+            placement: None,
             initial: String::new(),
         },
     );
@@ -1583,7 +1600,7 @@ fn paste_invalidates_pending_presentation_but_ignored_paste_does_not() {
         operation_id: Some(1),
         ui_generation: Some(generation),
         modal: Some(UiModal::Text {
-            action: TextAction::Create,
+            action: TextAction::Create { placement: None },
             prompt: "stale".into(),
             initial: "stale".into(),
             allow_empty: false,
@@ -1602,6 +1619,7 @@ fn creation_completion_does_not_close_newer_history_view() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "new".into(),
         },
     );
@@ -1626,6 +1644,7 @@ fn resolved_creation_of_existing_checkout_reuses_its_row_until_acceptance() {
     model.begin_action(
         1,
         &UiAction::Create {
+            placement: None,
             input: "issue-alias".into(),
         },
     );
@@ -2034,4 +2053,193 @@ fn delayed_removal_reviews_survive_navigation_and_keep_each_host_and_witness() {
         );
         assert!(model.removal_reviews.is_empty());
     }
+}
+
+#[test]
+fn create_captures_the_cursor_section_and_projects_below_its_row() {
+    let mut model = Model::default();
+    let mut initial = snapshot(&["one", "two"]);
+    initial.test_data_mut().sections = vec![BoardSection {
+        key: "Batch".into(),
+        title: "Batch".into(),
+        rows: vec![0, 1],
+        ..Default::default()
+    }];
+    initial.test_data_mut().hosts = vec![
+        crate::HostChoice {
+            id: None,
+            label: "local".into(),
+            sign_in_needed: vec![],
+        },
+        crate::HostChoice {
+            id: Some("box".into()),
+            label: "box".into(),
+            sign_in_needed: vec![],
+        },
+    ];
+    model.apply(initial);
+    model.input(KeyEvent::from(KeyCode::Char('n')), 20);
+    model.input(KeyEvent::from(KeyCode::Tab), 20);
+    model.paste("new");
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Enter), 20) else {
+        panic!("expected creation");
+    };
+    let UiAction::OnHost {
+        host,
+        action: inner,
+    } = &action
+    else {
+        panic!("missing selected host");
+    };
+    assert_eq!(host.as_deref(), Some("box"));
+    let UiAction::Create {
+        placement: Some(placement),
+        ..
+    } = inner.as_ref()
+    else {
+        panic!("missing creation position");
+    };
+    assert_eq!(placement.section.as_deref(), Some("Batch"));
+    assert_eq!(placement.after.as_deref(), Some("one"));
+    let placement = placement.clone();
+    model.begin_action(1, &action);
+    let section = model
+        .board
+        .sections
+        .iter()
+        .find(|section| section.key == "Batch")
+        .unwrap();
+    assert_eq!(
+        section
+            .rows
+            .iter()
+            .map(|&index| model.board.rows[index].title.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "new", "two"]
+    );
+    let key = wt_core::remote_worktree_ledger_key("box", "new");
+    bind_creation(&mut model, 1, &key);
+    model.reply(UiReply {
+        operation_id: Some(1),
+        creation_placement: Some(crate::CreationPlacementAccepted {
+            key,
+            placement: placement.clone(),
+            accepted_at: wt_runtime::Stamp::now(),
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        model.pending.mutation(1).unwrap().target.host.as_deref(),
+        Some("box")
+    );
+    let layout = model
+        .pending
+        .mutation(2)
+        .expect("layout has its own pending mutation");
+    assert_eq!(layout.target.host, None);
+    assert!(matches!(
+        layout.kind,
+        crate::MutationKind::Layout(crate::LayoutChange::Creation { .. })
+    ));
+}
+
+#[test]
+fn creation_uses_inbox_and_a_folded_section_header_without_guessing_an_anchor() {
+    for section_key in [INBOX_SECTION, "Batch"] {
+        let mut model = Model::default();
+        let mut source = snapshot(&["one"]);
+        source.test_data_mut().sections = vec![BoardSection {
+            key: section_key.into(),
+            title: "Group".into(),
+            rows: vec![0],
+            folded: true,
+            ..Default::default()
+        }];
+        model.apply(source);
+        model.input(KeyEvent::from(KeyCode::Char('n')), 20);
+        model.paste("new");
+        let InputResult::Action(UiAction::Create {
+            placement: Some(placement),
+            ..
+        }) = model.input(KeyEvent::from(KeyCode::Enter), 20)
+        else {
+            panic!("missing header placement");
+        };
+        assert_eq!(
+            placement.section.as_deref(),
+            (section_key != INBOX_SECTION).then_some(section_key)
+        );
+        assert_eq!(placement.after, None);
+        model.begin_action(
+            1,
+            &UiAction::Create {
+                input: "new".into(),
+                placement: Some(placement),
+            },
+        );
+        let section = model
+            .board
+            .sections
+            .iter()
+            .find(|section| section.key == section_key)
+            .unwrap();
+        assert!(!section.folded);
+        assert_eq!(model.board.rows[section.rows[0]].title, "new");
+    }
+}
+
+#[test]
+fn resolving_an_existing_worktree_does_not_move_it_into_the_create_section() {
+    let mut model = Model::default();
+    let mut source = snapshot(&["origin", "existing"]);
+    source.test_data_mut().sections = vec![
+        BoardSection {
+            key: "Batch".into(),
+            title: "Batch".into(),
+            rows: vec![0],
+            ..Default::default()
+        },
+        BoardSection {
+            key: "Other".into(),
+            title: "Other".into(),
+            rows: vec![1],
+            ..Default::default()
+        },
+    ];
+    model.apply(source);
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            input: "existing".into(),
+            placement: Some(crate::CreatePlacement {
+                section: Some("Batch".into()),
+                after: Some("origin".into()),
+            }),
+        },
+    );
+    let (ready, mut received) = tokio::sync::oneshot::channel();
+    model.reply(UiReply {
+        operation_id: Some(1),
+        creation_prepared: Some(crate::CreationPrepared {
+            key: "existing".into(),
+            already_exists: true,
+            ready,
+        }),
+        ..Default::default()
+    });
+    assert_eq!(received.try_recv(), Ok(()));
+    let other = model
+        .board
+        .sections
+        .iter()
+        .find(|section| section.key == "Other")
+        .unwrap();
+    assert_eq!(
+        other
+            .rows
+            .iter()
+            .map(|&index| model.board.rows[index].key.as_str())
+            .collect::<Vec<_>>(),
+        ["existing"]
+    );
 }

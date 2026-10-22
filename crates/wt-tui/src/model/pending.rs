@@ -121,7 +121,15 @@ impl Model {
             Some(&row.key) == mutation.target.key.as_ref() && row.host == mutation.target.host
         });
         self.pending.refine(id, |mutation| {
-            mutation.target.key = Some(prepared.key.clone())
+            mutation.target.key = Some(prepared.key.clone());
+            if prepared.already_exists
+                && let crate::MutationKind::Lifecycle(crate::LifecycleChange::Create {
+                    placement,
+                    ..
+                }) = &mut mutation.kind
+            {
+                *placement = None;
+            }
         });
         if selected {
             self.pending_selection = Some(prepared.key);
@@ -147,6 +155,10 @@ impl Model {
                 })
         };
         match action {
+            UiAction::PrepareCreate { initial, placement } => UiAction::PrepareCreate {
+                initial,
+                placement: placement.or_else(|| self.creation_placement()),
+            },
             UiAction::OnHost { host, action } => UiAction::OnHost {
                 host,
                 action: Box::new(self.resolve(*action)),
@@ -192,6 +204,7 @@ impl Model {
 
     /// Show the change an accepted request will make, before the host runs it.
     pub(crate) fn begin_action(&mut self, id: u64, action: &UiAction) {
+        self.next_op = self.next_op.max(id);
         let mut inner = action;
         while let UiAction::OnHost { action, .. } = inner {
             inner = action;

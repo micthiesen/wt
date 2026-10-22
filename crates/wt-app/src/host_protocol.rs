@@ -209,6 +209,7 @@ mod tests {
             for byte in encode(&ClientFrame::Command {
                 id: 1,
                 action: UiAction::Create {
+                    placement: None,
                     input: "quoted task".into(),
                 },
             })

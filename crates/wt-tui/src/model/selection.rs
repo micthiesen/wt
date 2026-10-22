@@ -188,6 +188,17 @@ impl Model {
         }
     }
 
+    pub(crate) fn creation_placement(&self) -> Option<crate::CreatePlacement> {
+        let section = self.selected_section()?;
+        if section.key == super::ARCHIVED_SECTION || section.key == super::REMOVING_SECTION {
+            return None;
+        }
+        Some(crate::CreatePlacement {
+            section: (section.key != super::INBOX_SECTION).then(|| section.key.clone()),
+            after: self.actionable_row().map(|row| row.key.clone()),
+        })
+    }
+
     pub(crate) fn selected_section(&self) -> Option<&BoardSection> {
         match self.selected_item()? {
             VisualItem::Section(index) => self.board.sections.get(index),

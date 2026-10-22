@@ -1203,3 +1203,61 @@ fn witnessed_archive_moves_layout_with_the_marker() {
         serde_json::Value::Null
     );
 }
+
+#[test]
+fn new_worktree_position_preserves_neighbors_and_survives_restart() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut store = Store::open(&path, identity("repo", "/repo")).unwrap();
+    store.write_repository_state_json(r#"{"sectionsOrder":["Batch"],"foldedSections":["Batch"],"slugs":{"origin":{"section":"Batch","order":7,"manualTitle":"Keep"}},"remoteLayouts":{"@remote/box/new":{"future":42}}}"#).unwrap();
+    let before = store.read_wt_state().unwrap();
+    assert!(
+        store
+            .place_new_worktree("@remote/box/new", Some("Batch"), Some("origin"))
+            .unwrap()
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["slugs"]["origin"], before["slugs"]["origin"]);
+    assert_eq!(state["remoteLayouts"]["@remote/box/new"]["future"], 42);
+    assert_eq!(
+        state["remoteLayouts"]["@remote/box/new"]["creationAfter"],
+        "origin"
+    );
+    assert!(state["foldedSections"].as_array().unwrap().is_empty());
+    drop(store);
+    let mut store = Store::open(&path, identity("repo", "/repo")).unwrap();
+    assert_eq!(store.read_wt_state().unwrap(), state);
+}
+
+#[test]
+fn a_changed_creation_section_is_refused_without_writing() {
+    let temp = tempdir().unwrap();
+    let mut store =
+        Store::open(temp.path().join("state.sqlite"), identity("repo", "/repo")).unwrap();
+    store
+        .write_repository_state_json(
+            r#"{"sectionsOrder":["Batch","Other"],"slugs":{"origin":{"section":"Other"}}}"#,
+        )
+        .unwrap();
+    let before = store.read_wt_state().unwrap();
+    assert!(
+        !store
+            .place_new_worktree("new", Some("Batch"), Some("origin"))
+            .unwrap()
+    );
+    assert!(
+        !store
+            .place_new_worktree("new", Some("Removed"), None)
+            .unwrap()
+    );
+    assert_eq!(store.read_wt_state().unwrap(), before);
+    assert!(store.place_new_worktree("new", None, None).unwrap());
+    let state = store.read_wt_state().unwrap();
+    assert!(state["slugs"]["new"]["section"].is_null());
+    assert!(
+        state["slugs"]["new"]
+            .as_object()
+            .unwrap()
+            .contains_key("creationAfter")
+    );
+}

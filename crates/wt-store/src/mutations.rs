@@ -442,6 +442,60 @@ impl Store {
         })
     }
 
+    /// Record an explicit position for a new row without changing its neighbors.
+    /// The anchor must still belong to the section where creation started.
+    pub fn place_new_worktree(
+        &mut self,
+        key: &str,
+        section: Option<&str>,
+        after: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let collection_for = |key: &str| {
+                if key.starts_with("@remote/") {
+                    "remoteLayouts"
+                } else {
+                    "slugs"
+                }
+            };
+            if let Some(anchor) = after {
+                let actual = state[collection_for(anchor)][anchor]["section"]
+                    .as_str()
+                    .filter(|name| !name.is_empty());
+                if actual != section || anchor == key {
+                    return Ok((false, false));
+                }
+            }
+            if let Some(section) = section {
+                let exists = state["sectionsOrder"]
+                    .as_array()
+                    .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(section)))
+                    || all_layouts(state).any(|layout| layout["section"].as_str() == Some(section));
+                if !exists {
+                    return Ok((false, false));
+                }
+            }
+            let collection = collection_for(key);
+            let mut entry = state[collection][key]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            entry.insert(
+                "section".into(),
+                section.map_or(Value::Null, |name| json!(name)),
+            );
+            entry.insert("order".into(), Value::Null);
+            entry.insert(
+                "creationAfter".into(),
+                after.map_or(Value::Null, |key| json!(key)),
+            );
+            object_mut(state, collection).insert(key.to_owned(), Value::Object(entry));
+            let section_key = section.unwrap_or(GROUP_INBOX);
+            array_mut(state, "foldedSections").retain(|name| name.as_str() != Some(section_key));
+            Ok((true, true))
+        })
+    }
+
     /// File a merge unit atomically. Re-read each layout in the transaction so
     /// unrelated concurrent title/status writes survive and an already-filed
     /// member keeps its position.

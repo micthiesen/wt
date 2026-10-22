@@ -16,11 +16,13 @@ pub enum LayoutChange {
     FoldSection { section: String, folded: bool },
     RenameSection { old: String, new: String },
     AttentionSeen { at_ms: u64 },
+    Creation { placement: crate::CreatePlacement },
 }
 
 impl Family for LayoutChange {
     fn field(&self) -> String {
         match self {
+            Self::Creation { .. } => "creation-position".into(),
             Self::Archive { .. } => "archive".into(),
             Self::MoveSection { .. } => "section".into(),
             Self::FoldSection { section, .. } => format!("fold:{section}"),
@@ -31,6 +33,7 @@ impl Family for LayoutChange {
 
     fn label(&self) -> String {
         match self {
+            Self::Creation { .. } => "placing new worktree".into(),
             Self::Archive { archived: true } => "archiving".into(),
             Self::Archive { archived: false } => "restoring".into(),
             Self::MoveSection { section } => {
@@ -48,6 +51,11 @@ impl Family for LayoutChange {
 
     fn apply(&self, target: &Target, board: &mut Board) {
         match self {
+            Self::Creation { placement } => {
+                if let Some(index) = target_index(board, target) {
+                    place_creation(board, index, placement);
+                }
+            }
             Self::Archive { archived } => {
                 if let Some(index) = target_index(board, target) {
                     board.rows[index].archived = *archived;
@@ -96,6 +104,9 @@ impl Family for LayoutChange {
     fn observed(&self, target: &Target, board: &Board) -> bool {
         let row = target_row(board, target);
         match self {
+            Self::Creation { placement } => {
+                row.is_none_or(|row| row.creation_placement.as_ref() == Some(placement))
+            }
             Self::Archive { archived } => row.is_none_or(|row| row.archived == *archived),
             Self::MoveSection { section } => row.is_none_or(|_| {
                 target_index(board, target)
@@ -120,4 +131,27 @@ impl Family for LayoutChange {
             Self::AttentionSeen { at_ms } => board.attention_seen_ms >= *at_ms,
         }
     }
+}
+
+/// Show the operation row at its captured position while its layout settles.
+pub(super) fn place_creation(board: &mut Board, index: usize, placement: &crate::CreatePlacement) {
+    board.rows[index].creation_placement = Some(placement.clone());
+    let section_key = placement.section.as_deref().unwrap_or(INBOX_SECTION);
+    let title = placement.section.as_deref().unwrap_or(INBOX_TITLE);
+    place(board, index, section_key, title);
+    let anchor_index = placement
+        .after
+        .as_ref()
+        .and_then(|key| board.rows.iter().position(|row| row.key == *key));
+    let section = board
+        .sections
+        .iter_mut()
+        .find(|section| section.key == section_key)
+        .unwrap();
+    section.folded = false;
+    section.rows.retain(|row| *row != index);
+    let position = anchor_index
+        .and_then(|anchor| section.rows.iter().position(|row| *row == anchor))
+        .map_or(0, |position| position + 1);
+    section.rows.insert(position, index);
 }

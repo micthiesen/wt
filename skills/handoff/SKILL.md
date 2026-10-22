@@ -54,6 +54,17 @@ ask how they want that dependency handled.
 Always use `wt new`, never raw `git worktree add`. Resolve the created slug,
 branch, and absolute path from the command output or a fresh `wt ls --json`.
 
+Create the follow-up in the source worktree's section when possible. Before
+creation, identify the source from the current directory and `wt ls --json`.
+Read its section with `wt section ls --json`: each entry has `name` and `slugs`;
+`name: null` means Inbox. Keep this choice separate from `--base`.
+
+After creation and before agent launch, move only the new worktree with
+`wt section mv --only -- <new-slug> <source-section>`. Use `-` for Inbox.
+Do not move the source or its stack. If the source or its controller-owned
+section is unavailable, keep the default section and state that limit in the
+handoff report. Do not ask the user to choose a section for this fallback.
+
 ## 3. Write the handoff brief
 
 Create `prompt.txt` in the NEW worktree root, never the current worktree. It is

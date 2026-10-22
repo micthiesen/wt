@@ -35,6 +35,22 @@ impl Model {
             }
             return None;
         }
+        if let Some(accepted) = reply.creation_placement.take() {
+            let now = tokio::time::Instant::now();
+            let id = self.next_op_id();
+            let mutation = crate::UiMutation {
+                target: wt_runtime::Target::row(None, accepted.key),
+                kind: crate::LayoutChange::Creation {
+                    placement: accepted.placement,
+                }
+                .into(),
+            };
+            self.pending.begin(id, mutation, now);
+            self.pending
+                .accept_with(id, accepted.accepted_at, now, |_| {});
+            self.reproject(now);
+            return None;
+        }
         if let Some(prepared) = reply.creation_prepared.take() {
             self.creation_prepared(reply.operation_id, prepared);
             return None;
@@ -244,7 +260,7 @@ impl Model {
             }) => {
                 // A plain create prompt names its host like `n` does, so a
                 // host picked in the Ctrl+N picker is visible and Tab works.
-                let prompt = if matches!(action, TextAction::Create) {
+                let prompt = if matches!(action, TextAction::Create { .. }) {
                     self.create_prompt(self.interaction_host.as_deref())
                 } else {
                     prompt

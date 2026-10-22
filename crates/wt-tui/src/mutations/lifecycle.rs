@@ -21,6 +21,7 @@ pub enum LifecycleChange {
         request_id: u64,
         input: String,
         resolved: Option<String>,
+        placement: Option<crate::CreatePlacement>,
     },
     Remove {
         keys: Vec<String>,
@@ -62,7 +63,10 @@ impl Family for LifecycleChange {
     fn apply(&self, target: &Target, board: &mut Board) {
         match self {
             Self::Create {
-                input, resolved, ..
+                input,
+                resolved,
+                placement,
+                ..
             } => {
                 let Some(key) = target.key.as_ref() else {
                     return;
@@ -90,6 +94,14 @@ impl Family for LifecycleChange {
                     if !board.sections.is_empty() {
                         place(board, index, INBOX_SECTION, "Inbox");
                     }
+                }
+                if let Some(placement) = placement
+                    && let Some(index) = board
+                        .rows
+                        .iter()
+                        .position(|row| row.key == *key && row.host == target.host)
+                {
+                    super::layout::place_creation(board, index, placement);
                 }
             }
             Self::Remove { keys } => {
