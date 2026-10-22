@@ -180,36 +180,46 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 .then_with(|| a.2.cmp(b.2))
                 .then_with(|| a.3.cmp(&b.3))
         });
-        let positions = indices
-            .iter()
-            .filter_map(|&index| {
-                let entry = &state["slugs"][&board.rows[index].key];
-                let after = entry.get("creationAfter")?;
-                if entry["order"].is_number()
-                    || anchor_of(index) != index
-                    || (sort == UiSort::Status && parse_work_status(&entry["work"]).is_some())
-                {
-                    return None;
-                }
-                let anchor = after
-                    .as_str()
-                    .and_then(|key| {
-                        indices
-                            .iter()
-                            .copied()
-                            .find(|&row| board.rows[row].key == key)
-                    })
-                    .and_then(|row| {
-                        let root = anchor_of(row);
-                        indices
-                            .iter()
-                            .copied()
-                            .rfind(|&member| anchor_of(member) == root)
-                    });
-                Some((index, anchor.filter(|anchor| *anchor != index)))
-            })
-            .collect::<Vec<_>>();
-        apply_creation_positions(indices, &positions);
+        // Apply a creation anchor to whole stack units. A child cannot be
+        // emitted before a root that has moved below its own anchor.
+        let mut units = Vec::new();
+        let mut members_by_unit = BTreeMap::<usize, Vec<usize>>::new();
+        for &index in indices.iter() {
+            let root = anchor_of(index);
+            if !members_by_unit.contains_key(&root) {
+                units.push(root);
+            }
+            members_by_unit.entry(root).or_default().push(index);
+        }
+        let mut positions = Vec::new();
+        for &root in &units {
+            let entry = &state["slugs"][&board.rows[root].key];
+            let Some(after) = entry.get("creationAfter") else {
+                continue;
+            };
+            let started = members_by_unit[&root].iter().any(|&member| {
+                parse_work_status(&state["slugs"][&board.rows[member].key]["work"]).is_some()
+            });
+            if entry["order"].is_number() || (sort == UiSort::Status && started) {
+                continue;
+            }
+            let anchor = after.as_str().and_then(|key| {
+                indices
+                    .iter()
+                    .copied()
+                    .find(|&index| board.rows[index].key == key)
+                    .map(anchor_of)
+            });
+            if anchor != Some(root) {
+                positions.push((root, anchor));
+            }
+        }
+        apply_creation_positions(&mut units, &positions);
+        let mut placed = Vec::with_capacity(indices.len());
+        for root in units {
+            placed.extend(members_by_unit[&root].iter().copied());
+        }
+        *indices = placed;
     }
     board.section_order = crate::commands::section::manual_sections(state);
     let folded = state["foldedSections"]
@@ -512,6 +522,50 @@ mod tests {
         state["slugs"]["new"]["order"] = json!(3);
         prepare(&mut board, &state, "main", UiSort::Manual);
         assert_eq!(keys(&board), "root,child,other,new");
+    }
+
+    #[test]
+    fn a_new_anchored_stack_keeps_its_children_together() {
+        let mut board = Board {
+            rows: vec![
+                row("new-root"),
+                row("new-child"),
+                row("anchor"),
+                row("other"),
+            ],
+            ..Default::default()
+        };
+        let mut state = json!({"sectionsOrder":["Batch"],"slugs":{
+            "anchor":{"section":"Batch","order":1},
+            "other":{"section":"Batch","order":2},
+            "new-root":{"section":"Batch","order":null,"creationAfter":"anchor"},
+            "new-child":{"section":"Batch","baseBranch":"new-root","order":null,"creationAfter":"new-root"}
+        }});
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        let section = board
+            .sections
+            .iter()
+            .find(|section| section.key == "Batch")
+            .unwrap();
+        let keys = section
+            .rows
+            .iter()
+            .map(|&index| board.rows[index].key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["anchor", "new-root", "new-child", "other"]);
+        state["slugs"]["new-child"]["work"] = json!({"state":"working","at":"now"});
+        prepare(&mut board, &state, "main", UiSort::Status);
+        let section = board
+            .sections
+            .iter()
+            .find(|section| section.key == "Batch")
+            .unwrap();
+        let keys = section
+            .rows
+            .iter()
+            .map(|&index| board.rows[index].key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["new-root", "new-child", "anchor", "other"]);
     }
 
     #[test]
