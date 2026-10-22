@@ -314,6 +314,12 @@ armed or the unconfirmed attempt expires.
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |
 | `O` | Open the main clone in the editor |
 
+F12 opens the existing live agent session even after Shift+Tab changes the
+primary harness. It retains the exact session, including a named Claude session.
+If several harnesses are live, F12 prefers the primary harness among them.
+Use `;` to choose another session. If no session is live, F12 uses the primary
+harness. A configured `harness.wt_session` still selects the `wt` special slot.
+
 While session entry waits for a host, `Esc` cancels that connection attempt.
 Navigation or another session request also cancels the wait. A cancelled remote
 connection does not block entry to a local session.

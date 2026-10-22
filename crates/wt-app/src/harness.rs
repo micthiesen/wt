@@ -544,12 +544,6 @@ impl AppHarness {
         pinned_harness(&self.harness_config, slug, kind)
     }
 
-    /// The harness a new start or prompt for this target uses when no live
-    /// session decides it: the configured pin, else the effective primary.
-    pub(crate) fn default_for(&self, slug: &str, kind: AgentTargetKind) -> HarnessId {
-        self.pinned(slug, kind).unwrap_or_else(|| self.primary())
-    }
-
     pub async fn routes(&self, context: &AppContext) -> Result<Vec<AgentRoute>> {
         let records = context.repository.inventory(&context.cancellation).await?;
         let targets = self.targets_from_records(records.iter());
@@ -904,8 +898,10 @@ pub async fn ui_session_with_harness(
     let default_diff_base = format!("origin/{}", context.config.branch.base);
     let (slug, cwd, managed_name, kind, diff_base) = match target {
         SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
-            let key = key.context("worktree session requires a worktree key")?;
-            let selected = session_commands::resolve_target(context, Some(&key), target).await?;
+            let key = key
+                .as_deref()
+                .context("worktree session requires a worktree key")?;
+            let selected = session_commands::resolve_target(context, Some(key), target).await?;
             let slug = selected.slug;
             let saved_base = if target == SessionTarget::Diff {
                 let state = context
@@ -1032,16 +1028,18 @@ pub async fn ui_session_with_harness(
                     .await?
                     .into_iter()
                     .find(|route| route.target.slug == slug)
-                    .and_then(|route| route.choice.selected)
-                    .unwrap_or_else(|| {
-                        let kind = if target == SessionTarget::Harness {
-                            AgentTargetKind::Worktree
-                        } else {
-                            AgentTargetKind::Special
-                        };
-                        app.default_for(&slug, kind)
-                    }),
+                    .context("selected session target is unavailable")?
+                    .choice
+                    .selected
+                    .context("could not inspect wt's tmux sessions; no session was started")?,
             };
+            if selected_harness.is_none()
+                && let Some(prepared) =
+                    session_commands::prepare_live_session(context, key.clone(), target, harness_id)
+                        .await?
+            {
+                return Ok(prepared);
+            }
             let request = HarnessSpawnRequest {
                 worktree_path: cwd.clone(),
                 slug: slug.clone(),
@@ -1322,14 +1320,6 @@ mod tests {
             let main = AppHarness::target_for("main", &routes).context("main route")?;
             assert_eq!(main.choice.selected, Some(HarnessId::Codex));
             assert_eq!(main.choice.source, SelectionSource::Primary);
-            assert_eq!(
-                app.default_for("wt", AgentTargetKind::Special),
-                HarnessId::Opencode
-            );
-            assert_eq!(
-                app.default_for("main", AgentTargetKind::Special),
-                HarnessId::Codex
-            );
             // Selection never stops the other harness's session.
             assert!(
                 app.tmux
@@ -1414,6 +1404,21 @@ mod tests {
             .await
             .unwrap();
         let result: Result<()> = async {
+            let original = app.session_inventory(&fixture.ctx).await?;
+            let codex = original
+                .iter()
+                .find(|slot| slot.name == "one-codex")
+                .unwrap();
+            for primary in [HarnessId::Codex, HarnessId::Claude] {
+                persist_primary(&fixture.ctx.config.paths.cache_root, primary)?;
+                let prepared =
+                    ui_session(&fixture.ctx, Some("one".into()), SessionTarget::Harness).await?;
+                assert_eq!(
+                    prepared.args.last().unwrap().to_string_lossy(),
+                    format!("={}", codex.id)
+                );
+                assert_eq!(app.session_inventory(&fixture.ctx).await?, original);
+            }
             let prepared = app.attach_command("one-codex", &agent.cwd);
             let mut navigation = SessionNavigation::new(
                 &fixture.ctx,

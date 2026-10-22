@@ -166,6 +166,28 @@ pub(crate) fn picker_entries(
     options
 }
 
+/// Resume a live slot with the same identity checks as the session picker.
+/// A named Claude slot must retain its name; the harness alone is not enough.
+pub(super) async fn prepare_live_session(
+    context: &AppContext,
+    key: Option<String>,
+    target: SessionTarget,
+    harness: HarnessId,
+) -> Result<Option<PreparedSession>> {
+    let agent = picker_agent(context, key.as_deref(), target).await?;
+    let app = AppHarness::new(context);
+    let live = app.session_inventory(context).await?;
+    let options = picker_entries(&[harness], &agent, key, target, &[], &live);
+    let selected = options
+        .iter()
+        .find(|entry| entry.selection.managed_name == agent.managed_name)
+        .or_else(|| options.first());
+    match selected {
+        Some(entry) => prepare_session(context, &entry.selection).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 /// Prepare the exact selected conversation for terminal handoff. It never
 /// replaces a live slot; the caller must first obtain explicit user intent and
 /// stop that exact managed session.

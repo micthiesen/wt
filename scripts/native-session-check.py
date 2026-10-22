@@ -34,11 +34,12 @@ def main():
     main_clone, home, config = fixture.fixture(root, 2)
     socket = f"wt-native-session-{os.getpid()}"
     # Fail closed if the picker accidentally starts a new agent instead of
-    # attaching the witnessed slot. Never launch the user's actual Codex.
-    unexpected_launch = root / "unexpected-codex-launch"
-    codex_stub = root / "fixture-bin" / "codex"
-    codex_stub.write_text(f"#!/bin/sh\nprintf unexpected > {shlex.quote(str(unexpected_launch))}\nexit 97\n")
-    codex_stub.chmod(0o700)
+    # attaching the witnessed slot. Never launch an actual agent.
+    unexpected_launch = root / "unexpected-agent-launch"
+    for harness in ("codex", "claude", "opencode", "pi"):
+        stub = root / "fixture-bin" / harness
+        stub.write_text(f"#!/bin/sh\nprintf unexpected > {shlex.quote(str(unexpected_launch))}\nexit 97\n")
+        stub.chmod(0o700)
     env = dict(os.environ, HOME=str(home), WT_CONFIG=str(config), TERM="xterm-256color",
                CODEX_HOME=str(home / ".codex"),
                PATH=str(root / "fixture-bin") + os.pathsep + os.environ["PATH"],
@@ -111,6 +112,18 @@ def main():
         unknown_id = session_id("bench-000-codex")
         unrelated_id = session_id("picker-unrelated")
         assert not tmux("show-option", "-qv", "-t", "=bench-000-codex", "@wt-harness-session-id").stdout.strip()
+        # Change the primary through the actual board key, then reopen the
+        # existing Codex slot. Its physical identity must stay the same.
+        for primary in (b"Codex", b"OpenCode", b"Pi", b"Claude"):
+            os.write(terminal, b"\x1b[Z")  # Shift+Tab.
+            wait_for(lambda data: b"Primaryharness:" + primary in printed(data))
+        os.write(terminal, b"\x1b[24~")  # F12.
+        wait_for(lambda _: tmux("list-clients", "-F", "#{session_id}").stdout.strip() == unknown_id)
+        assert session_id("bench-000-codex") == unknown_id
+        assert not unexpected_launch.exists(), "F12 started an agent after the primary changed"
+        detached = tmux("detach-client", "-s", "bench-000-codex")
+        assert detached.returncode == 0, detached.stderr
+        wait_for(lambda data: b"Returnedfromsession" in printed(data))
         os.write(terminal, b";")
         wait_for(lambda data: b"currentsession(conversationnotidentified)" in printed(data)
                  and b"live" in printed(data))
@@ -131,6 +144,24 @@ def main():
         wait_for(lambda _: tmux("has-session", "-t", "=bench-000-codex").returncode != 0)
         assert session_id("picker-unrelated") == unrelated_id
         assert tmux("has-session", "-t", "=bench-000-shell").returncode == 0
+        # A named Claude session has no default-name slot. F12 must use its
+        # exact live identity after the primary changes to Codex.
+        named = "bench-000~existing"
+        created = tmux("new-session", "-d", "-s", named, "-c",
+                       str(root / "worktrees" / "bench-000"), "/bin/sh")
+        assert created.returncode == 0, created.stderr
+        named_id = session_id(named)
+        os.write(terminal, b"\x1b[Z")
+        wait_for(lambda data: b"Primaryharness:Codex" in printed(data))
+        os.write(terminal, b"\x1b[24~")
+        wait_for(lambda _: tmux("list-clients", "-F", "#{session_id}").stdout.strip() == named_id)
+        assert session_id(named) == named_id
+        assert tmux("has-session", "-t", "=bench-000").returncode != 0
+        assert not unexpected_launch.exists(), "F12 replaced the named Claude session"
+        detached = tmux("detach-client", "-s", named)
+        assert detached.returncode == 0, detached.stderr
+        wait_for(lambda data: b"Returnedfromsession" in printed(data))
+        assert tmux("kill-session", "-t", named_id).returncode == 0
         # Graceful close must remain pinned to the original pane. When EOF
         # closes it, tmux activates the second pane; another EOF must not leak
         # into that unrelated shell after the 200 ms close retry delay.
@@ -203,6 +234,8 @@ def main():
         assert tmux("has-session", "-t", "=bench-000-shell").returncode == 0, "UI quit killed user shell"
         result = {"shell_received_input": True, "ui_resumed": True, "title_saved_after_resume": True,
                   "shell_survived_ui_exit": True, "clean_shutdown": True,
+                  "f12_resumed_codex_after_primary_change": True,
+                  "f12_resumed_named_claude_after_primary_change": True,
                   "unidentified_live_picker_attached": True, "picker_received_input": True,
                   "picker_killed_exact_slot": True, "unrelated_session_preserved": True,
                   "graceful_close_preserved_other_pane": True,
