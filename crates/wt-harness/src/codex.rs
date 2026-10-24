@@ -145,10 +145,12 @@ impl CodexHarness {
 
     /// Delayed identity discovery for a slot wt launched without `resume`.
     /// Codex only materializes a new thread's rollout once it has its first
-    /// prompt, so the UUID cannot be learned at launch. A candidate is a
-    /// terminal-TUI rollout owned by this checkout and slot whose
+    /// prompt, so the UUID cannot be learned at launch. A candidate is an
+    /// interactive rollout owned by this checkout and slot whose
     /// `session_meta` creation time is at or after the tmux session's
-    /// creation, excluding UUIDs other live slots already own. A sole
+    /// creation, excluding UUIDs other live slots already own. The
+    /// originator proves nothing: a shared app-server daemon labels every
+    /// thread with its first client's name, including `Codex Desktop`. A sole
     /// candidate is necessary but not sufficient: the caller must also prove
     /// no other Codex TUI could have created it, then revalidate the captured
     /// tmux slot before stamping it.
@@ -163,10 +165,9 @@ impl CodexHarness {
         let mut ids = scan_rollouts(&self.paths.sessions_dir(), cwd, slug)?
             .into_iter()
             .filter(|rollout| {
-                rollout.from_tui
-                    && rollout
-                        .created_ms
-                        .is_some_and(|created| created >= since_ms)
+                rollout
+                    .created_ms
+                    .is_some_and(|created| created >= since_ms)
             })
             .map(|rollout| rollout.session_id)
             .filter(|id| !claimed_elsewhere.contains(id))
@@ -472,10 +473,6 @@ struct Rollout {
     size: u64,
     /// `session_meta.payload.timestamp`: when Codex created the thread.
     created_ms: Option<i64>,
-    /// Possibly created by an interactive terminal TUI: anything but the
-    /// desktop app. Daemon-backed TUI threads carry the daemon's first
-    /// client name, so callers still prove the pane runs the only TUI.
-    from_tui: bool,
 }
 
 fn scan_rollouts(dir: &Path, cwd: &Path, slug: &str) -> Result<Vec<Rollout>, CodexHarnessError> {
@@ -612,8 +609,8 @@ fn read_rollout_uncached(
     };
     // A shared `codex app-server` daemon records every thread under the
     // client name of whichever process connected to it first (a TUI, wt, or
-    // any other tool), so an unfamiliar originator is still an interactive
-    // thread. Only exec runs and other apps' own servers name themselves.
+    // any other tool, `Codex Desktop` included), so an unfamiliar originator
+    // is still an interactive thread. Only exec runs name themselves.
     if NON_TERMINAL_ORIGINATORS.contains(&originator)
         || payload["source"].as_str() == Some("exec")
         || source != "user"
@@ -632,13 +629,10 @@ fn read_rollout_uncached(
         mtime_ms: modified.as_millis().min(i64::MAX as u128) as i64,
         size: metadata.len(),
         created_ms: parse_ts(payload["timestamp"].as_str()),
-        from_tui: originator != DESKTOP_ORIGINATOR,
     }))
 }
 
-/// Originators that never belong to a terminal TUI. The desktop app runs its
-/// own app-server, so its threads keep this name.
-const DESKTOP_ORIGINATOR: &str = "Codex Desktop";
+/// Originators that never belong to a terminal TUI.
 const NON_TERMINAL_ORIGINATORS: &[&str] = &["exec", "codex_exec", "codex_vscode"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

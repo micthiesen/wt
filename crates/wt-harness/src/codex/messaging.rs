@@ -1783,6 +1783,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_slot_finds_its_thread_although_the_daemon_labels_it_desktop() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        // Codex 0.164 shows the new-thread placeholder on a working thread,
+        // so the composer alone cannot tell this slot from an empty one.
+        fixture
+            .slot(
+                "history\n• Working (6m 15s • esc to interrupt)\n› Ask Codex to do anything\n",
+                None,
+            )
+            .await;
+        fixture.rollout_from("launched", &fixture.cwd, 0, "Codex Desktop");
+        let outcome = fixture
+            .messenger()
+            .send_target(&fixture.target("Integrate scratch"), &fixture.cancel)
+            .await
+            .unwrap();
+        let stamp = fixture.live().await.unwrap().harness_session_id;
+        let pane = fixture.pane().await;
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(outcome, CodexMessageOutcome::Queued(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(queued_to(&seen), ["launched"]);
+        assert_eq!(stamp.as_deref(), Some("launched"));
+        assert!(!pane.contains("Integrate scratch"));
+    }
+
+    #[tokio::test]
     async fn stamped_resumed_thread_is_addressed_without_discovery() {
         let fixture = Fixture::new();
         let (seen, server) = fake_app_server(&fixture.paths);
@@ -2068,26 +2099,10 @@ mod tests {
     async fn foreign_rollouts_and_non_codex_panes_are_never_stamped() {
         let fixture = Fixture::new();
         let (seen, server) = fake_app_server(&fixture.paths);
-        // A desktop-app conversation in this checkout is not a TUI rollout.
         fixture
             .slot_running("history\n› Ask a follow-up question\n", None, "cat")
             .await;
-        let path = fixture
-            .paths
-            .sessions_dir()
-            .join("2026/10/16/rollout-desktop.jsonl");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let stamp = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
-        let header = serde_json::json!({"type":"session_meta","payload":{"id":"desktop","timestamp":stamp,"cwd":fixture.cwd.to_string_lossy(),"originator":"Codex Desktop","thread_source":"user"}});
-        std::fs::write(&path, format!("{header}\n")).unwrap();
-        let desktop = fixture
-            .messenger()
-            .send_target(&fixture.target("DO NOT SEND"), &fixture.cancel)
-            .await
-            .unwrap();
-        // A TUI rollout cannot be attributed to a pane that runs no Codex.
+        // A rollout cannot be attributed to a pane that runs no Codex.
         fixture.rollout("tui-thread", &fixture.cwd, 0);
         let no_tui = fixture
             .messenger()
@@ -2097,13 +2112,6 @@ mod tests {
         let live_stamp = fixture.live().await.unwrap().harness_session_id;
         server.abort();
         fixture.close().await;
-        for outcome in [&desktop, &no_tui] {
-            assert!(
-                matches!(outcome, CodexMessageOutcome::Failed { reason }
-                    if reason.contains("Nothing was sent")),
-                "{outcome:?}"
-            );
-        }
         assert!(
             matches!(&no_tui, CodexMessageOutcome::Failed { reason }
                 if reason.contains("not running a Codex TUI")),

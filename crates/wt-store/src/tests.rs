@@ -854,10 +854,19 @@ fn failed_restore_reinserts_exact_history_only_when_no_newer_removal_exists() {
         identity("repo-a", "/repos/a"),
     )
     .unwrap();
+    // Restores prune by the wall clock, so the history must be recent.
+    let now = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap();
+    let at = |ago: time::Duration| {
+        (now - ago)
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
     let old = RemovedWorktree {
         slug: "task".to_owned(),
         branch: "feature/task".to_owned(),
-        removed_at: "2026-10-09T00:00:00Z".to_owned(),
+        removed_at: at(time::Duration::hours(1)),
         work: None,
         automations_paused: Some(true),
         extra: Map::from_iter([("futureField".to_owned(), json!({"preserve": true}))]),
@@ -871,11 +880,11 @@ fn failed_restore_reinserts_exact_history_only_when_no_newer_removal_exists() {
     assert!(store.clear_removed_worktree("task").unwrap());
 
     let newer = RemovedWorktree {
-        removed_at: "2026-10-09T00:01:00Z".into(),
+        removed_at: at(time::Duration::minutes(59)),
         ..old.clone()
     };
     store
-        .record_removed_worktrees(std::slice::from_ref(&newer), 1_791_540_060_000)
+        .record_removed_worktrees(std::slice::from_ref(&newer), now.unix_timestamp() * 1000)
         .unwrap();
     assert!(
         !store
