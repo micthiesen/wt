@@ -139,7 +139,8 @@ metered budget, you have spent a cycle.
 
 So **batch**. Fix everything the current round raised, verify locally, and push
 once. A push per finding turns one review round into five, and each one arrives
-about a diff that is already gone.
+about a diff that is already gone. After the push, bring the PR body, and any change guide your
+instructions ask for, up to date with the new head.
 
 The same applies to the reflex of pushing an empty commit to re-trigger
 something. If a check needs re-running, re-run the check.

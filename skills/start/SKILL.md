@@ -148,8 +148,9 @@ You own verification. After review:
        IF WRONG: <where it shows + the symptom>
        UNTESTED: <omit this line entirely if nothing is>
 
-   Make sure the PR body reflects the final state. The human merges — never
-   merge it yourself.
+   Make sure the PR body reflects the final state, and so does any change
+   guide (a reviewer's walkthrough of the change) your instructions ask for.
+   The human merges — never merge it yourself.
 
 Before handing off, run `wt dev stop` from your own worktree if you have no
 planned further use of its server. Retain it while ongoing verification needs
