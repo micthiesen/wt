@@ -47,6 +47,8 @@ pub struct CodexMessageTarget {
     pub cwd: PathBuf,
     pub managed_name: Option<String>,
     pub text: String,
+    /// Deliver into a running turn instead of queueing behind it.
+    pub steer: bool,
 }
 
 #[derive(Clone)]
@@ -263,6 +265,30 @@ impl CodexMessenger {
                     cancel,
                 )
                 .await;
+        }
+        if target.steer {
+            match app_server::steer_message(
+                &self.paths.app_server_socket(),
+                &id,
+                &target.text,
+                cancel,
+            )
+            .await
+            {
+                Ok(Some(delivery)) => return Ok(CodexMessageOutcome::Queued(delivery)),
+                // No running turn to steer: the queue starts it immediately.
+                Ok(None) => {}
+                Err(error) if error.kind == CodexAppServerFailureKind::Ambiguous => {
+                    return Ok(CodexMessageOutcome::Ambiguous {
+                        reason: format!("{error}; wt did not retry or queue the message"),
+                    });
+                }
+                Err(error) => {
+                    return Ok(CodexMessageOutcome::Failed {
+                        reason: format!("{error}. {NOTHING_SENT}"),
+                    });
+                }
+            }
         }
         match self.send(&id, &target.text, cancel).await {
             Ok(delivery) => Ok(CodexMessageOutcome::Queued(delivery)),
@@ -1371,6 +1397,7 @@ mod tests {
                         cwd: temp.path().into(),
                         managed_name: None,
                         text: text.into(),
+                        steer: false,
                     },
                     &CancellationToken::new(),
                 )
@@ -1546,6 +1573,7 @@ mod tests {
                 cwd: self.cwd.clone(),
                 managed_name: None,
                 text: text.into(),
+                steer: false,
             }
         }
 
@@ -1694,6 +1722,26 @@ mod tests {
                                 "clientUserMessageId":request["params"]["clientUserMessageId"],
                                 "input":request["params"]["input"]}}),
                             "thread/queue/start" => serde_json::json!({}),
+                            // Thread `busy` runs turn-1; every other thread is idle.
+                            "thread/turns/list" => {
+                                let status = if request["params"]["threadId"] == "busy" {
+                                    "inProgress"
+                                } else {
+                                    "completed"
+                                };
+                                serde_json::json!({"data":[{"id":"turn-1","items":[],"status":status}]})
+                            }
+                            "turn/steer" if request["params"]["expectedTurnId"] == "turn-1" => {
+                                serde_json::json!({"turnId":"turn-1"})
+                            }
+                            "turn/steer" => {
+                                let reply = serde_json::json!({"jsonrpc":"2.0","id":request["id"],
+                                    "error":{"code":-32600,"message":"expected turn mismatch"}});
+                                ws.send(Message::Text(reply.to_string().into()))
+                                    .await
+                                    .unwrap();
+                                continue;
+                            }
                             _ => continue,
                         };
                         let reply =
@@ -1835,6 +1883,72 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(queued_to(&seen), ["resumed"]);
+    }
+
+    #[tokio::test]
+    async fn steer_delivers_into_a_running_turn_and_queues_when_idle() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        fixture.rollout("busy", &fixture.cwd, 0);
+        fixture
+            .slot("history\n› Ask Codex to do anything\n", Some("busy"))
+            .await;
+        let steer = |text: &str| CodexMessageTarget {
+            steer: true,
+            ..fixture.target(text)
+        };
+        let busy = fixture
+            .messenger()
+            .send_target(&steer("GO now"), &fixture.cancel)
+            .await
+            .unwrap();
+        let steered = seen.lock().unwrap().clone();
+        fixture.close().await;
+
+        let fixture = Fixture::new();
+        fixture.rollout("idle", &fixture.cwd, 0);
+        fixture
+            .slot("history\n› Ask Codex to do anything\n", Some("idle"))
+            .await;
+        seen.lock().unwrap().clear();
+        server.abort();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        let idle = fixture
+            .messenger()
+            .send_target(
+                &CodexMessageTarget {
+                    steer: true,
+                    ..fixture.target("GO now")
+                },
+                &fixture.cancel,
+            )
+            .await
+            .unwrap();
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(&busy, CodexMessageOutcome::Queued(delivery)
+                if delivery.state == super::super::QueueState::Steered
+                    && delivery.submission.id == "turn-1"),
+            "{busy:?}"
+        );
+        assert!(
+            steered
+                .iter()
+                .any(|(method, thread)| method == "turn/steer" && thread == "busy")
+        );
+        assert!(
+            !steered
+                .iter()
+                .any(|(method, _)| method == "thread/queue/add")
+        );
+        // With no running turn the queue starts the message at once.
+        assert!(
+            matches!(&idle, CodexMessageOutcome::Queued(delivery)
+                if delivery.state != super::super::QueueState::Steered),
+            "{idle:?}"
+        );
+        assert_eq!(queued_to(&seen), ["idle"]);
     }
 
     #[tokio::test]

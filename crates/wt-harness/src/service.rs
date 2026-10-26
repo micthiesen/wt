@@ -22,6 +22,8 @@ pub struct HarnessTarget {
     pub managed_name: Option<String>,
     pub sender: Option<String>,
     pub text: String,
+    /// Codex only: deliver into a running turn instead of queueing.
+    pub steer: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,6 +268,7 @@ impl HarnessService {
                             cwd: target.cwd.clone(),
                             managed_name: target.managed_name.clone(),
                             text: text.clone(),
+                            steer: target.steer,
                         },
                         cancel,
                     )
@@ -405,6 +408,7 @@ mod tests {
                     managed_name: None,
                     sender: None,
                     text: "hello".into(),
+                    steer: false,
                 },
                 &CancellationToken::new(),
             )

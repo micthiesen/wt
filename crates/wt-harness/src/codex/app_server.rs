@@ -40,6 +40,9 @@ pub enum QueueState {
     Started,
     Queued,
     QueuedOrStarted,
+    /// Delivered into the turn that was running; the submission id is that
+    /// turn's id.
+    Steered,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -433,6 +436,34 @@ impl CodexAppServerClient {
         Ok(None)
     }
 
+    /// The id of the thread's running turn, if one is in progress.
+    pub async fn active_turn(
+        &mut self,
+        thread: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, CodexAppServerError> {
+        let page = self
+            .request(
+                "thread/turns/list",
+                json!({"threadId":thread,"limit":1,"sortDirection":"desc","itemsView":"notLoaded"}),
+                "thread-turns",
+                cancel,
+            )
+            .await?;
+        let rows = page.get("data").and_then(Value::as_array).ok_or_else(|| {
+            error(
+                "thread-turns",
+                CodexAppServerFailureKind::Protocol,
+                "invalid thread/turns/list page",
+            )
+        })?;
+        Ok(rows
+            .first()
+            .filter(|turn| turn["status"] == "inProgress")
+            .and_then(|turn| turn["id"].as_str())
+            .map(str::to_owned))
+    }
+
     pub async fn queue_start(
         &mut self,
         thread: &str,
@@ -470,14 +501,9 @@ impl CodexAppServerClient {
     }
 }
 
-pub async fn queue_message(
-    socket: &Path,
-    thread: &str,
-    text: &str,
-    cancel: &CancellationToken,
-) -> Result<CodexQueueDelivery, CodexAppServerError> {
+fn new_message_id(thread: &str) -> String {
     let sequence = MESSAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let message_id = Uuid::new_v5(
+    Uuid::new_v5(
         &Uuid::NAMESPACE_OID,
         format!(
             "wt:{}:{}:{}:{}",
@@ -488,7 +514,109 @@ pub async fn queue_message(
         )
         .as_bytes(),
     )
-    .to_string();
+    .to_string()
+}
+
+/// Deliver into the thread's running turn. `None` means no turn was running
+/// or the server refused the steer before writing anything, so the caller
+/// may queue instead. A lost reply is reconciled against recent thread items
+/// by the message's client id and is never re-sent.
+pub async fn steer_message(
+    socket: &Path,
+    thread: &str,
+    text: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<CodexQueueDelivery>, CodexAppServerError> {
+    let message_id = new_message_id(thread);
+    let mut client = CodexAppServerClient::connect(socket, cancel).await?;
+    let Some(turn) = client.active_turn(thread, cancel).await? else {
+        return Ok(None);
+    };
+    let input = json!([{"type":"text", "text":text, "text_elements":[]}]);
+    let steered = client
+        .request(
+            "turn/steer",
+            json!({
+                "threadId":thread,
+                "expectedTurnId":turn,
+                "input":input,
+                "clientUserMessageId":message_id
+            }),
+            "turn-steer",
+            cancel,
+        )
+        .await;
+    let submission = |id: String| CodexQueueSubmission {
+        id,
+        client_user_message_id: message_id.clone(),
+        input: input.clone(),
+    };
+    match steered {
+        Ok(result) => Ok(Some(CodexQueueDelivery {
+            submission: submission(
+                result
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&turn)
+                    .to_owned(),
+            ),
+            state: QueueState::Steered,
+            reconciled: false,
+        })),
+        // The turn ended or changed between the read and the steer.
+        Err(e) if e.kind == CodexAppServerFailureKind::Rejected => Ok(None),
+        Err(e) if e.kind == CodexAppServerFailureKind::Cancelled => Err(error(
+            "turn-steer",
+            CodexAppServerFailureKind::Ambiguous,
+            "cancelled after turn/steer was sent; wt will not re-submit",
+        )),
+        Err(e)
+            if matches!(
+                e.kind,
+                CodexAppServerFailureKind::Ambiguous | CodexAppServerFailureKind::Protocol
+            ) =>
+        {
+            drop(client);
+            let found = async {
+                CodexAppServerClient::connect(socket, cancel)
+                    .await?
+                    .find_recent_user(thread, &message_id, cancel)
+                    .await
+            }
+            .await
+            .map_err(|r| {
+                error(
+                    "turn-steer",
+                    CodexAppServerFailureKind::Ambiguous,
+                    format!("lost steer reply ({e}); reconciliation failed: {r}"),
+                )
+            })?;
+            match found {
+                Some(_) => Ok(Some(CodexQueueDelivery {
+                    submission: submission(turn),
+                    state: QueueState::Steered,
+                    reconciled: true,
+                })),
+                None => Err(error(
+                    "turn-steer",
+                    CodexAppServerFailureKind::Ambiguous,
+                    format!(
+                        "lost steer reply ({e}); recent thread items did not show the message; wt will not re-submit"
+                    ),
+                )),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn queue_message(
+    socket: &Path,
+    thread: &str,
+    text: &str,
+    cancel: &CancellationToken,
+) -> Result<CodexQueueDelivery, CodexAppServerError> {
+    let message_id = new_message_id(thread);
     let mut client = CodexAppServerClient::connect(socket, cancel).await?;
     match client.queue_add(thread, text, &message_id, cancel).await {
         Ok(submission) => {

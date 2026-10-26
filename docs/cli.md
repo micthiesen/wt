@@ -541,7 +541,13 @@ race-safe queued-or-started receipt. Use
 
 For Codex, `send` wakes the tmux session first and addresses its exact UUID
 through Codex's durable queue. A busy session or one showing an approval or
-question keeps the message queued until it is ready. The direct Unix socket is
+question keeps the message queued until it is ready: Codex starts a queued
+message only when the running turn ends, which can be never for an agent that
+is waiting on the message itself. `--steer` instead delivers into the running
+turn (`turn/steer`, pinned to that turn's id) and reports `steered`; with no
+running turn, or when the turn ended first and Codex refused the steer, it
+queues as usual. A lost steer reply is reconciled against recent thread items
+and never re-sent. `--steer` is Codex-only. The direct Unix socket is
 local to the target host. `wt agent send` refuses a remote row rather than deliver locally; message a worker by running the command on it
 with `wt remote agent send ...`. If the
 user-managed daemon is offline, wt uses `codex queue` against the same local

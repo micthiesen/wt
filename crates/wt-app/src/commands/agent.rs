@@ -36,6 +36,10 @@ pub enum AgentCommand {
         target: String,
         #[arg(long)]
         hold: Option<String>,
+        /// Codex only: deliver into the agent's running turn instead of
+        /// queueing behind it.
+        #[arg(long)]
+        steer: bool,
         #[arg(trailing_var_arg = true)]
         text: Vec<String>,
     },
@@ -54,7 +58,12 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
     }
     match &args.command {
         AgentCommand::Ls { json } => list(&routes, *json),
-        AgentCommand::Send { target, hold, text } => {
+        AgentCommand::Send {
+            target,
+            hold,
+            steer,
+            text,
+        } => {
             let mut text = read_message(text, &context.cancellation).await?;
             let Some(route) = AppHarness::target_for(target, &routes) else {
                 if target == "wt"
@@ -69,7 +78,7 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
                 }
                 bail!("unknown agent target: {target}; run `wt agent ls` to see available targets");
             };
-            send_route(context, &app, route, &mut text, hold.as_deref()).await
+            send_route(context, &app, route, &mut text, hold.as_deref(), *steer).await
         }
         AgentCommand::Start { target } => {
             let Some(route) = AppHarness::target_for(target, &routes) else {
@@ -90,7 +99,7 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
                 .context("harness selection is unavailable")?;
             let prompt = crate::skills::start_prompt(context, harness).await?;
             let mut body = prompt;
-            send_route(context, &app, route, &mut body, None).await
+            send_route(context, &app, route, &mut body, None, false).await
         }
     }
 }
@@ -129,7 +138,7 @@ pub async fn send_to(
         );
     }
     let mut body = text.trim().to_owned();
-    send_route(context, &app, route, &mut body, hold).await
+    send_route(context, &app, route, &mut body, hold, false).await
 }
 
 async fn send_route(
@@ -138,7 +147,11 @@ async fn send_route(
     route: &AgentRoute,
     body: &mut String,
     hold: Option<&str>,
+    steer: bool,
 ) -> Result<i32> {
+    if steer && route.choice.selected != Some(wt_harness::HarnessId::Codex) {
+        bail!("--steer applies to Codex sessions; nothing was sent");
+    }
     if route.target.remote {
         bail!(
             "remote agent messaging is not wired to the remote runtime yet; refusing local delivery to {}",
@@ -156,7 +169,9 @@ async fn send_route(
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let outcome = app.send(route, body, sender.as_deref(), context).await?;
+    let outcome = app
+        .send_with(route, body, sender.as_deref(), steer, context)
+        .await?;
     if let Some(notice) = app.claude_auth_restart_notice(route, context).await {
         eprintln!("note: {notice}");
     }
@@ -422,10 +437,22 @@ fn print_delivery(
             )
         }
         HarnessMessageOutcome::Codex(wt_harness::CodexMessageOutcome::Queued(delivery)) => {
-            println!(
-                "queued for {} in Codex ({:?}, reconciled={})",
-                route.target.slug, delivery.state, delivery.reconciled
-            );
+            let slug = &route.target.slug;
+            let reconciled = delivery.reconciled;
+            match delivery.state {
+                wt_harness::QueueState::Steered => println!(
+                    "steered into {slug}'s running Codex turn {} (reconciled={reconciled})",
+                    delivery.submission.id
+                ),
+                // Codex starts a queued message only once the running turn
+                // ends; say so, since a long turn can hold it indefinitely.
+                wt_harness::QueueState::Queued => println!(
+                    "queued for {slug} in Codex (Queued, reconciled={reconciled}): it starts when the current turn ends; use --steer to deliver into the running turn"
+                ),
+                state => {
+                    println!("queued for {slug} in Codex ({state:?}, reconciled={reconciled})")
+                }
+            }
             Ok(0)
         }
         HarnessMessageOutcome::Codex(wt_harness::CodexMessageOutcome::CliQueued { thread_id }) => {

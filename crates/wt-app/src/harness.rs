@@ -692,6 +692,18 @@ impl AppHarness {
         sender: Option<&str>,
         context: &AppContext,
     ) -> Result<HarnessMessageOutcome> {
+        self.send_with(route, text, sender, false, context).await
+    }
+
+    /// `steer` delivers into a running Codex turn instead of queueing.
+    pub async fn send_with(
+        &self,
+        route: &AgentRoute,
+        text: &str,
+        sender: Option<&str>,
+        steer: bool,
+        context: &AppContext,
+    ) -> Result<HarnessMessageOutcome> {
         let id = route.choice.selected.ok_or_else(|| {
             anyhow::anyhow!(
                 "could not inspect wt's tmux session registry; no harness was selected or started"
@@ -708,6 +720,7 @@ impl AppHarness {
                     managed_name: route.target.managed_name.clone(),
                     sender: sender.map(str::to_owned),
                     text: text.to_owned(),
+                    steer,
                 },
                 &context.cancellation,
             )

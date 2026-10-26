@@ -27,6 +27,8 @@ job is to reduce how many of them need human attention.
 - **You coordinate; workers implement.** Route necessary work through
   `wt agent send <slug> "<message>"`; wt owns addressing, harness selection,
   and delivery. Never edit another worktree or use harness-private messaging.
+  A Codex `queued` receipt waits for the worker's current turn to end; for a
+  time-bounded instruction to a busy Codex worker, send with `--steer`.
   Read-only repo operations from the main clone are yours.
 - **Never merge a PR** unless the human explicitly asks in this conversation.
   `ready` means ready for THEM. When they do hand you merging for an assigned

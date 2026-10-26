@@ -29,7 +29,7 @@ mod usage;
 
 pub use app_server::{
     CodexAppServerError, CodexAppServerFailureKind, CodexAppServerInfo, CodexQueueDelivery,
-    CodexQueueSubmission, CodexThreadStatus,
+    CodexQueueSubmission, CodexThreadStatus, QueueState,
 };
 pub use events::{CodexActivityBatch, CodexActivityTracker, CodexEvent, CodexEventLevel};
 pub use messaging::{CodexMessageOutcome, CodexMessageTarget, CodexMessenger};

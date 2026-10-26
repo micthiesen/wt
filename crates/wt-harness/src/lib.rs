@@ -34,8 +34,8 @@ pub use codex::{
     CodexAppServerInfo, CodexEvent, CodexEventLevel, CodexHarness, CodexHarnessError,
     CodexLaunchedThreads, CodexMessageOutcome, CodexMessageTarget, CodexMessenger,
     CodexOutputTracker, CodexPaths, CodexQueueDelivery, CodexQueueSubmission, CodexTail,
-    CodexThreadStatus, CodexTrustError, CodexUsage, PendingInteraction, ensure_trusted_project,
-    read_codex_tail, read_codex_usage,
+    CodexThreadStatus, CodexTrustError, CodexUsage, PendingInteraction, QueueState,
+    ensure_trusted_project, read_codex_tail, read_codex_usage,
 };
 pub use opencode::{
     OpenCodeActivityBatch, OpenCodeActivityTracker, OpenCodeCost, OpenCodeError, OpenCodeEvent,
