@@ -4,22 +4,7 @@
 //! identity it was compiled as; everything else lives here so a release
 //! rebuilds only that shim (docs/ci.md).
 
-mod action_palette;
 mod commands;
-mod controller;
-mod controller_actions;
-mod creation_placement;
-mod fleet_cleanup;
-mod history_actions;
-mod host_dispatch;
-mod host_server;
-mod host_service;
-mod host_stdio;
-mod remote_board;
-mod remote_host;
-mod section_actions;
-mod session_ui;
-mod terminal_palette;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -419,17 +404,17 @@ async fn run_application(
         }
     });
     let commands = tokio_util::sync::CancellationToken::new();
-    let host = Arc::new(host_service::HostService::start(
+    let host = Arc::new(wt_host::host_service::HostService::start(
         scope,
         context.clone(),
         commands,
     ));
-    let fleet = remote_board::start(scope, &context, host);
+    let fleet = wt_host::remote_board::start(scope, &context, host);
     let board = wt_app_core::display_time::overlay(scope, fleet.board.clone());
-    let controller = controller::start(scope, context.clone(), fleet, controller_port);
+    let controller = wt_host::controller::start(scope, context.clone(), fleet, controller_port);
     // A child cancellation token does not cancel its parent. The terminal
     // token handles Ctrl+C and explicit application shutdown owns the scope.
-    let result = terminal_palette::run(scope, board, actions, token, &context).await;
+    let result = wt_host::terminal_palette::run(scope, board, actions, token, &context).await;
     scope.cancel();
     let actions_finished = controller.shutdown().await;
     let shutdown = scope.shutdown(Duration::from_secs(5)).await;
@@ -507,7 +492,7 @@ async fn dispatch_command(
         Command::Snapshot { args } => commands::_snapshot::run(context, args).await,
         Command::Session { args } => commands::_session::run(context, args).await,
         Command::WorkerDispatch { args } => Box::pin(commands::_remote::run(context, args)).await,
-        Command::Host => host_server::run(context).await,
+        Command::Host => wt_host::host_server::run(context).await,
         Command::Version => {
             println!("wt {}", wt_app_core::build_info::native_version());
             Ok(0)

@@ -644,7 +644,7 @@ fn worker_panic_reply(active: &RunningAction, error: &str) -> UiReply {
     }
 }
 
-pub(crate) fn take_available<T>(
+pub fn take_available<T>(
     pending: &mut VecDeque<(Lane, T)>,
     busy: &BTreeSet<Lane>,
 ) -> Option<(Lane, T)> {
@@ -861,7 +861,7 @@ fn sanitize_reply(mut reply: UiReply) -> UiReply {
 
 /// Intermediate replies retain the input intent which requested them. Progress
 /// messages are not operation completions; only handoff tickets carry the ID.
-pub(crate) struct RequestReplies {
+pub struct RequestReplies {
     sender: tokio::sync::mpsc::Sender<UiReply>,
     id: u64,
     generation: u64,
@@ -870,7 +870,7 @@ pub(crate) struct RequestReplies {
 impl RequestReplies {
     /// A creation cannot enter inventory until its optimistic row has the
     /// exact key. No acknowledgement means no checkout mutation is sent.
-    pub(crate) async fn prepare_creation(
+    pub async fn prepare_creation(
         &self,
         key: String,
         already_exists: bool,
@@ -897,7 +897,7 @@ impl RequestReplies {
         }
     }
 
-    pub(crate) async fn send(&self, mut reply: UiReply) -> Result<()> {
+    pub async fn send(&self, mut reply: UiReply) -> Result<()> {
         reply.ui_generation = Some(self.generation);
         if reply.handoff.is_some()
             || reply.creation_prepared.is_some()
@@ -912,7 +912,7 @@ impl RequestReplies {
     }
 }
 
-pub(crate) async fn handoff_prepared(
+pub async fn handoff_prepared(
     prepared: wt_app_core::harness::PreparedSession,
     replies: &RequestReplies,
     shutdown: &CancellationToken,
@@ -920,7 +920,7 @@ pub(crate) async fn handoff_prepared(
     handoff_navigable(prepared, replies, shutdown, None).await
 }
 
-pub(crate) async fn handoff_navigable(
+pub async fn handoff_navigable(
     mut prepared: wt_app_core::harness::PreparedSession,
     replies: &RequestReplies,
     shutdown: &CancellationToken,

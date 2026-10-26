@@ -1,0 +1,44 @@
+[package]
+name = "wt-host"
+# Fixed: only the shipped binary carries the release version (docs/ci.md).
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wt-app-core.workspace = true
+wt-sources.workspace = true
+wt-ops.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wt-config.workspace = true
+wt-actions.workspace = true
+wt-core.workspace = true
+wt-github.workspace = true
+wt-lifecycle.workspace = true
+wt-platform.workspace = true
+wt-runtime.workspace = true
+wt-remote.workspace = true
+wt-store.workspace = true
+wt-tui.workspace = true
+wt-tmux.workspace = true
+
+[dev-dependencies]
+wt-app-core = { workspace = true, features = ["testing"] }
+wt-runtime = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

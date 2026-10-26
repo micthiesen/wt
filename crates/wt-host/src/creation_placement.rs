@@ -4,7 +4,7 @@ use wt_tui::{Board, CreatePlacement, CreationPlacementAccepted};
 
 use wt_app_core::context::AppContext;
 
-pub(crate) async fn accept(
+pub async fn accept(
     context: &AppContext,
     board: Option<&Board>,
     key: String,

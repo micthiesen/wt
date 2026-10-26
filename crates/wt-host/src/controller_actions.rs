@@ -706,10 +706,7 @@ fn require_live_host(board: Option<&Board>, host: Option<&str>) -> Result<()> {
 }
 
 /// The checkout a special slot works in.
-pub(crate) fn slot_path(
-    ctx: &AppContext,
-    target: wt_tui::SessionTarget,
-) -> Result<std::path::PathBuf> {
+pub fn slot_path(ctx: &AppContext, target: wt_tui::SessionTarget) -> Result<std::path::PathBuf> {
     use wt_tui::SessionTarget;
     match target {
         SessionTarget::Main | SessionTarget::Manager => Ok(ctx.config.paths.main_clone.clone()),

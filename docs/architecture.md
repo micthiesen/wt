@@ -13,7 +13,8 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-app-core` | Foundation of the application: `AppContext`, database, build identity, harness glue, host wire protocol and lane classification, feed helpers. Depends on no other application crate |
 | `wt-ops` | Operations both the CLI and the host run: removal and its background worker, creation, fork bases, landing evidence, restacking, the events daemon, updates, managed workers and remote dispatch, plus the command implementations they reuse. Depends on `wt-app-core` |
 | `wt-sources` | Everything that feeds the board: the host-local source graph (`sources::start`), its leaves and derived stages. Depends on `wt-app-core` and `wt-ops` |
-| `wt-cli` (library crate `wt`) | CLI composition, local and remote host services, TUI source pipeline, application actions, update integration |
+| `wt-host` | The host: controller and lanes scheduling, host service and dispatch, action palettes, remote hosts and the fleet board, the terminal palette loop. Depends on `wt-app-core`, `wt-ops` and `wt-sources` |
+| `wt-cli` (library crate `wt`) | Process composition (`wt::main`) and the CLI command implementations |
 | `wt-tui` | Board and modal models, input state machine, terminal rendering and action protocol |
 | `wt-config` | Config discovery, merge, validation, resolved process configuration |
 | `wt-core` | Pure identity, work-status, section and safety rules shared across domains |

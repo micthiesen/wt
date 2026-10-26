@@ -51,6 +51,7 @@ unicode-width = "0.2"
 uuid = { version = "1", features = ["v5"] }
 wt-app-core = { path = "crates/wt-app-core" }
 wt-cli = { path = "crates/wt-cli" }
+wt-host = { path = "crates/wt-host" }
 wt-sources = { path = "crates/wt-sources" }
 wt-ops = { path = "crates/wt-ops" }
 wt-config = { path = "crates/wt-config" }

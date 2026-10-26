@@ -21,7 +21,7 @@ const SETTLEMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30
 /// Complete an operation executed by this process, before scheduling its
 /// confirming reads. Never use this to classify a foreign or aggregate write.
 /// Explicit outcomes retain their original ownership and clock.
-pub(crate) fn complete_local(effect: &wt_tui::Effect, mut reply: UiReply) -> UiReply {
+pub fn complete_local(effect: &wt_tui::Effect, mut reply: UiReply) -> UiReply {
     if !reply.failed && reply.outcome.is_none() && matches!(effect, wt_tui::Effect::Mutation(_)) {
         // A mutation can discover changed preconditions and ask for a new
         // confirmation instead of writing. Its optimistic effect must settle
