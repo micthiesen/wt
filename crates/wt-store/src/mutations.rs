@@ -1574,6 +1574,38 @@ impl Store {
         })
     }
 
+    /// Record the outcome of a post-merge check owed by a removed row. Only
+    /// a retained row that still owes verification is written; its removal
+    /// record is otherwise left exactly as it was.
+    pub fn settle_removed_verification(
+        &mut self,
+        slug: &str,
+        outcome: &WorkStatusRecord,
+    ) -> Result<RemovedSettle, StoreError> {
+        let value = serde_json::to_value(outcome)?;
+        self.mutate_wt_state(|state| {
+            let removed = array_mut(state, "removed");
+            let Some(entry) = removed
+                .iter_mut()
+                .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(slug))
+            else {
+                return Ok((RemovedSettle::Missing, false));
+            };
+            let parsed: RemovedWorktree = serde_json::from_value(entry.clone())?;
+            if !verification_owed_at_removal(&parsed) {
+                return Ok((RemovedSettle::NotOwed, false));
+            }
+            let previous = parsed.work.and_then(|work| work.verify_after_merge);
+            entry["work"] = value;
+            Ok((
+                RemovedSettle::Settled {
+                    verify_after_merge: previous,
+                },
+                true,
+            ))
+        })
+    }
+
     /// Restore a removed-history row after a failed restore attempt, without
     /// replacing a newer removal record written for the same slug.
     pub fn restore_removed_worktree_if_absent(
@@ -1627,6 +1659,17 @@ pub fn is_merged_removal(entry: &RemovedWorktree) -> bool {
                 || entry.extra.get("gitState").and_then(Value::as_str) == Some("merged")
         }
     }
+}
+
+/// Outcome of [`Store::settle_removed_verification`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemovedSettle {
+    /// No retained removal record has this slug.
+    Missing,
+    /// The record owes no post-merge check, so nothing was written.
+    NotOwed,
+    /// The owed check was settled; these were its steps.
+    Settled { verify_after_merge: Option<String> },
 }
 
 /// Whether a removed row still had an outstanding post-merge check. This is

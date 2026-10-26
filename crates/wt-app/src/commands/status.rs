@@ -465,7 +465,14 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                     eprintln!("not inside a worktree");
                     return Ok(1);
                 }
+                // A removed row can still owe its post-merge check; only its
+                // outcome may be recorded, never a new claim about live work.
                 Err(e) => {
+                    if let Some(slug) = target.as_deref()
+                        && matches!(work_state, WorkState::Verified | WorkState::Dropped)
+                    {
+                        return settle_removed(ctx, slug, work_state, note, e).await;
+                    }
                     eprintln!("{e}");
                     return Ok(1);
                 }
@@ -627,6 +634,49 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             Ok(0)
         }
         Action::Error(_) => unreachable!(),
+    }
+}
+
+/// Record the outcome of a removed row's owed post-merge check.
+async fn settle_removed(
+    ctx: &AppContext,
+    slug: &str,
+    work_state: WorkState,
+    note: Option<String>,
+    unresolved: anyhow::Error,
+) -> Result<i32> {
+    let mut next = WorkStatusRecord::new(work_state, now_iso());
+    next.by = std::env::var("WT_AGENT")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    next.note = note;
+    let stored: StoredWorkStatusRecord =
+        serde_json::from_value(serde_json::to_value(&next)?).context("encode status record")?;
+    let db_slug = slug.to_owned();
+    let settled = ctx
+        .database
+        .call(move |s| Ok(s.settle_removed_verification(&db_slug, &stored)?))
+        .await?;
+    match settled {
+        wt_store::RemovedSettle::Settled { verify_after_merge } => {
+            println!("✓ {slug} {} (removed row)", work_state_name(work_state));
+            if let Some(steps) = verify_after_merge {
+                println!("  settled check: {steps}");
+            }
+            if let Some(note) = &next.note {
+                println!("  note: {note}");
+            }
+            Ok(0)
+        }
+        wt_store::RemovedSettle::NotOwed => {
+            eprintln!("{slug} was removed and owes no post-merge check");
+            Ok(1)
+        }
+        wt_store::RemovedSettle::Missing => {
+            eprintln!("{unresolved}");
+            Ok(1)
+        }
     }
 }
 
@@ -952,6 +1002,88 @@ mod tests {
         assert_eq!(after["slugs"]["one"]["work"]["state"], "todo");
         assert_eq!(after["slugs"]["one"]["work"]["at"], at);
         assert!(after["slugs"]["one"]["work"].get("blockedOn").is_none());
+        fixture.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn removed_row_settles_only_an_owed_post_merge_check() {
+        use crate::commands::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let removed = |slug: &str, state: &str, verify: Option<&str>| wt_store::RemovedWorktree {
+            slug: slug.into(),
+            branch: format!("feature/{slug}"),
+            removed_at: now_iso(),
+            work: Some(StoredWorkStatusRecord {
+                state: state.into(),
+                at: now_iso(),
+                note: Some("shipped".into()),
+                risk: Some("low".into()),
+                sha: None,
+                by: None,
+                blocked_on: None,
+                verify_after_merge: verify.map(str::to_owned),
+                extra: Default::default(),
+            }),
+            automations_paused: None,
+            extra: Default::default(),
+        };
+        let entries = vec![
+            removed("owed", "ready", Some("check prod")),
+            removed("clean", "ready", None),
+        ];
+        fixture
+            .ctx
+            .database
+            .call(move |s| Ok(s.record_removed_worktrees(&entries, now_ms())?))
+            .await
+            .unwrap();
+        let settle = |slug: &str, state: &str| StatusArgs {
+            positionals: vec![slug.into(), state.into()],
+            note: Some("owner confirmed".into()),
+            ..Default::default()
+        };
+        // A claim about live work is never written to a removed row.
+        assert_eq!(
+            run(&fixture.ctx, &settle("owed", "working")).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            run(&fixture.ctx, &settle("clean", "verified"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            run(&fixture.ctx, &settle("absent", "verified"))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            run(&fixture.ctx, &settle("owed", "verified"))
+                .await
+                .unwrap(),
+            0
+        );
+        let history = fixture
+            .ctx
+            .database
+            .call(|s| Ok(s.read_removed_worktrees()?))
+            .await
+            .unwrap();
+        let owed = history.iter().find(|entry| entry.slug == "owed").unwrap();
+        let clean = history.iter().find(|entry| entry.slug == "clean").unwrap();
+        assert!(!wt_store::verification_owed_at_removal(owed));
+        let work = owed.work.as_ref().unwrap();
+        assert_eq!(work.state, "verified");
+        assert_eq!(work.note.as_deref(), Some("owner confirmed"));
+        assert_eq!(clean.work.as_ref().unwrap().state, "ready");
+        // Settling twice finds nothing owed.
+        assert_eq!(
+            run(&fixture.ctx, &settle("owed", "verified"))
+                .await
+                .unwrap(),
+            1
+        );
         fixture.close().await.unwrap();
     }
 }
