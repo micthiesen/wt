@@ -25,9 +25,9 @@ class AnsiScreenTests(unittest.TestCase):
         # fingerprint by ~1s. Its legitimate refresh was misclassified as idle.
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "wt-native.log"
-            registered = {"target": "wt::freshness", "fields": {
+            registered = {"target": "wt_sources::freshness", "fields": {
                 "message": "filesystem watches registered", "paths": 9}}
-            baseline = {"target": "wt::freshness", "fields": {
+            baseline = {"target": "wt_sources::freshness", "fields": {
                 "message": "filesystem metadata invalidation", "git_changed": True}}
             log.write_text(json.dumps(registered) + "\n")
             self.assertFalse(ui.startup_metadata_sample_seen([log]))

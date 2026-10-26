@@ -19,7 +19,7 @@ use crate::github_source::GithubRefresh;
 
 /// A write this host made, or may have made, to one PR field.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GithubWrite {
+pub struct GithubWrite {
     branch: String,
     number: u64,
     change: WriteChange,
@@ -32,7 +32,7 @@ enum WriteChange {
 }
 
 impl GithubWrite {
-    pub(crate) fn auto_merge(branch: &str, number: u64, enable: bool) -> Self {
+    pub fn auto_merge(branch: &str, number: u64, enable: bool) -> Self {
         Self {
             branch: branch.to_owned(),
             number,
@@ -116,7 +116,7 @@ impl Mutation<GithubData> for GithubWrite {
 }
 
 /// The write ledger's records: pending, accepted or unconfirmed writes.
-pub(crate) type LedgerState = Pending<GithubData, GithubWrite>;
+pub type LedgerState = Pending<GithubData, GithubWrite>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Guard {

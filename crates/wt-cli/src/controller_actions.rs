@@ -610,7 +610,11 @@ pub async fn execute_with_shutdown(
                     // reopens the decision rather than undoing it. Restored
                     // rows return to the Inbox, as in TS.
                     let seen = seen.map(|wt_tui::Seen(seen)| seen);
-                    match store.toggle_archived_seen(&slug, seen, crate::board_layout::ARCHIVED)? {
+                    match store.toggle_archived_seen(
+                        &slug,
+                        seen,
+                        wt_sources::board_layout::ARCHIVED,
+                    )? {
                         wt_store::SeenToggle::Set(archived) => Ok(archived),
                         wt_store::SeenToggle::Stale { current } => {
                             Err(wt_app_core::host_errors::stale(if current {
@@ -822,14 +826,14 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
             .collect(),
         ..Default::default()
     };
-    crate::board_layout::prepare(
+    wt_sources::board_layout::prepare(
         &mut placement,
         &state,
         &ctx.config.branch.base,
         ctx.config.ui.sort,
     );
     if let Some(section) =
-        crate::board_layout::section_for(&placement, &wt_core::worktree_target_key(&target))
+        wt_sources::board_layout::section_for(&placement, &wt_core::worktree_target_key(&target))
     {
         ctx.database
             .call(move |store| {
@@ -1477,7 +1481,7 @@ mod tests {
             fixture
                 .ctx
                 .database
-                .call(|store| Ok(store.is_section_folded(crate::board_layout::ARCHIVED)?))
+                .call(|store| Ok(store.is_section_folded(wt_sources::board_layout::ARCHIVED)?))
                 .await
                 .unwrap(),
             "archiving folds the archive section in the same write"

@@ -3020,6 +3020,7 @@ dependencies = [
  "wt-remote",
  "wt-runtime",
  "wt-skills",
+ "wt-sources",
  "wt-sst",
  "wt-stack",
  "wt-store",
@@ -3284,6 +3285,43 @@ dependencies = [
  "thiserror",
  "wt-core",
  "wt-platform",
+]
+
+[[package]]
+name = "wt-sources"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "notify",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wt-actions",
+ "wt-app-core",
+ "wt-automations",
+ "wt-config",
+ "wt-core",
+ "wt-dev",
+ "wt-events",
+ "wt-github",
+ "wt-harness",
+ "wt-lifecycle",
+ "wt-naming",
+ "wt-ops",
+ "wt-platform",
+ "wt-runtime",
+ "wt-store",
+ "wt-tmux",
+ "wt-tui",
+ "wt-update",
+ "wt-vcs",
 ]
 
 [[package]]

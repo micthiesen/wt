@@ -246,7 +246,7 @@ def startup_metadata_sample_seen(paths):
             except ValueError:
                 continue  # The writer may still be appending its last record.
             fields = record.get("fields", {})
-            if (record.get("target") == "wt::freshness"
+            if (record.get("target") == "wt_sources::freshness"
                     and fields.get("message") == "filesystem metadata invalidation"
                     and fields.get("git_changed") is True):
                 return True
@@ -333,7 +333,7 @@ def main():
     shim.chmod(0o755)
     env = dict(os.environ, HOME=str(home), WT_CONFIG=str(config), TERM="xterm-256color",
                PATH=str(tools) + os.pathsep + os.environ["PATH"], WT_UPDATE="off", WT_SKILLS="off",
-               WT_LOG="info,wt::freshness=debug",
+               WT_LOG="info,wt_sources::freshness=debug",
                # A manual refresh queues origin work behind its ten-second floor.
                # That fetch legitimately invalidates Git, even if it completes
                # during the later title-only assertion. This fixture measures

@@ -73,7 +73,7 @@ impl GithubRefresh {
     }
 
     #[cfg(test)]
-    pub(crate) fn detached() -> Self {
+    pub fn detached() -> Self {
         let (github, _) = wt_runtime::leaf_channel(
             &TaskScope::new(),
             SourceSpec {
@@ -94,7 +94,7 @@ impl GithubRefresh {
 /// The one GitHub leaf. Each fetch chooses between the events daemon's
 /// snapshot and a direct read; both publish the moment their GitHub request
 /// started, so neither can claim to have seen a later write.
-pub(crate) fn start(
+pub fn start(
     scope: &TaskScope,
     context: &AppContext,
     git: LeafHandle<Vec<WorktreeSnapshot>>,

@@ -77,7 +77,7 @@ pub struct AutomationDrain {
 }
 
 impl AutomationDrain {
-    pub(crate) fn new(
+    pub fn new(
         cancel: tokio_util::sync::CancellationToken,
         task: tokio::task::JoinHandle<()>,
     ) -> Arc<Self> {

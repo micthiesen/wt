@@ -79,7 +79,7 @@ pub struct SessionInventory {
 impl SessionInventory {
     /// The running tmux sessions, with the identity fields a picker row
     /// witnesses. Built from the one inventory poll the board already holds.
-    pub(crate) fn live_sessions(&self) -> Vec<wt_tmux::SessionInfo> {
+    pub fn live_sessions(&self) -> Vec<wt_tmux::SessionInfo> {
         self.all
             .values()
             .map(|descriptor| wt_tmux::SessionInfo {
@@ -618,7 +618,7 @@ fn spawn_discoveries(
 /// Codex/OpenCode reuse one tmux slot across historical UUIDs. A live slot
 /// without its exact identity is still busy, but proves no transcript live.
 /// Claude's managed session name identifies its individual history entry.
-pub(crate) fn is_session_live(
+pub fn is_session_live(
     inventory: &SessionInventory,
     harness: HarnessId,
     session: &HarnessSession,

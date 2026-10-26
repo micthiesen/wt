@@ -309,7 +309,7 @@ fn section_title(key: &str) -> String {
 }
 
 /// Identical branch names on different machines do not form a shared stack.
-pub(crate) fn branch_key(row: &wt_tui::BoardRow, branch: &str) -> String {
+pub fn branch_key(row: &wt_tui::BoardRow, branch: &str) -> String {
     if wt_core::is_remote_worktree_ledger_key(&row.key) {
         let namespace = row
             .key

@@ -8,7 +8,7 @@
 
 mod retry;
 #[cfg(test)]
-pub(crate) mod tests;
+pub mod tests;
 mod writes;
 
 use std::ops::ControlFlow;
@@ -31,7 +31,7 @@ use wt_app_core::context::AppContext;
 
 const FAILED_LOG_LIMIT: usize = 200;
 /// The write named a PR the host cannot confirm as the one the user saw.
-pub(crate) const STALE_PIN: &str = "PR changed or still loading; review again";
+pub const STALE_PIN: &str = "PR changed or still loading; review again";
 const UNCONFIRMED_ENABLE: &str = "previous attempt unconfirmed; waiting for refresh";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

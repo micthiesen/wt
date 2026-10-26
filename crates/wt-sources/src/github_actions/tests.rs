@@ -6,7 +6,7 @@ use wt_tui::ReplyOutcome;
 
 use super::writes::{LedgerState, record_accepted};
 
-pub(crate) fn pr(branch: &str) -> PullRequest {
+pub fn pr(branch: &str) -> PullRequest {
     PullRequest {
         id: Some("PR_node".into()),
         number: 7,
@@ -37,7 +37,7 @@ pub(crate) fn pr(branch: &str) -> PullRequest {
 }
 
 /// GitHub data with one open draft PR #7 on `branch`.
-pub(crate) fn open_pr_data(branch: &str) -> GithubData {
+pub fn open_pr_data(branch: &str) -> GithubData {
     let mut data = GithubData::default();
     data.covered_branches.insert(branch.into());
     data.prs.insert(branch.into(), pr(branch));
@@ -45,7 +45,7 @@ pub(crate) fn open_pr_data(branch: &str) -> GithubData {
 }
 
 /// The same data with classic auto-merge armed on every PR.
-pub(crate) fn with_auto_merge(mut data: GithubData) -> GithubData {
+pub fn with_auto_merge(mut data: GithubData) -> GithubData {
     for pr in data.prs.values_mut() {
         pr.auto_merge = Some(AutoMerge {
             enabled_at: "then".into(),
@@ -55,7 +55,7 @@ pub(crate) fn with_auto_merge(mut data: GithubData) -> GithubData {
     data
 }
 
-pub(crate) fn ledger_with_accepted_enable(branch: &str, number: u64, at: Stamp) -> LedgerState {
+pub fn ledger_with_accepted_enable(branch: &str, number: u64, at: Stamp) -> LedgerState {
     let mut ledger = LedgerState::default();
     record_accepted(
         &mut ledger,

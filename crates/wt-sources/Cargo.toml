@@ -1,0 +1,47 @@
+[package]
+name = "wt-sources"
+# Fixed: only the shipped binary carries the release version (docs/ci.md).
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wt-app-core.workspace = true
+wt-ops.workspace = true
+futures-util.workspace = true
+anyhow.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+wt-config.workspace = true
+wt-actions.workspace = true
+wt-automations.workspace = true
+wt-dev.workspace = true
+wt-core.workspace = true
+wt-github.workspace = true
+wt-harness.workspace = true
+wt-lifecycle.workspace = true
+wt-naming.workspace = true
+wt-platform.workspace = true
+wt-runtime.workspace = true
+wt-events.workspace = true
+wt-store.workspace = true
+wt-tui.workspace = true
+wt-tmux.workspace = true
+wt-update.workspace = true
+wt-vcs.workspace = true
+
+[dev-dependencies]
+wt-app-core = { workspace = true, features = ["testing"] }
+rusqlite.workspace = true
+wt-runtime = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

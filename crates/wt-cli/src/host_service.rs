@@ -6,8 +6,8 @@ use wt_core::Domain;
 use wt_runtime::{SourceSnapshot, Stamp, TaskScope};
 use wt_tui::{ActionSurface, Board, ReplyOutcome, UiAction, UiReply};
 
-use crate::{github_actions::GithubAction, sources::BoardSources};
 use wt_app_core::context::AppContext;
+use wt_sources::{github_actions::GithubAction, sources::BoardSources};
 
 pub struct HostService {
     pub context: AppContext,
@@ -85,7 +85,7 @@ impl HostService {
         // Closing the view stops reads. An accepted mutation instead belongs to
         // its command drain, including when an SSH connection disappears.
         context.cancellation = commands;
-        let sources = crate::sources::start(scope, &context);
+        let sources = wt_sources::sources::start(scope, &context);
         sources.board.refresh();
         Self { context, sources }
     }
@@ -301,7 +301,7 @@ impl HostService {
                     selected,
                 } => {
                     Box::pin(self.sources.github_pickers.submit_reviewers(
-                        crate::github_pickers::ReviewerSubmission {
+                        wt_sources::github_pickers::ReviewerSubmission {
                             key: &key,
                             pr_number,
                             original: &original,
@@ -361,7 +361,7 @@ impl HostService {
                 branch,
             } => {
                 let created = Box::pin(self.sources.review_requests.checkout(
-                    crate::review_requests::ReviewCheckout {
+                    wt_sources::review_requests::ReviewCheckout {
                         url,
                         updated_at,
                         branch,

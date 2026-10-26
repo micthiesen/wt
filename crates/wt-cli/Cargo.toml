@@ -14,6 +14,7 @@ name = "wt"
 
 [dependencies]
 wt-app-core.workspace = true
+wt-sources.workspace = true
 wt-ops.workspace = true
 futures-util.workspace = true
 anyhow.workspace = true

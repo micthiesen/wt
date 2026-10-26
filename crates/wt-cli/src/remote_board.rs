@@ -1,5 +1,5 @@
 //! Fleet projection combines independent snapshots of the same host service.
-use crate::{host_service::HostService, local_source::Metadata, remote_host::RemoteHost};
+use crate::{host_service::HostService, remote_host::RemoteHost};
 use std::sync::Arc;
 use wt_app_core::feeds::FailureClock;
 use wt_app_core::{
@@ -10,6 +10,7 @@ use wt_core::Domain;
 use wt_runtime::{
     DomainMap, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel, merge_domains,
 };
+use wt_sources::local_source::Metadata;
 use wt_tui::{Board, HostChoice};
 
 pub struct Fleet {
@@ -413,8 +414,8 @@ fn compose(
             .cmp(&a.removed_at)
             .then_with(|| a.key.cmp(&b.key))
     });
-    crate::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
-    crate::board_layout::refresh_rollups(&mut board);
+    wt_sources::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
+    wt_sources::board_layout::refresh_rollups(&mut board);
     wt_app_core::feeds::bound_feeds(&mut board);
     snapshot.derive(Some(Arc::new(board)))
 }

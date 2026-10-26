@@ -14,7 +14,7 @@ pub(crate) async fn accept(
     let section_key = placement
         .section
         .as_deref()
-        .unwrap_or(crate::board_layout::INBOX);
+        .unwrap_or(wt_sources::board_layout::INBOX);
     let section = board
         .sections
         .iter()

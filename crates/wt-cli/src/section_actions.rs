@@ -77,18 +77,18 @@ pub async fn move_row(
         .map(|row| {
             ChainMember::new(
                 &row.key,
-                crate::board_layout::branch_key(row, &row.branch),
+                wt_sources::board_layout::branch_key(row, &row.branch),
                 row.base_branch
                     .as_deref()
                     .filter(|base| *base != ctx.config.branch.base)
-                    .map(|base| crate::board_layout::branch_key(row, base)),
+                    .map(|base| wt_sources::board_layout::branch_key(row, base)),
             )
         })
         .collect();
     let stacks = build_stack_index(&members, &ctx.config.branch.base);
     let moving: Vec<_> = stacks
         .by_branch
-        .get(&crate::board_layout::branch_key(row, &row.branch))
+        .get(&wt_sources::board_layout::branch_key(row, &row.branch))
         .map(|entry| {
             stacks.layouts[entry.layout_index]
                 .nodes
@@ -129,7 +129,7 @@ pub async fn reorder(
     board: Option<&wt_tui::Board>,
 ) -> Result<UiReply> {
     let board = board.context("worktree metadata is still loading")?;
-    if section == crate::board_layout::ARCHIVED {
+    if section == wt_sources::board_layout::ARCHIVED {
         bail!("Archived rows do not reorder; use a to restore");
     }
     let group_index = board
@@ -141,7 +141,9 @@ pub async fn reorder(
         let order = board
             .sections
             .iter()
-            .filter(|group| group.key != crate::board_layout::ARCHIVED && !group.rows.is_empty())
+            .filter(|group| {
+                group.key != wt_sources::board_layout::ARCHIVED && !group.rows.is_empty()
+            })
             .map(|group| group.key.clone())
             .collect::<Vec<_>>();
         let current = order
@@ -178,11 +180,11 @@ pub async fn reorder(
         .map(|row| {
             ChainMember::new(
                 &row.key,
-                crate::board_layout::branch_key(row, &row.branch),
+                wt_sources::board_layout::branch_key(row, &row.branch),
                 row.base_branch
                     .as_deref()
                     .filter(|base| *base != ctx.config.branch.base)
-                    .map(|base| crate::board_layout::branch_key(row, base)),
+                    .map(|base| wt_sources::board_layout::branch_key(row, base)),
             )
         })
         .collect::<Vec<_>>();
@@ -198,7 +200,7 @@ pub async fn reorder(
     let unit_key = |row: &wt_tui::BoardRow| {
         stacks
             .by_branch
-            .get(&crate::board_layout::branch_key(row, &row.branch))
+            .get(&wt_sources::board_layout::branch_key(row, &row.branch))
             .and_then(|entry| stacks.layouts[entry.layout_index].nodes.first())
             .map(|root| root.slug.clone())
             .filter(|root| section_rows.iter().any(|row| &row.key == root))
@@ -283,7 +285,7 @@ pub async fn reorder(
         }
         .into_iter()
         .find(|group| {
-            group.key != crate::board_layout::ARCHIVED && !group.key.starts_with("\0stack:")
+            group.key != wt_sources::board_layout::ARCHIVED && !group.key.starts_with("\0stack:")
         })
         .ok_or_else(|| {
             wt_app_core::host_errors::notice(if down {
@@ -293,7 +295,7 @@ pub async fn reorder(
             })
         })?;
         let section =
-            (destination.key != crate::board_layout::INBOX).then(|| destination.key.clone());
+            (destination.key != wt_sources::board_layout::INBOX).then(|| destination.key.clone());
         let message = format!("moved to {}", section.as_deref().unwrap_or("Inbox"));
         let moving = section_rows
             .iter()
@@ -372,7 +374,7 @@ mod tests {
             .await
             .unwrap();
         let board =
-            crate::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
+            wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
         // The menu showed the Inbox; another writer files the row under Release.
         fixture
             .ctx
@@ -435,11 +437,11 @@ mod tests {
             .await
             .unwrap();
         let mut board =
-            crate::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
+            wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
         reorder(
             &fixture.ctx,
             Some("one".into()),
-            crate::board_layout::INBOX.into(),
+            wt_sources::board_layout::INBOX.into(),
             true,
             Some(&board),
         )
@@ -451,7 +453,7 @@ mod tests {
             .call(|store| Ok(store.read_wt_state()?))
             .await
             .unwrap();
-        crate::board_layout::prepare(
+        wt_sources::board_layout::prepare(
             &mut board,
             &state,
             &fixture.ctx.config.branch.base,
@@ -460,7 +462,7 @@ mod tests {
         let inbox = board
             .sections
             .iter()
-            .find(|section| section.key == crate::board_layout::INBOX)
+            .find(|section| section.key == wt_sources::board_layout::INBOX)
             .unwrap();
         assert_eq!(board.rows[inbox.rows[0]].key, "two");
         let first = inbox.rows[0];
@@ -471,7 +473,7 @@ mod tests {
             reorder(
                 &ctx,
                 Some("two".into()),
-                crate::board_layout::INBOX.into(),
+                wt_sources::board_layout::INBOX.into(),
                 true,
                 Some(&board)
             )
@@ -486,7 +488,7 @@ mod tests {
         reorder(
             &fixture.ctx,
             Some("one".into()),
-            crate::board_layout::INBOX.into(),
+            wt_sources::board_layout::INBOX.into(),
             true,
             Some(&board),
         )
@@ -538,7 +540,7 @@ mod tests {
             .await
             .unwrap();
         let board =
-            crate::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
+            wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
         move_row(
             &fixture.ctx,
             key.clone(),

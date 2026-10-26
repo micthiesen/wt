@@ -20,13 +20,13 @@ use wt_runtime::{SourceHandle, Stamp, TaskScope};
 use wt_app_core::context::AppContext;
 
 /// Daemon data older than this is not used; the GitHub leaf reads directly.
-pub(crate) const FRESH: Duration = Duration::from_secs(90);
+pub const FRESH: Duration = Duration::from_secs(90);
 /// Rechecks the snapshot when a file event was missed or the shown data aged out.
 const RECONCILE: Duration = Duration::from_secs(15);
 
 /// A validated daemon snapshot narrowed to the requested branches.
 #[derive(Clone, Debug)]
-pub(crate) struct DaemonRead {
+pub struct DaemonRead {
     pub data: GithubData,
     /// When the daemon's GitHub read started, on this process clock. `None`
     /// when the writer did not record it; such data never orders against
@@ -47,7 +47,7 @@ impl DaemonRead {
 
 /// A stale, foreign-build or incomplete snapshot is disposable. Live fetches
 /// are the fallback, and retain their own last-good data on a fetch error.
-pub(crate) async fn load(context: &AppContext, branches: &[String]) -> Option<DaemonRead> {
+pub async fn load(context: &AppContext, branches: &[String]) -> Option<DaemonRead> {
     context.config.github.events.as_ref()?;
     read(
         context.config.paths.cache_root.join("events"),
@@ -138,7 +138,7 @@ fn validate(
 /// Ask the GitHub leaf to recheck the daemon snapshot when it changes, and on
 /// a slow backstop. `file_event` marks these requests so a recheck that finds
 /// nothing usable does not become a network read by itself.
-pub(crate) fn watch(
+pub fn watch(
     scope: &TaskScope,
     context: &AppContext,
     github: SourceHandle<GithubData>,

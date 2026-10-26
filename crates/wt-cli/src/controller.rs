@@ -20,7 +20,7 @@ use wt_app_core::context::AppContext;
 pub struct Controller {
     task: JoinHandle<()>,
     cancel: CancellationToken,
-    automations: Arc<crate::automation_source::AutomationDrain>,
+    automations: Arc<wt_sources::automation_source::AutomationDrain>,
 }
 
 struct RunningAction {
@@ -1354,7 +1354,7 @@ mod tests {
                 work.await.unwrap();
             }),
             cancel: cancel.clone(),
-            automations: crate::automation_source::AutomationDrain::new(
+            automations: wt_sources::automation_source::AutomationDrain::new(
                 CancellationToken::new(),
                 tokio::spawn(async move {
                     automation.await.unwrap();
