@@ -12,11 +12,12 @@ use wt_tui::{
     Board, ConfirmAction, RemovalRevision as UiRemovalRevision, UiAction, UiModal, UiReply, UrlKind,
 };
 
-use crate::{
-    commands::{new::NewArgs, resolve::run_git},
+use wt_app_core::context::AppContext;
+use wt_ops::{
+    commands::new::NewArgs,
+    commands::resolve::run_git,
     lifecycle_ops::{self, resolve_key},
 };
-use wt_app_core::context::AppContext;
 
 fn harness_name(harness: wt_core::HarnessId) -> &'static str {
     match harness {
@@ -511,10 +512,10 @@ pub async fn execute_with_shutdown(
                     .extra
                     .insert("title".into(), serde_json::json!(visible.title));
             }
-            let job = crate::commands::_destroy::start_remove(
+            let job = wt_ops::commands::_destroy::start_remove(
                 ctx,
                 &plan.row,
-                crate::commands::_destroy::DestroyOptions {
+                wt_ops::commands::_destroy::DestroyOptions {
                     force,
                     delete_branch: true,
                     landed: plan.landed,
@@ -524,13 +525,13 @@ pub async fn execute_with_shutdown(
                 },
             )
             .await?;
-            match crate::commands::_destroy::wait_for_completion_or_shutdown(ctx, &job, shutdown)
+            match wt_ops::commands::_destroy::wait_for_completion_or_shutdown(ctx, &job, shutdown)
                 .await?
             {
-                crate::commands::_destroy::RemovalWait::Completed => {
+                wt_ops::commands::_destroy::RemovalWait::Completed => {
                     Ok(message(format!("Removed {}", plan.row.target.slug())))
                 }
-                crate::commands::_destroy::RemovalWait::ContinuesInBackground => Ok(UiReply {
+                wt_ops::commands::_destroy::RemovalWait::ContinuesInBackground => Ok(UiReply {
                     message: format!(
                         "Removal job {job} continues in the background; use `wt logs` to follow it"
                     ),
@@ -729,9 +730,10 @@ async fn resolve_creation(ctx: &AppContext, input: &str) -> Result<wt_tui::Creat
     let matches = NewArgs::augment_args(clap::Command::new("new"))
         .try_get_matches_from(std::iter::once("new".to_owned()).chain(words))?;
     let args = NewArgs::from_arg_matches(&matches)?;
-    let branch = crate::commands::new::parse_branch(ctx, &args.positionals.join(" "), &args, false)
-        .await
-        .map_err(anyhow::Error::msg)?;
+    let branch =
+        wt_ops::commands::new::parse_branch(ctx, &args.positionals.join(" "), &args, false)
+            .await
+            .map_err(anyhow::Error::msg)?;
     let existing = ctx
         .repository
         .inventory(&ctx.cancellation)
@@ -986,7 +988,7 @@ async fn set_base(
     base: Option<String>,
     seen: Option<wt_tui::Seen<Option<String>>>,
 ) -> Result<UiReply> {
-    crate::fork_base::set(ctx, key, base, seen.map(|seen| seen.0)).await?;
+    wt_ops::fork_base::set(ctx, key, base, seen.map(|seen| seen.0)).await?;
     Ok(message("Fork base updated"))
 }
 
@@ -1083,7 +1085,7 @@ mod tests {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+        let row = wt_ops::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
             .await
             .unwrap();
         let key = wt_core::worktree_target_key(&row.target);
@@ -1182,7 +1184,7 @@ mod tests {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+        let row = wt_ops::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
             .await
             .unwrap();
         let key = wt_core::worktree_target_key(&row.target);
@@ -1268,7 +1270,7 @@ mod tests {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let listed = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+        let listed = wt_ops::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
             .await
             .unwrap();
         let listed_key = wt_core::worktree_target_key(&listed.target);
@@ -1401,7 +1403,7 @@ mod tests {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+        let row = wt_ops::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
             .await
             .unwrap();
         execute(
@@ -1443,7 +1445,7 @@ mod tests {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
+        let row = wt_ops::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
             .await
             .unwrap();
         let key = wt_core::worktree_target_key(&row.target);

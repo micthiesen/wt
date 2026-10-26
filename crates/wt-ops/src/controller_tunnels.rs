@@ -14,7 +14,7 @@ use wt_app_core::context::AppContext;
 /// OpenSSH's client StreamLocalBindUnlink setting does not apply to a remote
 /// -R listener. Reclaim an abandoned worker endpoint before asking sshd to bind
 /// it, without requiring a server-wide unlink policy or disturbing a live peer.
-pub(crate) async fn prepare_worker_socket(
+pub async fn prepare_worker_socket(
     root: &Path,
     socket: &Path,
     cancel: &CancellationToken,

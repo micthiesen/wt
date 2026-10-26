@@ -136,7 +136,7 @@ fn should_open(args: &NewArgs) -> bool {
     args.open || std::io::stdin().is_terminal()
 }
 
-pub(crate) async fn parse_branch(
+pub async fn parse_branch(
     ctx: &AppContext,
     raw: &str,
     args: &NewArgs,

@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_store::GuideRecord;
 
-use crate::commands::resolve::resolve_worktree;
 use wt_app_core::context::AppContext;
+use wt_ops::commands::resolve::resolve_worktree;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct GuideArgs {

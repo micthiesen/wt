@@ -11,6 +11,7 @@ tree; its behavior baseline is commit `d9cd2f4`.
 |---|---|
 | `wt-app` | The `wt` binary: passes its release version and build identity to `wt-cli` and nothing else, so a release recompiles only this crate ([ci.md](ci.md)) |
 | `wt-app-core` | Foundation of the application: `AppContext`, database, build identity, harness glue, host wire protocol and lane classification, feed helpers. Depends on no other application crate |
+| `wt-ops` | Operations both the CLI and the host run: removal and its background worker, creation, fork bases, landing evidence, restacking, the events daemon, updates, managed workers and remote dispatch, plus the command implementations they reuse. Depends on `wt-app-core` |
 | `wt-cli` (library crate `wt`) | CLI composition, local and remote host services, TUI source pipeline, application actions, update integration |
 | `wt-tui` | Board and modal models, input state machine, terminal rendering and action protocol |
 | `wt-config` | Config discovery, merge, validation, resolved process configuration |

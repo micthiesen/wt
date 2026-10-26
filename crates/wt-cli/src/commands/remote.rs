@@ -5,8 +5,8 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 use tokio::process::Command;
 
-use crate::remote;
 use wt_app_core::context::AppContext;
+use wt_ops::remote;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RemoteArgs {

@@ -13,11 +13,13 @@ use wt_github::{GithubClient, GithubOptions, PullRequest};
 use wt_store::{RemovedWorktree, WorkStatusRecord};
 use wt_vcs::WorktreeSnapshot;
 
-use crate::{
-    commands::{diagnostics::OperationLock, issue::repo_web_url, resolve::run_git},
+use wt_app_core::{context::AppContext, issue_identity};
+use wt_ops::{
+    commands::diagnostics::OperationLock,
+    commands::issue::repo_web_url,
+    commands::resolve::run_git,
     worktree_facts::{PushFacts, push_facts},
 };
-use wt_app_core::{context::AppContext, issue_identity};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct ListArgs {
@@ -251,7 +253,7 @@ async fn collect_operation_locks(
                 .acquire_owned()
                 .await
                 .context("acquire bounded operation-lock slot")?;
-            let lock = crate::commands::diagnostics::operation_lock(&context, &slug).await?;
+            let lock = wt_ops::commands::diagnostics::operation_lock(&context, &slug).await?;
             Ok::<_, anyhow::Error>((slug, lock))
         });
     }

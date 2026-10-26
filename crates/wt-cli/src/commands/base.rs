@@ -2,8 +2,8 @@ use anyhow::Result;
 use clap::Args;
 use serde_json::Value;
 
-use crate::commands::resolve::resolve_worktree;
 use wt_app_core::{context::AppContext, database::Database};
+use wt_ops::commands::resolve::resolve_worktree;
 
 const USAGE: &str = "usage: wt base <slug>                 show the recorded fork base\n       wt base set <slug> <ref>      record <ref> as the fork base\n       wt base clear <slug>          return to trunk, retaining the replay anchor";
 
@@ -29,7 +29,7 @@ pub async fn run(ctx: &AppContext, args: &BaseArgs) -> Result<i32> {
                 Some(values[2].clone())
             };
             let (branch, anchor) =
-                crate::fork_base::set(ctx, &wt_core::worktree_target_key(&row.target), base, None)
+                wt_ops::fork_base::set(ctx, &wt_core::worktree_target_key(&row.target), base, None)
                     .await?;
             println!(
                 "✓ {} base → {} @ {}",
@@ -95,7 +95,7 @@ mod tests {
             vec!["commit", "-m", "parent contribution"],
             vec!["branch", "-f", "base-branch", "HEAD"],
         ] {
-            crate::commands::resolve::run_git(&fixture.ctx, path, args)
+            wt_ops::commands::resolve::run_git(&fixture.ctx, path, args)
                 .await
                 .unwrap()
                 .checked("git")
@@ -116,7 +116,7 @@ mod tests {
         assert_eq!(state["slugs"]["one"]["baseBranch"], "base-branch");
         assert!(state["slugs"]["one"]["baseSha"].as_str().is_some());
         let saved_anchor = state["slugs"]["one"]["baseSha"].clone();
-        let trunk = crate::commands::resolve::run_git(&fixture.ctx, path, ["rev-parse", "main"])
+        let trunk = wt_ops::commands::resolve::run_git(&fixture.ctx, path, ["rev-parse", "main"])
             .await
             .unwrap()
             .stdout_text();

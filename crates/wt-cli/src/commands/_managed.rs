@@ -60,7 +60,7 @@ pub async fn run(args: &[String], cancellation: &CancellationToken) -> Result<i3
             let socket = std::env::var_os("WT_CONTROLLER_SOCKET")
                 .context("worker has no controller services")?;
             let socket = PathBuf::from(socket);
-            crate::controller_tunnels::prepare_worker_socket(
+            wt_ops::controller_tunnels::prepare_worker_socket(
                 Path::new(&root),
                 &socket,
                 cancellation,

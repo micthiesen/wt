@@ -6,11 +6,11 @@ use wt_github::{GithubClient, GithubOptions};
 use wt_harness::stale_harness_shims;
 use wt_platform::process::CommandSpec;
 
-use crate::commands::{
+use wt_app_core::context::AppContext;
+use wt_ops::commands::{
     diagnostics::{Check, CheckStatus, display_status, worst},
     resolve::worktree_at_cwd,
 };
-use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct DoctorArgs {
@@ -146,7 +146,7 @@ pub async fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<i32> {
                 ));
             }
         }
-        match crate::commands::diagnostics::operation_lock(ctx, row.target.slug()).await {
+        match wt_ops::commands::diagnostics::operation_lock(ctx, row.target.slug()).await {
             Ok(Some(lock)) => {
                 let label = lock.op.as_deref().unwrap_or("operation");
                 let phase = lock.phase.as_deref().filter(|phase| !phase.is_empty());
@@ -475,7 +475,7 @@ fn select_rows(
         return Ok(records.into_iter().filter(|r| !r.is_main).collect());
     }
     if let Some(target) = &args.target {
-        return Ok(vec![crate::commands::resolve::resolve_from_inventory(
+        return Ok(vec![wt_ops::commands::resolve::resolve_from_inventory(
             &records, target, true,
         )?]);
     }

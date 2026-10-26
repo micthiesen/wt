@@ -57,7 +57,7 @@ pub async fn run(
         if args.check || args.channel.is_some() || args.release.is_some() {
             bail!("`wt update log` does not accept --check, --channel, or --release")
         }
-        let paths = crate::updates::install_paths(options)?;
+        let paths = wt_ops::updates::install_paths(options)?;
         let store = StateStore::new(paths);
         let state = tokio::task::spawn_blocking(move || store.load()).await??;
         println!("channel: {:?}", state.channel);
@@ -99,12 +99,12 @@ pub async fn run(
     if args.action.is_some() {
         bail!("unknown `wt update` action; use `wt update log`")
     }
-    let paths = crate::updates::install_paths(options)?;
+    let paths = wt_ops::updates::install_paths(options)?;
     if !args.check {
-        crate::updates::require_stable_launcher(&paths)?;
+        wt_ops::updates::require_stable_launcher(&paths)?;
     }
-    let repository = crate::updates::repository(options)?;
-    let result = crate::updates::update_once(
+    let repository = wt_ops::updates::repository(options)?;
+    let result = wt_ops::updates::update_once(
         paths.clone(),
         repository,
         wt_app_core::build_info::target().to_owned(),
@@ -115,16 +115,16 @@ pub async fn run(
     )
     .await?;
     match result {
-        crate::updates::UpdateOutcome::Current => println!("wt is up to date"),
-        crate::updates::UpdateOutcome::Declined => {
+        wt_ops::updates::UpdateOutcome::Current => println!("wt is up to date"),
+        wt_ops::updates::UpdateOutcome::Declined => {
             println!("latest release was declined; run `wt update` to explicitly reapply it")
         }
-        crate::updates::UpdateOutcome::Available { release, build_id } => {
+        wt_ops::updates::UpdateOutcome::Available { release, build_id } => {
             println!("update available: {release} ({build_id})")
         }
-        crate::updates::UpdateOutcome::Installed { release, build_id } => {
+        wt_ops::updates::UpdateOutcome::Installed { release, build_id } => {
             println!("installed {release} ({build_id}); it will run next time wt starts");
-            crate::updates::refresh_events_agent(&options.home, &paths, cancel).await;
+            wt_ops::updates::refresh_events_agent(&options.home, &paths, cancel).await;
         }
     }
     Ok(0)

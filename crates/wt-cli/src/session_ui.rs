@@ -118,7 +118,7 @@ async fn terminal_target(
         anyhow::bail!("only shell and diff sessions use terminal stop");
     }
     let label = wt_tui::terminal_label(target);
-    let row = crate::lifecycle_ops::resolve_key(context, key).await?;
+    let row = wt_ops::lifecycle_ops::resolve_key(context, key).await?;
     if row.is_main || !matches!(row.target.location(), wt_core::WorktreeLocation::Local) {
         anyhow::bail!("terminal stop requires a worktree on this host");
     }

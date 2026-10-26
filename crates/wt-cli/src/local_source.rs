@@ -41,7 +41,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
                     .database
                     .call(|store| Ok(store.read_wt_state()?))
                     .await?;
-                crate::commands::_destroy::reconcile_removals(&context, &state).await?;
+                wt_ops::commands::_destroy::reconcile_removals(&context, &state).await?;
                 context
                     .database
                     .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))

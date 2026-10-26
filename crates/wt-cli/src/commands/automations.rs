@@ -56,7 +56,7 @@ pub async fn run(ctx: &AppContext, args: &AutomationsArgs) -> Result<i32> {
     }
     let report: Report = serde_json::from_str(&raw)?;
     let now = now_ms();
-    let alive = crate::events::pid_alive(report.pid);
+    let alive = wt_ops::events::pid_alive(report.pid);
     let age = now.saturating_sub(report.updated_at_ms);
     if !alive || age > STALE_AFTER_MS {
         println!(

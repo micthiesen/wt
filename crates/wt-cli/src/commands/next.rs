@@ -13,8 +13,8 @@ use serde::Deserialize;
 use wt_platform::{lock::FileLock, process::CommandSpec};
 use wt_store::BaseUpdate;
 
-use crate::commands::resolve::{resolve_worktree, run_git};
 use wt_app_core::context::AppContext;
+use wt_ops::commands::resolve::{resolve_worktree, run_git};
 
 const USAGE: &str = "usage: wt next [BRANCH] [--slug SLUG] [--issue ID|none] [--gh N|none]";
 
@@ -49,7 +49,7 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
     let issue = match args.issue.as_deref().map(str::trim) {
         None => None,
         Some(value) if value.eq_ignore_ascii_case("none") => Some(String::new()),
-        Some(value) if crate::commands::issue::valid_issue_id(&value.to_ascii_uppercase()) => {
+        Some(value) if wt_ops::commands::issue::valid_issue_id(&value.to_ascii_uppercase()) => {
             Some(value.to_ascii_uppercase())
         }
         Some(value) => {

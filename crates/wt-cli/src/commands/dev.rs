@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use crate::commands::resolve::resolve_worktree;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use serde_json::json;
 use wt_app_core::{context::AppContext, dev};
 use wt_dev::{DevServerStatus, DevStartOptions, DevWorktree, ReadyOutcome, WaitOutcome};
+use wt_ops::commands::resolve::resolve_worktree;
 
 const SLOT_FULL: i32 = 75;
 
@@ -111,12 +111,12 @@ pub async fn run(context: &AppContext, args: &DevArgs) -> Result<i32> {
         DevCommand::Stop { slug } => {
             let record = resolve_worktree(context, slug.as_deref()).await?;
             let service = dev::service(context)?;
-            let port = crate::host_cleanup::stored_dev_port(context, record.target.slug()).await;
+            let port = wt_ops::host_cleanup::stored_dev_port(context, record.target.slug()).await;
             let stopped = service
                 .stop(&DevWorktree::from(&record), &context.cancellation)
                 .await;
             for warning in
-                crate::host_cleanup::after_dev_stop(context, record.target.slug(), port).await
+                wt_ops::host_cleanup::after_dev_stop(context, record.target.slug(), port).await
             {
                 eprintln!("warning: {warning}");
             }
@@ -166,7 +166,7 @@ async fn run_start(
     let timeout = Duration::from_secs(timeout_seconds.unwrap_or(1800).max(1));
     let deadline = tokio::time::Instant::now() + timeout;
     let stopped_port = if rebuild {
-        crate::host_cleanup::stored_dev_port(context, &worktree.slug).await
+        wt_ops::host_cleanup::stored_dev_port(context, &worktree.slug).await
     } else {
         None
     };
@@ -200,7 +200,7 @@ async fn run_start(
         };
         if rebuild && !matches!(&result, Err(wt_dev::DevServerError::SlotFull { .. })) {
             for warning in
-                crate::host_cleanup::after_dev_stop(context, &worktree.slug, stopped_port).await
+                wt_ops::host_cleanup::after_dev_stop(context, &worktree.slug, stopped_port).await
             {
                 eprintln!("warning: {warning}");
             }

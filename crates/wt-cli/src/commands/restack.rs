@@ -27,7 +27,7 @@ pub async fn run(ctx: &AppContext, args: &RestackArgs) -> Result<i32> {
         main_clone: ctx.config.paths.main_clone.clone(),
         lock_dir: ctx.config.paths.lock_dir.clone(),
         trunk_branch: ctx.config.branch.base.clone(),
-        fetch_options: crate::origin::options(ctx),
+        fetch_options: wt_ops::origin::options(ctx),
         state: StateConfig {
             path: ctx.config.paths.state_db.clone(),
             identity: RepositoryIdentity::new(

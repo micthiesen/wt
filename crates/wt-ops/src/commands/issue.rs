@@ -232,7 +232,7 @@ async fn read_issue(ctx: &AppContext, cwd: &Path, id: Option<&str>) -> Result<i3
     Ok(if code == 3 { 1 } else { code })
 }
 
-pub(crate) fn valid_issue_id(raw: &str) -> bool {
+pub fn valid_issue_id(raw: &str) -> bool {
     let Some((prefix, number)) = raw.split_once('-') else {
         return false;
     };
@@ -289,7 +289,7 @@ async fn github_issue_url(ctx: &AppContext, number: u64) -> Option<String> {
 /// take the host from their authority and never keep userinfo (which can hold
 /// a token); an SSH port is dropped. Only scp-form `git@host:path` splits on
 /// `:`.
-pub(crate) fn repo_web_url(remote: &str) -> Option<String> {
+pub fn repo_web_url(remote: &str) -> Option<String> {
     let raw = remote.trim();
     fn from_url(rest: &str, keep_port: bool) -> Option<(&str, &str)> {
         let (authority, path) = rest.split_once('/')?;

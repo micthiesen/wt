@@ -292,7 +292,7 @@ pub async fn serve(context: &AppContext) -> Result<i32> {
     let _socket_guard = SocketGuard(socket.clone());
     tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).await?;
     let tunnel_cancel = CancellationToken::new();
-    let tunnels = tokio::spawn(crate::controller_tunnels::run(
+    let tunnels = tokio::spawn(wt_ops::controller_tunnels::run(
         context.clone(),
         socket,
         tunnel_cancel.clone(),

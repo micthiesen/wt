@@ -26,7 +26,7 @@ pub async fn run(
     args: &InstallArgs,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<i32> {
-    let result = crate::install::install_once(
+    let result = wt_ops::install::install_once(
         options,
         args.channel.map(Channel::from),
         args.release.clone(),
@@ -36,10 +36,10 @@ pub async fn run(
     )
     .await?;
     match result {
-        crate::install::InstallResult::Installed { release, build_id } => {
+        wt_ops::install::InstallResult::Installed { release, build_id } => {
             println!("installed wt {release} ({build_id})")
         }
-        crate::install::InstallResult::AlreadyCurrent { release, build_id } => {
+        wt_ops::install::InstallResult::AlreadyCurrent { release, build_id } => {
             println!("wt {release} ({build_id}) is already installed")
         }
     }

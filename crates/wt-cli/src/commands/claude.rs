@@ -3,11 +3,11 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 use wt_harness::ClaudeSelftestOutcome;
 
-use crate::commands::agent::send_to;
 use wt_app_core::{
     context::AppContext,
     harness::{AgentRoute, AppHarness, SelectionSource, unavailable_source_message},
 };
+use wt_ops::commands::agent::send_to;
 
 #[derive(Debug, Clone, Args)]
 pub struct ClaudeArgs {
@@ -43,7 +43,7 @@ pub async fn run(context: &AppContext, args: &ClaudeArgs) -> Result<i32> {
     if let ClaudeCommand::Stop { target } = &args.command
         && let Some((remote, slug)) = remote_claude_target(context, target)?
     {
-        return crate::remote::remote_admin_command(
+        return wt_ops::remote::remote_admin_command(
             context,
             remote,
             &["claude".into(), "stop".into(), slug],

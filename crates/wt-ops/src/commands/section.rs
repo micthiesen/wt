@@ -111,7 +111,7 @@ async fn list(ctx: &AppContext, state: &Value, json_output: bool) -> Result<i32>
     Ok(0)
 }
 
-pub(crate) fn manual_sections(state: &Value) -> Vec<String> {
+pub fn manual_sections(state: &Value) -> Vec<String> {
     state
         .get("sectionsOrder")
         .and_then(Value::as_array)
@@ -321,7 +321,7 @@ async fn remove(ctx: &AppContext, state: &Value, input: &str) -> Result<i32> {
     Ok(0)
 }
 
-pub(crate) fn resolve_section(state: &Value, input: &str) -> Option<String> {
+pub fn resolve_section(state: &Value, input: &str) -> Option<String> {
     let names = manual_sections(state);
     if names.iter().any(|name| name == input) {
         return Some(input.to_owned());
@@ -333,7 +333,7 @@ pub(crate) fn resolve_section(state: &Value, input: &str) -> Option<String> {
     (matches.len() == 1).then(|| matches[0].clone())
 }
 
-pub(crate) fn invalid_name(name: &str) -> Option<&'static str> {
+pub fn invalid_name(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
         Some("a section name can't be empty")
     } else if name.starts_with('\0') {

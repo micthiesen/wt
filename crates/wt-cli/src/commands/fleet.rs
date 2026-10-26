@@ -175,7 +175,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         };
         let last_activity = claude_activity.and_then(|entry| format_timestamp_ms(entry.updated_at));
         let (operation, operation_note) =
-            match crate::commands::diagnostics::operation_lock(ctx, &slug).await {
+            match wt_ops::commands::diagnostics::operation_lock(ctx, &slug).await {
                 Ok(lock) => (
                     lock.map(|lock| serde_json::to_value(lock).unwrap_or(Value::Null)),
                     None,

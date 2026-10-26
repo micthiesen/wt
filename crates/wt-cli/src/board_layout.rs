@@ -221,7 +221,7 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         }
         *indices = placed;
     }
-    board.section_order = crate::commands::section::manual_sections(state);
+    board.section_order = wt_ops::commands::section::manual_sections(state);
     let folded = state["foldedSections"]
         .as_array()
         .map(Vec::as_slice)

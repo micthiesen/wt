@@ -89,7 +89,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, local: Arc<HostService>) -
 type ComposedHost<'a> = (
     &'a wt_config::RemoteConfig,
     SourceSnapshot<HostSnapshot>,
-    Option<Arc<crate::managed::ManagedStatus>>,
+    Option<Arc<wt_ops::managed::ManagedStatus>>,
 );
 
 /// The fleet board carries the local board's provenance; each remote's
@@ -129,7 +129,7 @@ fn compose(
         let host = endpoint.key();
         let label = wt_core::sanitize_terminal_text(&endpoint.label);
         if let Some(status) = managed {
-            for line in crate::managed::notices(&status.report) {
+            for line in wt_ops::managed::notices(&status.report) {
                 let text = wt_core::sanitize_terminal_text(&line);
                 board.activity.push(wt_tui::ActivityLine {
                     at_ms: status.at_ms,
@@ -633,7 +633,7 @@ mod tests {
             managed: true,
             ..Default::default()
         };
-        let status = Arc::new(crate::managed::ManagedStatus {
+        let status = Arc::new(wt_ops::managed::ManagedStatus {
             report: ManagedReport {
                 protocol: 1,
                 codex_auth_generation: None,

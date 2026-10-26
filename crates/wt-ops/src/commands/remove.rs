@@ -170,7 +170,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
     }
 }
 
-pub(crate) fn is_our_stage_deployed(path: &Path, stage: &str, prefix: &str) -> bool {
+pub fn is_our_stage_deployed(path: &Path, stage: &str, prefix: &str) -> bool {
     matches!(wt_sst::observe_local_deployment(path, prefix),
         wt_sst::DeploymentObservation::Deployed {stage: pinned} if pinned == stage)
 }

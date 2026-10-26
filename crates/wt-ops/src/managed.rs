@@ -467,7 +467,7 @@ fn worker_config_with_resources(
     worker_config_from(raw)
 }
 
-pub(crate) fn worker_config_from(raw: toml::Value) -> Result<String> {
+pub fn worker_config_from(raw: toml::Value) -> Result<String> {
     let mut table = match raw {
         toml::Value::Table(table) => table,
         _ => bail!("configuration root must be a table"),
@@ -515,7 +515,7 @@ pub(crate) fn worker_config_from(raw: toml::Value) -> Result<String> {
 /// Sourced before every worker command. Sessions inherit the variables named
 /// in `WT_SESSION_ENV` and source `secrets/env.sh` themselves, so agents see
 /// the same credentials as wt itself without secrets appearing in argv.
-pub(crate) fn environment_script(root: &str) -> String {
+pub fn environment_script(root: &str) -> String {
     let session = [
         "WT_MANAGED_ROOT",
         "WT_MANAGED_FILES",
@@ -592,7 +592,7 @@ printf 'username=x-access-token\npassword=%s\n' "$token"
 
 /// Copy the controller's global git settings except credentials, signing,
 /// includes and URL rewrites, which name controller-only programs and keys.
-pub(crate) fn git_config(listing: &str) -> String {
+pub fn git_config(listing: &str) -> String {
     let mut entries: Vec<(String, String)> = Vec::new();
     for record in listing.split('\0').filter(|record| !record.is_empty()) {
         let (key, value) = record.split_once('\n').unwrap_or((record, "true"));
@@ -703,7 +703,7 @@ fn shell_quote(value: &str) -> String {
 
 /// Managed workers authenticate to GitHub with an HTTPS token, so SSH remote
 /// URLs are rewritten to their HTTPS form.
-pub(crate) fn https_clone_url(origin: &str) -> Option<String> {
+pub fn https_clone_url(origin: &str) -> Option<String> {
     let path = origin
         .strip_prefix("git@github.com:")
         .or_else(|| origin.strip_prefix("ssh://git@github.com/"))

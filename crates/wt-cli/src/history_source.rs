@@ -864,7 +864,7 @@ async fn read_github_repo_url(
     if !output.status.success() {
         return None;
     }
-    crate::commands::issue::repo_web_url(output.stdout_text().trim())
+    wt_ops::commands::issue::repo_web_url(output.stdout_text().trim())
 }
 
 fn now_ms() -> i64 {

@@ -83,7 +83,7 @@ fn ensure_local(target: &WorktreeTarget) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn worktree_at_cwd<'a>(
+pub fn worktree_at_cwd<'a>(
     records: &'a [WorktreeRecord],
     cwd: &Path,
 ) -> Option<&'a WorktreeRecord> {

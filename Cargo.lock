@@ -3015,6 +3015,7 @@ dependencies = [
  "wt-launcher",
  "wt-lifecycle",
  "wt-naming",
+ "wt-ops",
  "wt-platform",
  "wt-remote",
  "wt-runtime",
@@ -3179,6 +3180,49 @@ dependencies = [
  "wt-core",
  "wt-harness",
  "wt-platform",
+]
+
+[[package]]
+name = "wt-ops"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "getrandom 0.4.3",
+ "globset",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "wt-actions",
+ "wt-app-core",
+ "wt-automations",
+ "wt-config",
+ "wt-core",
+ "wt-dev",
+ "wt-events",
+ "wt-github",
+ "wt-harness",
+ "wt-launcher",
+ "wt-lifecycle",
+ "wt-platform",
+ "wt-remote",
+ "wt-runtime",
+ "wt-sst",
+ "wt-stack",
+ "wt-store",
+ "wt-tmux",
+ "wt-tui",
+ "wt-update",
+ "wt-vcs",
 ]
 
 [[package]]

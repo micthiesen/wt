@@ -177,7 +177,7 @@ pub async fn execute(
     }
     if let Some(remote) = remote
         && remote.endpoint.managed
-        && crate::managed::required_provider(&action, context.config.harness.primary)
+        && wt_ops::managed::required_provider(&action, context.config.harness.primary)
             == Some(wt_remote::managed::SignIn::Codex)
     {
         let desired = wt_app_core::codex_reauth::controller_generation(
@@ -189,7 +189,7 @@ pub async fn execute(
             .as_ref()
             .and_then(|status| status.report.codex_auth_generation);
         let pending_codex = remote.managed.borrow().as_ref().is_some_and(|status| {
-            crate::managed::required_sign_in(
+            wt_ops::managed::required_sign_in(
                 &status.report,
                 &action,
                 context.config.harness.primary,
@@ -200,20 +200,20 @@ pub async fn execute(
             // the worker stream remains connected. This is action preparation,
             // never filesystem work on the terminal input path.
             let client = remote.staged_client()?;
-            let report = crate::managed::provision(context, &client).await?;
+            let report = wt_ops::managed::provision(context, &client).await?;
             remote.set_managed(report);
         }
     }
     if let Some(remote) = remote
         && let Some(status) = remote.managed.borrow().clone()
-        && let Some(provider) = crate::managed::required_sign_in(
+        && let Some(provider) = wt_ops::managed::required_sign_in(
             &status.report,
             &action,
             context.config.harness.primary,
         )
     {
         return Ok(UiReply {
-            modal: Some(crate::managed::sign_in_modal(
+            modal: Some(wt_ops::managed::sign_in_modal(
                 &remote.endpoint.label,
                 provider,
                 action,
@@ -573,7 +573,7 @@ async fn managed_sign_in(
         return handoff;
     }
     let label = &remote.endpoint.label;
-    let report = crate::managed::provision(context, &client)
+    let report = wt_ops::managed::provision(context, &client)
         .await
         .with_context(|| format!("re-check {label} after sign-in"))?;
     let still_needed = report.sign_ins().contains(&provider);

@@ -13,7 +13,7 @@ pub async fn restore(
     expected_branch: &str,
 ) -> Result<UiReply> {
     let slug = local_slug(key)?;
-    let service = crate::lifecycle_ops::service(ctx)?;
+    let service = wt_ops::lifecycle_ops::service(ctx)?;
     let result = service
         .create_from_removed(
             &slug,

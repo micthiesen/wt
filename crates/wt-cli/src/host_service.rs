@@ -114,7 +114,7 @@ impl HostService {
             Ok(reply) => reply,
             Err(error)
                 if error
-                    .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                    .downcast_ref::<wt_ops::commands::_destroy::RemovalUncertain>()
                     .is_some() =>
             {
                 UiReply::uncertain(format!("{error:#}"))
@@ -404,7 +404,7 @@ impl HostService {
                 .await?
             }
             UiAction::Restack { key } => {
-                Box::pin(crate::restack_action::start(&context, &key, github, board)).await?
+                Box::pin(wt_ops::restack_action::start(&context, &key, github, board)).await?
             }
             // The board builds the prompt for a row whose PR it shows. Here
             // the board had no PR, so confirmed GitHub data decides between
@@ -479,7 +479,7 @@ impl HostService {
     }
 
     fn surface_action_requires_pr(&self, surface: &ActionSurface, id: &str) -> bool {
-        crate::action_dispatch::definitions(&self.context, surface)
+        wt_ops::action_dispatch::definitions(&self.context, surface)
             .into_iter()
             .find(|definition| definition.id == *id)
             .is_some_and(|definition| {

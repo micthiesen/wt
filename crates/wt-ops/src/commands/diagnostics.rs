@@ -6,7 +6,7 @@ use std::{fs::OpenOptions, io, path::Path};
 use wt_app_core::context::AppContext;
 
 #[derive(Clone, Debug, Serialize)]
-pub(crate) struct Check {
+pub struct Check {
     pub name: String,
     pub status: CheckStatus,
     pub message: String,
@@ -14,7 +14,7 @@ pub(crate) struct Check {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum CheckStatus {
+pub enum CheckStatus {
     Ok,
     Info,
     Warn,
@@ -23,7 +23,7 @@ pub(crate) enum CheckStatus {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct OperationLock {
+pub struct OperationLock {
     pub op: Option<String>,
     pub phase: Option<String>,
     pub pid: Option<u32>,
@@ -34,7 +34,7 @@ pub(crate) struct OperationLock {
 
 /// Read operation-lock metadata without creating lock files or acquiring a
 /// lock directory. A stale file is not reported as an active operation.
-pub(crate) async fn operation_lock(ctx: &AppContext, slug: &str) -> Result<Option<OperationLock>> {
+pub async fn operation_lock(ctx: &AppContext, slug: &str) -> Result<Option<OperationLock>> {
     let path = ctx.config.paths.lock_dir.join(format!("{slug}.lock"));
     Ok(tokio::task::spawn_blocking(move || inspect_operation_lock(&path)).await??)
 }
@@ -86,7 +86,7 @@ fn inspect_operation_lock(path: &Path) -> io::Result<Option<OperationLock>> {
     )))
 }
 
-pub(crate) fn worst(checks: &[Check]) -> CheckStatus {
+pub fn worst(checks: &[Check]) -> CheckStatus {
     checks
         .iter()
         .map(|check| check.status)
@@ -98,7 +98,7 @@ pub(crate) fn worst(checks: &[Check]) -> CheckStatus {
         .unwrap_or(CheckStatus::Ok)
 }
 
-pub(crate) fn display_status(status: CheckStatus) -> &'static str {
+pub fn display_status(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Ok => "ok",
         CheckStatus::Info => "info",

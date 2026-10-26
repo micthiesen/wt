@@ -1,7 +1,7 @@
 //! Join host-local source snapshots into the pure automation evaluator input.
 
-use crate::lifecycle_ops::LifecycleFacts;
 use std::collections::{BTreeMap, BTreeSet};
+use wt_ops::lifecycle_ops::LifecycleFacts;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -116,7 +116,7 @@ pub async fn lifecycle_facts(
         {
             continue;
         }
-        match crate::commands::diagnostics::operation_lock(ctx, slug).await {
+        match wt_ops::commands::diagnostics::operation_lock(ctx, slug).await {
             Ok(Some(_)) => result.deferred = true,
             Ok(None) => rows.push(snapshot.worktree.clone()),
             Err(error) => {
@@ -131,7 +131,7 @@ pub async fn lifecycle_facts(
         .iter()
         .map(|row| (row.target.slug().to_owned(), row.clone()))
         .collect();
-    let plans = crate::lifecycle_ops::plan_automation_facts(ctx, rows, state, github)
+    let plans = wt_ops::lifecycle_ops::plan_automation_facts(ctx, rows, state, github)
         .await
         .context("prepare automation lifecycle evidence")?;
     if !plans.busy.is_empty() {
@@ -143,7 +143,7 @@ pub async fn lifecycle_facts(
     for (slug, error) in plans.row_errors {
         // An operation can start after the initial probe. Its changing checkout
         // contributes no facts, but an expected race is not a failed Git install.
-        if let Ok(Some(_)) = crate::commands::diagnostics::operation_lock(ctx, &slug).await {
+        if let Ok(Some(_)) = wt_ops::commands::diagnostics::operation_lock(ctx, &slug).await {
             result.deferred = true;
             continue;
         }
@@ -629,7 +629,7 @@ async fn branch_tips(
     let mut tips = BTreeMap::new();
     let mut newly_observed = BTreeMap::new();
     for branch in watched {
-        let output = crate::commands::resolve::run_git(
+        let output = wt_ops::commands::resolve::run_git(
             ctx,
             &ctx.config.paths.main_clone,
             [
@@ -965,7 +965,7 @@ mod tests {
             .map(|snapshot| snapshot.worktree.clone())
             .collect();
         assert!(
-            crate::lifecycle_ops::plan_with_facts(ctx, rows, &metadata.0, None, None)
+            wt_ops::lifecycle_ops::plan_with_facts(ctx, rows, &metadata.0, None, None)
                 .await
                 .is_err()
         );

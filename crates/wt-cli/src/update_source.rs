@@ -111,14 +111,14 @@ pub fn enabled(context: &AppContext) -> bool {
 
 async fn check() -> anyhow::Result<UpdateNotice> {
     let options = wt_config::LoadOptions::default();
-    let paths = crate::updates::install_paths(&options)?;
+    let paths = wt_ops::updates::install_paths(&options)?;
     let store = StateStore::new(paths);
     let state = tokio::task::spawn_blocking(move || store.load()).await??;
     // Not a native install (a source build run directly): nothing to offer.
     let Some(current) = state.current else {
         return Ok(None);
     };
-    let release = ReleaseSource::new(crate::updates::repository(&options)?)?
+    let release = ReleaseSource::new(wt_ops::updates::repository(&options)?)?
         .latest(state.channel)
         .await?;
     let latest = release.version_id(wt_app_core::build_info::target())?;

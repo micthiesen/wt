@@ -9,8 +9,8 @@ use wt_tui::{
     ActionSurface, Board, PickerAction, PickerOption, TextAction, UiAction, UiModal, UiReply,
 };
 
-use crate::action_dispatch;
 use wt_app_core::context::AppContext;
+use wt_ops::action_dispatch;
 
 pub const CUSTOM_ID: &str = wt_app_core::action_builtins::CUSTOM_ID;
 

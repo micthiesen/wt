@@ -56,7 +56,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         context,
         local_sources.git.clone(),
         enabled,
-        crate::origin::backstop(context),
+        wt_ops::origin::backstop(context),
     );
     let github_actions =
         crate::github_actions::GithubActions::start(scope, context, github_refresh.clone());
@@ -68,7 +68,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     );
     let board = project(scope, local.clone(), github.view(), activity.view());
     let dev = crate::dev_source::overlay(scope, context, local.clone(), board);
-    let origin = crate::origin::overlay(scope, context, dev.board, local.clone());
+    let origin = wt_ops::origin::overlay(scope, context, dev.board, local.clone());
     let issues = crate::issue_source::start(scope, context, origin.board);
     let attention_sources = crate::attention_source::AttentionSources {
         metadata: local_sources.metadata.view(),

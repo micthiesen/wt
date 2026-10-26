@@ -1,8 +1,8 @@
-use crate::commands::resolve::resolve_worktree;
 use anyhow::{Result, bail};
 use clap::Args;
 use wt_app_core::context::AppContext;
 use wt_github::{GithubClient, GithubOptions, PrMergeTarget};
+use wt_ops::commands::resolve::resolve_worktree;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct MergeArgs {

@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail};
 use wt_core::{ChainMember, build_stack_index};
 use wt_tui::{Seen, UiReply};
 
-use crate::commands::section;
 use wt_app_core::context::AppContext;
+use wt_ops::commands::section;
 
 /// The section a row is stored under (`None` = Inbox). Remote rows keep their
 /// placement in the controller's `remoteLayouts`, as the board reads it.

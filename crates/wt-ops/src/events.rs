@@ -258,7 +258,7 @@ async fn resolve_secret(config: &Config) -> Result<String> {
     )
 }
 
-pub(crate) async fn lock_user_events(context: &AppContext) -> Result<wt_platform::lock::FileLock> {
+pub async fn lock_user_events(context: &AppContext) -> Result<wt_platform::lock::FileLock> {
     Ok(wt_platform::lock::FileLock::acquire(
         &context.home.join(".cache/wt"),
         EVENT_LOCK,
@@ -268,7 +268,7 @@ pub(crate) async fn lock_user_events(context: &AppContext) -> Result<wt_platform
     .await?)
 }
 
-pub(crate) async fn launchctl(
+pub async fn launchctl(
     context: &AppContext,
     action: &str,
     plist: &Path,
@@ -449,7 +449,7 @@ async fn launch_agent_status(context: &AppContext) -> Result<LaunchAgentStatus> 
     Ok(status)
 }
 
-pub(crate) async fn install_agent(context: &AppContext) -> Result<()> {
+pub async fn install_agent(context: &AppContext) -> Result<()> {
     ensure_configured(context)?;
     let _lock = lock_user_events(context).await?;
     let plist = plist_path(&context.home);
@@ -475,7 +475,7 @@ pub(crate) async fn install_agent(context: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn ensure_secret_for_install(context: &AppContext) -> Result<Option<String>> {
+pub async fn ensure_secret_for_install(context: &AppContext) -> Result<Option<String>> {
     let events = context
         .config
         .github
@@ -528,11 +528,11 @@ pub(crate) async fn ensure_secret_for_install(context: &AppContext) -> Result<Op
     }
 }
 
-pub(crate) async fn secret_is_configured(context: &AppContext) -> bool {
+pub async fn secret_is_configured(context: &AppContext) -> bool {
     resolve_secret(&context.config).await.is_ok()
 }
 
-pub(crate) async fn status(context: &AppContext) -> Result<()> {
+pub async fn status(context: &AppContext) -> Result<()> {
     let events = context.config.github.events.as_ref();
     let dir = events_directory(&context.config);
     let state = wt_events::read_state(&dir)
@@ -618,7 +618,7 @@ pub(crate) async fn status(context: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn agent_mutation(context: &AppContext, action: &str) -> Result<i32> {
+pub async fn agent_mutation(context: &AppContext, action: &str) -> Result<i32> {
     let _lock = lock_user_events(context).await?;
     let plist = plist_path(&context.home);
     if action == "install" {
@@ -880,7 +880,7 @@ fn canonical_optional(value: &str, cwd: &Path) -> String {
     }
 }
 
-pub(crate) fn plist_path(home: &Path) -> PathBuf {
+pub fn plist_path(home: &Path) -> PathBuf {
     home.join("Library/LaunchAgents")
         .join(format!("{LAUNCHD_LABEL}.plist"))
 }
@@ -941,7 +941,7 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-pub(crate) fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         unsafe {
@@ -978,7 +978,7 @@ fn now_millis() -> u64 {
 
 /// Which repository and configuration a daemon snapshot belongs to. A
 /// snapshot written for anything else is never read as this repository's.
-pub(crate) fn repository_identity(config: &wt_config::Config) -> String {
+pub fn repository_identity(config: &wt_config::Config) -> String {
     format!(
         "{}:{}",
         config.repo_id,

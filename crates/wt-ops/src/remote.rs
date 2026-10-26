@@ -25,7 +25,7 @@ use wt_app_core::context::AppContext;
 
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{summary}\n{details}")]
-pub(crate) struct MissingRemoteBuild {
+pub struct MissingRemoteBuild {
     pub summary: String,
     pub details: String,
 }

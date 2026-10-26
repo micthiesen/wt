@@ -16,8 +16,8 @@ use wt_core::{
 use wt_platform::process::CommandSpec;
 use wt_store::WorkStatusRecord as StoredWorkStatusRecord;
 
-use crate::commands::resolve::resolve_worktree;
 use wt_app_core::{context::AppContext, database::Database};
+use wt_ops::commands::resolve::resolve_worktree;
 
 const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo; --verify-after-merge records checks owed after deployment.";
 

@@ -4,24 +4,19 @@
 //! identity it was compiled as; everything else lives here so a release
 //! rebuilds only that shim (docs/ci.md).
 
-mod action_dispatch;
 mod action_palette;
 mod action_source;
 mod activity_source;
 mod attention_source;
-mod automation_builtins;
 mod automation_facts;
 mod automation_source;
 mod board_layout;
 mod commands;
 mod controller;
 mod controller_actions;
-mod controller_tunnels;
 mod creation_placement;
 mod dev_source;
-mod events;
 mod fleet_cleanup;
-mod fork_base;
 mod freshness;
 mod git_presentation;
 mod github_actions;
@@ -31,25 +26,18 @@ mod github_source;
 mod hard_refresh;
 mod history_actions;
 mod history_source;
-mod host_cleanup;
 mod host_dispatch;
 mod host_server;
 mod host_service;
 mod host_stdio;
-mod install;
 mod inventory;
 mod issue_source;
-mod lifecycle_ops;
 mod local_source;
-mod managed;
 mod naming_source;
-mod origin;
 mod palette_source;
 mod perf_source;
-mod remote;
 mod remote_board;
 mod remote_host;
-mod restack_action;
 mod review_requests;
 mod section_actions;
 mod session_activity;
@@ -59,9 +47,7 @@ mod session_ui;
 mod sources;
 mod terminal_palette;
 mod update_source;
-mod updates;
 mod work_presentation;
-mod worktree_facts;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,13 +131,13 @@ enum Command {
     /// Migrate legacy state into the repository's durable native store.
     State(commands::state::StateArgs),
     /// Inspect or change the task attached to a worktree.
-    Issue(commands::issue::IssueArgs),
+    Issue(wt_ops::commands::issue::IssueArgs),
     /// Diagnose repository and coding-agent session health.
     Doctor(commands::doctor::DoctorArgs),
     /// Show a compact fleet report.
     Fleet(commands::fleet::FleetArgs),
     /// Inspect wt process resource usage and machine load.
-    Perf(commands::perf::PerfArgs),
+    Perf(wt_ops::commands::perf::PerfArgs),
     /// Manage a worktree's supervised development server.
     Dev(commands::dev::DevArgs),
     #[command(name = "_dev-supervise", hide = true)]
@@ -186,29 +172,29 @@ enum Command {
     /// Inspect and synchronize bundled coding-agent skills and instructions.
     Skills(commands::skills::SkillsArgs),
     /// Inspect, start and message coding-agent sessions.
-    Agent(commands::agent::AgentArgs),
+    Agent(wt_ops::commands::agent::AgentArgs),
     /// Claude compatibility commands and diagnostics.
     Claude(commands::claude::ClaudeArgs),
     /// Diagnose Codex message transport and session readiness.
     Codex(commands::codex::CodexArgs),
     /// Coordinate the manager session and its report spool.
-    Manager(commands::manager::ManagerArgs),
+    Manager(wt_ops::commands::manager::ManagerArgs),
     /// Inspect or assert a bounded maintenance hold.
-    Hold(commands::hold::HoldArgs),
+    Hold(wt_ops::commands::hold::HoldArgs),
     /// Show whether automations are running and what is queued.
     Automations(commands::automations::AutomationsArgs),
     /// Initialize repository configuration without an existing wt installation.
     Init(commands::init::InitArgs),
     /// Execute an acknowledged, durable background removal job.
     #[command(name = "_destroy", hide = true)]
-    Destroy(commands::_destroy::DestroyWorkerArgs),
+    Destroy(wt_ops::commands::_destroy::DestroyWorkerArgs),
     /// Create a worktree from an issue, branch or slug.
-    New(commands::new::NewArgs),
+    New(wt_ops::commands::new::NewArgs),
     /// Keep a worktree whose PR landed and start its next PR on a fresh branch.
     Next(commands::next::NextArgs),
     /// Remove a worktree after checking for work that would be lost.
     #[command(name = "rm", alias = "remove")]
-    Remove(commands::remove::RemoveArgs),
+    Remove(wt_ops::commands::remove::RemoveArgs),
     /// Clean worktrees whose work has landed.
     #[command(name = "clean", alias = "cleanup")]
     Cleanup(commands::cleanup::CleanupArgs),
@@ -224,7 +210,7 @@ enum Command {
     /// Show, set or clear a recorded fork base.
     Base(commands::base::BaseArgs),
     /// Organize worktrees into named sections.
-    Section(commands::section::SectionArgs),
+    Section(wt_ops::commands::section::SectionArgs),
     /// Record dependencies and conflicts that expire when branches move.
     Edge(commands::edge::EdgeArgs),
     /// Show or record the worktree's change guide (`[guides] enabled`).
@@ -234,7 +220,7 @@ enum Command {
     /// Open a worktree in the configured editor.
     Open(commands::open::OpenArgs),
     /// Follow the latest retained destroy log.
-    Logs(commands::logs::LogsArgs),
+    Logs(wt_ops::commands::logs::LogsArgs),
     /// Print the running native version.
     Version,
     /// Inspect the native inventory source during conversion.
@@ -362,7 +348,7 @@ fn run(cli: Cli) -> Result<i32> {
                 return commands::_hello::run(&config, args);
             }
             if cli.command.is_none() {
-                updates::startup_check(&options, &config, &token).await?;
+                wt_ops::updates::startup_check(&options, &config, &token).await?;
             }
             run_application(cli, options, config, &scope, token, &mut scope_drained).await
         }
@@ -456,7 +442,7 @@ async fn run_application(
     wt_app_core::skills::startup_check(&context).await?;
     let events_context = context.clone();
     scope.spawn(async move {
-        if let Err(error) = events::reconcile(&events_context).await {
+        if let Err(error) = wt_ops::events::reconcile(&events_context).await {
             tracing::warn!(%error, event_channel = "attention", "GitHub events service reconciliation failed");
         }
     });
@@ -499,38 +485,38 @@ async fn dispatch_command(
         Command::Events(args) => commands::events::run(context, args).await,
         Command::Stages(args) => commands::stages::run(context, args).await,
         Command::State(args) => commands::state::run(context, args).await,
-        Command::Issue(args) => commands::issue::run(context, args).await,
+        Command::Issue(args) => wt_ops::commands::issue::run(context, args).await,
         Command::Doctor(args) => commands::doctor::run(context, args).await,
         Command::Fleet(args) => commands::fleet::run(context, args).await,
-        Command::Perf(args) => commands::perf::run(context, args).await,
+        Command::Perf(args) => wt_ops::commands::perf::run(context, args).await,
         Command::Dev(args) => commands::dev::run(context, args).await,
         Command::DevSupervisor(args) => commands::dev::run_supervisor_command(context, args).await,
         Command::Workload(_) => unreachable!("workload helper runs before app composition"),
         Command::DevGiveup(args) => commands::_dev_giveup::run(context, args).await,
         Command::ClaudeHook(args) => commands::_claude_hook::run(args).await,
         Command::Skills(args) => commands::skills::run(context, args).await,
-        Command::Agent(args) => commands::agent::run(context, args).await,
+        Command::Agent(args) => wt_ops::commands::agent::run(context, args).await,
         Command::Claude(args) => commands::claude::run(context, args).await,
         Command::Codex(args) => commands::codex::run(context, args).await,
-        Command::Manager(args) => commands::manager::run(context, args).await,
-        Command::Hold(args) => commands::hold::run(context, args).await,
+        Command::Manager(args) => wt_ops::commands::manager::run(context, args).await,
+        Command::Hold(args) => wt_ops::commands::hold::run(context, args).await,
         Command::Automations(args) => commands::automations::run(context, args).await,
-        Command::Destroy(args) => commands::_destroy::run_worker(context, args).await,
-        Command::New(args) => commands::new::run(context, args).await,
+        Command::Destroy(args) => wt_ops::commands::_destroy::run_worker(context, args).await,
+        Command::New(args) => wt_ops::commands::new::run(context, args).await,
         Command::Next(args) => commands::next::run(context, args).await,
-        Command::Remove(args) => commands::remove::run(context, args).await,
+        Command::Remove(args) => wt_ops::commands::remove::run(context, args).await,
         Command::Cleanup(args) => commands::cleanup::run(context, args).await,
         Command::List(args) => commands::list::run(context, args).await,
         Command::Archive(args) => commands::archive::run(context, args).await,
         Command::Restore(args) => commands::restore::run(context, args).await,
         Command::Status(args) => commands::status::run(context, args).await,
         Command::Base(args) => commands::base::run(context, args).await,
-        Command::Section(args) => commands::section::run(context, args).await,
+        Command::Section(args) => wt_ops::commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,
         Command::Guide(args) => commands::guide::run(context, args).await,
         Command::Merge(args) => commands::merge::run(context, args).await,
         Command::Open(args) => commands::open::run(context, args).await,
-        Command::Logs(args) => commands::logs::run(context, args).await,
+        Command::Logs(args) => wt_ops::commands::logs::run(context, args).await,
         Command::Remote(args) => commands::remote::run(context, args).await,
         Command::Auth(args) => commands::auth::run(context, args).await,
         Command::Controller(args) => match &args.command {

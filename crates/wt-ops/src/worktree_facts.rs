@@ -6,7 +6,7 @@ use crate::commands::resolve::run_git;
 use wt_app_core::context::AppContext;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PushFacts {
+pub struct PushFacts {
     pub unpushed: Option<u64>,
     pub pushed: Option<bool>,
     pub ahead_of_base: Option<u64>,
@@ -15,7 +15,7 @@ pub(crate) struct PushFacts {
 /// Compute push counts using wt's public contract: `unpushed` is relative to
 /// `origin/<branch>`, while `ahead_of_base` is relative to the recorded fork
 /// base (or configured trunk). Nulls mean Git could not prove the fact.
-pub(crate) async fn push_facts(
+pub async fn push_facts(
     context: &AppContext,
     path: &Path,
     branch: &str,

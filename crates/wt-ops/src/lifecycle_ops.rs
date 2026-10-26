@@ -86,7 +86,7 @@ pub struct RemovalPlans {
 /// Per-row landing evidence for automation facts. Each row's failure stays
 /// with that row; no row here carries a removal witness.
 #[derive(Default)]
-pub(crate) struct AutomationLifecycleEvidence {
+pub struct AutomationLifecycleEvidence {
     pub rows: BTreeMap<String, LifecycleFacts>,
     pub row_errors: BTreeMap<String, String>,
     /// Checkouts that kept changing while their landed state was being read.
@@ -142,7 +142,7 @@ pub async fn plan_cached(
 /// Build removal evidence from caller-prepared wtstate and confirmed GitHub
 /// data. This keeps automation evaluation on the same authoritative safety
 /// path as explicit cleanup without launching another GitHub fetch.
-pub(crate) async fn plan_with_facts(
+pub async fn plan_with_facts(
     ctx: &AppContext,
     rows: Vec<WorktreeRecord>,
     state: &serde_json::Value,
@@ -163,7 +163,7 @@ pub(crate) async fn plan_with_facts(
 /// captured only for landed rows. That is not a safety shortcut: an unlanded
 /// row is never a cleanup candidate, and removal itself recaptures and
 /// rechecks everything under its own lock.
-pub(crate) async fn plan_automation_facts(
+pub async fn plan_automation_facts(
     ctx: &AppContext,
     rows: Vec<WorktreeRecord>,
     state: &serde_json::Value,

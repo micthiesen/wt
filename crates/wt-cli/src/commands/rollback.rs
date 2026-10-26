@@ -16,9 +16,9 @@ pub async fn run(options: &LoadOptions, args: &RollbackArgs) -> Result<i32> {
     {
         bail!("native update system is disabled for this run by WT_UPDATE=off")
     }
-    let paths = crate::updates::install_paths(options)?;
-    crate::updates::require_stable_launcher(&paths)?;
-    let candidate = crate::updates::rollback_once(paths, args.reference.clone()).await?;
+    let paths = wt_ops::updates::install_paths(options)?;
+    wt_ops::updates::require_stable_launcher(&paths)?;
+    let candidate = wt_ops::updates::rollback_once(paths, args.reference.clone()).await?;
     println!(
         "activated rollback candidate {} ({}) for the next start",
         candidate.release_version(),

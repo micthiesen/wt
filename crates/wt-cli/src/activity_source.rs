@@ -206,16 +206,16 @@ fn feed_fingerprint(
 
 fn read_snapshot(reports: &Path, app_log_dir: &Path) -> anyhow::Result<ActivitySnapshot> {
     let mut activity = read_app_logs(app_log_dir)?;
-    let batch = crate::commands::manager::read_reports_from(reports, 0)?;
+    let batch = wt_ops::commands::manager::read_reports_from(reports, 0)?;
     for report in batch.reports.into_iter().rev().take(MAX_ATTENTION).rev() {
         let Some(at_ms) = parse_timestamp_ms(&report.at) else {
             continue;
         };
         let level = match report.level {
-            crate::commands::manager::ReportLevel::Info => "INFO",
-            crate::commands::manager::ReportLevel::Ok => "INFO",
-            crate::commands::manager::ReportLevel::Warn => "WARN",
-            crate::commands::manager::ReportLevel::Err => "ERROR",
+            wt_ops::commands::manager::ReportLevel::Info => "INFO",
+            wt_ops::commands::manager::ReportLevel::Ok => "INFO",
+            wt_ops::commands::manager::ReportLevel::Warn => "WARN",
+            wt_ops::commands::manager::ReportLevel::Err => "ERROR",
         };
         activity.push(ActivityLine {
             at_ms,

@@ -195,7 +195,7 @@ impl ReviewRequests {
             anyhow::anyhow!("GitHub omitted the reviewed PR head; refusing an unpinned checkout")
         })?;
 
-        let lifecycle = crate::lifecycle_ops::service(&self.context)?;
+        let lifecycle = wt_ops::lifecycle_ops::service(&self.context)?;
         let created = lifecycle
             .create_from_pull_request(
                 &request.branch,

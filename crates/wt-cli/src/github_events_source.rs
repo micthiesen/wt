@@ -52,7 +52,7 @@ pub(crate) async fn load(context: &AppContext, branches: &[String]) -> Option<Da
     read(
         context.config.paths.cache_root.join("events"),
         branches.to_vec(),
-        crate::events::repository_identity(&context.config),
+        wt_ops::events::repository_identity(&context.config),
     )
     .await
 }

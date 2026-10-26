@@ -1,8 +1,8 @@
 use anyhow::Result;
 use wt_config::InstanceRole;
 
-use crate::remote;
 use wt_app_core::context::AppContext;
+use wt_ops::remote;
 
 pub async fn run(context: &AppContext, args: &[String]) -> Result<i32> {
     if !args.is_empty() {

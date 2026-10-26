@@ -78,7 +78,7 @@ async fn consider(path: PathBuf, best: &mut Option<(SystemTime, PathBuf)>) -> Re
     Ok(())
 }
 
-pub(crate) async fn latest(context: &AppContext, slug: Option<&str>) -> Result<Option<PathBuf>> {
+pub async fn latest(context: &AppContext, slug: Option<&str>) -> Result<Option<PathBuf>> {
     let mut best = None;
     let legacy = Regex::new(r"^(.+)-\d{4}-\d{2}-\d{2}T.*\.log$").expect("constant regex");
     if let Some(mut entries) = entries(&context.config.paths.log_dir).await? {

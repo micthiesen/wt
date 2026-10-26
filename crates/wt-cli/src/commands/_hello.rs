@@ -1,7 +1,7 @@
 use anyhow::Result;
 use wt_config::Config;
 
-use crate::remote;
+use wt_ops::remote;
 
 pub fn run(config: &Config, args: &[String]) -> Result<i32> {
     if !args.is_empty() {

@@ -133,8 +133,8 @@ async fn login_host(
     remote: &wt_config::RemoteConfig,
     pending_only: bool,
 ) -> Result<()> {
-    let client = crate::remote::stage_remote_runtime(context, remote).await?;
-    let report = crate::managed::provision(context, &client).await?;
+    let client = wt_ops::remote::stage_remote_runtime(context, remote).await?;
+    let report = wt_ops::managed::provision(context, &client).await?;
     require_codex_available(&report)?;
     if pending_only
         && !report
@@ -166,7 +166,7 @@ async fn login_host(
     if !status.success() {
         bail!("managed sign-in exited with {status}");
     }
-    let report = crate::managed::provision(context, &client).await?;
+    let report = wt_ops::managed::provision(context, &client).await?;
     require_codex_available(&report)?;
     if report
         .sign_ins()

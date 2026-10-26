@@ -82,10 +82,10 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
         let mut context = context.clone();
         context.cancellation = cancellation;
         async move {
-            let snapshot = crate::commands::perf::snapshot(&context, true).await?;
+            let snapshot = wt_ops::commands::perf::snapshot(&context, true).await?;
             Ok(PerfSample {
-                report: crate::commands::perf::report(&snapshot),
-                view: Some(crate::commands::perf::view(&snapshot)),
+                report: wt_ops::commands::perf::report(&snapshot),
+                view: Some(wt_ops::commands::perf::view(&snapshot)),
             })
         }
     })

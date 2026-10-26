@@ -492,12 +492,12 @@ async fn dispatch_claim(
 ) -> (ClaimedFire, AutomationOutcome, Option<String>) {
     let fire = claim.fire().clone();
     let (outcome, error) = if fire.rule.run.starts_with("builtin:") {
-        match crate::automation_builtins::execute(&context, &fire).await {
-            crate::automation_builtins::BuiltinExecution::Retry { reason } => {
+        match wt_ops::automation_builtins::execute(&context, &fire).await {
+            wt_ops::automation_builtins::BuiltinExecution::Retry { reason } => {
                 tracing::info!(rule = %fire.rule.id, %reason, "automation will retry");
                 (AutomationOutcome::NotStarted, None)
             }
-            crate::automation_builtins::BuiltinExecution::Completed { message } => {
+            wt_ops::automation_builtins::BuiltinExecution::Completed { message } => {
                 tracing::info!(rule = %fire.rule.id, %message, "automation completed");
                 (
                     AutomationOutcome::Delivered {
@@ -506,7 +506,7 @@ async fn dispatch_claim(
                     None,
                 )
             }
-            crate::automation_builtins::BuiltinExecution::Failed { message } => {
+            wt_ops::automation_builtins::BuiltinExecution::Failed { message } => {
                 tracing::warn!(rule = %fire.rule.id, %message, "automation failed");
                 (
                     AutomationOutcome::Delivered {
@@ -518,7 +518,7 @@ async fn dispatch_claim(
         }
     } else {
         (
-            crate::action_dispatch::dispatch_automation(
+            wt_ops::action_dispatch::dispatch_automation(
                 &context,
                 &fire,
                 github.as_ref(),

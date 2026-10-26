@@ -13,8 +13,8 @@ use wt_core::{
 use wt_store::MergeEdge as StoredMergeEdge;
 use wt_vcs::WorktreeRecord;
 
-use crate::commands::resolve::{resolve_named_worktree, run_git};
 use wt_app_core::context::AppContext;
+use wt_ops::commands::resolve::{resolve_named_worktree, run_git};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct EdgeArgs {
@@ -189,7 +189,7 @@ async fn assert_edge(
         return Ok(1);
     };
     let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
-    let by = crate::commands::resolve::worktree_at_cwd(&inventory, &ctx.cwd)
+    let by = wt_ops::commands::resolve::worktree_at_cwd(&inventory, &ctx.cwd)
         .filter(|record| !record.is_main)
         .map_or_else(
             || "fleet".to_owned(),

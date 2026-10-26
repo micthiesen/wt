@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::Args;
 use wt_lifecycle::RemoveOptions;
 
-use crate::{commands::resolve::run_git, lifecycle_ops};
 use wt_app_core::context::AppContext;
+use wt_ops::{commands::resolve::run_git, lifecycle_ops};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct CleanupArgs {
@@ -23,7 +23,7 @@ pub struct CleanupArgs {
 
 pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
     let rows = ctx.repository.inventory(&ctx.cancellation).await?;
-    crate::origin::refresh(ctx, &ctx.cancellation).await?;
+    wt_ops::origin::refresh(ctx, &ctx.cancellation).await?;
     // Linked worktrees share refs; Rift clones must each refresh their own refs.
     let mut fetch_roots = BTreeSet::new();
     for row in &rows {
@@ -94,7 +94,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
             .map(|plan| {
                 (
                     plan.row,
-                    super::_destroy::DestroyOptions {
+                    wt_ops::commands::_destroy::DestroyOptions {
                         force: false,
                         delete_branch: true,
                         landed: true,
@@ -107,7 +107,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
             .collect();
         for ((row, _), result) in requests
             .iter()
-            .zip(super::_destroy::start_removals(ctx, &requests).await)
+            .zip(wt_ops::commands::_destroy::start_removals(ctx, &requests).await)
         {
             match result {
                 Ok(job) => println!("✓ cleanup queued for {} (job {job})", row.target.slug()),
@@ -120,7 +120,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
     } else {
         let service = lifecycle_ops::service(ctx)?;
         for plan in candidates {
-            let dev_port = crate::host_cleanup::stored_dev_port(ctx, plan.row.target.slug()).await;
+            let dev_port = wt_ops::host_cleanup::stored_dev_port(ctx, plan.row.target.slug()).await;
             let result = service
                 .remove_with_revision(
                     &plan.row.target,
@@ -139,9 +139,12 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
                 Ok(result) => {
                     println!("✓ removed {}", plan.row.target.slug());
                     if result.removed {
-                        for warning in
-                            crate::host_cleanup::after_remove(ctx, plan.row.target.slug(), dev_port)
-                                .await
+                        for warning in wt_ops::host_cleanup::after_remove(
+                            ctx,
+                            plan.row.target.slug(),
+                            dev_port,
+                        )
+                        .await
                         {
                             eprintln!("warning: {warning}");
                         }

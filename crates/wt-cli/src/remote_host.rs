@@ -81,7 +81,7 @@ enum ConnectionReadiness {
     #[default]
     Preparing,
     Ready(u64),
-    UnavailableBuild(Arc<crate::remote::MissingRemoteBuild>),
+    UnavailableBuild(Arc<wt_ops::remote::MissingRemoteBuild>),
 }
 
 impl ConnectionReadiness {
@@ -100,8 +100,8 @@ pub struct RemoteHost {
     /// one as `Restored` while connecting; it never authorizes a command.
     pub snapshot: LeafHandle<HostSnapshot>,
     /// The latest managed-worker checks; always `None` for unmanaged hosts.
-    pub managed: watch::Receiver<Option<Arc<crate::managed::ManagedStatus>>>,
-    managed_status: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
+    pub managed: watch::Receiver<Option<Arc<wt_ops::managed::ManagedStatus>>>,
+    managed_status: Arc<watch::Sender<Option<Arc<wt_ops::managed::ManagedStatus>>>>,
     requests: mpsc::Sender<Request>,
     ready: watch::Receiver<ConnectionReadiness>,
     client: watch::Receiver<Option<RemoteClient>>,
@@ -191,7 +191,7 @@ impl RemoteHost {
 
     pub fn set_managed(&self, report: wt_remote::managed::ManagedReport) {
         self.managed_status
-            .send_replace(Some(Arc::new(crate::managed::ManagedStatus::now(report))));
+            .send_replace(Some(Arc::new(wt_ops::managed::ManagedStatus::now(report))));
     }
 
     /// Ask a disconnected or blocked host to retry preparation now.
@@ -228,7 +228,7 @@ impl RemoteHost {
                 }
                 if ready.borrow().connection().is_some()
                     || managed.borrow().as_ref().is_some_and(|status| {
-                        crate::managed::required_sign_in(&status.report, action, primary).is_some()
+                        wt_ops::managed::required_sign_in(&status.report, action, primary).is_some()
                     })
                 {
                     return true;
@@ -243,7 +243,7 @@ impl RemoteHost {
         .unwrap_or(false)
     }
 
-    pub fn missing_remote_build(&self) -> Option<Arc<crate::remote::MissingRemoteBuild>> {
+    pub fn missing_remote_build(&self) -> Option<Arc<wt_ops::remote::MissingRemoteBuild>> {
         match &*self.ready.borrow() {
             ConnectionReadiness::UnavailableBuild(error) => Some(error.clone()),
             ConnectionReadiness::Preparing | ConnectionReadiness::Ready(_) => None,
@@ -356,7 +356,7 @@ struct HostChannels {
     readiness: watch::Sender<ConnectionReadiness>,
     prepared_client: watch::Sender<Option<RemoteClient>>,
     views: watch::Receiver<protocol::HostViews>,
-    managed: Arc<watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>>,
+    managed: Arc<watch::Sender<Option<Arc<wt_ops::managed::ManagedStatus>>>>,
 }
 
 /// Stage the runtime, provision a managed worker, then handshake. The staged
@@ -366,7 +366,7 @@ async fn prepare_host(
     context: &AppContext,
     endpoint: &RemoteConfig,
     prepared_client: &watch::Sender<Option<RemoteClient>>,
-    managed: &watch::Sender<Option<Arc<crate::managed::ManagedStatus>>>,
+    managed: &watch::Sender<Option<Arc<wt_ops::managed::ManagedStatus>>>,
 ) -> Result<(RemoteClient, WorkerInfo)> {
     // A report from an earlier connection no longer describes a worker this
     // controller cannot reach, so it must not keep prompting for sign-ins.
@@ -374,16 +374,16 @@ async fn prepare_host(
         managed.send_replace(None);
         error
     };
-    let staged = crate::remote::stage_remote_runtime(context, endpoint)
+    let staged = wt_ops::remote::stage_remote_runtime(context, endpoint)
         .await
         .map_err(unreachable)?;
     if endpoint.managed {
         prepared_client.send_replace(Some(staged.clone()));
-        let report = crate::managed::provision(context, &staged)
+        let report = wt_ops::managed::provision(context, &staged)
             .await
             .map_err(unreachable)?;
         let blocking = report.blocking_failure().map(|check| check.detail.clone());
-        managed.send_replace(Some(Arc::new(crate::managed::ManagedStatus::now(report))));
+        managed.send_replace(Some(Arc::new(wt_ops::managed::ManagedStatus::now(report))));
         if let Some(detail) = blocking {
             anyhow::bail!("{detail}");
         }
@@ -440,7 +440,8 @@ async fn run_host_actor(
                 }
                 Err(error) => {
                     publish_failed(&publisher, format!("worker preparation: {error:#}"));
-                    if let Some(missing) = error.downcast_ref::<crate::remote::MissingRemoteBuild>()
+                    if let Some(missing) =
+                        error.downcast_ref::<wt_ops::remote::MissingRemoteBuild>()
                     {
                         readiness.send_replace(ConnectionReadiness::UnavailableBuild(Arc::new(
                             missing.clone(),
@@ -1155,7 +1156,7 @@ mod tests {
     async fn missing_build_ends_session_wait_without_the_connection_timeout() {
         let scope = TaskScope::new();
         let (host, readiness) = waiting_host(&scope);
-        let missing = crate::remote::MissingRemoteBuild {
+        let missing = wt_ops::remote::MissingRemoteBuild {
             summary: "matching Linux build is not available".into(),
             details: "GitHub returned HTTP status 404".into(),
         };
