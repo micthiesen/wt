@@ -75,33 +75,8 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
                         observed,
                     )));
                 };
-                let argv = arguments(&command, &ids);
-                let (program, args) = argv
-                    .split_first()
-                    .context("issue status reader has no executable")?;
-                let mut spec = CommandSpec::new(program)
-                    .args(args)
-                    .cwd(&context.config.paths.main_clone);
-                spec.timeout = Duration::from_secs(30);
-                let output = context
-                    .processes
-                    .run(spec, &cancel)
-                    .await
-                    .context("issue status reader")?;
-                if !output.status.success() {
-                    bail!(
-                        "issue status reader exited {}: {}",
-                        output.status,
-                        output.stderr_text().trim()
-                    );
-                }
-                Ok(Some(Fetched::new(
-                    StatusBatch {
-                        statuses: parse(&output.stdout, &ids)?,
-                        ids,
-                    },
-                    observed,
-                )))
+                let statuses = read_with_fallback(&context, &command, &ids, &cancel).await?;
+                Ok(Some(Fetched::new(StatusBatch { statuses, ids }, observed)))
             }
         }
     });
@@ -136,6 +111,67 @@ fn confirmed_ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Option<
     };
     (board.data().is_some() && live(Domain::Git) && live(Domain::Metadata))
         .then(|| ids(board, prefix))
+}
+
+/// Read every status in one batch. A tracker may refuse a whole batch over
+/// one id it cannot resolve; statuses are display-only, so the rest are then
+/// read one at a time and only that row stays blank.
+async fn read_with_fallback(
+    context: &AppContext,
+    command: &[String],
+    ids: &[String],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<BTreeMap<String, String>> {
+    let batch = match read_statuses(context, command, ids, cancel).await {
+        Ok(statuses) => return Ok(statuses),
+        Err(error) if ids.len() > 1 && !cancel.is_cancelled() => error,
+        Err(error) => return Err(error),
+    };
+    let mut statuses = BTreeMap::new();
+    for id in ids {
+        match read_statuses(context, command, std::slice::from_ref(id), cancel).await {
+            Ok(one) => statuses.extend(one),
+            Err(_) if cancel.is_cancelled() => return Err(batch),
+            Err(error) => tracing::warn!(
+                issue = %id,
+                error = %format!("{error:#}"),
+                "issue status unavailable"
+            ),
+        }
+    }
+    if statuses.is_empty() {
+        return Err(batch);
+    }
+    Ok(statuses)
+}
+
+async fn read_statuses(
+    context: &AppContext,
+    command: &[String],
+    ids: &[String],
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<BTreeMap<String, String>> {
+    let argv = arguments(command, ids);
+    let (program, args) = argv
+        .split_first()
+        .context("issue status reader has no executable")?;
+    let mut spec = CommandSpec::new(program)
+        .args(args)
+        .cwd(&context.config.paths.main_clone);
+    spec.timeout = Duration::from_secs(30);
+    let output = context
+        .processes
+        .run(spec, cancel)
+        .await
+        .context("issue status reader")?;
+    if !output.status.success() {
+        bail!(
+            "issue status reader exited {}: {}",
+            output.status,
+            output.stderr_text().trim()
+        );
+    }
+    parse(&output.stdout, ids)
 }
 
 fn arguments(command: &[String], ids: &[String]) -> Vec<String> {
@@ -291,6 +327,41 @@ fn compose(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn one_unresolvable_id_blanks_only_its_own_status() {
+        let fixture = crate::commands::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let script = fixture.ctx.config.paths.main_clone.join("statuses.sh");
+        // Refuses any request naming COZ-2, like a tracker that fails a
+        // batch over one ambiguous task.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nfor id in \"$@\"; do [ \"$id\" = COZ-2 ] && { echo 'not accessible: COZ-2' >&2; exit 1; }; done\nprintf '{\"issues\":['\nsep=''\nfor id in \"$@\"; do printf '%s{\"id\":\"%s\",\"status\":\"Done\"}' \"$sep\" \"$id\"; sep=','; done\nprintf ']}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let command = vec![script.to_string_lossy().into_owned(), "{ids}".into()];
+        let ids = ["COZ-1".to_owned(), "COZ-2".into(), "COZ-3".into()];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let statuses = read_with_fallback(&fixture.ctx, &command, &ids, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            statuses.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["COZ-1", "COZ-3"]
+        );
+        // With nothing readable, the batch error stands.
+        let only_bad = ["COZ-2".to_owned()];
+        assert!(
+            read_with_fallback(&fixture.ctx, &command, &only_bad, &cancel)
+                .await
+                .is_err()
+        );
+        fixture.close().await.unwrap();
+    }
+
     use super::*;
     use wt_runtime::SourceState;
     use wt_tui::BoardRow;

@@ -651,9 +651,12 @@ Stdout must be only JSON of this shape:
 
 Return every requested ID exactly once, without extra fields or unrequested IDs.
 Statuses are arbitrary nonempty single-line strings; wt assigns no tracker
-vocabulary. Missing, duplicate, invalid, or failed responses
-reject the entire batch, retaining the last good cache and showing the source
-error. No reader or no IDs means no subprocess. Omission inherits the reader;
+vocabulary. Missing, duplicate or invalid responses reject the entire batch,
+retaining the last good cache and showing the source error. When the command
+fails for a batch of several IDs (a tracker may refuse a whole batch over one
+task it cannot resolve), wt re-runs it once per ID: the readable statuses are
+shown, each unreadable ID is logged as `issue status unavailable` and its row
+shows no status, and the source fails only when no ID could be read. No reader or no IDs means no subprocess. Omission inherits the reader;
 `[]` disables it. `affects = ["issue"]` action completion and `r` refresh it
 immediately; a three-minute poll picks up changes made outside wt.
 
