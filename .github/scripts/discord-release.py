@@ -47,9 +47,23 @@ def request(url, *, headers=None, payload=None):
     return json.loads(data) if data else None
 
 
+def unwrap(text: str) -> str:
+    """Join the hard-wrapped continuation lines of a commit message, which
+    Discord would otherwise show as breaks mid-sentence."""
+    lines: list[str] = []
+    for line in text.splitlines():
+        continues = (lines and lines[-1].strip() and line.strip()
+                     and not line.lstrip().startswith(("- ", "* ")))
+        if continues:
+            lines[-1] = f"{lines[-1].rstrip()} {line.strip()}"
+        else:
+            lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
 def description(body: str) -> str:
     """The release notes, without the trailing download boilerplate."""
-    notes = body.split("\n---\n", 1)[0].strip() or body.strip()
+    notes = unwrap(body.split("\n---\n", 1)[0].strip() or body.strip())
     if len(notes) > MAX_DESCRIPTION:
         notes = notes[: MAX_DESCRIPTION - 1].rstrip() + "…"
     return notes

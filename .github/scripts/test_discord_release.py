@@ -65,6 +65,11 @@ class DiscordReleaseTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             announcer.run(env(), Transport(release(target_commitish="b" * 40)))
 
+    def test_wrapped_commit_lines_are_joined_but_bullets_stay_separate(self):
+        body = "Faster CI\n\n- Native checks run in parallel,\n  cutting a job.\n- Releases post\n  to Discord.\n\n---\nboilerplate"
+        self.assertEqual(announcer.description(body),
+                         "Faster CI\n\n- Native checks run in parallel, cutting a job.\n- Releases post to Discord.")
+
     def test_long_notes_are_truncated_for_discord(self):
         text = announcer.description("x" * 5000)
         self.assertEqual(len(text), announcer.MAX_DESCRIPTION)
