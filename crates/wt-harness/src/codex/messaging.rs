@@ -1132,11 +1132,20 @@ fn idle_composer(text: &str) -> Option<Composer> {
     if text.to_ascii_lowercase().contains("esc to interrupt") {
         return None;
     }
-    match text
-        .lines()
-        .map(str::trim)
-        .rfind(|line| line.starts_with("› "))?
-    {
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    let composer = lines.iter().rposition(|line| line.starts_with("› "))?;
+    match lines[composer] {
+        // Codex 0.164 keeps this placeholder after a thread has history, so it
+        // alone cannot prove an empty conversation: any transcript item above
+        // the composer (an earlier prompt, an assistant or tool line, tool
+        // output) means the conversation has history.
+        FRESH_PLACEHOLDER
+            if lines[..composer]
+                .iter()
+                .any(|line| ["› ", "• ", "└ "].iter().any(|mark| line.starts_with(mark))) =>
+        {
+            Some(Composer::FollowUp)
+        }
         FRESH_PLACEHOLDER => Some(Composer::Fresh),
         FOLLOW_UP_PLACEHOLDER => Some(Composer::FollowUp),
         _ => None,
@@ -1509,6 +1518,19 @@ mod tests {
             idle_composer("output\n› Ask Codex to do anything"),
             Some(Composer::Fresh)
         );
+        // Codex 0.164 keeps the fresh placeholder on a thread with history;
+        // transcript items above the composer show the history.
+        for history in [
+            "› earlier prompt\n• answer\n› Ask Codex to do anything",
+            "• Ran cargo test\n  └ ok\n› Ask Codex to do anything",
+            "  └ (no output)\n› Ask Codex to do anything",
+        ] {
+            assert_eq!(
+                idle_composer(history),
+                Some(Composer::FollowUp),
+                "{history}"
+            );
+        }
         // Codex 0.163 changes the placeholder once a thread has history.
         assert_eq!(
             idle_composer("history\n› Ask a follow-up question\n  gpt · 80% left"),
