@@ -661,6 +661,7 @@ pub async fn execute_with_shutdown(
                 UrlKind::Issue => row.issue_url.as_deref().or(row.github_issue_url.as_deref()),
                 UrlKind::PrimaryIssue => row.issue_url.as_deref(),
                 UrlKind::StageOrDev => row.stage_url.as_deref().or(row.dev_url.as_deref()),
+                UrlKind::Guide => row.guide.as_ref().map(|guide| guide.url.as_str()),
             }
             .context("no URL is available for this worktree")?;
             let url = if kind == UrlKind::PullRequest {

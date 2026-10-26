@@ -399,6 +399,8 @@ pub enum UrlKind {
     Issue,
     PrimaryIssue,
     StageOrDev,
+    /// The change guide recorded with `wt guide`.
+    Guide,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -28,11 +28,12 @@ use crate::UiAction;
 pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION, REMOVING_SECTION};
 pub use board::{
     ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
-    DisplayPolicy, GitPresentation, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
-    PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
-    PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot,
-    ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView,
-    TerminalSlotView, TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
+    DisplayPolicy, GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LogView,
+    MergeQueueView, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
+    PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
+    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
+    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WorkPresentation,
+    WorkRiskCount, WorkStateCount,
 };
 pub use interaction::{
     ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,
@@ -142,6 +143,10 @@ pub struct Model {
     pub list_free_scroll: bool,
     /// Mouse drag selection, in screen cells, while a button is held.
     pub(crate) mouse_selection: Option<crate::mouse::Selection>,
+    /// Screen cells the last frame showed as links. Written by the driver
+    /// after each draw, because a link escape inside a buffer cell would
+    /// count as display width.
+    pub(crate) hyperlinks: Vec<crate::render::Hyperlink>,
     pub(crate) refresh_wave: crate::refresh_wave::RefreshWave,
 }
 
@@ -209,6 +214,7 @@ impl Default for Model {
             log_refresh: None,
             list_free_scroll: false,
             mouse_selection: None,
+            hyperlinks: Vec::new(),
             refresh_wave: Default::default(),
         }
     }

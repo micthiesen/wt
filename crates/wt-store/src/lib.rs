@@ -18,8 +18,8 @@ pub use mutations::{
 };
 pub use store::{Store, StoreError};
 pub use types::{
-    ForeignRepositoryRow, MergeEdge, RemovedWorktree, RepositoryIdentity, ReviewRequestDismissal,
-    WorkStatusRecord, WtState,
+    ForeignRepositoryRow, GuideRecord, MergeEdge, RemovedWorktree, RepositoryIdentity,
+    ReviewRequestDismissal, WorkStatusRecord, WtState,
 };
 
 #[cfg(test)]

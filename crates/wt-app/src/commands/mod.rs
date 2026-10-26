@@ -13,6 +13,7 @@ pub mod doctor;
 pub mod edge;
 pub mod events;
 pub mod fleet;
+pub mod guide;
 pub mod hold;
 pub mod init;
 pub mod install;

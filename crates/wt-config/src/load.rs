@@ -705,6 +705,7 @@ impl Config {
         let mut editor: EditorConfig = section(&raw, "editor", &mut errors);
         editor.command = editor.command.filter(|value| !value.is_empty());
         let mut browser: BrowserConfig = section(&raw, "browser", &mut errors);
+        let guides: GuidesConfig = section(&raw, "guides", &mut errors);
         browser.chrome_profile = browser.chrome_profile.filter(|value| !value.is_empty());
         let mut tmux: TmuxConfig = section(&raw, "tmux", &mut errors);
         if let Some(socket) =
@@ -797,6 +798,7 @@ impl Config {
             diff,
             editor,
             browser,
+            guides,
             github,
             actions,
             automations,

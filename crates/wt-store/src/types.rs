@@ -115,3 +115,14 @@ pub struct ForeignRepositoryRow {
     pub updated_at: i64,
     pub archived: BTreeSet<String>,
 }
+
+/// A worktree's change guide: a published walkthrough of the change, and the
+/// HEAD it described when it was recorded.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuideRecord {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    pub at: String,
+}

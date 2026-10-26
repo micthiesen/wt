@@ -710,6 +710,9 @@ impl Model {
             KeyCode::Char('i') if !control => self.url_action(UrlKind::Issue),
             KeyCode::Char('I') if !control => self.url_action(UrlKind::PrimaryIssue),
             KeyCode::Char('s') if !control => self.url_action(UrlKind::StageOrDev),
+            KeyCode::Char('z') if !control && self.board.display.guides => {
+                self.url_action(UrlKind::Guide)
+            }
             KeyCode::F(10) if shift => self.row_action(|key| UiAction::PrepareStopTerminal {
                 key,
                 target: SessionTarget::Shell,
@@ -859,6 +862,10 @@ impl Model {
                 .then_some("no primary issue URL (set a tracker id with #)"),
             UrlKind::StageOrDev => (row.stage_url.is_none() && row.dev_url.is_none())
                 .then_some("no stage deployed or dev server running"),
+            UrlKind::Guide => row
+                .guide
+                .is_none()
+                .then_some("no change guide recorded (the agent records one with wt guide)"),
         };
         if let Some(missing) = missing {
             return self.notify(missing);

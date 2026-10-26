@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Number, Value, json};
 
 use crate::{
-    MergeEdge, RemovedWorktree, ReviewRequestDismissal, Store, StoreError, WorkStatusRecord,
-    WtState,
+    GuideRecord, MergeEdge, RemovedWorktree, ReviewRequestDismissal, Store, StoreError,
+    WorkStatusRecord, WtState,
 };
 
 const GROUP_INBOX: &str = "\0inbox";
@@ -1187,6 +1187,30 @@ impl Store {
             } else {
                 entry.remove("work");
             }
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Record or clear a worktree's change guide. Returns whether it changed.
+    pub fn set_slug_guide(
+        &mut self,
+        slug: &str,
+        guide: Option<&GuideRecord>,
+    ) -> Result<bool, StoreError> {
+        let next = guide.map(serde_json::to_value).transpose()?;
+        self.mutate_wt_state(|state| {
+            if next.is_none() && !has_slug(state, slug) {
+                return Ok((false, false));
+            }
+            let mut entry = slug_entry(state, slug);
+            if entry.get("guide") == next.as_ref() {
+                return Ok((false, false));
+            }
+            match &next {
+                Some(guide) => entry.insert("guide".to_owned(), guide.clone()),
+                None => entry.remove("guide"),
+            };
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
             Ok((true, true))
         })

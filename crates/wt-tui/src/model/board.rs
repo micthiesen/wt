@@ -547,6 +547,17 @@ pub struct DisplayPolicy {
     pub trunk: String,
     /// The reviewer `E` requests when human reviewer requests are configured.
     pub default_reviewer: Option<String>,
+    /// `[guides] enabled`: the details pane shows each row's change guide.
+    pub guides: bool,
+}
+
+/// A recorded change guide. `current` compares the HEAD it described with
+/// the row's HEAD; `None` when either is unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct GuideView {
+    pub url: String,
+    pub current: Option<bool>,
 }
 
 /// One explicitly identified detail pane group. `id` is matched against
@@ -638,6 +649,9 @@ pub struct BoardRow {
     /// The checkout directory no longer exists.
     #[serde(default)]
     pub path_missing: bool,
+    /// The change guide the worktree's agent recorded with `wt guide`.
+    #[serde(default)]
+    pub guide: Option<GuideView>,
     /// The branch was deleted from the remote.
     #[serde(default)]
     pub branch_gone: bool,

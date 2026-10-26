@@ -112,6 +112,15 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         Paragraph::new(lines).scroll((model.details_scroll, 0)),
         content,
     );
+    if let Some(url) = model
+        .selected_row()
+        .filter(|_| model.board.display.guides)
+        .and_then(|row| row.guide.as_ref())
+        .map(|guide| guide.url.clone())
+        && let Some(link) = find_text(frame.buffer_mut(), content, GUIDE_LINK)
+    {
+        model.hyperlinks.push(super::Hyperlink { area: link, url });
+    }
     if total > height {
         let mut state = ScrollbarState::new(max_scroll).position(scroll);
         frame.render_stateful_widget(
@@ -286,7 +295,7 @@ fn title_lines(title: &str, source: Option<&str>, width: usize) -> Vec<Line<'sta
 fn group_label(group: &PreparedDetailGroup) -> String {
     match group.id.as_str() {
         "claude" => "ai".into(),
-        "branch" | "path" | "issue" | "stage" | "dev" | "pr" | "git" => group.id.clone(),
+        "branch" | "path" | "issue" | "stage" | "dev" | "pr" | "guide" | "git" => group.id.clone(),
         _ => group.label.to_lowercase(),
     }
 }
@@ -329,6 +338,7 @@ fn definition(
         "issue" => vec![issue_value(row)],
         "stage" => vec![stage_value(row)],
         "dev" => vec![dev_value(row)],
+        "guide" => vec![guide_value(row)],
         "pr" => pr_value(row.pr.as_ref(), policy, value_width),
         "claude" => session_values(row, policy),
         "git" => vec![git_value(row, value_width, now)],
@@ -457,6 +467,48 @@ fn issue_status_badge(status: Option<&str>) -> (&'static str, ratatui::style::Co
     } else {
         (glyphs::DOT_OUTLINE, theme::FG_DIM)
     }
+}
+
+/// Display text of the guide link; [`hyperlink`] finds it on screen.
+const GUIDE_LINK: &str = "change guide";
+
+/// The recorded guide and whether it still describes this HEAD.
+fn guide_value(row: &BoardRow) -> Spans {
+    let Some(guide) = &row.guide else {
+        return vec![Span::styled("none recorded", theme::dim())];
+    };
+    let (freshness, color) = match guide.current {
+        Some(true) => ("current", theme::OK),
+        Some(false) => ("outdated: commits since", theme::WARN),
+        None => ("freshness unknown", theme::FG_DIM),
+    };
+    vec![
+        Span::styled(
+            GUIDE_LINK,
+            theme::fg(theme::INFO).add_modifier(ratatui::style::Modifier::UNDERLINED),
+        ),
+        Span::styled(format!(" · {freshness}"), theme::fg(color)),
+        Span::styled("  z open", theme::dim()),
+    ]
+}
+
+/// Where `text` first appears inside `area`, as a one-row rectangle.
+fn find_text(buf: &ratatui::buffer::Buffer, area: Rect, text: &str) -> Option<Rect> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let width = u16::try_from(chars.len()).ok()?;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right().saturating_sub(width.saturating_sub(1)) {
+            if chars.iter().enumerate().all(|(i, ch)| {
+                buf[(x + i as u16, y)]
+                    .symbol()
+                    .chars()
+                    .eq(std::iter::once(*ch))
+            }) {
+                return Some(Rect::new(x, y, width, 1));
+            }
+        }
+    }
+    None
 }
 
 fn stage_value(row: &BoardRow) -> Spans {

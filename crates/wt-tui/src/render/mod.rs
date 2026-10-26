@@ -95,7 +95,15 @@ fn panes_with_footer(area: Rect, full_width_activity: bool, footer_height: u16) 
     }
 }
 
+/// One row of on-screen text that the terminal should show as a link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Hyperlink {
+    pub area: Rect,
+    pub url: String,
+}
+
 pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model) {
+    model.hyperlinks.clear();
     let area = frame.area();
     frame.render_widget(
         Block::new().style(Style::new().bg(theme::BG).fg(theme::FG)),
@@ -721,6 +729,68 @@ mod tests {
                 "selected option missing at {width}x{height}: {text}"
             );
         }
+    }
+
+    #[test]
+    fn guide_row_links_its_text_and_says_whether_it_is_current() {
+        let row = |current| BoardRow {
+            key: "one".into(),
+            title: "task".into(),
+            detail_groups: vec![crate::PreparedDetailGroup {
+                id: "guide".into(),
+                label: "Guide".into(),
+                ..Default::default()
+            }],
+            guide: Some(crate::GuideView {
+                url: "https://guides.example/g/1".into(),
+                current,
+            }),
+            ..BoardRow::default()
+        };
+        // The linked on-screen text, and the whole screen.
+        let draw = |row: BoardRow, guides: bool| {
+            let mut model = Model {
+                board: Arc::new(Board {
+                    name: "repository".into(),
+                    rows: vec![row],
+                    display: crate::DisplayPolicy {
+                        guides,
+                        ..Default::default()
+                    },
+                    ..Board::default()
+                }),
+                selected: Some(0),
+                ..Model::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal.draw(|frame| render(frame, &mut model)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let linked = model
+                .hyperlinks
+                .iter()
+                .map(|link| {
+                    assert_eq!(link.url, "https://guides.example/g/1");
+                    (link.area.left()..link.area.right())
+                        .map(|x| buffer[(x, link.area.y)].symbol().to_owned())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            let text = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol().to_owned())
+                .collect::<String>();
+            (linked, text)
+        };
+        let (linked, text) = draw(row(Some(true)), true);
+        assert_eq!(linked, ["change guide"]);
+        assert!(text.contains("change guide · current  z open"));
+        let (_, text) = draw(row(Some(false)), true);
+        assert!(text.contains("outdated: commits since"));
+        // Off by default the host prepares no guide row; nothing is linked
+        // even if one were shown.
+        let (linked, _) = draw(row(Some(true)), false);
+        assert!(linked.is_empty());
     }
 
     #[test]

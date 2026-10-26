@@ -21,6 +21,7 @@ pub(crate) const LINES: &[&str] = &[
     "  i / I              Open issue / primary tracker issue",
     "  #                  Set the tracker id (empty clears)",
     "  s                  Open deployed stage or dev server",
+    "  z                  Open the change guide ([guides] enabled)",
     "  y                  Copy picker: b s S d p n i I r, j/k, y/Enter, 1-9",
     "  y on folded        Copy section name (n), slugs (s), branches (b), list (l)",
     "  t / T              Rename worktree title manually / regenerate AI title",

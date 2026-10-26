@@ -150,6 +150,10 @@ You own verification. After review:
 
    Make sure the PR body reflects the final state, and so does any change
    guide (a reviewer's walkthrough of the change) your instructions ask for.
+   When `wt guide` does not print `change guides are off`, every change gets
+   a short guide: publish it with the tools your instructions name, put its
+   plain URL (not a signed or login link) at the top of the PR body, and
+   record it with `wt guide <url>` so wt shows whether it is current.
    The human merges — never merge it yourself.
 
 Before handing off, run `wt dev stop` from your own worktree if you have no

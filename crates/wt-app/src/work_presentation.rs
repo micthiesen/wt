@@ -223,10 +223,22 @@ fn comments(pr: &PullRequest, now_ms: i64) -> Vec<wt_tui::PrCommentView> {
 }
 
 fn detail_groups(row: &BoardRow, config: &Config) -> Vec<PreparedDetailGroup> {
-    config
+    let mut ids = config
         .ui
         .rows
         .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    // Enabling guides shows them without also requiring a `[ui].rows` edit;
+    // listing `guide` there places it explicitly.
+    if config.guides.enabled && !ids.contains(&"guide") {
+        let at = ids
+            .iter()
+            .position(|id| *id == "pr")
+            .map_or(ids.len(), |pr| pr + 1);
+        ids.insert(at, "guide");
+    }
+    ids.into_iter()
         .filter_map(|id| detail_group(row, id, config))
         .collect()
 }
@@ -282,6 +294,17 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
             row.stage_url
                 .as_deref()
                 .map(sanitize_terminal_text)
+                .into_iter()
+                .collect(),
+            None,
+        ),
+        "guide" if !config.guides.enabled => return None,
+        "guide" => (
+            "guide",
+            "Guide",
+            row.guide
+                .as_ref()
+                .map(|guide| sanitize_terminal_text(&guide.url))
                 .into_iter()
                 .collect(),
             None,
@@ -528,6 +551,31 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("not a typed"))
         );
+    }
+
+    #[test]
+    fn guide_group_appears_after_the_pr_only_when_guides_are_enabled() {
+        let row = BoardRow {
+            guide: Some(wt_tui::GuideView {
+                url: "https://guides.example/g".into(),
+                current: Some(true),
+            }),
+            ..Default::default()
+        };
+        let ids = |config: &Config| {
+            detail_groups(&row, config)
+                .into_iter()
+                .map(|group| group.id)
+                .collect::<Vec<_>>()
+        };
+        let mut config = config(&["branch", "pr", "path", "guide"]);
+        assert_eq!(ids(&config), ["branch", "pr", "path"]);
+        config.guides.enabled = true;
+        assert_eq!(ids(&config), ["branch", "pr", "path", "guide"]);
+        config.ui.rows = vec!["branch".into(), "pr".into(), "path".into()];
+        assert_eq!(ids(&config), ["branch", "pr", "guide", "path"]);
+        let guide = detail_groups(&row, &config).remove(2);
+        assert_eq!(guide.lines, ["https://guides.example/g"]);
     }
 
     #[test]

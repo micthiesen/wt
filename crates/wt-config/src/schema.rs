@@ -246,6 +246,14 @@ pub struct EditorConfig {
     pub command: Option<String>,
 }
 
+/// Change guides: a short published walkthrough of a worktree's change that
+/// its agent records with `wt guide <url>`. Off by default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuidesConfig {
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BrowserConfig {
@@ -627,6 +635,7 @@ pub struct Config {
     pub diff: DiffConfig,
     pub editor: EditorConfig,
     pub browser: BrowserConfig,
+    pub guides: GuidesConfig,
     pub github: GithubConfig,
     pub actions: Vec<ActionDef>,
     pub automations: Vec<AutomationDef>,

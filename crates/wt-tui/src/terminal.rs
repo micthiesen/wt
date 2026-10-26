@@ -296,6 +296,9 @@ async fn run_inner<'a>(
                 }
             })?;
             screen = Some(drawn.buffer.clone());
+            if let Some(buffer) = &screen {
+                write_hyperlinks(terminal.backend_mut(), buffer, &model.hyperlinks)?;
+            }
             if let Some(text) = copied.filter(|text| !text.trim().is_empty()) {
                 let chars = text.chars().count();
                 let lines = text.lines().count();
@@ -577,6 +580,9 @@ async fn run_inner<'a>(
                     if resized {
                         screen = Some(drawn.buffer.clone());
                     }
+                    if let Some(buffer) = &screen {
+                        write_hyperlinks(terminal.backend_mut(), buffer, &model.hyperlinks)?;
+                    }
                     model.frame_count += 1;
                 }
             }
@@ -585,6 +591,59 @@ async fn run_inner<'a>(
     log_latencies(&mut latencies);
     tracing::info!(frames = model.frame_count, "terminal stopped");
     Ok(())
+}
+
+/// Rewrite each linked cell wrapped in an OSC 8 hyperlink, with the cell's
+/// own colors and modifiers. ratatui cannot carry the escape in a cell (it
+/// would count as display width), so this runs after every draw, inside a
+/// saved cursor and attribute state.
+fn write_hyperlinks(
+    backend: &mut impl io::Write,
+    buffer: &ratatui::buffer::Buffer,
+    links: &[crate::render::Hyperlink],
+) -> io::Result<()> {
+    use crossterm::{
+        cursor::{MoveTo, RestorePosition, SavePosition},
+        queue,
+        style::{Attribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    };
+    use ratatui::{backend::IntoCrossterm, style::Modifier};
+    if links.is_empty() {
+        return Ok(());
+    }
+    queue!(backend, SavePosition)?;
+    for link in links {
+        if link.url.chars().any(char::is_control) {
+            continue;
+        }
+        let area = link.area.intersection(buffer.area);
+        for x in area.left()..area.right() {
+            let cell = &buffer[(x, area.y)];
+            queue!(
+                backend,
+                MoveTo(x, area.y),
+                SetAttribute(Attribute::Reset),
+                SetForegroundColor(cell.fg.into_crossterm()),
+                SetBackgroundColor(cell.bg.into_crossterm()),
+            )?;
+            if cell.modifier.contains(Modifier::UNDERLINED) {
+                queue!(backend, SetAttribute(Attribute::Underlined))?;
+            }
+            if cell.modifier.contains(Modifier::BOLD) {
+                queue!(backend, SetAttribute(Attribute::Bold))?;
+            }
+            queue!(
+                backend,
+                Print(format!(
+                    "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
+                    link.url,
+                    cell.symbol()
+                ))
+            )?;
+        }
+    }
+    queue!(backend, SetAttribute(Attribute::Reset), RestorePosition)?;
+    io::Write::flush(backend)
 }
 
 enum HandoffResult {
@@ -655,5 +714,35 @@ fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate
         if !sent {
             model.background_not_sent(&action, now);
         }
+    }
+}
+
+#[cfg(test)]
+mod hyperlink_tests {
+    use super::*;
+
+    #[test]
+    fn links_are_written_cell_by_cell_and_restore_the_cursor() {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 2));
+        buffer.set_string(2, 1, "guide", ratatui::style::Style::new());
+        let mut backend = Vec::new();
+        write_hyperlinks(
+            &mut backend,
+            &buffer,
+            &[crate::render::Hyperlink {
+                area: ratatui::layout::Rect::new(2, 1, 5, 1),
+                url: "https://guides.example/g".into(),
+            }],
+        )
+        .unwrap();
+        let out = String::from_utf8(backend).unwrap();
+        assert!(out.starts_with("\x1b7"));
+        assert!(out.ends_with("\x1b8"));
+        let linked = out
+            .split("\x1b]8;;https://guides.example/g\x1b\\")
+            .skip(1)
+            .map(|part| part.chars().next().unwrap())
+            .collect::<String>();
+        assert_eq!(linked, "guide");
     }
 }

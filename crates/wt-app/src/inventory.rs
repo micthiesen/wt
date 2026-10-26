@@ -101,6 +101,20 @@ pub fn board(
                 ..wt_tui::GitPresentation::default()
             },
             automations_paused: stored["automationsPaused"].as_bool() == Some(true),
+            guide: serde_json::from_value::<wt_store::GuideRecord>(stored["guide"].clone())
+                .ok()
+                .filter(|guide| !guide.url.chars().any(char::is_control))
+                .map(|guide| {
+                    let head = snapshot
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.head_sha.as_deref())
+                        .or(snapshot.worktree.head_sha.as_deref());
+                    wt_tui::GuideView {
+                        current: guide.sha.as_deref().zip(head).map(|(at, head)| at == head),
+                        url: guide.url,
+                    }
+                }),
             verify_steps: work
                 .as_ref()
                 .and_then(|work| work.verify_after_merge.as_deref())
@@ -225,6 +239,7 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
             .reviewers
             .then(|| config.github.default_reviewer.clone())
             .flatten(),
+        guides: config.guides.enabled,
     }
 }
 

@@ -2243,3 +2243,46 @@ fn resolving_an_existing_worktree_does_not_move_it_into_the_create_section() {
         ["existing"]
     );
 }
+
+#[test]
+fn z_opens_the_recorded_guide_only_when_guides_are_enabled() {
+    let model = |guides: bool, guide: Option<crate::GuideView>| Model {
+        board: std::sync::Arc::new(Board {
+            rows: vec![BoardRow {
+                key: "one".into(),
+                guide,
+                ..BoardRow::default()
+            }],
+            display: crate::DisplayPolicy {
+                guides,
+                ..Default::default()
+            },
+            ..Board::default()
+        }),
+        selected: Some(0),
+        ..Model::default()
+    };
+    let guide = || {
+        Some(crate::GuideView {
+            url: "https://guides.example/g".into(),
+            current: Some(false),
+        })
+    };
+    let z = || KeyEvent::from(KeyCode::Char('z'));
+    assert_eq!(
+        model(true, guide()).input(z(), 20),
+        InputResult::Action(UiAction::OpenUrl {
+            key: "one".into(),
+            kind: crate::UrlKind::Guide,
+        })
+    );
+    let mut missing = model(true, None);
+    assert_ne!(
+        missing.input(z(), 20),
+        InputResult::Action(UiAction::OpenUrl {
+            key: "one".into(),
+            kind: crate::UrlKind::Guide,
+        })
+    );
+    assert_eq!(model(false, guide()).input(z(), 20), InputResult::Unchanged);
+}

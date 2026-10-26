@@ -248,6 +248,8 @@ enum Command {
     Section(commands::section::SectionArgs),
     /// Record dependencies and conflicts that expire when branches move.
     Edge(commands::edge::EdgeArgs),
+    /// Show or record the worktree's change guide (`[guides] enabled`).
+    Guide(commands::guide::GuideArgs),
     /// Arm merge-when-ready or cancel the PR's actual merge state.
     Merge(commands::merge::MergeArgs),
     /// Open a worktree in the configured editor.
@@ -535,6 +537,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::Base(args) => commands::base::run(context, args).await,
         Command::Section(args) => commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,
+        Command::Guide(args) => commands::guide::run(context, args).await,
         Command::Merge(args) => commands::merge::run(context, args).await,
         Command::Open(args) => commands::open::run(context, args).await,
         Command::Logs(args) => commands::logs::run(context, args).await,
