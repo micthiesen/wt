@@ -9,7 +9,7 @@ use wt_harness::DerivedState;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, SessionTarget, SessionView, TerminalSlotView};
 
-use crate::activity_source::FailureClock;
+use crate::feeds::FailureClock;
 use crate::harness::{AgentTarget, AgentTargetKind, AppHarness};
 use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto};
 use crate::session_source::{SessionDiscoveries, SessionInventory, SessionSources};
@@ -350,7 +350,7 @@ fn compose(
                 .find(|harness| harness.as_str() == primary);
         }
     }
-    crate::activity_source::bound_feeds(&mut board);
+    crate::feeds::bound_feeds(&mut board);
     source
         .with_data(Some(Arc::new(board)))
         .with_input(&inventory)

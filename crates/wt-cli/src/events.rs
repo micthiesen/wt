@@ -125,9 +125,7 @@ pub async fn serve(context: &AppContext) -> Result<()> {
         Some(crate::build_info::build_id().to_owned()),
     )
     .with_version(crate::build_info::version())
-    .with_repository(crate::github_events_source::repository_identity(
-        &context.config,
-    ));
+    .with_repository(repository_identity(&context.config));
     let daemon = wt_events::start_daemon(
         config,
         Arc::new(AppEventSource {
@@ -976,6 +974,16 @@ fn now_millis() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+
+/// Which repository and configuration a daemon snapshot belongs to. A
+/// snapshot written for anything else is never read as this repository's.
+pub(crate) fn repository_identity(config: &wt_config::Config) -> String {
+    format!(
+        "{}:{}",
+        config.repo_id,
+        config.paths.main_clone.to_string_lossy()
+    )
 }
 
 #[cfg(test)]

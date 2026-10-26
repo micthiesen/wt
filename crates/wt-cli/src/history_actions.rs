@@ -72,7 +72,7 @@ fn local_slug(key: &str) -> Result<String> {
 fn restore_refusal(error: LifecycleError) -> anyhow::Error {
     match error {
         LifecycleError::Refused(message) if message == wt_lifecycle::REMOVED_CHANGED => {
-            crate::controller::stale(message)
+            crate::host_errors::stale(message)
         }
         error => error.into(),
     }
@@ -88,9 +88,9 @@ mod tests {
         let stale = restore_refusal(LifecycleError::Refused(
             wt_lifecycle::REMOVED_CHANGED.into(),
         ));
-        assert!(crate::controller::error_reply(&stale).stale);
+        assert!(crate::host_errors::error_reply(&stale).stale);
         let other = restore_refusal(LifecycleError::Refused("branch is checked out".into()));
-        assert!(!crate::controller::error_reply(&other).stale);
+        assert!(!crate::host_errors::error_reply(&other).stale);
     }
 
     #[tokio::test]

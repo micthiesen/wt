@@ -43,7 +43,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             let live = tmux.list_sessions(&context.cancellation).await?;
             if let Some(session) = live.iter().find(|session| session.name == name) {
                 if session.id != session_id || session.created_at != created_at {
-                    return Err(crate::controller::stale(format!(
+                    return Err(crate::host_errors::stale(format!(
                         "{label} session changed since confirmation; open the stop dialog again"
                     )));
                 }

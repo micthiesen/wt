@@ -1,5 +1,6 @@
 //! Join host-local source snapshots into the pure automation evaluator input.
 
+use crate::lifecycle_ops::LifecycleFacts;
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
@@ -70,12 +71,6 @@ pub struct AutomationInputs<'a> {
     pub last_edit_at_ms: &'a BTreeMap<String, i64>,
     pub rules: &'a [AutomationDef],
     pub lifecycle: &'a BTreeMap<String, LifecycleFacts>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LifecycleFacts {
-    pub local_merged: Option<bool>,
-    pub clean_candidate: bool,
 }
 
 #[derive(Default)]

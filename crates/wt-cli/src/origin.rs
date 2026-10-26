@@ -172,7 +172,7 @@ fn spawn_overlay(
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         trigger.request(&origin, "startup");
-        let mut failures = crate::activity_source::FailureClock::default();
+        let mut failures = crate::feeds::FailureClock::default();
         loop {
             tokio::select! { biased;
                 _ = cancellation.cancelled() => break,

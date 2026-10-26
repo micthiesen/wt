@@ -19,7 +19,7 @@ pub(crate) async fn accept(
         .sections
         .iter()
         .find(|section| section.key == section_key)
-        .ok_or_else(|| crate::controller::stale("the creation section disappeared"))?;
+        .ok_or_else(|| crate::host_errors::stale("the creation section disappeared"))?;
     if let Some(anchor) = &placement.after {
         let shown = section
             .rows
@@ -27,7 +27,7 @@ pub(crate) async fn accept(
             .filter_map(|index| board.rows.get(*index))
             .any(|row| row.key == *anchor && !row.archived && row.removal.is_none());
         if !shown {
-            return Err(crate::controller::stale(
+            return Err(crate::host_errors::stale(
                 "the creation row left its section",
             ));
         }
@@ -45,7 +45,7 @@ pub(crate) async fn accept(
         })
         .await?;
     if !changed {
-        return Err(crate::controller::stale(
+        return Err(crate::host_errors::stale(
             "the creation section changed; reopen the create prompt",
         ));
     }

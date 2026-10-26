@@ -263,7 +263,7 @@ async fn a_pin_mismatch_or_missing_confirmed_data_refuses_the_write() {
     for (action, github) in requests {
         let reply = match fake.actions.execute(action, &board(), github).await {
             Ok(reply) => reply,
-            Err(error) => crate::controller::error_reply(&error),
+            Err(error) => crate::host_errors::error_reply(&error),
         };
         assert!(reply.failed);
         if github.is_some() {
@@ -362,7 +362,7 @@ async fn covered_absence_is_no_pr_but_cannot_match_a_visible_pr_pin() {
         )
         .await
         .unwrap_err();
-    assert!(crate::controller::error_reply(&error).stale);
+    assert!(crate::host_errors::error_reply(&error).stale);
     assert_eq!(error.to_string(), STALE_PIN);
     assert!(!fake.calls.exists());
     fake.fixture.close().await.unwrap();

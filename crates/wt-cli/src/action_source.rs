@@ -387,7 +387,7 @@ fn project(
         let mut statuses = targets.issues.subscribe();
         boards.mark_changed(); updates.mark_changed(); log_updates.mark_changed(); statuses.mark_changed();
         let mut tracker = Tracker::new(epoch_ms());
-        let mut failures = crate::activity_source::FailureClock::default();
+        let mut failures = crate::feeds::FailureClock::default();
         let mut last_runs = None;
         let mut last_error = None;
         // The tracker's read model can lag the action's write past the read
@@ -727,7 +727,7 @@ fn compose(
     runs: SourceSnapshot<ActionHistory>,
     logs: SourceSnapshot<ActionLogs>,
     tracker: &Tracker,
-    failures: &mut crate::activity_source::FailureClock,
+    failures: &mut crate::feeds::FailureClock,
 ) -> SourceSnapshot<Board> {
     let Some(data) = board.data() else {
         // This compose reports nothing, so every tracked failure has cleared.
@@ -842,7 +842,7 @@ fn compose(
         }
     }
     data.attention.extend(tracker.attention.iter().cloned());
-    crate::activity_source::bound_feeds(&mut data);
+    crate::feeds::bound_feeds(&mut data);
     data.pending_views.extend(tracker.pending.views());
     board
         .with_data(Some(Arc::new(data)))
@@ -1013,7 +1013,7 @@ mod tests {
             SourceSnapshot::default(),
             SourceSnapshot::default(),
             &tracker,
-            &mut crate::activity_source::FailureClock::default(),
+            &mut crate::feeds::FailureClock::default(),
         );
         let data = output.data().unwrap();
         assert_eq!(data.rows[0].issue_status.as_deref(), Some("Review"));

@@ -76,7 +76,7 @@ where
                     changed = updates.changed() => {
                         if changed.is_err() { break; }
                         updates.borrow_and_update();
-                        let snapshot = HostSnapshot::capture(&writer_host);
+                        let snapshot = writer_host.snapshot();
                         // A refetch that changes nothing sends no frame, unless
                         // a write is settling and needs its newer stamps.
                         if previous.as_ref().is_some_and(|previous: &HostSnapshot| previous.same_frame(&snapshot)) { continue; }
@@ -111,7 +111,7 @@ where
         }
     });
     let mut work = tokio::task::JoinSet::new();
-    let mut queued = VecDeque::<(crate::controller::Lane, (u64, UiAction))>::new();
+    let mut queued = VecDeque::<(crate::lanes::Lane, (u64, UiAction))>::new();
     let mut busy = BTreeSet::new();
     let mut running = BTreeMap::new();
     let mut last_id = 0;
@@ -160,7 +160,7 @@ where
                         outcome = host.execute(action) => outcome,
                     }
                 } else { host.execute_with_shutdown(action, Some(&shutdown_wait)).await };
-                outcome.unwrap_or_else(|error| crate::controller::error_reply(&error))
+                outcome.unwrap_or_else(|error| crate::host_errors::error_reply(&error))
             });
             running.insert(task.id(), (id, lane, cancellation));
         }
@@ -184,7 +184,7 @@ where
                             result = Err(anyhow::anyhow!("host command worker failed: {error}"));
                             let mut retained = VecDeque::new();
                             while let Some((other, (queued_id, action))) = queued.pop_front() {
-                                if crate::controller::lanes_conflict(&lane, &other) {
+                                if crate::lanes::lanes_conflict(&lane, &other) {
                                     send_reply(&replies, &disconnected, queued_id, UiReply::failure("Conflicting worker failed; queued command was not started")).await;
                                 } else { retained.push_back((other, (queued_id, action))); }
                             }
@@ -222,14 +222,14 @@ where
                         }
                     },
                     ClientFrame::Command { id, action } => {
-                        let action = crate::host_dispatch::rename_as_title(action);
+                        let action = crate::host_routing::rename_as_title(action);
                         if id <= last_id { result = Err(anyhow::anyhow!("host command IDs must increase; replay is refused")); closed = true; continue; }
                         last_id = id;
                         let lane = if crate::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
                             Err(anyhow::anyhow!("controller-owned action cannot run on the worker"))
                         } else if queued.len() >= 32 {
                             Err(anyhow::anyhow!("worker command queue is full; command was not started"))
-                        } else { crate::controller::lane_for(&action) };
+                        } else { crate::lanes::lane_for(&action) };
                         match lane {
                             Ok(lane) => queued.push_back((lane, (id, action))),
                             Err(error) => { send_reply(&replies, &disconnected, id, UiReply::failure(format!("{error:#}"))).await; },

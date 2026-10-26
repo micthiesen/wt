@@ -40,7 +40,7 @@ impl ManagedStatus {
     pub fn now(report: ManagedReport) -> Self {
         Self {
             report,
-            at_ms: crate::activity_source::epoch_ms(),
+            at_ms: crate::feeds::epoch_ms(),
         }
     }
 }

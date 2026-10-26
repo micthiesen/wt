@@ -192,7 +192,7 @@ fn project(
         local_updates.mark_changed();
         github_updates.mark_changed();
         activity_updates.mark_changed();
-        let mut failures = crate::activity_source::FailureClock::default();
+        let mut failures = crate::feeds::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -257,7 +257,7 @@ fn compose(
     local: SourceSnapshot<Board>,
     github: SourceSnapshot<GithubData>,
     activity: SourceSnapshot<crate::activity_source::ActivitySnapshot>,
-    failures: &mut crate::activity_source::FailureClock,
+    failures: &mut crate::feeds::FailureClock,
 ) -> SourceSnapshot<Board> {
     let Some(board) = local.data() else {
         // This compose reports nothing, so every tracked failure has cleared.
@@ -308,7 +308,7 @@ fn compose(
         }
     }
     failures.sweep();
-    crate::activity_source::bound_feeds(&mut board);
+    crate::feeds::bound_feeds(&mut board);
     let mut state = local.state().clone();
     if let SourceState::Failed(error) = github.state() {
         // A remote failure stays visible while local updates and last-good

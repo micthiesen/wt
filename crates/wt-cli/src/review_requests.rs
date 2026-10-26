@@ -187,7 +187,7 @@ impl ReviewRequests {
                     && pr.head_ref_name.as_deref() == Some(request.branch.as_str())
             })
             .ok_or_else(|| {
-                crate::controller::stale(
+                crate::host_errors::stale(
                     "review request changed after confirmation; refresh the review list and retry",
                 )
             })?;

@@ -29,7 +29,7 @@ fn check_section_witness(
     if let Some(Seen(seen)) = seen {
         let current = stored_section(state, key);
         if current != *seen {
-            return Err(crate::controller::stale(format!(
+            return Err(crate::host_errors::stale(format!(
                 "section is now {}",
                 current.as_deref().unwrap_or("Inbox")
             )));
@@ -155,7 +155,7 @@ pub async fn reorder(
         .and_then(|index| order.get(index))
         .cloned()
         .ok_or_else(|| {
-            crate::controller::notice(if down {
+            crate::host_errors::notice(if down {
                 "section already at bottom"
             } else {
                 "section already at top"
@@ -241,7 +241,7 @@ pub async fn reorder(
                 .unwrap_or(99)
         };
         if ctx.config.ui.sort == wt_config::UiSort::Status && rank(&mover) != rank(&neighbor) {
-            return Err(crate::controller::notice(
+            return Err(crate::host_errors::notice(
                 "status sort pins this row; reorder within the same status or use manual sort",
             ));
         }
@@ -285,7 +285,7 @@ pub async fn reorder(
             group.key != crate::board_layout::ARCHIVED && !group.key.starts_with("\0stack:")
         })
         .ok_or_else(|| {
-            crate::controller::notice(if down {
+            crate::host_errors::notice(if down {
                 "already at bottom"
             } else {
                 "already at top"
@@ -394,7 +394,7 @@ mod tests {
         assert!(
             error
                 .chain()
-                .any(|cause| cause.is::<crate::controller::Stale>())
+                .any(|cause| cause.is::<crate::host_errors::Stale>())
         );
         let state = fixture
             .ctx

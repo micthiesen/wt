@@ -439,7 +439,7 @@ async fn run(
                     )
                 });
                 if started {
-                    crate::controller::stale(format!("{} is already running", def.name))
+                    crate::host_errors::stale(format!("{} is already running", def.name))
                 } else {
                     error
                 }
@@ -454,14 +454,14 @@ async fn run(
 /// chose from no longer matches the host's state, so the stale reply reopens
 /// it from the current board.
 fn refused(def: &ActionDef, reason: &str) -> anyhow::Error {
-    crate::controller::stale(format!("{}: {reason}", def.name))
+    crate::host_errors::stale(format!("{}: {reason}", def.name))
 }
 
 fn definition(ctx: &AppContext, surface: &ActionSurface, id: &str) -> Result<ActionDef> {
     action_dispatch::definitions(ctx, surface)
         .into_iter()
         .find(|def| def.id == id)
-        .ok_or_else(|| crate::controller::stale(format!("action {id:?} is no longer available")))
+        .ok_or_else(|| crate::host_errors::stale(format!("action {id:?} is no longer available")))
 }
 
 fn modal(modal: UiModal) -> UiReply {
@@ -484,7 +484,7 @@ async fn dev_logs(
     let text = crate::dev::service(ctx)?
         .logs(&context.slug, DEV_LOG_LINES, &ctx.cancellation)
         .await?
-        .ok_or_else(|| crate::controller::notice("dev server is not running"))?;
+        .ok_or_else(|| crate::host_errors::notice("dev server is not running"))?;
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let skip = lines.len().saturating_sub(DEV_LOG_LINES as usize);
     Ok(modal(UiModal::Log {
@@ -693,7 +693,7 @@ mod tests {
             "Fix CI and watch until green: GitHub data is not confirmed"
         );
         // The palette the user chose from no longer matches: reopen it.
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         fixture.close().await.unwrap();
     }
 

@@ -1,5 +1,5 @@
 //! Fleet projection combines independent snapshots of the same host service.
-use crate::activity_source::FailureClock;
+use crate::feeds::FailureClock;
 use crate::{
     context::AppContext,
     host_protocol::{HostSnapshot, HostState},
@@ -417,7 +417,7 @@ fn compose(
     });
     crate::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
     crate::board_layout::refresh_rollups(&mut board);
-    crate::activity_source::bound_feeds(&mut board);
+    crate::feeds::bound_feeds(&mut board);
     snapshot.derive(Some(Arc::new(board)))
 }
 

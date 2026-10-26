@@ -12,7 +12,7 @@ pub async fn execute(
     replies: &crate::controller::RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
-    let command = rename_as_title(command);
+    let command = crate::host_routing::rename_as_title(command);
     let selected_context = context.for_action(&command)?;
     let context = &selected_context;
     // Cleanup is a fleet-wide confirmation: prepare the candidate set from
@@ -614,12 +614,6 @@ async fn managed_sign_in(
         shutdown,
     ))
     .await
-}
-
-/// The row palette's `t` entry is the same request as `T`, so it shares the
-/// title path, including remote pin migration.
-pub(crate) fn rename_as_title(action: UiAction) -> UiAction {
-    action.resolve_palette_alias()
 }
 
 /// A fresh Claude session; the host picks the next automatic name.

@@ -149,19 +149,19 @@ impl GithubPickers {
             // The PR and reviewer list the picker showed are its witness; a
             // mismatch is a stale refusal, so the board refreshes.
             CoveredPr::Absent => {
-                return Err(crate::controller::stale(
+                return Err(crate::host_errors::stale(
                     "PR data is no longer available; reviewer edit aborted",
                 ));
             }
             CoveredPr::Present(pr) => pr,
         };
         if pr.number != pr_number || pr.state != "OPEN" || pr.is_draft {
-            return Err(crate::controller::stale(
+            return Err(crate::host_errors::stale(
                 "PR changed since the reviewer picker opened; reopen the picker",
             ));
         }
         if !same_reviewers(original, &pr.requested_reviewers) {
-            return Err(crate::controller::stale(
+            return Err(crate::host_errors::stale(
                 "the requested reviewer list changed; reopen the picker",
             ));
         }
@@ -457,7 +457,7 @@ mod tests {
         let loading = submit(None, 42).await.unwrap();
         assert!(loading.failed && loading.message.contains("still loading"));
         let replaced =
-            crate::controller::error_reply(&submit(Some(&confirmed), 41).await.unwrap_err());
+            crate::host_errors::error_reply(&submit(Some(&confirmed), 41).await.unwrap_err());
         assert!(replaced.stale && replaced.message.contains("PR changed"));
         let reviewers_changed = pickers
             .submit_reviewers(ReviewerSubmission {
@@ -470,7 +470,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(crate::controller::error_reply(&reviewers_changed).stale);
+        assert!(crate::host_errors::error_reply(&reviewers_changed).stale);
         let unchanged = submit(Some(&confirmed), 42).await.unwrap();
         assert!(!unchanged.failed);
         assert_eq!(unchanged.outcome, Some(ReplyOutcome::NoChange));
@@ -546,7 +546,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        let submit = crate::controller::error_reply(&submit);
+        let submit = crate::host_errors::error_reply(&submit);
         assert!(submit.stale && submit.message.contains("no longer available"));
         assert!(
             !fake.with_extension("calls").exists(),

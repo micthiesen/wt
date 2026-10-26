@@ -35,10 +35,10 @@ impl AppContext {
     /// Use the controller's scheduling classification at both local and remote
     /// execution boundaries. Cloning this view never creates a new process pool.
     pub fn for_action(&self, action: &wt_tui::UiAction) -> anyhow::Result<Self> {
-        use crate::controller::Lane;
+        use crate::lanes::Lane;
         let mut context = self.clone();
         let interactive = matches!(
-            crate::controller::lane_for(action)?,
+            crate::lanes::lane_for(action)?,
             Lane::Terminal(..)
                 | Lane::Preparation(..)
                 | Lane::Metadata(..)

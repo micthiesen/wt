@@ -52,19 +52,9 @@ pub(crate) async fn load(context: &AppContext, branches: &[String]) -> Option<Da
     read(
         context.config.paths.cache_root.join("events"),
         branches.to_vec(),
-        repository_identity(&context.config),
+        crate::events::repository_identity(&context.config),
     )
     .await
-}
-
-/// Which repository and configuration a daemon snapshot belongs to. A
-/// snapshot written for anything else is never read as this repository's.
-pub(crate) fn repository_identity(config: &wt_config::Config) -> String {
-    format!(
-        "{}:{}",
-        config.repo_id,
-        config.paths.main_clone.to_string_lossy()
-    )
 }
 
 async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> Option<DaemonRead> {

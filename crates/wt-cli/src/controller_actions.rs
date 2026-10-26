@@ -43,7 +43,7 @@ async fn dismiss_failed_removal(
         !row.is_main
             && (wt_core::worktree_target_key(&row.target) == key || row.target.path == seen.path)
     }) {
-        return Err(crate::controller::stale(
+        return Err(crate::host_errors::stale(
             "the checkout is in Git inventory again; review a retry instead",
         ));
     }
@@ -68,10 +68,10 @@ async fn dismiss_failed_removal(
         wt_store::ClearFailedRemoval::Cleared => {
             Ok(message(format!("Dismissed failed removal of {slug}")))
         }
-        wt_store::ClearFailedRemoval::Changed => Err(crate::controller::stale(
+        wt_store::ClearFailedRemoval::Changed => Err(crate::host_errors::stale(
             "the removal record changed since the dismissal menu was shown",
         )),
-        wt_store::ClearFailedRemoval::CheckoutPresent => Err(crate::controller::stale(
+        wt_store::ClearFailedRemoval::CheckoutPresent => Err(crate::host_errors::stale(
             "the checkout path exists again; review a retry instead",
         )),
     }
@@ -240,7 +240,7 @@ pub async fn execute_with_shutdown(
                     match outcome {
                         wt_store::SeenToggle::Set(paused) => Ok(paused),
                         wt_store::SeenToggle::Stale { current } => {
-                            Err(crate::controller::stale(if current {
+                            Err(crate::host_errors::stale(if current {
                                 "automations are now paused"
                             } else {
                                 "automations are now running"
@@ -442,7 +442,7 @@ pub async fn execute_with_shutdown(
                     || seen.branch != plan.revision.branch
                     || seen.head != plan.revision.head)
             {
-                return Err(crate::controller::stale(
+                return Err(crate::host_errors::stale(
                     "checkout changed since the removal menu was shown",
                 ));
             }
@@ -611,7 +611,7 @@ pub async fn execute_with_shutdown(
                     match store.toggle_archived_seen(&slug, seen, crate::board_layout::ARCHIVED)? {
                         wt_store::SeenToggle::Set(archived) => Ok(archived),
                         wt_store::SeenToggle::Stale { current } => {
-                            Err(crate::controller::stale(if current {
+                            Err(crate::host_errors::stale(if current {
                                 "row is already archived"
                             } else {
                                 "row is no longer archived"
@@ -935,7 +935,7 @@ async fn set_status(
                     verify_after_merge: work.verify_after_merge.clone(),
                 });
                 if current != *seen {
-                    return Err(crate::controller::stale(format!(
+                    return Err(crate::host_errors::stale(format!(
                         "status is now {}",
                         current.map_or("unset".into(), |claim| claim.state)
                     )));
@@ -1111,7 +1111,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         // Same state, but the owed check changed since: still unseen.
         let error = set_status(
             &fixture.ctx,
@@ -1127,7 +1127,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         set_status(
             &fixture.ctx,
             &key,
@@ -1216,14 +1216,14 @@ mod tests {
         let error = execute(&fixture.ctx, remove(None, None), None, None)
             .await
             .unwrap_err();
-        assert!(!crate::controller::error_reply(&error).stale);
+        assert!(!crate::host_errors::error_reply(&error).stale);
         assert!(Path::new(&path).exists());
 
         // The head moved after the board showed the row: the menu reopens.
         let error = execute(&fixture.ctx, remove(None, seen("moved")), None, None)
             .await
             .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         assert!(Path::new(&path).exists());
 
         // Uncommitted work appeared after the clean board: nothing is removed,
@@ -1306,7 +1306,7 @@ mod tests {
         };
         let refused = |action: UiAction| async {
             let error = execute(&fixture.ctx, action, None, None).await.unwrap_err();
-            assert!(crate::controller::error_reply(&error).stale, "{error:#}");
+            assert!(crate::host_errors::error_reply(&error).stale, "{error:#}");
         };
 
         // Another job than the one the menu showed writes nothing.
@@ -1465,7 +1465,7 @@ mod tests {
         let error = execute(&fixture.ctx, archive(false), None, None)
             .await
             .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         assert!(archived(&fixture.ctx).await);
         assert!(
             fixture
@@ -1509,7 +1509,7 @@ mod tests {
             let error = execute(&fixture.ctx, toggle(false), None, None)
                 .await
                 .unwrap_err();
-            assert!(crate::controller::error_reply(&error).stale);
+            assert!(crate::host_errors::error_reply(&error).stale);
             assert!(read(paused(&fixture.ctx).await), "a stale toggle resumed");
             execute(&fixture.ctx, toggle(true), None, None)
                 .await

@@ -1064,6 +1064,51 @@ mod tests {
     use wt_core::Domain;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
 
+    #[tokio::test(start_paused = true)]
+    async fn host_snapshots_meet_the_persisted_source_contract() {
+        use wt_runtime::{SourceSnapshot, SourceState};
+        let endpoint = wt_config::RemoteConfig {
+            host: "builder".into(),
+            label: "Builder".into(),
+            ..Default::default()
+        };
+        let name = super::source_name(&endpoint);
+        assert!(name.starts_with("host-") && name.len() == "host-".len() + 16);
+        let mut domains = SourceSnapshot::test_live(Some(()), SourceState::Ready, Domain::Git)
+            .domains()
+            .clone();
+        wt_runtime::merge_domains(
+            &mut domains,
+            SourceSnapshot::test_restored((), Domain::Github, 1_700_000_000_000).domains(),
+        );
+        let sample = HostSnapshot {
+            board: Some(wt_tui::Board {
+                name: "worker".into(),
+                rows: vec![wt_tui::BoardRow {
+                    key: "one".into(),
+                    slug: "one".into(),
+                    title: "Fix the flaky test".into(),
+                    branch: "feature/one".into(),
+                    path: "/srv/wt/one".into(),
+                    details: vec!["PR #42 open".into()],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            state: crate::host_protocol::HostState::Ready,
+            domains,
+            layout: std::collections::BTreeMap::from([(
+                "one".to_owned(),
+                crate::host_protocol::RowLayout {
+                    base_branch: Some("main".into()),
+                    work: None,
+                },
+            )]),
+        };
+        sample.validate().unwrap();
+        wt_runtime::conformance::persisted_source(name, Domain::Host, sample).await;
+    }
+
     #[allow(
         clippy::disallowed_methods,
         reason = "isolated connection control channels for tests"

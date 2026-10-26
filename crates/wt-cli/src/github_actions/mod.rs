@@ -131,7 +131,7 @@ impl GithubActions {
         if let Some(pin) = action.write_pin()
             && !pin_matches(pin, pr)
         {
-            return Err(crate::controller::stale(STALE_PIN));
+            return Err(crate::host_errors::stale(STALE_PIN));
         }
         let Some(pr) = pr else {
             return Ok(UiReply {

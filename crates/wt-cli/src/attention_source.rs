@@ -223,7 +223,7 @@ fn compose(
             .drain(..prepared.attention.len() - MAX_ATTENTION_FEED);
     }
     prepared.attention_seen_ms = seen_ms;
-    crate::activity_source::bound_feeds(&mut prepared);
+    crate::feeds::bound_feeds(&mut prepared);
     board.with_data(Some(Arc::new(prepared)))
 }
 
@@ -299,7 +299,7 @@ impl TransitionTracker {
     /// right-aligned column and `line` beside it, as TS did.
     fn push_from(&mut self, source: &str, line: String) {
         let text = wt_core::sanitize_terminal_text(&line);
-        let at_ms = crate::activity_source::epoch_ms();
+        let at_ms = crate::feeds::epoch_ms();
         let source = wt_core::sanitize_terminal_text(source);
         tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
         self.events.push_back(wt_tui::AttentionLine {

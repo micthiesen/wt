@@ -221,7 +221,7 @@ pub fn overlay(
         let mut histories = history.subscribe();
         boards.mark_changed();
         histories.mark_changed();
-        let mut failures = crate::activity_source::FailureClock::default();
+        let mut failures = crate::feeds::FailureClock::default();
         loop {
             tokio::select! {
                 biased;

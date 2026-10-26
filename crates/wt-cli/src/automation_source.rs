@@ -539,7 +539,7 @@ fn overlay(
     let mut updates = input.subscribe();
     scope.spawn(async move {
         updates.mark_changed();
-        let mut failures = crate::activity_source::FailureClock::default();
+        let mut failures = crate::feeds::FailureClock::default();
         loop {
             tokio::select! {
                 biased;

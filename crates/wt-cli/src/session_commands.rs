@@ -255,7 +255,7 @@ pub async fn prepare_session(
             .iter()
             .find(|slot| slot.name == tmux_name)
             .ok_or_else(|| {
-                crate::controller::stale(
+                crate::host_errors::stale(
                     "selected live session has ended; reopen the session picker",
                 )
             })?;
@@ -303,7 +303,7 @@ pub async fn prepare_session(
             same_harness && !shown.contains(&slot.id)
         });
         if let Some(slot) = unseen {
-            return Err(crate::controller::stale(format!(
+            return Err(crate::host_errors::stale(format!(
                 "{} started since the picker opened",
                 slot.name
             )));
@@ -365,7 +365,7 @@ pub async fn prepare_session(
             .iter()
             .find(|session| session.session_id == wanted_id)
             .ok_or_else(|| {
-                crate::controller::stale(format!(
+                crate::host_errors::stale(format!(
                     "selected {:?} conversation {wanted_id} is no longer available",
                     selection.harness
                 ))
@@ -373,7 +373,7 @@ pub async fn prepare_session(
         if selection.harness == HarnessId::Claude
             && exact.extras.managed_name.as_deref() != managed_name
         {
-            return Err(crate::controller::stale(
+            return Err(crate::host_errors::stale(
                 "selected Claude conversation no longer matches its managed name",
             ));
         }
@@ -475,7 +475,7 @@ pub async fn stop_managed_session(
             .iter()
             .find(|slot| slot.name == name)
             .ok_or_else(|| {
-                crate::controller::stale(
+                crate::host_errors::stale(
                     "selected live session has ended; reopen the session picker",
                 )
             })?;
@@ -532,7 +532,7 @@ pub async fn stop_managed_session(
             return Ok(false);
         };
         if live.harness_session_id.as_deref() != Some(expected.as_str()) {
-            return Err(crate::controller::stale(format!(
+            return Err(crate::host_errors::stale(format!(
                 "live {name} slot no longer matches the selected conversation; refusing to stop it"
             )));
         }
@@ -695,7 +695,7 @@ async fn validate_live_selection(
     live: &wt_tmux::SessionInfo,
 ) -> Result<()> {
     if !witness_matches(selection, live) {
-        return Err(crate::controller::stale(
+        return Err(crate::host_errors::stale(
             "live session changed since selection; reopen the session picker",
         ));
     }
@@ -711,7 +711,7 @@ async fn validate_live_selection(
                 .or(agent.managed_name.as_deref()),
         );
         if id != expected {
-            return Err(crate::controller::stale(
+            return Err(crate::host_errors::stale(
                 "selected Claude identity no longer matches its managed name",
             ));
         }
@@ -738,7 +738,7 @@ async fn validate_live_selection(
             return Ok(());
         }
     }
-    Err(crate::controller::stale(
+    Err(crate::host_errors::stale(
         "live session no longer matches the selected conversation; reopen the session picker",
     ))
 }
@@ -915,14 +915,14 @@ mod tests {
         let error = validate_live_selection(&fixture.ctx, &app, &agent, &selection, &replaced)
             .await
             .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         // The selected conversation moved to another live slot identity.
         let mut current = info("one-codex", Some("other"));
         current.id = "$1".into();
         let error = validate_live_selection(&fixture.ctx, &app, &agent, &selection, &current)
             .await
             .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
     }
 
     #[tokio::test]
@@ -976,8 +976,8 @@ mod tests {
             .kill_session("one-opencode", &fixture.ctx.cancellation)
             .await
             .unwrap();
-        assert!(crate::controller::error_reply(&unseen.err().unwrap()).stale);
-        assert!(!crate::controller::error_reply(&seen.err().unwrap()).stale);
+        assert!(crate::host_errors::error_reply(&unseen.err().unwrap()).stale);
+        assert!(!crate::host_errors::error_reply(&seen.err().unwrap()).stale);
     }
 
     #[tokio::test]

@@ -49,6 +49,33 @@ const WRITE_EVIDENCE_AGE: std::time::Duration = std::time::Duration::from_secs(1
 const ACTION_GITHUB_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
 impl HostService {
+    /// The host's current board and row layout, as the wire protocol sends it.
+    pub fn snapshot(&self) -> crate::host_protocol::HostSnapshot {
+        let snapshot = self.sources.board.snapshot();
+        let metadata = self.sources.metadata.snapshot();
+        let mut layout = std::collections::BTreeMap::new();
+        if let Some(board) = snapshot.data() {
+            for row in &board.rows {
+                let entry = metadata.data().map(|data| &data.0["slugs"][&row.key]);
+                layout.insert(
+                    row.key.clone(),
+                    crate::host_protocol::RowLayout {
+                        base_branch: entry
+                            .and_then(|e| e["baseBranch"].as_str())
+                            .map(str::to_owned),
+                        work: entry.and_then(|e| wt_core::parse_work_status(&e["work"])),
+                    },
+                );
+            }
+        }
+        crate::host_protocol::HostSnapshot {
+            board: snapshot.data().map(|board| (**board).clone()),
+            state: snapshot.state().into(),
+            domains: snapshot.domains().clone(),
+            layout,
+        }
+    }
+
     pub async fn shutdown_automations(&self) -> Result<()> {
         self.sources.automation_drain.shutdown().await
     }
@@ -385,15 +412,17 @@ impl HostService {
                 let row = board
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
                     .ok_or_else(|| {
-                        crate::controller::notice("worktree is no longer on the board")
+                        crate::host_errors::notice("worktree is no longer on the board")
                     })?;
                 let github =
                     github.ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
                 return Err(match github.covered_pr(&row.branch) {
                     wt_github::CoveredPr::Present(_) => {
-                        crate::controller::stale("GitHub data changed; press e again")
+                        crate::host_errors::stale("GitHub data changed; press e again")
                     }
-                    wt_github::CoveredPr::Absent => crate::controller::notice("no PR for this row"),
+                    wt_github::CoveredPr::Absent => {
+                        crate::host_errors::notice("no PR for this row")
+                    }
                     wt_github::CoveredPr::Uncovered => {
                         anyhow::anyhow!("GitHub data is not confirmed for this branch")
                     }

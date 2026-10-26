@@ -80,7 +80,7 @@ pub async fn set(
     if let Some(seen) = &seen
         && wt_core::recorded_fork_base(seen.as_deref(), &trunk) != recorded
     {
-        return Err(crate::controller::stale(format!(
+        return Err(crate::host_errors::stale(format!(
             "fork base for {slug} changed since the picker was opened"
         )));
     }
@@ -292,7 +292,7 @@ mod tests {
         let error = set(&fixture.ctx, "one", None, Some(None))
             .await
             .unwrap_err();
-        assert!(crate::controller::error_reply(&error).stale);
+        assert!(crate::host_errors::error_reply(&error).stale);
         let state = fixture
             .ctx
             .database
@@ -330,7 +330,7 @@ mod tests {
         let error = set(&fixture.ctx, "one", Some("feature/two".into()), None)
             .await
             .unwrap_err();
-        assert!(!crate::controller::error_reply(&error).stale);
+        assert!(!crate::host_errors::error_reply(&error).stale);
         assert!(
             error
                 .to_string()

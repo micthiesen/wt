@@ -61,6 +61,13 @@ pub async fn resolve_key(ctx: &AppContext, key: &str) -> Result<WorktreeRecord> 
         .context("worktree disappeared before the operation could run")
 }
 
+/// The lifecycle evidence automations evaluate for one worktree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LifecycleFacts {
+    pub local_merged: Option<bool>,
+    pub clean_candidate: bool,
+}
+
 pub struct RemovalPlan {
     pub row: WorktreeRecord,
     pub landed: bool,
@@ -79,7 +86,7 @@ pub struct RemovalPlans {
 /// with that row; no row here carries a removal witness.
 #[derive(Default)]
 pub(crate) struct AutomationLifecycleEvidence {
-    pub rows: BTreeMap<String, crate::automation_facts::LifecycleFacts>,
+    pub rows: BTreeMap<String, LifecycleFacts>,
     pub row_errors: BTreeMap<String, String>,
     /// Checkouts that kept changing while their landed state was being read.
     /// They contribute no facts and are retried later.
@@ -213,7 +220,7 @@ pub(crate) async fn plan_automation_facts(
         };
         evidence.rows.insert(
             slug,
-            crate::automation_facts::LifecycleFacts {
+            LifecycleFacts {
                 local_merged: landing.local_merged.then_some(true),
                 clean_candidate,
             },
