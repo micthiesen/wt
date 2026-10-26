@@ -258,7 +258,7 @@ pub async fn startup_check(
     let outcome = match update_latest(
         paths.clone(),
         repository(options)?,
-        crate::build_info::target().to_owned(),
+        wt_app_core::build_info::target().to_owned(),
         channel,
         None,
         cancel,
@@ -277,7 +277,7 @@ pub async fn startup_check(
     if state.declined_build_id.as_deref() == Some(&build_id) {
         return Ok(());
     }
-    if !crate::prompt::confirm(
+    if !wt_app_core::prompt::confirm(
         &format!("wt {release} ({build_id}) is available. Install it? [y/N] "),
         false,
         cancel,
@@ -291,7 +291,7 @@ pub async fn startup_check(
     match update_once(
         paths,
         repository(options)?,
-        crate::build_info::target().to_owned(),
+        wt_app_core::build_info::target().to_owned(),
         Some(channel),
         None,
         false,

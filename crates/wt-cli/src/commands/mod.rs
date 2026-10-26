@@ -49,5 +49,3 @@ pub mod _remote;
 pub mod _restack_worker;
 pub mod _session;
 pub mod _snapshot;
-#[cfg(test)]
-pub(crate) mod test_support;

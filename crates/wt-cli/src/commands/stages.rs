@@ -6,7 +6,7 @@ use wt_config::SstConfig;
 use wt_platform::process::CommandSpec;
 use wt_sst::{SstService, SstStage, StageInventory, human_size};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StagesArgs {
@@ -65,7 +65,7 @@ pub async fn run(ctx: &AppContext, args: &StagesArgs) -> Result<i32> {
             eprintln!("Use -y with --clean in non-interactive mode.");
             return Ok(2);
         }
-        if !crate::prompt::confirm(
+        if !wt_app_core::prompt::confirm(
             &format!(
                 "Remove {} orphaned SST stage(s)? [y/N] ",
                 inventory.orphaned.len()

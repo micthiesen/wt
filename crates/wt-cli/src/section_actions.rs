@@ -3,7 +3,8 @@ use anyhow::{Context, Result, bail};
 use wt_core::{ChainMember, build_stack_index};
 use wt_tui::{Seen, UiReply};
 
-use crate::{commands::section, context::AppContext};
+use crate::commands::section;
+use wt_app_core::context::AppContext;
 
 /// The section a row is stored under (`None` = Inbox). Remote rows keep their
 /// placement in the controller's `remoteLayouts`, as the board reads it.
@@ -29,7 +30,7 @@ fn check_section_witness(
     if let Some(Seen(seen)) = seen {
         let current = stored_section(state, key);
         if current != *seen {
-            return Err(crate::host_errors::stale(format!(
+            return Err(wt_app_core::host_errors::stale(format!(
                 "section is now {}",
                 current.as_deref().unwrap_or("Inbox")
             )));
@@ -155,7 +156,7 @@ pub async fn reorder(
         .and_then(|index| order.get(index))
         .cloned()
         .ok_or_else(|| {
-            crate::host_errors::notice(if down {
+            wt_app_core::host_errors::notice(if down {
                 "section already at bottom"
             } else {
                 "section already at top"
@@ -241,7 +242,7 @@ pub async fn reorder(
                 .unwrap_or(99)
         };
         if ctx.config.ui.sort == wt_config::UiSort::Status && rank(&mover) != rank(&neighbor) {
-            return Err(crate::host_errors::notice(
+            return Err(wt_app_core::host_errors::notice(
                 "status sort pins this row; reorder within the same status or use manual sort",
             ));
         }
@@ -285,7 +286,7 @@ pub async fn reorder(
             group.key != crate::board_layout::ARCHIVED && !group.key.starts_with("\0stack:")
         })
         .ok_or_else(|| {
-            crate::host_errors::notice(if down {
+            wt_app_core::host_errors::notice(if down {
                 "already at bottom"
             } else {
                 "already at top"
@@ -355,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_refuses_when_the_section_the_menu_showed_changed() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let facts = fixture
@@ -394,7 +395,7 @@ mod tests {
         assert!(
             error
                 .chain()
-                .any(|cause| cause.is::<crate::host_errors::Stale>())
+                .any(|cause| cause.is::<wt_app_core::host_errors::Stale>())
         );
         let state = fixture
             .ctx
@@ -418,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn reorder_swaps_only_same_rank_units_and_crosses_into_named_sections() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let facts = fixture
@@ -503,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn moving_files_the_stack_and_rename_preserves_unrelated_state() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         fixture

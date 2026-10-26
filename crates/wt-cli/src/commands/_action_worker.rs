@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Args;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args)]
 pub struct ActionWorkerArgs {
@@ -12,7 +12,7 @@ pub struct ActionWorkerArgs {
 }
 
 pub async fn run(context: &AppContext, args: &ActionWorkerArgs) -> Result<i32> {
-    let done = crate::actions::service(context)?
+    let done = wt_app_core::actions::service(context)?
         .run_worker(&args.job, &context.cancellation)
         .await?;
     Ok(match done.status {

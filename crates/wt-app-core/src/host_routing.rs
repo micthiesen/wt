@@ -240,7 +240,7 @@ pub fn qualify(mut action: UiAction, host: &str) -> Result<UiAction> {
 
 /// The row palette's `t` entry is the same request as `T`, so it shares the
 /// title path, including remote pin migration.
-pub(crate) fn rename_as_title(action: wt_tui::UiAction) -> wt_tui::UiAction {
+pub fn rename_as_title(action: wt_tui::UiAction) -> wt_tui::UiAction {
     action.resolve_palette_alias()
 }
 

@@ -1,8 +1,8 @@
 //! Host-owned session actions: terminal stop, live session stop and kill.
 //! Pickers are built from the board (`wt_tui::menus::sessions`); the host
 //! answers a picker only for targets the board has no prepared entries for.
-use crate::context::AppContext;
 use anyhow::Result;
+use wt_app_core::context::AppContext;
 use wt_tui::{UiAction, UiReply};
 
 pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> {
@@ -43,7 +43,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
             let live = tmux.list_sessions(&context.cancellation).await?;
             if let Some(session) = live.iter().find(|session| session.name == name) {
                 if session.id != session_id || session.created_at != created_at {
-                    return Err(crate::host_errors::stale(format!(
+                    return Err(wt_app_core::host_errors::stale(format!(
                         "{label} session changed since confirmation; open the stop dialog again"
                     )));
                 }
@@ -57,10 +57,10 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
         }
         UiAction::StopSession { selection } => {
             let label = wt_tui::harness_label(selection.harness);
-            let closed = crate::harness::stop_managed_session(
+            let closed = wt_app_core::harness::stop_managed_session(
                 context,
                 &selection,
-                crate::harness::SessionEnd::Graceful,
+                wt_app_core::harness::SessionEnd::Graceful,
             )
             .await?;
             Ok(UiReply {
@@ -75,10 +75,10 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
         UiAction::KillSession { selection } => {
             let label = wt_tui::harness_label(selection.harness);
             if selection.live {
-                let killed = crate::harness::stop_managed_session(
+                let killed = wt_app_core::harness::stop_managed_session(
                     context,
                     &selection,
-                    crate::harness::SessionEnd::Kill,
+                    wt_app_core::harness::SessionEnd::Kill,
                 )
                 .await?;
                 return Ok(UiReply {
@@ -96,7 +96,7 @@ pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> 
                     selection.harness.as_str()
                 );
             }
-            let name = crate::harness::forget_claude_session(context, &selection).await?;
+            let name = wt_app_core::harness::forget_claude_session(context, &selection).await?;
             Ok(UiReply {
                 message: format!("Forgot ghost session \"{name}\""),
                 ..Default::default()

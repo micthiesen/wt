@@ -13,7 +13,7 @@ use wt_events::{EventDaemonConfig, EventFuture, EventGithubData, EventSource};
 use wt_github::{GithubClient, GithubOptions};
 use wt_platform::process::CommandSpec;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const EVENT_LOCK: &str = "events-agent";
 const LAUNCHD_LABEL: &str = "com.wt.events";
@@ -122,9 +122,9 @@ pub async fn serve(context: &AppContext) -> Result<()> {
         secret,
         context.config.paths.cache_root.join("events"),
         context.config.branch.base.clone(),
-        Some(crate::build_info::build_id().to_owned()),
+        Some(wt_app_core::build_info::build_id().to_owned()),
     )
-    .with_version(crate::build_info::version())
+    .with_version(wt_app_core::build_info::version())
     .with_repository(repository_identity(&context.config));
     let daemon = wt_events::start_daemon(
         config,
@@ -220,7 +220,7 @@ async fn installed_build(root: PathBuf) -> String {
         None => None,
     };
     current.map_or_else(
-        || crate::build_info::build_id().to_owned(),
+        || wt_app_core::build_info::build_id().to_owned(),
         |version| version.build_id().to_owned(),
     )
 }
@@ -609,7 +609,7 @@ pub(crate) async fn status(context: &AppContext) -> Result<()> {
                 snapshot.prs.as_object().map_or(0, serde_json::Map::len),
                 ago(snapshot.updated_at)
             );
-            if snapshot.writer_sha.as_deref() != Some(crate::build_info::build_id()) {
+            if snapshot.writer_sha.as_deref() != Some(wt_app_core::build_info::build_id()) {
                 println!("  snapshot build stale; live GitHub reads will be used until refreshed");
             }
         }
@@ -996,14 +996,15 @@ mod tests {
         // No install state: only this process's own build is known.
         assert_eq!(
             installed_build(root.path().to_path_buf()).await,
-            crate::build_info::build_id()
+            wt_app_core::build_info::build_id()
         );
         // After an update the launcher starts the new build, even while an
         // older session performs the reconcile.
         let paths = wt_update::InstallPaths::new(root.path()).unwrap();
         let mut state = wt_update::InstallState::new(wt_update::Channel::Stable);
         state.current = Some(
-            wt_update::VersionId::new("v9.9.9", "newbuild", crate::build_info::target()).unwrap(),
+            wt_update::VersionId::new("v9.9.9", "newbuild", wt_app_core::build_info::target())
+                .unwrap(),
         );
         std::fs::write(paths.state_file(), state.to_json().unwrap()).unwrap();
         assert_eq!(installed_build(root.path().to_path_buf()).await, "newbuild");

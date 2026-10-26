@@ -1,5 +1,3 @@
-use crate::host_errors::{Notice, error_reply};
-use crate::lanes::{Lane, cleanup_lane, lane_for, lanes_conflict};
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 use std::{
@@ -9,10 +7,12 @@ use std::{
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use wt_app_core::host_errors::{Notice, error_reply};
+use wt_app_core::lanes::{Lane, cleanup_lane, lane_for, lanes_conflict};
 use wt_runtime::TaskScope;
 use wt_tui::{ActionController, UiReply};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 /// Commands serialize only where their resources conflict and drain on shutdown.
 /// Independent operations retain capacity while lifecycle jobs are running.
@@ -219,7 +219,7 @@ pub fn start(
                         }
                         // Resolve aliases before deciding cancellation ownership as
                         // well as conflicts. Palette title generation is a write.
-                        command.action = crate::host_routing::rename_as_title(command.action);
+                        command.action = wt_app_core::host_routing::rename_as_title(command.action);
                         match lane_for(&command.action) {
                         Ok(lane) if !lane_failed(&lane, &failed_lanes) => {
                             // A newer identical prefetch replaces a queued one.
@@ -692,7 +692,7 @@ pub(crate) fn take_available<T>(
 fn create_retry(
     action: &wt_tui::UiAction,
 ) -> Option<(Option<String>, String, Option<wt_tui::CreatePlacement>)> {
-    let (host, action, _) = crate::host_routing::resolve(action.clone()).ok()?;
+    let (host, action, _) = wt_app_core::host_routing::resolve(action.clone()).ok()?;
     match action {
         wt_tui::UiAction::Create { input, placement } => Some((host, input, placement)),
         _ => None,
@@ -913,7 +913,7 @@ impl RequestReplies {
 }
 
 pub(crate) async fn handoff_prepared(
-    prepared: crate::harness::PreparedSession,
+    prepared: wt_app_core::harness::PreparedSession,
     replies: &RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
@@ -921,10 +921,10 @@ pub(crate) async fn handoff_prepared(
 }
 
 pub(crate) async fn handoff_navigable(
-    mut prepared: crate::harness::PreparedSession,
+    mut prepared: wt_app_core::harness::PreparedSession,
     replies: &RequestReplies,
     shutdown: &CancellationToken,
-    mut navigation: Option<crate::harness::SessionNavigation<'_>>,
+    mut navigation: Option<wt_app_core::harness::SessionNavigation<'_>>,
 ) -> Result<UiReply> {
     let (ready, suspended) = tokio::sync::oneshot::channel();
     let (resume, resumed) = tokio::sync::oneshot::channel();
@@ -1043,7 +1043,7 @@ async fn forward_attach_stderr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_errors::notice;
+    use wt_app_core::host_errors::notice;
 
     #[tokio::test]
     async fn cancelled_preparations_complete_as_no_change_without_failure() {
@@ -1248,7 +1248,7 @@ mod tests {
         let (replies, mut received) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             handoff_prepared(
-                crate::harness::PreparedSession {
+                wt_app_core::harness::PreparedSession {
                     program: "sh".into(),
                     args: vec![
                         "-c".into(),
@@ -1290,7 +1290,7 @@ mod tests {
         let (replies, mut received) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(async move {
             handoff_prepared(
-                crate::harness::PreparedSession {
+                wt_app_core::harness::PreparedSession {
                     program: "sh".into(),
                     args: vec![
                         "-c".into(),
@@ -1323,7 +1323,7 @@ mod tests {
         let worker_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             handoff_prepared(
-                crate::harness::PreparedSession {
+                wt_app_core::harness::PreparedSession {
                     program: "sh".into(),
                     args: vec!["-c".into(), "exit 9".into()],
                     cwd: std::env::temp_dir(),
@@ -1666,7 +1666,7 @@ mod tests {
                     surface: wt_tui::ActionSurface::Row {
                         key: "selected".into(),
                     },
-                    id: crate::action_builtins::RENAME_ID.into(),
+                    id: wt_app_core::action_builtins::RENAME_ID.into(),
                     arg: None,
                 },
             ];

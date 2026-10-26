@@ -5,7 +5,7 @@ use wt_github::{Contributor, CoveredPr, GithubClient, GithubData, GithubOptions,
 use wt_runtime::{Confirmed, Stamp};
 use wt_tui::{Board, ReviewerOption, UiModal, UiReply};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 pub struct GithubPickers {
     client: GithubClient,
@@ -149,19 +149,19 @@ impl GithubPickers {
             // The PR and reviewer list the picker showed are its witness; a
             // mismatch is a stale refusal, so the board refreshes.
             CoveredPr::Absent => {
-                return Err(crate::host_errors::stale(
+                return Err(wt_app_core::host_errors::stale(
                     "PR data is no longer available; reviewer edit aborted",
                 ));
             }
             CoveredPr::Present(pr) => pr,
         };
         if pr.number != pr_number || pr.state != "OPEN" || pr.is_draft {
-            return Err(crate::host_errors::stale(
+            return Err(wt_app_core::host_errors::stale(
                 "PR changed since the reviewer picker opened; reopen the picker",
             ));
         }
         if !same_reviewers(original, &pr.requested_reviewers) {
-            return Err(crate::host_errors::stale(
+            return Err(wt_app_core::host_errors::stale(
                 "the requested reviewer list changed; reopen the picker",
             ));
         }
@@ -423,7 +423,7 @@ mod tests {
 
     #[tokio::test]
     async fn submissions_are_checked_against_confirmed_data_and_report_their_outcome() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let pickers = GithubPickers {
@@ -457,7 +457,7 @@ mod tests {
         let loading = submit(None, 42).await.unwrap();
         assert!(loading.failed && loading.message.contains("still loading"));
         let replaced =
-            crate::host_errors::error_reply(&submit(Some(&confirmed), 41).await.unwrap_err());
+            wt_app_core::host_errors::error_reply(&submit(Some(&confirmed), 41).await.unwrap_err());
         assert!(replaced.stale && replaced.message.contains("PR changed"));
         let reviewers_changed = pickers
             .submit_reviewers(ReviewerSubmission {
@@ -470,7 +470,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(crate::host_errors::error_reply(&reviewers_changed).stale);
+        assert!(wt_app_core::host_errors::error_reply(&reviewers_changed).stale);
         let unchanged = submit(Some(&confirmed), 42).await.unwrap();
         assert!(!unchanged.failed);
         assert_eq!(unchanged.outcome, Some(ReplyOutcome::NoChange));
@@ -481,7 +481,7 @@ mod tests {
     #[tokio::test]
     async fn reviewer_reads_and_writes_require_branch_coverage_before_github_io() {
         use std::{fs, os::unix::fs::PermissionsExt};
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let fake = fixture._root.path().join("reject-gh");
@@ -546,7 +546,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        let submit = crate::host_errors::error_reply(&submit);
+        let submit = wt_app_core::host_errors::error_reply(&submit);
         assert!(submit.stale && submit.message.contains("no longer available"));
         assert!(
             !fake.with_extension("calls").exists(),

@@ -10,7 +10,7 @@ use wt_runtime::{
 use wt_tui::Board;
 use wt_vcs::{FetchOriginOptions, FetchOriginReport};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 pub fn options(ctx: &AppContext) -> FetchOriginOptions {
     FetchOriginOptions {
@@ -172,7 +172,7 @@ fn spawn_overlay(
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         trigger.request(&origin, "startup");
-        let mut failures = crate::feeds::FailureClock::default();
+        let mut failures = wt_app_core::feeds::FailureClock::default();
         loop {
             tokio::select! { biased;
                 _ = cancellation.cancelled() => break,

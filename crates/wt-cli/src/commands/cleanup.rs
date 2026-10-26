@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::Args;
 use wt_lifecycle::RemoveOptions;
 
-use crate::{commands::resolve::run_git, context::AppContext, lifecycle_ops};
+use crate::{commands::resolve::run_git, lifecycle_ops};
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct CleanupArgs {
@@ -76,7 +77,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
             eprintln!("Confirming clean requires a TTY. Pass -y.");
             return Ok(2);
         }
-        if !crate::prompt::confirm(
+        if !wt_app_core::prompt::confirm(
             &format!("Remove {}? [Y/n] ", candidates.len()),
             true,
             &ctx.cancellation,

@@ -17,7 +17,7 @@ use wt_events::GithubSnapshot;
 use wt_github::GithubData;
 use wt_runtime::{SourceHandle, Stamp, TaskScope};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 /// Daemon data older than this is not used; the GitHub leaf reads directly.
 pub(crate) const FRESH: Duration = Duration::from_secs(90);
@@ -79,7 +79,7 @@ async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> 
             snapshot,
             &branches,
             (now_ms(), local_now),
-            crate::build_info::build_id(),
+            wt_app_core::build_info::build_id(),
             &repository,
         ))
     })
@@ -154,8 +154,8 @@ pub(crate) fn watch(
         let notify_hint = file_event.clone();
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
-            let mut watcher =
-                crate::watcher::new(move |event: notify::Result<notify::Event>| match event {
+            let mut watcher = wt_app_core::watcher::new(
+                move |event: notify::Result<notify::Event>| match event {
                     Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
                     Ok(event)
                         if !event.paths.is_empty()
@@ -164,7 +164,8 @@ pub(crate) fn watch(
                         notify_hint.store(true, Ordering::Release);
                         notify.refresh();
                     }
-                })?;
+                },
+            )?;
             watcher.watch(&directory, RecursiveMode::NonRecursive)?;
             Ok::<_, anyhow::Error>(watcher)
         })
@@ -186,7 +187,7 @@ pub(crate) fn watch(
                 }
             }
         }
-        crate::watcher_cleanup::drop_watcher(watcher).await;
+        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
     });
 }
 

@@ -16,7 +16,7 @@ use wt_runtime::{
 };
 use wt_tui::Board;
 
-use crate::{context::AppContext, issue_identity};
+use wt_app_core::{context::AppContext, issue_identity};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -329,7 +329,7 @@ fn compose(
 mod tests {
     #[tokio::test]
     async fn one_unresolvable_id_blanks_only_its_own_status() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let script = fixture.ctx.config.paths.main_clone.join("statuses.sh");

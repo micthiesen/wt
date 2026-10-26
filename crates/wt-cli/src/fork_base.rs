@@ -9,7 +9,8 @@ use anyhow::{Context, Result, bail};
 use wt_platform::lock::FileLock;
 use wt_store::BaseUpdate;
 
-use crate::{commands::resolve::run_git, context::AppContext};
+use crate::commands::resolve::run_git;
+use wt_app_core::context::AppContext;
 
 /// Records `base` (`None` returns to trunk) for the worktree `key`. `seen` is
 /// the recorded base the menu showed, when a menu asked; a mismatch is a stale
@@ -80,7 +81,7 @@ pub async fn set(
     if let Some(seen) = &seen
         && wt_core::recorded_fork_base(seen.as_deref(), &trunk) != recorded
     {
-        return Err(crate::host_errors::stale(format!(
+        return Err(wt_app_core::host_errors::stale(format!(
             "fork base for {slug} changed since the picker was opened"
         )));
     }
@@ -191,8 +192,8 @@ pub async fn set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
     use std::time::Duration;
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn disappearing_parent_is_rechecked_after_its_lock_is_acquired() {
@@ -292,7 +293,7 @@ mod tests {
         let error = set(&fixture.ctx, "one", None, Some(None))
             .await
             .unwrap_err();
-        assert!(crate::host_errors::error_reply(&error).stale);
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
         let state = fixture
             .ctx
             .database
@@ -330,7 +331,7 @@ mod tests {
         let error = set(&fixture.ctx, "one", Some("feature/two".into()), None)
             .await
             .unwrap_err();
-        assert!(!crate::host_errors::error_reply(&error).stale);
+        assert!(!wt_app_core::host_errors::error_reply(&error).stale);
         assert!(
             error
                 .to_string()

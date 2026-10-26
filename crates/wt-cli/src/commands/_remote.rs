@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use wt_config::InstanceRole;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 pub async fn run(context: &AppContext, args: &[String]) -> Result<i32> {
     if args.len() != 1 {

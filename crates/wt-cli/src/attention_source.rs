@@ -17,11 +17,11 @@ use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_c
 use wt_tui::Board;
 
 use crate::{
-    context::AppContext,
     issue_source::StatusBatch,
     local_source::Metadata,
     session_source::{DiscoveredSession, SessionDiscoveries},
 };
+use wt_app_core::context::AppContext;
 
 const MAX_ATTENTION_LINES: usize = 50;
 const MAX_ATTENTION_FEED: usize = 200;
@@ -223,7 +223,7 @@ fn compose(
             .drain(..prepared.attention.len() - MAX_ATTENTION_FEED);
     }
     prepared.attention_seen_ms = seen_ms;
-    crate::feeds::bound_feeds(&mut prepared);
+    wt_app_core::feeds::bound_feeds(&mut prepared);
     board.with_data(Some(Arc::new(prepared)))
 }
 
@@ -280,7 +280,7 @@ fn observe_comments(
 #[derive(Default)]
 struct TransitionTracker {
     /// This process's own section moves, which belong on the activity feed.
-    own_section_writes: crate::context::SectionWrites,
+    own_section_writes: wt_app_core::context::SectionWrites,
     statuses: Option<BTreeMap<String, Option<String>>>,
     sections: Option<BTreeMap<String, Option<String>>>,
     issues: Option<BTreeMap<String, String>>,
@@ -299,7 +299,7 @@ impl TransitionTracker {
     /// right-aligned column and `line` beside it, as TS did.
     fn push_from(&mut self, source: &str, line: String) {
         let text = wt_core::sanitize_terminal_text(&line);
-        let at_ms = crate::feeds::epoch_ms();
+        let at_ms = wt_app_core::feeds::epoch_ms();
         let source = wt_core::sanitize_terminal_text(source);
         tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
         self.events.push_back(wt_tui::AttentionLine {

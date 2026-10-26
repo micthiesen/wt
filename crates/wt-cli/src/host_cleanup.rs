@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use wt_platform::process::CommandSpec;
 use wt_tmux::{TmuxClient, TmuxServer};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RemovalCleanup {
@@ -78,7 +78,7 @@ pub async fn before_remove(
     }
     log_phase(path, "stop-sessions", started);
     let started = Instant::now();
-    match crate::actions::service(context)?
+    match wt_app_core::actions::service(context)?
         .kill(slug, cancellation)
         .await
     {

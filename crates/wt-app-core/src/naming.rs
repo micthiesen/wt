@@ -19,7 +19,7 @@ const CACHE_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 static TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default)]
-pub(crate) struct NamingCache {
+pub struct NamingCache {
     path: PathBuf,
     entries: std::sync::Arc<Mutex<BTreeMap<String, CacheEntry>>>,
 }
@@ -43,14 +43,14 @@ struct CacheFile {
 }
 
 impl NamingCache {
-    pub(crate) fn new(cache_root: &Path) -> Self {
+    pub fn new(cache_root: &Path) -> Self {
         Self {
             path: cache_root.join("naming-v1.json"),
             entries: Default::default(),
         }
     }
 
-    pub(crate) async fn load(&self) {
+    pub async fn load(&self) {
         let bytes = match read_bounded(&self.path).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
@@ -77,7 +77,7 @@ impl NamingCache {
         *self.entries.lock().await = entries;
     }
 
-    pub(crate) async fn get(&self, key: &NamingCacheKey) -> Option<AiSummary> {
+    pub async fn get(&self, key: &NamingCacheKey) -> Option<AiSummary> {
         let cache_key = key.as_str();
         self.entries
             .lock()
@@ -87,7 +87,7 @@ impl NamingCache {
             .map(|entry| entry.summary.clone().into())
     }
 
-    pub(crate) async fn put(
+    pub async fn put(
         &self,
         key: &NamingCacheKey,
         summary: AiSummary,
@@ -125,11 +125,7 @@ impl NamingCache {
         Ok(())
     }
 
-    pub(crate) async fn clear(
-        &self,
-        lock_dir: &Path,
-        cancellation: &CancellationToken,
-    ) -> Result<()> {
+    pub async fn clear(&self, lock_dir: &Path, cancellation: &CancellationToken) -> Result<()> {
         let mut current = self.entries.lock().await;
         let _lock = FileLock::acquire(
             lock_dir,
@@ -250,13 +246,13 @@ fn now_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-pub(crate) fn title_revision(state: &serde_json::Value, slug: &str) -> u64 {
+pub fn title_revision(state: &serde_json::Value, slug: &str) -> u64 {
     state["slugs"][slug]["manualTitleRevision"]
         .as_u64()
         .unwrap_or(0)
 }
 
-pub(crate) fn manual_title(state: &serde_json::Value, slug: &str) -> Option<String> {
+pub fn manual_title(state: &serde_json::Value, slug: &str) -> Option<String> {
     state["slugs"][slug]["manualTitle"]
         .as_str()
         .map(str::trim)

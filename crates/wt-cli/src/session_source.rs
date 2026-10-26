@@ -22,18 +22,12 @@ use wt_runtime::{
 use wt_tmux::{SessionInfo, TmuxClient, TmuxServer};
 use wt_vcs::WorktreeSnapshot;
 
-use crate::{context::AppContext, harness::AppHarness};
+use wt_app_core::{context::AppContext, harness::AppHarness};
 
 const INVENTORY_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_DISCOVERY_WORKERS: usize = 4;
+pub use wt_app_core::session_discovery::{DiscoveredSession, SessionDiscoveries, SessionKey};
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionKey {
-    pub slug: String,
-    pub harness: HarnessId,
-    pub session_id: String,
-}
+const MAX_DISCOVERY_WORKERS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,17 +94,6 @@ impl SessionInventory {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoveredSession {
-    pub key: SessionKey,
-    pub session: HarnessSession,
-}
-
-/// Vector DTO so the stable composite identity is representable in JSON/SSH
-/// protocol messages. Consumers index by `key`, never by a display label.
-pub type SessionDiscoveries = Vec<DiscoveredSession>;
-
 #[derive(Clone)]
 pub struct SessionCommands {
     discover: mpsc::Sender<(String, HarnessId)>,
@@ -170,9 +153,9 @@ pub fn start(
     let (requests, request_rx) = mpsc::channel(32);
     let service = HarnessService::new(
         ClaudePaths::new(&context.home, &context.config.paths.cache_root),
-        crate::harness::codex_paths(&context.home, &context.config.paths.cache_root),
+        wt_app_core::harness::codex_paths(&context.home, &context.config.paths.cache_root),
         OpenCodePaths::new(&context.home, &context.config.paths.cache_root),
-        crate::harness::pi_paths(&context.home, &context.config.paths.cache_root),
+        wt_app_core::harness::pi_paths(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         TmuxClient::new(
             context.processes.clone(),
@@ -652,7 +635,7 @@ type DiscoveryTaskOutput = (String, HarnessId, Result<Vec<HarnessSession>, Strin
 fn spawn_discovery(
     set: &mut tokio::task::JoinSet<DiscoveryTaskOutput>,
     service: HarnessService,
-    target: crate::harness::AgentTarget,
+    target: wt_app_core::harness::AgentTarget,
     harness: HarnessId,
     inventory: SessionInventory,
     names: Vec<String>,
@@ -700,7 +683,7 @@ fn live_discovery_requests(inventory: &SessionInventory) -> BTreeSet<(String, Ha
 
 async fn discover_target(
     service: &HarnessService,
-    target: &crate::harness::AgentTarget,
+    target: &wt_app_core::harness::AgentTarget,
     harness: HarnessId,
     live_session_id: Option<String>,
     live_tmux_names: &[String],
@@ -721,7 +704,7 @@ async fn discover_target(
         .map_err(|error| error.to_string())
 }
 
-fn tmux_name(target: &crate::harness::AgentTarget, harness: HarnessId) -> String {
+fn tmux_name(target: &wt_app_core::harness::AgentTarget, harness: HarnessId) -> String {
     match harness {
         HarnessId::Claude => target.managed_name.as_ref().map_or_else(
             || target.slug.clone(),
@@ -811,7 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_waits_for_identical_live_git_before_confirming_empty_discoveries() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
@@ -873,7 +856,10 @@ mod tests {
         );
         let service = HarnessService::new(
             ClaudePaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
-            crate::harness::codex_paths(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
+            wt_app_core::harness::codex_paths(
+                &fixture.ctx.home,
+                &fixture.ctx.config.paths.cache_root,
+            ),
             OpenCodePaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
             wt_harness::PiPaths::new(&fixture.ctx.home, &fixture.ctx.config.paths.cache_root),
             fixture.ctx.processes.clone(),

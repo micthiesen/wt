@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 unicode-normalization = "0.1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["v5"] }
+wt-app-core = { path = "crates/wt-app-core" }
 wt-cli = { path = "crates/wt-cli" }
 wt-config = { path = "crates/wt-config" }
 wt-core = { path = "crates/wt-core" }

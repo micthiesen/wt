@@ -28,9 +28,9 @@ use wt_runtime::{
 use wt_tui::Board;
 use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
-use crate::{
+use crate::local_source::Metadata;
+use wt_app_core::{
     context::AppContext,
-    local_source::Metadata,
     naming::{NamingCache, manual_title, title_revision},
 };
 
@@ -177,7 +177,7 @@ pub fn start(
                 naming,
                 // The per-user harness selection is persisted separately from
                 // the config fallback and can be changed with CyclePrimary.
-                primary_harness: crate::harness::AppHarness::new(&context).primary(),
+                primary_harness: wt_app_core::harness::AppHarness::new(&context).primary(),
                 main_clone: context.config.paths.main_clone.clone(),
                 trunk_branch: context.config.branch.base.clone(),
                 programs: HarnessPrograms::default(),
@@ -849,7 +849,7 @@ fn title_fallback(
     })
     .unwrap_or_else(|| {
         (
-            wt_core::sanitize_terminal_text(&crate::issue_identity::slug_title(slug)),
+            wt_core::sanitize_terminal_text(&wt_app_core::issue_identity::slug_title(slug)),
             TitleSource::Slug,
         )
     })

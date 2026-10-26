@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use wt_lifecycle::{CreateOptions, LifecycleError};
 use wt_tui::UiReply;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 pub async fn restore(
     ctx: &AppContext,
@@ -72,7 +72,7 @@ fn local_slug(key: &str) -> Result<String> {
 fn restore_refusal(error: LifecycleError) -> anyhow::Error {
     match error {
         LifecycleError::Refused(message) if message == wt_lifecycle::REMOVED_CHANGED => {
-            crate::host_errors::stale(message)
+            wt_app_core::host_errors::stale(message)
         }
         error => error.into(),
     }
@@ -88,14 +88,14 @@ mod tests {
         let stale = restore_refusal(LifecycleError::Refused(
             wt_lifecycle::REMOVED_CHANGED.into(),
         ));
-        assert!(crate::host_errors::error_reply(&stale).stale);
+        assert!(wt_app_core::host_errors::error_reply(&stale).stale);
         let other = restore_refusal(LifecycleError::Refused("branch is checked out".into()));
-        assert!(!crate::host_errors::error_reply(&other).stale);
+        assert!(!wt_app_core::host_errors::error_reply(&other).stale);
     }
 
     #[tokio::test]
     async fn pause_toggle_refreshes_the_removed_record() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let entry = RemovedWorktree {

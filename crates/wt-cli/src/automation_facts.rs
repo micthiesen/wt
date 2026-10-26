@@ -20,20 +20,19 @@ use wt_tui::Board;
 use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
 use crate::{
-    automation_engine::RequirementState,
-    context::AppContext,
     local_source::Metadata,
     session_activity::SessionActivitySnapshot,
     session_source::{SessionDiscoveries, SessionInventory},
 };
+use wt_app_core::{automation_engine::RequirementState, context::AppContext};
 
 #[derive(Clone, Debug, Default)]
 pub struct PreparedAutomationFacts {
     pub rows: Vec<AutomationRow>,
     pub context: AutomationEvalContext,
     pub requirements: BTreeMap<String, RequirementState>,
-    pub quiescence: BTreeMap<String, crate::automation_engine::WorktreeQuiescence>,
-    pub activity: crate::automation_engine::RuntimeActivity,
+    pub quiescence: BTreeMap<String, wt_app_core::automation_engine::WorktreeQuiescence>,
+    pub activity: wt_app_core::automation_engine::RuntimeActivity,
     /// Successful live tips to persist only after a branch-advanced action starts.
     pub initial_branch_tips: BTreeMap<String, String>,
     pub state_ready: bool,
@@ -289,7 +288,7 @@ pub async fn prepare(
             })
         });
         let issue_override = stored["issueId"].as_str();
-        let issue_id = crate::issue_identity::resolve(&slug, issue_override);
+        let issue_id = wt_app_core::issue_identity::resolve(&slug, issue_override);
         let github_issue = stored["githubIssue"].as_u64();
         let lifecycle = input.lifecycle.get(&slug).copied().unwrap_or_default();
         let clean_candidate = lifecycle.clean_candidate;
@@ -338,7 +337,7 @@ pub async fn prepare(
             .max();
         quiescence.insert(
             slug.clone(),
-            crate::automation_engine::WorktreeQuiescence {
+            wt_app_core::automation_engine::WorktreeQuiescence {
                 locked,
                 action_running,
                 session_busy,
@@ -464,7 +463,7 @@ pub async fn prepare(
         context,
         requirements,
         quiescence,
-        activity: crate::automation_engine::RuntimeActivity {
+        activity: wt_app_core::automation_engine::RuntimeActivity {
             headless_running,
             busy_sessions,
         },
@@ -823,7 +822,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_broken_checkout_does_not_suppress_other_merged_automations() {
-        use crate::commands::test_support::CommandFixture;
+        use wt_app_core::test_support::CommandFixture;
         use wt_platform::process::CommandSpec;
         let mut fixture = CommandFixture::new().await.unwrap();
         let rule = AutomationDef {
@@ -991,8 +990,8 @@ mod tests {
     }
 
     /// `one` carries landed work pushed to origin; `two` has no own work.
-    async fn landed_fixture() -> crate::commands::test_support::CommandFixture {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
+    async fn landed_fixture() -> wt_app_core::test_support::CommandFixture {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         std::sync::Arc::make_mut(&mut fixture.ctx.config).automations = vec![AutomationDef {

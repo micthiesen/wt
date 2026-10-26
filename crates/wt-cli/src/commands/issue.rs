@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::Args;
 use wt_platform::process::CommandSpec;
 
-use crate::{commands::resolve::resolve_worktree, context::AppContext};
+use crate::commands::resolve::resolve_worktree;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct IssueArgs {
@@ -242,11 +243,11 @@ pub(crate) fn valid_issue_id(raw: &str) -> bool {
 }
 
 fn issue_id_from_slug(_ctx: &AppContext, slug: &str) -> Option<String> {
-    crate::issue_identity::resolve(slug, None)
+    wt_app_core::issue_identity::resolve(slug, None)
 }
 
 fn resolve_issue_id(slug: &str, stored: Option<&str>) -> Option<String> {
-    crate::issue_identity::resolve(slug, stored)
+    wt_app_core::issue_identity::resolve(slug, stored)
 }
 
 async fn issue_url(ctx: &AppContext, id: &str) -> Option<String> {

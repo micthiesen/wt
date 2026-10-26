@@ -16,8 +16,8 @@ use wt_runtime::Confirmed;
 use wt_tui::{ActionSurface, Board, SessionTarget};
 use wt_vcs::WorktreeRecord;
 
-use crate::context::AppContext;
-use crate::harness::{AgentRoute, AgentTarget, AgentTargetKind, AppHarness, SelectionSource};
+use wt_app_core::context::AppContext;
+use wt_app_core::harness::{AgentRoute, AgentTarget, AgentTargetKind, AppHarness, SelectionSource};
 
 /// Dispatch an automation fire while retaining the durable-write ambiguity
 /// boundary that the interactive palette's `Result<String>` API cannot express.
@@ -26,8 +26,8 @@ pub async fn dispatch_automation(
     fire: &wt_automations::AutomationFire,
     github: Option<&Confirmed<GithubData>>,
     board: Option<&Board>,
-) -> crate::automation_engine::AutomationOutcome {
-    use crate::automation_engine::{AutomationOutcome, DeliverySlot};
+) -> wt_app_core::automation_engine::AutomationOutcome {
+    use wt_app_core::automation_engine::{AutomationOutcome, DeliverySlot};
     let attempt = async {
         let definition = context
             .config
@@ -100,7 +100,7 @@ pub async fn dispatch_automation(
                     .config_selectors
                     .insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
             }
-            match crate::actions::service(context) {
+            match wt_app_core::actions::service(context) {
                 Ok(service) => match service.start(request, &context.cancellation).await {
                     Ok(_) => AutomationOutcome::Delivered {
                         slot: DeliverySlot::Headless,
@@ -222,7 +222,7 @@ pub async fn dispatch_automation(
 }
 
 pub fn definitions(context: &AppContext, surface: &ActionSurface) -> Vec<ActionDef> {
-    crate::action_builtins::definitions(&context.config, surface)
+    wt_app_core::action_builtins::definitions(&context.config, surface)
 }
 
 pub async fn prepare(
@@ -286,7 +286,7 @@ pub async fn prepare(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
     let issue_id =
-        crate::issue_identity::resolve(&slug, issue_override.as_deref()).unwrap_or_default();
+        wt_app_core::issue_identity::resolve(&slug, issue_override.as_deref()).unwrap_or_default();
     let (pr, pr_observation) = match row_snapshot.as_ref().zip(github) {
         None => (None, ActionPrObservation::Unknown),
         Some((snapshot, github)) => match github.covered_pr(&snapshot.target.branch) {
@@ -339,7 +339,7 @@ pub async fn prepare(
     let issue_id = row.issue_id.as_deref().unwrap_or_default().to_owned();
     // A slot whose harness is pinned renders its prompt for that harness.
     let primary = slot
-        .and_then(|slot| crate::harness::pinned_slot_harness(&context.config.harness, slot))
+        .and_then(|slot| wt_app_core::harness::pinned_slot_harness(&context.config.harness, slot))
         .unwrap_or_else(|| AppHarness::new(context).primary());
     Ok(ActionContext {
         action_key,
@@ -381,7 +381,7 @@ pub async fn dispatch(
     let definition = &current_definition;
     let mut action_context = prepare(context, surface, github, board, arg).await?;
     if matches!(surface, ActionSurface::Manager { .. })
-        && crate::action_builtins::is_fleet(&definition.id)
+        && wt_app_core::action_builtins::is_fleet(&definition.id)
     {
         action_context.action_key = "manager".into();
         action_context.slug = "manager".into();
@@ -425,7 +425,7 @@ pub async fn dispatch(
                     .config_selectors
                     .insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
             }
-            let start = crate::actions::service(context)?
+            let start = wt_app_core::actions::service(context)?
                 .start(request, &context.cancellation)
                 .await
                 .context("start tracked action")?;
@@ -441,7 +441,7 @@ pub async fn dispatch(
                 (ActionDestination::Session, _) => (slug, false),
                 (ActionDestination::Manager, _) => (
                     "manager".into(),
-                    !crate::action_builtins::is_fleet(&definition.id)
+                    !wt_app_core::action_builtins::is_fleet(&definition.id)
                         && action_context.slug != "manager",
                 ),
                 (ActionDestination::Slot, ActionSurface::Slot { target }) => {
@@ -574,7 +574,7 @@ async fn delivery_route(
     } else {
         AgentTargetKind::Worktree
     };
-    let choice = crate::harness::select_harness(app.pinned(&slug, kind), primary, live);
+    let choice = wt_app_core::harness::select_harness(app.pinned(&slug, kind), primary, live);
     Ok(AgentRoute {
         target: AgentTarget {
             slug,
@@ -730,7 +730,7 @@ fn resolve_slot(
                 .wt_source
                 .as_ref()
                 .filter(|path| path.is_dir())
-                .context(crate::harness::unavailable_source_message())?;
+                .context(wt_app_core::harness::unavailable_source_message())?;
             ("wt", path.clone())
         }
         SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
@@ -775,14 +775,14 @@ fn today() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use wt_app_core::test_support::CommandFixture;
 
     #[test]
     fn manager_fleet_and_direct_actions_are_explicit() {
-        assert!(crate::action_builtins::is_fleet("manager-digest"));
-        assert!(!crate::action_builtins::is_fleet("manager-ask-row"));
-        assert!(crate::action_builtins::is_direct("manager-compact"));
-        assert!(!crate::action_builtins::is_direct("manager-digest"));
+        assert!(wt_app_core::action_builtins::is_fleet("manager-digest"));
+        assert!(!wt_app_core::action_builtins::is_fleet("manager-ask-row"));
+        assert!(wt_app_core::action_builtins::is_direct("manager-compact"));
+        assert!(!wt_app_core::action_builtins::is_direct("manager-digest"));
     }
 
     #[test]

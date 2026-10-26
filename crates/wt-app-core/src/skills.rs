@@ -239,6 +239,6 @@ pub async fn startup_check(context: &AppContext) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn target_options_for(context: &AppContext) -> wt_skills::TargetOptions {
+pub fn target_options_for(context: &AppContext) -> wt_skills::TargetOptions {
     target_options(context)
 }

@@ -1,0 +1,51 @@
+[package]
+name = "wt-app-core"
+# Fixed: only the shipped binary carries the release version (docs/ci.md).
+version = "0.0.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Test fixtures and a default build identity for other crates' tests.
+testing = []
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+libc.workspace = true
+notify.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+time.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+wt-config.workspace = true
+wt-actions.workspace = true
+wt-automations.workspace = true
+wt-dev.workspace = true
+wt-core.workspace = true
+wt-harness.workspace = true
+wt-naming.workspace = true
+wt-launcher.workspace = true
+wt-platform.workspace = true
+wt-runtime.workspace = true
+wt-store.workspace = true
+wt-skills.workspace = true
+wt-tui.workspace = true
+wt-tmux.workspace = true
+wt-update.workspace = true
+wt-vcs.workspace = true
+
+[dev-dependencies]
+wt-runtime = { workspace = true, features = ["testing"] }
+
+[lints]
+workspace = true

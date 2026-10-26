@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_store::GuideRecord;
 
-use crate::{commands::resolve::resolve_worktree, context::AppContext};
+use crate::commands::resolve::resolve_worktree;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct GuideArgs {
@@ -130,7 +131,7 @@ fn short(sha: Option<&str>) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn guide_records_only_when_enabled_and_reads_back_against_head() {

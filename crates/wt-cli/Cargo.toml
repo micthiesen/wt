@@ -13,6 +13,7 @@ license.workspace = true
 name = "wt"
 
 [dependencies]
+wt-app-core.workspace = true
 futures-util.workspace = true
 anyhow.workspace = true
 clap.workspace = true
@@ -58,6 +59,7 @@ wt-update.workspace = true
 wt-vcs.workspace = true
 
 [dev-dependencies]
+wt-app-core = { workspace = true, features = ["testing"] }
 rusqlite.workspace = true
 wt-runtime = { workspace = true, features = ["testing"] }
 

@@ -53,7 +53,7 @@ pub async fn install_once(
             }
         }) => result.context("release metadata request timed out")??,
     };
-    let target = crate::build_info::target();
+    let target = wt_app_core::build_info::target();
     let version = release.version_id(target)?;
     if let Some(expected) = expected_build_id
         && version.build_id() != expected

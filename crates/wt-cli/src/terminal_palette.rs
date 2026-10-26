@@ -7,7 +7,7 @@ use wt_runtime::{SourceHandle, TaskScope};
 use wt_tmux::{TmuxClient, TmuxServer, write_terminal_palette_config};
 use wt_tui::{Board, UiActions};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 pub async fn run(
     scope: &TaskScope,

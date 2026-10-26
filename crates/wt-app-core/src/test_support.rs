@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use std::{collections::BTreeMap, fs, process::Command, sync::Arc};
 
 use anyhow::{Context, Result};

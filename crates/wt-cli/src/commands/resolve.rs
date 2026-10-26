@@ -8,7 +8,7 @@ use wt_core::{WorktreeLocation, WorktreeTarget};
 use wt_platform::process::{CommandSpec, ProcessOutput};
 use wt_vcs::WorktreeRecord;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 /// List wt-owned worktrees and resolve either the current checkout or an
 /// explicit slug/branch. Exact names win; unique slug prefixes are accepted.

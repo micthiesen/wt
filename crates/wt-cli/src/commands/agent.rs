@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use wt_harness::{ClaudeInjectFailureKind, ClaudeMessageOutcome, HarnessMessageOutcome};
 
-use crate::{
+use wt_app_core::{
     context::AppContext,
     harness::{
         AgentRoute, AgentTargetKind, AppHarness, SelectionSource, unavailable_source_message,
@@ -97,7 +97,7 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
                 .choice
                 .selected
                 .context("harness selection is unavailable")?;
-            let prompt = crate::skills::start_prompt(context, harness).await?;
+            let prompt = wt_app_core::skills::start_prompt(context, harness).await?;
             let mut body = prompt;
             send_route(context, &app, route, &mut body, None, false).await
         }
@@ -254,7 +254,7 @@ async fn read_message(
 #[cfg(unix)]
 async fn read_bounded_stdin(cancel: &tokio_util::sync::CancellationToken) -> Result<Vec<u8>> {
     if std::io::stdin().is_terminal() {
-        return crate::prompt::read_line("Message: ", cancel)
+        return wt_app_core::prompt::read_line("Message: ", cancel)
             .await?
             .map(String::into_bytes)
             .context("message input cancelled");
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn special_session_start_is_not_accepted_as_worktree_start() {
         let route = AgentRoute {
-            target: crate::harness::AgentTarget {
+            target: wt_app_core::harness::AgentTarget {
                 slug: "manager".into(),
                 kind: AgentTargetKind::Special,
                 branch: None,
@@ -588,7 +588,7 @@ mod tests {
                 managed_name: Some("manager".into()),
                 remote: false,
             },
-            choice: crate::harness::HarnessChoice {
+            choice: wt_app_core::harness::HarnessChoice {
                 selected: Some(wt_core::HarnessId::Claude),
                 source: SelectionSource::Primary,
                 live: Some(vec![]),

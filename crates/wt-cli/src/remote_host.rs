@@ -29,7 +29,7 @@ use wt_runtime::{
 };
 use wt_tui::{UiAction, UiReply};
 
-use crate::{
+use wt_app_core::{
     context::AppContext,
     host_protocol::{self as protocol, ClientFrame, HostSnapshot, ServerFrame},
 };
@@ -115,10 +115,9 @@ impl RemoteHost {
             SourceSpec {
                 name: source_name(&endpoint),
                 domain: Domain::Host,
-                persistence: Persistence::Disk(DiskCache::new(&crate::query_cache::remote_store(
-                    &context.config,
-                    &endpoint,
-                ))),
+                persistence: Persistence::Disk(DiskCache::new(
+                    &wt_app_core::query_cache::remote_store(&context.config, &endpoint),
+                )),
                 // Fetches are driven by the worker's stream, not by a timer.
                 policy: RefreshPolicy::default(),
             },
@@ -832,7 +831,7 @@ async fn serve_connection(
                     let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.into(), detail: "request belonged to an earlier connection; no command was sent".into() }));
                 }
                 Some(Request::Command { action, reply, .. }) => {
-                    if crate::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
+                    if wt_app_core::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
                         let _ = reply.send(Err(RemoteHostError::NotStarted { host: host.into(), detail: "action is controller-owned and was not sent".into() }));
                         continue;
                     }
@@ -1060,7 +1059,7 @@ fn belongs_to_connection(request_connection: u64, active_connection: u64) -> boo
 #[cfg(test)]
 mod tests {
     use super::belongs_to_connection;
-    use crate::host_protocol::HostSnapshot;
+    use wt_app_core::host_protocol::HostSnapshot;
     use wt_core::Domain;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, TaskScope, leaf_channel};
 
@@ -1095,11 +1094,11 @@ mod tests {
                 }],
                 ..Default::default()
             }),
-            state: crate::host_protocol::HostState::Ready,
+            state: wt_app_core::host_protocol::HostState::Ready,
             domains,
             layout: std::collections::BTreeMap::from([(
                 "one".to_owned(),
-                crate::host_protocol::RowLayout {
+                wt_app_core::host_protocol::RowLayout {
                     base_branch: Some("main".into()),
                     work: None,
                 },
@@ -1493,7 +1492,7 @@ mod tests {
     #[tokio::test]
     async fn remote_rows_restore_before_connection_and_survive_empty_startup_frames() {
         use super::*;
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let endpoint = RemoteConfig {
@@ -1501,7 +1500,7 @@ mod tests {
             ..Default::default()
         };
         let name = source_name(&endpoint);
-        let store = crate::query_cache::remote_store(&fixture.ctx.config, &endpoint);
+        let store = wt_app_core::query_cache::remote_store(&fixture.ctx.config, &endpoint);
         let spec = || SourceSpec {
             name,
             domain: Domain::Host,
@@ -1608,7 +1607,7 @@ mod tests {
         );
         let snapshot = HostSnapshot {
             board: Some(wt_tui::Board::default()),
-            state: crate::host_protocol::HostState::Failed("GitHub: offline".into()),
+            state: wt_app_core::host_protocol::HostState::Failed("GitHub: offline".into()),
             layout: Default::default(),
             domains: Default::default(),
         };

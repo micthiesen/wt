@@ -12,7 +12,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Command;
 use wt_tui::SessionTarget;
 
-use crate::{commands::agent::send_to, context::AppContext, harness::ui_session};
+use crate::commands::agent::send_to;
+use wt_app_core::{context::AppContext, harness::ui_session};
 
 #[derive(Debug, Clone, Args)]
 pub struct ManagerArgs {

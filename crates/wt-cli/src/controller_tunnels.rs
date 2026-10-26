@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 /// OpenSSH's client StreamLocalBindUnlink setting does not apply to a remote
 /// -R listener. Reclaim an abandoned worker endpoint before asking sshd to bind
@@ -281,7 +281,7 @@ async fn forward(
         }
         if !ready { bail!("SSH forwarding did not pass the controller round-trip probe"); }
         tracing::info!(host = %endpoint.label, "controller service tunnel ready");
-        let home = crate::codex_reauth::controller_home(&context.home);
+        let home = wt_app_core::codex_reauth::controller_home(&context.home);
         // Re-read and send once after provisioning: an account switch may have
         // arrived while that earlier request was in flight.
         let mut synced = None;
@@ -291,7 +291,7 @@ async fn forward(
                 _ = cancel.cancelled() => return Ok(()),
                 status = child.wait() => bail!("controller SSH tunnel ended: {}", status?),
                 _ = tick.tick() => {
-                    let desired = crate::codex_reauth::controller_generation(&home)?;
+                    let desired = wt_app_core::codex_reauth::controller_generation(&home)?;
                     if desired != synced && let Some(generation) = desired {
                         let output = client.run_managed(&["auth-sync".into(), generation.to_string()], Vec::new(), Duration::from_secs(10), cancel).await?;
                         if !output.status.success() { bail!("worker could not persist the pending Codex account switch"); }

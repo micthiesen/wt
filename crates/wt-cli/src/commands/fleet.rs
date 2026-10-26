@@ -13,7 +13,7 @@ use wt_github::{GithubClient, GithubOptions, MergeQueueEntry};
 use wt_harness::ClaudePaths;
 use wt_tmux::{TmuxClient, TmuxServer};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct FleetArgs {
@@ -63,7 +63,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
     let registry_dir = claude_paths.sessions_dir();
     let registry = tokio::task::spawn_blocking(move || read_claude_registry(&registry_dir)).await?;
     let (dev, dev_note) = if ctx.config.dev_server.is_some() {
-        let service = crate::dev::service(ctx);
+        let service = wt_app_core::dev::service(ctx);
         match service {
             Ok(service) => {
                 let inventory = rows

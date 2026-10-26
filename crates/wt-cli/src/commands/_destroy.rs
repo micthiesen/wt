@@ -15,7 +15,8 @@ use wt_lifecycle::{RemovalRevision, RemoveOptions};
 use wt_platform::process::CommandSpec;
 use wt_vcs::WorktreeRecord;
 
-use crate::{commands::resolve::run_git, context::AppContext};
+use crate::commands::resolve::run_git;
+use wt_app_core::context::AppContext;
 
 const VERSION: u64 = 1;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -745,7 +746,7 @@ async fn process_start_identity(pid: u32, runner: &wt_platform::process::Process
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn accepted_failure_is_published_and_a_lost_success_reply_is_reconciled() {

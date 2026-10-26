@@ -131,7 +131,7 @@ fn pins_require_the_same_pr_and_head() {
 
 #[cfg(unix)]
 struct FakeGh {
-    fixture: crate::commands::test_support::CommandFixture,
+    fixture: wt_app_core::test_support::CommandFixture,
     calls: std::path::PathBuf,
     actions: GithubActions,
 }
@@ -140,7 +140,7 @@ struct FakeGh {
 async fn fake_gh() -> FakeGh {
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    let fixture = crate::commands::test_support::CommandFixture::new()
+    let fixture = wt_app_core::test_support::CommandFixture::new()
         .await
         .unwrap();
     let fake = fixture._root.path().join("fake-gh");
@@ -263,7 +263,7 @@ async fn a_pin_mismatch_or_missing_confirmed_data_refuses_the_write() {
     for (action, github) in requests {
         let reply = match fake.actions.execute(action, &board(), github).await {
             Ok(reply) => reply,
-            Err(error) => crate::host_errors::error_reply(&error),
+            Err(error) => wt_app_core::host_errors::error_reply(&error),
         };
         assert!(reply.failed);
         if github.is_some() {
@@ -362,7 +362,7 @@ async fn covered_absence_is_no_pr_but_cannot_match_a_visible_pr_pin() {
         )
         .await
         .unwrap_err();
-    assert!(crate::host_errors::error_reply(&error).stale);
+    assert!(wt_app_core::host_errors::error_reply(&error).stale);
     assert_eq!(error.to_string(), STALE_PIN);
     assert!(!fake.calls.exists());
     fake.fixture.close().await.unwrap();

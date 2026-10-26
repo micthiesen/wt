@@ -10,7 +10,8 @@ use wt_platform::process::{CommandSpec, ProcessRunner};
 use wt_stack::{RestackOptions, RestackOutcome, StackConfig, StackService, StateConfig};
 use wt_store::RepositoryIdentity;
 
-use crate::{context::AppContext, lifecycle_ops};
+use crate::lifecycle_ops;
+use wt_app_core::context::AppContext;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuiltinExecution {

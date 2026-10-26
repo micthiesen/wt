@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::Args;
 use serde::Deserialize;
 
-use crate::{automation_source::queue_report_path, context::AppContext};
+use crate::automation_source::queue_report_path;
+use wt_app_core::context::AppContext;
 
 /// The engine rewrites its report at least this often while it runs.
 const STALE_AFTER_MS: i64 = 3 * 60 * 1000;

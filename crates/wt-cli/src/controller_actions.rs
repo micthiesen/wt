@@ -14,9 +14,9 @@ use wt_tui::{
 
 use crate::{
     commands::{new::NewArgs, resolve::run_git},
-    context::AppContext,
     lifecycle_ops::{self, resolve_key},
 };
+use wt_app_core::context::AppContext;
 
 fn harness_name(harness: wt_core::HarnessId) -> &'static str {
     match harness {
@@ -43,7 +43,7 @@ async fn dismiss_failed_removal(
         !row.is_main
             && (wt_core::worktree_target_key(&row.target) == key || row.target.path == seen.path)
     }) {
-        return Err(crate::host_errors::stale(
+        return Err(wt_app_core::host_errors::stale(
             "the checkout is in Git inventory again; review a retry instead",
         ));
     }
@@ -68,10 +68,10 @@ async fn dismiss_failed_removal(
         wt_store::ClearFailedRemoval::Cleared => {
             Ok(message(format!("Dismissed failed removal of {slug}")))
         }
-        wt_store::ClearFailedRemoval::Changed => Err(crate::host_errors::stale(
+        wt_store::ClearFailedRemoval::Changed => Err(wt_app_core::host_errors::stale(
             "the removal record changed since the dismissal menu was shown",
         )),
-        wt_store::ClearFailedRemoval::CheckoutPresent => Err(crate::host_errors::stale(
+        wt_store::ClearFailedRemoval::CheckoutPresent => Err(wt_app_core::host_errors::stale(
             "the checkout path exists again; review a retry instead",
         )),
     }
@@ -151,7 +151,7 @@ pub async fn execute_with_shutdown(
             bail!("request must run through its host service")
         }
         UiAction::OpenLink { url } => {
-            crate::editor::open_url(ctx, &url).await?;
+            wt_app_core::editor::open_url(ctx, &url).await?;
             Ok(message("Opened link"))
         }
         UiAction::OpenPrLink { url, linear } => {
@@ -160,11 +160,12 @@ pub async fn execute_with_shutdown(
             } else {
                 wt_config::PullRequestTarget::Github
             };
-            crate::editor::open_url(ctx, &wt_github::pull_request_open_url(&url, target)).await?;
+            wt_app_core::editor::open_url(ctx, &wt_github::pull_request_open_url(&url, target))
+                .await?;
             Ok(message("Opened pull request"))
         }
         UiAction::OpenPrDefault { url } => {
-            crate::editor::open_url(
+            wt_app_core::editor::open_url(
                 ctx,
                 &wt_github::pull_request_open_url(&url, ctx.config.github.pr_target),
             )
@@ -173,7 +174,7 @@ pub async fn execute_with_shutdown(
         }
         UiAction::OpenSlotEditor { target } => {
             let path = slot_path(ctx, target)?;
-            crate::editor::open(ctx, &path).await?;
+            wt_app_core::editor::open(ctx, &path).await?;
             Ok(message(format!("Opened {}", path.display())))
         }
         action @ (UiAction::PrepareStopTerminal { .. }
@@ -240,7 +241,7 @@ pub async fn execute_with_shutdown(
                     match outcome {
                         wt_store::SeenToggle::Set(paused) => Ok(paused),
                         wt_store::SeenToggle::Stale { current } => {
-                            Err(crate::host_errors::stale(if current {
+                            Err(wt_app_core::host_errors::stale(if current {
                                 "automations are now paused"
                             } else {
                                 "automations are now running"
@@ -263,7 +264,7 @@ pub async fn execute_with_shutdown(
             Ok(modal(wt_tui::new_worktree_prompt(&initial, placement)))
         }
         UiAction::KillAction { action_key, run_id } => {
-            let killed = crate::actions::service(ctx)?
+            let killed = wt_app_core::actions::service(ctx)?
                 .kill_run(&action_key, &run_id, &ctx.cancellation)
                 .await?;
             Ok(message(if killed {
@@ -305,7 +306,7 @@ pub async fn execute_with_shutdown(
             }))
         }
         UiAction::CyclePrimary => {
-            let app = crate::harness::AppHarness::new(ctx);
+            let app = wt_app_core::harness::AppHarness::new(ctx);
             let config = ctx.config.clone();
             let next = tokio::task::spawn_blocking(move || {
                 let choices: Vec<_> = wt_core::HarnessId::ALL
@@ -319,7 +320,7 @@ pub async fn execute_with_shutdown(
                         .first()
                         .context("all harnesses are hidden in configuration")?,
                 };
-                crate::harness::persist_primary(&config.paths.cache_root, next)?;
+                wt_app_core::harness::persist_primary(&config.paths.cache_root, next)?;
                 Ok::<_, anyhow::Error>(next)
             })
             .await??;
@@ -368,7 +369,7 @@ pub async fn execute_with_shutdown(
         UiAction::CreateResolved { plan } => create_resolved(ctx, plan).await,
         UiAction::OpenEditor { key } => {
             let row = resolve_key(ctx, &key).await?;
-            crate::editor::open(ctx, Path::new(&row.target.path)).await?;
+            wt_app_core::editor::open(ctx, Path::new(&row.target.path)).await?;
             Ok(message(format!("Opened {}", row.target.slug())))
         }
         UiAction::PrepareRemove { key } => {
@@ -442,7 +443,7 @@ pub async fn execute_with_shutdown(
                     || seen.branch != plan.revision.branch
                     || seen.head != plan.revision.head)
             {
-                return Err(crate::host_errors::stale(
+                return Err(wt_app_core::host_errors::stale(
                     "checkout changed since the removal menu was shown",
                 ));
             }
@@ -611,7 +612,7 @@ pub async fn execute_with_shutdown(
                     match store.toggle_archived_seen(&slug, seen, crate::board_layout::ARCHIVED)? {
                         wt_store::SeenToggle::Set(archived) => Ok(archived),
                         wt_store::SeenToggle::Stale { current } => {
-                            Err(crate::host_errors::stale(if current {
+                            Err(wt_app_core::host_errors::stale(if current {
                                 "row is already archived"
                             } else {
                                 "row is no longer archived"
@@ -669,7 +670,7 @@ pub async fn execute_with_shutdown(
             } else {
                 url.to_owned()
             };
-            crate::editor::open_url(ctx, &url).await?;
+            wt_app_core::editor::open_url(ctx, &url).await?;
             Ok(message("Opened URL"))
         }
         UiAction::Session { .. } => unreachable!("session handoff is owned by the controller"),
@@ -799,7 +800,7 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
             .await?;
     }
     if plan.open {
-        crate::editor::open(ctx, Path::new(&target.path)).await?;
+        wt_app_core::editor::open(ctx, Path::new(&target.path)).await?;
     }
     let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
     let state = ctx
@@ -867,7 +868,7 @@ async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Re
     if let Some(path) = &ctx.config.repository_config {
         config_selectors.insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
     }
-    crate::actions::service(ctx)?
+    wt_app_core::actions::service(ctx)?
         .start(
             wt_actions::ActionRequest {
                 action_key: wt_core::worktree_target_key(target),
@@ -935,7 +936,7 @@ async fn set_status(
                     verify_after_merge: work.verify_after_merge.clone(),
                 });
                 if current != *seen {
-                    return Err(crate::host_errors::stale(format!(
+                    return Err(wt_app_core::host_errors::stale(format!(
                         "status is now {}",
                         current.map_or("unset".into(), |claim| claim.state)
                     )));
@@ -1079,7 +1080,7 @@ mod tests {
 
     #[tokio::test]
     async fn human_status_preserves_verification_until_explicitly_cleared() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
@@ -1111,7 +1112,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(crate::host_errors::error_reply(&error).stale);
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
         // Same state, but the owed check changed since: still unseen.
         let error = set_status(
             &fixture.ctx,
@@ -1127,7 +1128,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(crate::host_errors::error_reply(&error).stale);
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
         set_status(
             &fixture.ctx,
             &key,
@@ -1178,7 +1179,7 @@ mod tests {
 
     #[tokio::test]
     async fn board_removal_is_witnessed_and_hazards_return_for_review() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
@@ -1216,14 +1217,14 @@ mod tests {
         let error = execute(&fixture.ctx, remove(None, None), None, None)
             .await
             .unwrap_err();
-        assert!(!crate::host_errors::error_reply(&error).stale);
+        assert!(!wt_app_core::host_errors::error_reply(&error).stale);
         assert!(Path::new(&path).exists());
 
         // The head moved after the board showed the row: the menu reopens.
         let error = execute(&fixture.ctx, remove(None, seen("moved")), None, None)
             .await
             .unwrap_err();
-        assert!(crate::host_errors::error_reply(&error).stale);
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
         assert!(Path::new(&path).exists());
 
         // Uncommitted work appeared after the clean board: nothing is removed,
@@ -1264,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_removal_dismissal_requires_its_witness_and_an_absent_checkout() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let listed = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
@@ -1306,7 +1307,10 @@ mod tests {
         };
         let refused = |action: UiAction| async {
             let error = execute(&fixture.ctx, action, None, None).await.unwrap_err();
-            assert!(crate::host_errors::error_reply(&error).stale, "{error:#}");
+            assert!(
+                wt_app_core::host_errors::error_reply(&error).stale,
+                "{error:#}"
+            );
         };
 
         // Another job than the one the menu showed writes nothing.
@@ -1338,7 +1342,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_picker_rejects_cycles_and_keeps_a_real_merge_base() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let rows = fixture
@@ -1394,7 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn clearing_issue_from_ui_persists_explicit_none_and_stale_keys_refuse_writes() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
@@ -1436,7 +1440,7 @@ mod tests {
 
     #[tokio::test]
     async fn toggles_refuse_a_state_the_user_did_not_see() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let row = crate::commands::resolve::resolve_named_worktree(&fixture.ctx, "one")
@@ -1465,7 +1469,7 @@ mod tests {
         let error = execute(&fixture.ctx, archive(false), None, None)
             .await
             .unwrap_err();
-        assert!(crate::host_errors::error_reply(&error).stale);
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
         assert!(archived(&fixture.ctx).await);
         assert!(
             fixture
@@ -1509,7 +1513,7 @@ mod tests {
             let error = execute(&fixture.ctx, toggle(false), None, None)
                 .await
                 .unwrap_err();
-            assert!(crate::host_errors::error_reply(&error).stale);
+            assert!(wt_app_core::host_errors::error_reply(&error).stale);
             assert!(read(paused(&fixture.ctx).await), "a stale toggle resumed");
             execute(&fixture.ctx, toggle(true), None, None)
                 .await

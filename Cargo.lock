@@ -2922,6 +2922,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "wt-app-core"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "notify",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "wt-actions",
+ "wt-automations",
+ "wt-config",
+ "wt-core",
+ "wt-dev",
+ "wt-harness",
+ "wt-launcher",
+ "wt-naming",
+ "wt-platform",
+ "wt-runtime",
+ "wt-skills",
+ "wt-store",
+ "wt-tmux",
+ "wt-tui",
+ "wt-update",
+ "wt-vcs",
+]
+
+[[package]]
 name = "wt-automations"
 version = "0.0.0"
 dependencies = [
@@ -2966,6 +3004,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "wt-actions",
+ "wt-app-core",
  "wt-automations",
  "wt-config",
  "wt-core",

@@ -22,7 +22,7 @@ use wt_platform::{
     process::{CommandSpec, ProcessRunner},
 };
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(clap::Args, Debug)]
 pub struct ControllerArgs {
@@ -164,10 +164,10 @@ fn configuration_fingerprint(config: &wt_config::Config, build: &str, target: &s
 fn context_fingerprint(context: &AppContext) -> String {
     let base = configuration_fingerprint(
         &context.config,
-        crate::build_info::build_id(),
-        crate::build_info::target(),
+        wt_app_core::build_info::build_id(),
+        wt_app_core::build_info::target(),
     );
-    let home = crate::codex_reauth::controller_home(&context.home);
+    let home = wt_app_core::codex_reauth::controller_home(&context.home);
     format!(
         "{:x}",
         Sha256::digest(format!("{base}\0{}", home.display()).as_bytes())

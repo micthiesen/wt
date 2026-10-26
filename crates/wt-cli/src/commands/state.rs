@@ -8,7 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StateArgs {
@@ -834,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_backups_before_import_prunes_only_imported_rows_and_keeps_unknown_fields() {
-        use crate::commands::test_support::CommandFixture;
+        use wt_app_core::test_support::CommandFixture;
         let fixture = CommandFixture::new().await.unwrap();
         let legacy_dir = fixture._root.path().join("legacy");
         fs::create_dir_all(&legacy_dir).unwrap();

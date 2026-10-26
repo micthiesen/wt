@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 use wt_lifecycle::RemoveOptions;
 
-use crate::{commands::resolve::resolve_named_worktree, context::AppContext, lifecycle_ops};
+use crate::{commands::resolve::resolve_named_worktree, lifecycle_ops};
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RemoveArgs {
@@ -57,7 +58,8 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
             .map(|row| format!("{}  {}", row.target.slug(), row.target.branch))
             .collect::<Vec<_>>();
         let Some(index) =
-            crate::prompt::pick(&choices, "Remove which worktree?", &ctx.cancellation).await?
+            wt_app_core::prompt::pick(&choices, "Remove which worktree?", &ctx.cancellation)
+                .await?
         else {
             return Ok(0);
         };
@@ -85,7 +87,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
         if args.yes {
             destroy_stage = true;
         } else if std::io::stdin().is_terminal() {
-            destroy_stage = crate::prompt::confirm(
+            destroy_stage = wt_app_core::prompt::confirm(
                 &format!(
                     "Stage {} looks deployed. Run `pnpm sst remove`? [Y/n] ",
                     record.target.stage

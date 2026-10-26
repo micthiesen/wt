@@ -9,9 +9,10 @@ use wt_tui::{
     ActionSurface, Board, PickerAction, PickerOption, TextAction, UiAction, UiModal, UiReply,
 };
 
-use crate::{action_dispatch, context::AppContext};
+use crate::action_dispatch;
+use wt_app_core::context::AppContext;
 
-pub const CUSTOM_ID: &str = crate::action_builtins::CUSTOM_ID;
+pub const CUSTOM_ID: &str = wt_app_core::action_builtins::CUSTOM_ID;
 
 pub async fn execute(
     ctx: &AppContext,
@@ -67,7 +68,7 @@ async fn palette(
         None => Some(action_dispatch::prepare(ctx, &surface, github, board, None).await?),
     };
     if let Some(context) = &context
-        && let Some(run) = crate::actions::service(ctx)?
+        && let Some(run) = wt_app_core::actions::service(ctx)?
             .list_runs(usize::MAX)
             .await?
             .into_iter()
@@ -131,7 +132,7 @@ async fn palette(
         let mut pinned = vec![(
             "worktree",
             PickerOption {
-                value: Some(crate::action_builtins::RENAME_ID.into()),
+                value: Some(wt_app_core::action_builtins::RENAME_ID.into()),
                 label: "worktree: Rename worktree with AI".into(),
                 chord: Some('t'),
                 note: None,
@@ -140,14 +141,14 @@ async fn palette(
             },
         )];
         if ctx.config.dev_server.is_some() {
-            let running = crate::dev::service(ctx)?
+            let running = wt_app_core::dev::service(ctx)?
                 .logs(&context.slug, 1, &ctx.cancellation)
                 .await?
                 .is_some();
             pinned.push((
                 "dev server",
                 PickerOption {
-                    value: Some(crate::action_builtins::DEV_LOGS_ID.into()),
+                    value: Some(wt_app_core::action_builtins::DEV_LOGS_ID.into()),
                     label: "dev server: Open dev server logs".into(),
                     chord: Some('l'),
                     note: None,
@@ -201,7 +202,7 @@ async fn palette(
     }
     if matches!(surface, ActionSurface::Slot { .. }) {
         options.push(PickerOption {
-            value: Some(crate::action_builtins::OPEN_EDITOR_ID.into()),
+            value: Some(wt_app_core::action_builtins::OPEN_EDITOR_ID.into()),
             label: "Open in editor".into(),
             chord: Some('z'),
             note: None,
@@ -288,7 +289,7 @@ fn availability(
     row: &wt_actions::ActionRow,
 ) -> Option<String> {
     if matches!(surface, ActionSurface::Manager { key: None })
-        && !crate::action_builtins::is_fleet(&def.id)
+        && !wt_app_core::action_builtins::is_fleet(&def.id)
         && def.id != CUSTOM_ID
     {
         return Some("no row selected".into());
@@ -310,16 +311,18 @@ async fn prepare(
         bail!("{} slot unavailable: {reason}", slot_label(*target));
     }
     if let ActionSurface::Slot { target } = &surface
-        && id == crate::action_builtins::OPEN_EDITOR_ID
+        && id == wt_app_core::action_builtins::OPEN_EDITOR_ID
     {
         let path = crate::controller_actions::slot_path(ctx, *target)?;
-        crate::editor::open(ctx, &path).await?;
+        wt_app_core::editor::open(ctx, &path).await?;
         return Ok(UiReply {
             message: format!("Opened {}", path.display()),
             ..Default::default()
         });
     }
-    if matches!(surface, ActionSurface::Row { .. }) && id == crate::action_builtins::DEV_LOGS_ID {
+    if matches!(surface, ActionSurface::Row { .. })
+        && id == wt_app_core::action_builtins::DEV_LOGS_ID
+    {
         return dev_logs(ctx, surface, board, github).await;
     }
     let def = definition(ctx, &surface, &id)?;
@@ -371,7 +374,7 @@ async fn prepare(
             selected: 0,
         }));
     }
-    if def.kind == ActionKind::Shell || crate::action_builtins::is_direct(&id) {
+    if def.kind == ActionKind::Shell || wt_app_core::action_builtins::is_direct(&id) {
         return run(ctx, surface, id, arg, String::new(), board, github).await;
     }
     Ok(modal(UiModal::Text {
@@ -439,7 +442,7 @@ async fn run(
                     )
                 });
                 if started {
-                    crate::host_errors::stale(format!("{} is already running", def.name))
+                    wt_app_core::host_errors::stale(format!("{} is already running", def.name))
                 } else {
                     error
                 }
@@ -454,14 +457,16 @@ async fn run(
 /// chose from no longer matches the host's state, so the stale reply reopens
 /// it from the current board.
 fn refused(def: &ActionDef, reason: &str) -> anyhow::Error {
-    crate::host_errors::stale(format!("{}: {reason}", def.name))
+    wt_app_core::host_errors::stale(format!("{}: {reason}", def.name))
 }
 
 fn definition(ctx: &AppContext, surface: &ActionSurface, id: &str) -> Result<ActionDef> {
     action_dispatch::definitions(ctx, surface)
         .into_iter()
         .find(|def| def.id == id)
-        .ok_or_else(|| crate::host_errors::stale(format!("action {id:?} is no longer available")))
+        .ok_or_else(|| {
+            wt_app_core::host_errors::stale(format!("action {id:?} is no longer available"))
+        })
 }
 
 fn modal(modal: UiModal) -> UiReply {
@@ -481,10 +486,10 @@ async fn dev_logs(
     github: Option<&Confirmed<GithubData>>,
 ) -> Result<UiReply> {
     let context = action_dispatch::prepare(ctx, &surface, github, board, None).await?;
-    let text = crate::dev::service(ctx)?
+    let text = wt_app_core::dev::service(ctx)?
         .logs(&context.slug, DEV_LOG_LINES, &ctx.cancellation)
         .await?
-        .ok_or_else(|| crate::host_errors::notice("dev server is not running"))?;
+        .ok_or_else(|| wt_app_core::host_errors::notice("dev server is not running"))?;
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let skip = lines.len().saturating_sub(DEV_LOG_LINES as usize);
     Ok(modal(UiModal::Log {
@@ -493,7 +498,7 @@ async fn dev_logs(
         close_key: Some('l'),
         refresh: Some(Box::new(UiAction::PrepareAction {
             surface,
-            id: crate::action_builtins::DEV_LOGS_ID.into(),
+            id: wt_app_core::action_builtins::DEV_LOGS_ID.into(),
             arg: None,
         })),
     }))
@@ -580,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_slot_palette_opens_with_reasons() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         assert!(fixture.ctx.config.paths.wt_source.is_none());
@@ -619,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_visible_pr_is_unknown_until_github_is_confirmed() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let def = ActionDef {
@@ -693,13 +698,13 @@ mod tests {
             "Fix CI and watch until green: GitHub data is not confirmed"
         );
         // The palette the user chose from no longer matches: reopen it.
-        assert!(crate::host_errors::error_reply(&error).stale);
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
         fixture.close().await.unwrap();
     }
 
     #[tokio::test]
     async fn warm_keeps_only_a_picker_and_unavailable_slots_stay_on_the_host() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let manager = warm(

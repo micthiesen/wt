@@ -1,9 +1,10 @@
 use std::time::Duration;
 
-use crate::{commands::resolve::resolve_worktree, context::AppContext, dev};
+use crate::commands::resolve::resolve_worktree;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use serde_json::json;
+use wt_app_core::{context::AppContext, dev};
 use wt_dev::{DevServerStatus, DevStartOptions, DevWorktree, ReadyOutcome, WaitOutcome};
 
 const SLOT_FULL: i32 = 75;

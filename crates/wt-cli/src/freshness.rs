@@ -10,10 +10,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::watcher::{self, WtWatcher};
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde_json::Value;
+use wt_app_core::watcher::{self, WtWatcher};
 use wt_config::Config;
 use wt_core::Domain;
 use wt_runtime::{
@@ -163,7 +163,7 @@ fn start_with_notifications(
                 // watcher created concurrently with shutdown is dropped here
                 // instead of being detached from the source lifetime.
                 if let Ok(Ok(watcher)) = watcher.await {
-                    crate::watcher_cleanup::drop_watcher(watcher).await;
+                    wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
                 }
                 return;
             }
@@ -208,7 +208,7 @@ fn start_with_notifications(
                 let desired = tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
-                        crate::watcher_cleanup::drop_watcher(active).await;
+                        wt_app_core::watcher_cleanup::drop_watcher(active).await;
                         break;
                     }
                     desired = desired_paths(&config, &inputs) => desired,
@@ -232,7 +232,7 @@ fn start_with_notifications(
                                 // Join it and drop the returned watcher before
                                 // this source task exits.
                                 if let Ok((watcher, _, _)) = update.await {
-                                    crate::watcher_cleanup::drop_watcher(watcher).await;
+                                    wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
                                 }
                                 break;
                             }
@@ -241,7 +241,7 @@ fn start_with_notifications(
                         match update {
                             Ok((active, paths, cancelled)) => {
                                 if cancelled {
-                                    crate::watcher_cleanup::drop_watcher(active).await;
+                                    wt_app_core::watcher_cleanup::drop_watcher(active).await;
                                     break;
                                 }
                                 let watch_set_changed = paths != previous_registered;
@@ -344,7 +344,7 @@ fn start_with_notifications(
                 _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
             }
         }
-        crate::watcher_cleanup::drop_watcher(watcher).await;
+        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
     });
     edits
 }
@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     async fn edit_stream_regression(notifications: bool) {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let inventory = fixture
@@ -1354,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn removing_and_deleted_checkouts_leave_the_watch_set_with_bounded_refreshes() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let scope = TaskScope::new();

@@ -20,7 +20,7 @@ use wt_remote::{
     },
 };
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const APPLY_TIMEOUT: Duration = Duration::from_secs(35 * 60);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -40,7 +40,7 @@ impl ManagedStatus {
     pub fn now(report: ManagedReport) -> Self {
         Self {
             report,
-            at_ms: crate::feeds::epoch_ms(),
+            at_ms: wt_app_core::feeds::epoch_ms(),
         }
     }
 }
@@ -176,15 +176,15 @@ async fn prepare(context: &AppContext, remote: &RemoteConfig) -> Result<Prepared
             .contains(&wt_core::HarnessId::Pi)
     {
         match run(context, &main, "pi", &["--version"]).await {
-            Ok(version) if version.trim() == crate::managed_pi::VERSION => {
-                Some(crate::managed_pi::VERSION.to_owned())
+            Ok(version) if version.trim() == wt_app_core::managed_pi::VERSION => {
+                Some(wt_app_core::managed_pi::VERSION.to_owned())
             }
             result => {
                 if result.is_ok() || pi_primary {
                     checks.push(ManagedCheck::new(
                         "pi-controller",
                         if pi_primary { CheckState::Failed } else { CheckState::Warning },
-                        format!("Managed Pi requires @earendil-works/pi-coding-agent@{} on the controller; update its Pi installation before starting managed Pi sessions", crate::managed_pi::VERSION),
+                        format!("Managed Pi requires @earendil-works/pi-coding-agent@{} on the controller; update its Pi installation before starting managed Pi sessions", wt_app_core::managed_pi::VERSION),
                         None,
                     ));
                 }
@@ -361,8 +361,8 @@ async fn prepare(context: &AppContext, remote: &RemoteConfig) -> Result<Prepared
             repo_files,
             codex_config,
             pi_version,
-            codex_auth_generation: crate::codex_reauth::controller_generation(
-                &crate::codex_reauth::controller_home(&context.home),
+            codex_auth_generation: wt_app_core::codex_reauth::controller_generation(
+                &wt_app_core::codex_reauth::controller_home(&context.home),
             )?,
         },
         checks,

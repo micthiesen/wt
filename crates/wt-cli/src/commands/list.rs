@@ -15,10 +15,9 @@ use wt_vcs::WorktreeSnapshot;
 
 use crate::{
     commands::{diagnostics::OperationLock, issue::repo_web_url, resolve::run_git},
-    context::AppContext,
-    issue_identity,
     worktree_facts::{PushFacts, push_facts},
 };
+use wt_app_core::{context::AppContext, issue_identity};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct ListArgs {
@@ -92,7 +91,7 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
                 // run_worker validates its role/protocol and fails closed when
                 // it is missing; listing must never install or rewrite a host.
                 let client = wt_remote::RemoteClient::new(ctx.processes.clone(), remote.clone())
-                    .with_expected_build_id(crate::build_info::build_id().into());
+                    .with_expected_build_id(wt_app_core::build_info::build_id().into());
                 let output = client
                     .run_worker(&["ls".into(), "--json".into()], &ctx.cancellation)
                     .await?;
@@ -271,7 +270,7 @@ async fn collect_dev_status(
     if rows.is_empty() || ctx.config.dev_server.is_none() {
         return Ok(BTreeMap::new());
     }
-    let service = crate::dev::service(ctx).context("build dev-server status service")?;
+    let service = wt_app_core::dev::service(ctx).context("build dev-server status service")?;
     let worktrees = rows
         .iter()
         .map(|row| DevWorktree::from(&row.worktree))

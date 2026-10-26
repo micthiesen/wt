@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
-use crate::{context::AppContext, events};
+use crate::events;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args)]
 pub struct EventsArgs {

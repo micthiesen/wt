@@ -26,7 +26,8 @@ use wt_runtime::{
 use wt_tui::{Board, GitPresentation, LandingKind};
 use wt_vcs::WorktreeSnapshot;
 
-use crate::{context::AppContext, local_source::Metadata};
+use crate::local_source::Metadata;
+use wt_app_core::context::AppContext;
 
 const MAX_CONCURRENT_ROWS: usize = 4;
 const GIT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1747,7 +1748,7 @@ mod tests {
 
     #[tokio::test]
     async fn row_signature_changes_for_index_ref_and_rebase_state() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let rows = fixture
@@ -1775,7 +1776,7 @@ mod tests {
 
     #[tokio::test]
     async fn reprobe_retains_display_facts_and_original_stamp_until_replacement() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let rows = fixture
@@ -1896,7 +1897,7 @@ mod tests {
     /// base. That transient HEAD must not paint the row landed.
     #[tokio::test]
     async fn a_stopped_rebase_does_not_read_as_landed() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let git = |dir: &Path, args: &[&str]| {
@@ -1966,7 +1967,7 @@ mod tests {
     /// all, settles instead of failing every probe and retrying forever.
     #[tokio::test]
     async fn an_origin_only_or_missing_base_does_not_retry_forever() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let git = |dir: &Path, args: &[&str]| {
@@ -2040,7 +2041,7 @@ mod tests {
 
     #[tokio::test]
     async fn enrichment_reads_diff_activity_base_counts_and_conflicts() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let git = |dir: &Path, args: &[&str]| {
@@ -2184,7 +2185,7 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_line_counting_stops_at_the_row_byte_budget() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let rows = fixture

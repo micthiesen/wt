@@ -20,7 +20,8 @@ use wt_runtime::{
 };
 use wt_vcs::WorktreeSnapshot;
 
-use crate::{context::AppContext, github_events_source::DaemonRead};
+use crate::github_events_source::DaemonRead;
+use wt_app_core::context::AppContext;
 
 /// Network reads of GitHub, measured from the prior read's start.
 const GITHUB_MINIMUM: Duration = Duration::from_secs(10);
@@ -554,7 +555,7 @@ mod tests {
     /// guessed (empty or restored) branch set.
     #[tokio::test]
     async fn github_fetch_skips_while_git_inventory_is_unconfirmed() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let scope = TaskScope::new();

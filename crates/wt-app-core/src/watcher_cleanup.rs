@@ -1,7 +1,7 @@
 //! Native watcher destruction can join OS threads. Keep that work off Tokio's
 //! executor, but await it so a source is not drained before its watcher is.
 
-pub(crate) async fn drop_watcher<T: Send + 'static>(watcher: T) {
+pub async fn drop_watcher<T: Send + 'static>(watcher: T) {
     tokio::task::spawn_blocking(move || drop(watcher))
         .await
         .expect("native watcher cleanup panicked");

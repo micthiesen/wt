@@ -30,7 +30,7 @@ fn ensure_picker_target(target: SessionTarget) -> Result<()> {
 }
 
 /// Session harnesses the picker and board offer, in `HarnessId::ALL` order.
-pub(crate) fn visible_harnesses(config: &wt_config::Config) -> Vec<HarnessId> {
+pub fn visible_harnesses(config: &wt_config::Config) -> Vec<HarnessId> {
     HarnessId::ALL
         .into_iter()
         .filter(|harness| !config.harness.hidden.contains(harness))
@@ -53,7 +53,7 @@ async fn picker_agent(
 }
 
 /// The slug whose history a picker discovery refreshes.
-pub(crate) async fn picker_slug(
+pub async fn picker_slug(
     context: &AppContext,
     key: Option<&str>,
     target: SessionTarget,
@@ -63,11 +63,11 @@ pub(crate) async fn picker_slug(
 
 /// Cached history nominates conversations; live tmux identity is checked again
 /// when a selection is attached. No transcript discovery runs on this path.
-pub(crate) async fn cached_session_options(
+pub async fn cached_session_options(
     context: &AppContext,
     key: Option<String>,
     target: SessionTarget,
-    discoveries: &[crate::session_source::DiscoveredSession],
+    discoveries: &[crate::session_discovery::DiscoveredSession],
 ) -> Result<(String, Vec<SessionMenuEntry>)> {
     let agent = picker_agent(context, key.as_deref(), target).await?;
     let app = AppHarness::new(context);
@@ -86,12 +86,12 @@ pub(crate) async fn cached_session_options(
 /// Prepared picker entries for one target, from the discovery snapshot and one
 /// tmux inventory. The board and the host's cached path both build from here,
 /// so a row means the same thing wherever it is shown.
-pub(crate) fn picker_entries(
+pub fn picker_entries(
     visible: &[HarnessId],
     agent: &AgentTarget,
     key: Option<String>,
     target: SessionTarget,
-    discoveries: &[crate::session_source::DiscoveredSession],
+    discoveries: &[crate::session_discovery::DiscoveredSession],
     live: &[wt_tmux::SessionInfo],
 ) -> Vec<SessionMenuEntry> {
     let mut options = Vec::new();
@@ -821,9 +821,7 @@ mod tests {
     async fn session_identity_and_routes_do_not_scan_git_status() {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let root = fixture._root.path();
         let monitor = root.join("status-monitor");
         let calls = root.join("status-monitor.calls");
@@ -888,9 +886,7 @@ mod tests {
 
     #[tokio::test]
     async fn moved_live_slot_refuses_with_a_stale_reply() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let app = AppHarness::new(&fixture.ctx);
         let agent = resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
             .await
@@ -927,9 +923,7 @@ mod tests {
 
     #[tokio::test]
     async fn new_session_beside_an_unseen_live_slot_is_stale() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         std::sync::Arc::make_mut(&mut fixture.ctx.config)
             .tmux
             .socket = format!(
@@ -982,9 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_picker_opens_with_unreadable_history_database() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         std::sync::Arc::make_mut(&mut fixture.ctx.config)
             .tmux
             .socket = format!(
@@ -1029,14 +1021,12 @@ mod tests {
 
     #[tokio::test]
     async fn cached_picker_keeps_live_slots_and_does_not_trust_old_conversation_identity() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let agent = resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
             .await
             .unwrap();
-        let history = vec![crate::session_source::DiscoveredSession {
-            key: crate::session_source::SessionKey {
+        let history = vec![crate::session_discovery::DiscoveredSession {
+            key: crate::session_discovery::SessionKey {
                 slug: "one".into(),
                 harness: HarnessId::Opencode,
                 session_id: "old".into(),

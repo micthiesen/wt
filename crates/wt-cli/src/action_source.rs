@@ -21,7 +21,8 @@ use wt_runtime::{
 };
 use wt_tui::{Board, LogView};
 
-use crate::{context::AppContext, issue_source::StatusBatch};
+use crate::issue_source::StatusBatch;
+use wt_app_core::context::AppContext;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ActionHistory {
@@ -102,7 +103,7 @@ pub fn overlay(
     board: SourceHandle<Board>,
     targets: RefreshTargets,
 ) -> SourceHandle<Board> {
-    let service = crate::actions::service(context).map_err(|error| error.to_string());
+    let service = wt_app_core::actions::service(context).map_err(|error| error.to_string());
     let run_service = service.clone();
     let reconciled = Arc::new(AtomicBool::new(false));
     let run_reconciled = reconciled.clone();
@@ -180,8 +181,8 @@ fn watch(
         let log_callback = logs.clone();
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
-            let mut watcher =
-                crate::watcher::new(move |event: notify::Result<notify::Event>| match event {
+            let mut watcher = wt_app_core::watcher::new(
+                move |event: notify::Result<notify::Event>| match event {
                     Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
                         for path in event.paths {
                             match path.file_name().and_then(|name| name.to_str()) {
@@ -201,7 +202,8 @@ fn watch(
                         log_callback.refresh();
                     }
                     _ => {}
-                })?;
+                },
+            )?;
             watcher.watch(&directory, RecursiveMode::Recursive)?;
             Ok::<_, anyhow::Error>(watcher)
         })
@@ -229,7 +231,7 @@ fn watch(
                 }
             }
         }
-        crate::watcher_cleanup::drop_watcher(watcher).await;
+        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
     });
 }
 
@@ -387,7 +389,7 @@ fn project(
         let mut statuses = targets.issues.subscribe();
         boards.mark_changed(); updates.mark_changed(); log_updates.mark_changed(); statuses.mark_changed();
         let mut tracker = Tracker::new(epoch_ms());
-        let mut failures = crate::feeds::FailureClock::default();
+        let mut failures = wt_app_core::feeds::FailureClock::default();
         let mut last_runs = None;
         let mut last_error = None;
         // The tracker's read model can lag the action's write past the read
@@ -727,7 +729,7 @@ fn compose(
     runs: SourceSnapshot<ActionHistory>,
     logs: SourceSnapshot<ActionLogs>,
     tracker: &Tracker,
-    failures: &mut crate::feeds::FailureClock,
+    failures: &mut wt_app_core::feeds::FailureClock,
 ) -> SourceSnapshot<Board> {
     let Some(data) = board.data() else {
         // This compose reports nothing, so every tracked failure has cleared.
@@ -842,7 +844,7 @@ fn compose(
         }
     }
     data.attention.extend(tracker.attention.iter().cloned());
-    crate::feeds::bound_feeds(&mut data);
+    wt_app_core::feeds::bound_feeds(&mut data);
     data.pending_views.extend(tracker.pending.views());
     board
         .with_data(Some(Arc::new(data)))
@@ -1013,7 +1015,7 @@ mod tests {
             SourceSnapshot::default(),
             SourceSnapshot::default(),
             &tracker,
-            &mut crate::feeds::FailureClock::default(),
+            &mut wt_app_core::feeds::FailureClock::default(),
         );
         let data = output.data().unwrap();
         assert_eq!(data.rows[0].issue_status.as_deref(), Some("Review"));

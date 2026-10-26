@@ -25,7 +25,7 @@ pub fn board(
             .map(str::trim)
             .filter(|title| !title.is_empty());
         let title = manual.map_or_else(
-            || crate::issue_identity::slug_title(target.slug()),
+            || wt_app_core::issue_identity::slug_title(target.slug()),
             str::to_owned,
         );
         let mut details = Vec::new();
@@ -178,7 +178,7 @@ fn apply_removals(rows: &mut Vec<BoardRow>, state: &Value) {
             rows.push(BoardRow {
                 key: key.clone(),
                 slug: clean_text(key),
-                title: clean_text(&crate::issue_identity::slug_title(key)),
+                title: clean_text(&wt_app_core::issue_identity::slug_title(key)),
                 path: clean_text(path),
                 branch: clean_text(branch),
                 archived: true,
@@ -250,7 +250,7 @@ fn clean_text(text: &str) -> String {
 }
 
 fn issue_id(stored: &serde_json::Value, slug: &str) -> Option<String> {
-    crate::issue_identity::resolve(slug, stored.as_str())
+    wt_app_core::issue_identity::resolve(slug, stored.as_str())
 }
 
 #[cfg(test)]

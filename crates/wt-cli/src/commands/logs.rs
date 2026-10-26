@@ -1,4 +1,3 @@
-use crate::context::AppContext;
 use anyhow::{Context, Result};
 use clap::Args;
 use regex::Regex;
@@ -7,6 +6,7 @@ use std::{
     process::Stdio,
     time::SystemTime,
 };
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct LogsArgs {
@@ -134,7 +134,7 @@ pub(crate) async fn latest(context: &AppContext, slug: Option<&str>) -> Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn retained_logs_resolve_exact_slugs_without_a_live_worktree() {

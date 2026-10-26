@@ -1,10 +1,6 @@
 //! SSH invokes this host-local service, never a second implementation of the
 //! TUI's features. A disconnected reader closes admission, not accepted work.
-use crate::{
-    context::AppContext,
-    host_protocol::{self as protocol, ClientFrame, HostSnapshot, ServerFrame},
-    host_service::HostService,
-};
+use crate::host_service::HostService;
 use anyhow::{Context, Result, bail};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -13,6 +9,10 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio_util::sync::CancellationToken;
+use wt_app_core::{
+    context::AppContext,
+    host_protocol::{self as protocol, ClientFrame, HostSnapshot, ServerFrame},
+};
 use wt_runtime::TaskScope;
 use wt_tui::{UiAction, UiReply};
 
@@ -50,7 +50,7 @@ where
     output
         .write_all(&protocol::encode(&ServerFrame::Hello {
             protocol: protocol::HOST_PROTOCOL,
-            build: crate::build_info::build_id().into(),
+            build: wt_app_core::build_info::build_id().into(),
         })?)
         .await?;
     let scope = TaskScope::new();
@@ -111,7 +111,7 @@ where
         }
     });
     let mut work = tokio::task::JoinSet::new();
-    let mut queued = VecDeque::<(crate::lanes::Lane, (u64, UiAction))>::new();
+    let mut queued = VecDeque::<(wt_app_core::lanes::Lane, (u64, UiAction))>::new();
     let mut busy = BTreeSet::new();
     let mut running = BTreeMap::new();
     let mut last_id = 0;
@@ -160,7 +160,7 @@ where
                         outcome = host.execute(action) => outcome,
                     }
                 } else { host.execute_with_shutdown(action, Some(&shutdown_wait)).await };
-                outcome.unwrap_or_else(|error| crate::host_errors::error_reply(&error))
+                outcome.unwrap_or_else(|error| wt_app_core::host_errors::error_reply(&error))
             });
             running.insert(task.id(), (id, lane, cancellation));
         }
@@ -184,7 +184,7 @@ where
                             result = Err(anyhow::anyhow!("host command worker failed: {error}"));
                             let mut retained = VecDeque::new();
                             while let Some((other, (queued_id, action))) = queued.pop_front() {
-                                if crate::lanes::lanes_conflict(&lane, &other) {
+                                if wt_app_core::lanes::lanes_conflict(&lane, &other) {
                                     send_reply(&replies, &disconnected, queued_id, UiReply::failure("Conflicting worker failed; queued command was not started")).await;
                                 } else { retained.push_back((other, (queued_id, action))); }
                             }
@@ -222,14 +222,14 @@ where
                         }
                     },
                     ClientFrame::Command { id, action } => {
-                        let action = crate::host_routing::rename_as_title(action);
+                        let action = wt_app_core::host_routing::rename_as_title(action);
                         if id <= last_id { result = Err(anyhow::anyhow!("host command IDs must increase; replay is refused")); closed = true; continue; }
                         last_id = id;
-                        let lane = if crate::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
+                        let lane = if wt_app_core::host_routing::controller_owned(&action) || matches!(action, UiAction::OnHost { .. }) {
                             Err(anyhow::anyhow!("controller-owned action cannot run on the worker"))
                         } else if queued.len() >= 32 {
                             Err(anyhow::anyhow!("worker command queue is full; command was not started"))
-                        } else { crate::lanes::lane_for(&action) };
+                        } else { wt_app_core::lanes::lane_for(&action) };
                         match lane {
                             Ok(lane) => queued.push_back((lane, (id, action))),
                             Err(error) => { send_reply(&replies, &disconnected, id, UiReply::failure(format!("{error:#}"))).await; },
@@ -282,7 +282,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn worker_stream_uses_the_same_title_handler_and_publishes_the_result() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let context = fixture.ctx.clone();
@@ -405,7 +405,7 @@ mod tests {
     /// the cleanup's own checkout must wait for it.
     #[tokio::test]
     async fn held_cleanup_does_not_delay_work_on_other_checkouts() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let root = fixture._root.path().to_owned();
@@ -597,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn accepted_command_finishes_after_controller_disconnects() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let context = fixture.ctx.clone();

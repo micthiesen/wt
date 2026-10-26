@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use tokio_util::sync::CancellationToken;
 
-use crate::{codex_reauth, context::AppContext};
+use wt_app_core::{codex_reauth, context::AppContext};
 
 #[derive(Debug, Clone, Args)]
 pub struct AuthArgs {

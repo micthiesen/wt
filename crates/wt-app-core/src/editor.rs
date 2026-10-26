@@ -81,7 +81,7 @@ fn command(template: Option<&str>, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use crate::test_support::CommandFixture;
 
     #[test]
     fn remote_paths_cannot_change_uri_authority_query_or_fragment() {

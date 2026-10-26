@@ -3,8 +3,8 @@ use clap::{Args, Subcommand};
 use serde_json::json;
 use wt_harness::ClaudeSelftestOutcome;
 
-use crate::{
-    commands::agent::send_to,
+use crate::commands::agent::send_to;
+use wt_app_core::{
     context::AppContext,
     harness::{AgentRoute, AppHarness, SelectionSource, unavailable_source_message},
 };

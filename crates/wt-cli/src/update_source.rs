@@ -11,7 +11,7 @@ use wt_runtime::{
 use wt_tui::Board;
 use wt_update::{ReleaseSource, StateStore};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const FIRST_CHECK: Duration = Duration::from_secs(60);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -121,8 +121,12 @@ async fn check() -> anyhow::Result<UpdateNotice> {
     let release = ReleaseSource::new(crate::updates::repository(&options)?)?
         .latest(state.channel)
         .await?;
-    let latest = release.version_id(crate::build_info::target())?;
-    Ok(notice(&latest, &current, crate::build_info::build_id()))
+    let latest = release.version_id(wt_app_core::build_info::target())?;
+    Ok(notice(
+        &latest,
+        &current,
+        wt_app_core::build_info::build_id(),
+    ))
 }
 
 /// The running build may be older than the installed one: an update already

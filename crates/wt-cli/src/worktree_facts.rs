@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use crate::{commands::resolve::run_git, context::AppContext};
+use crate::commands::resolve::run_git;
+use wt_app_core::context::AppContext;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PushFacts {

@@ -7,7 +7,7 @@ use wt_stack::{
 };
 use wt_store::RepositoryIdentity;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RestackArgs {
@@ -173,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_checkout_has_no_current_branch() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let mut context = fixture.ctx.clone();

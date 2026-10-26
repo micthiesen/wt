@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Args;
 use wt_dev::DevWorktree;
 
-use crate::{context::AppContext, dev};
+use wt_app_core::{context::AppContext, dev};
 
 #[derive(Debug, Clone, Args)]
 pub struct DevGiveupArgs {

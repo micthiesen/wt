@@ -16,14 +16,16 @@ use wt_runtime::{Confirmed, LeafHandle, SourceHandle, SourceState, TaskScope, de
 use wt_tui::Board;
 
 use crate::{
-    automation_engine::{
-        AutomationEngine, AutomationOutcome, AutomationPassInput, ClaimedFire, QueuedFire,
-    },
     automation_facts::{self, AutomationInputs, PreparedAutomationFacts},
-    context::AppContext,
     local_source::Metadata,
     session_activity::SessionActivitySnapshot,
     session_source::{SessionDiscoveries, SessionInventory},
+};
+use wt_app_core::{
+    automation_engine::{
+        AutomationEngine, AutomationOutcome, AutomationPassInput, ClaimedFire, QueuedFire,
+    },
+    context::AppContext,
 };
 
 /// Facts that drive fires are read through the leaves' `confirmed()` views:
@@ -120,7 +122,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     let task = scope.spawn(async move {
         let ledger = AutomationLedger::new(context.config.paths.cache_root.join("automations.json"));
         let mut engine = AutomationEngine::new(ledger, token.clone());
-        let delivered = match crate::actions::service(&context) {
+        let delivered = match wt_app_core::actions::service(&context) {
             Ok(service) => match service.list_runs(500).await {
                 Ok(runs) => runs.into_iter().flat_map(|run| run.meta.auto_fire_keys).collect::<BTreeSet<_>>(),
                 Err(error) => { tracing::warn!(%error, "cannot inspect prior action runs during automation startup"); BTreeSet::new() }
@@ -447,7 +449,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
 fn failed_dispatch(error: &tokio::task::JoinError) -> AutomationOutcome {
     AutomationOutcome::Ambiguous {
         reason: format!("dispatch task failed: {error}"),
-        slot: crate::automation_engine::DeliverySlot::None,
+        slot: wt_app_core::automation_engine::DeliverySlot::None,
     }
 }
 
@@ -499,7 +501,7 @@ async fn dispatch_claim(
                 tracing::info!(rule = %fire.rule.id, %message, "automation completed");
                 (
                     AutomationOutcome::Delivered {
-                        slot: crate::automation_engine::DeliverySlot::None,
+                        slot: wt_app_core::automation_engine::DeliverySlot::None,
                     },
                     None,
                 )
@@ -508,7 +510,7 @@ async fn dispatch_claim(
                 tracing::warn!(rule = %fire.rule.id, %message, "automation failed");
                 (
                     AutomationOutcome::Delivered {
-                        slot: crate::automation_engine::DeliverySlot::None,
+                        slot: wt_app_core::automation_engine::DeliverySlot::None,
                     },
                     Some(format!("{}: {message}", fire.rule.id)),
                 )
@@ -539,7 +541,7 @@ fn overlay(
     let mut updates = input.subscribe();
     scope.spawn(async move {
         updates.mark_changed();
-        let mut failures = crate::feeds::FailureClock::default();
+        let mut failures = wt_app_core::feeds::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -857,8 +859,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_cancels_busy_evidence_without_cancelling_accepted_commands() {
-        use crate::commands::test_support::CommandFixture;
         use std::os::unix::fs::PermissionsExt;
+        use wt_app_core::test_support::CommandFixture;
         use wt_core::Domain;
         use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, Stamp, leaf_channel};
 

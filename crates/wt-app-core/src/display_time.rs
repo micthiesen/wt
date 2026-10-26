@@ -125,7 +125,7 @@ fn local_time_labels(_timestamps: Vec<u64>) -> BTreeMap<u64, String> {
 /// use this only on a background/source task; libc timezone lookup is not an
 /// input- or render-thread operation.
 #[cfg(unix)]
-pub(crate) fn local_time_components(timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
+pub fn local_time_components(timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
     let seconds = i64::try_from(timestamp_ms / 1_000).ok()?;
     #[cfg(target_pointer_width = "64")]
     let seconds: libc::time_t = seconds;
@@ -150,7 +150,7 @@ pub(crate) fn local_time_components(timestamp_ms: u64) -> Option<(i32, u8, u8, u
 }
 
 #[cfg(not(unix))]
-pub(crate) fn local_time_components(_timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
+pub fn local_time_components(_timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
     None
 }
 

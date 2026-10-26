@@ -1,8 +1,9 @@
 //! Controller routing and device-local effects. Host-owned operations use the
 //! same HostService whether called directly or carried over SSH.
-use crate::{context::AppContext, remote_board::Fleet};
+use crate::remote_board::Fleet;
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
+use wt_app_core::context::AppContext;
 use wt_tui::{SessionTarget, UiAction, UiReply};
 
 pub async fn execute(
@@ -12,7 +13,7 @@ pub async fn execute(
     replies: &crate::controller::RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
-    let command = crate::host_routing::rename_as_title(command);
+    let command = wt_app_core::host_routing::rename_as_title(command);
     let selected_context = context.for_action(&command)?;
     let context = &selected_context;
     // Cleanup is a fleet-wide confirmation: prepare the candidate set from
@@ -30,7 +31,7 @@ pub async fn execute(
             _ => {}
         }
     }
-    let (host, action, _) = crate::host_routing::resolve(command)?;
+    let (host, action, _) = wt_app_core::host_routing::resolve(command)?;
     if let UiAction::SetPerf {
         active,
         continuous,
@@ -112,7 +113,8 @@ pub async fn execute(
         if sent.failed {
             return Ok(sent);
         }
-        let prepared = crate::harness::ui_session(context, None, SessionTarget::WtSource).await?;
+        let prepared =
+            wt_app_core::harness::ui_session(context, None, SessionTarget::WtSource).await?;
         return crate::controller::handoff_prepared(prepared, replies, shutdown).await;
     }
     let remote = host
@@ -178,8 +180,8 @@ pub async fn execute(
         && crate::managed::required_provider(&action, context.config.harness.primary)
             == Some(wt_remote::managed::SignIn::Codex)
     {
-        let desired = crate::codex_reauth::controller_generation(
-            &crate::codex_reauth::controller_home(&context.home),
+        let desired = wt_app_core::codex_reauth::controller_generation(
+            &wt_app_core::codex_reauth::controller_home(&context.home),
         )?;
         let observed = remote
             .managed
@@ -224,12 +226,12 @@ pub async fn execute(
         let navigation_key = selection.key.clone();
         let navigation_target = selection.target;
         let prepared = match remote {
-            None => crate::harness::prepare_session(context, &selection).await?,
+            None => wt_app_core::harness::prepare_session(context, &selection).await?,
             Some(remote) => {
                 let client = remote.session_client().await?;
                 let prepared =
                     client.interactive_selected_session(&serde_json::to_string(&selection)?);
-                crate::harness::PreparedSession {
+                wt_app_core::harness::PreparedSession {
                     program: prepared.program,
                     args: prepared.args,
                     cwd: context.config.paths.main_clone.clone(),
@@ -238,7 +240,7 @@ pub async fn execute(
         };
         let navigation = if remote.is_none() {
             Some(
-                crate::harness::SessionNavigation::new(
+                wt_app_core::harness::SessionNavigation::new(
                     context,
                     navigation_key,
                     navigation_target,
@@ -256,10 +258,10 @@ pub async fn execute(
         let navigation_target = SessionTarget::Harness;
         let prepared = match (remote, harness) {
             (None, wt_core::HarnessId::Claude) => {
-                crate::harness::prepare_session(context, &new_claude_selection(key)).await?
+                wt_app_core::harness::prepare_session(context, &new_claude_selection(key)).await?
             }
             (None, harness) => {
-                crate::harness::ui_session_with_harness(
+                wt_app_core::harness::ui_session_with_harness(
                     context,
                     Some(key),
                     SessionTarget::Harness,
@@ -276,7 +278,7 @@ pub async fn execute(
                 } else {
                     client.interactive_session(&key, "harness", Some(harness.as_str()))
                 };
-                crate::harness::PreparedSession {
+                wt_app_core::harness::PreparedSession {
                     program: prepared.program,
                     args: prepared.args,
                     cwd: context.config.paths.main_clone.clone(),
@@ -285,7 +287,7 @@ pub async fn execute(
         };
         let navigation = if remote.is_none() {
             Some(
-                crate::harness::SessionNavigation::new(
+                wt_app_core::harness::SessionNavigation::new(
                     context,
                     navigation_key,
                     navigation_target,
@@ -302,7 +304,7 @@ pub async fn execute(
         let navigation_key = key.clone();
         let navigation_target = target;
         let prepared = match remote {
-            None => crate::harness::ui_session(context, key, target).await?,
+            None => wt_app_core::harness::ui_session(context, key, target).await?,
             Some(remote) => {
                 let client = remote.session_client().await?;
                 let target_name = match target {
@@ -316,7 +318,7 @@ pub async fn execute(
                 };
                 let prepared =
                     client.interactive_session(key.as_deref().unwrap_or(""), target_name, None);
-                crate::harness::PreparedSession {
+                wt_app_core::harness::PreparedSession {
                     program: prepared.program,
                     args: prepared.args,
                     cwd: context.config.paths.main_clone.clone(),
@@ -325,7 +327,7 @@ pub async fn execute(
         };
         let navigation = if remote.is_none() {
             Some(
-                crate::harness::SessionNavigation::new(
+                wt_app_core::harness::SessionNavigation::new(
                     context,
                     navigation_key,
                     navigation_target,
@@ -338,9 +340,9 @@ pub async fn execute(
         };
         return crate::controller::handoff_navigable(prepared, replies, shutdown, navigation).await;
     }
-    if crate::host_routing::controller_owned(&action) {
+    if wt_app_core::host_routing::controller_owned(&action) {
         let action = if let Some(host) = &host {
-            crate::host_routing::qualify(action, host)?
+            wt_app_core::host_routing::qualify(action, host)?
         } else {
             action
         };
@@ -355,8 +357,8 @@ pub async fn execute(
                     .data()
                     .and_then(|board| board.rows.iter().find(|row| row.key == *key))
                     .context("remote worktree metadata is still loading")?;
-                let uri = crate::editor::remote_uri(&remote.endpoint.host, &row.path)?;
-                crate::editor::open(context, std::path::Path::new(&uri)).await?;
+                let uri = wt_app_core::editor::remote_uri(&remote.endpoint.host, &row.path)?;
+                wt_app_core::editor::open(context, std::path::Path::new(&uri)).await?;
                 Ok(UiReply {
                     message: format!("Opened {} on {}", row.slug, remote.endpoint.label),
                     ..Default::default()
@@ -558,7 +560,7 @@ async fn managed_sign_in(
         provider.forward_port(),
     );
     let handoff = crate::controller::handoff_prepared(
-        crate::harness::PreparedSession {
+        wt_app_core::harness::PreparedSession {
             program: session.program,
             args: session.args,
             cwd: context.config.paths.main_clone.clone(),

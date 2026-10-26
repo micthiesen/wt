@@ -4,34 +4,22 @@
 //! identity it was compiled as; everything else lives here so a release
 //! rebuilds only that shim (docs/ci.md).
 
-mod action_builtins;
 mod action_dispatch;
 mod action_palette;
 mod action_source;
-mod actions;
 mod activity_source;
 mod attention_source;
 mod automation_builtins;
-mod automation_engine;
 mod automation_facts;
 mod automation_source;
 mod board_layout;
-mod bootstrap;
-mod build_info;
-mod codex_reauth;
 mod commands;
-mod context;
 mod controller;
 mod controller_actions;
 mod controller_tunnels;
 mod creation_placement;
-mod database;
-mod dev;
 mod dev_source;
-mod display_time;
-mod editor;
 mod events;
-mod feeds;
 mod fleet_cleanup;
 mod fork_base;
 mod freshness;
@@ -41,34 +29,23 @@ mod github_events_source;
 mod github_pickers;
 mod github_source;
 mod hard_refresh;
-mod harness;
 mod history_actions;
 mod history_source;
 mod host_cleanup;
 mod host_dispatch;
-mod host_errors;
-mod host_protocol;
-mod host_routing;
 mod host_server;
 mod host_service;
 mod host_stdio;
 mod install;
 mod inventory;
-mod issue_identity;
 mod issue_source;
-mod lanes;
 mod lifecycle_ops;
 mod local_source;
-mod logging;
 mod managed;
-mod managed_pi;
-mod naming;
 mod naming_source;
 mod origin;
 mod palette_source;
 mod perf_source;
-mod prompt;
-mod query_cache;
 mod remote;
 mod remote_board;
 mod remote_host;
@@ -79,15 +56,11 @@ mod session_activity;
 mod session_board;
 mod session_source;
 mod session_ui;
-mod skills;
 mod sources;
 mod terminal_palette;
 mod update_source;
 mod updates;
-mod watcher;
-mod watcher_cleanup;
 mod work_presentation;
-mod workload;
 mod worktree_facts;
 
 use std::sync::Arc;
@@ -101,7 +74,7 @@ use wt_runtime::TaskScope;
 use wt_vcs::{GitRepository, RepositoryConfig, StageConfig};
 
 #[derive(Parser)]
-#[command(name = "wt", version = build_info::native_version(), about = "Git worktree manager")]
+#[command(name = "wt", version = wt_app_core::build_info::native_version(), about = "Git worktree manager")]
 struct Cli {
     #[arg(long = "_boot-probe", hide = true)]
     boot_probe: bool,
@@ -111,7 +84,7 @@ struct Cli {
     command: Option<Command>,
 }
 
-pub use build_info::BuildInfo;
+pub use wt_app_core::build_info::BuildInfo;
 
 #[cfg(test)]
 mod cli_tests {
@@ -138,7 +111,7 @@ mod cli_tests {
             if error.kind() == clap::error::ErrorKind::DisplayVersion {
                 assert_eq!(
                     error.to_string().trim(),
-                    format!("wt {}", build_info::native_version())
+                    format!("wt {}", wt_app_core::build_info::native_version())
                 );
             }
         }
@@ -155,7 +128,7 @@ mod cli_tests {
 #[derive(Subcommand)]
 enum Command {
     #[command(name = "_workload", hide = true)]
-    Workload(workload::WorkloadArgs),
+    Workload(wt_app_core::workload::WorkloadArgs),
     /// Coordinate account changes on managed workers.
     Auth(commands::auth::AuthArgs),
     /// Serve explicitly configured controller capabilities to managed workers.
@@ -271,7 +244,7 @@ enum Command {
 
 /// Run wt as the binary `info` describes, exiting the process when done.
 pub fn main(info: BuildInfo) {
-    build_info::install(info);
+    wt_app_core::build_info::install(info);
     // wt runs inside the Claude sessions it starts, which carry BUN_INSPECT
     // for their own inspector socket. Every Bun program wt would run (hooks,
     // dev-server commands, actions) would otherwise try to bind that socket
@@ -282,14 +255,14 @@ pub fn main(info: BuildInfo) {
     if cli.boot_probe {
         println!(
             "wt-build-id:{}:{}",
-            build_info::build_id(),
-            build_info::target()
+            wt_app_core::build_info::build_id(),
+            wt_app_core::build_info::target()
         );
         return;
     }
     // Recovery and informational commands never load repository configuration.
     if matches!(cli.command, Some(Command::Version)) {
-        println!("wt {}", build_info::native_version());
+        println!("wt {}", wt_app_core::build_info::native_version());
         return;
     }
     match run(cli) {
@@ -309,7 +282,7 @@ fn run(cli: Cli) -> Result<i32> {
     ) {
         None
     } else {
-        bootstrap::BootAttempt::from_options(&options)?
+        wt_app_core::bootstrap::BootAttempt::from_options(&options)?
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -347,7 +320,9 @@ fn run(cli: Cli) -> Result<i32> {
                 boot.confirm().await?;
             }
             match &cli.command {
-                Some(Command::Workload(args)) => return workload::run(args, &token).await,
+                Some(Command::Workload(args)) => {
+                    return wt_app_core::workload::run(args, &token).await;
+                }
                 Some(Command::ClaudeHook(args)) => {
                     return commands::_claude_hook::run(args).await;
                 }
@@ -382,7 +357,7 @@ fn run(cli: Cli) -> Result<i32> {
             let config = Arc::new(
                 tokio::task::spawn_blocking(move || Config::load(&config_options)).await??,
             );
-            let _logging = logging::initialize(&config.paths.app_log_dir)?;
+            let _logging = wt_app_core::logging::initialize(&config.paths.app_log_dir)?;
             if let Some(Command::Hello { args }) = &cli.command {
                 return commands::_hello::run(&config, args);
             }
@@ -438,9 +413,9 @@ async fn run_application(
         println!("{}", serde_json::to_string_pretty(&rows)?);
         return Ok(0);
     }
-    let database = database::Database::open(&config).await?;
+    let database = wt_app_core::database::Database::open(&config).await?;
     if let Some(command) = &cli.command {
-        let context = context::AppContext {
+        let context = wt_app_core::context::AppContext {
             config: config.clone(),
             home: options.home.clone(),
             cwd: options.cwd,
@@ -451,7 +426,7 @@ async fn run_application(
             interactive_processes: ProcessRunner::default(),
             cancellation: token,
             section_writes: Default::default(),
-            caches: crate::query_cache::store(&config),
+            caches: wt_app_core::query_cache::store(&config),
         };
         let result = dispatch_command(&context, command).await;
         // A failed drain must not replace the command's own failure.
@@ -464,8 +439,8 @@ async fn run_application(
         return Ok(code);
     }
     let (actions, controller_port) = wt_tui::action_channel();
-    let caches = query_cache::store(&config);
-    let context = context::AppContext {
+    let caches = wt_app_core::query_cache::store(&config);
+    let context = wt_app_core::context::AppContext {
         config,
         home: options.home,
         cwd: options.cwd,
@@ -478,7 +453,7 @@ async fn run_application(
         section_writes: Default::default(),
         caches,
     };
-    skills::startup_check(&context).await?;
+    wt_app_core::skills::startup_check(&context).await?;
     let events_context = context.clone();
     scope.spawn(async move {
         if let Err(error) = events::reconcile(&events_context).await {
@@ -492,7 +467,7 @@ async fn run_application(
         commands,
     ));
     let fleet = remote_board::start(scope, &context, host);
-    let board = display_time::overlay(scope, fleet.board.clone());
+    let board = wt_app_core::display_time::overlay(scope, fleet.board.clone());
     let controller = controller::start(scope, context.clone(), fleet, controller_port);
     // A child cancellation token does not cancel its parent. The terminal
     // token handles Ctrl+C and explicit application shutdown owns the scope.
@@ -514,7 +489,10 @@ async fn run_application(
     Ok(0)
 }
 
-async fn dispatch_command(context: &context::AppContext, command: &Command) -> Result<i32> {
+async fn dispatch_command(
+    context: &wt_app_core::context::AppContext,
+    command: &Command,
+) -> Result<i32> {
     match command {
         Command::ActionWorker(args) => commands::_action_worker::run(context, args).await,
         Command::RestackWorker(args) => commands::_restack_worker::run(context, args).await,
@@ -573,7 +551,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
         Command::WorkerDispatch { args } => Box::pin(commands::_remote::run(context, args)).await,
         Command::Host => host_server::run(context).await,
         Command::Version => {
-            println!("wt {}", build_info::native_version());
+            println!("wt {}", wt_app_core::build_info::native_version());
             Ok(0)
         }
         Command::Inventory => {
@@ -603,7 +581,7 @@ async fn dispatch_command(context: &context::AppContext, command: &Command) -> R
 }
 
 pub(crate) async fn dispatch_worker_args(
-    context: &context::AppContext,
+    context: &wt_app_core::context::AppContext,
     argv: &[String],
 ) -> Result<i32> {
     let cli =

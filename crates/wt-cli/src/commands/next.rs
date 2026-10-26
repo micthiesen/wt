@@ -13,10 +13,8 @@ use serde::Deserialize;
 use wt_platform::{lock::FileLock, process::CommandSpec};
 use wt_store::BaseUpdate;
 
-use crate::{
-    commands::resolve::{resolve_worktree, run_git},
-    context::AppContext,
-};
+use crate::commands::resolve::{resolve_worktree, run_git};
+use wt_app_core::context::AppContext;
 
 const USAGE: &str = "usage: wt next [BRANCH] [--slug SLUG] [--issue ID|none] [--gh N|none]";
 

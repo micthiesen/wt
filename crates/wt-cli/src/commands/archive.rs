@@ -3,7 +3,8 @@ use clap::Args;
 use wt_core::{WorktreeRef, parse_worktree_ledger_key, worktree_target_key};
 use wt_lifecycle::{LifecycleService, ServiceConfig};
 
-use crate::{commands::resolve::resolve_named_worktree, context::AppContext};
+use crate::commands::resolve::resolve_named_worktree;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args)]
 pub struct ArchiveArgs {

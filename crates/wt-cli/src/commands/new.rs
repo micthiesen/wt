@@ -7,7 +7,8 @@ use clap::Args;
 use regex::Regex;
 use wt_lifecycle::{CreateOptions, LifecycleService, ServiceConfig};
 
-use crate::{commands::resolve::run_git, context::AppContext};
+use crate::commands::resolve::run_git;
+use wt_app_core::context::AppContext;
 
 const USAGE: &str = "usage: wt new <id [title…]|url|branch|slug> [--slug s] [--gh n] [--attach] [--any] [--base ref] [--open|--no-open] [--no-install]";
 
@@ -207,7 +208,7 @@ pub(crate) async fn parse_branch(
                     });
                 }
                 _ if interactive && std::io::stdin().is_terminal() => {
-                    let index = crate::prompt::pick(
+                    let index = wt_app_core::prompt::pick(
                         &found,
                         &format!("Multiple branches for {id}"),
                         &ctx.cancellation,
@@ -313,7 +314,7 @@ async fn set_github_issue(ctx: &AppContext, slug: &str, issue: u64) -> Result<()
 }
 
 async fn open_editor(ctx: &AppContext, path: &Path) -> Result<()> {
-    crate::editor::open(ctx, path).await
+    wt_app_core::editor::open(ctx, path).await
 }
 
 #[cfg(test)]

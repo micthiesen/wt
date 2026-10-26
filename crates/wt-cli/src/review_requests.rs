@@ -14,7 +14,7 @@ use wt_runtime::{
 use wt_store::ReviewRequestDismissal;
 use wt_tui::{Board, ReviewRequestRow};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const REVIEW_SECTION: &str = "Reviews";
 const DEFAULT_BACKSTOP: Duration = Duration::from_secs(60);
@@ -187,7 +187,7 @@ impl ReviewRequests {
                     && pr.head_ref_name.as_deref() == Some(request.branch.as_str())
             })
             .ok_or_else(|| {
-                crate::host_errors::stale(
+                wt_app_core::host_errors::stale(
                     "review request changed after confirmation; refresh the review list and retry",
                 )
             })?;
@@ -398,7 +398,7 @@ fn review_rows(board: &Board, snapshot: &ReviewRequestSnapshot) -> Vec<ReviewReq
                 "+{} / -{} · {} files · {} comments",
                 pr.additions, pr.deletions, pr.changed_files, pr.comment_count
             )));
-            let issue_url = crate::issue_identity::resolve(&branch, None).and_then(|issue| {
+            let issue_url = wt_app_core::issue_identity::resolve(&branch, None).and_then(|issue| {
                 if let Some(number) = issue.strip_prefix("GH-") {
                     let number = number.parse::<u64>().ok()?;
                     if pr.url.starts_with("https://github.com/") {

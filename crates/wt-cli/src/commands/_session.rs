@@ -6,7 +6,7 @@ use tokio::process::Command;
 use wt_config::{HarnessId, InstanceRole};
 use wt_tui::{SessionSelection, SessionTarget};
 
-use crate::{
+use wt_app_core::{
     context::AppContext,
     harness::{prepare_session, ui_session_with_harness},
 };
@@ -87,12 +87,12 @@ async fn run_inner(context: &AppContext, args: &[String]) -> Result<i32> {
 
 async fn attach_navigable(
     context: &AppContext,
-    mut prepared: crate::harness::PreparedSession,
+    mut prepared: wt_app_core::harness::PreparedSession,
     key: Option<String>,
     target: SessionTarget,
 ) -> Result<i32> {
     let mut navigation =
-        crate::harness::SessionNavigation::new(context, key, target, &prepared).await?;
+        wt_app_core::harness::SessionNavigation::new(context, key, target, &prepared).await?;
     loop {
         let code = attach(context, prepared).await?;
         if let Some(next) = navigation.next(Some(code)).await? {
@@ -103,7 +103,10 @@ async fn attach_navigable(
     }
 }
 
-async fn attach(context: &AppContext, prepared: crate::harness::PreparedSession) -> Result<i32> {
+async fn attach(
+    context: &AppContext,
+    prepared: wt_app_core::harness::PreparedSession,
+) -> Result<i32> {
     let mut child = Command::new(prepared.program)
         .args(prepared.args)
         .current_dir(prepared.cwd)
@@ -146,7 +149,7 @@ mod tests {
 
     #[tokio::test]
     async fn preparation_failure_is_retained_in_the_worker_log() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -171,7 +174,7 @@ mod tests {
     async fn remote_attach_logs_failures_but_accepts_legacy_detach_status() {
         use tracing::instrument::WithSubscriber;
 
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -185,7 +188,7 @@ mod tests {
             .finish();
         async {
             for (exit, expected) in [(1, 1), (110, 110), (111, 111), (112, 112)] {
-                let prepared = crate::harness::PreparedSession {
+                let prepared = wt_app_core::harness::PreparedSession {
                     program: "sh".into(),
                     args: vec!["-c".into(), format!("exit {exit}").into()],
                     cwd: std::env::temp_dir(),

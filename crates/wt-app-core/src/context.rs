@@ -163,7 +163,7 @@ mod tests {
         use wt_platform::process::{CommandSpec, ProcessRunner};
         use wt_tui::UiAction;
 
-        let mut fixture = crate::commands::test_support::CommandFixture::new().await?;
+        let mut fixture = crate::test_support::CommandFixture::new().await?;
         fixture.ctx.processes = ProcessRunner::new(NonZeroUsize::new(1).unwrap());
         fixture.ctx.background_processes = fixture.ctx.processes.clone();
         fixture.ctx.repository = Arc::new(
@@ -233,7 +233,7 @@ mod tests {
     async fn action_contexts_share_one_bounded_interactive_pool() -> anyhow::Result<()> {
         use std::{num::NonZeroUsize, time::Duration};
         use wt_platform::process::{CommandSpec, ProcessRunner};
-        let mut fixture = crate::commands::test_support::CommandFixture::new().await?;
+        let mut fixture = crate::test_support::CommandFixture::new().await?;
         fixture.ctx.interactive_processes = ProcessRunner::new(NonZeroUsize::new(1).unwrap());
         let action = wt_tui::UiAction::PrepareSessions {
             key: Some("one".into()),

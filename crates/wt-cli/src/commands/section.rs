@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use wt_config::InstanceRole;
 use wt_core::{ChainMember, build_stack_index};
 
-use crate::{commands::resolve::resolve_from_inventory, context::AppContext};
+use crate::commands::resolve::resolve_from_inventory;
+use wt_app_core::context::AppContext;
 
 const INBOX: &str = "\0inbox";
 #[derive(Debug, Clone, Args, Default)]
@@ -359,7 +360,7 @@ mod tests {
 
     #[tokio::test]
     async fn moves_whole_stack_and_only_mode_splits_it() {
-        use crate::commands::test_support::CommandFixture;
+        use wt_app_core::test_support::CommandFixture;
         let fixture = CommandFixture::new().await.unwrap();
         fixture
             .ctx

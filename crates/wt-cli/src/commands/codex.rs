@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use wt_platform::process::CommandSpec;
 
-use crate::{context::AppContext, harness::AppHarness};
+use wt_app_core::{context::AppContext, harness::AppHarness};
 
 #[derive(Debug, Clone, Args)]
 pub struct CodexArgs {

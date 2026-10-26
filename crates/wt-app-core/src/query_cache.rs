@@ -94,9 +94,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_scope_uses_endpoint_and_schema_instead_of_local_display_settings() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let mut config = (*fixture.ctx.config).clone();
         let endpoint = wt_config::RemoteConfig {
             host: "builder".into(),
@@ -126,9 +124,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_changes_with_configuration_build_and_dev_binary() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let config = (*fixture.ctx.config).clone();
         let base = store_for_build(&config, "v1", None);
         assert_eq!(base.scope(), store_for_build(&config, "v1", None).scope());

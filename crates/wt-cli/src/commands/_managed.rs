@@ -81,7 +81,7 @@ pub async fn run(args: &[String], cancellation: &CancellationToken) -> Result<i3
             let generation = generation
                 .parse::<u64>()
                 .context("invalid account-switch generation")?;
-            crate::codex_reauth::write_worker_desired(
+            wt_app_core::codex_reauth::write_worker_desired(
                 &PathBuf::from(root),
                 Some(generation),
                 cancellation,
@@ -118,8 +118,12 @@ pub async fn apply(
         .context("the managed root path must not contain quotes or newlines")?
         .to_owned();
     create_private_dir(&root)?;
-    crate::codex_reauth::write_worker_desired(&root, request.codex_auth_generation, cancellation)
-        .await?;
+    wt_app_core::codex_reauth::write_worker_desired(
+        &root,
+        request.codex_auth_generation,
+        cancellation,
+    )
+    .await?;
     // A reconnect and a finished sign-in can both converge the same root;
     // one apply at a time keeps the clone and mirrored trees consistent.
     let lock_path = root.join(".apply.lock");
@@ -177,7 +181,7 @@ pub async fn apply(
     let environment = child_environment(&root, &login_path);
 
     if let Some(version) = &request.pi_version {
-        checks.push(match crate::managed_pi::provision(
+        checks.push(match wt_app_core::managed_pi::provision(
             &root,
             version,
             &runner,
@@ -223,7 +227,7 @@ pub async fn apply(
         )
     });
     checks.extend(codex_checks(&runner, &environment, cancellation).await);
-    if crate::codex_reauth::worker_pending(&root)? {
+    if wt_app_core::codex_reauth::worker_pending(&root)? {
         checks.retain(|check| check.id != "codex-login");
         checks.push(ManagedCheck::new(
             "codex-login",
@@ -244,7 +248,7 @@ pub async fn apply(
     Ok(ManagedReport {
         protocol: MANAGED_PROTOCOL,
         checks,
-        codex_auth_generation: crate::codex_reauth::worker_desired(&root)?,
+        codex_auth_generation: wt_app_core::codex_reauth::worker_desired(&root)?,
     })
 }
 
@@ -366,7 +370,7 @@ async fn codex_login_lifecycle(
         wt_platform::lock::FileLock::try_acquire(root, "codex-login", "managed Codex login")
             .await?
             .context("another managed Codex sign-in is already running")?;
-    let expected = crate::codex_reauth::worker_desired(root)?;
+    let expected = wt_app_core::codex_reauth::worker_desired(root)?;
     let runner = ProcessRunner::default();
     // Never signal arbitrary processes or touch tmux. Native daemon ownership
     // checks scope the stop/restart to this worker's pinned CODEX_HOME.
@@ -397,7 +401,7 @@ async fn codex_login_lifecycle(
     }
     login?;
     codex_control(&runner, environment, &["login", "status"], cancellation).await?;
-    crate::codex_reauth::acknowledge(root, expected, cancellation).await
+    wt_app_core::codex_reauth::acknowledge(root, expected, cancellation).await
 }
 
 async fn codex_control(
@@ -1066,7 +1070,7 @@ exit 0
                 ("QA_FAILURE".into(), Some(failure.into())),
             ];
             let cancel = CancellationToken::new();
-            crate::codex_reauth::write_worker_desired(temp.path(), Some(5), &cancel)
+            wt_app_core::codex_reauth::write_worker_desired(temp.path(), Some(5), &cancel)
                 .await
                 .unwrap();
             let canceller = (failure == "cancel").then(|| {
@@ -1095,7 +1099,7 @@ exit 0
             }
             assert_eq!(result.is_ok(), failure.is_empty(), "{failure}: {result:?}");
             assert_eq!(
-                crate::codex_reauth::worker_pending(temp.path()).unwrap(),
+                wt_app_core::codex_reauth::worker_pending(temp.path()).unwrap(),
                 !failure.is_empty()
             );
             let calls = std::fs::read_to_string(calls).unwrap();

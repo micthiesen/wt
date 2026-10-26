@@ -14,7 +14,7 @@ use wt_core::Domain;
 use wt_runtime::{LeafHandle, Persistence, RefreshPolicy, SourceSpec, TaskScope, start_source};
 use wt_tui::{ActivityLine, AttentionLine};
 
-use crate::feeds::{MAX_ACTIVITY, MAX_ATTENTION, REPEAT_WINDOW_MS, collapse_repeats};
+use wt_app_core::feeds::{MAX_ACTIVITY, MAX_ATTENTION, REPEAT_WINDOW_MS, collapse_repeats};
 
 const MAX_TAIL_BYTES: u64 = 512 * 1024;
 
@@ -90,8 +90,8 @@ fn start_with_watcher(
             if !native_watch {
                 return Ok(None);
             }
-            let mut watcher =
-                crate::watcher::new(move |event: notify::Result<notify::Event>| match event {
+            let mut watcher = wt_app_core::watcher::new(
+                move |event: notify::Result<notify::Event>| match event {
                     Ok(event)
                         if !matches!(event.kind, notify::EventKind::Access(_))
                             && event.paths.iter().any(|path| {
@@ -107,7 +107,8 @@ fn start_with_watcher(
                         callback.refresh();
                     }
                     _ => {}
-                })?;
+                },
+            )?;
             // Register canonical paths so aliases such as /tmp do not lose
             // log notifications during path matching.
             let paths = vec![
@@ -135,7 +136,7 @@ fn start_with_watcher(
             }
         };
         if cancellation.is_cancelled() {
-            crate::watcher_cleanup::drop_watcher(watcher).await;
+            wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
             return;
         }
         let fingerprint = || {
@@ -165,7 +166,7 @@ fn start_with_watcher(
                 }
             }
         }
-        crate::watcher_cleanup::drop_watcher(watcher).await;
+        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
     });
     source
 }
@@ -428,7 +429,7 @@ fn parse_timestamp_ms(timestamp: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::feeds::{append_attention_at, bound_feeds, epoch_ms};
+    use wt_app_core::feeds::{append_attention_at, bound_feeds, epoch_ms};
 
     #[tokio::test]
     async fn native_watchers_drain_when_cancelled_during_startup() {

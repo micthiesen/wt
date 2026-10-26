@@ -19,9 +19,9 @@ use wt_update::{InstallState, VersionId};
 
 use crate::{
     commands::{issue::repo_web_url, resolve::run_git},
-    context::AppContext,
     worktree_facts::push_facts,
 };
+use wt_app_core::context::AppContext;
 
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{summary}\n{details}")]
@@ -55,7 +55,7 @@ impl MissingRemoteBuild {
             summary,
             details: format!(
                 "Local build: {build}\nLocal platform: {}\nRemote platform: {target}\nRelease: {}\nCause: {cause}",
-                crate::build_info::target(),
+                wt_app_core::build_info::target(),
                 release.unwrap_or("no published release identity"),
             ),
         }
@@ -105,7 +105,7 @@ pub fn worker_info(role: InstanceRole) -> WorkerInfo {
             InstanceRole::Worker => WorkerRole::Worker,
         },
         protocol: WORKER_PROTOCOL_VERSION,
-        build: crate::build_info::build_id().to_owned(),
+        build: wt_app_core::build_info::build_id().to_owned(),
     }
 }
 
@@ -148,7 +148,7 @@ async fn native_candidate_for_platform(
     platform: &RemotePlatform,
     cancellation: &CancellationToken,
 ) -> Result<(BinaryCandidate, Option<tempfile::TempDir>)> {
-    if platform.target == crate::build_info::target() {
+    if platform.target == wt_app_core::build_info::target() {
         let path = std::env::current_exe()
             .context("resolve running native wt executable")?
             .canonicalize()
@@ -163,16 +163,16 @@ async fn native_candidate_for_platform(
             .checked(&path)?;
         let expected = format!(
             "wt-build-id:{}:{}",
-            crate::build_info::build_id(),
-            crate::build_info::target()
+            wt_app_core::build_info::build_id(),
+            wt_app_core::build_info::target()
         );
         if output.stdout_text().trim() != expected {
             bail!("running wt binary did not prove its native identity; expected `{expected}`");
         }
         let candidate = BinaryCandidate::from_path(
             path,
-            crate::build_info::target(),
-            crate::build_info::build_id(),
+            wt_app_core::build_info::target(),
+            wt_app_core::build_info::build_id(),
         )
         .await?;
         return Ok((candidate, None));
@@ -197,12 +197,12 @@ async fn native_candidate_for_platform(
     let version = resolve_controller_release(
         &state,
         launcher_release.as_deref(),
-        crate::build_info::build_id(),
-        crate::build_info::target(),
+        wt_app_core::build_info::build_id(),
+        wt_app_core::build_info::target(),
     )
     .map_err(|error| {
         MissingRemoteBuild::new(
-            crate::build_info::build_id(),
+            wt_app_core::build_info::build_id(),
             &platform.target,
             None,
             &error.to_string(),
@@ -216,15 +216,15 @@ async fn native_candidate_for_platform(
             std::time::Duration::from_secs(100),
             source.by_tag(version.release_version()),
         ) => result.context("matching native release lookup timed out")?.map_err(|error| {
-            remote_release_error(error, crate::build_info::build_id(), &platform.target, version.release_version())
+            remote_release_error(error, wt_app_core::build_info::build_id(), &platform.target, version.release_version())
         })?,
     };
-    if release.build_id() != crate::build_info::build_id() {
+    if release.build_id() != wt_app_core::build_info::build_id() {
         bail!(
             "release {} has build {}, but the running controller is {}; refusing a cross-target runtime mismatch",
             release.tag(),
             release.build_id(),
-            crate::build_info::build_id()
+            wt_app_core::build_info::build_id()
         );
     }
     let verified = tokio::select! {
@@ -234,10 +234,10 @@ async fn native_candidate_for_platform(
             std::time::Duration::from_secs(100),
             source.download_verified(&release, &platform.target),
         ) => result.context("matching native worker artifact download timed out")?.map_err(|error| {
-            remote_release_error(error, crate::build_info::build_id(), &platform.target, version.release_version())
+            remote_release_error(error, wt_app_core::build_info::build_id(), &platform.target, version.release_version())
         })?,
     };
-    if verified.version().build_id() != crate::build_info::build_id()
+    if verified.version().build_id() != wt_app_core::build_info::build_id()
         || verified.version().target() != platform.target
         || verified.version().release_version() != version.release_version()
     {
@@ -261,7 +261,7 @@ async fn native_candidate_for_platform(
     let candidate = BinaryCandidate::from_path(
         local_path,
         platform.target.clone(),
-        crate::build_info::build_id(),
+        wt_app_core::build_info::build_id(),
     )
     .await?;
     Ok((candidate, Some(scratch)))
@@ -334,7 +334,7 @@ pub async fn collect_worker_snapshot(context: &AppContext) -> Result<WorkerSnaps
                 branch: row.worktree.target.branch.clone(),
             })
             .collect::<Vec<_>>();
-        crate::dev::service(context)?
+        wt_app_core::dev::service(context)?
             .status_all(&dev_worktrees, &context.cancellation)
             .await?
             .worktrees
@@ -789,7 +789,7 @@ pub async fn remote_admin_with_client(
 }
 
 fn resolve_issue_id(slug: &str, stored: Option<&str>) -> Option<String> {
-    crate::issue_identity::resolve(slug, stored)
+    wt_app_core::issue_identity::resolve(slug, stored)
 }
 
 #[cfg(test)]
@@ -798,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn removing_remote_row_exposes_its_native_destroy_log() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let snapshot = fixture

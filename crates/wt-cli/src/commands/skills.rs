@@ -4,7 +4,7 @@ use std::{ffi::OsString, io::IsTerminal, time::Duration};
 use wt_platform::process::CommandSpec;
 use wt_skills::{MemoryStore, SyncMode, UnitState, build_reports, detect_targets, sync};
 
-use crate::{context::AppContext, prompt};
+use wt_app_core::{context::AppContext, prompt};
 
 #[derive(Debug, Clone, Args)]
 pub struct SkillsArgs {
@@ -54,7 +54,7 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
     let memory = store(context);
     match command {
         SkillsCommand::Status => {
-            let targets = detect_targets(&super::super::skills::target_options_for(context));
+            let targets = detect_targets(&wt_app_core::skills::target_options_for(context));
             if targets.harnesses.is_empty() {
                 println!("{}", wt_skills::no_tools_hint());
                 return Ok(0);
@@ -75,7 +75,7 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
             Ok(0)
         }
         SkillsCommand::Sync { units, yes, force } => {
-            let options = super::super::skills::target_options_for(context);
+            let options = wt_app_core::skills::target_options_for(context);
             let targets = detect_targets(&options);
             if targets.harnesses.is_empty() {
                 println!("{} — nothing to install into", wt_skills::no_tools_hint());
@@ -331,7 +331,7 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
         SkillsCommand::Diff { unit } => {
             let _unit = wt_skills::find_unit(&unit)
                 .with_context(|| format!("unknown skill unit `{unit}`"))?;
-            let targets = detect_targets(&super::super::skills::target_options_for(context));
+            let targets = detect_targets(&wt_app_core::skills::target_options_for(context));
             let reports = build_reports(&targets, &memory.load()?)
                 .into_iter()
                 .filter(|r| r.unit.name == unit)

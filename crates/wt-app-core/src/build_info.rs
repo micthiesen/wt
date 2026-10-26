@@ -28,7 +28,7 @@ struct Installed {
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
 /// Record the binary's identity. Called once, first thing in `main`.
-pub(crate) fn install(info: BuildInfo) {
+pub fn install(info: BuildInfo) {
     INSTALLED.get_or_init(|| installed(info));
 }
 
@@ -41,11 +41,11 @@ fn installed(info: BuildInfo) -> Installed {
 }
 
 fn get() -> &'static Installed {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     {
         INSTALLED.get_or_init(|| installed(test_identity()))
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "testing")))]
     {
         INSTALLED
             .get()
@@ -55,7 +55,7 @@ fn get() -> &'static Installed {
 
 /// The identity unit tests run under, matching what the build script gave a
 /// development build: `dev-<version>` for the build and the real target.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 fn test_identity() -> BuildInfo {
     BuildInfo {
         version: "0.0.0",
@@ -72,19 +72,19 @@ fn test_identity() -> BuildInfo {
     }
 }
 
-pub(crate) fn version() -> &'static str {
+pub fn version() -> &'static str {
     get().info.version
 }
 
-pub(crate) fn build_id() -> &'static str {
+pub fn build_id() -> &'static str {
     get().info.build_id
 }
 
-pub(crate) fn target() -> &'static str {
+pub fn target() -> &'static str {
     get().info.target
 }
 
 /// `<version> (<build id>, <target>)`.
-pub(crate) fn native_version() -> &'static str {
+pub fn native_version() -> &'static str {
     get().native_version
 }

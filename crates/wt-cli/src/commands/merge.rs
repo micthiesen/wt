@@ -1,6 +1,7 @@
-use crate::{commands::resolve::resolve_worktree, context::AppContext};
+use crate::commands::resolve::resolve_worktree;
 use anyhow::{Result, bail};
 use clap::Args;
+use wt_app_core::context::AppContext;
 use wt_github::{GithubClient, GithubOptions, PrMergeTarget};
 
 #[derive(Debug, Clone, Args, Default)]
@@ -97,8 +98,8 @@ async fn run_with_client(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
     use std::{fs, os::unix::fs::PermissionsExt};
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn draft_refusal_never_attempts_a_github_write() {

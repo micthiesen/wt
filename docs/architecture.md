@@ -10,6 +10,7 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | Crate | Responsibility |
 |---|---|
 | `wt-app` | The `wt` binary: passes its release version and build identity to `wt-cli` and nothing else, so a release recompiles only this crate ([ci.md](ci.md)) |
+| `wt-app-core` | Foundation of the application: `AppContext`, database, build identity, harness glue, host wire protocol and lane classification, feed helpers. Depends on no other application crate |
 | `wt-cli` (library crate `wt`) | CLI composition, local and remote host services, TUI source pipeline, application actions, update integration |
 | `wt-tui` | Board and modal models, input state machine, terminal rendering and action protocol |
 | `wt-config` | Config discovery, merge, validation, resolved process configuration |

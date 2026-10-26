@@ -1,13 +1,11 @@
 //! Fleet projection combines independent snapshots of the same host service.
-use crate::feeds::FailureClock;
-use crate::{
+use crate::{host_service::HostService, local_source::Metadata, remote_host::RemoteHost};
+use std::sync::Arc;
+use wt_app_core::feeds::FailureClock;
+use wt_app_core::{
     context::AppContext,
     host_protocol::{HostSnapshot, HostState},
-    host_service::HostService,
-    local_source::Metadata,
-    remote_host::RemoteHost,
 };
-use std::sync::Arc;
 use wt_core::Domain;
 use wt_runtime::{
     DomainMap, SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel, merge_domains,
@@ -417,7 +415,7 @@ fn compose(
     });
     crate::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
     crate::board_layout::refresh_rollups(&mut board);
-    crate::feeds::bound_feeds(&mut board);
+    wt_app_core::feeds::bound_feeds(&mut board);
     snapshot.derive(Some(Arc::new(board)))
 }
 
@@ -454,7 +452,7 @@ mod tests {
     }
     #[tokio::test]
     async fn remote_layout_uses_controller_section_and_preserves_worker_title() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let endpoint = wt_config::RemoteConfig {
@@ -553,7 +551,7 @@ mod tests {
     }
     #[tokio::test]
     async fn same_slugs_on_three_hosts_stay_separate_when_one_host_disconnects() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let row = wt_tui::BoardRow {
@@ -626,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn managed_host_needing_sign_in_reaches_attention_before_it_has_rows() {
         use wt_remote::managed::{CheckState, ManagedCheck, ManagedReport, SignIn};
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let endpoint = wt_config::RemoteConfig {
@@ -686,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_remote_reads_as_cached_until_its_stream_is_live() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let endpoint = wt_config::RemoteConfig {

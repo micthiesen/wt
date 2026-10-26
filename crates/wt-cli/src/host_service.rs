@@ -6,7 +6,8 @@ use wt_core::Domain;
 use wt_runtime::{SourceSnapshot, Stamp, TaskScope};
 use wt_tui::{ActionSurface, Board, ReplyOutcome, UiAction, UiReply};
 
-use crate::{context::AppContext, github_actions::GithubAction, sources::BoardSources};
+use crate::{github_actions::GithubAction, sources::BoardSources};
+use wt_app_core::context::AppContext;
 
 pub struct HostService {
     pub context: AppContext,
@@ -50,7 +51,7 @@ const ACTION_GITHUB_WAIT: std::time::Duration = std::time::Duration::from_secs(1
 
 impl HostService {
     /// The host's current board and row layout, as the wire protocol sends it.
-    pub fn snapshot(&self) -> crate::host_protocol::HostSnapshot {
+    pub fn snapshot(&self) -> wt_app_core::host_protocol::HostSnapshot {
         let snapshot = self.sources.board.snapshot();
         let metadata = self.sources.metadata.snapshot();
         let mut layout = std::collections::BTreeMap::new();
@@ -59,7 +60,7 @@ impl HostService {
                 let entry = metadata.data().map(|data| &data.0["slugs"][&row.key]);
                 layout.insert(
                     row.key.clone(),
-                    crate::host_protocol::RowLayout {
+                    wt_app_core::host_protocol::RowLayout {
                         base_branch: entry
                             .and_then(|e| e["baseBranch"].as_str())
                             .map(str::to_owned),
@@ -68,7 +69,7 @@ impl HostService {
                 );
             }
         }
-        crate::host_protocol::HostSnapshot {
+        wt_app_core::host_protocol::HostSnapshot {
             board: snapshot.data().map(|board| (**board).clone()),
             state: snapshot.state().into(),
             domains: snapshot.domains().clone(),
@@ -179,7 +180,7 @@ impl HostService {
     /// rebuilds from the discoveries source as each harness completes.
     fn queue_session_discovery(&self, context: &AppContext, slug: &str) {
         self.sources.sessions.inventory.refresh();
-        for harness in crate::harness::visible_harnesses(&context.config) {
+        for harness in wt_app_core::harness::visible_harnesses(&context.config) {
             self.sources
                 .sessions
                 .commands
@@ -202,7 +203,7 @@ impl HostService {
             // without a slug has nothing to refresh.
             UiAction::DiscoverSessions { key, target } => {
                 if let Ok(slug) =
-                    crate::harness::picker_slug(&context, key.as_deref(), *target).await
+                    wt_app_core::harness::picker_slug(&context, key.as_deref(), *target).await
                 {
                     self.queue_session_discovery(&context, &slug);
                 }
@@ -212,7 +213,7 @@ impl HostService {
             // answered here from the same discovery snapshot the board uses.
             UiAction::PrepareSessions { key, target } => {
                 let history = self.sources.sessions.discoveries.snapshot();
-                let (slug, entries) = crate::harness::cached_session_options(
+                let (slug, entries) = wt_app_core::harness::cached_session_options(
                     &context,
                     key.clone(),
                     *target,
@@ -225,7 +226,7 @@ impl HostService {
                         key.clone(),
                         *target,
                         &entries,
-                        &crate::harness::visible_harnesses(&context.config),
+                        &wt_app_core::harness::visible_harnesses(&context.config),
                     )),
                     ..Default::default()
                 });
@@ -412,16 +413,16 @@ impl HostService {
                 let row = board
                     .and_then(|board| board.rows.iter().find(|row| row.key == key))
                     .ok_or_else(|| {
-                        crate::host_errors::notice("worktree is no longer on the board")
+                        wt_app_core::host_errors::notice("worktree is no longer on the board")
                     })?;
                 let github =
                     github.ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
                 return Err(match github.covered_pr(&row.branch) {
                     wt_github::CoveredPr::Present(_) => {
-                        crate::host_errors::stale("GitHub data changed; press e again")
+                        wt_app_core::host_errors::stale("GitHub data changed; press e again")
                     }
                     wt_github::CoveredPr::Absent => {
-                        crate::host_errors::notice("no PR for this row")
+                        wt_app_core::host_errors::notice("no PR for this row")
                     }
                     wt_github::CoveredPr::Uncovered => {
                         anyhow::anyhow!("GitHub data is not confirmed for this branch")
@@ -601,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn board_menus_never_reach_the_host() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let scope = TaskScope::new();
@@ -695,14 +696,14 @@ mod tests {
 
     #[tokio::test]
     async fn folding_durable_metadata_returns_accepted_on_the_local_clock() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let action = UiAction::FoldSection {
             key: "test-section".into(),
             folded: true,
         };
-        assert!(crate::host_routing::controller_owned(&action));
+        assert!(wt_app_core::host_routing::controller_owned(&action));
         let board = Board::default();
         let effect = action.effect(&board);
         let result = crate::controller_actions::execute(&fixture.ctx, action, Some(&board), None)

@@ -25,7 +25,8 @@ use wt_store::RemovedWorktree;
 use wt_tui::{Board, RemovedHistoryRow, RemovedHistorySnapshot};
 use wt_vcs::WorktreeSnapshot;
 
-use crate::{context::AppContext, issue_identity, local_source::Metadata};
+use crate::local_source::Metadata;
+use wt_app_core::{context::AppContext, issue_identity};
 
 const MAX_ENTRIES: usize = 30;
 const MAX_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
@@ -221,7 +222,7 @@ pub fn overlay(
         let mut histories = history.subscribe();
         boards.mark_changed();
         histories.mark_changed();
-        let mut failures = crate::feeds::FailureClock::default();
+        let mut failures = wt_app_core::feeds::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -501,7 +502,8 @@ fn removal_day_label(timestamp: &str) -> Option<String> {
 }
 
 fn local_removal_day(timestamp_ms: u64) -> Option<time::Date> {
-    let (year, month, day, hour, _, _) = crate::display_time::local_time_components(timestamp_ms)?;
+    let (year, month, day, hour, _, _) =
+        wt_app_core::display_time::local_time_components(timestamp_ms)?;
     let month = time::Month::try_from(month).ok()?;
     let mut date = time::Date::from_calendar_date(year, month, day).ok()?;
     if hour < 4 {
@@ -1068,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn history_is_prepared_before_open_and_survives_close_and_refresh() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let scratch = tempfile::tempdir().unwrap();

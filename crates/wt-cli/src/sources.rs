@@ -10,7 +10,7 @@ use wt_runtime::{
 use wt_tui::Board;
 use wt_vcs::WorktreeSnapshot;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 pub struct BoardSources {
     pub board: SourceHandle<Board>,
@@ -117,7 +117,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         naming.board,
         &sessions,
         session_activity.clone(),
-        crate::harness::AppHarness::new(context),
+        wt_app_core::harness::AppHarness::new(context),
     );
     let board = crate::history_source::overlay(scope, board, history.snapshot);
     let (review_requests, review_snapshot) =
@@ -192,7 +192,7 @@ fn project(
         local_updates.mark_changed();
         github_updates.mark_changed();
         activity_updates.mark_changed();
-        let mut failures = crate::feeds::FailureClock::default();
+        let mut failures = wt_app_core::feeds::FailureClock::default();
         loop {
             tokio::select! {
                 biased;
@@ -257,7 +257,7 @@ fn compose(
     local: SourceSnapshot<Board>,
     github: SourceSnapshot<GithubData>,
     activity: SourceSnapshot<crate::activity_source::ActivitySnapshot>,
-    failures: &mut crate::feeds::FailureClock,
+    failures: &mut wt_app_core::feeds::FailureClock,
 ) -> SourceSnapshot<Board> {
     let Some(board) = local.data() else {
         // This compose reports nothing, so every tracked failure has cleared.
@@ -308,7 +308,7 @@ fn compose(
         }
     }
     failures.sweep();
-    crate::feeds::bound_feeds(&mut board);
+    wt_app_core::feeds::bound_feeds(&mut board);
     let mut state = local.state().clone();
     if let SourceState::Failed(error) = github.state() {
         // A remote failure stays visible while local updates and last-good
@@ -353,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_source_declares_and_is_covered() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let scope = TaskScope::new();

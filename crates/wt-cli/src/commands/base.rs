@@ -2,7 +2,8 @@ use anyhow::Result;
 use clap::Args;
 use serde_json::Value;
 
-use crate::{commands::resolve::resolve_worktree, context::AppContext, database::Database};
+use crate::commands::resolve::resolve_worktree;
+use wt_app_core::{context::AppContext, database::Database};
 
 const USAGE: &str = "usage: wt base <slug>                 show the recorded fork base\n       wt base set <slug> <ref>      record <ref> as the fork base\n       wt base clear <slug>          return to trunk, retaining the replay anchor";
 
@@ -82,7 +83,7 @@ async fn read_state(database: &Database) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn set_records_a_merge_base_anchor_and_clear_retains_it() {

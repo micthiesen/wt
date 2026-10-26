@@ -30,7 +30,7 @@ mod session_commands;
 pub use session_commands::{
     SessionEnd, forget_claude_session, prepare_session, stop_managed_session,
 };
-pub(crate) use session_commands::{
+pub use session_commands::{
     cached_session_options, picker_entries, picker_slug, visible_harnesses,
 };
 use session_commands::{session_name, slot_name};
@@ -85,14 +85,14 @@ pub struct PreparedSession {
 
 /// Session keys keep the same worktree while the board is suspended.
 /// Retain the selected agent identity and use the normal resume checks.
-pub(crate) struct SessionNavigation<'a> {
+pub struct SessionNavigation<'a> {
     context: &'a AppContext,
     key: Option<String>,
     agent: Option<wt_tui::SessionSelection>,
 }
 
 impl<'a> SessionNavigation<'a> {
-    pub(crate) async fn new(
+    pub async fn new(
         context: &'a AppContext,
         key: Option<String>,
         target: SessionTarget,
@@ -161,7 +161,7 @@ impl<'a> SessionNavigation<'a> {
         Ok(())
     }
 
-    pub(crate) async fn next(&mut self, code: Option<i32>) -> Result<Option<PreparedSession>> {
+    pub async fn next(&mut self, code: Option<i32>) -> Result<Option<PreparedSession>> {
         let target = match code {
             Some(110) => SessionTarget::Shell,
             Some(111) => SessionTarget::Diff,
@@ -275,7 +275,7 @@ fn harness_session_environment(
 /// The `wt` special session's account selector. It names the configured
 /// `paths.wt_source` checkout, so a worktree that shares the slug never
 /// matches, and it applies to whichever path starts Claude there.
-pub(crate) fn claude_launch_auth(context: &AppContext) -> Option<wt_harness::ClaudeLaunchAuth> {
+pub fn claude_launch_auth(context: &AppContext) -> Option<wt_harness::ClaudeLaunchAuth> {
     let command = context
         .config
         .harness
@@ -292,7 +292,7 @@ pub(crate) fn claude_launch_auth(context: &AppContext) -> Option<wt_harness::Cla
 
 /// Extra `claude` arguments for the `wt` special session, scoped like
 /// [`claude_launch_auth`].
-pub(crate) fn claude_launch_args(context: &AppContext) -> Option<wt_harness::ClaudeLaunchArgs> {
+pub fn claude_launch_args(context: &AppContext) -> Option<wt_harness::ClaudeLaunchArgs> {
     let args = &context.config.harness.wt_session_claude_args;
     let wt_source = context.config.paths.wt_source.as_ref()?;
     (!args.is_empty()).then(|| wt_harness::ClaudeLaunchArgs::new("wt", wt_source, args.clone()))
@@ -514,7 +514,7 @@ impl AppHarness {
 
     /// Attach to a session whose switch-key kind the caller knows; the kind
     /// is never derived from the session name.
-    pub(crate) fn attach_command_as(
+    pub fn attach_command_as(
         &self,
         session: &str,
         cwd: &Path,
@@ -540,7 +540,7 @@ impl AppHarness {
     }
 
     /// The harness configuration pins for this target, if any.
-    pub(crate) fn pinned(&self, slug: &str, kind: AgentTargetKind) -> Option<HarnessId> {
+    pub fn pinned(&self, slug: &str, kind: AgentTargetKind) -> Option<HarnessId> {
         pinned_harness(&self.harness_config, slug, kind)
     }
 
@@ -588,7 +588,7 @@ impl AppHarness {
 
     /// The slot agents a session picker can name, with the same checks as
     /// [`Self::slot_agent`]. Reads the checkout directories, never Git.
-    pub(crate) fn slot_agents(&self) -> Vec<(wt_tui::SessionTarget, AgentTarget)> {
+    pub fn slot_agents(&self) -> Vec<(wt_tui::SessionTarget, AgentTarget)> {
         [
             wt_tui::SessionTarget::Manager,
             wt_tui::SessionTarget::Main,
@@ -601,7 +601,7 @@ impl AppHarness {
     }
 
     /// The agent for one slot target, or `None` when its checkout is absent.
-    pub(crate) fn slot_agent(&self, target: wt_tui::SessionTarget) -> Option<AgentTarget> {
+    pub fn slot_agent(&self, target: wt_tui::SessionTarget) -> Option<AgentTarget> {
         use wt_tui::SessionTarget as Slot;
         match target {
             Slot::Manager => Some(special_target(
@@ -730,7 +730,7 @@ impl AppHarness {
 
     /// A live Claude `wt` slot keeps the account it started with. Name the
     /// restart that would apply the configured selection, if one is needed.
-    pub(crate) async fn claude_auth_restart_notice(
+    pub async fn claude_auth_restart_notice(
         &self,
         route: &AgentRoute,
         context: &AppContext,
@@ -754,7 +754,7 @@ impl AppHarness {
             .flatten()
     }
 
-    pub(crate) async fn ensure_started(
+    pub async fn ensure_started(
         &self,
         id: HarnessId,
         request: &HarnessSpawnRequest,
@@ -854,7 +854,7 @@ impl AppHarness {
 /// The one rule for configuration-pinned slot harnesses: only the `wt`
 /// special session can be pinned, by `[harness] wt_session`. A worktree that
 /// happens to be named `wt` is never pinned.
-pub(crate) fn pinned_harness(
+pub fn pinned_harness(
     config: &wt_config::HarnessConfig,
     slug: &str,
     kind: AgentTargetKind,
@@ -867,7 +867,7 @@ pub(crate) fn pinned_harness(
 
 /// [`pinned_harness`] for a slot surface, for callers holding a
 /// [`SessionTarget`] rather than an [`AgentTarget`].
-pub(crate) fn pinned_slot_harness(
+pub fn pinned_slot_harness(
     config: &wt_config::HarnessConfig,
     target: SessionTarget,
 ) -> Option<HarnessId> {
@@ -1144,7 +1144,7 @@ fn resolve_diff_command(template: &str, base: &str) -> String {
 /// Route selection for one target. A configured pin decides outright and
 /// never touches a live session of another harness; otherwise a live session
 /// wins, preferring the primary when several are live.
-pub(crate) fn select_harness(
+pub fn select_harness(
     pinned: Option<HarnessId>,
     primary: HarnessId,
     live: Vec<HarnessId>,
@@ -1291,9 +1291,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_wt_session_wins_over_saved_primary_and_a_foreign_live_slot() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let wt_source = fixture._root.path().join("wt-source");
         fs::create_dir_all(&wt_source).unwrap();
         {
@@ -1352,9 +1350,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unretainable_first_attach_still_attaches_without_switching() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         std::sync::Arc::make_mut(&mut fixture.ctx.config)
             .tmux
             .socket = format!(
@@ -1391,9 +1387,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_keys_keep_the_agent_identity_and_reject_a_replacement() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         std::sync::Arc::make_mut(&mut fixture.ctx.config)
             .tmux
             .socket = format!(
@@ -1482,9 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn pi_existing_attach_paths_reject_an_unowned_same_name_slot() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         std::sync::Arc::make_mut(&mut fixture.ctx.config)
             .tmux
             .socket = format!(
@@ -1602,9 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_wakes_prepare_exact_worktree_and_special_root_trust_before_dispatch() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let mut app = AppHarness::new(&fixture.ctx);
         // Do not inherit the test runner's selected CODEX_HOME.
         app.codex_config = fixture.ctx.home.join("selected-codex/config.toml");
@@ -1639,9 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_preparation_rejects_unowned_and_mismatched_roots() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let mut app = AppHarness::new(&fixture.ctx);
         app.codex_config = fixture.ctx.home.join("selected-codex/config.toml");
         for (slug, cwd) in [
@@ -1867,9 +1855,7 @@ mod tests {
     #[tokio::test]
     async fn wt_slot_cold_starts_select_the_account_and_refuse_on_helper_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
-            .await
-            .unwrap();
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let root = fixture._root.path().to_owned();
         let wt_source = root.join("wt-source");
         fs::create_dir_all(&wt_source).unwrap();

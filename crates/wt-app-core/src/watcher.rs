@@ -11,11 +11,11 @@
 use std::time::Duration;
 
 #[cfg(target_os = "macos")]
-pub(crate) type WtWatcher = notify::PollWatcher;
+pub type WtWatcher = notify::PollWatcher;
 #[cfg(not(target_os = "macos"))]
-pub(crate) type WtWatcher = notify::RecommendedWatcher;
+pub type WtWatcher = notify::RecommendedWatcher;
 
-pub(crate) fn new<F>(handler: F) -> notify::Result<WtWatcher>
+pub fn new<F>(handler: F) -> notify::Result<WtWatcher>
 where
     F: notify::EventHandler,
 {

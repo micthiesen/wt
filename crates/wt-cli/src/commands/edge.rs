@@ -13,10 +13,8 @@ use wt_core::{
 use wt_store::MergeEdge as StoredMergeEdge;
 use wt_vcs::WorktreeRecord;
 
-use crate::{
-    commands::resolve::{resolve_named_worktree, run_git},
-    context::AppContext,
-};
+use crate::commands::resolve::{resolve_named_worktree, run_git};
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct EdgeArgs {
@@ -404,7 +402,7 @@ mod tests {
 
     #[tokio::test]
     async fn edge_attribution_uses_third_worktree_as_author() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let third = fixture.ctx.config.paths.worktree_root.join("three");
@@ -449,7 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn edge_assertion_persists_both_head_anchors_and_removes_pair() {
-        use crate::commands::test_support::CommandFixture;
+        use wt_app_core::test_support::CommandFixture;
         let fixture = CommandFixture::new().await.unwrap();
         let args = EdgeArgs {
             from: Some("one".into()),

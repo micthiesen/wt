@@ -12,7 +12,8 @@ use wt_runtime::{
 use wt_tui::Board;
 use wt_vcs::WorktreeSnapshot;
 
-use crate::{context::AppContext, freshness, inventory};
+use crate::{freshness, inventory};
+use wt_app_core::context::AppContext;
 
 pub type Metadata = (Value, BTreeSet<String>);
 
@@ -172,7 +173,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_changes_reuse_git_facts_while_git_is_busy_or_failed() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let scope = TaskScope::new();
@@ -243,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn restored_git_inventory_publishes_a_restored_board_before_any_fetch() {
-        let mut fixture = crate::commands::test_support::CommandFixture::new()
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         let caches = tempfile::tempdir().unwrap();

@@ -9,10 +9,10 @@ use wt_harness::DerivedState;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, SessionTarget, SessionView, TerminalSlotView};
 
-use crate::feeds::FailureClock;
-use crate::harness::{AgentTarget, AgentTargetKind, AppHarness};
 use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto};
 use crate::session_source::{SessionDiscoveries, SessionInventory, SessionSources};
+use wt_app_core::feeds::FailureClock;
+use wt_app_core::harness::{AgentTarget, AgentTargetKind, AppHarness};
 
 pub fn overlay(
     scope: &TaskScope,
@@ -270,7 +270,7 @@ fn compose(
             };
             board.session_menus.insert(
                 wt_tui::session_menu_key(Some(&row.key), SessionTarget::Harness),
-                crate::harness::picker_entries(
+                wt_app_core::harness::picker_entries(
                     &visible,
                     &agent,
                     Some(row.key.clone()),
@@ -286,7 +286,9 @@ fn compose(
         for (target, agent) in slots {
             board.session_menus.insert(
                 wt_tui::session_menu_key(None, *target),
-                crate::harness::picker_entries(&visible, agent, None, *target, discovered, &live),
+                wt_app_core::harness::picker_entries(
+                    &visible, agent, None, *target, discovered, &live,
+                ),
             );
         }
     }
@@ -350,7 +352,7 @@ fn compose(
                 .find(|harness| harness.as_str() == primary);
         }
     }
-    crate::feeds::bound_feeds(&mut board);
+    wt_app_core::feeds::bound_feeds(&mut board);
     source
         .with_data(Some(Arc::new(board)))
         .with_input(&inventory)

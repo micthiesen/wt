@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::{context::AppContext, restack_action};
+use crate::restack_action;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args)]
 pub struct RestackWorkerArgs {

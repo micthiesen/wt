@@ -12,7 +12,7 @@ use wt_stack::{
 use wt_store::RepositoryIdentity;
 use wt_tui::{Board, UiReply};
 
-use crate::{context::AppContext, harness::AppHarness};
+use wt_app_core::{context::AppContext, harness::AppHarness};
 
 const ACTION_ID: &str = "wt-restack";
 
@@ -115,7 +115,7 @@ pub async fn start(
         auto_fire_keys: Vec::new(),
         config_selectors,
     };
-    match crate::actions::service(context)?
+    match wt_app_core::actions::service(context)?
         .start(request, &context.cancellation)
         .await
     {

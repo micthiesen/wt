@@ -1,7 +1,7 @@
-use crate::{context::AppContext, editor, prompt};
 use anyhow::{Result, bail};
 use clap::Args;
 use std::io::IsTerminal;
+use wt_app_core::{context::AppContext, editor, prompt};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct OpenArgs {

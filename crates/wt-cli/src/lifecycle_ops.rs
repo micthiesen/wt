@@ -11,7 +11,8 @@ use wt_lifecycle::{LifecycleService, ServiceConfig};
 use wt_runtime::Confirmed;
 use wt_vcs::WorktreeRecord;
 
-use crate::{commands::resolve::run_git, context::AppContext};
+use crate::commands::resolve::run_git;
+use wt_app_core::context::AppContext;
 
 pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
     let context = ctx.clone();
@@ -46,7 +47,7 @@ pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
         }
     });
     Ok(if ctx.config.dev_server.is_some() {
-        service.with_dev_server(crate::dev::service(ctx)?)
+        service.with_dev_server(wt_app_core::dev::service(ctx)?)
     } else {
         service
     })
@@ -346,7 +347,7 @@ async fn plan_with_evidence(
                 extra.insert("title".into(), serde_json::json!(title));
             }
             if let Some(issue_id) =
-                crate::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
+                wt_app_core::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
             {
                 extra.insert("issueId".into(), serde_json::json!(issue_id));
             }
@@ -681,7 +682,7 @@ fn same_revision(plan: &wt_lifecycle::RemovalRevision, expected: &wt_tui::Remova
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
+    use wt_app_core::test_support::CommandFixture;
 
     #[test]
     fn board_confirmation_rejects_head_changes_during_planning() {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const MAX_HOLD_MS: i128 = 60 * 60 * 1000;
 const HOLD_FILE: &str = "communication-holds.json";

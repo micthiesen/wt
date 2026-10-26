@@ -12,7 +12,7 @@ use wt_runtime::{
 };
 use wt_tui::{Board, PerfView};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(2);
 

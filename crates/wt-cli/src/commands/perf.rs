@@ -9,7 +9,7 @@ use std::{
 use wt_platform::process::CommandSpec;
 use wt_tui::{PerfGroupView, PerfProcessView, PerfTone, PerfView};
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct PerfArgs {
@@ -299,7 +299,7 @@ pub fn short_command(command: &str) -> String {
 fn sampled_at_label(sampled_at_ms: u128) -> String {
     let millis = u64::try_from(sampled_at_ms).unwrap_or(u64::MAX);
     if let Some((year, month, day, hour, minute, second)) =
-        crate::display_time::local_time_components(millis)
+        wt_app_core::display_time::local_time_components(millis)
     {
         return format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}");
     }

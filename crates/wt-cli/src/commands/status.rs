@@ -16,7 +16,8 @@ use wt_core::{
 use wt_platform::process::CommandSpec;
 use wt_store::WorkStatusRecord as StoredWorkStatusRecord;
 
-use crate::{commands::resolve::resolve_worktree, context::AppContext, database::Database};
+use crate::commands::resolve::resolve_worktree;
+use wt_app_core::{context::AppContext, database::Database};
 
 const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo; --verify-after-merge records checks owed after deployment.";
 
@@ -918,7 +919,7 @@ mod tests {
 
     #[tokio::test]
     async fn base_lookup_distinguishes_missing_ref_from_cancellation() {
-        let fixture = crate::commands::test_support::CommandFixture::new()
+        let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
         assert!(base_tip_sha(&fixture.ctx, "main").await.unwrap().is_some());
@@ -978,7 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_writes_gate_then_unblocks_without_changing_assertion_time() {
-        use crate::commands::test_support::CommandFixture;
+        use wt_app_core::test_support::CommandFixture;
         let fixture = CommandFixture::new().await.unwrap();
         let mut set = StatusArgs {
             positionals: vec!["todo".into()],
@@ -1006,7 +1007,7 @@ mod tests {
     }
     #[tokio::test]
     async fn removed_row_settles_only_an_owed_post_merge_check() {
-        use crate::commands::test_support::CommandFixture;
+        use wt_app_core::test_support::CommandFixture;
         let fixture = CommandFixture::new().await.unwrap();
         let removed = |slug: &str, state: &str, verify: Option<&str>| wt_store::RemovedWorktree {
             slug: slug.into(),

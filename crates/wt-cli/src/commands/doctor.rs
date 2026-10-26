@@ -6,13 +6,11 @@ use wt_github::{GithubClient, GithubOptions};
 use wt_harness::stale_harness_shims;
 use wt_platform::process::CommandSpec;
 
-use crate::{
-    commands::{
-        diagnostics::{Check, CheckStatus, display_status, worst},
-        resolve::worktree_at_cwd,
-    },
-    context::AppContext,
+use crate::commands::{
+    diagnostics::{Check, CheckStatus, display_status, worst},
+    resolve::worktree_at_cwd,
 };
+use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct DoctorArgs {
@@ -530,8 +528,8 @@ async fn check_merged(ctx: &AppContext, worktree: &Path, trunk: &str) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::CommandFixture;
     use sha2::{Digest, Sha256};
+    use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
     async fn sst_health_reports_owned_pins_and_outputs_as_deployed() {

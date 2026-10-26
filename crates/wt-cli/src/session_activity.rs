@@ -31,10 +31,10 @@ use wt_runtime::{
 };
 use wt_tmux::{TmuxClient, TmuxServer};
 
-use crate::{
+use crate::session_source::{SessionDiscoveries, SessionInventory, SessionKey, SessionSources};
+use wt_app_core::{
     context::AppContext,
     harness::{AgentTarget, AppHarness},
-    session_source::{SessionDiscoveries, SessionInventory, SessionKey, SessionSources},
 };
 
 const ACTIVITY_INTERVAL: Duration = Duration::from_millis(2_500);
@@ -53,7 +53,7 @@ type RolloutFingerprint = Option<(u64, std::time::SystemTime)>;
 /// handler filters back to retained UUID paths. A metadata-only 500ms backstop
 /// catches dropped notifications without rereading unchanged transcripts.
 struct CodexOutputWatch {
-    watcher: Option<crate::watcher::WtWatcher>,
+    watcher: Option<wt_app_core::watcher::WtWatcher>,
     watched_paths: Arc<RwLock<BTreeSet<PathBuf>>>,
     directories: BTreeSet<PathBuf>,
     updates: mpsc::Receiver<()>,
@@ -98,7 +98,8 @@ impl CodexOutputWatch {
                 }
             }
         });
-        let watcher = crate::watcher::new(Self::event_handler(Arc::clone(&watched_paths), sender));
+        let watcher =
+            wt_app_core::watcher::new(Self::event_handler(Arc::clone(&watched_paths), sender));
         let watcher = match watcher {
             Ok(watcher) => Some(watcher),
             Err(error) => {
@@ -358,7 +359,7 @@ pub fn start(
         TmuxServer::named(context.config.tmux.socket.clone()).with_cwd(context.home.clone()),
     );
     let codex = CodexHarness::new(
-        crate::harness::codex_paths(&context.home, &context.config.paths.cache_root),
+        wt_app_core::harness::codex_paths(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         tmux.clone(),
     );
@@ -368,7 +369,7 @@ pub fn start(
         tmux.clone(),
     );
     let pi = PiHarness::new(
-        crate::harness::pi_paths(&context.home, &context.config.paths.cache_root),
+        wt_app_core::harness::pi_paths(&context.home, &context.config.paths.cache_root),
         context.processes.clone(),
         tmux,
     );
@@ -481,7 +482,7 @@ pub fn start(
                 commands.discover(slug, harness);
             }
             snapshot.primary =
-                Some(crate::harness::read_primary(&primary_path, primary_fallback).await.as_str().to_owned());
+                Some(wt_app_core::harness::read_primary(&primary_path, primary_fallback).await.as_str().to_owned());
             let errors = usage_error
                 .iter()
                 .cloned()
@@ -504,7 +505,7 @@ pub fn start(
                 );
             }
         }
-        crate::watcher_cleanup::drop_watcher(codex_watch).await;
+        wt_app_core::watcher_cleanup::drop_watcher(codex_watch).await;
     });
     SessionActivitySources {
         activity: activity.view(),
@@ -1405,8 +1406,8 @@ mod tests {
 
     #[tokio::test]
     async fn active_polling_rechecks_exact_identity_even_if_discovery_claims_live() {
-        use crate::commands::test_support::CommandFixture;
         use crate::session_source::{DiscoveredSession, SessionDescriptor};
+        use wt_app_core::test_support::CommandFixture;
         let fixture = CommandFixture::new().await.unwrap();
         let app = AppHarness::new(&fixture.ctx);
         let worktrees = fixture
@@ -1528,7 +1529,7 @@ mod tests {
             },
             target: AgentTarget {
                 slug: "fixture".into(),
-                kind: crate::harness::AgentTargetKind::Worktree,
+                kind: wt_app_core::harness::AgentTargetKind::Worktree,
                 branch: Some("feature/fixture".into()),
                 cwd,
                 managed_name: None,

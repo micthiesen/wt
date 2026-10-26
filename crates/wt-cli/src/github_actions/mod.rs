@@ -26,7 +26,8 @@ use self::{
     retry::{Retries, RetryCancel, RetryStart},
     writes::{GithubWrite, Guard, WriteLedger, effective_pr, spawn_confirmer},
 };
-use crate::{context::AppContext, github_source::GithubRefresh};
+use crate::github_source::GithubRefresh;
+use wt_app_core::context::AppContext;
 
 const FAILED_LOG_LIMIT: usize = 200;
 /// The write named a PR the host cannot confirm as the one the user saw.
@@ -131,7 +132,7 @@ impl GithubActions {
         if let Some(pin) = action.write_pin()
             && !pin_matches(pin, pr)
         {
-            return Err(crate::host_errors::stale(STALE_PIN));
+            return Err(wt_app_core::host_errors::stale(STALE_PIN));
         }
         let Some(pr) = pr else {
             return Ok(UiReply {

@@ -11,7 +11,7 @@ use wt_runtime::{
 };
 use wt_tui::Board;
 
-use crate::context::AppContext;
+use wt_app_core::context::AppContext;
 
 const BACKSTOP: Duration = Duration::from_secs(15);
 
@@ -40,7 +40,7 @@ pub fn overlay(
             let rows = worktrees(&local.snapshot());
             async move {
                 Ok::<_, anyhow::Error>(
-                    crate::dev::service(&context)?
+                    wt_app_core::dev::service(&context)?
                         .status_all(&rows, &cancel)
                         .await?
                         .worktrees,
@@ -145,20 +145,21 @@ fn watch(scope: &TaskScope, directory: PathBuf, source: SourceHandle<Vec<DevStat
         let callback = source.clone();
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
-            let mut watcher = crate::watcher::new(move |event: notify::Result<notify::Event>| {
-                match event {
-                    Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
-                    // Streaming log output must not turn into status polling.
-                    Ok(event)
-                        if event
-                            .paths
-                            .iter()
-                            .any(|path| path.extension().is_some_and(|ext| ext == "log")) => {}
-                    _ => {
-                        callback.refresh();
+            let mut watcher =
+                wt_app_core::watcher::new(move |event: notify::Result<notify::Event>| {
+                    match event {
+                        Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => {}
+                        // Streaming log output must not turn into status polling.
+                        Ok(event)
+                            if event
+                                .paths
+                                .iter()
+                                .any(|path| path.extension().is_some_and(|ext| ext == "log")) => {}
+                        _ => {
+                            callback.refresh();
+                        }
                     }
-                }
-            })?;
+                })?;
             watcher.watch(&directory, RecursiveMode::Recursive)?;
             Ok::<_, anyhow::Error>(watcher)
         })
@@ -179,7 +180,7 @@ fn watch(scope: &TaskScope, directory: PathBuf, source: SourceHandle<Vec<DevStat
                 _ = interval.tick() => { source.refresh(); }
             }
         }
-        crate::watcher_cleanup::drop_watcher(watcher).await;
+        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
     });
 }
 
