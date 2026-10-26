@@ -23,7 +23,8 @@ class Check:
     name: str
     args: tuple[str, ...]
     env: dict[str, str] = field(default_factory=dict)
-    # Measures machine resources, so it runs after the others, alone.
+    # Measures machine resources or terminal responsiveness, so it runs after
+    # the shared checks, alone: parallel load would make its deadlines flaky.
     exclusive: bool = False
 
 
@@ -41,11 +42,11 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         check("release installation, update and rollback", "release", "--binary", binary,
               "--launcher", str(Path(binary).with_name("wt-launcher"))),
         check("terminal liveness and filesystem refresh", "ui", "--binary", binary,
-              "--sections", "--feeds", "--output", str(output / "wt-native-ui")),
+              "--sections", "--feeds", "--output", str(output / "wt-native-ui"), exclusive=True),
         check("shutdown with Git children in flight", "ui", "--binary", binary,
-              "--exit-signal", "TERM", "--output", str(output / "wt-native-signal")),
+              "--exit-signal", "TERM", "--output", str(output / "wt-native-signal"), exclusive=True),
         check("terminal handoff and return", "session", "--binary", binary,
-              "--output", str(output / "wt-native-session")),
+              "--output", str(output / "wt-native-session"), exclusive=True),
         check("detached lifecycle and CLI prompts", "lifecycle",
               env={"WT_NATIVE_BIN": binary, "WT_GITHUB": "off"}),
         check("cleanup safety", "cleanup", env={"WT_NATIVE_BIN": binary}),
@@ -59,9 +60,9 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         check("state migration and diagnostics", "command", binary),
         check("SST cleanup", "stages", "--binary", binary),
         check("optimistic creation and navigation", "ui", "--binary", binary,
-              "--create", "--create-section", "--output", str(output / "wt-native-create")),
+              "--create", "--create-section", "--output", str(output / "wt-native-create"), exclusive=True),
         check("overlapping removal and prompt responsiveness", "ui", "--binary", binary,
-              "--removal", "--output", str(output / "wt-native-removal")),
+              "--removal", "--output", str(output / "wt-native-removal"), exclusive=True),
     ]
     if system == "Linux":
         checks.append(check("Linux CPU and RAM workload limits", "workload", "--binary", binary,

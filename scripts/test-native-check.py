@@ -222,10 +222,18 @@ class NativeCheckTests(unittest.TestCase):
         self.assertEqual(runner.run_parallel(failing, {}, 3, run), 7)
         self.assertNotIn("workload", order)
 
-    def test_linux_workload_check_is_exclusive(self):
+    def test_resource_and_terminal_timing_checks_run_alone(self):
+        # Workload measures CPU and memory limits; the terminal checks assert
+        # responsiveness deadlines that parallel load would make flaky.
         linux = runner.plan(Path("/candidate/wt"), Path("/diagnostics"), "Linux")
-        self.assertEqual([check.args[1] for check in linux if check.exclusive],
-                         ["scripts/native-workload-check.py"])
+        self.assertEqual([check.name for check in linux if check.exclusive], [
+            "terminal liveness and filesystem refresh",
+            "shutdown with Git children in flight",
+            "terminal handoff and return",
+            "optimistic creation and navigation",
+            "overlapping removal and prompt responsiveness",
+            "Linux CPU and RAM workload limits",
+        ])
 
 
 if __name__ == "__main__":

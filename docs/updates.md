@@ -79,8 +79,9 @@ streams directly to the terminal; a failing check stops the suite with its exit
 status and name. The runner prints the retained diagnostics directory.
 `--jobs N` (or `WT_NATIVE_JOBS`) runs N checks at once, about 4x faster: each
 check owns its temp home, sockets and tmux server. Each check's output is then
-printed whole when it finishes, every failure is reported, and the Linux
-workload check, which measures CPU and memory limits, runs last and alone. CI
+printed whole when it finishes, every failure is reported, and checks that
+measure CPU and memory limits or terminal responsiveness run last, one at a
+time (see [ci.md](ci.md#native-end-to-end-checks)). CI
 runs one check per runner core.
 
 Install the pinned Rust toolchain, Python 3, tmux, SSH tools and lsof first

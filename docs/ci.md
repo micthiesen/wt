@@ -78,10 +78,13 @@ release or commit, and `CARGO_PKG_VERSION` would read `0.0.0` there.
 
 `scripts/native-check.py` runs the native suite. CI sets `WT_NATIVE_JOBS` to
 one check per runner core. Each check owns its own temporary home, sockets and
-tmux server, so checks can share a machine. The Linux workload check measures
-CPU and memory limits, so it is marked exclusive and runs last, alone. A new
-check that uses a fixed path, port or global service must be made isolated or
-marked exclusive.
+tmux server, so checks can share a machine. Checks marked exclusive run after
+the shared ones, one at a time: the Linux workload check, which measures CPU and
+memory limits, and the terminal UI and session checks, which assert
+responsiveness deadlines (some as short as 0.5 seconds) that parallel load made
+flaky on the 3-core macOS runner. Do not lengthen those deadlines to make a
+check pass in parallel; they are the regression signal. A new check that uses a
+fixed path, port or global service must be made isolated or marked exclusive.
 
 ## Concurrency
 
