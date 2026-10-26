@@ -10,12 +10,22 @@ supported targets are documented in [the distribution design](rust-distribution-
 Stable follows the latest non-prerelease release. Preview follows the latest
 `preview-<fullsha>` prerelease. Pushes to `main` no longer publish one; publish
 a preview of `main` on demand with `gh workflow run release.yml --ref main -f
-publish=true`, which runs the same checks and packaging as a tag. `wt update --channel stable|preview` persists a
-channel choice; otherwise the saved channel is used. `wt update --check` checks
+publish=true`, which runs the same checks and packaging as a tag.
+`wt update --channel stable|preview` persists a channel choice; otherwise the
+saved channel is used. `wt update --check` checks
 metadata without installing. `wt update --release <tag>` selects one exact
 release for testing, including `rust-test-*` tags. Those test tags are never
 selected by normal stable or preview discovery. `wt update log` prints local
 update history. The old `--head` source-update option is rejected.
+
+An update takes effect for new processes only. A running board keeps its
+binary until it restarts. So does every agent session wt started before the
+update: wt puts the running version's own `bin` directory
+(`~/.local/share/wt/versions/<version>/bin`) first on each session's `PATH`, so
+the session's agents and the commands they run keep using the wt build that
+started them. A long-lived session, such as the manager, keeps calling that
+older wt until it is restarted. To reach the new version from such a session,
+call the stable launcher by its path (`~/.local/bin/wt`).
 
 `wt install` installs a verified release and can create the `~/.local/bin/wt`
 launcher link. `scripts/install.sh` is the bootstrap installer for machines
