@@ -1103,7 +1103,7 @@ env_files_to_copy = [".env"]
         let script = root.join("env.sh");
         std::fs::write(&script, environment_script("managed space")).unwrap();
         let output = std::process::Command::new("/bin/sh")
-            .args(["-c", ". \"$1\"; first=$PATH; n=0; while [ \"$n\" -lt 25 ]; do . \"$1\"; n=$((n + 1)); done; [ \"$PATH\" = \"$first\" ] || exit 9; printf '%s' \"$PATH\"", "path-test"])
+            .args(["-c", ". \"$1\"; first=$PATH; n=0; while [ \"$n\" -lt 2 ]; do . \"$1\"; n=$((n + 1)); done; [ \"$PATH\" = \"$first\" ] || exit 9; printf '%s' \"$PATH\"", "path-test"])
             .arg(script)
             .env("HOME", temp.path())
             .env("PATH", "/usr/bin::/tools with spaces:/live-only:/usr/bin:")

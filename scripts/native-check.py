@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ class Check:
     name: str
     args: tuple[str, ...]
     env: dict[str, str] = field(default_factory=dict)
+    # Measures machine resources, so it runs after the others, alone.
+    exclusive: bool = False
 
 
 def plan(binary: Path, output: Path, system: str) -> list[Check]:
@@ -29,8 +32,9 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
         raise ValueError(f"native checks support Linux and macOS, got {system}")
     binary = str(binary)
 
-    def check(name: str, script: str, *args: str, env=None) -> Check:
-        return Check(name, (sys.executable, f"scripts/native-{script}-check.py", *args), env or {})
+    def check(name: str, script: str, *args: str, env=None, exclusive=False) -> Check:
+        return Check(name, (sys.executable, f"scripts/native-{script}-check.py", *args), env or {},
+                     exclusive)
 
     checks = [
         check("bootstrap installation and launcher recovery", "install"),
@@ -61,13 +65,52 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
     ]
     if system == "Linux":
         checks.append(check("Linux CPU and RAM workload limits", "workload", "--binary", binary,
-                            "--output", str(output / "wt-native-workload")))
+                            "--output", str(output / "wt-native-workload"), exclusive=True))
     if system == "Darwin":
         checks.append(check("webhooks and service ownership", "events", "--binary", binary))
     return checks
 
 
-def run_checks(checks: list[Check], environment: dict[str, str], run=subprocess.run) -> int:
+def run_parallel(checks: list[Check], environment: dict[str, str], jobs: int,
+                 run=subprocess.run) -> int:
+    """Run shared checks `jobs` at a time, then exclusive ones alone. Each
+    check's output is captured and printed whole when it finishes."""
+    shared = [check for check in checks if not check.exclusive]
+    exclusive = [check for check in checks if check.exclusive]
+    if jobs <= 1 or len(shared) <= 1:
+        return run_checks(checks, environment, run)
+
+    def one(check: Check):
+        try:
+            return check, run(check.args, cwd=ROOT, env={**environment, **check.env}, check=False,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except OSError as error:
+            return check, error
+
+    failed = 0
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        for done, (check, result) in enumerate(pool.map(one, shared), 1):
+            print(f"\n[{done}/{len(checks)}] {check.name}", flush=True)
+            print(shlex.join(check.args), flush=True)
+            if isinstance(result, OSError):
+                print(f"FAILED to start {check.name}: {result}", file=sys.stderr, flush=True)
+                failed = failed or 127
+                continue
+            sys.stdout.write((result.stdout or b"").decode(errors="replace"))
+            sys.stdout.flush()
+            if result.returncode:
+                print(f"FAILED: {check.name} (exit {result.returncode})", file=sys.stderr, flush=True)
+                failed = failed or (result.returncode if result.returncode > 0 else 128 - result.returncode)
+    if failed:
+        return failed
+    code = run_checks(exclusive, environment, run, quiet_success=True) if exclusive else 0
+    if code == 0:
+        print(f"\nAll {len(checks)} native checks passed.", flush=True)
+    return code
+
+
+def run_checks(checks: list[Check], environment: dict[str, str], run=subprocess.run,
+               quiet_success: bool = False) -> int:
     for index, check in enumerate(checks, 1):
         print(f"\n[{index}/{len(checks)}] {check.name}", flush=True)
         print(shlex.join(check.args), flush=True)
@@ -79,7 +122,8 @@ def run_checks(checks: list[Check], environment: dict[str, str], run=subprocess.
         if result.returncode:
             print(f"FAILED: {check.name} (exit {result.returncode})", file=sys.stderr, flush=True)
             return result.returncode if result.returncode > 0 else 128 - result.returncode
-    print(f"\nAll {len(checks)} native checks passed.", flush=True)
+    if not quiet_success:
+        print(f"\nAll {len(checks)} native checks passed.", flush=True)
     return 0
 
 
@@ -109,6 +153,8 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, default=Path("target/debug/wt"))
     parser.add_argument("--output", type=Path, help="retained UI/session/action diagnostics directory")
     parser.add_argument("--build", action="store_true", help="build workspace bins/examples first; otherwise use the existing build")
+    parser.add_argument("--jobs", type=int, default=int(os.environ.get("WT_NATIVE_JOBS", "1")),
+                        help="checks to run at once (default 1, or WT_NATIVE_JOBS)")
     args = parser.parse_args()
     environment = dict(os.environ)
     if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", environment.get("WT_BUILD_ID", "")):
@@ -130,7 +176,7 @@ def main() -> int:
         checks = plan(binary, output, platform.system())
     except ValueError as error:
         parser.error(str(error))
-    return run_checks(checks, environment)
+    return run_parallel(checks, environment, args.jobs)
 
 
 if __name__ == "__main__":

@@ -98,6 +98,9 @@ jobs:
     env:
       # The release check requires a full commit SHA as the build identity.
       WT_BUILD_ID: ${{ github.sha }}
+      # Each check owns its temp home, sockets and tmux server, so they share
+      # the runner; one per core (macOS runners have 3, Linux 4).
+      WT_NATIVE_JOBS: ${{ matrix.os == 'macos-latest' && '3' || '4' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain

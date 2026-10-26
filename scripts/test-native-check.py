@@ -192,5 +192,41 @@ class NativeCheckTests(unittest.TestCase):
                          lambda args, **kwargs: subprocess.CompletedProcess(args, -15)), 143)
 
 
+    def test_parallel_runs_exclusive_checks_last_and_alone_and_reports_failure(self):
+        import threading
+        lock = threading.Lock()
+        running, peak, order = [0], [0], []
+
+        def run(args, **kwargs):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+                order.append(args[0])
+            try:
+                # Exclusive checks must see nothing else running.
+                if args[0] == "workload":
+                    self.assertEqual(running[0], 1)
+                return subprocess.CompletedProcess(args, 7 if args[0] == "bad" else 0, b"out\n")
+            finally:
+                with lock:
+                    running[0] -= 1
+
+        checks = [runner.Check(name, (name,)) for name in ("a", "b", "c", "d")]
+        checks.append(runner.Check("workload", ("workload",), exclusive=True))
+        self.assertEqual(runner.run_parallel(checks, {}, 3, run), 0)
+        self.assertEqual(order[-1], "workload")
+        self.assertLessEqual(peak[0], 3)
+        # A shared failure is reported and the exclusive check never starts.
+        order.clear()
+        failing = [runner.Check("bad", ("bad",)), *checks]
+        self.assertEqual(runner.run_parallel(failing, {}, 3, run), 7)
+        self.assertNotIn("workload", order)
+
+    def test_linux_workload_check_is_exclusive(self):
+        linux = runner.plan(Path("/candidate/wt"), Path("/diagnostics"), "Linux")
+        self.assertEqual([check.args[1] for check in linux if check.exclusive],
+                         ["scripts/native-workload-check.py"])
+
+
 if __name__ == "__main__":
     unittest.main()
