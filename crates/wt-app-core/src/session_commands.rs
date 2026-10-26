@@ -970,6 +970,7 @@ mod tests {
             .kill_session("one-opencode", &fixture.ctx.cancellation)
             .await
             .unwrap();
+        fixture.close().await.unwrap();
         assert!(crate::host_errors::error_reply(&unseen.err().unwrap()).stale);
         assert!(!crate::host_errors::error_reply(&seen.err().unwrap()).stale);
     }
@@ -1011,6 +1012,7 @@ mod tests {
             .kill_session("one-opencode", &fixture.ctx.cancellation)
             .await
             .unwrap();
+        fixture.close().await.unwrap();
         let (_, options) = result.unwrap();
         assert!(
             options

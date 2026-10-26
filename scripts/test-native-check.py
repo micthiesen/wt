@@ -157,9 +157,13 @@ class NativeCheckTests(unittest.TestCase):
                   runner.Check("must not run", ("second",))]
         self.assertEqual(runner.run_checks(checks, {"WT_BUILD_ID": "a" * 40}, run), 23)
         self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][1], {"cwd": runner.ROOT,
-                                     "env": {"WT_BUILD_ID": "a" * 40, "WT_GITHUB": "off"},
-                                     "check": False})
+        env = calls[0][1].pop("env")
+        self.assertEqual(calls[0][1], {"cwd": runner.ROOT, "check": False})
+        # Each check gets its own tmux socket directory, removed afterwards.
+        tmux_tmp = env.pop("TMUX_TMPDIR")
+        self.assertTrue(tmux_tmp.startswith("/tmp/wt-tmux-"))
+        self.assertFalse(Path(tmux_tmp).exists())
+        self.assertEqual(env, {"WT_BUILD_ID": "a" * 40, "WT_GITHUB": "off"})
 
     def test_probe_requires_exact_candidate_identity(self):
         expected = "a" * 40

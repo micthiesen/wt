@@ -11,6 +11,7 @@ from pathlib import Path
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,18 @@ def plan(binary: Path, output: Path, system: str) -> list[Check]:
     return checks
 
 
+def run_check(check: Check, environment: dict[str, str], run, **kwargs):
+    """Run one check with its own tmux socket directory, removed afterwards.
+    tmux never deletes a socket file, so checks would otherwise leave one in
+    the user's /tmp/tmux-<uid> per server; a check may still set its own."""
+    tmux_tmp = tempfile.mkdtemp(prefix="wt-tmux-", dir="/tmp")
+    try:
+        env = {**environment, "TMUX_TMPDIR": tmux_tmp, **check.env}
+        return run(check.args, cwd=ROOT, env=env, check=False, **kwargs)
+    finally:
+        shutil.rmtree(tmux_tmp, ignore_errors=True)
+
+
 def run_parallel(checks: list[Check], environment: dict[str, str], jobs: int,
                  run=subprocess.run) -> int:
     """Run shared checks `jobs` at a time, then exclusive ones alone. Each
@@ -83,8 +96,8 @@ def run_parallel(checks: list[Check], environment: dict[str, str], jobs: int,
 
     def one(check: Check):
         try:
-            return check, run(check.args, cwd=ROOT, env={**environment, **check.env}, check=False,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            return check, run_check(check, environment, run,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         except OSError as error:
             return check, error
 
@@ -116,7 +129,7 @@ def run_checks(checks: list[Check], environment: dict[str, str], run=subprocess.
         print(f"\n[{index}/{len(checks)}] {check.name}", flush=True)
         print(shlex.join(check.args), flush=True)
         try:
-            result = run(check.args, cwd=ROOT, env={**environment, **check.env}, check=False)
+            result = run_check(check, environment, run)
         except OSError as error:
             print(f"FAILED to start {check.name}: {error}", file=sys.stderr, flush=True)
             return 127

@@ -101,7 +101,26 @@ impl CommandFixture {
     }
 
     pub async fn close(&self) -> Result<()> {
+        remove_tmux_server(&self.ctx, &self.ctx.config.tmux.socket).await;
         self.ctx.database.clone().shutdown().await
+    }
+}
+
+/// Stop a fixture's tmux server and delete its socket file, which tmux leaves
+/// behind even after `kill-server`. Only a socket at tmux's own path for this
+/// name is removed.
+pub async fn remove_tmux_server(ctx: &AppContext, socket: &str) {
+    let tmux = wt_tmux::TmuxClient::new(ctx.processes.clone(), wt_tmux::TmuxServer::named(socket));
+    let _ = tmux.kill_server(&ctx.cancellation).await;
+    let base = std::env::var_os("TMUX_TMPDIR").unwrap_or_else(|| "/tmp".into());
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let path = std::path::Path::new(&base)
+        .join(format!("tmux-{uid}"))
+        .join(socket);
+    use std::os::unix::fs::FileTypeExt;
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_socket()) {
+        let _ = fs::remove_file(path);
     }
 }
 
