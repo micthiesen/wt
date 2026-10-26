@@ -31,13 +31,44 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-tmux` | Cancellable tmux transport for a caller-selected server and socket; never reads wt configuration or ambient `$TMUX` |
 | `xtask` | Repository tooling: `cargo xtask gate`, `deps-check`, `hygiene` (see [development.md](development.md)) |
 
+### Application layering
+
+The application is five library crates in a strict order, each depending only
+on those before it: `wt-app-core`, then `wt-ops`, then `wt-sources`, then
+`wt-host`, then `wt-cli` (library crate `wt`). `wt-app` is the binary on top.
+The order is enforced by Cargo: a lower crate cannot name a higher one. When
+code in a lower layer needs something from a higher one, move that item down
+to where both can reach it (as `Lane`, `stale` and the feed helpers moved to
+`wt-app-core`); never pass it around the boundary with callbacks or
+duplicates.
+
+- `wt-app-core`: context, database, build identity, harness glue, the host wire
+  protocol, lane classification, feeds and small shared helpers.
+- `wt-ops`: operations the CLI and the host both run, and the command
+  implementations they reuse (`wt_ops::commands::{_destroy, new, remove, ...}`).
+- `wt-sources`: the source graph that prepares the board.
+- `wt-host`: the controller, host service and dispatch, remote hosts, palettes.
+- `wt-cli`: `wt::main` and the remaining CLI commands.
+
+Splitting keeps CI and test rebuilds proportional to the layers an edit touches
+(an edit to a CLI command recompiles `wt-cli` alone). It costs release binary
+size: each crate keeps its own copies of the generic and inline code it uses,
+which stable Rust cannot share in optimized builds, so the five-crate binary is
+about 27% larger than the single crate was (38 MB against 30 MB, v0.1.35). See
+[ci.md](ci.md) for how caching relies on the split.
+
+Each module logs under its crate's name (`wt_sources::freshness`,
+`wt_ops::events`), except explicit targets such as `wt::origin` and `wt::removal`.
+The activity feed accepts any `wt_*` target; anything that filters or matches on
+a target must use the module's current crate.
+
 `crates/wt-cli/src/lib.rs` (`wt::main`) is the composition root; the binary
 only installs its build identity (`build_info.rs`) and calls it. It resolves one
 configuration for the process, opens the repository-scoped database, builds an
 `AppContext`, and starts either a CLI operation, the local host, or the remote
-worker protocol. `sources.rs` composes the host-local source graph; the GitHub
-leaf's fetch scheduling (rate floor, events-daemon arbitration, deferred reads)
-lives in `github_source.rs`. A remote
+worker protocol. `wt-sources`' `sources.rs` composes the host-local source
+graph; the GitHub leaf's fetch scheduling (rate floor, events-daemon
+arbitration, deferred reads) lives in `github_source.rs`. A remote
 host runs the same source and action pipeline as a local host; the controller
 combines the resulting snapshots for display.
 
@@ -81,7 +112,7 @@ independent reader is a `wt-runtime` source; actions go through the host
 service. `TaskScope` owns source tasks and cancels them together at the host
 boundary.
 
-`wt-app::sources::start` builds the local leaves and the derived stages that
+`wt_sources::sources::start` builds the local leaves and the derived stages that
 project GitHub, action history/log tails, naming, sessions, removed history,
 automation status, and optional diagnostics into the board. Fetches are batched
 by domain, never issued once per rendered row. Watchers and activity sources
@@ -439,7 +470,7 @@ while closed; opening it takes a snapshot, and continuous sampling is opt-in.
 
 ## Host commands and remote execution
 
-`wt-app::controller` accepts typed UI requests, assigns them to a host lane, and
+`wt_host::controller` accepts typed UI requests, assigns them to a host lane, and
 tracks running commands through shutdown. `HostService` performs the host-local
 operation and returns a typed reply. Accepted mutations belong to the command
 drain, not the lifetime of a particular SSH view; read sources are cancelled
@@ -499,7 +530,7 @@ a second source grace period.
 Native filesystem watcher setup and teardown run on the blocking pool. Sources
 await teardown, including cancellation during setup, so OS thread joins cannot
 block the async executor or outlive successful source cleanup.
-`wt-app::watcher` selects the backend centrally: macOS uses `PollWatcher` with
+`wt_app_core::watcher` selects the backend centrally: macOS uses `PollWatcher` with
 metadata-only comparisons at a one-second interval, while other platforms use
 notify's recommended native watcher. Do not enable macOS kqueue here: recursive
 directory link events can rebuild descendant watches and close unrelated open
@@ -530,7 +561,7 @@ different command implementation. Configuration is resolved independently on
 each host, so each process has one selected config and its own repository state.
 
 A managed remote adds one step between staging the runtime and the handshake.
-`wt-app::managed` builds a `wt_remote::managed::ManagedRequest` from the
+`wt_ops::managed` builds a `wt_remote::managed::ManagedRequest` from the
 controller's config layers, git settings, GitHub token, Codex home, and
 `[managed.env]`, and the runtime's config-free `_managed apply` command writes
 it under the worker's managed root, ensures the clone, and returns typed
@@ -571,7 +602,7 @@ Existing tmux sessions and unrelated account homes remain owned by their users.
 ## Linux workload resource limits
 
 `wt-config` owns the optional `resources.linux` policy and validates every
-limit before app composition. `wt-app::workload` converts the selected policy
+limit before app composition. `wt_app_core::workload` converts the selected policy
 into explicit helper arguments. Managed-worker generation merges each host's
 resource override into its worker config. An unmanaged worker owns its own
 configuration.

@@ -6,8 +6,10 @@ belongs in docs/; update the relevant reference when a contract changes.
 # wt agent instructions
 
 wt is a native Rust terminal application for managing Git worktrees. The
-workspace is under `crates/`; the production binary is `wt-app`, and its
-presentation model and terminal driver live in `wt-tui`.
+workspace is under `crates/`; the production binary is `wt-app`, a shim over
+the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
+`wt-host`, `wt-cli`), and its presentation model and terminal driver live in
+`wt-tui`.
 
 ## Working in this repository
 
@@ -39,8 +41,10 @@ presentation model and terminal driver live in `wt-tui`.
 - Use the existing Cargo workspace boundaries. `wt-config` owns selected
   configuration, `wt-store` durable state, `wt-platform` subprocesses and OS
   resources, `wt-runtime` scheduled source lifetimes, `wt-vcs` Git operations,
-  `wt-lifecycle` worktree safety, `wt-harness` agent adapters, and `wt-app`
-  composition. Keep pure domain rules in `wt-core` or the owning domain crate.
+  `wt-lifecycle` worktree safety, `wt-harness` agent adapters, and the
+  application layers in order `wt-app-core`, `wt-ops`, `wt-sources`, `wt-host`,
+  `wt-cli` (see `docs/architecture.md`): move an item down a layer rather than
+  reach upward. Keep pure domain rules in `wt-core` or the owning domain crate.
 - When adding a faster or alternate path for an existing action, share the
   original's validation through one helper instead of copying or dropping it,
   and keep action-specific logic in the action's owning module rather than as

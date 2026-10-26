@@ -74,6 +74,17 @@ library code reads them at runtime from `wt::build_info`. Never read
 crate: it would make that crate, and everything above it, rebuild for every
 release or commit, and `CARGO_PKG_VERSION` would read `0.0.0` there.
 
+## Crate layering
+
+The application is split into `wt-app-core`, `wt-ops`, `wt-sources`, `wt-host`
+and `wt-cli` (see [architecture.md](architecture.md#application-layering)) so a
+change recompiles only the layers it touches and those above. With caching, a
+pull request that edits a CLI command restores every other crate from `main`.
+Measured without incremental compilation (as CI builds), an edit to a CLI
+command rebuilt in 3.8 seconds against 21 for the single crate, and an edit in
+`wt-app-core`, which everything depends on, in 15 against 20. The cost is a
+release binary about 27% larger, from per-crate copies of generic code.
+
 ## Native end-to-end checks
 
 `scripts/native-check.py` runs the native suite. CI sets `WT_NATIVE_JOBS` to

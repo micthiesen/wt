@@ -2,7 +2,7 @@
 
 `[[automations]]` bindings run an action (or a built-in flow) automatically when a condition holds for a worktree — CI failed, a review requested changes, a stack parent merged. Nothing is automated by default; the section is strictly opt-in. Config fields and examples: [configuration.md](configuration.md#automations--optional-strictly-opt-in).
 
-This page explains the runtime semantics — what "fires", when, and why it won't fire twice. The native implementation keeps pure condition evaluation and the durable fire ledger in `wt-automations`, tracked action execution in `wt-actions`, and source preparation and dispatch in `wt-app`.
+This page explains the runtime semantics — what "fires", when, and why it won't fire twice. The native implementation keeps pure condition evaluation and the durable fire ledger in `wt-automations`, tracked action execution in `wt-actions`, and source preparation in `wt-sources` and dispatch in `wt-ops`.
 
 The native evaluator is deliberately I/O-free. Its caller supplies one source snapshot, including the per-session GitHub freshness bit, lifecycle clean-candidate evidence, local-day bucket, current pause flags, branch watermarks, and frozen template values. The durable ledger then serializes dispatch claims with a sibling file lock and atomic replacement while retaining fields it does not understand. A dispatched durable prompt whose send reply is lost becomes `ambiguous` and is never blindly replayed.
 

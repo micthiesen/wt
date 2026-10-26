@@ -27,7 +27,7 @@ pub use row::RowChange;
 /// resolves it into an explicit enable/disable before sending.
 pub const AUTO_MERGE_ACTION_ID: &str = "__auto_merge__";
 /// Domains a pending change may wait on. Each must be published by a leaf
-/// source on every host (wt-app's registry test checks that), otherwise a
+/// source on every host (wt-sources' registry test checks that), otherwise a
 /// change could only end at its deadline. An empty list settles as soon as
 /// the host accepts.
 pub const SETTLING_DOMAINS: &[Domain] = &[
