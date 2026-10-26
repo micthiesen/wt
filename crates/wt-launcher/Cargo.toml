@@ -1,6 +1,8 @@
 [package]
 name = "wt-launcher"
-version.workspace = true
+# Fixed: only wt-app carries the release version (docs/ci.md).
+version = "0.0.0"
+publish = false
 edition.workspace = true
 license.workspace = true
 

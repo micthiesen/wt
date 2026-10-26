@@ -31,9 +31,10 @@ presentation model and terminal driver live in `wt-tui`.
   enforced line budget.
 - CI speed rests on invariants in `docs/ci.md`: only `main` saves caches,
   tags restore the release cache `main` warms, files are dated by commit so
-  cached workspace crates stay fresh, and only `wt-app` and `wt-launcher`
-  carry the release version. Library crates stay at `0.0.0`; never read
-  `CARGO_PKG_VERSION` or `WT_BUILD_ID` outside `wt-app`. Update `docs/ci.md`
+  cached workspace crates stay fresh, and only the `wt-app` binary shim
+  carries the release version and build identity. Other crates stay at
+  `0.0.0`; read identity through `wt::build_info`, never with `env!` outside
+  `wt-app`. Update `docs/ci.md`
   with any workflow change.
 - Use the existing Cargo workspace boundaries. `wt-config` owns selected
   configuration, `wt-store` durable state, `wt-platform` subprocesses and OS

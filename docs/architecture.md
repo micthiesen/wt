@@ -1,7 +1,7 @@
 # Architecture
 
 wt is a native Rust workspace. The installed `wt` executable is built from
-`crates/wt-app`; running it does not require Bun, Node, a JavaScript bundle, or
+`crates/wt-app`, a shim over the application library in `crates/wt-cli`; running it does not require Bun, Node, a JavaScript bundle, or
 a source checkout. The former TypeScript implementation is not included in this
 tree; its behavior baseline is commit `d9cd2f4`.
 
@@ -9,7 +9,8 @@ tree; its behavior baseline is commit `d9cd2f4`.
 
 | Crate | Responsibility |
 |---|---|
-| `wt-app` | CLI composition, local and remote host services, TUI source pipeline, application actions, update integration |
+| `wt-app` | The `wt` binary: passes its release version and build identity to `wt-cli` and nothing else, so a release recompiles only this crate ([ci.md](ci.md)) |
+| `wt-cli` (library crate `wt`) | CLI composition, local and remote host services, TUI source pipeline, application actions, update integration |
 | `wt-tui` | Board and modal models, input state machine, terminal rendering and action protocol |
 | `wt-config` | Config discovery, merge, validation, resolved process configuration |
 | `wt-core` | Pure identity, work-status, section and safety rules shared across domains |
@@ -26,7 +27,8 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-tmux` | Cancellable tmux transport for a caller-selected server and socket; never reads wt configuration or ambient `$TMUX` |
 | `xtask` | Repository tooling: `cargo xtask gate`, `deps-check`, `hygiene` (see [development.md](development.md)) |
 
-`crates/wt-app/src/main.rs` is the binary composition root. It resolves one
+`crates/wt-cli/src/lib.rs` (`wt::main`) is the composition root; the binary
+only installs its build identity (`build_info.rs`) and calls it. It resolves one
 configuration for the process, opens the repository-scoped database, builds an
 `AppContext`, and starts either a CLI operation, the local host, or the remote
 worker protocol. `sources.rs` composes the host-local source graph; the GitHub

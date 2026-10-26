@@ -121,8 +121,8 @@ async fn check() -> anyhow::Result<UpdateNotice> {
     let release = ReleaseSource::new(crate::updates::repository(&options)?)?
         .latest(state.channel)
         .await?;
-    let latest = release.version_id(env!("WT_TARGET"))?;
-    Ok(notice(&latest, &current, env!("WT_BUILD_ID")))
+    let latest = release.version_id(crate::build_info::target())?;
+    Ok(notice(&latest, &current, crate::build_info::build_id()))
 }
 
 /// The running build may be older than the installed one: an update already

@@ -89,7 +89,7 @@ async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> 
             snapshot,
             &branches,
             (now_ms(), local_now),
-            env!("WT_BUILD_ID"),
+            crate::build_info::build_id(),
             &repository,
         ))
     })

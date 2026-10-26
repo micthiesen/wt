@@ -29,7 +29,9 @@ impl BootAttempt {
             required(wt_launcher::BUILD_ID_ENV)?,
             required(wt_launcher::TARGET_ENV)?,
         )?;
-        if version.build_id() != env!("WT_BUILD_ID") || version.target() != env!("WT_TARGET") {
+        if version.build_id() != crate::build_info::build_id()
+            || version.target() != crate::build_info::target()
+        {
             bail!("native launcher identity does not match the running binary");
         }
         let running = std::env::current_exe()?.canonicalize()?;

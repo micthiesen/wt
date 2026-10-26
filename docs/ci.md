@@ -61,16 +61,18 @@ same prefix, which is the intended fallback, and saves the new key from
 
 ## Versions
 
-Only `wt-app` and `wt-launcher` carry the release version
-(`version.workspace = true`). Every library crate has the fixed version
-`0.0.0` and `publish = false`. Cargo hashes a crate's version into its
+Only `wt-app`, the `wt` binary shim, carries the release version
+(`version.workspace = true`). Every other crate, `wt-launcher` included, has
+the fixed version `0.0.0` and `publish = false`. Cargo hashes a crate's version into its
 identity, so when every crate inherited the workspace version, each release
-bump recompiled all of them. Now a bump recompiles only the two binaries, and
-the libraries come from `main`'s cache. Code that needs the release version or
-build identity reads it in `wt-app` (`CARGO_PKG_VERSION`, and `WT_BUILD_ID`
-through `crates/wt-app/build.rs`) and passes it down. Never read either in a
-library crate: it would make that crate, and everything above it, rebuild for
-every release or commit.
+bump recompiled all of them. Now a bump recompiles only the few lines of
+`crates/wt-app/src/main.rs`, and everything else comes from `main`'s cache.
+That shim is also the only crate compiled with `WT_BUILD_ID` and `WT_TARGET`
+(through `crates/wt-app/build.rs`): it passes all three to `wt::main`, and
+library code reads them at runtime from `wt::build_info`. Never read
+`CARGO_PKG_VERSION`, `WT_BUILD_ID` or `WT_TARGET` with `env!` in a library
+crate: it would make that crate, and everything above it, rebuild for every
+release or commit, and `CARGO_PKG_VERSION` would read `0.0.0` there.
 
 ## Native end-to-end checks
 

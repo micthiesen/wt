@@ -162,7 +162,11 @@ fn configuration_fingerprint(config: &wt_config::Config, build: &str, target: &s
 }
 
 fn context_fingerprint(context: &AppContext) -> String {
-    let base = configuration_fingerprint(&context.config, env!("WT_BUILD_ID"), env!("WT_TARGET"));
+    let base = configuration_fingerprint(
+        &context.config,
+        crate::build_info::build_id(),
+        crate::build_info::target(),
+    );
     let home = crate::codex_reauth::controller_home(&context.home);
     format!(
         "{:x}",

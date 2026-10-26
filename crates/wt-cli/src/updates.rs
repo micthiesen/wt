@@ -258,7 +258,7 @@ pub async fn startup_check(
     let outcome = match update_latest(
         paths.clone(),
         repository(options)?,
-        env!("WT_TARGET").to_owned(),
+        crate::build_info::target().to_owned(),
         channel,
         None,
         cancel,
@@ -291,7 +291,7 @@ pub async fn startup_check(
     match update_once(
         paths,
         repository(options)?,
-        env!("WT_TARGET").to_owned(),
+        crate::build_info::target().to_owned(),
         Some(channel),
         None,
         false,

@@ -55,7 +55,7 @@ impl MissingRemoteBuild {
             summary,
             details: format!(
                 "Local build: {build}\nLocal platform: {}\nRemote platform: {target}\nRelease: {}\nCause: {cause}",
-                env!("WT_TARGET"),
+                crate::build_info::target(),
                 release.unwrap_or("no published release identity"),
             ),
         }
@@ -105,7 +105,7 @@ pub fn worker_info(role: InstanceRole) -> WorkerInfo {
             InstanceRole::Worker => WorkerRole::Worker,
         },
         protocol: WORKER_PROTOCOL_VERSION,
-        build: env!("WT_BUILD_ID").to_owned(),
+        build: crate::build_info::build_id().to_owned(),
     }
 }
 
@@ -148,7 +148,7 @@ async fn native_candidate_for_platform(
     platform: &RemotePlatform,
     cancellation: &CancellationToken,
 ) -> Result<(BinaryCandidate, Option<tempfile::TempDir>)> {
-    if platform.target == env!("WT_TARGET") {
+    if platform.target == crate::build_info::target() {
         let path = std::env::current_exe()
             .context("resolve running native wt executable")?
             .canonicalize()
@@ -161,12 +161,20 @@ async fn native_candidate_for_platform(
             )
             .await?
             .checked(&path)?;
-        let expected = format!("wt-build-id:{}:{}", env!("WT_BUILD_ID"), env!("WT_TARGET"));
+        let expected = format!(
+            "wt-build-id:{}:{}",
+            crate::build_info::build_id(),
+            crate::build_info::target()
+        );
         if output.stdout_text().trim() != expected {
             bail!("running wt binary did not prove its native identity; expected `{expected}`");
         }
-        let candidate =
-            BinaryCandidate::from_path(path, env!("WT_TARGET"), env!("WT_BUILD_ID")).await?;
+        let candidate = BinaryCandidate::from_path(
+            path,
+            crate::build_info::target(),
+            crate::build_info::build_id(),
+        )
+        .await?;
         return Ok((candidate, None));
     }
 
@@ -189,12 +197,12 @@ async fn native_candidate_for_platform(
     let version = resolve_controller_release(
         &state,
         launcher_release.as_deref(),
-        env!("WT_BUILD_ID"),
-        env!("WT_TARGET"),
+        crate::build_info::build_id(),
+        crate::build_info::target(),
     )
     .map_err(|error| {
         MissingRemoteBuild::new(
-            env!("WT_BUILD_ID"),
+            crate::build_info::build_id(),
             &platform.target,
             None,
             &error.to_string(),
@@ -208,15 +216,15 @@ async fn native_candidate_for_platform(
             std::time::Duration::from_secs(100),
             source.by_tag(version.release_version()),
         ) => result.context("matching native release lookup timed out")?.map_err(|error| {
-            remote_release_error(error, env!("WT_BUILD_ID"), &platform.target, version.release_version())
+            remote_release_error(error, crate::build_info::build_id(), &platform.target, version.release_version())
         })?,
     };
-    if release.build_id() != env!("WT_BUILD_ID") {
+    if release.build_id() != crate::build_info::build_id() {
         bail!(
             "release {} has build {}, but the running controller is {}; refusing a cross-target runtime mismatch",
             release.tag(),
             release.build_id(),
-            env!("WT_BUILD_ID")
+            crate::build_info::build_id()
         );
     }
     let verified = tokio::select! {
@@ -226,10 +234,10 @@ async fn native_candidate_for_platform(
             std::time::Duration::from_secs(100),
             source.download_verified(&release, &platform.target),
         ) => result.context("matching native worker artifact download timed out")?.map_err(|error| {
-            remote_release_error(error, env!("WT_BUILD_ID"), &platform.target, version.release_version())
+            remote_release_error(error, crate::build_info::build_id(), &platform.target, version.release_version())
         })?,
     };
-    if verified.version().build_id() != env!("WT_BUILD_ID")
+    if verified.version().build_id() != crate::build_info::build_id()
         || verified.version().target() != platform.target
         || verified.version().release_version() != version.release_version()
     {
@@ -250,9 +258,12 @@ async fn native_candidate_for_platform(
             .await
             .context("make verified native worker candidate executable")?;
     }
-    let candidate =
-        BinaryCandidate::from_path(local_path, platform.target.clone(), env!("WT_BUILD_ID"))
-            .await?;
+    let candidate = BinaryCandidate::from_path(
+        local_path,
+        platform.target.clone(),
+        crate::build_info::build_id(),
+    )
+    .await?;
     Ok((candidate, Some(scratch)))
 }
 

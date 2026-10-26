@@ -42,13 +42,15 @@ def main() -> None:
         bin_dir.mkdir()
         shutil.copy2(binary, bin_dir / "wt")
         shutil.copy2(args.launcher, bin_dir / "wt-launcher")
-        # Debug binaries can exceed the installer's release-size guard.
-        # On macOS, -S leaves a large local symbol table, so remove it with -x;
-        # on Linux, drop the symbol table too (--strip-all), not only debug info.
-        # Strip only fixture copies. Keep production archive limits and the
-        # original binaries' debugging symbols. The release job also tests its
-        # actual optimized binaries through this fixture.
-        strip_flags = ["-S", "-x"] if platform.system() == "Darwin" else ["--strip-all"]
+        # Debug binaries can exceed the installer's release-size guard, mostly
+        # through their symbol tables: a debug build links wt-cli's symbols as
+        # globals (about 240k), which `strip -S -x` keeps. So strip the whole
+        # symbol table on both platforms (plain `strip` on macOS,
+        # --strip-all on Linux). Strip only fixture copies. Keep production
+        # archive limits and the original binaries' debugging symbols. The
+        # release job also tests its actual optimized binaries through this
+        # fixture.
+        strip_flags = [] if platform.system() == "Darwin" else ["--strip-all"]
         for executable in (bin_dir / "wt", bin_dir / "wt-launcher"):
             subprocess.run(["strip", *strip_flags, str(executable)], check=True)
         responses: dict[str, bytes] = {}

@@ -2918,6 +2918,31 @@ dependencies = [
 name = "wt-app"
 version = "0.1.35"
 dependencies = [
+ "wt-cli",
+]
+
+[[package]]
+name = "wt-automations"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-util",
+ "wt-config",
+ "wt-core",
+ "wt-platform",
+ "wt-store",
+]
+
+[[package]]
+name = "wt-cli"
+version = "0.0.0"
+dependencies = [
  "anyhow",
  "clap",
  "futures-util",
@@ -2962,24 +2987,6 @@ dependencies = [
  "wt-tui",
  "wt-update",
  "wt-vcs",
-]
-
-[[package]]
-name = "wt-automations"
-version = "0.0.0"
-dependencies = [
- "getrandom 0.4.3",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-util",
- "wt-config",
- "wt-core",
- "wt-platform",
- "wt-store",
 ]
 
 [[package]]
@@ -3086,7 +3093,7 @@ dependencies = [
 
 [[package]]
 name = "wt-launcher"
-version = "0.1.35"
+version = "0.0.0"
 dependencies = [
  "tempfile",
  "thiserror",

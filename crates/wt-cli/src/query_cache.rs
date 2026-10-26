@@ -10,7 +10,7 @@ use wt_runtime::CacheStore;
 /// One store per configuration; its directory is inside the repository's
 /// cache root, and its scope fingerprints everything restored data depends on.
 pub fn store(config: &Config) -> CacheStore {
-    store_for_build(config, env!("WT_BUILD_ID"), executable_stamp())
+    store_for_build(config, crate::build_info::build_id(), executable_stamp())
 }
 
 /// Remote display snapshots survive compatible binary updates. Their schema

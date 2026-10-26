@@ -107,7 +107,7 @@ pub async fn run(
     let result = crate::updates::update_once(
         paths.clone(),
         repository,
-        env!("WT_TARGET").to_owned(),
+        crate::build_info::target().to_owned(),
         args.channel.map(Into::into),
         args.release.clone(),
         args.check,

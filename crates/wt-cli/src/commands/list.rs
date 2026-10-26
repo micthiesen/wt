@@ -92,7 +92,7 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
                 // run_worker validates its role/protocol and fails closed when
                 // it is missing; listing must never install or rewrite a host.
                 let client = wt_remote::RemoteClient::new(ctx.processes.clone(), remote.clone())
-                    .with_expected_build_id(env!("WT_BUILD_ID").into());
+                    .with_expected_build_id(crate::build_info::build_id().into());
                 let output = client
                     .run_worker(&["ls".into(), "--json".into()], &ctx.cancellation)
                     .await?;

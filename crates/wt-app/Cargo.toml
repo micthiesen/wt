@@ -1,5 +1,7 @@
 [package]
 name = "wt-app"
+# The only crate that carries the release version: a version bump recompiles
+# this shim alone, never the libraries it links (docs/ci.md).
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,55 +9,11 @@ license.workspace = true
 [[bin]]
 name = "wt"
 path = "src/main.rs"
+# The library it links is also named `wt`; document only the library.
+doc = false
 
 [dependencies]
-futures-util.workspace = true
-anyhow.workspace = true
-clap.workspace = true
-getrandom.workspace = true
-libc.workspace = true
-notify.workspace = true
-regex.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-globset.workspace = true
-sha2.workspace = true
-shlex.workspace = true
-tempfile.workspace = true
-thiserror.workspace = true
-toml.workspace = true
-time.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
-tracing.workspace = true
-tracing-appender.workspace = true
-tracing-subscriber.workspace = true
-wt-config.workspace = true
-wt-actions.workspace = true
-wt-automations.workspace = true
-wt-dev.workspace = true
-wt-core.workspace = true
-wt-github.workspace = true
-wt-harness.workspace = true
-wt-lifecycle.workspace = true
-wt-naming.workspace = true
-wt-launcher.workspace = true
-wt-platform.workspace = true
-wt-runtime.workspace = true
-wt-remote.workspace = true
-wt-stack.workspace = true
-wt-sst.workspace = true
-wt-events.workspace = true
-wt-store.workspace = true
-wt-skills.workspace = true
-wt-tui.workspace = true
-wt-tmux.workspace = true
-wt-update.workspace = true
-wt-vcs.workspace = true
-
-[dev-dependencies]
-rusqlite.workspace = true
-wt-runtime = { workspace = true, features = ["testing"] }
+wt-cli.workspace = true
 
 [lints]
 workspace = true

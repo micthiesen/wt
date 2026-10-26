@@ -122,9 +122,9 @@ pub async fn serve(context: &AppContext) -> Result<()> {
         secret,
         context.config.paths.cache_root.join("events"),
         context.config.branch.base.clone(),
-        Some(env!("WT_BUILD_ID").to_owned()),
+        Some(crate::build_info::build_id().to_owned()),
     )
-    .with_version(env!("CARGO_PKG_VERSION"))
+    .with_version(crate::build_info::version())
     .with_repository(crate::github_events_source::repository_identity(
         &context.config,
     ));
@@ -222,7 +222,7 @@ async fn installed_build(root: PathBuf) -> String {
         None => None,
     };
     current.map_or_else(
-        || env!("WT_BUILD_ID").to_owned(),
+        || crate::build_info::build_id().to_owned(),
         |version| version.build_id().to_owned(),
     )
 }
@@ -611,7 +611,7 @@ pub(crate) async fn status(context: &AppContext) -> Result<()> {
                 snapshot.prs.as_object().map_or(0, serde_json::Map::len),
                 ago(snapshot.updated_at)
             );
-            if snapshot.writer_sha.as_deref() != Some(env!("WT_BUILD_ID")) {
+            if snapshot.writer_sha.as_deref() != Some(crate::build_info::build_id()) {
                 println!("  snapshot build stale; live GitHub reads will be used until refreshed");
             }
         }
@@ -988,14 +988,15 @@ mod tests {
         // No install state: only this process's own build is known.
         assert_eq!(
             installed_build(root.path().to_path_buf()).await,
-            env!("WT_BUILD_ID")
+            crate::build_info::build_id()
         );
         // After an update the launcher starts the new build, even while an
         // older session performs the reconcile.
         let paths = wt_update::InstallPaths::new(root.path()).unwrap();
         let mut state = wt_update::InstallState::new(wt_update::Channel::Stable);
-        state.current =
-            Some(wt_update::VersionId::new("v9.9.9", "newbuild", env!("WT_TARGET")).unwrap());
+        state.current = Some(
+            wt_update::VersionId::new("v9.9.9", "newbuild", crate::build_info::target()).unwrap(),
+        );
         std::fs::write(paths.state_file(), state.to_json().unwrap()).unwrap();
         assert_eq!(installed_build(root.path().to_path_buf()).await, "newbuild");
     }

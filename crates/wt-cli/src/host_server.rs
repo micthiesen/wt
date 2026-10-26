@@ -50,7 +50,7 @@ where
     output
         .write_all(&protocol::encode(&ServerFrame::Hello {
             protocol: protocol::HOST_PROTOCOL,
-            build: env!("WT_BUILD_ID").into(),
+            build: crate::build_info::build_id().into(),
         })?)
         .await?;
     let scope = TaskScope::new();
