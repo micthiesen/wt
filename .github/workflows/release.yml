@@ -17,9 +17,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a branch supersedes its running checks; a tag run is a
+# publication and is never cancelled.
 concurrency:
   group: native-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,8 +49,12 @@ jobs:
     with:
       build_release: false
 
+  # Packages are built only for a publication: a version tag, or a manual
+  # dispatch. main pushes run the checks only; the release-cache workflow keeps
+  # main's optimized build cache warm so a tag rebuilds little.
   package:
     needs: identity
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -68,11 +74,19 @@ jobs:
       SOURCE_DATE_EPOCH: ${{ needs.identity.outputs.epoch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history dates each file for restore-mtimes.py.
+          fetch-depth: 0
+      - name: Date files by their last commit so cached workspace crates stay fresh
+        run: python3 scripts/restore-mtimes.py
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: native-release-${{ matrix.target }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+          # Restored from main's release-cache run. A tag-scoped save could
+          # only ever be restored by that same tag.
+          save-if: false
       - run: cargo build -p wt-app -p wt-launcher --release --locked
       - name: Verify binary identity and package immutable assets
         run: python3 scripts/package-native.py package --release "$RELEASE_VERSION" --build-id "$WT_BUILD_ID" --target "$RELEASE_TARGET" --bin-dir target/release --output dist

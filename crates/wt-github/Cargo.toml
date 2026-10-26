@@ -1,6 +1,8 @@
 [package]
 name = "wt-github"
-version.workspace = true
+# Fixed: only the shipped binaries carry the release version (docs/ci.md).
+version = "0.0.0"
+publish = false
 edition.workspace = true
 license.workspace = true
 

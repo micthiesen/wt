@@ -31,13 +31,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history dates each file for restore-mtimes.py.
+          fetch-depth: 0
+      - name: Date files by their last commit so cached workspace crates stay fresh
+        run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
       - run: cargo fmt --all --check
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: lint
-          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo xtask deps-check
       - name: Verify native release packaging
@@ -46,8 +52,13 @@ jobs:
         run: |
           python3 scripts/test-package-native.py
           python3 scripts/test-native-check.py
+          python3 scripts/test-restore-mtimes.py
           python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
+  # test and native share one debug cache per OS: both build the workspace
+  # with the dev profile, so their dependency artifacts are identical. Only
+  # main saves caches; GitHub scopes a cache to the ref that saved it, so a
+  # branch or tag save could never be restored anywhere else.
   test:
     strategy:
       fail-fast: false
@@ -61,12 +72,18 @@ jobs:
       WT_BUILD_ID: ${{ github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history dates each file for restore-mtimes.py.
+          fetch-depth: 0
+      - name: Date files by their last commit so cached workspace crates stay fresh
+        run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: test-${{ matrix.os }}
-          save-if: ${{ github.event_name != 'pull_request' }}
+          shared-key: debug-${{ matrix.os }}
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.145
@@ -103,12 +120,18 @@ jobs:
       WT_NATIVE_JOBS: ${{ matrix.os == 'macos-latest' && '3' || '4' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history dates each file for restore-mtimes.py.
+          fetch-depth: 0
+      - name: Date files by their last commit so cached workspace crates stay fresh
+        run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: native-${{ matrix.os }}
-          save-if: ${{ github.event_name != 'pull_request' }}
+          shared-key: debug-${{ matrix.os }}
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install terminal integration dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -155,10 +178,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history dates each file for restore-mtimes.py.
+          fetch-depth: 0
+      - name: Date files by their last commit so cached workspace crates stay fresh
+        run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-${{ matrix.os }}
-          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --workspace --release --locked

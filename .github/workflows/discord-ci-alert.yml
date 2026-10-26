@@ -1,10 +1,10 @@
-# Post unsuccessful main-branch CI completions, except cancellations, to Discord #github.
+# Post unsuccessful main-branch CI and release-cache completions, except cancellations, to Discord #github.
 # Secret: DISCORD_GITHUB_WEBHOOK (the channel webhook URL, without /github).
 name: discord-ci-alert
 
 on:
   workflow_run:
-    workflows: [Native release]
+    workflows: [Native release, Release cache]
     types: [completed]
     branches: [main]
 

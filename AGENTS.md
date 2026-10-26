@@ -29,6 +29,12 @@ presentation model and terminal driver live in `wt-tui`.
   distribute them with `wt skills sync`; do not edit installed copies. Replace
   the managed `instructions.md` block instead of appending, and keep its
   enforced line budget.
+- CI speed rests on invariants in `docs/ci.md`: only `main` saves caches,
+  tags restore the release cache `main` warms, files are dated by commit so
+  cached workspace crates stay fresh, and only `wt-app` and `wt-launcher`
+  carry the release version. Library crates stay at `0.0.0`; never read
+  `CARGO_PKG_VERSION` or `WT_BUILD_ID` outside `wt-app`. Update `docs/ci.md`
+  with any workflow change.
 - Use the existing Cargo workspace boundaries. `wt-config` owns selected
   configuration, `wt-store` durable state, `wt-platform` subprocesses and OS
   resources, `wt-runtime` scheduled source lifetimes, `wt-vcs` Git operations,

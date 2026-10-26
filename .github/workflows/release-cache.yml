@@ -1,0 +1,57 @@
+# Keep main's optimized build cache warm for release tags. See docs/ci.md.
+#
+# GitHub scopes a cache to the ref that saved it, and a tag run can restore
+# only caches saved by its own tag or by main. So main compiles the release
+# binaries here, saving the cache the tag's package job restores; a tag on a
+# warmed main commit then recompiles only what changed since. This must build
+# with the same toolchain, profile, Cargo environment, and shared-key as the
+# package job in release.yml, or the tag restores a cache it cannot reuse.
+name: Release cache
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only the newest main commit's cache is worth finishing.
+concurrency:
+  group: release-cache
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  warm:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      WT_BUILD_ID: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history dates each file for restore-mtimes.py.
+          fetch-depth: 0
+      - name: Date files by their last commit so cached workspace crates stay fresh
+        run: python3 scripts/restore-mtimes.py
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native-release-${{ matrix.target }}
+          cache-workspace-crates: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build -p wt-app -p wt-launcher --release --locked

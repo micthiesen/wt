@@ -8,7 +8,9 @@ The stable launcher lives under `~/.local/share/wt` by default; set
 supported targets are documented in [the distribution design](rust-distribution-design.md).
 
 Stable follows the latest non-prerelease release. Preview follows the latest
-`preview-<fullsha>` prerelease. `wt update --channel stable|preview` persists a
+`preview-<fullsha>` prerelease. Pushes to `main` no longer publish one; publish
+a preview of `main` on demand with `gh workflow run release.yml --ref main -f
+publish=true`, which runs the same checks and packaging as a tag. `wt update --channel stable|preview` persists a
 channel choice; otherwise the saved channel is used. `wt update --check` checks
 metadata without installing. `wt update --release <tag>` selects one exact
 release for testing, including `rust-test-*` tags. Those test tags are never
