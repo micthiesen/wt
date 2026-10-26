@@ -1,0 +1,33 @@
+# Announce each published stable wt release, with its notes, in Discord #updates.
+#
+# The release itself is created by the native release run with GITHUB_TOKEN,
+# which cannot trigger `release` events, so this follows that run instead.
+# Only a successful run for a version tag posts; the script checks the release
+# is stable and was published from that run's commit. Secret:
+# DISCORD_UPDATES_WEBHOOK.
+name: discord-release
+
+on:
+  workflow_run:
+    workflows: [Native release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Post the release notes to Discord
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_UPDATES_WEBHOOK }}
+        run: python3 .github/scripts/discord-release.py

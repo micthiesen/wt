@@ -105,22 +105,27 @@ launcher. Unit tests and lint are separate gates: run the workspace nextest and
 doc tests, formatting, Clippy and dependency checks as defined in Rust CI.
 Running only those gates does not verify native end-to-end behavior.
 
-Before updating `main` or publishing a stable release:
+To publish a stable release:
 
-1. Run the complete local unit/lint gate and native suite against the candidate.
-2. Push the candidate commit to a verification branch, then run
-   `gh workflow run release.yml --ref <verification-branch>`. Manual dispatch
-   defaults to `publish=false`, so this verifies without publishing a release.
-3. Require green Linux and macOS unit and native jobs, lint, and all release
-   packaging jobs for that exact commit SHA. A green run for an earlier commit
-   or only one platform is insufficient.
-4. Fast-forward `main` to that same verified SHA. Tag only that proven commit
-   when ready to publish. If `main` has moved or the code changes, reconcile it
-   on the verification branch and repeat validation before promotion.
+1. Run `cargo xtask gate` and the native suite against the candidate.
+2. Bump `version` in the root `Cargo.toml`, run `cargo update -w`, and commit
+   with the release notes as the message: `Release vX.Y.Z: <summary>`, then a
+   blank line and bullet points. The summary and bullets become the GitHub
+   release notes and the Discord #updates post (see [discord.md](discord.md)).
+3. Rebuild with `WT_BUILD_ID` set to the release commit SHA and run the native
+   suite again; check its exit status rather than piping it.
+4. Push `main`, then push an annotated `vX.Y.Z` tag (message `wt vX.Y.Z`) on
+   that commit. The tag's `Native release` run repeats every unit, lint, native
+   and packaging check and publishes only if all of them pass.
+5. When it publishes, check that `SHA256SUMS` verifies the downloaded assets
+   and that `wt-release.json` names the release commit as `build_id`.
 
-Use the verification branch to discover and fix failures before they reach
-`main`. This is a procedure using the existing release workflow, not a separate
-publishing system.
+There is no separate verification run: publication already depends on the tag
+run's complete checks, so a failure publishes nothing. If the tag run fails,
+fix forward on `main`, delete the unpublished tag (`git push --delete origin
+vX.Y.Z`), and tag the fixed commit with the same version. A flaky check can be
+re-run on the same run. `workflow_dispatch` with `publish=false` remains for
+validating a branch without publishing.
 
 ## Durable application data
 

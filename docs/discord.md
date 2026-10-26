@@ -7,7 +7,7 @@ enabled — that id is public by design; it powers the README badge).
 ## Channels
 
 - **#general** — chat.
-- **#updates** — AI-written commit digests, posted by the workflow below.
+- **#updates** — one post per published stable release, with its notes.
   Nothing else posts here.
 - **#github** — raw repo events via a native Discord GitHub webhook (see
   below), plus unsuccessful, non-cancelled `Native release` completions on `main`. Deliberately excludes
@@ -15,50 +15,36 @@ enabled — that id is public by design; it powers the README badge).
 - **#help** — support. Carries a pinned message telling reporters to include
   `wt doctor` output and the tail of `~/.cache/wt/logs/app/wt-native.<date>.log`.
 
-## #updates: the commit digest
+## #updates: release announcements
 
-`.github/workflows/discord-digest.yml` + `.github/scripts/discord-digest.py`.
-The helper uses Python's standard library and needs no JavaScript runtime.
-Full mechanics are documented in those files' header comments; the shape:
+`.github/workflows/discord-release.yml` + `.github/scripts/discord-release.py`
+(standard-library Python, no JavaScript runtime). Each published stable release
+is posted once, as an embed titled `wt vX.Y.Z` that links the GitHub release and
+carries its notes.
 
-- Triggers via `workflow_run` when `Native release` goes green on `main` (a
-  red tree is never digested; its commits roll into the next green digest).
-  That workflow includes Rust CI, all three native packages, and publication.
-  The trigger names the workflow by its `name:`. If it is renamed,
-  update `workflows: [Native release]` in both Discord workflows in the same commit, or digests silently stop
-  (this bit us once when `typecheck` became `ci`).
-- Debounce: the run sleeps 30 minutes inside a `concurrency` group with
-  `cancel-in-progress: true`, so every newer green push cancels the sleeping
-  run and restarts the countdown — one digest per burst. The group sits at
-  the JOB level, not the workflow level: a workflow-level group is claimed
-  even by runs whose job the green-only `if:` skips, so a red push was
-  cancelling the previous green push's pending digest (its commits then
-  silently waited for the next green burst). The idle runner is
-  free on public repos; if this repo ever goes private, switch to a cron
-  check instead.
-- "Since when" state is the head SHA of the digest workflow's own last
-  successful run — no tags, no state files.
-- The model (`gpt-6-luna`) sees commit titles + bodies only, never diffs.
-  OpenAI failure degrades to posting raw commit titles.
-- Attribution is built in: the embed footer lists commit authors' GitHub
-  logins.
-- **Silence is ambiguous, and #updates is the only place it shows.** Because
-  the trigger is a green release on `main`, "no digest for two days" has two
-  readings that look identical from the channel: nobody pushed, or `main` has
-  been red and every commit is queued for the next green digest. This happened
-  on 2026-08-24 to 08-26, before the native rewrite (eight pushes, four
-  tests leaking the developer's config), and nothing anywhere announced it — the same green gate also holds back
-  hot updates, so users had been getting nothing either. Before treating a
-  quiet #updates as a digest bug, check `gh run list --workflow=release.yml
-  --branch=main`; a run of `skipped` digest runs is the tell, since the
-  green-only `if:` skips rather than fails.
-- A GitHub Actions outage can wedge a `push`-triggered ci run in
-  `queued` indefinitely — `gh run cancel`/`rerun` both error unhelpfully on
-  it ("already completed" / "already running") rather than clearing it. The
-  stuck run itself has no fix; a new push supersedes it and the debounce
-  resumes normally once ci runs are getting picked up again.
+- The notes are the release commit's message: `scripts/publish-native.py`
+  writes its summary line (without the `Release vX.Y.Z:` prefix) and body into
+  stable GitHub releases above the download boilerplate, and the post drops that
+  boilerplate. Preview (`preview-<sha>`) releases keep only the boilerplate and
+  are never posted.
+- `publish-native.py` creates releases with `GITHUB_TOKEN`, which cannot
+  trigger `release` events, so the workflow follows `Native release` through
+  `workflow_run`. It runs only for a successful `push` run whose ref is a `v*`
+  tag. The script then requires a stable, non-draft release for that tag
+  published from the run's commit, so the `main` run of the same commit posts
+  nothing.
+- The trigger names the workflow by its `name:`. If `Native release` is renamed,
+  update both Discord workflows in the same commit, or posts silently stop.
+- A failed post does not affect the release. Re-run the `discord-release` run to
+  retry it.
+- **Silence means no stable release was published.** A failed release run posts
+  nothing here; its failure shows in #github.
 
-**Actions secrets** (repo Settings → Secrets → Actions): `OPENAI_API_KEY`,
+This replaced an AI-written digest of commits on `main`, which predates the
+versioned release flow. The `OPENAI_API_KEY` Actions secret it used is no
+longer read.
+
+**Actions secret** (repo Settings → Secrets → Actions):
 `DISCORD_UPDATES_WEBHOOK` (the #updates channel webhook URL).
 
 ## #github: repo events and CI failures
@@ -105,7 +91,6 @@ secrets; never commit one.
 
 ## Deliberately not set up (revisit when the server grows)
 
-- Separate release announcements; the digest covers published changes.
 - Forum-style #help (needs Community mode) and an opt-in @updates ping role —
   wait for strangers.
 - Stats/moderation bots, server banner, vanity URL.
