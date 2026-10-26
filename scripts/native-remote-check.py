@@ -23,9 +23,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def stripped_fixture_binary(source: Path, destination: Path) -> Path:
-    """Provision release-sized copies while keeping the build's debug symbols."""
+    """Provision release-sized copies while keeping the build's debug symbols.
+
+    Strip the whole symbol table: a debug build links the application
+    libraries' symbols as globals, which `strip -S -x` keeps, and the larger
+    copy made the runtime-transfer checks slow enough to time out on CI.
+    """
     shutil.copy2(source, destination)
-    flags = ["-S", "-x"] if sys.platform == "darwin" else ["--strip-all"]
+    flags = [] if sys.platform == "darwin" else ["--strip-all"]
     subprocess.run(["strip", *flags, str(destination)], check=True)
     return destination
 
