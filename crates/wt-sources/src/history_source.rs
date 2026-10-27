@@ -813,7 +813,11 @@ async fn read_issue_statuses(
     let output = match context.processes.run(spec, cancellation).await {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            tracing::warn!(status = %output.status, "removed-history issue status reader failed");
+            tracing::warn!(
+                status = %output.status,
+                stderr = %output.stderr_text().trim(),
+                "removed-history issue status reader failed"
+            );
             return BTreeMap::new();
         }
         Err(error) => {

@@ -993,6 +993,15 @@ pub async fn handoff_navigable(
                 if detail.is_empty() {
                     bail!("tmux client exited with {status}");
                 }
+                // tmux rejects the inherited TERM's terminfo; name it, since
+                // the board's process environment is otherwise invisible.
+                if detail.contains("open terminal failed") {
+                    let term = std::env::var("TERM").map_or_else(
+                        |_| "unset".into(),
+                        |term| wt_core::sanitize_terminal_text(&term),
+                    );
+                    bail!("tmux client exited with {status}: {detail} (TERM={term})");
+                }
                 bail!("tmux client exited with {status}: {detail}");
             }
             if let Some(navigation) = &mut navigation
