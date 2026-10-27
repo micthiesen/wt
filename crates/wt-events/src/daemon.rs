@@ -410,6 +410,30 @@ pub(super) fn next_fetch_at(
     }
 }
 
+/// Longest wait between GitHub reads while they keep failing. GitHub asks
+/// clients that hit a secondary rate limit to wait minutes, not seconds.
+const MAX_FAILURE_BACKOFF_MS: u64 = 5 * 60 * 1000;
+
+/// The floor between reads after `failures` consecutive failed ones: the
+/// normal interval, doubled per failure up to [`MAX_FAILURE_BACKOFF_MS`]. A
+/// rate limit waits the longest at once; retrying sooner extends it.
+pub(super) fn backoff_interval_ms(
+    min_fetch_interval_ms: u64,
+    failures: u32,
+    rate_limited: bool,
+) -> u64 {
+    if rate_limited {
+        return MAX_FAILURE_BACKOFF_MS.max(min_fetch_interval_ms);
+    }
+    if failures == 0 {
+        return min_fetch_interval_ms;
+    }
+    min_fetch_interval_ms
+        .saturating_mul(1u64 << failures.min(16))
+        .min(MAX_FAILURE_BACKOFF_MS)
+        .max(min_fetch_interval_ms)
+}
+
 async fn scheduler(
     config: EventDaemonConfig,
     source: Arc<dyn EventSource>,
@@ -420,6 +444,8 @@ async fn scheduler(
 ) {
     let started = Instant::now();
     let mut last_fetch_start: Option<Instant> = None;
+    let mut fetch_interval_ms = config.min_fetch_interval_ms;
+    let mut failures = 0u32;
     let mut pending_deadline: Option<Instant> = Some(started);
     let mut cached_inventory_at: Option<Instant> = None;
     let mut local_branches = BTreeSet::new();
@@ -482,7 +508,7 @@ async fn scheduler(
                     let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     let last_ms = last_fetch_start.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
                     let pending_ms = pending_deadline.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
-                    if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, config.min_fetch_interval_ms) {
+                    if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, fetch_interval_ms) {
                         pending_deadline = Some(started + Duration::from_millis(deadline));
                     }
                 }
@@ -492,7 +518,7 @@ async fn scheduler(
                 let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let last_ms = last_fetch_start.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
                 let pending_ms = pending_deadline.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
-                if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, config.min_fetch_interval_ms) {
+                if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, fetch_interval_ms) {
                     pending_deadline = Some(started + Duration::from_millis(deadline));
                 }
             }
@@ -551,7 +577,16 @@ async fn scheduler(
                 // Readers order this observation by when the GitHub read
                 // began: a write accepted after this moment may be missing.
                 let fetch_started_at_ms = now_millis();
-                match source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await {
+                let fetched = source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await;
+                (failures, fetch_interval_ms) = match &fetched {
+                    Ok(_) => (0, config.min_fetch_interval_ms),
+                    Err(e) => {
+                        let failures = failures.saturating_add(1);
+                        let interval = backoff_interval_ms(config.min_fetch_interval_ms, failures, rate_limited(e));
+                        (failures, interval)
+                    }
+                };
+                match fetched {
                     Ok(data) => {
                         let snapshot = GithubSnapshot {
                             updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
@@ -576,6 +611,12 @@ async fn scheduler(
             }
         }
     }
+}
+
+/// The event source reports errors as text; GitHub's rate-limit replies say so.
+fn rate_limited(error: &str) -> bool {
+    let lower = error.to_lowercase();
+    lower.contains("rate limit") || lower.contains("abuse detection")
 }
 
 async fn set_error(durable: &DurableState, message: String) {
@@ -828,6 +869,22 @@ mod tests {
             ),
             Some(vec!["topic".into()])
         );
+    }
+
+    #[test]
+    fn failed_reads_back_off_and_rate_limits_wait_longest() {
+        assert_eq!(backoff_interval_ms(10_000, 0, false), 10_000);
+        assert_eq!(backoff_interval_ms(10_000, 1, false), 20_000);
+        assert_eq!(backoff_interval_ms(10_000, 3, false), 80_000);
+        assert_eq!(
+            backoff_interval_ms(10_000, 40, false),
+            MAX_FAILURE_BACKOFF_MS
+        );
+        assert_eq!(backoff_interval_ms(10_000, 1, true), MAX_FAILURE_BACKOFF_MS);
+        assert!(rate_limited(
+            "GitHub refresh failed: cannot resolve GitHub repository: HTTP 403: You have exceeded a secondary rate limit."
+        ));
+        assert!(!rate_limited("transient GitHub failure: gh: HTTP 504"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use futures_util::{StreamExt, TryStreamExt, stream};
@@ -29,6 +29,18 @@ const MAX_ATTEMPTS: usize = 3;
 const MAX_CHUNK_CONCURRENCY: usize = 4;
 const WORKFLOW_SCOPE_REMEDY: &str = "This is the LOCAL gh token, not the PR: run `gh auth refresh -h github.com -s workflow` (then `gh auth status` to confirm), and try again. Retrying as-is never clears it.";
 const PICKER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a resolved repository answers for its checkout. Callers build a
+/// client per read, so without this every board or event refresh would spend
+/// a `gh repo view` request before the read itself.
+const REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
+type RepositoryKey = (OsString, PathBuf);
+
+fn repository_cache() -> &'static Mutex<HashMap<RepositoryKey, (RepoSlug, Instant)>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<RepositoryKey, (RepoSlug, Instant)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
 type PickerCache<T> = Arc<AsyncMutex<Option<(tokio::time::Instant, T)>>>;
 
 #[derive(Clone, Debug)]
@@ -149,11 +161,23 @@ impl GithubClient {
         if let Some(repo) = &self.repo {
             return Ok(repo.clone());
         }
+        let key = (self.gh_program.clone(), self.cwd.clone());
+        if let Ok(cache) = repository_cache().lock()
+            && let Some((repo, at)) = cache.get(&key)
+            && at.elapsed() < REPOSITORY_CACHE_TTL
+        {
+            return Ok(repo.clone());
+        }
         let out = self
             .run(["repo", "view", "--json", "nameWithOwner"], cancellation)
             .await?;
         if !out.status.success() {
-            return Err(GithubError::Repository(output_failure(&out).0));
+            // A rate limit or outage is not a repository problem; keep its
+            // class so callers back off instead of reporting a bad remote.
+            return Err(match classify_output(&out) {
+                GithubError::Command(message) => GithubError::Repository(message),
+                other => other,
+            });
         }
         let data: Value = serde_json::from_slice(&out.stdout).map_err(|e| {
             GithubError::Protocol(format!("unparseable gh repo view response: {e}"))
@@ -162,8 +186,12 @@ impl GithubClient {
             .get("nameWithOwner")
             .and_then(Value::as_str)
             .ok_or_else(|| GithubError::Protocol("gh repo view omitted nameWithOwner".into()))?;
-        RepoSlug::parse(slug)
-            .ok_or_else(|| GithubError::Protocol(format!("invalid repository name {slug:?}")))
+        let repo = RepoSlug::parse(slug)
+            .ok_or_else(|| GithubError::Protocol(format!("invalid repository name {slug:?}")))?;
+        if let Ok(mut cache) = repository_cache().lock() {
+            cache.insert(key, (repo.clone(), Instant::now()));
+        }
+        Ok(repo)
     }
 
     pub async fn authenticated_login(
@@ -1812,6 +1840,39 @@ mod transport_tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    #[tokio::test]
+    async fn repository_keeps_rate_limits_and_reuses_a_resolved_slug() {
+        let dir = tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let limited = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(fake_gh(
+                dir.path(),
+                "limited",
+                "echo 'HTTP 403: You have exceeded a secondary rate limit.' >&2; exit 1",
+            ));
+        assert!(matches!(
+            limited.repository(&cancel).await,
+            Err(GithubError::RateLimit(_))
+        ));
+        let calls = dir.path().join("calls");
+        let gh = fake_gh(
+            dir.path(),
+            "view",
+            &format!(
+                "echo call >> '{}'; echo '{{\"nameWithOwner\":\"owner/repo\"}}'",
+                calls.display()
+            ),
+        );
+        let client = || {
+            GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+                .with_gh_program(gh.clone())
+        };
+        let first = client().repository(&cancel).await.unwrap();
+        // A fresh client for the same checkout does not ask again.
+        assert_eq!(client().repository(&cancel).await.unwrap(), first);
+        assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
     }
 
     /// Only gh's explicit "no PR" answer proves absence; any other failure,
