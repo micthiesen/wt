@@ -34,6 +34,25 @@ mod cli_tests {
     use super::*;
 
     #[test]
+    fn error_chain_prints_an_embedded_source_once() {
+        let io = std::io::Error::from_raw_os_error(1);
+        let error = anyhow::Error::new(wt_harness::CodexTrustError::Io {
+            path: "/h/.codex/config.toml".into(),
+            source: io,
+        })
+        .context("prepare Codex target trust");
+        let text = error_chain(&error);
+        assert_eq!(text.matches("os error 1").count(), 1, "{text}");
+        assert!(
+            text.starts_with(
+                "prepare Codex target trust: Codex trust file /h/.codex/config.toml: "
+            )
+        );
+        let plain = anyhow::anyhow!("inner").context("outer");
+        assert_eq!(error_chain(&plain), "outer: inner");
+    }
+
+    #[test]
     fn version_and_help_parse_without_repository_configuration() {
         for args in [vec!["wt"], vec!["wt", "status"], vec!["wt", "merge", "one"]] {
             assert!(Cli::try_parse_from(args).is_ok());
@@ -211,10 +230,26 @@ pub fn main(info: BuildInfo) {
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
-            eprintln!("wt: {error:#}");
+            eprintln!("wt: {}", error_chain(&error));
             std::process::exit(1);
         }
     }
+}
+
+/// `{:#}` with each cause once. Many wt errors already embed their source in
+/// their own message, so the plain chain would print it twice.
+fn error_chain(error: &anyhow::Error) -> String {
+    let mut text = String::new();
+    for cause in error.chain() {
+        let cause = cause.to_string();
+        if !text.ends_with(&cause) {
+            if !text.is_empty() {
+                text.push_str(": ");
+            }
+            text.push_str(&cause);
+        }
+    }
+    text
 }
 
 fn run(cli: Cli) -> Result<i32> {

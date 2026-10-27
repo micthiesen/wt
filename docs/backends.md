@@ -178,7 +178,12 @@ and it drives the rest of the design:
   manager/main/source roots; a stale route cannot authorize another directory.
   The writer preserves TOML settings,
   comments and config symlinks, uses atomic private-file replacement, and refuses
-  malformed or concurrently changed config. It never trusts a parent or sibling
+  malformed or concurrently changed config. An already-trusted root takes no
+  lock and writes nothing. When the OS denies the write (an agent sandbox
+  protecting `$CODEX_HOME`), the launch or message continues with one logged
+  warning, also on stderr inside the Codex sandbox; if Codex then shows its
+  folder-trust gate, message delivery reports it without typing into it.
+  It never trusts a parent or sibling
   as a shortcut. Entries remain in the harness config after teardown. OpenCode
   has no such gate. Pi uses its native `--approve` flag for the validated target
   of that launch, without rewriting global trust or permission settings. See

@@ -72,7 +72,12 @@ pub struct SessionSummary {
 }
 
 pub async fn run(ctx: &AppContext, args: &PerfArgs) -> Result<i32> {
-    let snapshot = snapshot(ctx, true).await?;
+    let snapshot = match snapshot(ctx, true).await {
+        Err(error) if process_listing_denied(&error) => {
+            return machine_only(ctx, args).await;
+        }
+        result => result?,
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
         return Ok(0);
@@ -81,6 +86,44 @@ pub async fn run(ctx: &AppContext, args: &PerfArgs) -> Result<i32> {
         println!("{line}");
     }
     Ok(0)
+}
+
+/// An agent sandbox may refuse to run `ps` (macOS's is setuid). Load and
+/// memory still answer "is the machine busy?", so report those rather than
+/// fail the command, and say plainly that the process list is missing.
+async fn machine_only(ctx: &AppContext, args: &PerfArgs) -> Result<i32> {
+    let reason = if std::env::var_os("CODEX_SANDBOX").is_some() {
+        "the Codex sandbox denied running ps; rerun with escalation for processes"
+    } else {
+        "permission to run ps was denied"
+    };
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    let load_average = load_average();
+    let memory = memory(ctx).await;
+    if args.json {
+        let value = serde_json::json!({
+            "process_probe_available": false,
+            "unavailable_reason": reason,
+            "cores": cores,
+            "load_average": load_average,
+            "memory": memory,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(0);
+    }
+    println!("wt perf: process list unavailable: {reason}.");
+    println!("{}", machine_line(cores, memory.as_ref(), load_average));
+    Ok(0)
+}
+
+fn process_listing_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<wt_platform::process::ProcessError>(),
+            Some(wt_platform::process::ProcessError::Io { operation: "spawn", source, .. })
+                if source.kind() == std::io::ErrorKind::PermissionDenied
+        )
+    })
 }
 
 /// Reusable bounded process snapshot for both `wt perf` and the TUI P overlay.
@@ -163,7 +206,7 @@ pub async fn snapshot(ctx: &AppContext, root_at_wt_instances: bool) -> Result<Sn
         system_cpu,
         wt_cpu,
         wt_rss_kb: downstream.iter().map(|row| row.rss_kb).sum(),
-        load_average: load_average(ctx).await,
+        load_average: load_average(),
         memory: memory(ctx).await,
         process_count: rows.len(),
         downstream_count: downstream.len(),
@@ -331,21 +374,11 @@ pub fn report(snapshot: &Snapshot) -> Vec<String> {
         ),
         format!("Verdict: {}", snapshot.verdict),
     ];
-    let mut machine = format!("Machine: {} cores", snapshot.cores);
-    if let Some(memory) = &snapshot.memory {
-        machine.push_str(&format!(
-            ", memory {} of {} in use",
-            format_memory(memory.used_bytes / 1024),
-            format_memory(memory.total_bytes / 1024)
-        ));
-    }
-    if let Some(load) = snapshot.load_average {
-        machine.push_str(&format!(
-            ", load {:.2} {:.2} {:.2} (1m/5m/15m)",
-            load[0], load[1], load[2]
-        ));
-    }
-    lines.push(machine);
+    lines.push(machine_line(
+        snapshot.cores,
+        snapshot.memory.as_ref(),
+        snapshot.load_average,
+    ));
     lines.push(format!(
         "CPU: {} of {} machine-wide; {} of that is wt-downstream ({}, {} RSS)",
         percent(snapshot.system_cpu),
@@ -417,6 +450,28 @@ pub fn report(snapshot: &Snapshot) -> Vec<String> {
         lines.push("tmux session attribution unavailable.".into());
     }
     lines
+}
+
+fn machine_line(
+    cores: usize,
+    memory: Option<&MemorySnapshot>,
+    load_average: Option<[f64; 3]>,
+) -> String {
+    let mut machine = format!("Machine: {cores} cores");
+    if let Some(memory) = memory {
+        machine.push_str(&format!(
+            ", memory {} of {} in use",
+            format_memory(memory.used_bytes / 1024),
+            format_memory(memory.total_bytes / 1024)
+        ));
+    }
+    if let Some(load) = load_average {
+        machine.push_str(&format!(
+            ", load {:.2} {:.2} {:.2} (1m/5m/15m)",
+            load[0], load[1], load[2]
+        ));
+    }
+    machine
 }
 
 fn report_process(row: &ProcessRow) -> String {
@@ -839,38 +894,13 @@ async fn launchd_owned_pids(ctx: &AppContext) -> Option<HashSet<u32>> {
     }
 }
 
-async fn load_average(ctx: &AppContext) -> Option<[f64; 3]> {
-    #[cfg(not(target_os = "macos"))]
-    let _ = ctx;
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(out) = ctx
-            .processes
-            .run(
-                CommandSpec::new("sysctl").args(["-n", "vm.loadavg"]),
-                &ctx.cancellation,
-            )
-            .await
-            && out.status.success()
-        {
-            let text = out.stdout_text();
-            let mut values = text
-                .trim()
-                .trim_matches(['{', '}'])
-                .split_whitespace()
-                .filter_map(|v| v.parse().ok());
-            if let (Some(a), Some(b), Some(c)) = (values.next(), values.next(), values.next()) {
-                return Some([a, b, c]);
-            }
-        }
-    }
-    let values = std::fs::read_to_string("/proc/loadavg").ok()?;
-    let mut fields = values.split_whitespace();
-    Some([
-        fields.next()?.parse().ok()?,
-        fields.next()?.parse().ok()?,
-        fields.next()?.parse().ok()?,
-    ])
+/// A system call rather than `sysctl` or `/proc`, so agent sandboxes that
+/// deny those still get the machine's load.
+fn load_average() -> Option<[f64; 3]> {
+    let mut values = [0.0_f64; 3];
+    // SAFETY: the buffer holds the three samples requested.
+    let read = unsafe { libc::getloadavg(values.as_mut_ptr(), 3) };
+    (read == 3).then_some(values)
 }
 
 async fn memory(ctx: &AppContext) -> Option<MemorySnapshot> {
@@ -878,18 +908,21 @@ async fn memory(ctx: &AppContext) -> Option<MemorySnapshot> {
     let _ = ctx;
     #[cfg(target_os = "macos")]
     {
-        let total = ctx
-            .processes
-            .run(
-                CommandSpec::new("sysctl").args(["-n", "hw.memsize"]),
-                &ctx.cancellation,
+        let mut total = 0_u64;
+        let mut size = std::mem::size_of::<u64>();
+        // SAFETY: hw.memsize is a u64 and `size` describes the buffer.
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut total).cast(),
+                &raw mut size,
+                std::ptr::null_mut(),
+                0,
             )
-            .await
-            .ok()?
-            .stdout_text()
-            .trim()
-            .parse::<u64>()
-            .ok()?;
+        };
+        if status != 0 || total == 0 {
+            return None;
+        }
         let stats = ctx
             .processes
             .run(CommandSpec::new("vm_stat"), &ctx.cancellation)
@@ -955,6 +988,26 @@ async fn memory(ctx: &AppContext) -> Option<MemorySnapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_denied_ps_spawn_degrades_to_machine_figures() {
+        let spawn = |kind| {
+            anyhow::Error::new(wt_platform::process::ProcessError::Io {
+                program: "ps".into(),
+                operation: "spawn",
+                source: std::io::Error::from(kind),
+            })
+            .context("snapshot processes")
+        };
+        assert!(process_listing_denied(&spawn(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!process_listing_denied(&spawn(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!process_listing_denied(&anyhow::anyhow!("ps: timed out")));
+    }
+
     #[test]
     fn process_parser_handles_commands_and_classifies_harnesses() {
         let row = parse_process("123 2 14.5 1024 00:42 codex --resume abc").unwrap();

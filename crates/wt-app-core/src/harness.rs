@@ -810,8 +810,13 @@ impl AppHarness {
             if root != authorized {
                 bail!("Codex target path no longer matches its authorized checkout");
             }
-            wt_harness::ensure_trusted_project(&config, &root)?;
-            Ok(())
+            match wt_harness::ensure_trusted_project(&config, &root) {
+                Err(error) if error.is_access_denied() => {
+                    warn_trust_denied(&root, &error);
+                    Ok(())
+                }
+                result => Ok(result?),
+            }
         })
         .await
         .context("prepare Codex target trust")??;
@@ -849,6 +854,25 @@ impl AppHarness {
             .await
             .context("discover harness sessions")
     }
+}
+
+/// A denied trust write must not fail the send, status or hold it rides on.
+/// Codex may then show its folder-trust gate, which message delivery already
+/// detects and reports without typing into it. Warn once per process; only an
+/// agent sandbox's CLI process gets the stderr line, since the board owns its
+/// terminal.
+fn warn_trust_denied(root: &Path, error: &wt_harness::CodexTrustError) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(root = %root.display(), error = %error, "Codex trust not recorded");
+        if std::env::var_os("CODEX_SANDBOX").is_some() {
+            eprintln!(
+                "wt: warning: the Codex sandbox denied recording trust for {} ({error}); \
+                 continuing. If Codex asks to trust that folder, rerun with escalation.",
+                root.display()
+            );
+        }
+    });
 }
 
 /// The one rule for configuration-pinned slot harnesses: only the `wt`
@@ -1644,6 +1668,40 @@ mod tests {
             );
             assert!(!app.codex_config.exists());
         }
+        fixture.close().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_preparation_continues_when_trust_config_is_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        let mut app = AppHarness::new(&fixture.ctx);
+        let dir = fixture.ctx.home.join("sandboxed-codex");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), "model = 'x'\n").unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        app.codex_config = dir.join("config.toml");
+        let result = app
+            .prepare_start(HarnessId::Codex, "one", &fixture.ctx.cwd, &fixture.ctx)
+            .await;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        result.unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("config.toml")).unwrap(),
+            "model = 'x'\n"
+        );
+        // Authorization still fails closed; only the trust write degrades.
+        assert!(
+            app.prepare_start(
+                HarnessId::Codex,
+                "unregistered",
+                &fixture.ctx.cwd,
+                &fixture.ctx
+            )
+            .await
+            .is_err()
+        );
         fixture.close().await.unwrap();
     }
 

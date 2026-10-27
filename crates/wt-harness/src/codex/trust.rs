@@ -26,6 +26,20 @@ pub enum CodexTrustError {
     Config { path: PathBuf, message: String },
 }
 
+impl CodexTrustError {
+    /// The OS refused access to Codex's config, as an agent sandbox does for
+    /// `$CODEX_HOME`. Malformed or concurrently changed config is not this.
+    pub fn is_access_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::Io { source, .. } if matches!(
+                source.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            )
+        )
+    }
+}
+
 /// Trust exactly one existing project root before starting Codex. The caller
 /// must authorize it from live wt inventory or an explicitly managed root;
 /// this function must never be fed arbitrary user-supplied directories.
