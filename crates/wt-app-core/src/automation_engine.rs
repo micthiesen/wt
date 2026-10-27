@@ -203,15 +203,18 @@ impl AutomationEngine {
     }
 
     pub async fn tick(&mut self, input: AutomationPassInput<'_>) -> Result<AutomationTick> {
-        // Reasons describe this pass only; an early return reports none.
-        self.waiting.clear();
-        self.unmet.clear();
         self.release_finished_slots(input.now_ms, input.activity);
         if !input.state_ready {
             // A transient store read failure must pause dispatch, not silently
             // discard the in-memory queue or pretend its cancellation persisted.
+            // Git and metadata refresh often, so the queue keeps the last
+            // pass's reasons; clearing them would flash requirement-held
+            // intents into the reported queue on every refresh.
             return Ok(AutomationTick::default());
         }
+        // Reasons describe this pass only.
+        self.waiting.clear();
+        self.unmet.clear();
         if input.globally_paused || !input.enabled {
             self.cancel_pending(input).await?;
             return Ok(AutomationTick::default());
@@ -904,6 +907,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(engine.pending_count(), 1);
+        // Held only by its requirement, so not reported as queued.
+        assert!(engine.queued().is_empty());
 
         let mut unavailable = input(
             &rules,
@@ -917,6 +922,8 @@ mod tests {
         unavailable.state_ready = false;
         engine.tick(unavailable).await.unwrap();
         assert_eq!(engine.pending_count(), 1);
+        // A pass without state changes nothing the queue reports.
+        assert!(engine.queued().is_empty());
 
         requirements.insert("test|worktree".into(), RequirementState::Ready);
         let ready = engine
