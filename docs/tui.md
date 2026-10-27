@@ -56,7 +56,8 @@ they start expanded when the check is due.
 Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
 order and visibility: `branch` (with its landing base), `issue` (also
 `linear`), `stage`, `dev`, `pr` (number, merge queue or auto-merge, checks with
-failing names, review, review bot), `claude` (every Claude, Codex, OpenCode, and Pi
+failing names, review, review bot, and with `[guides] enabled` the change
+guide last), `claude` (every Claude, Codex, OpenCode, and Pi
 session, the F12 target first), and `git` (dirty or clean, diff against the
 merge-base, last commit and creation ages, upstream counts in parentheses, base
 counts in brackets). The optional `path` group can be added explicitly and

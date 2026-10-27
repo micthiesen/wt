@@ -22,8 +22,9 @@ use wt_core::WorkState;
 
 use super::text::{age, now_ms, truncate_end, truncate_start, wrap};
 use crate::{
-    BoardRow, BoardSection, CheckState, DisplayPolicy, Model, PrPresentation, PreparedDetailGroup,
-    ReviewRequestRow, ReviewState, SessionView, badges, glyphs, model::ARCHIVED_SECTION, theme,
+    BoardRow, BoardSection, CheckState, DisplayPolicy, GuideView, Model, PrPresentation,
+    PreparedDetailGroup, ReviewRequestRow, ReviewState, SessionView, badges, glyphs,
+    model::ARCHIVED_SECTION, theme,
 };
 
 /// Conflicting files listed before collapsing into a `+N more` tail.
@@ -117,7 +118,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         .filter(|_| model.board.display.guides)
         .and_then(|row| row.guide.as_ref())
         .map(|guide| guide.url.clone())
-        && let Some(link) = find_text(frame.buffer_mut(), content, GUIDE_LINK)
+        && let Some(link) = guide_link(frame.buffer_mut(), content)
     {
         model.hyperlinks.push(super::Hyperlink { area: link, url });
     }
@@ -339,7 +340,7 @@ fn definition(
         "stage" => vec![stage_value(row)],
         "dev" => vec![dev_value(row)],
         "guide" => vec![guide_value(row)],
-        "pr" => pr_value(row.pr.as_ref(), policy, value_width),
+        "pr" => pr_value(row, policy, value_width),
         "claude" => session_values(row, policy),
         "git" => vec![git_value(row, value_width, now)],
         _ => group
@@ -469,8 +470,19 @@ fn issue_status_badge(status: Option<&str>) -> (&'static str, ratatui::style::Co
     }
 }
 
-/// Display text of the guide link; [`hyperlink`] finds it on screen.
+/// Display text of the guide link in its own row; [`guide_link`] finds it
+/// on screen.
 const GUIDE_LINK: &str = "change guide";
+/// The guide link's text at the end of the PR line.
+const GUIDE_WORD: &str = "guide";
+
+/// Where the guide link landed: its own row, else the PR line's book glyph
+/// and word, else the bare glyph when the pane is narrow.
+fn guide_link(buf: &ratatui::buffer::Buffer, area: Rect) -> Option<Rect> {
+    find_text(buf, area, GUIDE_LINK)
+        .or_else(|| find_text(buf, area, &format!("{}  {GUIDE_WORD}", glyphs::BOOK)))
+        .or_else(|| find_text(buf, area, glyphs::BOOK))
+}
 
 /// The recorded guide and whether it still describes this HEAD.
 fn guide_value(row: &BoardRow) -> Spans {
@@ -488,7 +500,6 @@ fn guide_value(row: &BoardRow) -> Spans {
             theme::fg(theme::INFO).add_modifier(ratatui::style::Modifier::UNDERLINED),
         ),
         Span::styled(format!(" · {freshness}"), theme::fg(color)),
-        Span::styled("  z open", theme::dim()),
     ]
 }
 
@@ -540,17 +551,60 @@ fn dev_value(row: &BoardRow) -> Spans {
     }
 }
 
-fn pr_value(pr: Option<&PrPresentation>, policy: &DisplayPolicy, width: usize) -> Vec<Spans> {
+/// The PR line, ending with the change guide when one is recorded and no
+/// `guide` row of its own shows it. The guide drops first on a narrow pane.
+fn pr_value(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Spans> {
+    let mut segments = pr_segments(row.pr.as_ref(), policy);
+    let standalone = row.detail_groups.iter().any(|group| group.id == "guide");
+    if policy.guides
+        && !standalone
+        && let Some(guide) = &row.guide
+    {
+        let segments = segments.get_or_insert_with(|| {
+            vec![Segment::new(1, vec![vec![Span::styled("—", theme::dim())]])]
+        });
+        segments.push(guide_segment(guide));
+    }
+    // Only an error is known; the caller renders it from the group.
+    segments.map_or_else(Vec::new, |segments| vec![fit_segments(segments, width)])
+}
+
+/// Linked `guide`, colored by whether it still describes this HEAD.
+fn guide_segment(guide: &GuideView) -> Segment {
+    let color = match guide.current {
+        Some(true) => theme::OK,
+        Some(false) => theme::WARN,
+        None => theme::FG_DIM,
+    };
+    let glyph = Span::styled(format!("{}  ", glyphs::BOOK), theme::fg(color));
+    Segment::new(
+        7,
+        vec![
+            vec![
+                glyph.clone(),
+                Span::styled(
+                    GUIDE_WORD,
+                    theme::fg(color).add_modifier(ratatui::style::Modifier::UNDERLINED),
+                ),
+            ],
+            vec![glyph],
+        ],
+    )
+}
+
+/// `None` only when an error is all that is known about the PR.
+fn pr_segments(pr: Option<&PrPresentation>, policy: &DisplayPolicy) -> Option<Vec<Segment>> {
+    let dash = || {
+        Some(vec![Segment::new(
+            1,
+            vec![vec![Span::styled("—", theme::dim())]],
+        )])
+    };
     let Some(pr) = pr else {
-        return vec![vec![Span::styled("—", theme::dim())]];
+        return dash();
     };
     let Some(number) = pr.number else {
-        // Only an error is known; the caller renders it from the group.
-        return if pr.error.is_some() {
-            Vec::new()
-        } else {
-            vec![vec![Span::styled("—", theme::dim())]]
-        };
+        return if pr.error.is_some() { None } else { dash() };
     };
     let state = badges::pr_state_badge(pr);
     let id = format!("#{number}");
@@ -647,7 +701,7 @@ fn pr_value(pr: Option<&PrPresentation>, policy: &DisplayPolicy, width: usize) -
             segments.push(Segment::new(5, modes));
         }
     }
-    vec![fit_segments(segments, width)]
+    Some(segments)
 }
 
 /// The row's sessions, the one F12 attaches to first. With none, the
@@ -1714,6 +1768,50 @@ mod tests {
 
     use super::*;
     use crate::{Board, DiffStat, GitPresentation, PrCommentView, TitleSource, WorkPresentation};
+
+    #[test]
+    fn pr_line_guide_shrinks_to_its_glyph_then_drops_before_pr_facts() {
+        let row = BoardRow {
+            pr: Some(PrPresentation {
+                number: Some(1234),
+                state: Some("OPEN".into()),
+                checks: CheckState::Pass,
+                ..Default::default()
+            }),
+            guide: Some(GuideView {
+                url: "https://guides.example/g".into(),
+                current: Some(false),
+            }),
+            ..Default::default()
+        };
+        let policy = DisplayPolicy {
+            guides: true,
+            ..Default::default()
+        };
+        let text = |row: &BoardRow, policy: &DisplayPolicy, width| {
+            pr_value(row, policy, width)
+                .concat()
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        let book = glyphs::BOOK;
+        let wide = text(&row, &policy, 80);
+        assert!(wide.contains("#1234") && wide.ends_with(&format!("{book}  guide")));
+        let narrow = text(&row, &policy, wide.width() - 2);
+        assert!(narrow.contains("checks") && narrow.ends_with(&format!("{book}  ")));
+        let tight = text(&row, &policy, narrow.width() - 4);
+        assert!(tight.contains("checks") && !tight.contains(book));
+        // Off, or shown in its own row, the PR line carries no guide.
+        let off = DisplayPolicy::default();
+        assert!(!text(&row, &off, 80).contains(book));
+        let mut own_row = row.clone();
+        own_row.detail_groups.push(PreparedDetailGroup {
+            id: "guide".into(),
+            ..Default::default()
+        });
+        assert!(!text(&own_row, &policy, 80).contains(book));
+    }
 
     #[test]
     fn a_span_that_exactly_fills_the_row_still_marks_the_cut() {

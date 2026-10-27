@@ -51,6 +51,7 @@ pub(crate) const CONFLICT: &str = "\u{F421}";
 pub(crate) const RESTACK: &str = "\u{F46A}";
 
 pub(crate) const MERGE_QUEUE: &str = "\u{F4DB}";
+pub(crate) const BOOK: &str = "\u{F405}"; // change guide
 pub(crate) const BOLT: &str = "\u{F0E7}"; // environment live (stage deployed / dev running)
 pub(crate) const BAN: &str = "\u{F05E}"; // environment not running
 pub(crate) const COMMENT: &str = "\u{F41F}"; // headless action running

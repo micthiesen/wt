@@ -229,14 +229,11 @@ fn detail_groups(row: &BoardRow, config: &Config) -> Vec<PreparedDetailGroup> {
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    // Enabling guides shows them without also requiring a `[ui].rows` edit;
-    // listing `guide` there places it explicitly.
-    if config.guides.enabled && !ids.contains(&"guide") {
-        let at = ids
-            .iter()
-            .position(|id| *id == "pr")
-            .map_or(ids.len(), |pr| pr + 1);
-        ids.insert(at, "guide");
+    // Enabling guides shows them without also requiring a `[ui].rows` edit:
+    // the PR line carries the guide, so only a pane without one adds a row.
+    // Listing `guide` there gives it its own row explicitly.
+    if config.guides.enabled && !ids.contains(&"guide") && !ids.contains(&"pr") {
+        ids.push("guide");
     }
     ids.into_iter()
         .filter_map(|id| detail_group(row, id, config))
@@ -554,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn guide_group_appears_after_the_pr_only_when_guides_are_enabled() {
+    fn guide_group_appears_only_when_guides_are_enabled_and_no_pr_line_carries_it() {
         let row = BoardRow {
             guide: Some(wt_tui::GuideView {
                 url: "https://guides.example/g".into(),
@@ -572,10 +569,12 @@ mod tests {
         assert_eq!(ids(&config), ["branch", "pr", "path"]);
         config.guides.enabled = true;
         assert_eq!(ids(&config), ["branch", "pr", "path", "guide"]);
-        config.ui.rows = vec!["branch".into(), "pr".into(), "path".into()];
-        assert_eq!(ids(&config), ["branch", "pr", "guide", "path"]);
-        let guide = detail_groups(&row, &config).remove(2);
+        let guide = detail_groups(&row, &config).remove(3);
         assert_eq!(guide.lines, ["https://guides.example/g"]);
+        config.ui.rows = vec!["branch".into(), "pr".into(), "path".into()];
+        assert_eq!(ids(&config), ["branch", "pr", "path"]);
+        config.ui.rows = vec!["branch".into(), "path".into()];
+        assert_eq!(ids(&config), ["branch", "path", "guide"]);
     }
 
     #[test]

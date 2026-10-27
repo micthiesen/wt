@@ -784,13 +784,65 @@ mod tests {
         };
         let (linked, text) = draw(row(Some(true)), true);
         assert_eq!(linked, ["change guide"]);
-        assert!(text.contains("change guide · current  z open"));
+        assert!(text.contains("change guide · current"));
+        assert!(!text.contains("z open"));
         let (_, text) = draw(row(Some(false)), true);
         assert!(text.contains("outdated: commits since"));
         // Off by default the host prepares no guide row; nothing is linked
         // even if one were shown.
         let (linked, _) = draw(row(Some(true)), false);
         assert!(linked.is_empty());
+    }
+
+    #[test]
+    fn guide_rides_the_pr_line_as_a_link() {
+        let mut model = Model {
+            board: Arc::new(Board {
+                name: "repository".into(),
+                rows: vec![BoardRow {
+                    key: "one".into(),
+                    title: "task".into(),
+                    detail_groups: vec![crate::PreparedDetailGroup {
+                        id: "pr".into(),
+                        label: "PR".into(),
+                        ..Default::default()
+                    }],
+                    guide: Some(crate::GuideView {
+                        url: "https://guides.example/g/1".into(),
+                        current: Some(true),
+                    }),
+                    ..BoardRow::default()
+                }],
+                display: crate::DisplayPolicy {
+                    guides: true,
+                    ..Default::default()
+                },
+                ..Board::default()
+            }),
+            selected: Some(0),
+            ..Model::default()
+        };
+        let book = crate::glyphs::BOOK;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut model)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let texts = model
+            .hyperlinks
+            .iter()
+            .map(|link| {
+                assert_eq!(link.url, "https://guides.example/g/1");
+                (link.area.left()..link.area.right())
+                    .map(|x| buffer[(x, link.area.y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, [format!("{book}  guide")]);
+        let screen = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect::<String>();
+        assert!(!screen.contains("change guide"), "no separate guide row");
     }
 
     #[test]
