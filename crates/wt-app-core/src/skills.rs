@@ -17,6 +17,11 @@ fn target_options(context: &AppContext) -> wt_skills::TargetOptions {
         home: context.home.clone(),
         codex_home: std::env::var_os("CODEX_HOME").map(PathBuf::from),
         pi_dir: std::env::var_os("PI_CODING_AGENT_DIR").map(PathBuf::from),
+        claude_instructions: match context.config.skills.claude_instructions {
+            wt_config::ClaudeInstructions::Auto => wt_skills::ClaudeInstructions::Auto,
+            wt_config::ClaudeInstructions::Write => wt_skills::ClaudeInstructions::Write,
+            wt_config::ClaudeInstructions::Skip => wt_skills::ClaudeInstructions::Skip,
+        },
     }
 }
 

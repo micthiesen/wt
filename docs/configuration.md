@@ -1029,6 +1029,7 @@ entry remains last.
 | key | required | default | meaning |
 |---|---|---|---|
 | `startup_check` | no | `true` | Check wt's bundled agent skills + managed instructions block for pending updates when the TUI starts, prompting y/n once per update before the terminal is taken over (so agent sessions spawned from that run see the updates). A "no" is remembered per content version and never re-asked; copies wt didn't install are never overwritten without an explicit yes. `false` disables the startup prompt — `wt skills` keeps working on demand. See [skills.md](skills.md). |
+| `claude_instructions` | no | `"auto"` | Whether `wt skills` writes the instructions block into `~/.claude/CLAUDE.md`. `"auto"` skips it when Claude Code's `agents` mod (a plugin directory in `~/.claude/settings.json` `env.CLAUDE_CODE_PLUGIN_DIRS` whose `.claude-plugin/plugin.json` is named `agents`) already loads `~/.codex/AGENTS.md`, which carries the block; `"write"` and `"skip"` override detection either way. When skipping, `wt skills sync` removes only wt's marked block from `CLAUDE.md` and deletes the file if nothing else is left. `wt skills status` prints the active mode. See [skills.md](skills.md#claude-code-and-the-agents-mod). |
 
 ## `[manager]`
 

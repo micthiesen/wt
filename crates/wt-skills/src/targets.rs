@@ -59,12 +59,77 @@ pub struct Targets {
     pub skills: Vec<SkillsTarget>,
     pub instructions: Vec<InstructionsTarget>,
     pub harnesses: Vec<AgentToolId>,
+    /// How Claude Code gets the instructions block, when Claude is configured.
+    pub claude_instructions: Option<ClaudeInstructionsMode>,
+}
+/// Whether wt writes its block into `~/.claude/CLAUDE.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeInstructions {
+    /// Write unless Claude Code already reads `~/.codex/AGENTS.md`.
+    #[default]
+    Auto,
+    Write,
+    Skip,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeInstructionsMode {
+    pub setting: ClaudeInstructions,
+    pub write: bool,
+    pub reason: String,
+    /// The CLAUDE.md that sync should clear of wt's block when skipping. None
+    /// when it resolves to a file wt still writes the block into.
+    pub retired: Option<PathBuf>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct TargetOptions {
     pub home: PathBuf,
     pub codex_home: Option<PathBuf>,
     pub pi_dir: Option<PathBuf>,
+    pub claude_instructions: ClaudeInstructions,
+}
+
+/// The `agents` mod serves the Codex-native layout, including
+/// `~/.codex/AGENTS.md`, to Claude Code. It is registered as a plugin
+/// directory in Claude's user settings.
+fn agents_mod_dir(home: &Path) -> Option<PathBuf> {
+    let raw = fs::read_to_string(home.join(".claude/settings.json")).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let dirs = settings
+        .get("env")?
+        .get("CLAUDE_CODE_PLUGIN_DIRS")?
+        .as_str()?;
+    dirs.split([':', ','])
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| match dir.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None if dir == "~" => home.to_path_buf(),
+            None => PathBuf::from(dir),
+        })
+        .find(|dir| {
+            fs::read_to_string(dir.join(".claude-plugin/plugin.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+                .is_some_and(|plugin| plugin.get("name").and_then(|n| n.as_str()) == Some("agents"))
+        })
+}
+
+fn claude_instructions_mode(o: &TargetOptions, codex_configured: bool) -> (bool, String) {
+    match o.claude_instructions {
+        ClaudeInstructions::Write => (true, "[skills] claude_instructions = \"write\"".into()),
+        ClaudeInstructions::Skip => (false, "[skills] claude_instructions = \"skip\"".into()),
+        ClaudeInstructions::Auto => match agents_mod_dir(&o.home) {
+            Some(dir) if codex_configured => (
+                false,
+                format!(
+                    "auto: the agents mod at {} loads the Codex AGENTS.md",
+                    dir.display()
+                ),
+            ),
+            _ => (true, "auto: Claude Code reads only CLAUDE.md".into()),
+        },
+    }
 }
 
 pub fn target_key(target: &impl TargetPath) -> String {
@@ -262,6 +327,16 @@ pub fn detect_targets(o: &TargetOptions) -> Targets {
     if pi.as_ref().is_some_and(|p| configured(p)) {
         hs.push(AgentToolId::Pi)
     }
+    let mut claude = None;
+    if hs.contains(&AgentToolId::Claude) {
+        let (write, reason) = claude_instructions_mode(o, hs.contains(&AgentToolId::Codex));
+        claude = Some(ClaudeInstructionsMode {
+            setting: o.claude_instructions,
+            write,
+            reason,
+            retired: None,
+        });
+    }
     let mut skills = vec![];
     let mut ins = vec![];
     for h in &hs {
@@ -296,12 +371,28 @@ pub fn detect_targets(o: &TargetOptions) -> Targets {
             }
         };
         skills.push((*h, resolve(&dir)));
-        ins.push((*h, resolve(&file)));
+        match &mut claude {
+            Some(mode) if *h == AgentToolId::Claude && !mode.write => {
+                mode.retired = Some(resolve(&file));
+            }
+            _ => ins.push((*h, resolve(&file))),
+        }
+    }
+    let instructions = dedupe_ins(ins);
+    // A CLAUDE.md linked to a file another tool reads keeps its block.
+    if let Some(mode) = &mut claude
+        && mode
+            .retired
+            .as_ref()
+            .is_some_and(|file| instructions.iter().any(|t| t.path() == file))
+    {
+        mode.retired = None;
     }
     Targets {
         skills: dedupe_skills(skills),
-        instructions: dedupe_ins(ins),
+        instructions,
         harnesses: hs,
+        claude_instructions: claude,
     }
 }
 pub fn harness_skill_dirs(h: HarnessId, o: &TargetOptions) -> Vec<PathBuf> {
@@ -355,6 +446,95 @@ pub fn no_tools_hint() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claude_and_codex(home: &Path) {
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/CLAUDE.md"), "x").unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::write(home.join(".codex/AGENTS.md"), "x").unwrap();
+    }
+
+    fn install_agents_mod(home: &Path) {
+        let dir = home.join("dotfiles/mod");
+        fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+        fs::write(
+            dir.join(".claude-plugin/plugin.json"),
+            r#"{"name":"agents"}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"env":{"CLAUDE_CODE_PLUGIN_DIRS":"~/elsewhere:~/dotfiles/mod"}}"#,
+        )
+        .unwrap();
+    }
+
+    fn options(home: &Path, setting: ClaudeInstructions) -> TargetOptions {
+        TargetOptions {
+            home: home.to_path_buf(),
+            claude_instructions: setting,
+            ..Default::default()
+        }
+    }
+
+    fn claude_md_targeted(targets: &Targets) -> bool {
+        targets
+            .instructions
+            .iter()
+            .any(|t| t.path().ends_with(".claude/CLAUDE.md"))
+    }
+
+    #[test]
+    fn agents_mod_moves_claude_onto_the_codex_block_unless_overridden() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        claude_and_codex(home);
+
+        let plain = detect_targets(&options(home, ClaudeInstructions::Auto));
+        assert!(claude_md_targeted(&plain));
+        assert!(plain.claude_instructions.as_ref().unwrap().write);
+
+        install_agents_mod(home);
+        let auto = detect_targets(&options(home, ClaudeInstructions::Auto));
+        let mode = auto.claude_instructions.clone().unwrap();
+        assert!(!claude_md_targeted(&auto) && !mode.write);
+        assert!(mode.reason.contains("dotfiles/mod"), "{}", mode.reason);
+        assert!(mode.retired.unwrap().ends_with(".claude/CLAUDE.md"));
+        assert!(auto.harnesses.contains(&AgentToolId::Claude));
+        assert!(
+            auto.skills
+                .iter()
+                .any(|t| t.path().ends_with(".claude/skills"))
+        );
+
+        let forced = detect_targets(&options(home, ClaudeInstructions::Write));
+        assert!(claude_md_targeted(&forced));
+        assert!(forced.claude_instructions.unwrap().retired.is_none());
+    }
+
+    #[test]
+    fn skip_never_retires_a_claude_md_linked_to_a_kept_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        claude_and_codex(home);
+        fs::remove_file(home.join(".claude/CLAUDE.md")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            home.join(".codex/AGENTS.md"),
+            home.join(".claude/CLAUDE.md"),
+        )
+        .unwrap();
+        let skip = detect_targets(&options(home, ClaudeInstructions::Skip));
+        let mode = skip.claude_instructions.unwrap();
+        assert!(!mode.write);
+        assert!(mode.retired.is_none());
+        assert!(
+            skip.instructions
+                .iter()
+                .any(|t| t.path().ends_with(".codex/AGENTS.md"))
+        );
+    }
+
     #[test]
     fn opencode_uses_native_or_shared_skills_without_creating_claude_layout() {
         let t = tempfile::tempdir().unwrap();

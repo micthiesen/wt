@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use std::{ffi::OsString, io::IsTerminal, time::Duration};
 use wt_platform::process::CommandSpec;
-use wt_skills::{MemoryStore, SyncMode, UnitState, build_reports, detect_targets, sync};
+use wt_skills::{
+    MemoryStore, RetiredInstructions, SyncMode, UnitState, build_reports, detect_targets, sync,
+};
 
 use wt_app_core::{context::AppContext, prompt};
 
@@ -49,6 +51,13 @@ fn label(state: UnitState) -> &'static str {
     }
 }
 
+/// The CLAUDE.md wt stopped writing into, and what is left of its block.
+fn retired(targets: &wt_skills::Targets) -> Option<(std::path::PathBuf, RetiredInstructions)> {
+    let path = targets.claude_instructions.as_ref()?.retired.clone()?;
+    let state = wt_skills::inspect_retired(&path);
+    Some((path, state))
+}
+
 pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
     let command = args.command.clone().unwrap_or(SkillsCommand::Status);
     let memory = store(context);
@@ -58,6 +67,13 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
             if targets.harnesses.is_empty() {
                 println!("{}", wt_skills::no_tools_hint());
                 return Ok(0);
+            }
+            if let Some(mode) = &targets.claude_instructions {
+                println!(
+                    "claude instructions: {} ({})",
+                    if mode.write { "write" } else { "skip" },
+                    mode.reason
+                );
             }
             let reports = build_reports(&targets, &memory.load()?);
             for r in reports {
@@ -71,6 +87,16 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
                 if let Some(detail) = r.detail {
                     println!("  {detail}")
                 }
+            }
+            match retired(&targets) {
+                Some((path, RetiredInstructions::Pending)) => println!(
+                    "remove  instructions  {}  (wt block; `wt skills sync` removes it)",
+                    path.display()
+                ),
+                Some((path, RetiredInstructions::Blocked(detail))) => {
+                    println!("blocked  instructions  {}\n  {detail}", path.display())
+                }
+                _ => {}
             }
             Ok(0)
         }
@@ -155,12 +181,18 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
                             .any(|name| name == r.unit.name || *name == wt_skills::unit_key(r.unit))
                 })
                 .collect::<Vec<_>>();
+            let retire = retired(&targets)
+                .filter(|(_, state)| *state == RetiredInstructions::Pending && units.is_empty())
+                .map(|(path, _)| path);
             if !interactive && !yes && !force {
                 let pending = selected
                     .iter()
                     .filter(|r| wt_skills::report_is_actionable(r))
                     .collect::<Vec<_>>();
-                if pending.is_empty() {
+                if let Some(path) = &retire {
+                    println!("wt block to remove from {}", path.display());
+                }
+                if pending.is_empty() && retire.is_none() {
                     println!("agent skills and instructions are up to date");
                     return Ok(0);
                 }
@@ -285,6 +317,22 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
                     _ => false,
                 });
             }
+            let mut removed = 0;
+            if let Some(path) = retire {
+                let apply = !interactive
+                    || prompt::confirm(
+                        &format!(
+                            "Remove wt's instructions block from {} (Claude Code reads it from AGENTS.md)? [Y/n] ",
+                            path.display()
+                        ),
+                        true,
+                        &context.cancellation,
+                    )
+                    .await?;
+                if apply && wt_skills::retire_instructions(&path)? {
+                    removed += 1;
+                }
+            }
             let mode = SyncMode::Force;
             let summary = sync(&approved, mode)?;
             // Regenerate each touched rulesync pipeline after its source files
@@ -323,7 +371,7 @@ pub async fn run(context: &AppContext, args: &SkillsArgs) -> Result<i32> {
                 }
             }
             println!(
-                "installed {}, updated {}, skipped modified {}, blocked {}",
+                "installed {}, updated {}, removed {removed}, skipped modified {}, blocked {}",
                 summary.installed, summary.updated, summary.skipped_modified, summary.blocked
             );
             Ok(0)

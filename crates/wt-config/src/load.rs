@@ -758,7 +758,7 @@ impl Config {
 
         let actions = parse_actions(&raw, &mut errors);
         let automations = parse_automations(&raw, &actions, &branch, &mut errors);
-        let skills_raw: StartupCheckSection = section(&raw, "skills", &mut errors);
+        let skills_raw: SkillsSection = section(&raw, "skills", &mut errors);
         let manager_raw: ManagerSection = section(&raw, "manager", &mut errors);
         let update_raw: StartupCheckSection = section(&raw, "update", &mut errors);
 
@@ -805,6 +805,7 @@ impl Config {
             ui,
             skills: SkillsConfig {
                 startup_check: skills_raw.startup_check,
+                claude_instructions: skills_raw.claude_instructions,
             },
             manager: ManagerConfig {
                 wt_feedback: manager_raw.wt_feedback,
@@ -1468,6 +1469,20 @@ struct RawIssueTracker {
 #[serde(default)]
 struct RawLinear {
     workspace: String,
+}
+#[derive(Deserialize)]
+#[serde(default)]
+struct SkillsSection {
+    startup_check: bool,
+    claude_instructions: crate::schema::ClaudeInstructions,
+}
+impl Default for SkillsSection {
+    fn default() -> Self {
+        Self {
+            startup_check: true,
+            claude_instructions: Default::default(),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(default)]

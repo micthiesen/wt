@@ -184,9 +184,42 @@ pub fn splice_instructions_block(file_text: &str, block_body: &str) -> String {
     format!("{file_text}{separator}{block}\n")
 }
 
+/// The file without its one well-formed managed block, keeping everything
+/// outside the markers. None when there is no single intact block to remove.
+pub fn remove_instructions_block(file_text: &str) -> Option<String> {
+    if count_instructions_blocks(file_text) != 1 {
+        return None;
+    }
+    let span = block_span(file_text)?;
+    let before = file_text[..span.start].trim_end_matches('\n');
+    let after = file_text[span.end..].trim_start_matches('\n');
+    Some(match (before.is_empty(), after.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => after.to_owned(),
+        (false, true) => format!("{before}\n"),
+        (false, false) => format!("{before}\n\n{after}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_the_block_keeps_surrounding_text() {
+        let with = splice_instructions_block("mine\n", "RULES");
+        assert_eq!(remove_instructions_block(&with).as_deref(), Some("mine\n"));
+        let only = splice_instructions_block("", "RULES");
+        assert_eq!(remove_instructions_block(&only).as_deref(), Some(""));
+        let middle = format!("top\n\n{}\nbottom\n", only.trim_end());
+        assert_eq!(
+            remove_instructions_block(&middle).as_deref(),
+            Some("top\n\nbottom\n")
+        );
+        assert_eq!(remove_instructions_block("mine\n"), None);
+        let damaged = only.replace(END_MARKER, "");
+        assert_eq!(remove_instructions_block(&damaged), None);
+    }
     #[test]
     fn hash_stamp_and_render_are_stable() {
         let var = TemplateVar {

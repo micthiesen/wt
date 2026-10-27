@@ -31,7 +31,7 @@ other `@skill-id` references. See [OpenCode sessions](opencode.md).
 
 | unit | what it is |
 |---|---|
-| `instructions` | a managed block spliced into each tool's **global instructions file** (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `$PI_CODING_AGENT_DIR/AGENTS.md`, `~/.config/opencode/AGENTS.md`): the always-on ownership rules for agents working in wt worktrees (work status, decision ownership and the `needs-human` refusal test, manual testing, the dev server) |
+| `instructions` | a managed block spliced into each tool's **global instructions file** (`~/.claude/CLAUDE.md` unless [Claude reads AGENTS.md](#claude-code-and-the-agents-mod), `~/.codex/AGENTS.md`, `$PI_CODING_AGENT_DIR/AGENTS.md`, `~/.config/opencode/AGENTS.md`): the always-on ownership rules for agents working in wt worktrees (work status, decision ownership and the `needs-human` refusal test, manual testing, the dev server) |
 | `wt` skill | orientation: subcommands, conventions, the stacked-PR model, gotchas |
 | `restack` skill | the conflict-resolution playbook behind `/restack` |
 | `manager` skill | the fleet-coordinator playbook for the [manager session](manager.md) |
@@ -184,6 +184,26 @@ prefers the native `~/.pi/agent` directory over legacy Pi locations.
   One regenerate per sync, not per unit. Those repos commit their generated
   output, so wt reports how many files are left uncommitted afterwards —
   an update nobody commits is one `git checkout --` from being gone.
+
+### Claude Code and the agents mod
+
+Claude Code normally reads only `~/.claude/CLAUDE.md`. When its `agents` mod
+serves the Codex-native layout instead, Claude already loads
+`~/.codex/AGENTS.md`, and a second block in `CLAUDE.md` would load the rules
+twice. `[skills] claude_instructions` decides (see
+[configuration](configuration.md#skills)): `auto` detects the mod, `write` and
+`skip` force either side. Claude's skills directory is served either way.
+
+When skipping, `wt skills status` lists a `remove` line while wt's block is
+still in `CLAUDE.md`, and `wt skills sync` removes only that marked block,
+deleting the file when nothing else is left (a symlinked file is written
+through and kept). Damaged or repeated markers are reported as blocked and
+left alone. A `CLAUDE.md` linked to a file wt still writes keeps its block.
+The status output starts with the active mode:
+
+```
+claude instructions: skip (auto: the agents mod at ~/.dotfiles/claude-code/mod loads the Codex AGENTS.md)
+```
 
 ## Template values
 

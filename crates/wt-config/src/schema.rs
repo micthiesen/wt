@@ -581,6 +581,17 @@ pub struct UiConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SkillsConfig {
     pub startup_check: bool,
+    pub claude_instructions: ClaudeInstructions,
+}
+/// Whether `wt skills` writes its block into `~/.claude/CLAUDE.md`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeInstructions {
+    /// Skip when Claude Code's `agents` mod already loads `~/.codex/AGENTS.md`.
+    #[default]
+    Auto,
+    Write,
+    Skip,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ManagerConfig {

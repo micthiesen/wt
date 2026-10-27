@@ -10,7 +10,9 @@ mod report;
 mod targets;
 mod template;
 
-pub use apply::{SyncMode, SyncSummary, sync};
+pub use apply::{
+    RetiredInstructions, SyncMode, SyncSummary, inspect_retired, retire_instructions, sync,
+};
 pub use bundle::{TemplateVar, Unit, UnitKind, find_unit, unit_key, unit_source, units};
 pub use memory::{MemoryError, MemoryStore, SkillsMemory};
 pub use report::{
@@ -18,12 +20,14 @@ pub use report::{
     report_is_actionable,
 };
 pub use targets::{
-    AgentToolId, InstructionsTarget, RulesyncInfo, SkillsTarget, TargetOptions, Targets,
-    detect_targets, harness_can_resolve_skill, harness_skill_dirs, no_tools_hint, target_key,
+    AgentToolId, ClaudeInstructions, ClaudeInstructionsMode, InstructionsTarget, RulesyncInfo,
+    SkillsTarget, TargetOptions, Targets, detect_targets, harness_can_resolve_skill,
+    harness_skill_dirs, no_tools_hint, target_key,
 };
 pub use template::{
     content_hash, count_instructions_blocks, extract_instructions_block, normalize_body,
-    render_template, splice_instructions_block, split_stamp, stamp_content, strip_rulesync_keys,
+    remove_instructions_block, render_template, splice_instructions_block, split_stamp,
+    stamp_content, strip_rulesync_keys,
 };
 
 use anyhow::{Result, bail};

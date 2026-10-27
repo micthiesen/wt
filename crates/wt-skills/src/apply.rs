@@ -82,6 +82,58 @@ fn write_instructions(report: &UnitReport) -> Result<(), SyncError> {
     atomic_write(&report.path, next.as_bytes())?;
     Ok(())
 }
+/// State of a CLAUDE.md wt no longer writes its block into.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetiredInstructions {
+    /// No file, or no wt block in it.
+    Clean,
+    /// wt's block is still there; sync removes it.
+    Pending,
+    /// Markers are damaged or repeated; left for a human.
+    Blocked(String),
+}
+
+pub fn inspect_retired(path: &Path) -> RetiredInstructions {
+    match fs::read_to_string(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => RetiredInstructions::Clean,
+        Err(error) => RetiredInstructions::Blocked(format!("cannot read: {error}")),
+        Ok(text) if crate::count_instructions_blocks(&text) == 0 => RetiredInstructions::Clean,
+        Ok(text) if crate::remove_instructions_block(&text).is_some() => {
+            RetiredInstructions::Pending
+        }
+        Ok(_) => RetiredInstructions::Blocked(
+            "wt block markers are damaged or repeated; remove them by hand".into(),
+        ),
+    }
+}
+
+/// Remove wt's block from a retired instructions file, leaving everything
+/// else. A plain file left empty is deleted; a symlinked one is written
+/// through and kept. Returns whether anything changed.
+pub fn retire_instructions(path: &Path) -> Result<bool, SyncError> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if crate::count_instructions_blocks(&text) == 0 {
+        return Ok(false);
+    }
+    let rest = crate::remove_instructions_block(&text).ok_or_else(|| {
+        SyncError::Blocked(format!(
+            "{}: wt block markers are damaged or repeated",
+            path.display()
+        ))
+    })?;
+    let linked = fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+    if rest.trim().is_empty() && !linked {
+        fs::remove_file(path)?;
+    } else {
+        atomic_write(path, rest.as_bytes())?;
+    }
+    Ok(true)
+}
+
 pub fn sync(reports: &[UnitReport], mode: SyncMode) -> Result<SyncSummary, SyncError> {
     let mut summary = SyncSummary::default();
     // Two targets can link to one source file; write it once.
@@ -127,6 +179,34 @@ mod tests {
     use super::*;
     use crate::{SkillsMemory, Targets, build_reports};
     use std::path::Path;
+    #[test]
+    fn retiring_removes_only_the_block_and_an_emptied_file() {
+        let d = tempfile::tempdir().unwrap();
+        let only = d.path().join("CLAUDE.md");
+        fs::write(&only, crate::splice_instructions_block("", "RULES")).unwrap();
+        assert_eq!(inspect_retired(&only), RetiredInstructions::Pending);
+        assert!(retire_instructions(&only).unwrap());
+        assert!(!only.exists());
+        assert_eq!(inspect_retired(&only), RetiredInstructions::Clean);
+        assert!(!retire_instructions(&only).unwrap());
+
+        let shared = d.path().join("shared.md");
+        fs::write(&shared, crate::splice_instructions_block("mine\n", "RULES")).unwrap();
+        assert!(retire_instructions(&shared).unwrap());
+        assert_eq!(fs::read_to_string(&shared).unwrap(), "mine\n");
+
+        let damaged = d.path().join("damaged.md");
+        let text = crate::splice_instructions_block("", "RULES")
+            .replace("<!-- wt:instructions:end -->", "");
+        fs::write(&damaged, &text).unwrap();
+        assert!(matches!(
+            inspect_retired(&damaged),
+            RetiredInstructions::Blocked(_)
+        ));
+        assert!(retire_instructions(&damaged).is_err());
+        assert_eq!(fs::read_to_string(&damaged).unwrap(), text);
+    }
+
     #[test]
     fn safe_sync_preserves_existing_personal_skill() {
         let d = tempfile::tempdir().unwrap();
