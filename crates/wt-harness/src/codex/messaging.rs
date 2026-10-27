@@ -714,6 +714,11 @@ impl CodexMessenger {
         let mut command = CommandSpec::new("ps").args([
             "-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart=", "-o", "comm=",
         ]);
+        // The start time is an identity; keep it independent of locale and zone.
+        command.env = vec![
+            ("LC_ALL".into(), Some("C".into())),
+            ("TZ".into(), Some("UTC".into())),
+        ];
         command.timeout = Duration::from_secs(2);
         let output = self.runner.run(command, cancel).await.ok()?;
         if !output.status.success() {

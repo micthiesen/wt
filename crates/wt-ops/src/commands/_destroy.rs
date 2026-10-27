@@ -306,7 +306,7 @@ pub async fn wait_for_completion_or_shutdown(
                     .filter(|identity| !identity.is_empty()),
             ) {
                 let actual = process_start_identity(pid, &ctx.processes).await;
-                if pid_is_gone(pid) || (!actual.is_empty() && actual != expected) {
+                if pid_is_gone(pid) || identities_conflict(expected, &actual) {
                     // An unrelated reused PID cannot own this job. Do not
                     // rewrite archive state here: the durable record does
                     // not prove where a crashed worker stopped.
@@ -505,8 +505,7 @@ async fn reconcile_removal(ctx: &AppContext, key: &str, removal: &Value) -> Resu
     };
     let expected = job["workerStartIdentity"].as_str().unwrap_or_default();
     let actual = process_start_identity(pid, &ctx.processes).await;
-    let exited =
-        pid_is_gone(pid) || (!expected.is_empty() && !actual.is_empty() && expected != actual);
+    let exited = pid_is_gone(pid) || identities_conflict(expected, &actual);
     if !exited {
         return Ok(());
     }
@@ -673,7 +672,7 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
         let abandoned = if actual.is_empty() {
             pid_is_gone(pid)
         } else {
-            !expected.is_empty() && actual != expected
+            identities_conflict(expected, &actual)
         };
         if !abandoned {
             continue;
@@ -732,21 +731,80 @@ async fn process_start_identity(pid: u32, runner: &wt_platform::process::Process
             return format!("linux:{start}");
         }
     }
+    // `lstart` is formatted in the caller's locale and time zone; pin both so
+    // every wt process, whatever its environment, prints the same identity.
     let mut spec = CommandSpec::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]);
+    spec.env = vec![
+        ("LC_ALL".into(), Some("C".into())),
+        ("TZ".into(), Some("UTC".into())),
+    ];
     spec.timeout = Duration::from_secs(2);
     runner
         .run(spec, &CancellationToken::new())
         .await
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| format!("ps:{}", output.stdout_text().trim()))
+        .map(|output| format!("{PS_IDENTITY}:{}", output.stdout_text().trim()))
         .unwrap_or_default()
+}
+
+/// Scheme of [`process_start_identity`] on macOS. Builds before it wrote
+/// `ps:` in their own locale, which is not comparable.
+const PS_IDENTITY: &str = "ps-c-utc";
+
+/// Proof that a PID now belongs to another process: two known identities
+/// of the same scheme that differ. A record from another scheme proves
+/// nothing, so a worker that predates an update is never declared gone.
+fn identities_conflict(expected: &str, actual: &str) -> bool {
+    let scheme = |identity: &str| {
+        identity
+            .split_once(':')
+            .map(|(scheme, _)| scheme.to_owned())
+    };
+    !expected.is_empty()
+        && !actual.is_empty()
+        && scheme(expected) == scheme(actual)
+        && expected != actual
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use wt_app_core::test_support::CommandFixture;
+
+    #[test]
+    fn only_same_scheme_identities_can_prove_a_reused_pid() {
+        let now = "ps-c-utc:Mon Oct 26 17:50:50 2026";
+        assert!(!identities_conflict(now, now));
+        assert!(identities_conflict(
+            now,
+            "ps-c-utc:Mon Oct 26 17:50:51 2026"
+        ));
+        // A record from an older build, in whatever locale it ran, and an
+        // unreadable probe prove nothing.
+        assert!(!identities_conflict("ps:Mon 26 Oct 10:50:50 2026", now));
+        assert!(!identities_conflict("", now));
+        assert!(!identities_conflict(now, ""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn start_identity_ignores_the_callers_locale_and_zone() {
+        let runner = wt_platform::process::ProcessRunner::default();
+        let pid = std::process::id();
+        let identity = process_start_identity(pid, &runner).await;
+        assert!(identity.starts_with("ps-c-utc:"), "{identity}");
+        // The pinned environment wins over anything the caller inherited.
+        let mut spec = CommandSpec::new("ps").args(["-o", "lstart=", "-p", &pid.to_string()]);
+        spec.env = vec![
+            ("LC_ALL".into(), Some("en_CA.UTF-8".into())),
+            ("TZ".into(), Some("America/Vancouver".into())),
+        ];
+        let local = runner.run(spec, &CancellationToken::new()).await.unwrap();
+        let local = local.stdout_text();
+        assert_ne!(format!("ps-c-utc:{}", local.trim()), identity);
+        assert_eq!(process_start_identity(pid, &runner).await, identity);
+    }
 
     #[tokio::test]
     async fn accepted_failure_is_published_and_a_lost_success_reply_is_reconciled() {
