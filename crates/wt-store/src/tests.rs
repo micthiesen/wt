@@ -1335,3 +1335,28 @@ fn adopting_explicit_sections_keeps_only_live_ones_once() {
         json!(["\0inbox", "Live", "Remote", "Creating"])
     );
 }
+
+#[test]
+fn a_removal_records_a_later_production_landing_once() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store
+        .write_repository_state_json(
+            r#"{"version":18,"removed":[
+                {"slug":"one","branch":"b","removedAt":"t1","landedOnAtRemoval":"base"},
+                {"slug":"one","branch":"b","removedAt":"t0","landedOnAtRemoval":"base"}]}"#,
+        )
+        .unwrap();
+    let landed = [("one".to_owned(), "t1".to_owned())];
+    assert!(store.record_removed_production_landings(&landed).unwrap());
+    assert!(!store.record_removed_production_landings(&landed).unwrap());
+    let state: serde_json::Value =
+        serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap();
+    assert_eq!(state["removed"][0]["landedOn"], "production");
+    // Only the exact removal: an older record of the same slug is untouched.
+    assert!(state["removed"][1].get("landedOn").is_none());
+}

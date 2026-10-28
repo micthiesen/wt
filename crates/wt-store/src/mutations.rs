@@ -1636,6 +1636,28 @@ impl Store {
         })
     }
 
+    /// Record that these removals (slug, removedAt) have since reached
+    /// production. Returns whether any record changed.
+    pub fn record_removed_production_landings(
+        &mut self,
+        landed: &[(String, String)],
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut changed = false;
+            for entry in array_mut(state, "removed").iter_mut() {
+                let matches = landed.iter().any(|(slug, removed_at)| {
+                    entry.get("slug").and_then(Value::as_str) == Some(slug)
+                        && entry.get("removedAt").and_then(Value::as_str) == Some(removed_at)
+                });
+                if matches && entry.get("landedOn").and_then(Value::as_str) != Some("production") {
+                    entry["landedOn"] = json!("production");
+                    changed = true;
+                }
+            }
+            Ok((changed, changed))
+        })
+    }
+
     /// Restore a removed-history row after a failed restore attempt, without
     /// replacing a newer removal record written for the same slug.
     pub fn restore_removed_worktree_if_absent(

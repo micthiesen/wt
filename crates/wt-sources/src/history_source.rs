@@ -160,6 +160,7 @@ pub fn start(
                 }
             };
             last_prepared = prepare_ledger(&context, &records, &last_prepared);
+            let records_seen = records.clone();
             publisher.publish_live(last_prepared.clone(), observed);
             if !is_active {
                 continue;
@@ -180,7 +181,19 @@ pub fn start(
                 result = enrich(&context, records, &request_cancellation) => result,
             };
             match prepared {
-                Ok((snapshot, fact_error)) if !cancellation.is_cancelled() => {
+                Ok((mut snapshot, fact_error)) if !cancellation.is_cancelled() => {
+                    let proven =
+                        keep_strongest_landing(&mut snapshot, &last_prepared, &records_seen);
+                    if !proven.is_empty()
+                        && let Err(error) = context
+                            .database
+                            .call(move |store| {
+                                Ok(store.record_removed_production_landings(&proven)?)
+                            })
+                            .await
+                    {
+                        tracing::warn!(%error, "could not record production landings");
+                    }
                     last_prepared = snapshot.clone();
                     publisher.publish_live_with_state(
                         snapshot,
@@ -270,6 +283,40 @@ async fn read_records(
         .await?;
     let cutoff = now_ms().saturating_sub(MAX_AGE.as_millis().min(i64::MAX as u128) as i64);
     Ok(filter_records(records, live_slugs, cutoff))
+}
+
+/// A landing never un-happens: keep a row's earlier, stronger answer when a
+/// later pass falls back (a failed or skipped production check), so switching
+/// rows never flips production back to base. Returns the production landings
+/// the removal records do not hold yet, to persist.
+fn keep_strongest_landing(
+    snapshot: &mut RemovedHistorySnapshot,
+    previous: &RemovedHistorySnapshot,
+    records: &[RemovedWorktree],
+) -> Vec<(String, String)> {
+    let mut proven = Vec::new();
+    for row in &mut snapshot.rows {
+        let earlier = previous
+            .rows
+            .iter()
+            .find(|old| old.key == row.key && old.removed_at == row.removed_at)
+            .and_then(|old| old.landed_on);
+        if earlier == Some(wt_tui::LandingKind::Production) {
+            row.landed_on = earlier;
+            row.production_landed = Some(true);
+        } else if row.landed_on.is_none() {
+            row.landed_on = earlier;
+        }
+        if row.landed_on == Some(wt_tui::LandingKind::Production)
+            && let Some(record) = records
+                .iter()
+                .find(|record| record.slug == row.slug && record.removed_at == row.removed_at)
+            && saved_landing(record) != Some(true)
+        {
+            proven.push((record.slug.clone(), record.removed_at.clone()));
+        }
+    }
+    proven
 }
 
 /// Publish durable facts before any external I/O. Preserve enriched display
@@ -397,11 +444,7 @@ fn present(
         .get("prState")
         .and_then(Value::as_str)
         .map(sanitize_terminal_text);
-    let saved_landing = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
-        Some("production") => Some(true),
-        Some("base") => Some(false),
-        _ => None,
-    };
+    let saved_landing = saved_landing(&entry);
     let production_landed = landing_override.or(saved_landing);
     let landed_on = production_landed.map(|production| {
         if production {
@@ -589,6 +632,24 @@ fn classify_landing(
     }
 }
 
+/// Where a removal's work had landed as last recorded: its state at removal,
+/// upgraded to production once a later check proved it (`landedOn`). A
+/// landing never un-happens, so the stronger record wins.
+fn saved_landing(entry: &RemovedWorktree) -> Option<bool> {
+    if entry.extra.get(LANDED_ON).and_then(Value::as_str) == Some("production") {
+        return Some(true);
+    }
+    match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
+        Some("production") => Some(true),
+        Some("base") => Some(false),
+        _ => None,
+    }
+}
+
+/// The removal record field holding a production landing proven after
+/// removal, so reopening history starts from it instead of re-proving it.
+const LANDED_ON: &str = "landedOn";
+
 fn has_durable_landing_proof(landing_marker: Option<&str>, git_state: Option<&str>) -> bool {
     match landing_marker {
         Some("base" | "production") => true,
@@ -608,11 +669,7 @@ async fn read_landing_facts(
     let candidates: Vec<(String, Option<bool>, bool, Option<String>)> = records
         .iter()
         .map(|entry| {
-            let saved = match entry.extra.get("landedOnAtRemoval").and_then(Value::as_str) {
-                Some("production") => Some(true),
-                Some("base") => Some(false),
-                _ => None,
-            };
+            let saved = saved_landing(entry);
             let durable_landing_proof = has_durable_landing_proof(
                 entry.extra.get("landedOnAtRemoval").and_then(Value::as_str),
                 entry.extra.get("gitState").and_then(Value::as_str),
@@ -887,6 +944,56 @@ mod tests {
     use super::*;
     use serde_json::{Map, json};
     use wt_runtime::leaf_channel;
+
+    fn removed(slug: &str, landed: &str) -> RemovedWorktree {
+        let mut extra = Map::new();
+        extra.insert("landedOnAtRemoval".into(), json!(landed));
+        RemovedWorktree {
+            slug: slug.into(),
+            branch: format!("m/{slug}"),
+            removed_at: "2026-10-09T10:00:00Z".into(),
+            work: None,
+            automations_paused: None,
+            extra,
+        }
+    }
+
+    #[test]
+    fn a_production_landing_is_kept_and_recorded_once_proven() {
+        let records = vec![removed("one", "base")];
+        let row = |landing| {
+            let mut row = present(None, records[0].clone(), &BTreeMap::new(), None, landing);
+            row.removed_at = records[0].removed_at.clone();
+            row
+        };
+        // The check proved production: kept, and owed to the record.
+        let mut snapshot = RemovedHistorySnapshot {
+            rows: vec![row(Some(true))],
+        };
+        let proven =
+            keep_strongest_landing(&mut snapshot, &RemovedHistorySnapshot::default(), &records);
+        assert_eq!(proven, [("one".to_owned(), records[0].removed_at.clone())]);
+        // A later pass that fell back to the saved base answer does not
+        // flip the row back.
+        let previous = snapshot;
+        let mut fallback = RemovedHistorySnapshot {
+            rows: vec![row(None)],
+        };
+        assert_eq!(fallback.rows[0].landed_on, Some(wt_tui::LandingKind::Base));
+        keep_strongest_landing(&mut fallback, &previous, &records);
+        assert_eq!(
+            fallback.rows[0].landed_on,
+            Some(wt_tui::LandingKind::Production)
+        );
+        // Once recorded, a fresh read starts at production and owes nothing.
+        let mut recorded = records[0].clone();
+        recorded.extra.insert(LANDED_ON.into(), json!("production"));
+        assert_eq!(saved_landing(&recorded), Some(true));
+        let fresh = present(None, recorded.clone(), &BTreeMap::new(), None, None);
+        assert_eq!(fresh.landed_on, Some(wt_tui::LandingKind::Production));
+        let mut again = RemovedHistorySnapshot { rows: vec![fresh] };
+        assert!(keep_strongest_landing(&mut again, &previous, &[recorded]).is_empty());
+    }
 
     #[test]
     fn presentation_preserves_manual_snapshot_links_and_unknown_landing() {

@@ -209,7 +209,9 @@ shows a marker (the work-status color when a landing is proved, otherwise
 merged, closed, dropped, gone, open, or a dim trash glyph), the title, pause,
 issue and PR glyphs, and a right-aligned age. Older records can be checked
 against a bounded local GitHub-merge and production-history scan while history
-is open. The `removal record` pane shows removal time, host, saved status,
+is open. A landing only moves forward: once a removal is proven in
+production its record keeps that (`landedOn`), so a later refresh or restart
+never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
 verification, landing, and notes. `Enter` restores, `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
