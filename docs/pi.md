@@ -42,10 +42,9 @@ from the matching wt worker. The remote host retains its own Pi settings and
 credentials; sign in to an authenticated provider on that host when needed.
 Unsupported runtimes fail explicitly before a session starts.
 
-`naming.harness = "pi"` and Pi as the primary harness also support generated
-titles, prompt actions, manager messaging and automation. Naming uses a short-lived
-ephemeral process with tools disabled; normal interactive sessions preserve the
-user's configured extensions and permission policy.
+Pi as the primary harness also supports prompt actions, manager messaging and
+automation; interactive sessions preserve the user's configured extensions and
+permission policy.
 
 ## Verification
 

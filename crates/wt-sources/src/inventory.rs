@@ -20,13 +20,14 @@ pub fn board(
         let target = &snapshot.worktree.target;
         let stored = &state["slugs"][target.slug()];
         let work = parse_work_status(&stored["work"]);
-        let manual = stored["manualTitle"]
-            .as_str()
-            .map(str::trim)
-            .filter(|title| !title.is_empty());
-        let title = manual.map_or_else(
-            || wt_app_core::issue_identity::slug_title(target.slug()),
-            str::to_owned,
+        let (title, title_source) = wt_store::stored_title(state, target.slug()).map_or_else(
+            || {
+                (
+                    wt_app_core::issue_identity::slug_title(target.slug()),
+                    wt_tui::TitleSource::Slug,
+                )
+            },
+            |(title, source)| (title, crate::titles::presented(source)),
         );
         let mut details = Vec::new();
         let mut badge = String::new();
@@ -43,11 +44,7 @@ pub fn board(
             detached: snapshot.worktree.detached,
             slug: clean_text(target.slug()),
             title: clean_text(&title),
-            title_source: if manual.is_some() {
-                wt_tui::TitleSource::Manual
-            } else {
-                wt_tui::TitleSource::Slug
-            },
+            title_source,
             branch: clean_text(&target.branch),
             path: clean_text(&target.path),
             stage_name: Some(clean_text(&target.stage)).filter(|stage| !stage.is_empty()),

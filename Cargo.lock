@@ -2948,7 +2948,6 @@ dependencies = [
  "wt-dev",
  "wt-harness",
  "wt-launcher",
- "wt-naming",
  "wt-platform",
  "wt-runtime",
  "wt-skills",
@@ -3192,22 +3191,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wt-naming"
-version = "0.0.0"
-dependencies = [
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "wt-config",
- "wt-core",
- "wt-harness",
- "wt-platform",
-]
-
-[[package]]
 name = "wt-ops"
 version = "0.0.0"
 dependencies = [
@@ -3337,7 +3320,6 @@ dependencies = [
  "wt-github",
  "wt-harness",
  "wt-lifecycle",
- "wt-naming",
  "wt-ops",
  "wt-platform",
  "wt-runtime",

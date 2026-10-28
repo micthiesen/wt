@@ -69,9 +69,8 @@ with no patch-id guessing.
 
 A worktree whose recorded base names another live worktree's branch is stacked
 on it. Chains of records form a stack: the TUI groups the members into one
-section (tree spine in the gutter, harness-generated title on the header), each
-member diffs/syncs against its parent instead of trunk, and the generated summary
-describes only what that member adds. Forks are fine — two worktrees based on
+section (tree spine in the gutter), and each member diffs/syncs against its
+parent instead of trunk. Forks are fine — two worktrees based on
 the same parent render as parallel lanes.
 
 Stack identity is the root member's branch. When the root lands and its

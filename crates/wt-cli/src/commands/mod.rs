@@ -26,6 +26,7 @@ pub mod skills;
 pub mod stages;
 pub mod state;
 pub mod status;
+pub mod title;
 pub mod update;
 
 pub mod _action_worker;

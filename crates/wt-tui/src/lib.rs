@@ -22,10 +22,11 @@ mod theme;
 
 pub use actions::{
     ActionController, ActionSurface, CleanupTarget, ConfirmAction, CreatePlacement, CreatePlan,
-    CreationPlacementAccepted, CreationPrepared, FailedRemovalSeen, LiveSessionIdentity,
-    PickerAction, PickerOption, PrPin, RemovalRevision, RemovalSeen, ReplyOutcome, ReviewerOption,
-    Seen, SessionMode, SessionSelection, SessionTarget, StatusClaim, TerminalHandoff, TextAction,
-    UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind, action_channel,
+    CreationPlacementAccepted, CreationPrepared, CreationTitle, FailedRemovalSeen,
+    LiveSessionIdentity, PickerAction, PickerOption, PrPin, RemovalRevision, RemovalSeen,
+    ReplyOutcome, ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget, StatusClaim,
+    TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind,
+    action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;

@@ -260,53 +260,6 @@ pub struct BrowserConfig {
     pub chrome_profile: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NamingReasoningEffort {
-    Minimal,
-    #[default]
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NamingHarness {
-    #[default]
-    Primary,
-    Claude,
-    Codex,
-    Opencode,
-    Pi,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct NamingConfig {
-    pub auto_rename: bool,
-    pub harness: NamingHarness,
-    pub models: BTreeMap<String, String>,
-    pub reasoning_effort: NamingReasoningEffort,
-    pub max_input_tokens: f64,
-    pub timeout_ms: f64,
-}
-
-impl Default for NamingConfig {
-    fn default() -> Self {
-        Self {
-            auto_rename: true,
-            harness: NamingHarness::Primary,
-            models: BTreeMap::new(),
-            reasoning_effort: NamingReasoningEffort::Low,
-            max_input_tokens: 8000.0,
-            timeout_ms: 120_000.0,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EffectTag {
@@ -642,7 +595,6 @@ pub struct Config {
     pub remotes: Vec<RemoteConfig>,
     pub managed: ManagedConfig,
     pub harness: HarnessConfig,
-    pub naming: Option<NamingConfig>,
     pub diff: DiffConfig,
     pub editor: EditorConfig,
     pub browser: BrowserConfig,

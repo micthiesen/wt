@@ -7,6 +7,7 @@
 mod migrations;
 mod mutations;
 mod store;
+mod titles;
 mod types;
 
 pub use migrations::{
@@ -17,6 +18,7 @@ pub use mutations::{
     verification_owed_at_removal,
 };
 pub use store::{Store, StoreError};
+pub use titles::{TitleSource, TitleWrite, stored_title};
 pub use types::{
     ForeignRepositoryRow, GuideRecord, MergeEdge, RemovedWorktree, RepositoryIdentity,
     ReviewRequestDismissal, WorkStatusRecord, WtState,

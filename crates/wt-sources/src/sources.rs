@@ -23,7 +23,6 @@ pub struct BoardSources {
     pub github_refresh: crate::github_source::GithubRefresh,
     pub github_actions: crate::github_actions::GithubActions,
     pub github_pickers: Arc<crate::github_pickers::GithubPickers>,
-    pub naming: crate::naming_source::NamingCommands,
     pub sessions: crate::session_source::SessionSources,
     /// Harness transcripts and the persisted primary harness.
     pub session_activity: SourceHandle<crate::session_activity::SessionActivitySnapshot>,
@@ -105,16 +104,10 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         github.view(),
         context.config.branch.base.clone(),
     );
-    let naming = crate::naming_source::start(
-        scope,
-        context,
-        local_sources.git.view(),
-        local_sources.metadata.view(),
-        board,
-    );
+    let board = crate::titles::overlay(scope, board);
     let board = crate::session_board::overlay(
         scope,
-        naming.board,
+        board,
         &sessions,
         session_activity.clone(),
         wt_app_core::harness::AppHarness::new(context),
@@ -152,7 +145,6 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         perf.board.clone(),
         github_refresh.clone(),
         origin.origin.as_ref().map(|origin| origin.view()),
-        naming.commands.clone(),
         github_pickers.clone(),
     );
     BoardSources {
@@ -164,7 +156,6 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         github_refresh,
         github_actions,
         github_pickers,
-        naming: naming.commands,
         sessions,
         session_activity,
         automations: automations.commands,

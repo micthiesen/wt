@@ -282,7 +282,6 @@ pub async fn execute_with_shutdown(
         | UiAction::GithubSetAutoMerge { .. }
         | UiAction::GithubShip { .. }
         | UiAction::GithubFailedChecks { .. }
-        | UiAction::GenerateTitle { .. }
         | UiAction::PrepareAction { .. }
         | UiAction::RunAction { .. } => {
             bail!("action palette requests must be routed through their controller")
@@ -339,7 +338,8 @@ pub async fn execute_with_shutdown(
             let slug = row.target.slug().to_owned();
             ctx.database
                 .call(move |store| {
-                    store.set_slug_manual_title(&slug, &title, None)?;
+                    // The TUI rename is the user's, and final.
+                    store.set_slug_title(&slug, &title, wt_store::TitleSource::User, None)?;
                     Ok(())
                 })
                 .await?;
@@ -437,7 +437,7 @@ pub async fn execute_with_shutdown(
             let row = resolve_key(ctx, &key).await?;
             let plans = lifecycle_ops::plan_cached(ctx, vec![row], github).await?;
             let warning = plans.warning.clone();
-            let mut plan = plans
+            let plan = plans
                 .rows
                 .into_iter()
                 .next()
@@ -497,24 +497,6 @@ pub async fn execute_with_shutdown(
                     lines,
                     cancel_key: Some('d'),
                 }));
-            }
-            // The history title is durable. Take it from the board only when
-            // its source cannot be restored cache data: manual titles come
-            // from SQLite and generated ones from the naming service. PR
-            // titles already come from confirmed GitHub data in the plan;
-            // otherwise the history falls back to the slug.
-            if let Some(visible) =
-                board.and_then(|board| board.rows.iter().find(|row| row.key == key))
-                && matches!(
-                    visible.title_source,
-                    wt_tui::TitleSource::Manual | wt_tui::TitleSource::Llm
-                )
-                && visible.title != visible.slug
-                && !visible.title.trim().is_empty()
-            {
-                plan.removed_snapshot
-                    .extra
-                    .insert("title".into(), serde_json::json!(visible.title));
             }
             let job = wt_ops::commands::_destroy::start_remove(
                 ctx,
@@ -735,7 +717,7 @@ async fn resolve_creation(ctx: &AppContext, input: &str) -> Result<wt_tui::Creat
     let matches = NewArgs::augment_args(clap::Command::new("new"))
         .try_get_matches_from(std::iter::once("new".to_owned()).chain(words))?;
     let args = NewArgs::from_arg_matches(&matches)?;
-    let branch =
+    let wt_ops::commands::new::Parsed { branch, title } =
         wt_ops::commands::new::parse_branch(ctx, &args.positionals.join(" "), &args, false)
             .await
             .map_err(anyhow::Error::msg)?;
@@ -756,6 +738,7 @@ async fn resolve_creation(ctx: &AppContext, input: &str) -> Result<wt_tui::Creat
         install: !args.no_install && ctx.config.backend.kind == wt_config::BackendKind::GitWorktree,
         open: args.open && !args.no_open,
         github_issue: args.gh,
+        title,
     })
 }
 
@@ -780,7 +763,8 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
     let target = if let Some(row) = existing {
         row.target
     } else {
-        lifecycle_ops::service(ctx)?
+        let lookup = wt_ops::commands::new::IssueTitleLookup::start(ctx, &plan.title);
+        let target = lifecycle_ops::service(ctx)?
             .create(
                 &branch,
                 CreateOptions {
@@ -791,7 +775,18 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
                 &ctx.cancellation,
             )
             .await?
-            .target
+            .target;
+        let issue_title = lookup.finish().await;
+        // Creating from the TUI is the user's own request.
+        wt_ops::commands::new::record_title(
+            ctx,
+            target.slug(),
+            plan.title,
+            wt_store::TitleSource::User,
+            issue_title,
+        )
+        .await;
+        target
     };
     let mut setup_warning = None;
     if install && let Err(error) = start_install(ctx, &target).await {

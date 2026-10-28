@@ -106,7 +106,6 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::WarmPalette { .. }
         | UiAction::PrepareSection { .. }
         | UiAction::PrepareDeleteSection { .. }
-        | UiAction::GenerateTitle { .. }
         | UiAction::Copy { .. }
         | UiAction::OpenEditor { .. }
         | UiAction::PrepareRemove { .. }
@@ -249,8 +248,10 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
             board,
             host,
             key,
+            // Shown as the store saves it and the inventory cleans it, so
+            // the edit settles on the first board that carries it.
             RowChange::Title {
-                title: title.clone(),
+                title: wt_core::sanitize_terminal_text(title.trim()),
             },
         ),
         UiAction::Create { input, placement } => on_board(

@@ -234,6 +234,7 @@ fn compose(
                     .filter(|s| !s.trim().is_empty())
                 {
                     row.title = wt_core::sanitize_terminal_text(title);
+                    row.title_source = wt_tui::TitleSource::User;
                 }
                 for value in [
                     &mut row.title,

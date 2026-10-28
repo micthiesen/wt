@@ -88,6 +88,9 @@ impl Model {
         if key.code == KeyCode::Char('r') {
             return InputResult::Refresh;
         }
+        if let Some(result) = self.feed_input(key) {
+            return result;
+        }
         self.reconcile_history();
         let count = self.board.removed_history.rows.len();
         let next = match key.code {

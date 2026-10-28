@@ -165,7 +165,6 @@ impl UiAction {
             | A::DeleteSection { .. }
             | A::CyclePrimary
             | A::SetTitle { .. }
-            | A::GenerateTitle { .. }
             | A::Copy { .. }
             | A::Create { .. }
             | A::OpenEditor { .. }

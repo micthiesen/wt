@@ -27,8 +27,6 @@ pub enum Domain {
     Dev,
     /// `git fetch origin` maintenance.
     Origin,
-    /// Generated worktree titles.
-    Naming,
     /// Extra per-row Git facts (ahead/behind, last commit, diff stat).
     Presentation,
     /// Removed-worktree history.
@@ -43,7 +41,7 @@ pub enum Domain {
 
 impl Domain {
     /// Every domain, for summaries that must not silently miss one.
-    pub const ALL: [Domain; 16] = [
+    pub const ALL: [Domain; 15] = [
         Self::Git,
         Self::Metadata,
         Self::Github,
@@ -54,7 +52,6 @@ impl Domain {
         Self::Actions,
         Self::Dev,
         Self::Origin,
-        Self::Naming,
         Self::Presentation,
         Self::History,
         Self::Perf,
@@ -81,7 +78,6 @@ impl Domain {
             Self::Actions => "actions",
             Self::Dev => "dev",
             Self::Origin => "origin",
-            Self::Naming => "titles",
             Self::Presentation => "Git details",
             Self::History => "history",
             Self::Perf => "perf",
@@ -111,7 +107,6 @@ mod tests {
                 | Domain::Actions
                 | Domain::Dev
                 | Domain::Origin
-                | Domain::Naming
                 | Domain::Presentation
                 | Domain::History
                 | Domain::Perf

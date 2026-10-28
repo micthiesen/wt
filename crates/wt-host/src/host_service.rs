@@ -98,6 +98,17 @@ impl HostService {
                 Err(error) => tracing::warn!(%error, "could not adopt explicit sections"),
             }
         });
+        // wt no longer generates titles or summaries; drop their cache.
+        let retired = context.config.paths.cache_root.join("naming-v1.json");
+        scope.spawn(async move {
+            match tokio::fs::remove_file(&retired).await {
+                Ok(()) => {
+                    tracing::info!(path = %retired.display(), "removed the retired naming cache")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(%error, "could not remove the retired naming cache"),
+            }
+        });
         Self { context, sources }
     }
 
@@ -171,7 +182,6 @@ impl HostService {
                 Domain::Activity
                 | Domain::Dev
                 | Domain::Origin
-                | Domain::Naming
                 | Domain::Presentation
                 | Domain::History
                 | Domain::Perf
@@ -446,16 +456,6 @@ impl HostService {
                     message: format!(
                         "Cancelled {cancelled} queued automations; running actions continue"
                     ),
-                    ..Default::default()
-                }
-            }
-            UiAction::GenerateTitle { key } => {
-                self.sources
-                    .naming
-                    .request(key)
-                    .map_err(anyhow::Error::msg)?;
-                UiReply {
-                    message: "Generating title…".into(),
                     ..Default::default()
                 }
             }

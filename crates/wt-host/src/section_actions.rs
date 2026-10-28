@@ -702,7 +702,7 @@ mod tests {
             .database
             .call(|store| {
                 store.set_slug_base("two", Some(("feature/one", None)))?;
-                store.set_slug_manual_title("two", "Pinned", None)?;
+                store.set_slug_title("two", "Pinned", wt_store::TitleSource::User, None)?;
                 Ok(())
             })
             .await

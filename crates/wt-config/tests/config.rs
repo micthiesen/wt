@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use wt_config::{
     ActivityPane, BackendKind, Config, ConfigError, EffectTag, HarnessId, LoadOptions,
-    NamingHarness, ReviewBotMode, UiSort,
+    ReviewBotMode, UiSort,
 };
 
 fn options(cwd: &Path, home: &Path, env: &[(&str, &str)]) -> LoadOptions {
@@ -62,10 +62,6 @@ fn snapshot(config: &Config) -> serde_json::Value {
             "portRange": server.port_range, "urlTemplate": server.url, "maxConcurrent": server.max_concurrent,
             "stopCommand": server.stop_command, "resetCommand": server.reset_command, "healthCommand": server.health_command })),
         "remote": config.remotes.first().map(|remote| json!({ "host": remote.host, "label": remote.label, "wtPath": remote.wt_path })),
-        "naming": config.naming.as_ref().map(|naming| json!({ "autoRename": naming.auto_rename,
-            "harness": format!("{:?}", naming.harness).to_lowercase(), "models": naming.models,
-            "reasoningEffort": format!("{:?}", naming.reasoning_effort).to_lowercase(),
-            "maxInputTokens": number(naming.max_input_tokens), "timeoutMs": number(naming.timeout_ms) })),
         "diff": { "command": config.diff.command },
         "editor": { "command": config.editor.command },
         "browser": { "chromeProfile": config.browser.chrome_profile },
@@ -559,10 +555,6 @@ fn optional_sections_keep_their_typed_values_and_defaults() {
     );
     assert_eq!(config.remotes[0].label, "worker");
     assert_eq!(config.remotes[0].wt_path, "~/.wt/bin/wt");
-    assert_eq!(
-        config.naming.as_ref().unwrap().harness,
-        NamingHarness::Codex
-    );
     assert_eq!(
         config
             .github

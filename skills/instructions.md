@@ -5,6 +5,9 @@ server.
 
 - Assert each transition with `wt status <state> [-m note]` (bare `wt status`
   lists the states): `working` when work begins, `review` when review begins.
+- Titles are set only on purpose. When work begins, if `wt title` shows an
+  `issue` or `fallback` title, replace it once with the outcome, about the PR
+  title: `wt title "<outcome>"`. A person's title is final.
 - Testing is yours. `needs-testing` means you still owe verification, never
   the human.
 - `needs-human` is only for an action outside the repository with no

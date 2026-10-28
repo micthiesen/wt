@@ -28,7 +28,6 @@ wt-core.workspace = true
 wt-github.workspace = true
 wt-harness.workspace = true
 wt-lifecycle.workspace = true
-wt-naming.workspace = true
 wt-platform.workspace = true
 wt-runtime.workspace = true
 wt-events.workspace = true

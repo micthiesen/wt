@@ -129,17 +129,7 @@ async fn palette(
         }
     }
     if let (ActionSurface::Row { .. }, Some(context)) = (&surface, &context) {
-        let mut pinned = vec![(
-            "worktree",
-            PickerOption {
-                value: Some(wt_app_core::action_builtins::RENAME_ID.into()),
-                label: "worktree: Rename worktree with AI".into(),
-                chord: Some('t'),
-                note: None,
-                verify_after_merge: None,
-                detail: Some(rename_detail(ctx, board, &surface)),
-            },
-        )];
+        let mut pinned = Vec::new();
         if ctx.config.dev_server.is_some() {
             let running = wt_app_core::dev::service(ctx)?
                 .logs(&context.slug, 1, &ctx.cancellation)
@@ -515,29 +505,12 @@ fn action_detail(def: &wt_config::ActionDef, primary: &str) -> String {
     }
 }
 
-/// The `! t` row detail, with the reason when it cannot run.
-fn rename_detail(ctx: &AppContext, board: Option<&Board>, surface: &ActionSurface) -> String {
-    let busy = match surface {
-        ActionSurface::Row { key } => board
-            .and_then(|board| board.rows.iter().find(|row| &row.key == key))
-            .is_some_and(|row| row.busy.is_some()),
-        _ => false,
-    };
-    if ctx.config.naming.is_none() {
-        "(worktree naming not configured)".into()
-    } else if busy {
-        "(worktree is busy)".into()
-    } else {
-        "AI".into()
-    }
-}
-
 /// Letters a surface keeps for its fixed rows, so user actions never take
-/// them: custom prompt and movement everywhere, then merge, dev logs, and
-/// rename on rows and open-in-editor on slots.
+/// them: custom prompt and movement everywhere, then merge and dev logs on
+/// rows and open-in-editor on slots.
 fn reserved_keys(surface: &ActionSurface) -> &'static [char] {
     match surface {
-        ActionSurface::Row { .. } => &['c', 'j', 'k', 'q', 'm', 'l', 't'],
+        ActionSurface::Row { .. } => &['c', 'j', 'k', 'q', 'm', 'l'],
         ActionSurface::Manager { .. } => &['c', 'j', 'k', 'q'],
         ActionSurface::Slot { .. } => &['c', 'j', 'k', 'q', 'z'],
     }
@@ -757,7 +730,7 @@ mod tests {
     }
 
     #[test]
-    fn row_palette_reserves_merge_logs_and_rename_letters() {
+    fn row_palette_reserves_merge_and_logs_letters() {
         let defs = vec![
             ActionDef {
                 id: "lint".into(),
@@ -775,7 +748,9 @@ mod tests {
             &defs,
             reserved_keys(&ActionSurface::Row { key: "a".into() }),
         );
-        assert!(!keys.values().any(|key| ['m', 'l', 't'].contains(key)));
+        assert!(!keys.values().any(|key| ['m', 'l'].contains(key)));
+        // `t` was the retired AI rename; actions may claim it again.
+        assert_eq!(keys.get("test"), Some(&'t'));
         let slot = reserved_keys(&ActionSurface::Slot {
             target: wt_tui::SessionTarget::Main,
         });

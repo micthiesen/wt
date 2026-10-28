@@ -6,17 +6,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use wt_core::Domain;
-use wt_platform::process::CommandSpec;
 use wt_runtime::{
     DiskCache, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot,
     SourceSpec, Stamp, TaskScope, derived_channel, start_skippable_source,
 };
 use wt_tui::Board;
 
-use wt_app_core::{context::AppContext, issue_identity};
+use wt_app_core::{context::AppContext, issue_identity, issue_tracker};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,84 +150,12 @@ async fn read_statuses(
     ids: &[String],
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
-    let argv = arguments(command, ids);
-    let (program, args) = argv
-        .split_first()
-        .context("issue status reader has no executable")?;
-    let mut spec = CommandSpec::new(program)
-        .args(args)
-        .cwd(&context.config.paths.main_clone);
-    spec.timeout = Duration::from_secs(30);
-    let output = context
-        .processes
-        .run(spec, cancel)
-        .await
-        .context("issue status reader")?;
-    if !output.status.success() {
-        bail!(
-            "issue status reader exited {}: {}",
-            output.status,
-            output.stderr_text().trim()
-        );
-    }
-    parse(&output.stdout, ids)
-}
-
-fn arguments(command: &[String], ids: &[String]) -> Vec<String> {
-    command
-        .iter()
-        .flat_map(|arg| {
-            if arg == "{ids}" {
-                ids.to_vec()
-            } else {
-                vec![arg.clone()]
-            }
-        })
-        .collect()
-}
-
-fn parse(bytes: &[u8], ids: &[String]) -> Result<BTreeMap<String, String>> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Response {
-        issues: Vec<Issue>,
-    }
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Issue {
-        id: String,
-        status: String,
-    }
-    let response: Response =
-        serde_json::from_slice(bytes).context("issue status reader: invalid JSON response")?;
-    let expected = ids.iter().collect::<BTreeSet<_>>();
-    let mut statuses = BTreeMap::new();
-    for Issue { id, status } in response.issues {
-        if !expected.contains(&id) {
-            bail!("issue status reader: unexpected issue {id:?}");
-        }
-        if statuses.contains_key(&id) {
-            bail!("issue status reader: duplicate issue {id}");
-        }
-        if status.trim().is_empty() || status.chars().any(char::is_control) {
-            bail!(
-                "issue status reader: invalid status for {id}: expected a nonempty single-line string"
-            );
-        }
-        statuses.insert(id, status);
-    }
-    let missing = ids
-        .iter()
-        .filter(|id| !statuses.contains_key(*id))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        bail!(
-            "issue status reader: missing issues: {}",
-            missing.join(", ")
-        );
-    }
-    Ok(statuses)
+    let issues =
+        issue_tracker::read(context, command, ids, Duration::from_secs(30), cancel).await?;
+    Ok(issues
+        .into_iter()
+        .map(|(id, issue)| (id, issue.status))
+        .collect())
 }
 
 fn project(
@@ -365,31 +292,6 @@ mod tests {
     use super::*;
     use wt_runtime::SourceState;
     use wt_tui::BoardRow;
-
-    #[test]
-    fn rejects_partial_duplicate_extra_and_control_statuses() {
-        let ids = vec!["ENG-1".into()];
-        for invalid in [
-            r#"{"issues":[]}"#,
-            r#"{"issues":[{"id":"ENG-1","status":"Open"},{"id":"ENG-1","status":"Open"}]}"#,
-            r#"{"issues":[{"id":"ENG-2","status":"Open"}]}"#,
-            r#"{"issues":[{"id":"ENG-1","status":"\u001b[31m"}]}"#,
-            r#"{"issues":[{"id":"ENG-1","status":"Open","extra":true}]}"#,
-        ] {
-            assert!(parse(invalid.as_bytes(), &ids).is_err(), "{invalid}");
-        }
-        assert_eq!(
-            parse(br#"{"issues":[{"id":"ENG-1","status":"In Review"}]}"#, &ids).unwrap()["ENG-1"],
-            "In Review"
-        );
-        assert_eq!(
-            arguments(
-                &["reader".into(), "{ids}".into(), "literal{id}".into()],
-                &ids
-            ),
-            vec!["reader", "ENG-1", "literal{id}"]
-        );
-    }
 
     fn snapshot<T>(value: T) -> SourceSnapshot<T> {
         SourceSnapshot::test_live(Some(value), SourceState::Ready, Domain::Issues)

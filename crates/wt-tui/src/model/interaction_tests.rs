@@ -338,34 +338,6 @@ fn confirm_cancels_on_n() {
 }
 
 #[test]
-fn palette_title_generation_is_an_accepted_command_not_menu_preparation() {
-    let mut model = model_with(&["one"]);
-    model.reply(UiReply {
-        modal: Some(UiModal::Picker {
-            action: PickerAction::Actions {
-                surface: ActionSurface::Row { key: "one".into() },
-            },
-            title: "Commands".into(),
-            options: vec![PickerOption {
-                value: Some(UiAction::RENAME_ID.into()),
-                label: "Rename with AI".into(),
-                chord: Some('t'),
-                note: None,
-                verify_after_merge: None,
-                detail: None,
-            }],
-            selected: 0,
-        }),
-        ..Default::default()
-    });
-    let InputResult::Action(action) = ch(&mut model, 't') else {
-        panic!("title command missing")
-    };
-    assert_eq!(action, UiAction::GenerateTitle { key: "one".into() });
-    assert!(!action.is_preparation());
-}
-
-#[test]
 fn palettes_confirm_on_their_own_opener_and_ignore_digits() {
     for (surface, opener) in [
         (ActionSurface::Manager { key: None }, 'M'),
@@ -725,6 +697,23 @@ fn esc_returns_output_focus_and_o_opens_the_main_clone() {
             target: SessionTarget::Main
         })
     );
+}
+
+#[test]
+fn history_shares_the_activity_feed_keys() {
+    let mut model = model_with(&["one"]);
+    model.history.active = true;
+    assert_eq!(model.output.target, crate::output::OutputTarget::Attention);
+    assert_eq!(ch(&mut model, 'x'), model.notify("attention feed is empty"));
+    std::sync::Arc::make_mut(&mut model.board).attention = vec![Default::default()];
+    assert!(matches!(
+        ch(&mut model, 'x'),
+        InputResult::Action(UiAction::SetAttentionSeen { .. })
+    ));
+    assert_eq!(ch(&mut model, '"'), InputResult::Draw);
+    assert_ne!(model.output.target, crate::output::OutputTarget::Attention);
+    // Still in history: its own keys keep working.
+    assert!(model.history.active);
 }
 
 fn review_board() -> Board {

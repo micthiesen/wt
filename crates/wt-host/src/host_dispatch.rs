@@ -13,7 +13,6 @@ pub async fn execute(
     replies: &crate::controller::RequestReplies,
     shutdown: &CancellationToken,
 ) -> Result<UiReply> {
-    let command = wt_app_core::host_routing::rename_as_title(command);
     let selected_context = context.for_action(&command)?;
     let context = &selected_context;
     // Cleanup is a fleet-wide confirmation: prepare the candidate set from
@@ -383,7 +382,7 @@ pub async fn execute(
     }
     let migrated_pin = if let Some(remote) = remote {
         match &action {
-            UiAction::SetTitle { key, .. } | UiAction::GenerateTitle { key } => {
+            UiAction::SetTitle { key, .. } => {
                 let ledger_key = wt_core::remote_worktree_ledger_key(&remote.endpoint.key(), key);
                 let lookup = ledger_key.clone();
                 let pin = context
@@ -394,34 +393,10 @@ pub async fn execute(
                         Ok(entry["manualTitle"]
                             .as_str()
                             .filter(|title| !title.trim().is_empty())
-                            .map(|title| {
-                                (
-                                    title.to_owned(),
-                                    entry["manualTitleRevision"].as_u64().unwrap_or(0),
-                                )
-                            }))
+                            .map(|_| entry["manualTitleRevision"].as_u64().unwrap_or(0)))
                     })
                     .await?;
-                if let Some((title, revision)) = pin {
-                    if matches!(action, UiAction::GenerateTitle { .. }) {
-                        let reply = remote
-                            .execute(UiAction::SetTitle {
-                                key: key.clone(),
-                                title,
-                            })
-                            .await?;
-                        if reply.failed {
-                            return Ok(reply);
-                        }
-                        clear_migrated_pin(context, &ledger_key, revision).await?;
-                        fleet.local.sources.metadata.refresh();
-                        None
-                    } else {
-                        Some((ledger_key, revision))
-                    }
-                } else {
-                    None
-                }
+                pin.map(|revision| (ledger_key, revision))
             }
             _ => None,
         }

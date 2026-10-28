@@ -152,10 +152,9 @@ Application state and release state are separate:
   are retained. See [configuration](configuration.md#repository-identity-is-a-property-of-the-repository-not-of-your-shell).
 - **Update state** is under the install root and is shared by the launcher and
   installed executable. It records build transitions, not repository data.
-- **Derived caches** under the repository cache root include generated naming
-  summaries, event snapshots, remote presentation snapshots, and rebuildable
-  runtime data. `Ctrl+R` clears the generated naming and picker caches before
-  requesting live source reads; it does not clear SQLite or accepted action and
+- **Derived caches** under the repository cache root include event snapshots,
+  remote presentation snapshots, and rebuildable runtime data. `Ctrl+R` clears
+  the picker cache before requesting live source reads; it does not clear SQLite or accepted action and
   automation history.
 - **User configuration** is hand-written TOML. wt reads and validates one
   merged configuration at process startup and never rewrites it. Configuration

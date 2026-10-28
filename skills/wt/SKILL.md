@@ -30,15 +30,18 @@ wt restack prune-backups [--days <n>]   # delete old backup/restack-* branches
 wt merge [slug] [--cancel]             # arm merge-when-ready
 wt next [branch] [--issue <ID>|none] [--gh <n>|none]
 wt issue [slug] [--gh <n> | --clear-gh | --read]
+wt title [title…] [-w slug]          # show, or set once over an issue title
 wt rm [slug] [--keep-branch]           # deletes the branch by default
 ```
 
 ## Rules
 
 - **Naming a new worktree.** Lead with the tracker id, then the title words:
-  `wt new ENG-1953 fix calendar rendering`. Pass the id, never a URL. A bare
-  id gets a random suffix, so it makes another worktree for that id. Without
-  an id, the words alone make the slug. With `[issue_tracker] prefix` set, only
+  `wt new ENG-1953 fix calendar rendering`. Pass the id, never a URL. The
+  words become the worktree's title as typed; a bare id gets a random slug
+  suffix (another worktree for that id) and the tracker's title. Without an
+  id, the words alone make the slug and title. `wt title` shows or sets the
+  title; nothing generates one. With `[issue_tracker] prefix` set, only
   that prefix may lead; a GitHub issue never names a worktree, so pass it as
   `--gh <n>` next to a slug.
 - **Stacking.** `--base <branch>` on `wt new` stacks the new worktree on that

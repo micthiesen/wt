@@ -11,7 +11,7 @@ use serde_json::{Map, Number, Value, json};
 
 use crate::{
     GuideRecord, MergeEdge, RemovedWorktree, ReviewRequestDismissal, Store, StoreError,
-    WorkStatusRecord, WtState,
+    TitleSource, TitleWrite, WorkStatusRecord, WtState,
 };
 
 const GROUP_INBOX: &str = "\0inbox";
@@ -881,15 +881,19 @@ impl Store {
         })
     }
 
-    pub fn set_slug_manual_title(
+    /// Save a worktree title from `source`. A lower source never replaces a
+    /// higher one (see [`TitleSource::may_replace`]); `expected_revision`
+    /// refuses a write after any other title change.
+    pub fn set_slug_title(
         &mut self,
         slug: &str,
         title: &str,
+        source: TitleSource,
         expected_revision: Option<u64>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<TitleWrite, StoreError> {
         let title = title.trim().to_owned();
-        if title.is_empty() {
-            return Err(StoreError::EmptyManualTitle {
+        if title.is_empty() || title.chars().any(char::is_control) {
+            return Err(StoreError::InvalidTitle {
                 slug: slug.to_owned(),
             });
         }
@@ -906,10 +910,14 @@ impl Store {
                 .filter(|revision| *revision <= MAX_SAFE_INTEGER)
                 .unwrap_or(0);
             if expected_revision.is_some_and(|expected| revision != expected) {
-                return Ok((false, false));
+                return Ok((TitleWrite::Stale, false));
+            }
+            let current = crate::stored_title(state, slug).map(|(_, source)| source);
+            if !source.may_replace(current) {
+                return Ok((TitleWrite::Outranked(current.unwrap_or(source)), false));
             }
             if revision >= MAX_SAFE_INTEGER {
-                return Err(StoreError::ManualTitleRevisionExhausted {
+                return Err(StoreError::TitleRevisionExhausted {
                     slug: slug.to_owned(),
                 });
             }
@@ -917,9 +925,10 @@ impl Store {
             next.entry("section").or_insert(Value::Null);
             next.entry("order").or_insert(json!(0));
             next.insert("manualTitle".to_owned(), json!(title));
+            next.insert("titleSource".to_owned(), json!(source.as_str()));
             next.insert("manualTitleRevision".to_owned(), json!(revision + 1));
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(next));
-            Ok((true, true))
+            Ok((TitleWrite::Saved, true))
         })
     }
 
@@ -947,12 +956,13 @@ impl Store {
                 return Ok((false, false));
             }
             if revision >= MAX_SAFE_INTEGER {
-                return Err(StoreError::ManualTitleRevisionExhausted {
+                return Err(StoreError::TitleRevisionExhausted {
                     slug: slug.to_owned(),
                 });
             }
             let mut next = previous.clone();
             next.remove("manualTitle");
+            next.remove("titleSource");
             next.insert("manualTitleRevision".into(), json!(revision + 1));
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(next));
             Ok((true, true))

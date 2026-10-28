@@ -52,8 +52,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         // It owns only the checkouts it removes; unrelated work proceeds.
         return cleanup_lane(action, None);
     }
-    let (host, action, _) =
-        crate::host_routing::resolve(crate::host_routing::rename_as_title(action.clone()))?;
+    let (host, action, _) = crate::host_routing::resolve(action.clone())?;
     if action.is_preparation() {
         // Menu ownership stays in UiAction::menu, not in the scheduler.
         return Ok(Lane::Preparation(host));
@@ -112,10 +111,9 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::GithubFailedChecks { .. } => unreachable!("menu declaration handles preparations"),
         A::Create { .. } | A::CreateResolved { .. } => Lane::Creation(host),
         A::Remove { key, .. } | A::DismissFailedRemoval { key, .. } => Lane::Removal(host, key),
-        A::SetTitle { key, .. }
-        | A::GenerateTitle { key }
-        | A::SetStatus { key, .. }
-        | A::SetIssueOverride { key, .. } => Lane::Metadata(host, key),
+        A::SetTitle { key, .. } | A::SetStatus { key, .. } | A::SetIssueOverride { key, .. } => {
+            Lane::Metadata(host, key)
+        }
         A::SubmitReviewers { key, .. }
         | A::GithubMarkReady { key, .. }
         | A::GithubSetAutoMerge { key, .. }

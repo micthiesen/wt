@@ -198,9 +198,6 @@ pub enum UiAction {
         key: String,
         title: String,
     },
-    GenerateTitle {
-        key: String,
-    },
     Copy {
         value: String,
         label: String,
@@ -331,26 +328,6 @@ pub enum UiAction {
 }
 
 impl UiAction {
-    pub const RENAME_ID: &str = "__rename__";
-
-    /// Resolve built-in aliases before pending state, cancellation and host
-    /// scheduling classify the request. AI title generation is an accepted
-    /// command, not a cancellable menu preparation.
-    pub fn resolve_palette_alias(self) -> Self {
-        match self {
-            Self::OnHost { host, action } => Self::OnHost {
-                host,
-                action: Box::new(action.resolve_palette_alias()),
-            },
-            Self::PrepareAction {
-                surface: ActionSurface::Row { key },
-                id,
-                ..
-            } if id == Self::RENAME_ID => Self::GenerateTitle { key },
-            action => action,
-        }
-    }
-
     /// Requests that acquire the interactive terminal. They serialize with
     /// each other, independently of unrelated background work.
     pub fn is_terminal_handoff(&self) -> bool {
@@ -799,6 +776,22 @@ pub struct CreatePlan {
     pub install: bool,
     pub open: bool,
     pub github_issue: Option<u64>,
+    /// The title the request carries, saved once the worktree exists.
+    #[serde(default)]
+    pub title: CreationTitle,
+}
+
+/// The title a creation request carries.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CreationTitle {
+    /// A branch or slug: nobody titled it, so it reads as its PR or commit.
+    #[default]
+    None,
+    /// Title words typed after the issue id, or a multi-word name.
+    Given(String),
+    /// A bare issue id: seed from the tracker, else the id itself.
+    Issue(String),
 }
 
 #[derive(Debug)]

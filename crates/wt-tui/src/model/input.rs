@@ -19,6 +19,51 @@ pub(crate) const TYPEAHEAD_TTL: std::time::Duration = std::time::Duration::from_
 pub(crate) const REMOVAL_IN_PROGRESS: &str = "Removal is already in progress";
 
 impl Model {
+    /// Keys for the activity pane's feeds. They never touch a row, so the
+    /// removed-history view shares them with the board.
+    pub(crate) fn feed_input(&mut self, key: KeyEvent) -> Option<InputResult> {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let attention = matches!(self.output.target, crate::output::OutputTarget::Attention);
+        Some(match key.code {
+            KeyCode::Char('"') if !control => {
+                self.output.toggle_feed();
+                InputResult::Draw
+            }
+            KeyCode::Char('x' | 'X')
+                if !control && attention && self.board.attention.is_empty() =>
+            {
+                self.notify("attention feed is empty")
+            }
+            KeyCode::Char('x' | 'X') if !control && attention => {
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                self.output.mark_seen();
+                InputResult::Action(UiAction::SetAttentionSeen { at_ms })
+            }
+            KeyCode::Char('j' | 'J') if control && shift => {
+                self.output.scroll(false);
+                InputResult::Draw
+            }
+            KeyCode::Char('k' | 'K') if control && shift => {
+                self.output.scroll(true);
+                InputResult::Draw
+            }
+            KeyCode::Char('e') if control => {
+                self.output.scroll(false);
+                InputResult::Draw
+            }
+            KeyCode::Char('y') if control => {
+                self.output.scroll(true);
+                InputResult::Draw
+            }
+            _ => return None,
+        })
+    }
+
     pub(crate) fn expire_toast(&mut self) {
         if self.pending_request.is_some() {
             return;
@@ -373,6 +418,9 @@ impl Model {
         if self.history.active && !crate::history::is_global_key(key) {
             return self.history_input(key, height);
         }
+        if let Some(result) = self.feed_input(key) {
+            return result;
+        }
         if let Some(result) = self.review_input(key) {
             return result;
         }
@@ -423,51 +471,9 @@ impl Model {
                 self.open_output_picker();
                 InputResult::Draw
             }
-            KeyCode::Char('"') if !control => {
-                self.output.toggle_feed();
-                InputResult::Draw
-            }
-            KeyCode::Char('x' | 'X')
-                if !control
-                    && matches!(self.output.target, crate::output::OutputTarget::Attention)
-                    && self.board.attention.is_empty() =>
-            {
-                self.notify("attention feed is empty")
-            }
-            KeyCode::Char('x' | 'X')
-                if !control
-                    && matches!(self.output.target, crate::output::OutputTarget::Attention) =>
-            {
-                let at_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64;
-                self.output.mark_seen();
-                InputResult::Action(UiAction::SetAttentionSeen { at_ms })
-            }
             KeyCode::Char('[' | ']') if !control => {
                 self.output.cycle(key.code == KeyCode::Char(']'));
                 InputResult::Draw
-            }
-            KeyCode::Char('e') if control => {
-                self.output.scroll(false);
-                InputResult::Draw
-            }
-            KeyCode::Char('y') if control => {
-                self.output.scroll(true);
-                InputResult::Draw
-            }
-            KeyCode::Char('j' | 'J') if control && shift => {
-                self.output.scroll(false);
-                InputResult::Draw
-            }
-            KeyCode::Char('k' | 'K') if control && shift => {
-                self.output.scroll(true);
-                InputResult::Draw
-            }
-            KeyCode::Char('T') if !control => {
-                self.row_action(|key| UiAction::GenerateTitle { key })
             }
             KeyCode::Char('V') if !control => {
                 let Some(row) = self.actionable_row() else {

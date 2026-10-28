@@ -18,7 +18,7 @@ restarting the service during slow watcher setup and interrupting the first
 prompt. Existing live terminals skip these readiness reads. Invalid resume IDs
 are rejected before starting native services.
 
-Interactive terminals, API calls, naming and generated headless actions share
+Interactive terminals, API calls and generated headless actions share
 the native service registration under `$XDG_STATE_HOME/opencode/service.json`
 (normally `~/.local/state/opencode/service.json`). They pin an authenticated
 `--server` connection so polling a busy service cannot restart it. Only missing
@@ -58,15 +58,8 @@ compatibility. wt does not require a Claude installation for OpenCode skills.
 Prompt actions run `opencode run --auto` with the action's working directory.
 This approves pending tool permissions while preserving explicit deny rules;
 V2 otherwise rejects pending requests in headless mode and skips that work.
-Naming uses `opencode api experimental.generate.text`, the V2 stateless generation
-endpoint: it creates no session and supplies no tools. Its JSON response is
-validated before becoming a title. The removed V1 `--pure`, `--dir` and
-`--variant` options are never sent.
-
-An optional `[naming.models] opencode = "provider/model#variant"` selects a
-model and variant. Without `#variant`, naming's `reasoning_effort` supplies the
-variant. Without a model override, the server's default model and variant apply.
+The removed V1 `--pure`, `--dir` and `--variant` options are never sent.
 Provider authentication remains OpenCode's own configuration on the host.
 
 The adapter is validated against OpenCode 2.0.29. Tests isolate databases and
-tmux servers; naming tests exercise valid and malformed native API envelopes.
+tmux servers.

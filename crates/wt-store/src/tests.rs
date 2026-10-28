@@ -6,7 +6,7 @@ use tempfile::tempdir;
 
 use crate::{
     CURRENT_WT_STATE_VERSION, MergeEdge, RemovedWorktree, RepositoryIdentity, Store, StoreError,
-    WorkStatusRecord, migrate_wt_state,
+    TitleSource, TitleWrite, WorkStatusRecord, migrate_wt_state,
 };
 
 fn identity(id: &str, path: &str) -> RepositoryIdentity {
@@ -536,7 +536,7 @@ fn foreign_repository_scan_is_read_only_and_ignores_non_wt_files() {
 }
 
 #[test]
-fn manual_title_cas_counts_same_text_edit_and_rejects_delayed_result() {
+fn title_cas_counts_same_text_edit_and_rejects_delayed_result() {
     let temp = tempdir().unwrap();
     let mut store = Store::open(
         temp.path().join("wt.sqlite"),
@@ -546,32 +546,103 @@ fn manual_title_cas_counts_same_text_edit_and_rejects_delayed_result() {
     store
         .write_repository_state_json(r#"{"version":17,"futureRoot":true}"#)
         .unwrap();
-    assert!(
+    let user = |store: &mut Store, title: &str, revision| {
         store
-            .set_slug_manual_title("task", " Pinned title ", Some(0))
+            .set_slug_title("task", title, TitleSource::User, revision)
             .unwrap()
+    };
+    assert_eq!(
+        user(&mut store, " Pinned title ", Some(0)),
+        TitleWrite::Saved
     );
-    assert!(
-        store
-            .set_slug_manual_title("task", "Pinned title", Some(1))
-            .unwrap()
-    );
-    assert!(
-        !store
-            .set_slug_manual_title("task", "Delayed title", Some(1))
-            .unwrap()
+    assert_eq!(user(&mut store, "Pinned title", Some(1)), TitleWrite::Saved);
+    assert_eq!(
+        user(&mut store, "Delayed title", Some(1)),
+        TitleWrite::Stale
     );
     let state: serde_json::Value =
         serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap();
     assert_eq!(state["slugs"]["task"]["manualTitle"], "Pinned title");
+    assert_eq!(state["slugs"]["task"]["titleSource"], "user");
     assert_eq!(state["slugs"]["task"]["manualTitleRevision"], 2);
     assert_eq!(state["futureRoot"], true);
     assert!(!store.clear_slug_manual_title("task", 1).unwrap());
     assert!(store.clear_slug_manual_title("task", 2).unwrap());
     let state = store.read_wt_state().unwrap();
     assert!(state["slugs"]["task"]["manualTitle"].is_null());
+    assert!(state["slugs"]["task"]["titleSource"].is_null());
     assert_eq!(state["slugs"]["task"]["manualTitleRevision"], 3);
     assert_eq!(state["futureRoot"], true);
+}
+
+#[test]
+fn title_sources_only_climb_and_a_user_rename_is_final() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(temp.path().join("wt.sqlite"), identity("repo", "/repo")).unwrap();
+    let mut set = |title: &str, source| {
+        let outcome = store.set_slug_title("task", title, source, None).unwrap();
+        let state = store.read_wt_state().unwrap();
+        (outcome, crate::stored_title(&state, "task").unwrap())
+    };
+    // Created from an issue whose title lookup failed, then seeded by it.
+    assert_eq!(
+        set("COZ-1234", TitleSource::Fallback),
+        (
+            TitleWrite::Saved,
+            ("COZ-1234".into(), TitleSource::Fallback)
+        )
+    );
+    assert_eq!(
+        set("Calendar renders twice", TitleSource::Issue),
+        (
+            TitleWrite::Saved,
+            ("Calendar renders twice".into(), TitleSource::Issue)
+        )
+    );
+    // A late fallback cannot undo the issue title.
+    assert_eq!(
+        set("COZ-1234", TitleSource::Fallback),
+        (
+            TitleWrite::Outranked(TitleSource::Issue),
+            ("Calendar renders twice".into(), TitleSource::Issue)
+        )
+    );
+    // The agent renames once; a second rename and a later issue seed are refused.
+    assert_eq!(
+        set(
+            "Render the calendar once per week change",
+            TitleSource::Agent
+        )
+        .0,
+        TitleWrite::Saved
+    );
+    assert_eq!(
+        set("Something else", TitleSource::Agent).0,
+        TitleWrite::Outranked(TitleSource::Agent)
+    );
+    assert_eq!(
+        set("Calendar renders twice", TitleSource::Issue).0,
+        TitleWrite::Outranked(TitleSource::Agent)
+    );
+    // The user can always rename, and nothing else replaces it afterwards.
+    assert_eq!(set("Calendar fix", TitleSource::User).0, TitleWrite::Saved);
+    assert_eq!(
+        set("Calendar fix, take two", TitleSource::User).0,
+        TitleWrite::Saved
+    );
+    for source in [
+        TitleSource::Agent,
+        TitleSource::Issue,
+        TitleSource::Fallback,
+    ] {
+        assert_eq!(
+            set("Not this", source),
+            (
+                TitleWrite::Outranked(TitleSource::User),
+                ("Calendar fix, take two".into(), TitleSource::User)
+            )
+        );
+    }
 }
 
 #[test]

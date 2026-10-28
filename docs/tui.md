@@ -10,7 +10,8 @@ The list takes 44% of the width, clamped to 32..52 columns, and the right
 column holds details above the activity feed. Details get at most 20 rows; the
 feed gets the rest and at least 7. Below 60 columns the panes stack vertically.
 With `[ui].activity_pane = "full_width"`, list and details share the top region
-and the activity feed spans the bottom. Terminals smaller than 20 columns or 5
+and the activity feed spans the bottom with at most 12 lines of content, so a
+taller terminal grows the list and details instead. Terminals smaller than 20 columns or 5
 rows show a resize prompt. The UI uses a Nord-derived palette and Nerd Font
 glyphs; a terminal font without Nerd Font symbols shows placeholder boxes.
 
@@ -57,9 +58,8 @@ placement remains separate. Within a section, rows without a manual order sort
 first, and a stack sorts as one unit under its root's identity.
 
 The details pane's border names the slug. It starts with the wrapped title
-and a dim source tag: `manual`, `llm`, `pr`, `commit`, or `slug`, following the
-title precedence of saved manual title, generated title, PR title, first commit
-title, then slug. The work-status block follows when a status is saved: state,
+and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
+The work-status block follows when a status is saved: state,
 risk, age, and commits since the status, then the gate and the note behind a
 rail in the state's color. `OPS`, `REVERT`, `IF WRONG`, and `UNTESTED` note
 fields align under a hanging indent. A verify-after-merge obligation shows its
@@ -213,7 +213,7 @@ is open. A landing only moves forward: once a removal is proven in
 production its record keeps that (`landedOn`), so a later refresh or restart
 never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
 verification, landing, and notes. `Enter` restores, `p` opens the PR, `i` opens
-the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
+the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
 ## Keymap
@@ -266,7 +266,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `d` | Remove the selected worktree after confirmation |
 | `c` | Open cleanup review from background results, including archived rows |
 | `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
-| `t` / `T` | Rename worktree title manually / regenerate its AI title |
+| `t` | Rename the worktree. A rename is final: no agent or tracker title replaces it |
 | `#` | Set or clear the worktree's issue identity |
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
@@ -280,6 +280,23 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
 | `h` | Open removed-worktree history |
+
+### Worktree titles
+
+wt never generates titles or summaries; a title is only ever set on purpose,
+and the latest `wt status` note is the row's running summary. Each saved title
+records its source, and a lower source never replaces a higher one:
+
+| Source | Set by |
+|---|---|
+| `user` | `t`, or creating from the TUI. Final |
+| `agent` | `wt new <words>` or `wt title` from an agent. It may replace an `issue` or `fallback` title once, with the outcome its PR will have |
+| `issue` | `wt new <ID>` with no title words: the tracker's title (`[issue_tracker] status_command`) |
+| `fallback` | The same, when the tracker gave no title: the bare ID |
+
+A worktree nobody titled (created from a branch or a one-word slug) shows its
+PR title, then its first commit, then its slug, tagged `pr`, `commit`, or
+`slug`. Titles change only the display, never the branch or directory.
 
 Creation selects the row after it appears in the prepared board. Remote
 worktrees use the same host service for commands and sessions. On a
@@ -334,7 +351,7 @@ armed or the unconfirmed attempt expires.
 | `Shift+F12` | Start a new agent session: `c` Claude, `x` Codex, `o` OpenCode, `p` Pi, or `F12` for the highlighted one |
 | `;` | Pick a session. Inside: `d` closes the highlighted live session gracefully and `x` kills it (a dead Claude row is forgotten), both without confirmation; `c`/`x`/`o`/`p` on a New row jump between harnesses; an empty Claude name picks one automatically |
 | `Shift+Tab` | Cycle the primary harness |
-| `!` | Open worktree actions: `m` merge when ready, `u`/`g` agent builtins, `d`/`s` dev server, `l` dev logs, `t` rename with AI, `c` custom prompt, and configured actions |
+| `!` | Open worktree actions: `m` merge when ready, `u`/`g` agent builtins, `d`/`s` dev server, `l` dev logs, `c` custom prompt, and configured actions |
 | `m` / `M` | Enter the manager session / open manager commands (`d t o n a s` fleet plays, `r` ask about the row, `m` compact, `c` custom; `M M` confirms) |
 | `,` / `.` / `/` | Enter the wt repo / main clone / dotfiles session when configured |
 | `<` / `>` / `\` | Open the corresponding special-session palette (`g` continue, `m` compact, `z` open in editor, `c` custom) |

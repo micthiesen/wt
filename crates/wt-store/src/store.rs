@@ -34,10 +34,10 @@ pub enum StoreError {
     ReadOnly,
     #[error("repository state contains invalid JSON: {0}")]
     InvalidStateJson(#[from] serde_json::Error),
-    #[error("set title for {slug}: manual title must not be empty")]
-    EmptyManualTitle { slug: String },
-    #[error("set title for {slug}: manual title revision exhausted")]
-    ManualTitleRevisionExhausted { slug: String },
+    #[error("set title for {slug}: a title is one nonempty line")]
+    InvalidTitle { slug: String },
+    #[error("set title for {slug}: title revision exhausted")]
+    TitleRevisionExhausted { slug: String },
 }
 
 /// A synchronous owner of a single repository's rows in the shared wt DB.

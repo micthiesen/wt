@@ -691,11 +691,10 @@ impl Config {
             }
         }
 
-        let naming = optional_section::<NamingConfig>(&raw, "naming", "", &mut errors);
+        // wt no longer generates titles or summaries; a leftover `[naming]`
+        // is ignored like any unknown table, so older configs still load.
         if raw.get("ai").is_some() {
-            errors.push(
-                "[ai] is no longer supported; use [naming] with a coding-agent harness".into(),
-            );
+            errors.push("[ai] is no longer supported; wt does not generate titles".into());
         }
 
         let mut diff: DiffConfig = section(&raw, "diff", &mut errors);
@@ -794,7 +793,6 @@ impl Config {
                 wt_session_claude_token_command,
                 wt_session_claude_args,
             },
-            naming,
             diff,
             editor,
             browser,

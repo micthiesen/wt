@@ -218,7 +218,7 @@ worktree's own `origin/<trunk>` at the tip the main clone just fetched
 maintenance lock. Everything keyed to the base reads that
 ref: the ahead/behind counts, the pre-PR row title (the oldest commit
 in `base..HEAD`, which otherwise becomes a colleague's commit), the
-diff context the AI summary is generated from, the git row's
+git row's
 files/insertions, the merge-conflict probe (which reports clean against
 a trunk several merges old, a false green), the `{{base}}` handed to
 the diff tool — and the agent's own `git log origin/<trunk>..HEAD`

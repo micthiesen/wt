@@ -81,14 +81,6 @@ wt_path = "/opt/wt/bin/wt"
 primary = "codex"
 hidden = ["claude"]
 
-[naming]
-auto_rename = false
-harness = "opencode"
-models = { claude = "model-a", codex = "model-b", opencode = "model-c" }
-reasoning_effort = "high"
-max_input_tokens = 12000
-timeout_ms = 60000
-
 [diff]
 command = "diff-tool {{base}}"
 

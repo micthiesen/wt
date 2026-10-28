@@ -113,18 +113,6 @@
     "label": "Remote builder",
     "wtPath": "/opt/wt/bin/wt"
   },
-  "naming": {
-    "autoRename": false,
-    "harness": "opencode",
-    "models": {
-      "claude": "model-a",
-      "codex": "model-b",
-      "opencode": "model-c"
-    },
-    "reasoningEffort": "high",
-    "maxInputTokens": 12000,
-    "timeoutMs": 60000
-  },
   "diff": {
     "command": "diff-tool {{base}}"
   },

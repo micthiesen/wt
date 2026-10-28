@@ -191,6 +191,12 @@ enum Command {
     Edge(commands::edge::EdgeArgs),
     /// Show or record the worktree's change guide (`[guides] enabled`).
     Guide(commands::guide::GuideArgs),
+    /// Show or set the worktree's title.
+    ///
+    /// Titles rank user > agent > issue > fallback; a lower source never
+    /// replaces a higher one. An agent may replace an issue or fallback title
+    /// once, with the outcome its PR will have; a person's rename is final.
+    Title(commands::title::TitleArgs),
     /// Arm merge-when-ready or cancel the PR's actual merge state.
     ///
     /// Chooses the merge queue or classic auto-merge from the PR's base
@@ -511,6 +517,7 @@ async fn dispatch_command(
         Command::Section(args) => wt_ops::commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,
         Command::Guide(args) => commands::guide::run(context, args).await,
+        Command::Title(args) => commands::title::run(context, args).await,
         Command::Merge(args) => commands::merge::run(context, args).await,
         Command::Open(args) => commands::open::run(context, args).await,
         Command::Logs(args) => wt_ops::commands::logs::run(context, args).await,

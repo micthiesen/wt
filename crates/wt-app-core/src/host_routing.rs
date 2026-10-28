@@ -47,7 +47,6 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::RunAction { .. }
         | UiAction::CyclePrimary
         | UiAction::SetTitle { .. }
-        | UiAction::GenerateTitle { .. }
         | UiAction::PrepareCreate { .. }
         | UiAction::ResolveCreation { .. }
         | UiAction::CreateResolved { .. }
@@ -130,7 +129,6 @@ fn visit_keys(
         | UiAction::RestoreRemoved { key, .. }
         | UiAction::ToggleRemovedAutomations { key }
         | UiAction::SetTitle { key, .. }
-        | UiAction::GenerateTitle { key }
         | UiAction::OpenEditor { key }
         | UiAction::PrepareRemove { key }
         | UiAction::DismissFailedRemoval { key, .. }
@@ -240,12 +238,6 @@ pub fn qualify(mut action: UiAction, host: &str) -> Result<UiAction> {
         Ok(())
     })?;
     Ok(action)
-}
-
-/// The row palette's `t` entry is the same request as `T`, so it shares the
-/// title path, including remote pin migration.
-pub fn rename_as_title(action: wt_tui::UiAction) -> wt_tui::UiAction {
-    action.resolve_palette_alias()
 }
 
 #[cfg(test)]

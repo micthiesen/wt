@@ -195,9 +195,6 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
 
     let label_width = label_column(&row.detail_groups);
     for group in &row.detail_groups {
-        if group.id == "summary" {
-            continue;
-        }
         lines.extend(definition(row, group, policy, label_width, width, now));
     }
 
@@ -305,7 +302,6 @@ fn group_label(group: &PreparedDetailGroup) -> String {
 fn label_column(groups: &[PreparedDetailGroup]) -> usize {
     groups
         .iter()
-        .filter(|group| group.id != "summary")
         .map(|group| group_label(group).width())
         .max()
         .unwrap_or(0)
@@ -1848,7 +1844,7 @@ mod tests {
             key: "one".into(),
             slug: "eng-12-fix".into(),
             title: "Fix the flaky login test".into(),
-            title_source: TitleSource::Llm,
+            title_source: TitleSource::Agent,
             branch: "feature/eng-12".into(),
             path: "/very/long/path/to/the/worktrees/eng-12-fix".into(),
             issue_id: Some("ENG-12".into()),
@@ -1943,7 +1939,7 @@ mod tests {
     fn title_carries_its_source_and_the_border_names_the_slug() {
         let lines = screen(row(), 70, 40);
         assert!(lines[0].contains("eng-12-fix"), "{}", lines[0]);
-        assert!(find(&lines, "Fix the flaky login test").contains("(llm)"));
+        assert!(find(&lines, "Fix the flaky login test").contains("(agent)"));
     }
 
     #[test]

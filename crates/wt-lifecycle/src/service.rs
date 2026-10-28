@@ -3905,7 +3905,12 @@ mod tests {
 
         service
             .mutate_store(&cancellation, |store| {
-                store.set_slug_manual_title("ENG-42-feature", "Latest manual title", None)?;
+                store.set_slug_title(
+                    "ENG-42-feature",
+                    "Latest manual title",
+                    wt_store::TitleSource::User,
+                    None,
+                )?;
                 store.set_slug_issue_id("ENG-42-feature", Some("COZ-42"))?;
                 store.set_slug_github_issue("ENG-42-feature", Some(42))?;
                 store.set_slug_work_status(

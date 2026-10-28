@@ -90,7 +90,7 @@ impl Family for RowChange {
                     }
                     Self::Title { title } => {
                         row.title = title.clone();
-                        row.title_source = crate::TitleSource::Manual;
+                        row.title_source = crate::TitleSource::User;
                     }
                     Self::Base { base } => row.base_branch = base.clone(),
                     Self::Issue { issue_id } => row.issue_id = issue_id.clone(),

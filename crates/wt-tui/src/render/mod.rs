@@ -24,6 +24,9 @@ use text::truncate_end;
 /// the rest of the right column.
 const DETAILS_MAX: u16 = 20;
 const ACTIVITY_MIN: u16 = 7;
+/// The full-width activity pane stops at 12 lines of content (plus its
+/// border); a taller terminal grows the list and details above it instead.
+const FULL_WIDTH_ACTIVITY_MAX: u16 = 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Panes {
@@ -64,6 +67,7 @@ fn panes_with_footer(area: Rect, full_width_activity: bool, footer_height: u16) 
     let list_width = ((u32::from(area.width) * 44 / 100) as u16).clamp(32, 52);
     let activity_height = body.height.saturating_sub(DETAILS_MAX).max(ACTIVITY_MIN);
     if full_width_activity {
+        let activity_height = activity_height.min(FULL_WIDTH_ACTIVITY_MAX);
         let [top, activity] = Layout::vertical([
             Constraint::Length(body.height.saturating_sub(activity_height)),
             Constraint::Min(0),
@@ -565,6 +569,24 @@ mod tests {
     use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn full_width_activity_stops_at_twelve_lines_and_the_column_layout_keeps_growing() {
+        let area = |height| Rect::new(0, 0, 160, height);
+        for height in [30, 60, 120] {
+            let full = panes(area(height), true);
+            assert!(full.activity.height <= 14, "{height}: {full:?}");
+            // Everything above it takes the rest.
+            assert_eq!(full.list.height, height - 2 - full.activity.height);
+        }
+        assert_eq!(panes(area(120), true).activity.height, 14);
+        // Short terminals keep the shared minimum.
+        assert_eq!(panes(area(20), true).activity.height, ACTIVITY_MIN);
+        // The column layout is unchanged: the activity pane takes what
+        // details leave.
+        let column = panes(area(120), false);
+        assert_eq!(column.activity.height, 120 - 2 - DETAILS_MAX);
+    }
 
     #[test]
     fn topbar_keeps_only_stable_summary_and_footer_owns_action_progress() {

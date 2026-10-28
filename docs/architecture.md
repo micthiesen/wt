@@ -27,7 +27,7 @@ tree; its behavior baseline is commit `d9cd2f4`.
 | `wt-actions`, `wt-automations` | Tracked action execution and typed automation evaluation/ledger |
 | `wt-remote` | Native worker protocol and runtime transfer primitives |
 | `wt-update`, `wt-launcher` | Verified release installation, activation, boot probe and rollback |
-| `wt-skills`, `wt-events`, `wt-dev`, `wt-sst`, `wt-naming` | Skills distribution, webhook daemon, dev supervision, deployment reads and naming domain |
+| `wt-skills`, `wt-events`, `wt-dev`, `wt-sst` | Skills distribution, webhook daemon, dev supervision and deployment reads |
 | `wt-tmux` | Cancellable tmux transport for a caller-selected server and socket; never reads wt configuration or ambient `$TMUX` |
 | `xtask` | Repository tooling: `cargo xtask gate`, `deps-check`, `hygiene` (see [development.md](development.md)) |
 
@@ -113,7 +113,7 @@ service. `TaskScope` owns source tasks and cancels them together at the host
 boundary.
 
 `wt_sources::sources::start` builds the local leaves and the derived stages that
-project GitHub, action history/log tails, naming, sessions, removed history,
+project GitHub, action history/log tails, titles, sessions, removed history,
 automation status, and optional diagnostics into the board. Fetches are batched
 by domain, never issued once per rendered row. Watchers and activity sources
 publish only meaningful changes; timers are backstops for inputs without a
@@ -462,8 +462,7 @@ the change expire. A Sessions refresh also reruns the session-activity pass,
 which re-reads the persisted primary harness.
 
 `r` requests an ordinary source refresh and keeps durable data and derived
-caches. `Ctrl+R` asks for confirmation, clears the derived naming cache and
-GitHub picker memory, bypasses a cached webhook snapshot once, and requests
+caches. `Ctrl+R` asks for confirmation, clears GitHub picker memory, bypasses a cached webhook snapshot once, and requests
 fresh source data. It preserves authoritative SQLite state, running actions,
 automation history, and agent-session identity. The performance pane is dormant
 while closed; opening it takes a snapshot, and continuous sampling is opt-in.
@@ -632,9 +631,9 @@ versioned worktree-state payload migrations are distinct compatibility
 boundaries. `wt state migrate` imports legacy records; it does not run as an
 implicit cache clear.
 
-Generated naming summaries, the per-source query cache, event observations,
-action log tails, and source snapshots are rebuildable. Hard refresh may clear derived
-summaries; it must not delete durable state or resend an accepted operation.
+The per-source query cache, event observations, action log tails, and source
+snapshots are rebuildable. Hard refresh may clear derived caches; it must not
+delete durable state or resend an accepted operation.
 Action metadata and logs remain tracked on disk so a disconnected controller
 can re-read completion and output.
 

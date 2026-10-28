@@ -21,7 +21,6 @@ pub(crate) const LIST: &[Domain] = &[
     Domain::Reviews,
     Domain::Issues,
     Domain::Sessions,
-    Domain::Naming,
     Domain::Presentation,
     Domain::Host,
 ];

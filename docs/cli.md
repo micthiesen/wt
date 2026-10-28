@@ -81,6 +81,8 @@ Issue-id input resolves like this:
 - Multiword input without a leading id (`wt new fix the calendar`) slugifies wholesale to `yourname/fix-the-calendar` — issue-less worktrees are first-class.
 - With `[issue_tracker] prefix` set (e.g. `"eng"`), a differently-prefixed id (`wt new GH-970 …`) is rejected with guidance: a GitHub issue attaches as the secondary id via `--gh`, never as the worktree's identity.
 
+The input also sets the title (see [Worktree titles](tui.md#worktree-titles)): title words, or multiword input without an id, become the title as typed, with source `agent` (the CLI is the agents' path; people create and rename in the TUI). A bare id is titled from the tracker's `status_command` (read while the worktree is created), else the id itself. A branch or one-word slug sets no title. An existing worktree keeps its title.
+
 - `--slug <s>` — explicit slug when creating from an issue id (equivalent to inline title words; wins when both are given).
 - `--gh <n>` — attach GitHub issue `#n` as the worktree's secondary id (see `wt issue`).
 - `--attach` — attach to an existing branch for the id instead of minting a new one.
@@ -279,7 +281,7 @@ defaults or stopping another task.
 
 An unknown or ambiguous slug exits 1 with the reason.
 
-Show or change a worktree's fork base. `clear` returns its parent to trunk while retaining the saved commit anchor, so a later restack can still distinguish the parent's work after a squash merge. Explicit `set` records a merge base and rejects stack cycles. This record is the stack primitive (see [stacked-prs.md](stacked-prs.md)): the TUI's base row, stack grouping, sync counts, diff, and AI summary all resolve against it, and `wt restack` replays onto it.
+Show or change a worktree's fork base. `clear` returns its parent to trunk while retaining the saved commit anchor, so a later restack can still distinguish the parent's work after a squash merge. Explicit `set` records a merge base and rejects stack cycles. This record is the stack primitive (see [stacked-prs.md](stacked-prs.md)): the TUI's base row, stack grouping, sync counts, and diff all resolve against it, and `wt restack` replays onto it.
 
 ### `wt status [<slug>] [<state>] [-m <note>] [--risk <r>] [--blocked-on <gate>] [--verify-after-merge <steps>]`
 
@@ -354,6 +356,10 @@ It is a **skip hint, never authority**. Absent, stale, or unrecognised all mean 
 ### `wt guide [<slug>] [<url>] [--clear] [--json]`
 
 Record or show the worktree's change guide; requires `[guides] enabled` (see [configuration.md](configuration.md#guides--change-guides)). A lone URL argument records it for the current worktree, stamped with its HEAD, so the details pane can say whether the guide still describes the branch. Only one `http(s)` URL is accepted. Bare `wt guide` prints the guide and `current` or `outdated`; `--json` prints `{enabled, slug, head, guide: {url, sha, at}, current}`. `--clear` forgets it. With guides off, recording or clearing exits 2 and writes nothing, so an agent that runs it in a repo without guides changes nothing.
+
+### `wt title [<title…>] [-w <slug>]`
+
+Show or set the worktree's title (default: the current worktree). Bare `wt title` prints the title and its source. Setting one records source `agent`; people rename with the TUI's `t`. A lower source never replaces a higher one, so an agent can replace an `issue` or `fallback` title once and never a person's; a refused write exits 1 and names the title it kept. See [Worktree titles](tui.md#worktree-titles).
 
 ### `wt edge [<from> <kind> <to>]`
 

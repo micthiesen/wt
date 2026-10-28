@@ -28,7 +28,7 @@ needed to run an installed release.
 - Dev server — one supervised `npm run dev`-style process per worktree (`[dev_server]`): wt-owned ports, crash restarts with give-up, tmux-backed so it survives wt restarts.
 - Review bot — the CodeRabbit badge/automation track, retargetable at any PR-review bot (`[review_bot]`), including checklist-style GitHub Actions reviewers.
 - Coding agents: live sessions are detected from each agent's local state; starting from the TUI needs that agent's CLI on PATH (`claude`, `codex`, `opencode`, `pi`). Claude, Codex and Pi support native queued delivery. See [Pi setup and managed hosts](docs/pi.md) for the supported runtime and provider configuration.
-- A coding-agent CLI (`claude`, `codex`, `opencode`, or `pi`): live sessions and, when `[naming]` is configured, generated worktree titles and descriptions.
+- A coding-agent CLI (`claude`, `codex`, `opencode`, or `pi`) for live sessions.
 - [`rift`](https://github.com/anomalyco/rift) — required only when `[backend] kind = "rift"`; see [docs/backends.md](docs/backends.md).
 
 ## Install
@@ -72,7 +72,7 @@ worktree_root = "~/Code/your-repo-wt"
 prefix = "yourname"   # branches you create get `yourname/<id>-<slug>`
 ```
 
-Everything else is optional and section-gated: add `[deploy.sst]`, `[issue_tracker]`, `[review_bot]`, `[naming]`, or `[github.events]` to turn on or retarget that integration; omit it and the related rows hide themselves (the review-bot track defaults to CodeRabbit). The loader validates everything at startup and prints every missing or malformed field at once.
+Everything else is optional and section-gated: add `[deploy.sst]`, `[issue_tracker]`, `[review_bot]`, or `[github.events]` to turn on or retarget that integration; omit it and the related rows hide themselves (the review-bot track defaults to CodeRabbit). The loader validates everything at startup and prints every missing or malformed field at once.
 
 For multiple repositories, put shared personal defaults in the user config and add a `.wt.toml` at each repository root. Each wt process resolves one merged configuration at startup. Repository-specific values override user defaults. Durable state lives in SQLite and is partitioned by repository identity; disposable caches and runtime files live under the repository cache root.
 

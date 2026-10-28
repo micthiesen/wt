@@ -500,26 +500,45 @@ pub struct PrCommentView {
 }
 
 /// Where the row's title came from. Shown dimly beside the details title.
+/// The first four are titles set deliberately and stored (see
+/// `wt_store::TitleSource`); the rest are display fallbacks for a worktree
+/// nobody titled.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TitleSource {
-    Manual,
-    Llm,
+    #[serde(alias = "manual")]
+    User,
+    Agent,
+    Issue,
+    Fallback,
     Pr,
     Commit,
+    /// Also any source an older build sent.
     #[default]
+    #[serde(other)]
     Slug,
 }
 
 impl TitleSource {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Manual => "manual",
-            Self::Llm => "llm",
+            Self::User => "user",
+            Self::Agent => "agent",
+            Self::Issue => "issue",
+            Self::Fallback => "fallback",
             Self::Pr => "pr",
             Self::Commit => "commit",
             Self::Slug => "slug",
         }
+    }
+
+    /// Whether the title was set deliberately rather than read from the PR,
+    /// a commit, or the slug.
+    pub fn is_stored(self) -> bool {
+        matches!(
+            self,
+            Self::User | Self::Agent | Self::Issue | Self::Fallback
+        )
     }
 }
 

@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 use regex::Regex;
 use wt_lifecycle::{CreateOptions, LifecycleService, ServiceConfig};
+use wt_store::TitleSource;
+use wt_tui::CreationTitle;
 
 use crate::commands::resolve::run_git;
 use wt_app_core::context::AppContext;
@@ -58,8 +60,8 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
         return Ok(2);
     }
     let raw = args.positionals.join(" ").trim().to_owned();
-    let branch = match parse_branch(ctx, &raw, args, true).await {
-        Ok(branch) => branch,
+    let Parsed { branch, title } = match parse_branch(ctx, &raw, args, true).await {
+        Ok(parsed) => parsed,
         Err(message) => {
             log_failure(&raw, &message);
             eprintln!("{message}");
@@ -89,6 +91,7 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
         (*ctx.repository).clone(),
         ctx.processes.clone(),
     );
+    let lookup = IssueTitleLookup::start(ctx, &title);
     let created = match service
         .create(
             &branch,
@@ -111,6 +114,16 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
     if let Some(number) = args.gh {
         set_github_issue(ctx, created.target.slug(), number).await?;
     }
+    // The CLI is the agents' path; people title worktrees in the TUI.
+    let issue_title = lookup.finish().await;
+    record_title(
+        ctx,
+        created.target.slug(),
+        title,
+        TitleSource::Agent,
+        issue_title,
+    )
+    .await;
     println!(
         "✓ created {}\n  path: {}",
         created.target.slug(),
@@ -146,12 +159,95 @@ fn should_open(args: &NewArgs) -> bool {
     args.open || std::io::stdin().is_terminal()
 }
 
+/// A creation request's branch and the title it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parsed {
+    pub branch: String,
+    pub title: CreationTitle,
+}
+
+impl From<String> for Parsed {
+    fn from(branch: String) -> Self {
+        Self {
+            branch,
+            title: CreationTitle::None,
+        }
+    }
+}
+
+/// The tracker's title for a bare issue id, read while the worktree is
+/// created. Dropping it abandons the read.
+pub struct IssueTitleLookup(Option<tokio::task::JoinHandle<Option<String>>>);
+
+impl IssueTitleLookup {
+    /// Once creation is done, the read gets this much longer before the
+    /// worktree is titled with the bare id instead.
+    const AFTER_CREATION: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn start(ctx: &AppContext, title: &CreationTitle) -> Self {
+        let CreationTitle::Issue(id) = title else {
+            return Self(None);
+        };
+        let (ctx, id) = (ctx.clone(), id.clone());
+        Self(Some(tokio::spawn(async move {
+            wt_app_core::issue_tracker::title(&ctx, &id, &ctx.cancellation).await
+        })))
+    }
+
+    pub async fn finish(mut self) -> Option<String> {
+        let read = self.0.as_mut()?;
+        match tokio::time::timeout(Self::AFTER_CREATION, read).await {
+            Ok(title) => title.ok().flatten(),
+            Err(_) => {
+                tracing::warn!("issue title read outlasted creation; titled with the id");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for IssueTitleLookup {
+    fn drop(&mut self) {
+        if let Some(read) = &self.0 {
+            read.abort();
+        }
+    }
+}
+
+/// Save a new worktree's title: the words it was created with (from
+/// `creator`), else the tracker's title, else the bare issue id. A failure
+/// only costs the title, so it is logged rather than failing the creation.
+pub async fn record_title(
+    ctx: &AppContext,
+    slug: &str,
+    title: CreationTitle,
+    creator: TitleSource,
+    issue_title: Option<String>,
+) {
+    let (title, source) = match title {
+        CreationTitle::None => return,
+        CreationTitle::Given(title) => (title, creator),
+        CreationTitle::Issue(id) => match issue_title {
+            Some(title) => (title, TitleSource::Issue),
+            None => (id, TitleSource::Fallback),
+        },
+    };
+    let db_slug = slug.to_owned();
+    if let Err(error) = ctx
+        .database
+        .call(move |store| Ok(store.set_slug_title(&db_slug, &title, source, None)?))
+        .await
+    {
+        tracing::warn!(slug, error = %format!("{error:#}"), "could not save the new worktree's title");
+    }
+}
+
 pub async fn parse_branch(
     ctx: &AppContext,
     raw: &str,
     args: &NewArgs,
     interactive: bool,
-) -> Result<String, String> {
+) -> Result<Parsed, String> {
     if raw.is_empty() {
         return Err("empty input".into());
     }
@@ -206,7 +302,7 @@ pub async fn parse_branch(
                 }
             }
             match found.as_slice() {
-                [branch] => return Ok(branch.clone()),
+                [branch] => return Ok(branch.clone().into()),
                 [] => {
                     return Err(if args.any {
                         format!("No existing branch for {id} to attach to.")
@@ -226,7 +322,7 @@ pub async fn parse_branch(
                     .await
                     .map_err(|error| error.to_string())?;
                     return index
-                        .map(|index| found[index].clone())
+                        .map(|index| found[index].clone().into())
                         .ok_or_else(|| format!("no branch chosen for {id}"));
                 }
                 _ => {
@@ -254,11 +350,13 @@ pub async fn parse_branch(
                 "{id} can't lead a worktree ([issue_tracker] prefix = \"{required}\"). Use `wt new {required}-NNNN …`, an issue-less slug, or --attach for an existing branch. To link a GitHub issue, use an issue-less slug with `--gh <n>`."
             ));
         }
-        let title = args
-            .slug
-            .clone()
-            .unwrap_or_else(|| words.iter().skip(1).cloned().collect::<Vec<_>>().join(" "));
-        let suffix = slugify(&title);
+        let words = words.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+        let suffix = slugify(args.slug.as_deref().unwrap_or(&words));
+        let title = if words.is_empty() {
+            CreationTitle::Issue(id.clone())
+        } else {
+            CreationTitle::Given(words)
+        };
         let mut branch = format!("{}/{}", ctx.config.branch.prefix, id.to_ascii_lowercase());
         if suffix.is_empty() {
             let nanos = SystemTime::now()
@@ -270,10 +368,10 @@ pub async fn parse_branch(
             branch.push('-');
             branch.push_str(&suffix);
         }
-        return Ok(branch);
+        return Ok(Parsed { branch, title });
     }
     if words.len() == 1 && raw.contains('/') {
-        return Ok(raw.to_owned());
+        return Ok(raw.to_owned().into());
     }
     let existing = run_git(
         ctx,
@@ -288,13 +386,22 @@ pub async fn parse_branch(
     .await
     .map_err(|error| format!("failed to inspect branches: {error}"))?;
     if existing.status.success() {
-        return Ok(raw.to_owned());
+        return Ok(raw.to_owned().into());
     }
     let slug = slugify(raw);
     if slug.is_empty() {
         return Err("input does not contain a valid branch name or slug".into());
     }
-    Ok(format!("{}/{}", ctx.config.branch.prefix, slug))
+    // A single word is a slug; several are a name the creator chose.
+    let title = if words.len() > 1 {
+        CreationTitle::Given(raw.to_owned())
+    } else {
+        CreationTitle::None
+    };
+    Ok(Parsed {
+        branch: format!("{}/{}", ctx.config.branch.prefix, slug),
+        title,
+    })
 }
 
 fn slugify(value: &str) -> String {
@@ -329,7 +436,7 @@ async fn open_editor(ctx: &AppContext, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NewArgs, slugify};
+    use super::{IssueTitleLookup, NewArgs, TitleSource, parse_branch, record_title, slugify};
     use clap::{Args as _, Command, FromArgMatches};
 
     #[test]
@@ -367,6 +474,108 @@ mod tests {
             .unwrap();
         let args = NewArgs::from_arg_matches(&matches).unwrap();
         assert_eq!(args.positionals, ["ENG-42", "--literal"]);
+    }
+
+    async fn title_after(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        input: &str,
+    ) -> Option<(String, TitleSource)> {
+        let args = NewArgs::default();
+        let parsed = parse_branch(&fixture.ctx, input, &args, false)
+            .await
+            .unwrap();
+        let looked_up = IssueTitleLookup::start(&fixture.ctx, &parsed.title)
+            .finish()
+            .await;
+        record_title(
+            &fixture.ctx,
+            "one",
+            parsed.title,
+            TitleSource::Agent,
+            looked_up,
+        )
+        .await;
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        wt_store::stored_title(&state, "one")
+    }
+
+    fn tracker(fixture: &mut wt_app_core::test_support::CommandFixture, reply: &str) {
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).issue_tracker =
+            Some(wt_config::IssueTrackerConfig {
+                status_command: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("printf '%s' '{reply}'"),
+                    "reader".into(),
+                    "{ids}".into(),
+                ]),
+                ..Default::default()
+            });
+    }
+
+    #[tokio::test]
+    async fn a_bare_issue_id_takes_the_trackers_title() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        tracker(
+            &mut fixture,
+            r#"{"issues":[{"id":"ENG-42","status":"Todo","title":"Calendar renders twice"}]}"#,
+        );
+        assert_eq!(
+            title_after(&fixture, "ENG-42").await,
+            Some(("Calendar renders twice".into(), TitleSource::Issue))
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_or_titleless_lookup_falls_back_to_the_id() {
+        for reply in [
+            r#"{"issues":[{"id":"ENG-42","status":"Todo"}]}"#,
+            "not json",
+        ] {
+            let mut fixture = wt_app_core::test_support::CommandFixture::new()
+                .await
+                .unwrap();
+            tracker(&mut fixture, reply);
+            assert_eq!(
+                title_after(&fixture, "ENG-42").await,
+                Some(("ENG-42".into(), TitleSource::Fallback)),
+                "{reply}"
+            );
+            fixture.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn title_words_are_the_creators_and_a_slug_sets_none() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        tracker(
+            &mut fixture,
+            r#"{"issues":[{"id":"ENG-42","status":"Todo","title":"Ignored"}]}"#,
+        );
+        assert_eq!(
+            title_after(&fixture, "ENG-42 fix calendar week view").await,
+            Some(("fix calendar week view".into(), TitleSource::Agent))
+        );
+        let fresh = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        assert_eq!(title_after(&fresh, "some-slug").await, None);
+        assert_eq!(
+            title_after(&fresh, "Tidy the release notes").await,
+            Some(("Tidy the release notes".into(), TitleSource::Agent))
+        );
+        fixture.close().await.unwrap();
+        fresh.close().await.unwrap();
     }
 
     #[test]

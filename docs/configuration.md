@@ -521,8 +521,8 @@ new terminal or deliberately restart its job to apply new per-job limits.
 The board, SSH host service, tmux server, action recorders, and dev supervisors
 remain outside the workload group.
 Limits do not cover work delegated to a separate daemon, such as Docker or an
-existing OpenCode service. Configure such services separately. Headless naming
-and controller reads also remain outside these terminal/action/dev budgets.
+existing OpenCode service. Configure such services separately. Controller
+reads also remain outside these terminal/action/dev budgets.
 These limits control cooperative workloads; they are not a security boundary.
 
 ## `[dev_server]` — optional per-worktree dev server
@@ -646,10 +646,15 @@ with a 30-second timeout.
 Stdout must be only JSON of this shape:
 
 ```json
-{"issues":[{"id":"ENG-1","status":"In Review"},{"id":"ENG-2","status":"Open"}]}
+{"issues":[{"id":"ENG-1","status":"In Review","title":"Fix calendar"},{"id":"ENG-2","status":"Open"}]}
 ```
 
-Return every requested ID exactly once, without extra fields or unrequested IDs.
+Return every requested ID exactly once, without unrequested IDs or fields other
+than `id`, `status` and the optional `title`. `wt new <ID>` with no title words
+runs the command for that one ID (15-second timeout, alongside creation) and
+seeds the worktree's title from `title`; a blank or multi-line title is ignored
+rather than failing the batch, and without one the title is the bare ID (see
+[Worktree titles](tui.md#worktree-titles)).
 Statuses are arbitrary nonempty single-line strings; wt assigns no tracker
 vocabulary. Missing, duplicate or invalid responses reject the entire batch,
 retaining the last good cache and showing the source error. When the command
@@ -813,51 +818,6 @@ login Keychain:
    steps 1 and 2 (a dotfiles refresh command can wrap them), then restart the
    `wt` session.
 
-## `[naming]` — optional generated worktree names
-
-See [Pi sessions](pi.md) for Pi setup, managed hosts and provider authentication.
-
-Omit to disable generated title and description text. Naming invokes the
-configured coding-agent harness's non-interactive CLI using its existing
-authentication; wt does not require or call a separate model API. Runs are
-serialized, short-lived, and read-only. Codex runs ephemerally without project
-rules, Claude disables tools and session persistence, and OpenCode uses its
-V2 stateless text-generation API without session creation or tool execution.
-Pi uses ephemeral print mode with all tools, MCP, project context, skills and prompt templates disabled.
-OpenCode model overrides use `provider/model#variant`; an explicit variant wins
-over `reasoning_effort`. Without an override, OpenCode uses its configured model
-and variant. See [OpenCode sessions](opencode.md).
-
-```toml
-[naming]
-auto_rename      = true
-harness          = "primary"
-reasoning_effort = "low"
-
-[naming.models]
-codex = "gpt-6-luna"
-```
-
-| key | required | default | meaning |
-|---|---|---|---|
-| `auto_rename` | no | `true` | Generate names when changes are detected. Set `false` to request names only with `! t` or `T`. |
-| `harness` | no | `"primary"` | `"primary"` follows the repository's effective primary harness; `"claude"`, `"codex"`, `"opencode"`, or `"pi"` pins naming independently. |
-| `models.<harness>` | no | *(harness default)* | Harness-native model override for `claude`, `codex`, `opencode`, or `pi`. Per-harness keys keep `harness = "primary"` valid when the selected primary changes. |
-| `reasoning_effort` | no | `"low"` | Naming-only effort/variant: `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Claude maps `minimal` to `low`. Model support is enforced by the selected CLI. |
-| `max_input_tokens` | no | `8000` | Soft prompt budget; diff hunks are dropped largest-first to stay under it. |
-| `timeout_ms` | no | `120000` | Per-process timeout, including harness startup. |
-
-With `auto_rename = true`, summaries use a hash of the diff as their cache key.
-Identical diffs reuse the result. With `auto_rename = false`, automatic AI
-naming stops. Select a local worktree and press `!`, then select **Rename
-worktree with AI** (`t`). The direct `T` key does the same operation.
-The `t` key opens the manual title editor. A saved manual title disables
-automatic naming for that worktree. Explicit AI generation can replace it.
-The requested name stays fixed until you request another name, including
-after new commits and TUI restarts. Naming changes the displayed title and description. The list and details
-use the same title, truncated in the list and wrapped in details. It does not change the Git branch or directory name.
-A worktree needs committed changes for AI naming.
-
 ## `[guides]` — change guides
 
 Off by default. A change guide is a short published walkthrough of one
@@ -1019,9 +979,9 @@ entry remains last.
 
 | key | required | default | meaning |
 |---|---|---|---|
-| `rows` | no | `["branch", "issue", "stage", "dev", "pr", "claude", "git"]` | Detail-pane row order. Available ids: `branch` (renders `<branch> → <base>`; the branch gives up cells first when the line is tight, so the target is always readable), `path`, `issue` (legacy alias: `linear`), `stage`, `dev`, `pr`, `guide`, `claude`, `git`. `guide` shows only with `[guides] enabled`; unlisted, the guide rides the end of the `pr` line, or gets its own row when `pr` is not listed either. Unknown ids are ignored (including the retired `base` id, now merged into `branch`, and the retired `status` id — the asserted work status now renders as a fixed full-width banner at the top of the pane, so its note never truncates); omitted ones are hidden. A row also hides itself when its integration isn't configured (e.g. `issue` without `[issue_tracker]`, `dev` without `[dev_server]`). The rebase state (restacking / mid-rebase / conflict + files) isn't a row — it renders as a fixed block below the rows, above the AI summary. |
+| `rows` | no | `["branch", "issue", "stage", "dev", "pr", "claude", "git"]` | Detail-pane row order. Available ids: `branch` (renders `<branch> → <base>`; the branch gives up cells first when the line is tight, so the target is always readable), `path`, `issue` (legacy alias: `linear`), `stage`, `dev`, `pr`, `guide`, `claude`, `git`. `guide` shows only with `[guides] enabled`; unlisted, the guide rides the end of the `pr` line, or gets its own row when `pr` is not listed either. Unknown ids are ignored (including the retired `base` id, now merged into `branch`, and the retired `status` id — the asserted work status now renders as a fixed full-width banner at the top of the pane, so its note never truncates); omitted ones are hidden. A row also hides itself when its integration isn't configured (e.g. `issue` without `[issue_tracker]`, `dev` without `[dev_server]`). The rebase state (restacking / mid-rebase / conflict + files) isn't a row — it renders as a fixed block below the rows. |
 | `hidden_badges` | no | `[]` | Glyph slots to suppress from the **list-pane** badge cluster. Ids: `action` (running action), `dirty` (uncommitted-changes pencil), `rebase` (restacking / conflict), `deploy` (SST-or-dev-server bolt), `session` (harness glyph), `review_bot`, `review` (human review), `pr` (PR state, doubling as the merge-queue slot), `checks` (CI rollup). Unknown ids fail the load. Opt-out rather than an ordered allow-list like `rows`, because the cluster's left-to-right order is designed (`[bot] [review] [pr] [checks]` reads as one "state of this PR" run) and an allow-list would hide slots added in later versions. Details-pane segments are unaffected — hiding a badge declutters the list without losing the signal. |
-| `activity_pane` | no | `"column"` | Where the activity pane (harness sessions, action runs, the attention and firehose feeds) sits. `"column"` puts it in the right-hand column under the details pane, so the list pane gets the full TUI height — the better default when the board is long enough to scroll. `"full_width"` spans it across the bottom under both panes, capping list+details at 20 rows, which is what the layout was before the column split. The trade is the one you'd expect: `full_width` buys the feed the whole terminal width before its word-wrap kicks in (attention lines are mostly word-wrapped status notes, so width is what they spend), and pays for it in list rows. Neither changes what renders, only the box it renders in. |
+| `activity_pane` | no | `"column"` | Where the activity pane (harness sessions, action runs, the attention and firehose feeds) sits. `"column"` puts it in the right-hand column under the details pane, so the list pane gets the full TUI height — the better default when the board is long enough to scroll. `"full_width"` spans it across the bottom under both panes with at most 12 lines of content (at least 5); extra terminal height goes to the list and details above it. The trade is the one you'd expect: `full_width` buys the feed the whole terminal width before its word-wrap kicks in (attention lines are mostly word-wrapped status notes, so width is what they spend), and pays for it in list rows. Neither changes what renders, only the box it renders in. |
 | `sort` | no | `"status"` | Row ordering inside each list section. `"status"` ranks rows by work-status urgency — `ready` (the merge is yours to do), `needs-human`, `needs-testing`, `review`, `working`, statusless, `todo`, then merged/gone last — with the manual order as the stable tie-break, so same-status rows keep their hand order and `J`/`K` still reorders within a rank (a cross-rank nudge is refused with a hint). With no statuses asserted it's a pure no-op. `"manual"` restores the pure hand order. Stack sections always keep spine order either way. The cursor tracks the worktree, not the position, so a re-sort never moves your selection. |
 
 ## `[skills]`

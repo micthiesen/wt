@@ -213,13 +213,10 @@ pub fn start(
                     None => {},
                 },
                 command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
-                    Some(mut command) => {
+                    Some(command) => {
                         if task_lanes.is_empty() && pending.is_empty() {
                             progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
                         }
-                        // Resolve aliases before deciding cancellation ownership as
-                        // well as conflicts. Palette title generation is a write.
-                        command.action = wt_app_core::host_routing::rename_as_title(command.action);
                         match lane_for(&command.action) {
                         Ok(lane) if !lane_failed(&lane, &failed_lanes) => {
                             // A newer identical prefetch replaces a queued one.
@@ -323,7 +320,6 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::GithubFailedChecks { .. } => "load failed checks",
         A::ResolveCreation { .. } => "resolve worktree creation",
         A::SetTitle { .. } => "save title",
-        A::GenerateTitle { .. } => "generate title",
         A::SetStatus { .. } => "save status",
         A::SetIssueOverride { .. } => "save issue",
         A::SetBase { .. } => "save fork base",
@@ -401,7 +397,6 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::DismissFailedRemoval { key, .. }
         | A::PrepareRemove { key }
         | A::SetTitle { key, .. }
-        | A::GenerateTitle { key }
         | A::SetStatus { key, .. }
         | A::PrepareStatus { key }
         | A::SetIssueOverride { key, .. }
@@ -1646,8 +1641,8 @@ mod tests {
 
     #[test]
     fn metadata_has_reserved_capacity_during_unrelated_removals() {
-        // Exercise routing as well as admission, including managed hosts and
-        // the palette alias, so neither entry point regresses to a host lane.
+        // Exercise routing as well as admission, including managed hosts, so
+        // no entry point regresses to a host lane.
         for host in [None, Some("MaxBook".to_owned())] {
             let route = |action| match &host {
                 Some(host) => UiAction::OnHost {
@@ -1661,9 +1656,6 @@ mod tests {
                     key: "selected".into(),
                     title: "new title".into(),
                 },
-                UiAction::GenerateTitle {
-                    key: "selected".into(),
-                },
                 UiAction::SetIssueOverride {
                     key: "selected".into(),
                     issue_id: None,
@@ -1674,13 +1666,6 @@ mod tests {
                     note: None,
                     verify_after_merge: None,
                     seen: None,
-                },
-                UiAction::PrepareAction {
-                    surface: wt_tui::ActionSurface::Row {
-                        key: "selected".into(),
-                    },
-                    id: wt_app_core::action_builtins::RENAME_ID.into(),
-                    arg: None,
                 },
             ];
             let busy = (0..4)

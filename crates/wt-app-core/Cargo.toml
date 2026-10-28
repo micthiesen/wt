@@ -33,7 +33,6 @@ wt-automations.workspace = true
 wt-dev.workspace = true
 wt-core.workspace = true
 wt-harness.workspace = true
-wt-naming.workspace = true
 wt-launcher.workspace = true
 wt-platform.workspace = true
 wt-runtime.workspace = true
