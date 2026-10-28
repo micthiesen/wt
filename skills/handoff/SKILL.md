@@ -1,12 +1,9 @@
 ---
 name: handoff
 description: >-
-  Create and launch a distinct follow-up task in a new wt-managed worktree.
-  Use when the user invokes /handoff or $handoff, or explicitly asks to move,
-  fork, delegate, or continue follow-up work in another worktree and start its
-  coding agent. Writes a focused prompt.txt, queues the task, and starts the
-  configured primary harness; do not use for work that should stay in the
-  current worktree.
+  Creates a follow-up task in a new wt worktree, writes its prompt.txt brief,
+  and starts its agent. Use for /handoff or $handoff, or when the user asks to
+  move, fork, or delegate follow-up work into another worktree.
 targets:
   - '*'
 argument-hint: "<follow-up task, optional tracker id and dependency context>"
@@ -15,61 +12,44 @@ user_invocable: true
 
 # Handoff
 
-Move one well-defined follow-up from the current conversation into a fresh
-worktree and start its configured primary agent. The bundled `start` skill is
-the consumer: it reads `prompt.txt`, absorbs the task, deletes the disposable
-brief, and owns implementation through testing and status hand-off.
+Move one well-defined follow-up into a fresh worktree and start its agent. That
+agent runs the `start` skill: it reads `prompt.txt`, deletes it, and owns the
+task through testing and status.
 
-## 1. Define the follow-up
+An explicit request with a clear task authorizes creating one worktree and
+starting its agent. Ask one short question only when the task or its base is
+materially ambiguous.
 
-Extract the objective, acceptance criteria, relevant decisions, dependencies,
-and useful file or issue references from the conversation and current repo.
-Keep the brief task-focused; do not dump or summarize the whole conversation.
+## 1. Check for an owner
 
-Treat an explicit invocation with a clear task as authorization to create one
-worktree and start its agent. Ask one concise question only when the task or
-its dependency base is materially ambiguous.
+Run `wt ls --json`. If a worktree already owns this follow-up, report it
+instead of creating another. Update its `prompt.txt` only when it is still
+queued and the new text belongs to that same task.
 
-Before creating anything, run `wt ls --json` and avoid duplicating an existing
-worktree that already owns the follow-up. If one exists, update its
-`prompt.txt` only when it is still queued and the new text clearly belongs to
-that same task; otherwise report the collision rather than overwriting another
-agent's brief.
+## 2. Create
 
-## 2. Choose identity and base
+    wt new [<TRACKER-ID>] <short title words> --no-open [--gh <n>] [--base <current-branch>]
 
-- Use `wt new <ID> <short title words> --no-open` when the user supplied a
-  tracker id. A second worktree for the same id needs distinct title words.
-- Use `wt new <short title words> --no-open` for issue-less follow-ups.
-- Add `--gh <n>` only for a supplied related GitHub issue.
-- Add `--base <current-branch>` only when the new task depends on the current
-  branch's unlanded changes. Independent follow-ups fork from the configured
-  trunk. State the dependency in the brief either way.
+- Give the tracker id only when the user supplied one; a second worktree for
+  the same id needs distinct title words. Add `--gh` only for a related issue
+  the user supplied.
+- Add `--base <current-branch>` only when the follow-up needs this branch's
+  unlanded commits; otherwise it forks from trunk. State the dependency in the
+  brief either way. `--base` carries commits only: if the follow-up depends on
+  uncommitted changes, commit them within the user's authorized workflow or
+  ask; never claim they are there.
+- Never use raw `git worktree add`. Take the new slug, branch, and path from
+  the output.
+- Keep the new worktree in the source's section: find the source in
+  `wt section ls --json` (entries have `name` and `slugs`; `name: null` is
+  Inbox), then `wt section mv --only -- <new-slug> <section>` (`-` for Inbox)
+  before launch. Move only the new row. If sections can't be read, keep the
+  default and say so in the report.
 
-`--base` transfers committed history only. If the follow-up depends on
-uncommitted changes, do not claim they are available in the new worktree;
-either establish a durable commit within the user's authorized workflow or
-ask how they want that dependency handled.
+## 3. Write the brief
 
-Always use `wt new`, never raw `git worktree add`. Resolve the created slug,
-branch, and absolute path from the command output or a fresh `wt ls --json`.
-
-Create the follow-up in the source worktree's section when possible. Before
-creation, identify the source from the current directory and `wt ls --json`.
-Read its section with `wt section ls --json`: each entry has `name` and `slugs`;
-`name: null` means Inbox. Keep this choice separate from `--base`.
-
-After creation and before agent launch, move only the new worktree with
-`wt section mv --only -- <new-slug> <source-section>`. Use `-` for Inbox.
-Do not move the source or its stack. If the source or its controller-owned
-section is unavailable, keep the default section and state that limit in the
-handoff report. Do not ask the user to choose a section for this fallback.
-
-## 3. Write the handoff brief
-
-Create `prompt.txt` in the NEW worktree root, never the current worktree. It is
-an untracked transport artifact and must not be committed. Use this compact
-shape, omitting empty sections:
+Write `prompt.txt` in the new worktree's root, never the current one; it is
+never committed. Omit empty sections:
 
 ```text
 Objective
@@ -90,29 +70,22 @@ Dependencies
 (You can delete this prompt.txt after reading it.)
 ```
 
-Prefer references over copied prose when an issue, plan, commit, or existing
-artifact already holds the durable specification. Never include credentials,
-tokens, private keys, or unrelated conversation details.
+Keep it to this task, not a summary of the conversation, and point to the
+issue, plan, or commit that already holds the spec. Never include credentials
+or tokens.
 
 ## 4. Queue and launch
 
-After the brief is safely written:
+1. `wt status <slug> todo -m "<one-line goal>"`
+2. `wt agent start <slug>`. It picks the configured harness and sends that
+   harness's form of `start`; never address a harness yourself.
 
-1. Run `wt status <slug> todo -m "<one-line goal>"`.
-2. Run `wt agent start <slug>`.
-
-`wt agent start` reads wt's configured primary harness, cold-starts that
-harness if needed, and invokes its native form of the `start` skill (`/start`
-for Claude, `$start` for Codex/OpenCode). Do not address a harness directly or
-guess its command prefix.
-
-If launch fails, leave the worktree and `prompt.txt` intact in `todo`, report
-the exact failure, and stop. Do not mark it `needs-human` merely because the
-agent did not start. A successful dispatch is fire-and-forget; do not wait for
-the new task to finish.
+If launch fails, leave the worktree and brief in `todo`, report the exact
+error, and stop; that alone is not `needs-human`. Do not wait for the new task
+to finish.
 
 ## 5. Report
 
-Return the follow-up goal, slug, branch, path, recorded base when non-trunk,
-and the harness `wt agent start` selected. Confirm that the brief was written,
-the status is `todo`, and the start skill was dispatched.
+The goal, slug, branch, path, base when not trunk, and the harness
+`wt agent start` selected; confirm the brief is written, the status is `todo`,
+and `start` was dispatched.
