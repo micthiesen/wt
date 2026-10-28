@@ -22,7 +22,7 @@ mod github;
 pub(crate) mod sessions;
 
 pub use confirms::new_worktree_prompt;
-pub(crate) use section::{EMPTY_DETAIL, NEW_SECTION};
+pub(crate) use section::NEW_SECTION;
 
 use crate::{Board, SessionTarget, UiAction, UiModal};
 
@@ -118,6 +118,9 @@ impl UiAction {
                 reason: "reads action definitions, running actions and checkout state",
             },
             A::PrepareSection { key } => Menu::Local(section::menu(board, key)),
+            A::PrepareDeleteSection { section } => {
+                Menu::Local(section::delete_confirm(board, section))
+            }
             A::PrepareRemove { key } => remove::menu(board, key),
             A::PrepareCleanup => Menu::Host {
                 reason: "plans landing evidence on every host; `c` builds from the board",
@@ -159,6 +162,7 @@ impl UiAction {
             | A::MoveSection { .. }
             | A::Reorder { .. }
             | A::RenameSection { .. }
+            | A::DeleteSection { .. }
             | A::CyclePrimary
             | A::SetTitle { .. }
             | A::GenerateTitle { .. }

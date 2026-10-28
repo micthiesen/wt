@@ -2286,3 +2286,78 @@ fn z_opens_the_recorded_guide_only_when_guides_are_enabled() {
     );
     assert_eq!(model(false, guide()).input(z(), 20), InputResult::Unchanged);
 }
+
+#[test]
+fn empty_named_section_is_a_stop_and_shift_d_deletes_with_a_witness() {
+    let key = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT);
+    let mut model = Model::default();
+    let mut board = grouped(&["one"], false);
+    board.test_data_mut().sections.push(BoardSection {
+        key: "Later".into(),
+        title: "Later".into(),
+        ..Default::default()
+    });
+    model.apply(board);
+    // The row, then the empty section's own line.
+    assert_eq!(model.item_count(), 2);
+    model.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 20);
+    assert_eq!(model.selected_section().unwrap().key, "Later");
+    // Nothing to lose: deleting an empty section needs no confirmation.
+    assert_eq!(
+        model.input(key, 20),
+        InputResult::Action(UiAction::DeleteSection {
+            section: "Later".into(),
+            seen: Seen(vec![]),
+        })
+    );
+    // A section with rows confirms first, naming the rows it will move.
+    model.input(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), 20);
+    assert_eq!(model.input(key, 20), InputResult::Draw);
+    let Interaction::Confirm(confirm) = &model.interaction else {
+        panic!("deleting a section with rows should confirm")
+    };
+    assert_eq!(
+        confirm.action,
+        ConfirmAction::DeleteSection {
+            section: "Batch".into(),
+            seen: Seen(vec!["one".into()]),
+        }
+    );
+    model.input(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), 20);
+    // An empty section has nothing to fold and only its name to copy.
+    model.input(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), 20);
+    assert_eq!(
+        model.input(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), 20),
+        InputResult::Draw
+    );
+    assert_eq!(
+        model.toast.as_ref().map(|(text, _)| text.as_str()),
+        Some("nothing to fold in an empty section")
+    );
+    assert_eq!(
+        model.yank_choices(),
+        vec![('n', "section", "Later".to_owned())]
+    );
+    // The Inbox is wt's, not the user's.
+    let mut inbox = grouped(&["one"], false);
+    inbox.test_data_mut().sections[0].key = "\0inbox".into();
+    inbox.test_data_mut().sections[0].title = "Inbox".into();
+    model.apply(inbox);
+    assert_eq!(model.input(key, 20), InputResult::Draw);
+    assert_eq!(
+        model.toast.as_ref().map(|(text, _)| text.as_str()),
+        Some("Inbox is not a section you can delete")
+    );
+}
+
+#[test]
+fn a_section_witness_counts_only_rows_a_delete_would_move() {
+    let mut board = grouped(&["live", "archived", "removing", "creating"], false);
+    {
+        let board = board.test_data_mut();
+        board.rows[1].archived = true;
+        board.rows[2].removal = Some(Default::default());
+        board.rows[3].pending_creation = true;
+    }
+    assert_eq!(board.data().unwrap().section_witness("Batch"), ["live"]);
+}

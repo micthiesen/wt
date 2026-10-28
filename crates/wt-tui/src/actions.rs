@@ -183,6 +183,16 @@ pub enum UiAction {
         old: String,
         new: String,
     },
+    /// Open the confirmation for deleting a section that still has rows.
+    PrepareDeleteSection {
+        section: String,
+    },
+    /// Delete a named section, moving its rows to the Inbox. `seen` is the
+    /// live rows the user saw in it; the host refuses a section that changed.
+    DeleteSection {
+        section: String,
+        seen: Seen<Vec<String>>,
+    },
     CyclePrimary,
     SetTitle {
         key: String,
@@ -522,6 +532,10 @@ pub enum ConfirmAction {
     DismissFailedRemoval {
         key: String,
         seen: Seen<FailedRemovalSeen>,
+    },
+    DeleteSection {
+        section: String,
+        seen: Seen<Vec<String>>,
     },
     Cleanup {
         revisions: Vec<RemovalRevision>,

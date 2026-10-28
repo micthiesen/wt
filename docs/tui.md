@@ -34,8 +34,15 @@ dropped status. A hollow marker in a state's color means the saved status SHA
 differs from the current observed HEAD, and overdue post-merge verification is
 red. A landed branch without a newer status shows the green merge glyph.
 
-Sections fold with `Tab`. Only folded sections are cursor stops; an expanded
-section is just its rows. A folded header reads `[×NN] Name` with a
+Sections are explicit: one lasts from creation (`l n`) until you delete it with
+`D`, and stays on screen when its last worktree leaves, drawn as its rule over
+a dim `empty` line. That line is the section's cursor stop, so an empty section
+can be renamed, deleted, moved with `J`/`K`, or filled (`n` creates into it).
+Deleting a section that still has worktrees asks first and moves them to the
+Inbox. The Inbox and the archive appear only when they have rows.
+
+Sections fold with `Tab`. Only folded and empty sections are cursor stops; an
+expanded section is just its rows. A folded header reads `[×NN] Name` with a
 right-aligned count per work state, most urgent first (ready, needs-human,
 needs-testing, review, working), plus overdue verifications, conflicts, and
 failing checks. Selecting it shows the full rollup and blocker notes in the
@@ -259,8 +266,9 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `V` | Show or hide this row's post-merge verification steps (open by default when the check is due) |
 | `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` ready with verification, `x` clears, `m` edits the note) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
-| `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists sections holding live rows first, then the five newest empty ones, muted under "recent" |
-| `J` / `K` | Reorder the selected row, stack, or folded group; the cursor follows the row across sections, skipping empty ones |
+| `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists every section in board order with its size |
+| `D` | Delete the current section; its worktrees move to the Inbox (confirmation when it has any) |
+| `J` / `K` | Reorder the selected row, stack, or folded or empty section; the cursor follows the row across sections, including into an empty one on screen, never into a hidden group |
 | `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
 | `h` | Open removed-worktree history |

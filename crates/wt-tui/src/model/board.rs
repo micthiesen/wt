@@ -297,6 +297,35 @@ pub struct BoardSection {
     pub rollup: SectionRollup,
 }
 
+impl Board {
+    /// The rows a section shows that deleting it would move: drawn in it,
+    /// not archived, not being removed, not a pending creation. Sorted keys,
+    /// so the TUI's witness and the host's check compare equal.
+    pub fn section_witness(&self, name: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .sections
+            .iter()
+            .filter(|section| section.key == name)
+            .flat_map(|section| &section.rows)
+            .filter_map(|&row| self.rows.get(row))
+            .filter(|row| !row.archived && row.removal.is_none() && !row.pending_creation)
+            .map(|row| row.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+}
+
+impl BoardSection {
+    /// Whether the list draws this section. A named section stays on screen
+    /// (and is a cursor stop) while empty; a derived group such as the Inbox
+    /// or the archive appears only with rows. Rendering, cursor stops and
+    /// row moves all ask this, so a row never lands somewhere unseen.
+    pub fn drawn(&self) -> bool {
+        !self.rows.is_empty() || !self.key.starts_with('\0')
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SectionRollup {

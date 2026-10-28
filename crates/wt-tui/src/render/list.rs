@@ -212,11 +212,21 @@ impl RowContext<'_> {
             .iter()
             .filter_map(|&row| self.model.board.rows.get(row).map(|data| (row, data)))
             .collect();
-        if rows.is_empty() {
+        if rows.is_empty() && !section.drawn() {
             return;
         }
         if leading_blank {
             lines.push(blank());
+        }
+        if rows.is_empty() {
+            let item = positions.get(&VisualItem::Section(index)).copied();
+            lines.push(divider(&section.title, self.width));
+            lines.push(empty_section(
+                item.is_some() && item == self.model.selected,
+                self.width,
+                item,
+            ));
+            return;
         }
         if section.folded {
             let item = positions.get(&VisualItem::Section(index)).copied();
@@ -356,6 +366,20 @@ fn divider(label: &str, width: usize) -> ListLine {
             Span::styled("─".repeat(trail), theme::fg(theme::BORDER_DIM)),
         ]),
         item: None,
+    }
+}
+
+/// The one cursor stop of a named section with no rows, so it can be
+/// renamed, deleted, or filled.
+fn empty_section(selected: bool, width: usize, item: Option<usize>) -> ListLine {
+    let mut style = theme::dim().add_modifier(Modifier::ITALIC);
+    if selected {
+        style = style.bg(theme::SELECTED_BG);
+    }
+    let text = fit("   empty", width.saturating_sub(1));
+    ListLine {
+        line: Line::from(vec![Span::styled(text, style), Span::raw(" ")]),
+        item,
     }
 }
 
@@ -509,6 +533,44 @@ fn review_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_named_section_draws_with_a_selectable_empty_line() {
+        let model = Model::default();
+        let context = RowContext {
+            model: &model,
+            width: 60,
+            gutter: 0,
+        };
+        let text = |line: &ListLine| {
+            line.line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let positions = std::collections::HashMap::from([(VisualItem::Section(0), 0)]);
+        let named = BoardSection {
+            key: "Later".into(),
+            title: "Later".into(),
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        context.section(&mut lines, 0, &named, &positions, false);
+        assert_eq!(lines.len(), 2);
+        assert!(text(&lines[0]).contains("Later"));
+        assert!(text(&lines[1]).contains("empty"));
+        assert_eq!(lines[1].item, Some(0));
+        // A derived group without rows (the Inbox) is not drawn.
+        let inbox = BoardSection {
+            key: "\0inbox".into(),
+            title: "Inbox".into(),
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        context.section(&mut lines, 0, &inbox, &positions, false);
+        assert!(lines.is_empty());
+    }
 
     #[test]
     fn pending_removal_title_is_dim_and_struck_through_even_when_selected() {

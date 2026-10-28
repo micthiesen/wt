@@ -1444,11 +1444,16 @@ fn section_lines(section: &BoardSection, model: &Model, width: usize) -> Vec<Lin
     lines.push(Line::default());
     // The archived block is pinned and named by wt, so rename and move do
     // nothing there; advertise only the keys it has.
-    let hint = match (section.folded, section.key == ARCHIVED_SECTION) {
-        (true, true) => "TAB expand · y yank",
-        (true, false) => "TAB expand · y yank · L rename · J/K move",
-        (false, true) => "TAB fold · y yank",
-        (false, false) => "TAB fold · y yank · L rename · J/K move",
+    let hint = match (
+        section.folded,
+        section.key == ARCHIVED_SECTION,
+        section.rows.is_empty(),
+    ) {
+        (_, false, true) => "L rename · D delete · J/K move",
+        (true, true, _) => "TAB expand · y yank",
+        (true, false, _) => "TAB expand · y yank · L rename · D delete · J/K move",
+        (false, true, _) => "TAB fold · y yank",
+        (false, false, _) => "TAB fold · y yank · L rename · D delete · J/K move",
     };
     lines.push(Line::styled(truncate_end(hint, width), theme::dim()));
     lines
@@ -2160,7 +2165,10 @@ mod tests {
         let human = rollup.find("needs-human").unwrap();
         let working = rollup.find("working").unwrap();
         assert!(ready < human && human < working, "{rollup}");
-        find(&lines, "TAB expand · y yank · L rename · J/K move");
+        find(
+            &lines,
+            "TAB expand · y yank · L rename · D delete · J/K move",
+        );
 
         let archived = section_screen(vec![row()], ARCHIVED_SECTION);
         assert!(!archived.join("\n").contains("L rename"));

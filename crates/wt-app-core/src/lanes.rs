@@ -89,6 +89,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::MoveSection { .. }
         | A::Reorder { .. }
         | A::RenameSection { .. }
+        | A::DeleteSection { .. }
         | A::ToggleArchive { .. } => Lane::Presentation,
         A::PrepareCreate { .. }
         | A::ResolveCreation { .. }
@@ -100,6 +101,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::PrepareActions { .. }
         | A::PrepareAction { .. }
         | A::PrepareSection { .. }
+        | A::PrepareDeleteSection { .. }
         | A::PrepareRemove { .. }
         | A::PrepareCleanup
         | A::PrepareStatus { .. }

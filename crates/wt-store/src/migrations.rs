@@ -1,6 +1,6 @@
 use serde_json::{Map, Number, Value};
 
-pub const CURRENT_WT_STATE_VERSION: u64 = 17;
+pub const CURRENT_WT_STATE_VERSION: u64 = 18;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MigrationOutcome {
@@ -58,9 +58,12 @@ pub fn migrate_wt_state(raw: Value) -> MigrationOutcome {
                     .entry("reviewRequestDismissals")
                     .or_insert_with(|| Value::Array(Vec::new()));
             }
-            // v4-v14 and v17 are compatibility boundaries with no data
+            // v4-v14, v17 and v18 are compatibility boundaries with no data
             // transform. Their version steps still matter for downgrade
             // detection, just as they do in the original TypeScript chain.
+            // v18: sections are explicit. The host adopts them once it knows
+            // the live worktrees (`explicitSections`); a v17 binary writing
+            // this state would still prune emptied sections.
             _ => {}
         }
     }

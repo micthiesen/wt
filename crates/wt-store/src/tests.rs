@@ -1270,3 +1270,68 @@ fn a_changed_creation_section_is_refused_without_writing() {
             .contains_key("creationAfter")
     );
 }
+
+#[test]
+fn sections_outlive_their_last_worktree_until_deleted() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let state = |store: &mut Store| -> serde_json::Value {
+        serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap()
+    };
+    store.place_slug("one", Some("Batch"), false).unwrap();
+    store
+        .move_worktrees_to_section(&["one".into()], None)
+        .unwrap();
+    store.clear_slug_state("one").unwrap();
+    assert_eq!(
+        state(&mut store)["sectionsOrder"],
+        json!(["\0inbox", "Batch"])
+    );
+    assert_eq!(store.remove_section("Batch").unwrap(), 0);
+    assert_eq!(state(&mut store)["sectionsOrder"], json!(["\0inbox"]));
+}
+
+#[test]
+fn adopting_explicit_sections_keeps_only_live_ones_once() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store
+        .write_repository_state_json(
+            r#"{"version":17,"sectionsOrder":["\u0000inbox","Live","Stale","Remote","Empty","Placed","Creating"],
+               "foldedSections":["Stale","Live"],
+               "slugs":{"live":{"section":"Live"},"gone":{"section":"Stale"},
+                        "old":{"section":"Placed","creationAfter":"x","order":3},
+                        "new":{"section":"Creating","creationAfter":"x"}},
+               "remoteLayouts":{"@remote/h/r":{"section":"Remote"}}}"#,
+        )
+        .unwrap();
+    let live = std::collections::BTreeSet::from(["live".to_owned()]);
+    assert!(store.adopt_explicit_sections(&live).unwrap());
+    let state: serde_json::Value =
+        serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap();
+    // A creation still in flight counts as live; a settled one does not.
+    assert_eq!(
+        state["sectionsOrder"],
+        json!(["\0inbox", "Live", "Remote", "Creating"])
+    );
+    assert_eq!(state["foldedSections"], json!(["Live"]));
+    // The stale reference is cleared so loading cannot resurrect it.
+    assert!(state["slugs"]["gone"]["section"].is_null());
+    // Afterwards an emptied section stays, and adoption never runs again.
+    store.place_slug("live", None, false).unwrap();
+    assert!(!store.adopt_explicit_sections(&live).unwrap());
+    let state: serde_json::Value =
+        serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap();
+    assert_eq!(
+        state["sectionsOrder"],
+        json!(["\0inbox", "Live", "Remote", "Creating"])
+    );
+}

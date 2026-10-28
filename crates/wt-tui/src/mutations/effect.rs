@@ -105,6 +105,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::PrepareActions { .. }
         | UiAction::WarmPalette { .. }
         | UiAction::PrepareSection { .. }
+        | UiAction::PrepareDeleteSection { .. }
         | UiAction::GenerateTitle { .. }
         | UiAction::Copy { .. }
         | UiAction::OpenEditor { .. }
@@ -232,6 +233,9 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         ),
         UiAction::Reorder { key, .. } => {
             unprojected(host, key.as_deref(), "reordering", &[Domain::Metadata])
+        }
+        UiAction::DeleteSection { .. } => {
+            unprojected(host, None, "deleting section", &[Domain::Metadata])
         }
         UiAction::RenameSection { old, new } => on_board(
             host,

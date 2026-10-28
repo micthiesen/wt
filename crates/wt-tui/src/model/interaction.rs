@@ -311,6 +311,10 @@ impl Model {
                             label: "error details".into(),
                         },
                         ConfirmAction::HardRefresh => UiAction::HardRefresh,
+                        ConfirmAction::DeleteSection { section, seen } => UiAction::DeleteSection {
+                            section: section.clone(),
+                            seen: seen.clone(),
+                        },
                         ConfirmAction::StopTerminal {
                             key,
                             target,

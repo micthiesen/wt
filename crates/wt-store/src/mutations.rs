@@ -16,6 +16,9 @@ use crate::{
 
 const GROUP_INBOX: &str = "\0inbox";
 const STACK_PREFIX: &str = "\0stack:";
+/// Marks a state whose sections were adopted as explicit (see
+/// `adopt_explicit_sections`).
+const EXPLICIT_SECTIONS: &str = "explicitSections";
 const REMOVED_MAX_ENTRIES: usize = 30;
 const REMOVED_MAX_AGE_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 const MAX_REVIEW_REQUEST_DISMISSALS: usize = 200;
@@ -356,7 +359,6 @@ impl Store {
             if slugs.remove(slug).is_none() {
                 return Ok((false, false));
             }
-            prune_sections_order(state);
             Ok((true, true))
         })
     }
@@ -404,7 +406,6 @@ impl Store {
             );
             entry.insert("order".to_owned(), number(order));
             object_mut(state, collection).insert(slug.to_owned(), Value::Object(entry));
-            prune_sections_order(state);
             Ok(((), true))
         })
     }
@@ -437,7 +438,6 @@ impl Store {
             );
             layout.insert("order".to_owned(), number(order));
             object_mut(state, "remoteLayouts").insert(key.to_owned(), Value::Object(layout));
-            prune_sections_order(state);
             Ok(((), true))
         })
     }
@@ -642,8 +642,16 @@ impl Store {
                     }
                 }
             }
-            prune_sections_order(state);
             Ok(((), true))
+        })
+    }
+
+    /// One-time switch to explicit sections, given the live worktree slugs.
+    /// Returns whether anything changed; later calls are no-ops.
+    pub fn adopt_explicit_sections(&mut self, live: &BTreeSet<String>) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let changed = adopt_explicit_sections(state, live);
+            Ok((changed, changed))
         })
     }
 
@@ -678,7 +686,7 @@ impl Store {
                 }
             }
             array_mut(state, "foldedSections").retain(|key| key.as_str() != Some(name));
-            prune_sections_order(state);
+            array_mut(state, "sectionsOrder").retain(|key| key.as_str() != Some(name));
             Ok((local.len() + remote.len(), true))
         })
     }
@@ -841,7 +849,6 @@ impl Store {
                 .collect::<Map<_, _>>();
             state["slugs"] = Value::Object(kept);
             state["edges"] = Value::Array(std::mem::take(&mut next_edges));
-            prune_sections_order(state);
             Ok((true, true))
         })
     }
@@ -870,7 +877,6 @@ impl Store {
             for key in stale {
                 layouts.remove(&key);
             }
-            prune_sections_order(state);
             Ok((true, true))
         })
     }
@@ -1757,9 +1763,6 @@ pub(crate) fn move_to_section(
         object_mut(state, collection).insert(key.clone(), Value::Object(layout));
         changed.push(key.clone());
     }
-    if !changed.is_empty() {
-        prune_sections_order(state);
-    }
     changed
 }
 
@@ -1922,16 +1925,56 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn prune_sections_order(state: &mut Value) {
-    let live: BTreeSet<String> = all_layouts(state)
-        .filter_map(|entry| entry.get("section")?.as_str().map(str::to_owned))
-        .collect();
+/// Sections are explicit: one lives from creation until it is deleted, so
+/// leaving it empty no longer removes it. Before that, an emptied section
+/// survived only while a removed or archived worktree still named it, and
+/// never rendered. Adopting the explicit model keeps the sections that hold a
+/// live worktree (or a remote layout) and drops the rest, once.
+fn adopt_explicit_sections(state: &mut Value, live: &BTreeSet<String>) -> bool {
+    if state[EXPLICIT_SECTIONS] == true {
+        return false;
+    }
+    let mut kept: BTreeSet<String> = all_remote_sections(state);
+    for (slug, layout) in state["slugs"].as_object().into_iter().flatten() {
+        // A creation records its placement before Git lists the checkout, so
+        // one in flight while the inventory was read still counts as live.
+        let creating = layout.get("creationAfter").is_some() && !layout["order"].is_number();
+        if (live.contains(slug) || creating)
+            && let Some(section) = layout.get("section").and_then(Value::as_str)
+        {
+            kept.insert(section.to_owned());
+        }
+    }
+    for layout in object_mut(state, "slugs").values_mut() {
+        let dropped = layout
+            .get("section")
+            .and_then(Value::as_str)
+            .is_some_and(|section| !kept.contains(section));
+        if dropped && let Some(layout) = layout.as_object_mut() {
+            layout.insert("section".to_owned(), Value::Null);
+        }
+    }
     array_mut(state, "sectionsOrder").retain(|entry| {
-        let Some(key) = entry.as_str() else {
-            return false;
-        };
-        key == GROUP_INBOX || key.starts_with(STACK_PREFIX) || live.contains(key)
+        entry.as_str().is_some_and(|key| {
+            key == GROUP_INBOX || key.starts_with(STACK_PREFIX) || kept.contains(key)
+        })
     });
+    array_mut(state, "foldedSections").retain(|entry| {
+        entry
+            .as_str()
+            .is_some_and(|key| key.starts_with('\0') || kept.contains(key))
+    });
+    state[EXPLICIT_SECTIONS] = Value::Bool(true);
+    true
+}
+
+fn all_remote_sections(state: &Value) -> BTreeSet<String> {
+    state["remoteLayouts"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, layout)| layout.get("section")?.as_str().map(str::to_owned))
+        .collect()
 }
 
 fn number(value: f64) -> Value {

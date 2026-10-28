@@ -123,6 +123,7 @@ pub async fn execute_with_shutdown(
         UiAction::PrepareStatus { .. }
         | UiAction::PrepareBase { .. }
         | UiAction::PrepareSection { .. }
+        | UiAction::PrepareDeleteSection { .. }
         | UiAction::PrepareHardRefresh
         | UiAction::PrepareReviewCheckout { .. }
         | UiAction::PrepareRestoreRemoved { .. }
@@ -293,6 +294,9 @@ pub async fn execute_with_shutdown(
             crate::section_actions::move_row(ctx, key, section, seen, board).await
         }
         UiAction::RenameSection { old, new } => crate::section_actions::rename(ctx, old, new).await,
+        UiAction::DeleteSection { section, seen } => {
+            crate::section_actions::delete(ctx, section, seen, board).await
+        }
         UiAction::FoldSection { key, folded } => {
             ctx.database
                 .call(move |store| {

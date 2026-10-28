@@ -528,6 +528,12 @@ impl Model {
                 let Some(section) = self.selected_section() else {
                     return self.notify("no section here to fold");
                 };
+                // Folding an empty section would hide nothing now and hide
+                // the first row moved into it later; unfolding still clears
+                // a flag left from before it emptied.
+                if section.rows.is_empty() && !section.folded {
+                    return self.notify("nothing to fold in an empty section");
+                }
                 let (key, folded) = (section.key.clone(), !section.folded);
                 // Unfolding from the header lands on the section's first row.
                 if !folded
@@ -559,6 +565,25 @@ impl Model {
             }
             KeyCode::Char('l') if !control => {
                 self.row_action(|key| UiAction::PrepareSection { key })
+            }
+            KeyCode::Char('D') if !control => {
+                let Some(section) = self.selected_section() else {
+                    return self.notify("no section here to delete");
+                };
+                if section.key.starts_with('\0') {
+                    return self
+                        .notify(format!("{} is not a section you can delete", section.title));
+                }
+                let section = section.key.clone();
+                let seen = self.board.section_witness(&section);
+                InputResult::Action(if seen.is_empty() {
+                    UiAction::DeleteSection {
+                        section,
+                        seen: crate::Seen(seen),
+                    }
+                } else {
+                    UiAction::PrepareDeleteSection { section }
+                })
             }
             KeyCode::Char('L') if !control => {
                 if let Some(section) = self
@@ -938,6 +963,10 @@ impl Model {
                 .iter()
                 .filter_map(|&index| self.board.rows.get(index))
                 .collect::<Vec<_>>();
+            // An empty section has only its name to copy.
+            if rows.is_empty() {
+                return vec![('n', "section", section.title.clone())];
+            }
             return vec![
                 ('n', "section", section.title.clone()),
                 (

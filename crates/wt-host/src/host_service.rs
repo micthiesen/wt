@@ -87,6 +87,17 @@ impl HostService {
         context.cancellation = commands;
         let sources = wt_sources::sources::start(scope, &context);
         sources.board.refresh();
+        let adopting = context.clone();
+        let metadata = sources.metadata.clone();
+        scope.spawn(async move {
+            match crate::section_actions::adopt_explicit_sections(&adopting).await {
+                Ok(true) => {
+                    metadata.refresh();
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "could not adopt explicit sections"),
+            }
+        });
         Self { context, sources }
     }
 

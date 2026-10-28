@@ -313,6 +313,7 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::PrepareActions { .. } => "prepare action palette",
         A::WarmPalette { .. } => "prefetch action palette",
         A::PrepareSection { .. } => "prepare section picker",
+        A::PrepareDeleteSection { .. } => "prepare section delete",
         A::PrepareStatus { .. } => "prepare status picker",
         A::PrepareBase { .. } => "prepare fork base picker",
         A::PrepareSessions { .. } => "prepare session picker",
@@ -354,6 +355,7 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::MoveSection { .. } => "move to section",
         A::Reorder { .. } => "reorder",
         A::RenameSection { .. } => "rename section",
+        A::DeleteSection { .. } => "delete section",
         A::ToggleArchive { .. } => "toggle archive",
         A::Session { .. } | A::EnterHarness { .. } | A::SelectSession { .. } => "open session",
         A::StopTerminal { .. } | A::StopSession { .. } => "stop session",
@@ -458,8 +460,10 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::KillAction { .. }
         | A::FoldSection { .. }
         | A::PrepareSection { .. }
+        | A::PrepareDeleteSection { .. }
         | A::Reorder { .. }
         | A::RenameSection { .. }
+        | A::DeleteSection { .. }
         | A::CyclePrimary
         | A::Copy { .. }
         | A::PrepareCleanup => return None,

@@ -58,6 +58,7 @@ pub(crate) const LINES: &[&str] = &[
     "  l                  Move to section (picker); l l confirms",
     "  l n                New section (Esc returns to the picker)",
     "  L                  Rename current section",
+    "  D                  Delete current section; its worktrees go to the Inbox",
     "  b                  Record fork base (picker); b b confirms; never rebases",
     "  u                  Work status: t w r n h y v d, a ready + verify, x clears, m note",
     "  R                  Restack (rebase) the row or its stack; /restack on conflict",

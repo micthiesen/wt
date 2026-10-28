@@ -119,6 +119,37 @@ pub async fn move_row(
     })
 }
 
+/// Switch the repository to explicit sections once, keeping only those that
+/// hold a live, unarchived worktree. Live means listed in Git's inventory now;
+/// an inventory failure, or one listing no worktrees, adopts nothing and the
+/// next start tries again.
+pub async fn adopt_explicit_sections(ctx: &AppContext) -> Result<bool> {
+    let live = ctx
+        .repository
+        .inventory(&ctx.cancellation)
+        .await?
+        .into_iter()
+        .filter(|row| !row.is_main)
+        .map(|row| row.target.slug().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    // An inventory with no worktrees is more likely a misread than a fleet
+    // with nothing in any section; adopting from it would drop every section
+    // for good. Leave the state alone and try again on the next start.
+    if live.is_empty() {
+        return Ok(false);
+    }
+    ctx.database
+        .call(move |store| {
+            let archived = store.read_archived_keys()?;
+            let live = live
+                .into_iter()
+                .filter(|slug| !archived.contains(slug))
+                .collect();
+            Ok(store.adopt_explicit_sections(&live)?)
+        })
+        .await
+}
+
 /// Move the displayed unit. Stack membership is always inferred from branches;
 /// only controller-owned order/section fields are persisted.
 pub async fn reorder(
@@ -141,9 +172,7 @@ pub async fn reorder(
         let order = board
             .sections
             .iter()
-            .filter(|group| {
-                group.key != wt_sources::board_layout::ARCHIVED && !group.rows.is_empty()
-            })
+            .filter(|group| group.key != wt_sources::board_layout::ARCHIVED && group.drawn())
             .map(|group| group.key.clone())
             .collect::<Vec<_>>();
         let current = order
@@ -284,12 +313,12 @@ pub async fn reorder(
                 .collect::<Vec<_>>()
         }
         .into_iter()
-        // Empty sections stay on the board for the picker but are not drawn,
-        // so a row only crosses into a section the user can see.
+        // A row only crosses into a section on screen: a named section even
+        // while empty, a derived group (the Inbox) only with rows.
         .find(|group| {
             group.key != wt_sources::board_layout::ARCHIVED
                 && !group.key.starts_with("\0stack:")
-                && !group.rows.is_empty()
+                && group.drawn()
         })
         .ok_or_else(|| {
             wt_app_core::host_errors::notice(if down {
@@ -322,6 +351,58 @@ pub async fn reorder(
     }
     // A swap within the section shows itself; no toast, as in TS.
     Ok(UiReply::default())
+}
+
+/// Delete a named section; its rows (live, archived and remote) return to
+/// the Inbox. `seen` is the sorted keys of the live rows the user saw in it,
+/// rechecked against stored placement inside the write.
+pub async fn delete(
+    ctx: &AppContext,
+    section: String,
+    seen: Seen<Vec<String>>,
+    board: Option<&wt_tui::Board>,
+) -> Result<UiReply> {
+    if section.starts_with('\0') {
+        bail!("This group is named by wt and cannot be deleted");
+    }
+    let board = board.context("worktree metadata is still loading")?;
+    let stale = |name: &str| {
+        wt_app_core::host_errors::stale(format!(
+            "{name} changed since you asked; look again before deleting it"
+        ))
+    };
+    if board.section_witness(&section) != seen.0 {
+        return Err(stale(&section));
+    }
+    // Under the write, the rows the user saw must still be filed there, and
+    // no other row the board shows as movable may have been filed since.
+    let movable = board
+        .rows
+        .iter()
+        .filter(|row| !row.archived && row.removal.is_none() && !row.pending_creation)
+        .map(|row| row.key.clone())
+        .collect::<Vec<_>>();
+    let name = section.clone();
+    let moved = ctx
+        .database
+        .call(move |store| {
+            let state = store.read_wt_state()?;
+            let mut current = movable
+                .into_iter()
+                .filter(|key| stored_section(&state, key).as_deref() == Some(name.as_str()))
+                .collect::<Vec<_>>();
+            current.sort();
+            if current != seen.0 {
+                return Err(stale(&name));
+            }
+            Ok(store.remove_section(&name)?)
+        })
+        .await?;
+    tracing::info!(%section, moved, "deleted section");
+    Ok(UiReply {
+        message: format!("Deleted section {section}"),
+        ..Default::default()
+    })
 }
 
 pub async fn rename(ctx: &AppContext, old: String, new: String) -> Result<UiReply> {
@@ -424,6 +505,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adoption_keeps_sections_of_listed_unarchived_worktrees() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.place_slug("one", Some("Live"), false)?;
+                store.place_slug("two", Some("Shelved"), false)?;
+                store.place_slug("gone", Some("Stale"), false)?;
+                store.set_archived("two", true)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(adopt_explicit_sections(&fixture.ctx).await.unwrap());
+        assert!(!adopt_explicit_sections(&fixture.ctx).await.unwrap());
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert_eq!(
+            state["sectionsOrder"],
+            serde_json::json!([wt_sources::board_layout::INBOX, "Live"])
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_a_section_that_changed_and_moves_rows_to_the_inbox() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.place_slug("one", Some("Batch"), false)?))
+            .await
+            .unwrap();
+        let facts = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let board =
+            wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
+        // The user saw Batch empty, but `one` is in it now.
+        let stale = delete(&fixture.ctx, "Batch".into(), Seen(vec![]), Some(&board)).await;
+        assert!(stale.is_err());
+        delete(
+            &fixture.ctx,
+            "Batch".into(),
+            Seen(vec!["one".into()]),
+            Some(&board),
+        )
+        .await
+        .unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(state["slugs"]["one"]["section"].is_null());
+        assert!(
+            !state["sectionsOrder"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "Batch")
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn reorder_swaps_only_same_rank_units_and_crosses_into_visible_sections() {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
@@ -484,11 +650,11 @@ mod tests {
             .await
             .is_err()
         );
-        // An empty section is kept on the board but never drawn, so moving
-        // down past the last row must not drop the row into it.
+        // An empty derived group is not drawn, so moving down past the last
+        // row skips it; an empty named section is on screen and takes the row.
         board.sections.push(wt_tui::BoardSection {
-            key: "Hidden".into(),
-            title: "Hidden".into(),
+            key: wt_sources::board_layout::REMOVING.into(),
+            title: "Removing".into(),
             ..Default::default()
         });
         assert!(
@@ -505,7 +671,6 @@ mod tests {
         board.sections.push(wt_tui::BoardSection {
             key: "Next".into(),
             title: "Next".into(),
-            rows: vec![first],
             ..Default::default()
         });
         reorder(
