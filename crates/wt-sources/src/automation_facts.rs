@@ -502,8 +502,19 @@ pub fn refresh_requirements(
     ctx: &AppContext,
     facts: &mut PreparedAutomationFacts,
     board: Option<&Board>,
+    queued: &[AutomationFire],
 ) {
-    let fires = evaluate(&ctx.config.automations, &facts.rows, &facts.context);
+    let mut fires = evaluate(&ctx.config.automations, &facts.rows, &facts.context);
+    // A queued fire the evaluation no longer produces (its worktree was
+    // removed after a merge, or is busy being removed) still needs a decision,
+    // or it would wait for one forever.
+    let current = fires.iter().map(fire_identity).collect::<BTreeSet<_>>();
+    fires.extend(
+        queued
+            .iter()
+            .filter(|fire| !current.contains(&fire_identity(fire)))
+            .cloned(),
+    );
     facts.requirements = fires
         .iter()
         .map(|fire| {
@@ -877,6 +888,50 @@ mod tests {
             requirement_state(&actions, None, &fire, &[], false, false, &BTreeSet::new()),
             RequirementState::Ready,
         );
+    }
+
+    #[tokio::test]
+    async fn a_queued_merge_whose_worktree_was_removed_still_gets_a_decision() {
+        // COZ-3199: cleanup razed the worktree inside the settle window, so
+        // the evaluation stopped producing the fire and it waited forever for
+        // a requirement decision.
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).actions = vec![wt_config::ActionDef {
+            id: "record-merge".into(),
+            requires: vec![wt_config::RequireTag::Pr],
+            external: true,
+            ..Default::default()
+        }];
+        let fire = AutomationFire {
+            rule: AutomationDef {
+                id: "in-review-on-merge".into(),
+                on: wt_config::AutomationTrigger::WtMerged,
+                run: "record-merge".into(),
+                ..Default::default()
+            },
+            slug: "removed".into(),
+            quiesce_slugs: vec![],
+            fire_keys: vec!["in-review-on-merge:merged:removed:3092".into()],
+            stack_id: None,
+            close_issue: None,
+            delete_branch: None,
+            delete_branch_pr: None,
+            branch_range: None,
+            frozen_vars: Some(BTreeMap::from([("pr".into(), "3092".into())])),
+            frozen_pr: None,
+            detail: String::new(),
+        };
+        let mut facts = PreparedAutomationFacts::default();
+        refresh_requirements(&fixture.ctx, &mut facts, None, &[]);
+        assert!(!facts.requirements.contains_key(&fire_identity(&fire)));
+        refresh_requirements(&fixture.ctx, &mut facts, None, std::slice::from_ref(&fire));
+        assert_eq!(
+            facts.requirements.get(&fire_identity(&fire)),
+            Some(&RequirementState::Ready)
+        );
+        fixture.close().await.unwrap();
     }
 
     #[test]

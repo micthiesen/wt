@@ -165,6 +165,16 @@ impl AutomationEngine {
         self.intents.len()
     }
 
+    /// The fires every retained intent carries, including frozen post-merge
+    /// intents whose worktree has gone. Their requirements are decided from
+    /// these, since the current evaluation no longer produces them.
+    pub fn retained_fires(&self) -> Vec<AutomationFire> {
+        self.intents
+            .values()
+            .map(|intent| intent.fire.clone())
+            .collect()
+    }
+
     /// The queue as of the latest pass, oldest first, without intents held
     /// only by unmet requirements (docs/automations.md does not count those).
     pub fn queued(&self) -> Vec<QueuedFire> {

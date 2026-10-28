@@ -11,7 +11,7 @@ use tokio::{
     sync::{mpsc, oneshot, watch},
     task::JoinSet,
 };
-use wt_automations::AutomationLedger;
+use wt_automations::{AutomationLedger, fire_identity};
 use wt_runtime::{Confirmed, LeafHandle, SourceHandle, SourceState, TaskScope, derived_channel};
 use wt_tui::Board;
 
@@ -369,8 +369,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 if let Some(seen) = persisted_tips.get(branch) { tip.seen = Some(seen.clone()); }
             }
             automation_facts::refresh_sessions(facts, confirmed_sessions.as_ref(), confirmed_inventory.as_ref());
-            if requirements_board_revision != Some(base_board.revision()) {
-                automation_facts::refresh_requirements(&context, facts, base_board.data().map(|board| &**board));
+            let queued = engine.retained_fires();
+            let undecided = queued.iter().any(|fire| !facts.requirements.contains_key(&fire_identity(fire)));
+            if undecided || requirements_board_revision != Some(base_board.revision()) {
+                automation_facts::refresh_requirements(&context, facts, base_board.data().map(|board| &**board), &queued);
                 requirements_board_revision = Some(base_board.revision());
             }
             facts.context.now_ms = now_ms();
