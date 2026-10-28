@@ -395,6 +395,11 @@ fn picker(
         picker.action,
         PickerAction::Status { .. } | PickerAction::Sessions { .. } | PickerAction::Harness { .. }
     );
+    // Empty sections trail the move-to-section list, muted under a header.
+    let recent = |option: &crate::PickerOption| {
+        matches!(picker.action, PickerAction::Section { .. })
+            && option.detail.as_deref() == Some(crate::menus::EMPTY_DETAIL)
+    };
 
     // Action palettes group their entries as `group: name`; the group
     // becomes a header and the entry keeps only its name.
@@ -404,6 +409,7 @@ fn picker(
     for (index, option) in picker.options.iter().enumerate() {
         let (group, label) = match option.label.split_once(": ").filter(|_| actions) {
             Some((group, label)) if !group.is_empty() => (Some(group), label),
+            _ if recent(option) => (Some("recent"), option.label.as_str()),
             _ => (None, option.label.as_str()),
         };
         // One blank before every group change except at the top; entries
@@ -584,11 +590,12 @@ fn picker(
                     let (glyph, color) = picker_glyph(&picker.action, option, primary);
                     spans.push(Span::styled(format!("{glyph}  "), theme::fg(color)));
                 }
-                let blocked = actions
-                    && option
-                        .detail
-                        .as_deref()
-                        .is_some_and(|detail| detail.starts_with('('));
+                let blocked = recent(option)
+                    || actions
+                        && option
+                            .detail
+                            .as_deref()
+                            .is_some_and(|detail| detail.starts_with('('));
                 let mut label = option_label(labels[*index], actions, selected);
                 if blocked {
                     for span in &mut label {
@@ -2791,6 +2798,37 @@ mod tests {
         assert!(text.contains("2 Landed"), "{text}");
         assert!(text.contains("n + new section"), "{text}");
         assert!(text.contains("letter / 1-9 quick pick"), "{text}");
+    }
+
+    #[test]
+    fn section_picker_mutes_empty_sections_under_a_recent_header() {
+        let option = |label: &str, detail: Option<&str>| PickerOption {
+            value: Some(label.into()),
+            label: label.into(),
+            chord: None,
+            note: None,
+            verify_after_merge: None,
+            detail: detail.map(str::to_owned),
+        };
+        let mut model = Model {
+            interaction: Interaction::Picker(PickerPrompt {
+                action: PickerAction::Section {
+                    key: "one".into(),
+                    seen: None,
+                },
+                title: "section".into(),
+                options: vec![
+                    option("Busy", None),
+                    option("Old Wave", Some(crate::menus::EMPTY_DETAIL)),
+                ],
+                selected: 0,
+            }),
+            ..Model::default()
+        };
+        let text = rows(&draw(&mut model, 100, 30)).join("\n");
+        let header = text.find("recent").expect(&text);
+        assert!(text.find("Busy").unwrap() < header, "{text}");
+        assert!(header < text.find("Old Wave").unwrap(), "{text}");
     }
 
     #[test]

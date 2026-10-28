@@ -22,7 +22,7 @@ mod github;
 pub(crate) mod sessions;
 
 pub use confirms::new_worktree_prompt;
-pub(crate) use section::NEW_SECTION;
+pub(crate) use section::{EMPTY_DETAIL, NEW_SECTION};
 
 use crate::{Board, SessionTarget, UiAction, UiModal};
 

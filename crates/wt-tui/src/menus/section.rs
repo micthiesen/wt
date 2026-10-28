@@ -8,6 +8,12 @@ use crate::{Board, PickerAction, PickerOption, Seen, UiModal};
 /// derived groups, so no real section can collide with it.
 pub(crate) const NEW_SECTION: &str = "\0new-section";
 
+/// How many empty sections stay offered after the occupied ones.
+const RECENT_EMPTY: usize = 5;
+
+/// Detail on an empty section's row; the picker mutes these under "recent".
+pub(crate) const EMPTY_DETAIL: &str = "empty";
+
 pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
     let Some(index) = board.rows.iter().position(|row| row.key == key) else {
         return LocalMenu::Notice("worktree is no longer on the board".into());
@@ -17,17 +23,21 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
         return LocalMenu::Notice("Restore the archived row before moving it to a section".into());
     }
     let current = current_section(board, index);
-    // TS order: the Inbox (only when the row is in a section), every other
-    // manual section, then the "+ new section" row on its `n` chord.
+    // The Inbox (only when the row is in a section), the sections that hold
+    // live rows in board order, "+ new section" on its `n` chord, then a few
+    // recently created empty sections, muted.
     let mut options = Vec::new();
     if current.is_some() {
         options.push(option(None, "Inbox".into(), None));
     }
+    let (occupied, empty): (Vec<&String>, Vec<&String>) = board
+        .section_order
+        .iter()
+        .filter(|name| Some(name.as_str()) != current.as_deref())
+        .partition(|name| live_rows(board, name) > 0);
     options.extend(
-        board
-            .section_order
-            .iter()
-            .filter(|name| Some(name.as_str()) != current.as_deref())
+        occupied
+            .into_iter()
             .map(|name| option(Some(name.clone()), name.clone(), None)),
     );
     options.push(option(
@@ -35,6 +45,12 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
         "+ new section".into(),
         Some('n'),
     ));
+    // Sections are appended on creation, so the newest empty ones are last.
+    options.extend(empty.into_iter().rev().take(RECENT_EMPTY).map(|name| {
+        let mut recent = option(Some(name.clone()), name.clone(), None);
+        recent.detail = Some(EMPTY_DETAIL.into());
+        recent
+    }));
     LocalMenu::modal(UiModal::Picker {
         action: PickerAction::Section {
             key: key.to_owned(),
@@ -44,6 +60,17 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
         options,
         selected: 0,
     })
+}
+
+/// Rows still on the board (not archived) filed under `name`.
+fn live_rows(board: &Board, name: &str) -> usize {
+    board
+        .sections
+        .iter()
+        .filter(|section| section.key == name)
+        .flat_map(|section| &section.rows)
+        .filter(|&&row| board.rows.get(row).is_some_and(|row| !row.archived))
+        .count()
 }
 
 /// The section a row is filed under, or `None` for the Inbox. Derived groups
@@ -74,10 +101,12 @@ mod tests {
     use super::*;
     use crate::{BoardRow, BoardSection};
 
+    /// Row `one` sits in `placed_in` (or the Inbox), `two` is live in Busy,
+    /// `three` is archived in Shipped, and E1..E6 are empty, oldest first.
     fn board(archived: bool, placed_in: Option<&str>) -> Board {
-        let row = BoardRow {
-            key: "one".into(),
-            slug: "one".into(),
+        let row = |key: &str, archived: bool| BoardRow {
+            key: key.into(),
+            slug: key.into(),
             archived,
             ..Default::default()
         };
@@ -87,18 +116,27 @@ mod tests {
             rows,
             ..Default::default()
         };
+        let mut sections = vec![section("Busy", vec![1]), section("Shipped", vec![2])];
+        let mut section_order = vec!["Busy".to_owned(), "Shipped".to_owned()];
+        match placed_in {
+            Some(name) => {
+                sections.insert(0, section("\0inbox", vec![]));
+                sections.push(section(name, vec![0]));
+                section_order.push(name.into());
+            }
+            None => sections.insert(0, section("\0inbox", vec![0])),
+        }
+        section_order.extend((1..=6).map(|n| format!("E{n}")));
         Board {
-            rows: vec![row],
-            sections: match placed_in {
-                Some(name) => vec![section("\0inbox", vec![]), section(name, vec![0])],
-                None => vec![section("\0inbox", vec![0])],
-            },
-            section_order: vec!["Review".into(), "Next".into()],
+            rows: vec![row("one", archived), row("two", false), row("three", true)],
+            sections,
+            section_order,
             ..Default::default()
         }
     }
 
-    type Choice = (Option<String>, String, Option<char>);
+    /// Value, label, chord, and whether the row is a muted recent section.
+    type Choice = (Option<String>, String, Option<char>, bool);
 
     fn picker(menu: LocalMenu) -> (PickerAction, Vec<Choice>, String) {
         let LocalMenu::Modal { modal, .. } = menu else {
@@ -117,9 +155,25 @@ mod tests {
             action,
             options
                 .into_iter()
-                .map(|option| (option.value, option.label, option.chord))
+                .map(|option| {
+                    let recent = option.detail.as_deref() == Some(EMPTY_DETAIL);
+                    (option.value, option.label, option.chord, recent)
+                })
                 .collect(),
             title,
+        )
+    }
+
+    fn named(name: &str, recent: bool) -> Choice {
+        (Some(name.into()), name.into(), None, recent)
+    }
+
+    fn new_section() -> Choice {
+        (
+            Some(NEW_SECTION.into()),
+            "+ new section".into(),
+            Some('n'),
+            false,
         )
     }
 
@@ -136,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn inbox_row_lists_every_section_and_witnesses_the_inbox() {
+    fn inbox_row_lists_occupied_sections_then_five_recent_empty_ones() {
         let (action, options, title) = picker(menu(&board(false, None), "one"));
         assert_eq!(title, "Move one to section · n new");
         assert_eq!(
@@ -146,12 +200,18 @@ mod tests {
                 seen: Some(Seen(None)),
             }
         );
+        // Shipped holds only an archived row, so it counts as empty and is
+        // the oldest; the cap drops it along with E1.
         assert_eq!(
             options,
             [
-                (Some("Review".into()), "Review".into(), None),
-                (Some("Next".into()), "Next".into(), None),
-                (Some(NEW_SECTION.into()), "+ new section".into(), Some('n')),
+                named("Busy", false),
+                new_section(),
+                named("E6", true),
+                named("E5", true),
+                named("E4", true),
+                named("E3", true),
+                named("E2", true),
             ]
         );
     }
@@ -167,13 +227,14 @@ mod tests {
             }
         );
         assert_eq!(
-            options,
+            options[..3],
             [
-                (None, "Inbox".into(), None),
-                (Some("Next".into()), "Next".into(), None),
-                (Some(NEW_SECTION.into()), "+ new section".into(), Some('n')),
+                (None, "Inbox".into(), None, false),
+                named("Busy", false),
+                new_section()
             ]
         );
+        assert!(!options.iter().any(|option| option.1 == "Review"));
     }
 
     #[test]
