@@ -58,7 +58,8 @@ pub enum DevCommand {
     /// Show recent supervisor output.
     Logs {
         slug: Option<String>,
-        #[arg(long, default_value_t = 200)]
+        /// How many trailing lines to show.
+        #[arg(long, short = 'n', visible_alias = "tail", default_value_t = 200)]
         lines: u32,
     },
 }
@@ -213,7 +214,12 @@ async fn run_start(
                 break outcome;
             }
             Err(wt_dev::DevServerError::SlotFull { .. }) if wait => continue,
-            Err(wt_dev::DevServerError::SlotFull { .. }) => return Ok(SLOT_FULL),
+            Err(error @ wt_dev::DevServerError::SlotFull { .. }) => {
+                eprintln!(
+                    "{error}. Run `wt dev start --wait` to queue; do not stop another worktree's server."
+                );
+                return Ok(SLOT_FULL);
+            }
             Err(error) => {
                 if wait {
                     service.clear_waiter(&worktree.slug).await?;

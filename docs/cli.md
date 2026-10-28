@@ -89,7 +89,7 @@ Issue-id input resolves like this:
 - `--open` / `--no-open` — open in the configured editor after creation (default: open when interactive).
 - `--no-install` — skip the package-install step. Ignored under the `rift` backend, which copies packages via its clone.
 
-If the branch already has a worktree, prints its path instead of erroring. A dirty main clone never blocks creation: the `rift` backend's CoW clone copies the main clone's uncommitted changes, and the post-clone branch switch discards them in the copy (`--discard-changes` — the main clone itself is never touched). Any create failure surfaces its reason on the CLI and the TUI attention feed instead of a row silently vanishing.
+If the branch already has a worktree, prints its path instead of erroring. A dirty main clone never blocks creation: the `rift` backend's CoW clone copies the main clone's uncommitted changes, and the post-clone branch switch discards them in the copy (`--discard-changes` — the main clone itself is never touched). Like `git worktree add --no-track`, the switch creates the branch with no upstream, so a first `git push` cannot target the trunk. Any create failure surfaces its reason on the CLI and the TUI attention feed instead of a row silently vanishing.
 
 Creation also sets `branch.<name>.gh-merge-base` to the branch's real merge target (its fork base; the trunk for plain worktrees, the parent for stacked ones). `gh pr create` consults that config **before** the repository's default branch, so a bare `gh pr create` opens against the right base even in repos whose GitHub default branch isn't the integration branch — without it, agents were opening PRs against the default (the harness's own context hints them there), burning CI and review passes on a 100-file diff of other people's code. `wt doctor` checks the config against the recorded base to catch worktrees created before this or left stale by a reparent.
 
@@ -227,7 +227,7 @@ If `stop_command` fails, `stop` exits 1 instead of claiming the entire environme
 Flags:
 
 - `start --rebuild` — reset the project state (as `reset` does) and then start, instead of a plain start.
-- `logs --lines <n>` — number of lines to print (default 200, clamped to 1-5000).
+- `logs --lines <n>` (also `-n`, `--tail`) — number of lines to print (default 200, clamped to 1-5000).
 - `start --wait [--timeout <secs>]` — when `[dev_server] max_concurrent` is set and the fleet is full, queue until a slot opens instead of refusing. Default timeout 1800s; on expiry it exits `75` like a plain refusal. While queued the slug shows in `wt dev status --all` and on its own board row, so a waiting agent doesn't read as a stalled one.
 - `status --all` — the fleet view: slots in use against the cap, every dev server and whether it's up or crashed, the queue with ages and tiers, and the machine's **1-minute load against its core count**. Works from anywhere; it needs no subject worktree. The load line is there because slots ration *stacks*, not load: a test run, a build or a type-check is neither queued nor counted, so every slot can read healthy on a box that is far past capacity (observed: 3 of 4 slots in use at load 84.9 on 12 cores). Past 2× cores it says so, and points at `wt perf` — a test timing out on a saturated box is measuring the box.
 - `queue` — print the wait queue. `queue <slug> --first` moves a waiter ahead of every ordinary one; `queue <slug> --normal` gives its place back. See below.

@@ -1799,7 +1799,14 @@ impl LifecycleService {
                     Some(_) if base_source.is_some() => {
                         self.run_git(
                             path,
-                            ["switch", "--discard-changes", "-c", branch, "FETCH_HEAD"],
+                            [
+                                "switch",
+                                "--discard-changes",
+                                "--no-track",
+                                "-c",
+                                branch,
+                                "FETCH_HEAD",
+                            ],
                             cancellation,
                             "create branch in Rift clone",
                         )
@@ -1808,7 +1815,14 @@ impl LifecycleService {
                     Some(base) => {
                         self.run_git(
                             path,
-                            ["switch", "--discard-changes", "-c", branch, base],
+                            [
+                                "switch",
+                                "--discard-changes",
+                                "--no-track",
+                                "-c",
+                                branch,
+                                base,
+                            ],
                             cancellation,
                             "create branch in Rift clone",
                         )

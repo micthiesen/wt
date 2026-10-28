@@ -23,28 +23,45 @@ const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, 
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StatusArgs {
+    /// Optional worktree slug or branch (default: current worktree) and/or a
+    /// state; a unique prefix works, `nh` and `nt` are aliases. Bare shows the
+    /// status or, outside a worktree, the vocabulary.
     #[arg(value_name = "TARGET_OR_STATE", num_args = 0..=2)]
     pub positionals: Vec<String>,
+    /// Note for the assertion; replaces the existing note (the old one is echoed back).
     #[arg(short = 'm', long = "note", allow_hyphen_values = true)]
     pub note: Option<String>,
+    /// Rewrite only the note of the current status, leaving state and timestamp.
     #[arg(long, allow_hyphen_values = true)]
     pub note_only: Option<String>,
+    /// Confidence after testing: low, medium or high (required for `ready`).
+    /// Without a state, re-judges the risk alone.
     #[arg(long, value_name = "RISK")]
     pub risk: Option<String>,
+    /// External gate that must happen before merging (for `ready` or `todo`).
     #[arg(long, allow_hyphen_values = true)]
     pub blocked_on: Option<String>,
+    /// Numbered steps for a check only the deployed environment can prove;
+    /// returns the worktree as needs-testing after merge. Without a state,
+    /// amends in place.
     #[arg(long, allow_hyphen_values = true)]
     pub verify_after_merge: Option<String>,
+    /// Record that you examined this row and your verdict, without changing its status.
     #[arg(long, allow_hyphen_values = true)]
     pub examined: Option<String>,
+    /// Clear the `--blocked-on` gate, keeping state, risk and note.
     #[arg(long)]
     pub unblock: bool,
+    /// Add to the existing note instead of replacing it (with `-m` or `--note-only`).
     #[arg(long)]
     pub append: bool,
+    /// Drop the status record.
     #[arg(long)]
     pub clear: bool,
+    /// Print the fleet overview of every worktree's status.
     #[arg(long)]
     pub all: bool,
+    /// Print machine-readable JSON (with `--all` or a show).
     #[arg(long)]
     pub json: bool,
 }

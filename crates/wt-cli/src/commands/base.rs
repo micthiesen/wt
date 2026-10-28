@@ -9,6 +9,8 @@ const USAGE: &str = "usage: wt base <slug>                 show the recorded for
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct BaseArgs {
+    /// `<slug>` shows the recorded fork base; `set <slug> <ref>` records <ref>
+    /// as the base; `clear <slug>` returns to trunk, keeping the replay anchor.
     #[arg(value_name = "ARG", num_args = 0..)]
     pub positionals: Vec<String>,
 }

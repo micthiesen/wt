@@ -27,16 +27,23 @@ pub struct HoldArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum HoldCommand {
+    /// Record a transient hold on a resource; prints JSON including its ID.
     Set {
+        /// Resource being held, e.g. `browser:19989`.
         resource: String,
+        /// The affected operations, e.g. 'browser execution during restart'.
         #[arg(long)]
         scope: String,
+        /// Original event time, RFC 3339 UTC (e.g. 2026-10-02T18:40:00Z); not in the future.
         #[arg(long = "at")]
         event_at: String,
+        /// Expiry, RFC 3339 UTC; after `--at` and at most one hour later.
         #[arg(long)]
         until: String,
+        /// Holder name (default: `WT_AGENT`; required outside an agent).
         #[arg(long)]
         owner: Option<String>,
+        /// Why, including the release condition.
         #[arg(trailing_var_arg = true, required = true)]
         reason: Vec<String>,
     },

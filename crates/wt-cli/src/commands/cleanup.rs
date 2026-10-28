@@ -9,14 +9,19 @@ use wt_ops::{commands::resolve::run_git, lifecycle_ops};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct CleanupArgs {
+    /// Skip confirmation (required when not interactive).
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Destroy the SST stage of every candidate (default: per worktree, iff its stage is live).
     #[arg(long, conflicts_with = "no_destroy_stage")]
     pub destroy_stage: bool,
+    /// Keep the SST stage of every candidate.
     #[arg(long, conflicts_with = "destroy_stage")]
     pub no_destroy_stage: bool,
+    /// Run removals synchronously (background is the default).
     #[arg(long)]
     pub foreground: bool,
+    /// Dispatch removals as background jobs (the default).
     #[arg(long, conflicts_with = "foreground")]
     pub background: bool,
 }

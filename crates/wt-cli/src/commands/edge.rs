@@ -20,16 +20,22 @@ use wt_ops::commands::resolve::{resolve_named_worktree, run_git};
 pub struct EdgeArgs {
     #[command(subcommand)]
     pub command: Option<EdgeCommand>,
+    /// Worktree slug or branch that merges first; omit all three to list edges.
     #[arg(value_name = "FROM")]
     pub from: Option<String>,
+    /// `before`, `enables` or `conflicts` (unique prefixes accepted).
     #[arg(value_name = "KIND")]
     pub kind: Option<String>,
+    /// Worktree slug or branch that merges after FROM.
     #[arg(value_name = "TO")]
     pub to: Option<String>,
+    /// Mark the edge as a hard dependency (unsafe to violate).
     #[arg(long, global = true, conflicts_with = "prefer")]
     pub blocks: bool,
+    /// Mark the edge as a preference (the default; safe to violate).
     #[arg(long, global = true, conflicts_with = "blocks")]
     pub prefer: bool,
+    /// Why the edge exists.
     #[arg(
         short = 'm',
         long = "message",
@@ -37,14 +43,22 @@ pub struct EdgeArgs {
         allow_hyphen_values = true
     )]
     pub message: Option<String>,
+    /// Print machine-readable JSON.
     #[arg(long, global = true)]
     pub json: bool,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum EdgeCommand {
+    /// Drop every edge whose endpoint is no longer a live worktree.
     Prune,
-    Rm { from: String, to: String },
+    /// Drop the edge from FROM to TO (edges are ordered pairs).
+    Rm {
+        /// Slug or branch of the earlier endpoint.
+        from: String,
+        /// Slug or branch of the later endpoint.
+        to: String,
+    },
 }
 
 pub async fn run(ctx: &AppContext, args: &EdgeArgs) -> Result<i32> {

@@ -25,10 +25,17 @@ pub enum SectionCommand {
         #[arg(long)]
         json: bool,
     },
-    #[command(alias = "move")]
+    /// Move worktrees' whole stacks to a section (created if new).
+    #[command(
+        alias = "move",
+        override_usage = "wt section mv [OPTIONS] <SLUG>... <SECTION>"
+    )]
     Mv {
-        #[arg(required = true, num_args = 2..)]
+        /// One or more worktree slugs, then the target section last (matched
+        /// case-insensitively); `-` means the inbox.
+        #[arg(required = true, num_args = 2.., value_names = ["SLUG", "SECTION"])]
         positionals: Vec<String>,
+        /// Move only the named worktrees, not their whole stacks.
         #[arg(long)]
         only: bool,
     },

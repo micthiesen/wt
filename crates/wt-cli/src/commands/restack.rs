@@ -11,7 +11,9 @@ use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RestackArgs {
-    /// Worktree branch; defaults to the branch checked out in the current directory.
+    /// Worktree branch; defaults to the branch checked out in the current
+    /// directory. `prune-backups [--days <n>]` instead deletes old restack
+    /// backup branches.
     #[arg(value_name = "BRANCH")]
     pub branch: Option<String>,
     /// Rebase the selected stack onto a different target ref.

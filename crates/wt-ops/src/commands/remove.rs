@@ -10,20 +10,30 @@ use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct RemoveArgs {
+    /// Worktree slug or branch; omit to pick interactively (needs a TTY).
     #[arg(value_name = "SLUG")]
     pub slug: Option<String>,
+    /// Skip confirmations.
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Discard work that would otherwise block removal: uncommitted or
+    /// unpushed work, a stopped rebase/merge/cherry-pick, or an outstanding
+    /// post-merge verification.
     #[arg(long)]
     pub force: bool,
+    /// Destroy the SST stage (default: prompt when it looks deployed).
     #[arg(long, conflicts_with = "no_destroy_stage")]
     pub destroy_stage: bool,
+    /// Keep the SST stage (default: prompt when it looks deployed).
     #[arg(long, conflicts_with = "destroy_stage")]
     pub no_destroy_stage: bool,
+    /// Delete the branch; already the default, so this changes nothing.
     #[arg(long, conflicts_with = "keep_branch")]
     pub delete_branch: bool,
+    /// Keep the branch instead of deleting it.
     #[arg(long, conflicts_with = "delete_branch")]
     pub keep_branch: bool,
+    /// Remove as a background job (watch with `wt logs <slug>`).
     #[arg(short = 'b', long)]
     pub background: bool,
 }

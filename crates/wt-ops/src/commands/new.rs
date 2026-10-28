@@ -14,22 +14,32 @@ const USAGE: &str = "usage: wt new <id [title…]|url|branch|slug> [--slug s] [-
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct NewArgs {
+    /// `<ID> [title words…]`, a tracker URL, an existing branch, or a slug.
+    /// Pass the bare id, not a URL followed by words.
     #[arg(value_name = "INPUT", num_args = 0..)]
     pub positionals: Vec<String>,
+    /// Explicit slug for an issue id (instead of inline title words).
     #[arg(long, value_name = "SLUG")]
     pub slug: Option<String>,
+    /// Attach GitHub issue #N as the worktree's secondary id.
     #[arg(long, value_name = "N")]
     pub gh: Option<u64>,
+    /// With --attach, match branches by any author.
     #[arg(long, requires = "attach")]
     pub any: bool,
+    /// Check out the id's existing branch instead of minting a new one.
     #[arg(long)]
     pub attach: bool,
+    /// Stack on this branch or ref instead of the trunk (recorded as the fork base).
     #[arg(long, value_name = "REF")]
     pub base: Option<String>,
+    /// Open in the configured editor after creation.
     #[arg(long, conflicts_with = "no_open")]
     pub open: bool,
+    /// Do not open in the editor.
     #[arg(long, conflicts_with = "open")]
     pub no_open: bool,
+    /// Skip the package-install step.
     #[arg(long)]
     pub no_install: bool,
 }
@@ -241,7 +251,7 @@ pub async fn parse_branch(
                 .and_then(|tracker| tracker.prefix.as_deref())
                 .unwrap_or_default();
             return Err(format!(
-                "{id} can't lead a worktree ([issue_tracker] prefix = \"{required}\"). Use `wt new {required}-NNNN …`, an issue-less slug, or --attach for an existing branch."
+                "{id} can't lead a worktree ([issue_tracker] prefix = \"{required}\"). Use `wt new {required}-NNNN …`, an issue-less slug, or --attach for an existing branch. To link a GitHub issue, use an issue-less slug with `--gh <n>`."
             ));
         }
         let title = args
