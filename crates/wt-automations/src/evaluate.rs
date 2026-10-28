@@ -318,7 +318,10 @@ fn evaluate_merged(
     if row.local_merged != Some(true) && row.gone != Some(true) && !pr_done {
         return None;
     }
-    if !row.clean_candidate {
+    // Clean safety gates actions on the checkout. An external action (a
+    // tracker update) is about the landing alone, and a merged PR is proof of
+    // that even when the worktree is retained, e.g. for an owed check.
+    if !row.clean_candidate && !(external && pr_done) {
         return None;
     }
     let landed = if pr_done {
@@ -782,6 +785,37 @@ mod tests {
         assert_eq!(fires[0].close_issue, Some(19));
         assert!(fires[0].quiesce_slugs.is_empty());
         assert_eq!(fires[1].frozen_vars.as_ref().unwrap()["issue_id"], "WK-1");
+    }
+
+    #[test]
+    fn merged_pr_fires_external_actions_for_a_retained_worktree() {
+        let mut row = row();
+        row.pr.as_mut().unwrap().state = "MERGED".into();
+        // Retained: an owed post-merge check keeps it from being cleanable.
+        row.clean_candidate = false;
+        let mut context = AutomationEvalContext {
+            github_fresh: true,
+            ..AutomationEvalContext::default()
+        };
+        context.actions.insert(
+            "tracker".into(),
+            crate::types::ActionTraits {
+                shell: true,
+                external: true,
+                ..Default::default()
+            },
+        );
+        let rules = [
+            rule("close", AutomationTrigger::WtMerged, "builtin:close-issue"),
+            rule("track", AutomationTrigger::WtMerged, "tracker"),
+        ];
+        let fires = evaluate(&rules, std::slice::from_ref(&row), &context);
+        assert_eq!(fires.len(), 1, "only the external action fires");
+        assert_eq!(fires[0].rule.id, "track");
+        assert_eq!(fires[0].fire_keys[0], "track:merged:feature-1:42");
+        // Without GitHub's word the landing is unproven for a retained row.
+        context.github_fresh = false;
+        assert!(evaluate(&rules, &[row], &context).is_empty());
     }
 
     #[test]

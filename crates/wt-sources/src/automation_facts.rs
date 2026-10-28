@@ -679,9 +679,32 @@ fn requirement_state(
             fire.rule.run
         ));
     };
+    // A branch advance targets the fleet, not a worktree row; dispatch runs
+    // it against an empty row, so judge its requirements the same way.
+    if fire.branch_range.is_some() {
+        return match wt_actions::evaluate_requirements(
+            &definition.requires,
+            &wt_actions::ActionRow::default(),
+        ) {
+            Some(reason) => RequirementState::FrozenUnmet(reason),
+            None => RequirementState::Ready,
+        };
+    }
     let Some(row) = rows.iter().find(|row| row.slug == fire.slug) else {
-        return if fire.frozen_vars.is_some() {
-            RequirementState::Ready
+        return if let Some(vars) = &fire.frozen_vars {
+            // Dispatch trusts the frozen variables, so a PR requirement needs
+            // the PR number captured before the worktree went away.
+            let needs_pr = definition.requires.iter().any(|tag| {
+                matches!(
+                    tag,
+                    wt_config::RequireTag::Pr | wt_config::RequireTag::PrReady
+                )
+            });
+            if needs_pr && vars.get("pr").is_none_or(String::is_empty) {
+                RequirementState::FrozenUnmet("no PR was observed before removal".into())
+            } else {
+                RequirementState::Ready
+            }
         } else {
             RequirementState::FrozenUnmet("worktree is no longer available".into())
         };
@@ -704,7 +727,17 @@ fn requirement_state(
         pr_number: row.pr.as_ref().map(|pr| pr.number.to_string()),
         deployed,
     };
+    // GitHub not yet confirming this row says nothing about its PR, so a
+    // PR requirement waits for the next fetch instead of skipping the fire.
+    let pr_unknown = matches!(action_row.pr, wt_actions::ActionPrObservation::Unknown)
+        && definition.requires.iter().any(|tag| {
+            matches!(
+                tag,
+                wt_config::RequireTag::Pr | wt_config::RequireTag::PrReady
+            )
+        });
     match wt_actions::evaluate_requirements(&definition.requires, &action_row) {
+        Some(_) if pr_unknown => RequirementState::Waiting,
         Some(reason) if fire.frozen_vars.is_some() => RequirementState::FrozenUnmet(reason),
         Some(_) => RequirementState::Waiting,
         None => RequirementState::Ready,
@@ -816,6 +849,74 @@ mod tests {
         fire.frozen_vars = Some(BTreeMap::new());
         assert!(matches!(
             requirement_state(&actions, None, &fire, &rows, false, false, &BTreeSet::new(),),
+            RequirementState::FrozenUnmet(_)
+        ));
+        // A merge seen before GitHub confirms the row's PR waits for it; the
+        // same fire with GitHub confirming no PR is a final skip.
+        let actions = [wt_config::ActionDef {
+            id: fire.rule.run.clone(),
+            requires: vec![wt_config::RequireTag::Pr],
+            ..Default::default()
+        }];
+        assert_eq!(
+            requirement_state(&actions, None, &fire, &rows, false, false, &BTreeSet::new()),
+            RequirementState::Waiting,
+        );
+        let covered = BTreeSet::from([rows[0].branch.clone()]);
+        assert!(matches!(
+            requirement_state(&actions, None, &fire, &rows, false, true, &covered),
+            RequirementState::FrozenUnmet(_)
+        ));
+        // Once the worktree is gone, only a captured PR number lets it run.
+        assert!(matches!(
+            requirement_state(&actions, None, &fire, &[], false, false, &BTreeSet::new()),
+            RequirementState::FrozenUnmet(_)
+        ));
+        fire.frozen_vars = Some(BTreeMap::from([("pr".into(), "3056".into())]));
+        assert_eq!(
+            requirement_state(&actions, None, &fire, &[], false, false, &BTreeSet::new()),
+            RequirementState::Ready,
+        );
+    }
+
+    #[test]
+    fn a_branch_advance_runs_its_action_without_a_worktree_row() {
+        let fire = AutomationFire {
+            rule: AutomationDef {
+                id: "complete-on-release".into(),
+                on: wt_config::AutomationTrigger::BranchAdvanced,
+                run: "release".into(),
+                branch: Some("main".into()),
+                ..Default::default()
+            },
+            slug: wt_automations::FLEET_SLUG.into(),
+            quiesce_slugs: vec![],
+            fire_keys: vec![],
+            stack_id: None,
+            close_issue: None,
+            delete_branch: None,
+            delete_branch_pr: None,
+            branch_range: Some(wt_automations::BranchRange {
+                branch: "main".into(),
+                from: "a".repeat(40),
+                to: "b".repeat(40),
+            }),
+            frozen_vars: None,
+            frozen_pr: None,
+            detail: String::new(),
+        };
+        let mut actions = [wt_config::ActionDef {
+            id: "release".into(),
+            ..Default::default()
+        }];
+        assert_eq!(
+            requirement_state(&actions, None, &fire, &[], false, false, &BTreeSet::new()),
+            RequirementState::Ready,
+        );
+        // A row requirement can never hold for the fleet: skip, do not wait.
+        actions[0].requires = vec![wt_config::RequireTag::IssueTracker];
+        assert!(matches!(
+            requirement_state(&actions, None, &fire, &[], false, false, &BTreeSet::new()),
             RequirementState::FrozenUnmet(_)
         ));
     }
