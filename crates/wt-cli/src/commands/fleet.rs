@@ -17,6 +17,12 @@ use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct FleetArgs {
+    /// Print one object per worktree: kind (live, merged, removed), slug,
+    /// branch, path, base, section, work (state, risk, note, blockedOn,
+    /// verifyAfterMerge), edges, dirty, session, merge_queue, and pr (number,
+    /// draft, checks, mergeable, merge_state, review_bot {state, unresolved,
+    /// stale}, unresolved_threads, unresolved_human_threads). pr is null with
+    /// pr_note set when GitHub is unreachable.
     #[arg(long)]
     pub json: bool,
 }

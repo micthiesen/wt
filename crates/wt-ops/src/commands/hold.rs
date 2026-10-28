@@ -56,7 +56,9 @@ pub enum HoldCommand {
         #[arg(trailing_var_arg = true, required = true)]
         reason: Vec<String>,
     },
+    /// Report whether a hold is active; honor it only on `active: true`.
     Check {
+        /// The hold ID printed by `wt hold set`.
         id: String,
     },
     Status {

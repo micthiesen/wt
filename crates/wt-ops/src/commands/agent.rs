@@ -44,7 +44,10 @@ pub enum AgentCommand {
         text: Vec<String>,
     },
     /// Start an agent using the bundled start skill prompt.
-    Start { target: String },
+    Start {
+        /// Worktree slug or branch.
+        target: String,
+    },
 }
 
 pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {

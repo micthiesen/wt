@@ -4,7 +4,6 @@ description: >-
   Starts work on the task this wt worktree is for: reads the prompt.txt brief
   and linked issues, then implements, reviews, tests, and hands off with a
   `wt status`. Use when the user or wt invokes /start or $start.
-disable-model-invocation: true
 targets:
   - '*'
 argument-hint: "[optional task context or extra instructions, e.g. a pasted task description]"

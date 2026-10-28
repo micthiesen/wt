@@ -4,7 +4,6 @@ description: >-
   Tiers a pasted batch of tracker tasks, creates worktrees for the approved
   batch, or reviews a batch in flight. Start with /triage <tasks> | review |
   create <tier>.
-disable-model-invocation: true
 targets:
   - '*'
 argument-hint: "<pasted tasks: ids + titles/descriptions> | review | create <which tier(s)>"

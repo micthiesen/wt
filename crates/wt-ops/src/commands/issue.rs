@@ -9,18 +9,25 @@ use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct IssueArgs {
+    /// Worktree slug or branch; defaults to the current worktree for reads.
     #[arg(value_name = "SLUG_OR_BRANCH")]
     pub target: Option<String>,
+    /// Override the primary tracker id parsed from the slug.
     #[arg(long, value_name = "ID", conflicts_with_all = ["no_id", "clear_id", "clear_gh", "gh", "read"])]
     pub id: Option<String>,
+    /// Record that this worktree has no tracker issue.
     #[arg(long, conflicts_with_all = ["id", "clear_id", "clear_gh", "gh", "read"])]
     pub no_id: bool,
+    /// Drop the override and return to the id parsed from the slug.
     #[arg(long, conflicts_with_all = ["id", "no_id", "clear_gh", "gh", "read"])]
     pub clear_id: bool,
+    /// Attach GitHub issue #N as the secondary id.
     #[arg(long, value_name = "N", conflicts_with_all = ["id", "no_id", "clear_id", "clear_gh", "read"])]
     pub gh: Option<u64>,
+    /// Detach the GitHub issue.
     #[arg(long, conflicts_with_all = ["id", "no_id", "clear_id", "gh", "read"])]
     pub clear_gh: bool,
+    /// Print the attached task's title and description.
     #[arg(long, conflicts_with_all = ["id", "no_id", "clear_id", "gh", "clear_gh"])]
     pub read: bool,
 }

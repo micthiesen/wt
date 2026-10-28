@@ -192,6 +192,11 @@ enum Command {
     /// Show or record the worktree's change guide (`[guides] enabled`).
     Guide(commands::guide::GuideArgs),
     /// Arm merge-when-ready or cancel the PR's actual merge state.
+    ///
+    /// Chooses the merge queue or classic auto-merge from the PR's base
+    /// branch, so pending checks are fine. Armed is final: GitHub merges once
+    /// requirements are met; do not watch it or merge again. Exit 75 means a
+    /// required check has not reported yet: wait and re-run.
     Merge(commands::merge::MergeArgs),
     /// Open a worktree in the configured editor.
     Open(commands::open::OpenArgs),

@@ -12,6 +12,9 @@ const STALE_AFTER_MS: i64 = 3 * 60 * 1000;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct AutomationsArgs {
+    /// Print the engine's raw report: pid, paused, error, and queued runs
+    /// (rule, target, detail, waiting_for). Rules and triggers are configured
+    /// under `[[automations]]`; see docs/automations.md.
     #[arg(long)]
     pub json: bool,
 }
