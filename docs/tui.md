@@ -260,7 +260,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` ready with verification, `x` clears, `m` edits the note) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
 | `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists sections holding live rows first, then the five newest empty ones, muted under "recent" |
-| `J` / `K` | Reorder the selected row, stack, or folded group; the cursor follows the row across sections |
+| `J` / `K` | Reorder the selected row, stack, or folded group; the cursor follows the row across sections, skipping empty ones |
 | `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
 | `h` | Open removed-worktree history |

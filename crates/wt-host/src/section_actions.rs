@@ -284,8 +284,12 @@ pub async fn reorder(
                 .collect::<Vec<_>>()
         }
         .into_iter()
+        // Empty sections stay on the board for the picker but are not drawn,
+        // so a row only crosses into a section the user can see.
         .find(|group| {
-            group.key != wt_sources::board_layout::ARCHIVED && !group.key.starts_with("\0stack:")
+            group.key != wt_sources::board_layout::ARCHIVED
+                && !group.key.starts_with("\0stack:")
+                && !group.rows.is_empty()
         })
         .ok_or_else(|| {
             wt_app_core::host_errors::notice(if down {
@@ -420,7 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reorder_swaps_only_same_rank_units_and_crosses_into_named_sections() {
+    async fn reorder_swaps_only_same_rank_units_and_crosses_into_visible_sections() {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
@@ -480,9 +484,28 @@ mod tests {
             .await
             .is_err()
         );
+        // An empty section is kept on the board but never drawn, so moving
+        // down past the last row must not drop the row into it.
+        board.sections.push(wt_tui::BoardSection {
+            key: "Hidden".into(),
+            title: "Hidden".into(),
+            ..Default::default()
+        });
+        assert!(
+            reorder(
+                &fixture.ctx,
+                Some("one".into()),
+                wt_sources::board_layout::INBOX.into(),
+                true,
+                Some(&board),
+            )
+            .await
+            .is_err()
+        );
         board.sections.push(wt_tui::BoardSection {
             key: "Next".into(),
             title: "Next".into(),
+            rows: vec![first],
             ..Default::default()
         });
         reorder(
