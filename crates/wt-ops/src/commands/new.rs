@@ -436,7 +436,9 @@ async fn open_editor(ctx: &AppContext, path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{IssueTitleLookup, NewArgs, TitleSource, parse_branch, record_title, slugify};
+    use super::{
+        CreationTitle, IssueTitleLookup, NewArgs, TitleSource, parse_branch, record_title, slugify,
+    };
     use clap::{Args as _, Command, FromArgMatches};
 
     #[test]
@@ -531,6 +533,31 @@ mod tests {
             title_after(&fixture, "ENG-42").await,
             Some(("Calendar renders twice".into(), TitleSource::Issue))
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_explicit_slug_keeps_the_trackers_title() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        tracker(
+            &mut fixture,
+            r#"{"issues":[{"id":"ENG-42","status":"Todo","title":"Calendar renders twice"}]}"#,
+        );
+        let args = NewArgs {
+            slug: Some("calendar-week".into()),
+            ..Default::default()
+        };
+        let parsed = parse_branch(&fixture.ctx, "ENG-42", &args, false)
+            .await
+            .unwrap();
+        assert!(
+            parsed.branch.ends_with("eng-42-calendar-week"),
+            "{}",
+            parsed.branch
+        );
+        assert_eq!(parsed.title, CreationTitle::Issue("ENG-42".into()));
         fixture.close().await.unwrap();
     }
 

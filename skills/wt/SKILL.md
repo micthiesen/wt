@@ -36,10 +36,12 @@ wt rm [slug] [--keep-branch]           # deletes the branch by default
 
 ## Rules
 
-- **Naming a new worktree.** Lead with the tracker id, then the title words:
-  `wt new ENG-1953 fix calendar rendering`. Pass the id, never a URL. The
-  words become the worktree's title as typed; a bare id gets a random slug
-  suffix (another worktree for that id) and the tracker's title. Without an
+- **Naming a new worktree.** Lead with the tracker id:
+  `wt new ENG-1953 --slug calendar-week-view`. Pass the id, never a URL. The
+  tracker supplies the title, which the worktree's agent replaces once with
+  its outcome (`wt title`). Title words after the id
+  (`wt new ENG-1953 fix calendar`) become a title no agent can replace; a
+  bare id gets a random slug suffix (another worktree for that id). Without an
   id, the words alone make the slug and title. `wt title` shows or sets the
   title; nothing generates one. With `[issue_tracker] prefix` set, only
   that prefix may lead; a GitHub issue never names a worktree, so pass it as

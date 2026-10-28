@@ -28,10 +28,13 @@ queued and the new text belongs to that same task.
 
 ## 2. Create
 
-    wt new [<TRACKER-ID>] <short title words> --no-open [--gh <n>] [--base <current-branch>]
+    wt new <TRACKER-ID> --slug <short words> --no-open [--gh <n>] [--base <current-branch>]
+    wt new <title words> --no-open [--gh <n>] [--base <current-branch>]
 
-- Give the tracker id only when the user supplied one; a second worktree for
-  the same id needs distinct title words. Add `--gh` only for a related issue
+- Give the tracker id only when the user supplied one. With an id, `--slug`
+  keeps the tracker's title so the new agent can retitle it once; a second
+  worktree for the same id needs a distinct slug. Without one, the words are
+  the slug and the title. Add `--gh` only for a related issue
   the user supplied.
 - Add `--base <current-branch>` only when the follow-up needs this branch's
   unlanded commits; otherwise it forks from trunk. State the dependency in the
