@@ -294,7 +294,15 @@ async fn landing_evidence(
         });
     let local_merged = own_work
         && !pr_landed
-        && published_base_contains(ctx, path, &head, published_bases, warning).await?;
+        && published_base_contains(
+            ctx,
+            path,
+            &head,
+            &row.target.branch,
+            published_bases,
+            warning,
+        )
+        .await?;
     Ok(Landing {
         pr_landed,
         local_merged,
@@ -436,6 +444,7 @@ async fn published_base_contains(
     ctx: &AppContext,
     path: &Path,
     head: &str,
+    branch: &str,
     published: &mut BTreeMap<PathBuf, Option<String>>,
     warning: &mut Option<String>,
 ) -> Result<bool> {
@@ -484,12 +493,30 @@ async fn published_base_contains(
     };
     // A newly advertised object may not have been fetched yet. Missing objects
     // are unknown, not a reason to trust the older local base.
-    Ok(
-        run_git(ctx, path, ["merge-base", "--is-ancestor", head, tip])
-            .await?
-            .status
-            .success(),
-    )
+    if !run_git(ctx, path, ["merge-base", "--is-ancestor", head, tip])
+        .await?
+        .status
+        .success()
+    {
+        return Ok(false);
+    }
+    // Contained is not landed when HEAD is only a snapshot of the base: a
+    // lagging fork anchor would otherwise count base commits as own work.
+    let line = run_git(ctx, path, wt_vcs::mainline_args(tip, head)).await?;
+    if !line.status.success() || line.stdout_truncated {
+        return Ok(true);
+    }
+    let reflog = run_git(ctx, path, wt_vcs::branch_reflog_args(branch)).await?;
+    let reflog = if reflog.status.success() {
+        reflog.stdout_text().to_string()
+    } else {
+        String::new()
+    };
+    Ok(wt_vcs::contained_head_landed(
+        &line.stdout_text(),
+        &reflog,
+        head,
+    ))
 }
 
 /// Re-plan the exact confirmed set. Never expand a user's confirmation because

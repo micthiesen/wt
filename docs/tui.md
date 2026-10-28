@@ -32,7 +32,13 @@ needs-testing or blocked, cyan for working, purple for review, green for ready
 or verified, and a dim hollow dot for todo or unset. A slash marks a gated or
 dropped status. A hollow marker in a state's color means the saved status SHA
 differs from the current observed HEAD, and overdue post-merge verification is
-red. A landed branch without a newer status shows the green merge glyph.
+red. A landed branch without a newer status shows the green merge glyph. Landed
+means the branch's own commits reached the base: its PR merged, or its HEAD is
+in the base and was either merged in or committed on the branch itself. A
+worktree only fast-forwarded (or reset) to a base commit is never landed, even
+when its recorded fork anchor is older. The same
+answer drives the glyph and `c`, and `c` never offers a row whose status is
+working or needs-human.
 
 Sections are explicit: one lasts from creation (`l n`) until you delete it with
 `D`, and stays on screen when its last worktree leaves, drawn as its rule over

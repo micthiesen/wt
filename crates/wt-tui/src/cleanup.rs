@@ -101,6 +101,17 @@ pub(crate) fn checkout_hold_reason(row: &BoardRow, landing_required: bool) -> Op
         Some("Git state is unavailable")
     } else if landing_required && row.git.landed_on.is_none() {
         Some("landing of its own work is not proven")
+    } else if landing_required
+        && row.work.as_ref().is_some_and(|work| {
+            matches!(
+                work.effective_state,
+                Some(wt_core::WorkState::Working | wt_core::WorkState::NeedsHuman)
+            )
+        })
+    {
+        // Whatever Git says, an agent still at work (or waiting on the
+        // human) has not finished with this checkout.
+        Some("work is still in progress")
     } else if row.work.as_ref().is_some_and(|work| work.verification_owed) {
         Some("post-merge verification still owed")
     } else if row.git.rebasing || !row.git.conflict_files.is_empty() {
@@ -134,6 +145,24 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn work_in_progress_is_never_offered_for_cleanup() {
+        for state in [wt_core::WorkState::Working, wt_core::WorkState::NeedsHuman] {
+            let mut row = landed("busy");
+            row.work = Some(WorkPresentation {
+                effective_state: Some(state),
+                ..Default::default()
+            });
+            assert_eq!(keep_reason(&row), Some("work is still in progress"));
+        }
+        let mut ready = landed("done");
+        ready.work = Some(WorkPresentation {
+            effective_state: Some(wt_core::WorkState::Ready),
+            ..Default::default()
+        });
+        assert_eq!(keep_reason(&ready), None);
     }
 
     #[test]

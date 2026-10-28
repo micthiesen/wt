@@ -896,7 +896,21 @@ async fn enrich(
                     if failed {
                         failures.push("base ancestry");
                     }
+                    // A recorded anchor can lag behind a HEAD that only moved
+                    // along the base (a fresh worktree on a newer base tip),
+                    // counting base commits as its own. A HEAD on the base's
+                    // own first-parent line is a base snapshot, not work that
+                    // landed; a merged branch is a merge's second parent.
                     landed
+                        && contained_landed(
+                            context,
+                            &path,
+                            head,
+                            base_ref,
+                            &row.worktree.target.branch,
+                            cancellation,
+                        )
+                        .await
                 }
                 None => false,
             };
@@ -1406,6 +1420,32 @@ async fn async_count(
     }
     let count = output.stdout_text().trim().parse().ok();
     (count, count.is_none())
+}
+
+/// Whether a `head` already contained in `base_ref` is landed work rather
+/// than a base snapshot (see `wt_vcs::mainline`). A failed read keeps the
+/// containment answer, as before this check existed.
+async fn contained_landed(
+    context: &AppContext,
+    path: &Path,
+    head: &str,
+    base_ref: &str,
+    branch: &str,
+    cancel: &CancellationToken,
+) -> bool {
+    let read = |args: Vec<String>| async move {
+        run_git(context, path, args, cancel)
+            .await
+            .filter(|output| output.status.success() && !output.stdout_truncated)
+            .map(|output| output.stdout_text().to_string())
+    };
+    let Some(mainline) = read(wt_vcs::mainline_args(base_ref, head)).await else {
+        return true;
+    };
+    let reflog = read(wt_vcs::branch_reflog_args(branch))
+        .await
+        .unwrap_or_default();
+    wt_vcs::contained_head_landed(&mainline, &reflog, head)
 }
 
 async fn is_ancestor(
@@ -1956,11 +1996,83 @@ mod tests {
             .0
             .landed_on
         };
-        // Without rebase metadata the same HEAD is genuinely landed.
-        assert_eq!(probe().await, Some(LandingKind::Base));
+        // A HEAD at the base tip is a snapshot of the base, not landed work,
+        // with or without rebase metadata.
+        assert_eq!(probe().await, None);
         std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
         assert_eq!(probe().await, None);
         assert!(wt_vcs::operation_in_progress(Some(&git_dir)).await);
+    }
+
+    /// A worktree started on a newer base tip than its recorded anchor has
+    /// no commits of its own, so it is not landed, clean or dirty. Once its
+    /// own commit merges into the base, it is.
+    #[tokio::test]
+    async fn a_fresh_worktree_on_a_newer_base_tip_is_not_landed() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let anchor = git(&main, &["rev-parse", "HEAD"]);
+        std::fs::write(main.join("tracked.txt"), "trunk moved\n").unwrap();
+        git(&main, &["commit", "-qam", "trunk moved"]);
+        let tip = git(&main, &["rev-parse", "HEAD"]);
+        let find = || async {
+            fixture
+                .ctx
+                .repository
+                .inventory_status(&fixture.ctx.cancellation)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.worktree.target.branch == "feature/one")
+                .unwrap()
+        };
+        let row = find().await;
+        let worktree = PathBuf::from(&row.worktree.target.path);
+        // Fresh on the newer tip, with the older anchor still recorded.
+        git(&worktree, &["reset", "-q", "--hard", &tip]);
+        let slug = row.worktree.target.slug().to_owned();
+        let state = serde_json::json!({"slugs": {slug: {"baseBranch": "main", "baseSha": anchor}}});
+        let probe = |row| {
+            let state = state.clone();
+            let fixture = &fixture;
+            async move {
+                enrich(
+                    &fixture.ctx,
+                    &row,
+                    &state,
+                    None,
+                    &ConflictCache::default(),
+                    &fixture.ctx.cancellation,
+                )
+                .await
+                .0
+                .landed_on
+            }
+        };
+        assert_eq!(probe(find().await).await, None);
+        std::fs::write(worktree.join("scratch.txt"), "dirty\n").unwrap();
+        assert_eq!(probe(find().await).await, None);
+        std::fs::remove_file(worktree.join("scratch.txt")).unwrap();
+        // Its own commit, merged into the base, is landed work.
+        std::fs::write(worktree.join("own.txt"), "own\n").unwrap();
+        git(&worktree, &["add", "own.txt"]);
+        git(&worktree, &["commit", "-qm", "own work"]);
+        git(
+            &main,
+            &["merge", "-q", "--no-ff", "-m", "merge one", "feature/one"],
+        );
+        assert_eq!(probe(find().await).await, Some(LandingKind::Base));
     }
 
     /// A recorded base that exists only as a remote-tracking ref, or not at
