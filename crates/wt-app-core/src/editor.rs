@@ -28,6 +28,7 @@ pub fn remote_uri(host: &str, path: &str) -> Result<String> {
 }
 
 pub async fn open(context: &AppContext, path: &Path) -> Result<()> {
+    hide_terminal(context).await;
     let script = command(
         context.config.editor.command.as_deref(),
         &path.to_string_lossy(),
@@ -54,6 +55,7 @@ pub async fn open_url(context: &AppContext, url: &str) -> Result<()> {
             || url.starts_with("linear://review/"),
         "refusing to open a URL with an unsupported scheme"
     );
+    hide_terminal(context).await;
     #[cfg(target_os = "macos")]
     let command = CommandSpec::new("open");
     #[cfg(not(target_os = "macos"))]
@@ -67,6 +69,45 @@ pub async fn open_url(context: &AppContext, url: &str) -> Result<()> {
         .await?
         .checked(name)?;
     Ok(())
+}
+
+/// Hides the frontmost app (as Cmd+H does) when it is one of
+/// `ui.hide_terminal_apps`. It runs to completion before the open: once the
+/// browser or editor takes focus, the terminal is no longer frontmost and the
+/// hide would do nothing. Best-effort, since Automation permission may be
+/// missing and the open matters more than the hide.
+async fn hide_terminal(context: &AppContext) {
+    let Some(args) = hide_terminal_args(&context.config.ui.hide_terminal_apps) else {
+        return;
+    };
+    let mut spec = CommandSpec::new("osascript").args(args);
+    spec.timeout = Duration::from_secs(3);
+    if let Err(error) = context.processes.run(spec, &context.cancellation).await {
+        tracing::debug!(%error, "could not hide the terminal");
+    }
+}
+
+/// The apps arrive as script arguments, never spliced into its source.
+fn hide_terminal_args(apps: &[String]) -> Option<Vec<String>> {
+    if !cfg!(target_os = "macos") || apps.is_empty() {
+        return None;
+    }
+    let mut args: Vec<String> = [
+        "on run terminalApps",
+        "tell application \"System Events\"",
+        "set p to first application process whose frontmost is true",
+        "ignoring case",
+        "if name of p is in terminalApps then set visible of p to false",
+        "end ignoring",
+        "end tell",
+        "end run",
+    ]
+    .into_iter()
+    .flat_map(|line| ["-e".to_owned(), line.to_owned()])
+    .collect();
+    args.push("--".into());
+    args.extend(apps.iter().cloned());
+    Some(args)
 }
 
 fn command(template: Option<&str>, path: &str) -> String {
@@ -91,6 +132,15 @@ mod tests {
         );
         assert!(remote_uri("builder", "relative").is_err());
         assert!(remote_uri("builder/path", "/work").is_err());
+    }
+
+    #[test]
+    fn terminal_hiding_is_opt_in_and_passes_apps_as_arguments() {
+        assert_eq!(hide_terminal_args(&[]), None);
+        if cfg!(target_os = "macos") {
+            let args = hide_terminal_args(&["ghostty".into(), "a\"b".into()]).unwrap();
+            assert_eq!(&args[args.len() - 3..], ["--", "ghostty", "a\"b"]);
+        }
     }
 
     #[tokio::test]
