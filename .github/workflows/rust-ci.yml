@@ -40,7 +40,11 @@ jobs:
         run: rustup toolchain install
       - run: cargo fmt --all --check
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
+          WT_CACHE_COMMIT: ${{ github.sha }}
         with:
+          env-vars: WT_CACHE_COMMIT
           shared-key: lint
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -80,7 +84,11 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
+          WT_CACHE_COMMIT: ${{ github.sha }}
         with:
+          env-vars: WT_CACHE_COMMIT
           shared-key: debug-${{ matrix.os }}
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -128,7 +136,11 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
+          WT_CACHE_COMMIT: ${{ github.sha }}
         with:
+          env-vars: WT_CACHE_COMMIT
           shared-key: debug-${{ matrix.os }}
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -186,7 +198,11 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
+          WT_CACHE_COMMIT: ${{ github.sha }}
         with:
+          env-vars: WT_CACHE_COMMIT
           shared-key: release-${{ matrix.os }}
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}

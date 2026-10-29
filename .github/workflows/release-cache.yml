@@ -50,8 +50,33 @@ jobs:
         run: python3 scripts/restore-mtimes.py
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        env:
+          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
+          WT_CACHE_COMMIT: ${{ github.sha }}
         with:
+          env-vars: WT_CACHE_COMMIT
           shared-key: native-release-${{ matrix.target }}
           cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build -p wt-app -p wt-launcher --release --locked
+
+  # Each main commit now saves its own key, so delete superseded ones before
+  # they crowd the repository's 10 GB cache quota. Keeps the newest entry of
+  # every rust-cache prefix; a save still in flight is pruned next push.
+  prune:
+    needs: warm
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Delete superseded rust caches
+        run: |
+          gh cache list --ref refs/heads/main --key v0-rust- --limit 500 \
+            --json id,key,createdAt \
+            --jq 'group_by(.key | split("-")[:-2] | join("-"))
+                  | map(sort_by(.createdAt) | .[:-1][]) | flatten | .[].id' |
+          while read -r id; do gh cache delete "$id"; done

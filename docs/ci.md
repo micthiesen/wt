@@ -53,11 +53,18 @@ restore `main`'s compiled output and recompile only what changed:
 5. **`test` and `native` share one debug cache per OS** (`debug-<os>`). Both
    build with the dev profile, so their dependency output is identical; two
    keys only doubled the cache size.
+6. **Every commit has its own exact key** (`WT_CACHE_COMMIT`, hashed through
+   the action's `env-vars`). The action normalizes workspace crate versions to
+   `0.0.0` before hashing `Cargo.toml` and `Cargo.lock`, so neither a release
+   bump nor a code change alters the key, and it skips saving on an exact hit.
+   Without this item `main` saved each key once and never again: from v0.1.46
+   to v0.1.50 every release restored v0.1.46's build and recompiled every
+   workspace crate changed since, about 8.5 minutes on macOS. Now `main` saves
+   each commit; a tag restores its own commit's entry when `release-cache.yml`
+   has finished, and other runs restore the newest entry with the same prefix.
 
-Cache keys include a hash of every `Cargo.toml` and `Cargo.lock`, so a version
-bump produces a new key. The action then restores the newest cache with the
-same prefix, which is the intended fallback, and saves the new key from
-`main`. Old keys age out under GitHub's least-recently-used eviction.
+`release-cache.yml`'s `prune` job deletes all but the newest `main` entry of
+each prefix after warming, so per-commit keys stay within the 10 GB quota.
 
 ## Versions
 
