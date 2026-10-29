@@ -39,16 +39,15 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
       - run: cargo fmt --all --check
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
-          WT_CACHE_COMMIT: ${{ github.sha }}
+      - uses: ./.github/actions/cargo-cache
         with:
-          env-vars: WT_CACHE_COMMIT
-          shared-key: lint
-          cache-workspace-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: lint
+          mode: restore
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: ./.github/actions/cargo-cache
+        with:
+          name: lint
+          mode: save
       - run: cargo xtask deps-check
       - name: Verify native release packaging
         env:
@@ -83,15 +82,10 @@ jobs:
         run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
-          WT_CACHE_COMMIT: ${{ github.sha }}
+      - uses: ./.github/actions/cargo-cache
         with:
-          env-vars: WT_CACHE_COMMIT
-          shared-key: debug-${{ matrix.os }}
-          cache-workspace-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: debug-${{ matrix.os }}
+          mode: restore
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-nextest@0.9.145
@@ -109,6 +103,10 @@ jobs:
             brew install tmux
           fi
       - run: cargo nextest run --workspace --locked --profile ci
+      - uses: ./.github/actions/cargo-cache
+        with:
+          name: debug-${{ matrix.os }}
+          mode: save
       - run: cargo test --workspace --locked --doc
 
   # The end-to-end checks drive the built binary; they run beside the unit
@@ -135,15 +133,10 @@ jobs:
         run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
-          WT_CACHE_COMMIT: ${{ github.sha }}
+      - uses: ./.github/actions/cargo-cache
         with:
-          env-vars: WT_CACHE_COMMIT
-          shared-key: debug-${{ matrix.os }}
-          cache-workspace-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: debug-${{ matrix.os }}
+          mode: restore
       - name: Install terminal integration dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -158,6 +151,10 @@ jobs:
             brew install tmux
           fi
       - run: cargo build --workspace --bins --examples --locked
+      - uses: ./.github/actions/cargo-cache
+        with:
+          name: debug-${{ matrix.os }}
+          mode: save
       - name: Start the Linux resource-control test manager
         if: runner.os == 'Linux'
         run: |
@@ -197,13 +194,12 @@ jobs:
         run: python3 scripts/restore-mtimes.py
       - name: Install pinned toolchain
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
-          WT_CACHE_COMMIT: ${{ github.sha }}
+      - uses: ./.github/actions/cargo-cache
         with:
-          env-vars: WT_CACHE_COMMIT
-          shared-key: release-${{ matrix.os }}
-          cache-workspace-crates: true
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: release-${{ matrix.os }}
+          mode: restore
       - run: cargo build --workspace --release --locked
+      - uses: ./.github/actions/cargo-cache
+        with:
+          name: release-${{ matrix.os }}
+          mode: save

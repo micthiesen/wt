@@ -26,45 +26,45 @@ documented in [updates.md](updates.md#contributor-validation-and-release-gate).
 
 ## Caching
 
-Every Rust job uses `Swatinem/rust-cache`. Together these settings let a job
-restore `main`'s compiled output and recompile only what changed:
+Every Rust job restores and saves its build through
+`.github/actions/cargo-cache` (`actions/cache` restore and save), caching the
+Cargo registry and the whole `target/` directory under a build-flavor name.
+Together these rules let a job restore `main`'s compiled output and recompile
+only what changed:
 
-1. **Only `main` saves caches** (`save-if: github.ref == 'refs/heads/main'`).
-   GitHub scopes a cache to the ref that saved it: a tag or branch run can
-   restore caches saved by its own ref or by the default branch, nothing else.
-   A save from a tag, a pull request or a feature branch can never be reused,
-   and before this rule such saves filled most of the 10 GB repository quota
-   with duplicate keys.
-2. **Tags restore what `main` built.** `release.yml`'s package job has
-   `save-if: false` and restores the `native-release-<target>` cache that
-   `release-cache.yml` saves on `main`. Both must build the same packages
-   (`-p wt-app -p wt-launcher --release --locked`) with the same toolchain,
-   `CARGO_*` environment and `shared-key`. Otherwise the tag restores output it
-   cannot use and compiles from scratch, which is correct but slow.
-3. **Workspace crates are cached** (`cache-workspace-crates: true`). By default
-   the action keeps only third-party dependencies, and wt's own crates are most
-   of the compile time.
+1. **Only `main` saves caches.** GitHub scopes a cache to the ref that saved
+   it: a tag or branch run can restore caches saved by its own ref or by the
+   default branch, nothing else. A save from a tag, a pull request or a feature
+   branch can never be reused, and before this rule such saves filled most of
+   the 10 GB repository quota with duplicate keys.
+2. **Every commit has its own key, and restores fall back to the newest.** The
+   key is `cargo-<name>-<os>-<arch>-<toolchain hash>-<sha>`; a restore takes
+   the exact commit when it exists, else the newest entry with the same prefix.
+   This replaced `Swatinem/rust-cache`, which could not express it: it
+   normalizes workspace crate versions to `0.0.0` before hashing the
+   manifests, skips saving on an exact hit, and puts any added key material in
+   its fallback prefix too. Its `main` caches froze at their first commit: from
+   v0.1.46 to v0.1.50 every release restored v0.1.46's build and recompiled
+   every workspace crate changed since, about 8.5 minutes on macOS.
+3. **Tags restore what `main` built.** `release.yml`'s package job only
+   restores the `native-release-<target>` cache that `release-cache.yml` saves
+   on `main`, so a tag on a warmed commit gets an exact hit. Both must build the
+   same packages (`-p wt-app -p wt-launcher --release --locked`) with the same
+   toolchain and `CARGO_*` environment. Otherwise the tag restores output it
+   cannot use and compiles from scratch, which is correct but slow. A tag pushed
+   together with its commit restores the previous commit's entry instead.
 4. **Files are dated by their last commit** (`scripts/restore-mtimes.py` after
    a `fetch-depth: 0` checkout). Cargo treats a workspace crate as stale when a
    source file is newer than its cached output, and a checkout stamps every
-   file with the current time. Without this step, item 3 does nothing:
-   every cached workspace crate rebuilds. The script fails rather than guess
-   when history is shallow.
+   file with the current time. Without this step every cached workspace crate
+   rebuilds. The script fails rather than guess when history is shallow.
 5. **`test` and `native` share one debug cache per OS** (`debug-<os>`). Both
    build with the dev profile, so their dependency output is identical; two
-   keys only doubled the cache size.
-6. **Every commit has its own exact key** (`WT_CACHE_COMMIT`, hashed through
-   the action's `env-vars`). The action normalizes workspace crate versions to
-   `0.0.0` before hashing `Cargo.toml` and `Cargo.lock`, so neither a release
-   bump nor a code change alters the key, and it skips saving on an exact hit.
-   Without this item `main` saved each key once and never again: from v0.1.46
-   to v0.1.50 every release restored v0.1.46's build and recompiled every
-   workspace crate changed since, about 8.5 minutes on macOS. Now `main` saves
-   each commit; a tag restores its own commit's entry when `release-cache.yml`
-   has finished, and other runs restore the newest entry with the same prefix.
-
-`release-cache.yml`'s `prune` job deletes all but the newest `main` entry of
-each prefix after warming, so per-commit keys stay within the 10 GB quota.
+   keys only doubled the cache size. Whichever saves second for a commit finds
+   the key taken and skips with a warning.
+6. **Superseded entries are pruned.** `release-cache.yml`'s `prune` job keeps
+   only the newest `main` entry of each cache name, so per-commit keys stay
+   within the quota.
 
 ## Versions
 

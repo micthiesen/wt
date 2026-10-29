@@ -80,17 +80,10 @@ jobs:
       - name: Date files by their last commit so cached workspace crates stay fresh
         run: python3 scripts/restore-mtimes.py
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        env:
-          # Commit-unique exact key; see docs/ci.md "Caching" item 6.
-          WT_CACHE_COMMIT: ${{ github.sha }}
+      - uses: ./.github/actions/cargo-cache
         with:
-          env-vars: WT_CACHE_COMMIT
-          shared-key: native-release-${{ matrix.target }}
-          cache-workspace-crates: true
-          # Restored from main's release-cache run. A tag-scoped save could
-          # only ever be restored by that same tag.
-          save-if: false
+          name: native-release-${{ matrix.target }}
+          mode: restore
       - run: cargo build -p wt-app -p wt-launcher --release --locked
       - name: Verify binary identity and package immutable assets
         run: python3 scripts/package-native.py package --release "$RELEASE_VERSION" --build-id "$WT_BUILD_ID" --target "$RELEASE_TARGET" --bin-dir target/release --output dist

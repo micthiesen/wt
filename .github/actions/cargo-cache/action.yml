@@ -1,0 +1,40 @@
+# Restores or saves one Cargo build cache. See docs/ci.md "Caching".
+#
+# Every commit gets its own key, and a restore falls back to the newest entry
+# of the same name, OS, architecture and toolchain. Swatinem/rust-cache could
+# not do both: it normalizes workspace versions out of its key and puts any
+# extra key material into its fallback prefix too, so its main caches froze
+# at their first commit.
+name: Cargo cache
+description: Restore or save the registry and target directory for one build flavor.
+inputs:
+  name:
+    description: Build flavor sharing the cache, such as lint or debug-macos-latest.
+    required: true
+  mode:
+    description: restore or save.
+    required: true
+runs:
+  using: composite
+  steps:
+    - if: inputs.mode == 'restore'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: cargo-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
+        restore-keys: cargo-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+    # Only main saves: GitHub scopes a cache to the ref that saved it, so a
+    # branch, pull request or tag save could never be restored elsewhere.
+    - if: inputs.mode == 'save' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: cargo-${{ inputs.name }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ github.sha }}
