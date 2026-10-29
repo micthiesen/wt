@@ -166,7 +166,8 @@ tracked action output; its title names which, such as `attention · 2 new` or
 `slug · claude / name · live · 1/3`. Rows show a dim local time, the source,
 and the message. Attention entries wrap with a hanging indent; the full feed is
 one line per event, colored by level. Entries already marked seen are dimmed
-below a `seen HH:MM:SS` rule, and an empty attention feed reads "nothing needs
+above a `seen HH:MM:SS` rule; when nothing new follows it and the feed overflows
+the pane, the rule takes the bottom row, and an empty attention feed reads "nothing needs
 you". The attention watermark is saved and `x` or `X` marks the current feed as seen.
 `Ctrl+E`/`Ctrl+Y`, `Ctrl+Shift+J`/`Ctrl+Shift+K` where supported, and the
 mouse wheel scroll the output pane. Selecting an output with `'` pins it until

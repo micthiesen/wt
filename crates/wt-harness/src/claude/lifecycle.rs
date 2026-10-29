@@ -725,9 +725,12 @@ fn prepend_path(shims: &Path, path: &str) -> String {
         format!("{}:{path}", shims.to_string_lossy())
     }
 }
+/// RFC 3986 unreserved characters plus `/`. `~` must pass: named sessions
+/// (`manager~manager`) put it in their socket path, and a session launched
+/// without `BUN_INSPECT` can only be reached by typing into its pane.
 fn url_path_safe(path: &str) -> bool {
     path.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"/-_.".contains(&b))
+        .all(|b| b.is_ascii_alphanumeric() || b"/-_.~".contains(&b))
 }
 
 pub(super) struct SessionLock {
@@ -788,6 +791,8 @@ mod tests {
     fn claude_environment_url_safety_and_path_prepend_are_deterministic() {
         assert!(url_path_safe("/tmp/cache/insp/demo.sock"));
         assert!(!url_path_safe("/tmp/cache with spaces/insp/demo.sock"));
+        let named = inspector_socket_path(Path::new("/tmp/cache"), "manager~manager");
+        assert!(url_path_safe(named.to_str().unwrap()));
         assert_eq!(
             prepend_path(Path::new("/cache/shims"), "/usr/bin:/bin"),
             "/cache/shims:/usr/bin:/bin"

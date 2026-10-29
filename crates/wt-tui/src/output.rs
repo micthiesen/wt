@@ -135,7 +135,8 @@ impl Model {
         let target = self.output.target.clone();
         // Line ranges of attention entries.
         let mut entries: Vec<(usize, usize)> = Vec::new();
-        let (title, lines, identity, count) = match &target {
+        let mut trailing_rule = false;
+        let (title, mut lines, identity, count) = match &target {
             OutputTarget::Attention => {
                 let seen_ms = self.board.attention_seen_ms;
                 let events = &self.board.attention;
@@ -172,6 +173,7 @@ impl Model {
                 }
                 if seen_ms > 0 && !marked && !events.is_empty() {
                     lines.extend(self.seen_rule(seen_ms, width, true));
+                    trailing_rule = true;
                 }
                 if events.is_empty() {
                     lines.push(Line::from(vec![
@@ -324,8 +326,8 @@ impl Model {
         // Following the newest entries, start at an entry rather than the
         // wrapped tail of one, so the top row always carries its time.
         // When no entry starts in view (a seen rule trails the last one),
-        // show the cut entry from its start if it fits; a taller entry
-        // keeps the plain bottom so its end stays reachable.
+        // show the cut entry from its start if it and the rule fit; a taller
+        // entry keeps the plain bottom so its end stays reachable.
         let snapped = entries
             .iter()
             .map(|(start, _)| *start)
@@ -333,7 +335,7 @@ impl Model {
             .or_else(|| {
                 entries
                     .last()
-                    .filter(|(start, end)| end - start <= height)
+                    .filter(|(start, _)| lines.len() - start <= height)
                     .map(|(start, _)| *start)
             });
         if self.output.top.is_none()
@@ -341,6 +343,14 @@ impl Model {
         {
             // Render only: scrolling still steps from the clamped top.
             top = start;
+        }
+        // Snapping leaves a varying gap under the last row. A trailing seen
+        // rule takes the bottom row anyway, with the gap above it, so it sits
+        // in the same place however the entries above happen to wrap.
+        if trailing_rule && lines.len() > height {
+            let gap = (top + height).saturating_sub(lines.len());
+            let rule = lines.len() - 1;
+            lines.splice(rule..rule, std::iter::repeat_n(Line::default(), gap));
         }
         let hint = if self.output.top.is_some() {
             " · scrolled"
@@ -789,6 +799,37 @@ mod tests {
             "{:?}",
             text(&lines[0])
         );
+    }
+
+    #[test]
+    fn a_trailing_seen_rule_always_takes_the_bottom_row() {
+        let line = |at_ms, text: &str| crate::AttentionLine {
+            at_ms,
+            source: "wt".into(),
+            text: text.into(),
+        };
+        let first = "first entry wraps across several rows of a narrow pane";
+        for second in ["second", "second entry also wraps onto a row"] {
+            let mut model = Model {
+                board: Arc::new(crate::Board {
+                    attention: vec![line(1_000, first), line(2_000, second)],
+                    attention_seen_ms: 2_000,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            for height in 3..8 {
+                let lines = model.output_view(height, 30).1;
+                // A feed that fits ends where it ends; one that overflows
+                // fills the pane down to the rule.
+                let fits = model.output_view(100, 30).1.len();
+                assert_eq!(lines.len(), height.min(fits), "{second:?} at {height}");
+                assert!(
+                    text(lines.last().unwrap()).starts_with("── seen"),
+                    "{second:?} at {height}"
+                );
+            }
+        }
     }
 
     #[test]

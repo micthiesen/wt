@@ -498,9 +498,6 @@ fn transcript_has_prompt(
         .skip(usize::from(start > 0))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .any(|entry| {
-            if entry.get("type").and_then(Value::as_str) != Some("user") {
-                return false;
-            }
             if entry
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -509,8 +506,26 @@ fn transcript_has_prompt(
             {
                 return false;
             }
-            user_body(&entry).is_some_and(|found| normalize_for_match(&found).contains(&needle))
+            received_prompt(&entry)
+                .is_some_and(|found| normalize_for_match(&found).contains(&needle))
         })
+}
+
+/// The prompt text a record proves Claude received: a user turn, or a
+/// message queued while the session was busy. Claude records the queue entry
+/// at once but writes the user turn only when the turn takes it, which can
+/// be long after confirmation gives up.
+fn received_prompt(entry: &Value) -> Option<String> {
+    match entry.get("type").and_then(Value::as_str)? {
+        "user" => user_body(entry),
+        "queue-operation" if entry.get("operation").and_then(Value::as_str) == Some("enqueue") => {
+            entry
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+        _ => None,
+    }
 }
 
 fn user_body(entry: &Value) -> Option<String> {
@@ -567,4 +582,62 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn transcript(home: &Path, target: &ClaudeSessionTarget, lines: &[Value]) {
+        let id = crate::claude_session_id(&target.cwd, target.managed_name.as_deref());
+        let path = session_jsonl_path(home, &target.cwd, &id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body: Vec<String> = lines.iter().map(Value::to_string).collect();
+        std::fs::write(path, body.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn a_message_queued_behind_a_busy_turn_counts_as_received() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = super::super::ClaudePaths::new(home.path(), home.path().join("cache"));
+        let target = ClaudeSessionTarget {
+            slug: "manager".into(),
+            cwd: home.path().join("repo"),
+            managed_name: Some("manager".into()),
+        };
+        let since = parse_timestamp_ms("2026-10-29T20:48:00.000Z").unwrap();
+        transcript(
+            home.path(),
+            &target,
+            &[
+                serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                    "timestamp": "2026-10-29T20:47:00.000Z", "content": "[a] old note"}),
+                serde_json::json!({"type": "queue-operation", "operation": "remove",
+                    "timestamp": "2026-10-29T20:48:20.000Z", "content": "[a] removed note"}),
+                serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                    "timestamp": "2026-10-29T20:48:05.000Z", "content": "[a]  peer1 needs\nsigning in"}),
+            ],
+        );
+
+        assert!(transcript_has_prompt(
+            &paths,
+            &target,
+            "[a] peer1 needs signing in",
+            since
+        ));
+        assert!(!transcript_has_prompt(
+            &paths,
+            &target,
+            "[a] old note",
+            since
+        ));
+        assert!(!transcript_has_prompt(
+            &paths,
+            &target,
+            "[a] removed note",
+            since
+        ));
+    }
 }
