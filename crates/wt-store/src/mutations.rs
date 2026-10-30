@@ -969,10 +969,14 @@ impl Store {
         })
     }
 
+    /// Claim the first candidate no other live worktree has reserved.
+    /// `live_slugs` is the caller's worktree inventory: a reservation held by
+    /// a slug outside it belongs to a removed worktree and blocks nothing.
     pub fn claim_dev_port(
         &mut self,
         slug: &str,
         candidates: &[u16],
+        live_slugs: &BTreeSet<String>,
     ) -> Result<Option<u16>, StoreError> {
         self.mutate_wt_state(|state| {
             let claimed: BTreeSet<u16> = state
@@ -980,7 +984,7 @@ impl Store {
                 .and_then(Value::as_object)
                 .into_iter()
                 .flat_map(|slugs| slugs.iter())
-                .filter(|(key, _)| key.as_str() != slug)
+                .filter(|(key, _)| key.as_str() != slug && live_slugs.contains(key.as_str()))
                 .filter_map(|(_, value)| value.get("devPort")?.as_u64()?.try_into().ok())
                 .collect();
             let Some(port) = candidates
@@ -1600,6 +1604,17 @@ impl Store {
             });
             removed.truncate(REMOVED_MAX_ENTRIES);
             state["removed"] = Value::Array(removed);
+            // A removed slug's port reservation would otherwise block every
+            // later claim for it, and slug entries outlive their worktrees.
+            if let Some(slugs) = state.get_mut("slugs").and_then(Value::as_object_mut) {
+                for incoming in incoming {
+                    if let Some(entry) =
+                        slugs.get_mut(&incoming.slug).and_then(Value::as_object_mut)
+                    {
+                        entry.remove("devPort");
+                    }
+                }
+            }
             Ok(((), true))
         })
     }
