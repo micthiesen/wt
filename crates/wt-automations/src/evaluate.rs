@@ -257,6 +257,9 @@ fn evaluate_row(
                 (&audience, work.by.as_deref()),
                 (ActionAudience::Manager, Some("manager"))
             ) || matches!((&audience, work.by.as_deref()), (ActionAudience::Session, Some(by)) if by == slug)
+                // The human set it in the TUI; a banner would tell them what
+                // they just did.
+                || (rule.run == "builtin:notify" && work.by.as_deref() == Some("human"))
             {
                 return None;
             }
@@ -751,6 +754,27 @@ mod tests {
         work.blocked_on = Some("approval".into());
         row.work = Some(work);
         assert!(evaluate(&[ready], &[row], &context).is_empty());
+    }
+
+    #[test]
+    fn a_status_the_human_set_does_not_notify_the_human() {
+        let mut row = row();
+        let mut work = WorkStatusRecord::new(WorkState::Ready, "2026-10-01T00:00:00Z");
+        work.by = Some("human".into());
+        row.work = Some(work.clone());
+        let notify = rule("ping", AutomationTrigger::StatusReady, "builtin:notify");
+        let context = AutomationEvalContext::default();
+        assert!(
+            evaluate(
+                std::slice::from_ref(&notify),
+                std::slice::from_ref(&row),
+                &context
+            )
+            .is_empty()
+        );
+        work.by = Some(row.slug.clone());
+        row.work = Some(work);
+        assert_eq!(evaluate(&[notify], &[row], &context).len(), 1);
     }
 
     #[test]

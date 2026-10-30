@@ -800,7 +800,7 @@ impl LifecycleService {
                 published_base: None,
             });
         }
-        let phase = RemovalPhase::new(Path::new(&target.path), "prepare-revision");
+        let phase = RemovalPhase::quiet(Path::new(&target.path), "prepare-revision");
         let result = self
             .stable_removal_revision(&row, landed, cancellation)
             .await;

@@ -884,21 +884,25 @@ async fn read_issue_statuses(
             return BTreeMap::new();
         }
     };
+    let Some(statuses) = parse_issue_statuses(&output.stdout, &ids) else {
+        tracing::warn!("removed-history issue status reader returned invalid JSON");
+        return BTreeMap::new();
+    };
+    statuses
+}
+
+fn parse_issue_statuses(stdout: &[u8], ids: &BTreeSet<String>) -> Option<BTreeMap<String, String>> {
+    // Readers may add fields (a title, a URL); only these two are needed.
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Response {
         issues: Vec<Issue>,
     }
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Issue {
         id: String,
         status: String,
     }
-    let Ok(response) = serde_json::from_slice::<Response>(&output.stdout) else {
-        tracing::warn!("removed-history issue status reader returned invalid JSON");
-        return BTreeMap::new();
-    };
+    let response = serde_json::from_slice::<Response>(stdout).ok()?;
     let mut statuses = BTreeMap::new();
     for issue in response.issues {
         if ids.contains(&issue.id)
@@ -910,7 +914,7 @@ async fn read_issue_statuses(
                 .or_insert_with(|| issue.status.trim().to_owned());
         }
     }
-    statuses
+    Some(statuses)
 }
 
 async fn read_github_repo_url(
@@ -956,6 +960,17 @@ mod tests {
             automations_paused: None,
             extra,
         }
+    }
+
+    #[test]
+    fn issue_statuses_ignore_fields_the_reader_adds() {
+        let ids = BTreeSet::from(["COZ-1".to_owned()]);
+        let stdout = br#"{"issues":[{"id":"COZ-1","status":"In Review","title":"t"},{"id":"COZ-9","status":"Done"}]}"#;
+        assert_eq!(
+            parse_issue_statuses(stdout, &ids),
+            Some(BTreeMap::from([("COZ-1".into(), "In Review".into())]))
+        );
+        assert_eq!(parse_issue_statuses(b"nope", &ids), None);
     }
 
     #[test]

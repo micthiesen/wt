@@ -12,7 +12,11 @@ pub(crate) struct RemovalPhase {
     path: PathBuf,
     start: Instant,
     finished: bool,
+    quiet: bool,
 }
+
+/// A quiet phase that succeeds within this stays at debug level.
+const QUIET_SUCCESS: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl RemovalPhase {
     pub(crate) fn new(path: &Path, phase: &'static str) -> Self {
@@ -22,7 +26,16 @@ impl RemovalPhase {
             path: path.to_owned(),
             start: Instant::now(),
             finished: false,
+            quiet: false,
         }
+    }
+
+    /// A phase that also runs on every automation pass for each landed
+    /// worktree; a fast success there is routine, not a removal event.
+    pub(crate) fn quiet(path: &Path, phase: &'static str) -> Self {
+        let mut span = Self::new(path, phase);
+        span.quiet = true;
+        span
     }
 
     pub(crate) fn finish(mut self, outcome: &'static str) {
@@ -39,9 +52,15 @@ impl RemovalPhase {
     }
 
     fn log(&mut self, outcome: &'static str) {
-        tracing::info!(target: "wt::removal", phase = self.phase, path = %self.path.display(),
-            elapsed_ms = self.start.elapsed().as_secs_f64() * 1000.0, outcome,
-            "removal phase finished");
+        let elapsed = self.start.elapsed();
+        let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+        if self.quiet && outcome == "success" && elapsed < QUIET_SUCCESS {
+            tracing::debug!(target: "wt::removal", phase = self.phase, path = %self.path.display(),
+                elapsed_ms, outcome, "removal phase finished");
+        } else {
+            tracing::info!(target: "wt::removal", phase = self.phase, path = %self.path.display(),
+                elapsed_ms, outcome, "removal phase finished");
+        }
         self.finished = true;
     }
 }

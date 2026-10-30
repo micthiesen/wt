@@ -327,10 +327,14 @@ impl TransitionTracker {
                 else {
                     continue;
                 };
-                self.push_from(
-                    &wt_core::worktree_ledger_label(slug),
-                    describe_status(record),
-                );
+                let label = wt_core::worktree_ledger_label(slug);
+                let text = describe_status(record);
+                // A status the human set in the TUI already showed a toast.
+                if record.get("by").and_then(Value::as_str) == Some("human") {
+                    tracing::info!(target: "wt::status", event_source = %label, event_text = %text, "status set by the human");
+                } else {
+                    self.push_from(&label, text);
+                }
             }
         }
         if let Some(previous) = self.sections.clone() {
@@ -692,6 +696,13 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("moved to"))
         );
+
+        // A status the human set in the TUI stays off attention too.
+        let by_human = serde_json::json!({"slugs":{"one":{"section":"Build","work":{"state":"ready","at":"3","by":"human"}}}});
+        let mut tracker = TransitionTracker::default();
+        tracker.metadata(&initial);
+        tracker.metadata(&by_human);
+        assert!(tracker.events.is_empty());
     }
 
     #[test]

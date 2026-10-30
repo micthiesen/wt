@@ -383,6 +383,7 @@ pub async fn delete(
         .map(|row| row.key.clone())
         .collect::<Vec<_>>();
     let name = section.clone();
+    let writes = ctx.section_writes.clone();
     let moved = ctx
         .database
         .call(move |store| {
@@ -395,6 +396,15 @@ pub async fn delete(
             if current != seen.0 {
                 return Err(stale(&name));
             }
+            // Every row filed here (archived and remote too) lands in the
+            // Inbox; none of those moves is news to the user who deleted it.
+            let members = ["slugs", "remoteLayouts"]
+                .into_iter()
+                .filter_map(|collection| state[collection].as_object())
+                .flatten()
+                .filter(|(_, entry)| entry["section"].as_str() == Some(name.as_str()))
+                .map(|(key, _)| key.clone());
+            writes.record(members, None);
             Ok(store.remove_section(&name)?)
         })
         .await?;
@@ -579,6 +589,8 @@ mod tests {
             .await
             .unwrap();
         assert!(state["slugs"]["one"]["section"].is_null());
+        // The move is the user's own, so the attention feed stays quiet.
+        assert!(fixture.ctx.section_writes.consume("one", None));
         assert!(
             !state["sectionsOrder"]
                 .as_array()

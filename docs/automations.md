@@ -37,7 +37,7 @@ This exists because the manager's *last* triage step is sharpening the `needs-hu
 
 The wasted turn is not the cost. A briefing whose correct answer is usually "nothing changed" stops getting read, and that spends the one channel that exists for "a worktree is blocked on the human". Note that only `status.*` triggers can loop this way — every other condition is derived from git or GitHub, which no session can write by asserting.
 
-The guard is deliberately narrow in the other direction too: an **unattributed** record (the human's `u` picker, a `wt status` typed in a plain shell, or any record written before `by` existed) is not the audience, so it still fires. A guard keyed on stored state has to decide what a missing value means, and here "unknown" must mean "brief it" — the alternative silently swallows real escalations on exactly the rows that have no stamp.
+The guard is deliberately narrow in the other direction too: an **unattributed** record (a `wt status` typed in a plain shell, or any record written before `by` existed) is not the audience, so it still fires. A status set with the TUI's `u` picker is stamped `by = "human"`: it still briefs a manager or session, but `builtin:notify` skips it, because the banner would only tell the human what they just did. The attention feed likewise leaves it, and the user's own section moves (including the rows a deleted section returns to the Inbox), to the toast. A guard keyed on stored state has to decide what a missing value means, and here "unknown" must mean "brief it" — the alternative silently swallows real escalations on exactly the rows that have no stamp.
 
 ## Built-in runs
 

@@ -164,7 +164,10 @@ if the PR or its head commit changed since you saw it.
 The bottom pane shows the attention feed, all activity, session output, or
 tracked action output; its title names which, such as `attention · 2 new` or
 `slug · claude / name · live · 1/3`. Rows show a dim local time, the source,
-and the message. Attention entries wrap with a hanging indent; the full feed is
+and the message. Attention carries status changes and section moves made
+elsewhere (agents, the manager, another process); your own moves in this TUI,
+including rows a deleted section returns to the Inbox, and statuses you set
+with `u` appear only as the toast and in all activity. Attention entries wrap with a hanging indent; the full feed is
 one line per event, colored by level. Entries already marked seen are dimmed
 above a `seen HH:MM:SS` rule; when nothing new follows it and the feed overflows
 the pane, the rule takes the bottom row, and an empty attention feed reads "nothing needs
