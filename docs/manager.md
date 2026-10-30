@@ -191,7 +191,12 @@ wt itself runs as a native Rust binary. Each Claude session wt starts receives
 `BUN_INSPECT=ws+unix://<cacheRoot>/insp/<tmux name>.sock`, which exposes Bun's
 inspector on a private 0700 socket; delivery connects there, walks the live
 Ink/React tree to the prompt component, and calls the same `onSubmit` a
-keypress would.
+keypress would. The session's Bash commands must not inherit it: a child Bun
+program (`claude --version`, `opencode --version`) would try to bind the same
+socket and die with `EADDRINUSE`. wt also sets `CLAUDE_ENV_FILE` to
+`<cacheRoot>/claude-bash-env.sh`, which Claude Code sources before each Bash
+command and which unsets `BUN_INSPECT`; the shims in `<cacheRoot>/shims/`
+cover other Bun programs Claude starts directly.
 
 That gets four things at once:
 

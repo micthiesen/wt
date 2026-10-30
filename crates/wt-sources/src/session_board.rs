@@ -317,12 +317,25 @@ fn compose(
             }
         }
         if let Some(usage) = &feed.usage {
-            for (harness, five, week) in [
-                ("Claude", &usage.claude_five_hour, &usage.claude_seven_day),
-                ("Codex", &usage.codex_five_hour, &usage.codex_seven_day),
+            let claude_observed = usage
+                .claude_observed_at_ms
+                .and_then(|ms| u64::try_from(ms).ok());
+            for (harness, five, week, observed) in [
+                (
+                    "Claude",
+                    &usage.claude_five_hour,
+                    &usage.claude_seven_day,
+                    claude_observed,
+                ),
+                (
+                    "Codex",
+                    &usage.codex_five_hour,
+                    &usage.codex_seven_day,
+                    None,
+                ),
             ] {
                 for (period, value) in [("5h", five), ("7d", week)] {
-                    if let Some(item) = usage_item(harness, period, value.as_ref()) {
+                    if let Some(item) = usage_item(harness, period, value.as_ref(), observed) {
                         board.usage.push(item);
                     }
                 }
@@ -385,6 +398,7 @@ fn usage_item(
     harness: &str,
     period: &str,
     value: Option<&UsagePeriodDto>,
+    observed_at_ms: Option<u64>,
 ) -> Option<wt_tui::UsageItem> {
     let value = value.filter(|value| value.utilization.is_finite())?;
     Some(wt_tui::UsageItem {
@@ -396,6 +410,7 @@ fn usage_item(
             .as_deref()
             .and_then(wt_core::parse_iso_millis)
             .and_then(|ms| u64::try_from(ms).ok()),
+        observed_at_ms,
         cost: None,
     })
 }

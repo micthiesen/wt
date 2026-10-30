@@ -587,6 +587,12 @@ impl ClaudeSessionManager {
         command.push(format!("WT_AGENT={}", target.slug));
         if let Some(url) = inspector_url {
             command.push(format!("BUN_INSPECT={url}"));
+            // Claude's Bash children would inherit the variable, and a child
+            // Bun program such as `claude --version` then dies on the bound
+            // socket. The shims skip the harness CLIs, so clear it per command.
+            if let Ok(env_file) = bash_env_file(&self.paths.cache_dir) {
+                command.push(format!("CLAUDE_ENV_FILE={}", env_file.to_string_lossy()));
+            }
         }
         match handoff {
             Some(handoff) => command.extend([
@@ -716,6 +722,27 @@ fn operation(operation: &'static str, detail: impl Into<String>) -> ClaudeSessio
         detail: detail.into(),
     }
 }
+/// Claude Code sources `CLAUDE_ENV_FILE` before each Bash command. Running
+/// sessions read it while another session starts, so it is replaced whole.
+fn bash_env_file(cache_dir: &Path) -> std::io::Result<PathBuf> {
+    const BODY: &str = "unset BUN_INSPECT\n";
+    let file = cache_dir.join("claude-bash-env.sh");
+    if fs::read_to_string(&file).ok().as_deref() != Some(BODY) {
+        fs::create_dir_all(cache_dir)?;
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temporary = cache_dir.join(format!(
+            ".claude-bash-env.{}.{sequence}.tmp",
+            std::process::id()
+        ));
+        fs::write(&temporary, BODY)?;
+        fs::rename(&temporary, &file).inspect_err(|_| {
+            let _ = fs::remove_file(&temporary);
+        })?;
+    }
+    Ok(file)
+}
+
 fn prepend_path(shims: &Path, path: &str) -> String {
     // A trailing ':' would add an empty entry, which shells read as the
     // current directory.
@@ -798,6 +825,21 @@ mod tests {
             "/cache/shims:/usr/bin:/bin"
         );
         assert_eq!(prepend_path(Path::new("/cache/shims"), ""), "/cache/shims");
+    }
+
+    #[test]
+    fn bash_children_do_not_inherit_the_inspector() {
+        let cache = tempfile::tempdir().unwrap();
+        let file = bash_env_file(cache.path()).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "unset BUN_INSPECT\n");
+        let output = std::process::Command::new("bash")
+            .args(["-c", ". \"$1\"; echo \"${BUN_INSPECT-unset}\"", "_"])
+            .arg(&file)
+            .env("BUN_INSPECT", "ws+unix:///tmp/x.sock")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "unset\n");
+        assert_eq!(bash_env_file(cache.path()).unwrap(), file);
     }
 
     #[tokio::test]

@@ -565,6 +565,9 @@ pub struct UsageItem {
     pub percent: Option<u8>,
     /// UTC epoch milliseconds when the window resets.
     pub resets_at_ms: Option<u64>,
+    /// UTC epoch milliseconds of the reading, when an outside fetch supplies
+    /// it and may silently stop.
+    pub observed_at_ms: Option<u64>,
     /// Spend, already formatted (`$1.20`), for harnesses that report cost.
     pub cost: Option<String>,
 }

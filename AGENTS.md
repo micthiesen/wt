@@ -38,6 +38,10 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   `0.0.0`; read identity through `wt::build_info`, never with `env!` outside
   `wt-app`. Update `docs/ci.md`
   with any workflow change.
+- Claude Code keeps OAuth credentials in both `~/.claude/.credentials.json`
+  and the macOS Keychain item `Claude Code-credentials`, and refreshes only
+  the Keychain on macOS. Code that ever reads them must take the
+  `claudeAiOauth` entry with the later `expiresAt`, never the file first.
 - Use the existing Cargo workspace boundaries. `wt-config` owns selected
   configuration, `wt-store` durable state, `wt-platform` subprocesses and OS
   resources, `wt-runtime` scheduled source lifetimes, `wt-vcs` Git operations,

@@ -297,6 +297,10 @@ pub struct UsageSnapshot {
     pub opencode_five_hour: Option<f64>,
     pub opencode_seven_day: Option<f64>,
     pub cached_at_ms: i64,
+    /// When Claude's usage file was last written. Something outside wt
+    /// fetches it, so an old file means that fetch is failing or idle.
+    #[serde(default)]
+    pub claude_observed_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -1213,6 +1217,7 @@ fn merge_usage(
     let mut errors = Vec::new();
     match claude {
         Ok(value) => {
+            usage.claude_observed_at_ms = value.as_ref().map(|value| value.cached_at_ms);
             usage.claude_five_hour = value
                 .as_ref()
                 .and_then(|value| value.five_hour.clone())

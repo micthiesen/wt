@@ -177,7 +177,10 @@ returns to the default. The feed is restored from the app log on startup.
 The header shows worktree and archive counts, refresh motion, paused or queued
 automations, a dim `↑` notice when a newer wt release is available or installed
 and awaiting a restart ([updates.md](updates.md)), the primary harness's rate-limit windows (colored as they near
-the limit, with time to reset), and the primary harness glyph. Refreshing uses
+the limit, with time to reset), and the primary harness glyph. Claude's
+windows come from `~/.cache/claude-statusline-usage.json`, written by a
+statusline outside wt; a reading over 30 minutes old turns dim and ends with
+`as of <age> ago`, and a window it saw reset shows `?` instead of `0%`. Refreshing uses
 a traveling bar wave in a reserved 12-cell slot, so counts and
 right-aligned telemetry stay put as refreshes start and finish. The wave follows
 the number of refreshing source lanes across hosts and eases to rest. Its 10 Hz

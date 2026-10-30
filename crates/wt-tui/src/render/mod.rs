@@ -217,7 +217,7 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             base.fg(theme::FG_DIM),
         ));
     }
-    let usage = usage_spans(model, base);
+    let usage = usage_spans(model, base, text::now_ms());
     if !usage.is_empty() {
         right.extend(usage);
         right.push(Span::styled(" · ", base.fg(theme::FG_DIM)));
@@ -253,14 +253,19 @@ pub(crate) fn refresh_header(frame: &mut Frame<'_>, model: &Model) {
     }
 }
 
+/// A Claude reading older than this means the outside fetch that writes it
+/// has stopped (its own statusline treats 30 minutes as stale too).
+const STALE_USAGE_MS: u64 = 30 * 60 * 1000;
+
 /// The primary harness's rate-limit windows, each colored by how close it is
 /// to the limit, with the time until it resets. Codex reports headroom, so
-/// its figure is the percentage left.
-fn usage_spans(model: &Model, base: Style) -> Vec<Span<'static>> {
+/// its figure is the percentage left. A stale reading is dim and says how old
+/// it is; a window it saw reset is unknown, not 0%.
+fn usage_spans(model: &Model, base: Style, now: u64) -> Vec<Span<'static>> {
     let primary = model.primary_harness();
-    let now = text::now_ms();
     let codex = primary.eq_ignore_ascii_case("codex");
     let mut spans = Vec::new();
+    let mut stale_since = None;
     for item in model
         .board
         .usage
@@ -281,11 +286,25 @@ fn usage_spans(model: &Model, base: Style) -> Vec<Span<'static>> {
             continue;
         };
         let expired = item.resets_at_ms.is_some_and(|reset| reset <= now);
+        let observed = item
+            .observed_at_ms
+            .filter(|at| now.saturating_sub(*at) > STALE_USAGE_MS);
+        if let Some(at) = observed {
+            stale_since = Some(stale_since.map_or(at, |since: u64| since.min(at)));
+            if expired {
+                spans.push(Span::styled(
+                    format!("{} ?", item.period),
+                    base.fg(theme::FG_DIM),
+                ));
+                continue;
+            }
+        }
         if expired {
             percent = 0;
         }
         let used = percent.min(100);
         let color = match used {
+            _ if observed.is_some() => theme::FG_DIM,
             80.. => theme::ERR,
             60..80 => theme::WARN,
             _ => theme::FG,
@@ -305,6 +324,12 @@ fn usage_spans(model: &Model, base: Style) -> Vec<Span<'static>> {
                 base.fg(theme::FG_DIM),
             ));
         }
+    }
+    if let Some(since) = stale_since {
+        spans.push(Span::styled(
+            format!(" · as of {} ago", text::age(since, now)),
+            base.fg(theme::FG_DIM),
+        ));
     }
     spans
 }
@@ -566,9 +591,43 @@ pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::model::ConfirmPrompt;
-    use crate::{Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption};
+    use crate::{
+        Board, BoardRow, ConfirmAction, Interaction, PickerAction, PickerOption, UsageItem,
+    };
     use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn a_stale_usage_reading_says_so_instead_of_guessing_zero() {
+        const HOUR: u64 = 3_600_000;
+        let now = 100 * HOUR;
+        let render = |observed_at_ms| {
+            let mut model = Model::default();
+            let board = Arc::make_mut(&mut model.board);
+            for (period, percent, resets_at_ms) in
+                [("5h", 40, now - HOUR), ("7d", 13, now + 2 * HOUR)]
+            {
+                board.usage.push(UsageItem {
+                    harness: "Claude".into(),
+                    period: period.into(),
+                    percent: Some(percent),
+                    resets_at_ms: Some(resets_at_ms),
+                    observed_at_ms,
+                    cost: None,
+                });
+            }
+            usage_spans(&model, Style::new(), now)
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(render(Some(now - 60_000)), "5h 0% · 7d 13% (2h)");
+        assert_eq!(render(None), "5h 0% · 7d 13% (2h)");
+        assert_eq!(
+            render(Some(now - 3 * HOUR)),
+            "5h ? · 7d 13% (2h) · as of 3h ago"
+        );
+    }
 
     #[test]
     fn full_width_activity_stops_at_twelve_lines_and_the_column_layout_keeps_growing() {
