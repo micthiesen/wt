@@ -1236,6 +1236,16 @@ impl DevServerService {
         cancellation: &CancellationToken,
     ) -> Result<u16, DevServerError> {
         let recorded = self.read_port(slug).await?;
+        // One inventory read per start: reservations held by slugs whose
+        // worktree is gone must not exhaust the range.
+        let mut live_slugs = self
+            .repository
+            .inventory(cancellation)
+            .await?
+            .into_iter()
+            .map(|row| row.target.slug().to_owned())
+            .collect::<BTreeSet<_>>();
+        live_slugs.insert(slug.to_owned());
         let range_start = u32::from(self.config.settings.port_base);
         let range_end = range_start
             .saturating_add(self.config.settings.port_range)
@@ -1247,7 +1257,10 @@ impl DevServerService {
             probe_port,
             |candidates| {
                 let owned_slug = slug.to_owned();
-                self.mutate_store(move |store| store.claim_dev_port(&owned_slug, &candidates))
+                let live_slugs = live_slugs.clone();
+                self.mutate_store(move |store| {
+                    store.claim_dev_port(&owned_slug, &candidates, &live_slugs)
+                })
             },
         )
         .await
@@ -1694,6 +1707,122 @@ mod tests {
         .unwrap()
     }
 
+    /// Every slug these tests reserve for is a live worktree.
+    fn all_live() -> BTreeSet<String> {
+        (8100..8220)
+            .flat_map(|port| [format!("owner-{port}"), format!("winner-{port}")])
+            .chain(["new", "own"].map(str::to_owned))
+            .collect()
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[tokio::test]
+    async fn port_allocation_ignores_reservations_of_removed_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let root = temp.path().join("worktrees");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "core.fsmonitor", "false"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        for slug in ["live", "starting"] {
+            let path = root.join(slug);
+            git(
+                &main,
+                &["worktree", "add", "-q", "-b", slug, path.to_str().unwrap()],
+            );
+        }
+        // An OS-assigned port nobody listens on once the listener drops.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let state = StateConfig {
+            path: temp.path().join("state.sqlite"),
+            identity: RepositoryIdentity::new("port-test", "/isolated/port-test"),
+        };
+        let processes = ProcessRunner::default();
+        let service = DevServerService::new(
+            DevServerConfig {
+                main_clone: main.clone(),
+                dev_dir: temp.path().join("dev"),
+                lock_dir: temp.path().join("locks"),
+                state: state.clone(),
+                settings: Settings {
+                    command: "true".into(),
+                    port_base: port,
+                    port_range: 1,
+                    ..Settings::default()
+                },
+                tmux: TmuxClient::new(
+                    processes.clone(),
+                    wt_tmux::TmuxServer::named("wt-port-test-unused"),
+                ),
+                executable: PathBuf::from("wt"),
+                config_selector: None,
+                home: temp.path().to_path_buf(),
+            },
+            GitRepository::new(
+                wt_vcs::RepositoryConfig {
+                    main_clone: main.clone(),
+                    worktree_root: root.clone(),
+                    trunk_branch: "main".into(),
+                    stage: wt_vcs::StageConfig {
+                        prefix: "stage-".into(),
+                        issue_id_pattern: String::new(),
+                    },
+                },
+                processes.clone(),
+            ),
+            processes,
+        );
+        let cancellation = CancellationToken::new();
+
+        // A slug with no worktree left must not hold the only port.
+        port_store(&state.path)
+            .set_slug_dev_port("gone", Some(port))
+            .unwrap();
+        assert_eq!(
+            service
+                .allocate_port("starting", &cancellation)
+                .await
+                .unwrap(),
+            port
+        );
+
+        // A live worktree's reservation still blocks a different slug.
+        let mut store = port_store(&state.path);
+        store.set_slug_dev_port("starting", None).unwrap();
+        store.set_slug_dev_port("live", Some(port)).unwrap();
+        assert!(matches!(
+            service.allocate_port("starting", &cancellation).await,
+            Err(DevServerError::NoPort)
+        ));
+    }
+
     #[tokio::test]
     async fn port_allocation_searches_past_reserved_prefix_without_stealing() {
         let temp = tempfile::tempdir().unwrap();
@@ -1712,7 +1841,13 @@ mod tests {
                 probes.push(port);
                 std::future::ready(PortProbe::Free)
             },
-            |batch| std::future::ready(store.claim_dev_port("new", &batch).map_err(Into::into)),
+            |batch| {
+                std::future::ready(
+                    store
+                        .claim_dev_port("new", &batch, &all_live())
+                        .map_err(Into::into),
+                )
+            },
         )
         .await
         .unwrap();
@@ -1748,7 +1883,13 @@ mod tests {
                     PortProbe::Free
                 })
             },
-            |batch| std::future::ready(store.claim_dev_port("new", &batch).map_err(Into::into)),
+            |batch| {
+                std::future::ready(
+                    store
+                        .claim_dev_port("new", &batch, &all_live())
+                        .map_err(Into::into),
+                )
+            },
         )
         .await;
         assert!(matches!(result, Err(DevServerError::NoPort)));
@@ -1775,13 +1916,17 @@ mod tests {
                     for &port in &batch {
                         assert_eq!(
                             competing
-                                .claim_dev_port(&format!("winner-{port}"), &[port])
+                                .claim_dev_port(&format!("winner-{port}"), &[port], &all_live())
                                 .unwrap(),
                             Some(port)
                         );
                     }
                 }
-                std::future::ready(store.claim_dev_port("new", &batch).map_err(Into::into))
+                std::future::ready(
+                    store
+                        .claim_dev_port("new", &batch, &all_live())
+                        .map_err(Into::into),
+                )
             },
         )
         .await
@@ -1806,7 +1951,13 @@ mod tests {
             Some(8111),
             &CancellationToken::new(),
             |_| std::future::ready(PortProbe::Free),
-            |batch| std::future::ready(store.claim_dev_port("own", &batch).map_err(Into::into)),
+            |batch| {
+                std::future::ready(
+                    store
+                        .claim_dev_port("own", &batch, &all_live())
+                        .map_err(Into::into),
+                )
+            },
         )
         .await
         .unwrap();

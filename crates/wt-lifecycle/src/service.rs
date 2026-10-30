@@ -3913,6 +3913,7 @@ mod tests {
                 )?;
                 store.set_slug_issue_id("ENG-42-feature", Some("COZ-42"))?;
                 store.set_slug_github_issue("ENG-42-feature", Some(42))?;
+                store.set_slug_dev_port("ENG-42-feature", Some(8142))?;
                 store.set_slug_work_status(
                     "ENG-42-feature",
                     Some(&wt_store::WorkStatusRecord {
@@ -3986,6 +3987,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(history.len(), 1);
+        assert_eq!(
+            service
+                .mutate_store(&cancellation, |store| store
+                    .read_slug_dev_port("ENG-42-feature"))
+                .await
+                .unwrap(),
+            None,
+            "removal releases the dev-port reservation"
+        );
         assert_eq!(history[0].extra["title"], "Latest manual title");
         assert_eq!(history[0].extra["issueId"], "COZ-42");
         assert_eq!(history[0].extra["githubIssue"], 42);

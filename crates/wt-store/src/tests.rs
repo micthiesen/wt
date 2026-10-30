@@ -1136,6 +1136,51 @@ fn mutation_of_newer_state_keeps_its_version_and_unrecognized_fields() {
 }
 
 #[test]
+fn dev_port_claims_ignore_reservations_of_slugs_without_a_live_worktree() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store.set_slug_dev_port("live", Some(4500)).unwrap();
+    store.set_slug_dev_port("gone", Some(4501)).unwrap();
+    let live: BTreeSet<String> = ["live", "new"].map(str::to_owned).into();
+    assert_eq!(
+        store.claim_dev_port("new", &[4500, 4501], &live).unwrap(),
+        Some(4501)
+    );
+    assert_eq!(store.read_slug_dev_port("live").unwrap(), Some(4500));
+}
+
+#[test]
+fn recording_a_removal_releases_only_that_slugs_dev_port() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store.set_slug_dev_port("gone", Some(4500)).unwrap();
+    store.set_slug_dev_port("kept", Some(4501)).unwrap();
+    store
+        .record_removed_worktrees(
+            &[RemovedWorktree {
+                slug: "gone".into(),
+                branch: "feature/gone".into(),
+                removed_at: "2026-10-09T00:00:00Z".into(),
+                work: None,
+                automations_paused: None,
+                extra: Default::default(),
+            }],
+            1_792_000_000_000,
+        )
+        .unwrap();
+    assert_eq!(store.read_slug_dev_port("gone").unwrap(), None);
+    assert_eq!(store.read_slug_dev_port("kept").unwrap(), Some(4501));
+}
+
+#[test]
 fn dev_port_claims_skip_existing_allocations_and_automation_toggles_persist() {
     let temp = tempdir().unwrap();
     let mut store = Store::open(
@@ -1143,16 +1188,20 @@ fn dev_port_claims_skip_existing_allocations_and_automation_toggles_persist() {
         identity("repo-a", "/repos/a"),
     )
     .unwrap();
+    let live: BTreeSet<String> = ["a", "b", "c"].map(str::to_owned).into();
     assert_eq!(
-        store.claim_dev_port("a", &[4500, 4501]).unwrap(),
+        store.claim_dev_port("a", &[4500, 4501], &live).unwrap(),
         Some(4500)
     );
     assert_eq!(
-        store.claim_dev_port("b", &[4500, 4501]).unwrap(),
+        store.claim_dev_port("b", &[4500, 4501], &live).unwrap(),
         Some(4501)
     );
     assert_eq!(store.read_slug_dev_port("a").unwrap(), Some(4500));
-    assert_eq!(store.claim_dev_port("c", &[4500, 4501]).unwrap(), None);
+    assert_eq!(
+        store.claim_dev_port("c", &[4500, 4501], &live).unwrap(),
+        None
+    );
     assert!(store.toggle_slug_automations_paused("a").unwrap());
     assert!(
         store
