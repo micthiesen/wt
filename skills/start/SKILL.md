@@ -93,7 +93,10 @@ for a blocker only the human can clear. Keep the PR body and any change guide
 matching the final state. Unless `wt guide` prints `change guides are off`,
 publish a short change guide with the tools your instructions name, put its
 plain URL (not a signed or login link) first in the PR body, and record it with
-`wt guide <url>`. Never merge; the human does.
+`wt guide <url>`. Give the guide the same risk, revert, and post-merge checks
+as your ready note. If it can carry a question for the human, put a
+`needs-human` question there, point the note at it, and read the answer there
+when you resume. Never merge; the human does.
 
 ## User Instructions
 

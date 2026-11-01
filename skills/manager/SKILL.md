@@ -159,6 +159,8 @@ evidence; label theories, and verify a destructive remedy before proposing it.
   a cleanup candidate. The owning session runs the check and asserts
   `verified`; nudge it once. A red, overdue one gets a digest line, not a second
   reminder.
+- **Removing a worktree:** if `wt guide <slug> --json` shows a recorded
+  guide, retire it first the way your instructions say.
 - **Digest** ("where are we?"): one line per live worktree, by slug, ordered ready →
   needs-human → needs-testing → rest, each with its next action and owner
   (human, worker, you).

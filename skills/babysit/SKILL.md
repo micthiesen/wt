@@ -61,6 +61,7 @@ human sees.
 | `checks: fail` | read the failure first; see *Red review check* |
 | `mergeable: conflicting` | rebase onto the base and resolve; `wt restack` if stacked |
 | open human threads | reply and resolve them |
+| open reader comments on a recorded guide | treat them as human threads: answer or fix, then mark them addressed |
 | merged, more work asked | *Next PR from this worktree* |
 
 ## Findings

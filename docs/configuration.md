@@ -838,8 +838,10 @@ agent has; wt only records where it lives. With `enabled = true`:
 - `z` opens the guide in the browser.
 - The bundled `start` and `babysit` skills ask the agent to publish a guide
   for every change, link it at the top of the PR body, record it with
-  `wt guide`, and refresh both as commits land. Which tool publishes it, and
-  where, belongs in your own agent instructions.
+  `wt guide`, refresh both as commits land, and answer reader comments on
+  it; the `manager` skill retires a recorded guide before removing its
+  worktree. Which tool publishes it, and where, belongs in your own agent
+  instructions.
 
 ```toml
 [guides]
