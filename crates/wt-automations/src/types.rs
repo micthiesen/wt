@@ -87,7 +87,7 @@ pub struct BranchTip {
 
 /// An MCP event a rule's poller recorded and no fire has started yet. Its
 /// `data` came from a remote server and people: untrusted, never instructions.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McpEvent {
     pub rule: String,
     pub server: String,
@@ -126,20 +126,20 @@ pub struct AutomationEvalContext {
     pub guides: Vec<GuideOwner>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BranchRange {
     pub branch: String,
     pub from: String,
     pub to: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FrozenPr {
     pub state: String,
     pub is_draft: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AutomationFire {
     pub rule: AutomationDef,
     pub slug: String,

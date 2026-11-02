@@ -441,6 +441,61 @@ impl AutomationLedger {
         .await
     }
 
+    /// Release a claim proven not started and, in the same write, record the
+    /// fire as deferred under `id`. A deferred fire must outlive the process:
+    /// its row may be gone, so nothing would evaluate it again after a
+    /// restart, and its work (a remote branch delete) would never happen.
+    pub async fn release_deferred(
+        &self,
+        claim: &DispatchClaim,
+        id: &str,
+        record: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        let claim_id = claim.claim_id.clone();
+        let keys = claim.keys.clone();
+        self.mutate("defer dispatch", cancellation, move |root| {
+            let fired = ensure_object(root, "fired");
+            for key in &keys {
+                let ours = fired
+                    .get(key.as_str())
+                    .and_then(Value::as_object)
+                    .is_some_and(|entry| {
+                        entry.get("state").and_then(Value::as_str) == Some("dispatched")
+                            && entry.get("claimId").and_then(Value::as_str)
+                                == Some(claim_id.as_str())
+                    });
+                if ours {
+                    fired.remove(key);
+                }
+            }
+            ensure_object(root, "deferred").insert(id.to_owned(), record);
+        })
+        .await
+    }
+
+    /// Forget a deferred fire once it reached a terminal outcome.
+    pub async fn clear_deferred(
+        &self,
+        id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.mutate("clear deferral", cancellation, |root| {
+            ensure_object(root, "deferred").remove(id);
+        })
+        .await
+    }
+
+    /// Deferred fires recorded by any process, by identity.
+    pub async fn deferred(&self) -> Result<BTreeMap<String, Value>, LedgerError> {
+        let root = self.read_root().await?;
+        Ok(root
+            .get("deferred")
+            .and_then(Value::as_object)
+            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default())
+    }
+
     pub async fn mark_skipped(
         &self,
         keys: &[String],
@@ -713,7 +768,7 @@ impl AutomationLedger {
                         message: "root must be an object".into(),
                     });
                 }
-                for field in ["fired", "breaker", "lastDispatch"] {
+                for field in ["fired", "breaker", "lastDispatch", "deferred"] {
                     if value.get(field).is_some_and(|entry| !entry.is_object()) {
                         return Err(LedgerError::Invalid {
                             path: self.path.clone(),
@@ -882,6 +937,11 @@ fn prune(root: &mut Value, now_ms: i64) {
     }
     if let Some(last) = root.get_mut("lastDispatch").and_then(Value::as_object_mut) {
         last.retain(|_, timestamp| number(Some(timestamp)).is_none_or(|at| at >= cutoff));
+    }
+    // A deferral older than the retention window is waiting on something
+    // that will not change (an unreachable GitHub, an abandoned child PR).
+    if let Some(deferred) = root.get_mut("deferred").and_then(Value::as_object_mut) {
+        deferred.retain(|_, entry| number(entry.get("queuedAtMs")).is_none_or(|at| at >= cutoff));
     }
 }
 

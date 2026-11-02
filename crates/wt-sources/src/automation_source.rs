@@ -133,6 +133,11 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         if let Err(error) = engine.reconcile_boot(&delivered, now_ms()).await {
             tracing::warn!(%error, "cannot reconcile automation ledger at startup");
         }
+        match engine.restore_deferred(now_ms()).await {
+            Ok(0) => {}
+            Ok(restored) => tracing::info!(restored, "requeued deferred automation fires"),
+            Err(error) => tracing::warn!(%error, "cannot restore deferred automation fires"),
+        }
 
         let mut git_rx = sources.git.subscribe();
         let mut metadata_rx = sources.metadata.subscribe();
@@ -527,9 +532,9 @@ async fn dispatch_claim(
                 tracing::info!(rule = %fire.rule.id, %reason, "automation will retry");
                 (AutomationOutcome::NotStarted, None)
             }
-            wt_ops::automation_builtins::BuiltinExecution::Defer { reason } => {
+            wt_ops::automation_builtins::BuiltinExecution::Defer { reason, frozen } => {
                 tracing::info!(rule = %fire.rule.id, %reason, "automation deferred");
-                (AutomationOutcome::Deferred { reason }, None)
+                (AutomationOutcome::Deferred { reason, frozen }, None)
             }
             wt_ops::automation_builtins::BuiltinExecution::Completed { message } => {
                 tracing::info!(rule = %fire.rule.id, %message, "automation completed");

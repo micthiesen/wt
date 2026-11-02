@@ -23,6 +23,8 @@ pub enum BuiltinExecution {
     /// after its worktree is gone: the engine requeues the same frozen fire.
     Defer {
         reason: String,
+        /// What a retry needs that may be gone by then, by frozen-var name.
+        frozen: std::collections::BTreeMap<String, String>,
     },
     Completed {
         message: String,
@@ -353,6 +355,7 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
         Err(error) => {
             return Ok(BuiltinExecution::Defer {
                 reason: format!("cannot confirm the merge of {branch}: {error:#}"),
+                frozen: Default::default(),
             });
         }
     };
@@ -377,12 +380,22 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
     // Delete only the commit that was proven merged: the merged PR's head,
     // or without a PR the local branch tip that Git proved landed. Commits
     // pushed to the branch since then must survive.
+    // A retry may run after the worktree's cleanup deleted the local branch,
+    // so a tip proven on an earlier attempt is carried with the fire.
+    let carried = fire
+        .frozen_vars
+        .as_ref()
+        .and_then(|vars| vars.get(DELETE_TIP_VAR))
+        .cloned();
     let expected = match claimed {
         Some(number) => prs
             .iter()
             .find(|pr| pr.number == number)
             .and_then(|pr| pr.head_oid.clone()),
-        None => local_branch_tip(ctx, branch).await,
+        None => match carried {
+            Some(tip) => Some(tip),
+            None => local_branch_tip(ctx, branch).await,
+        },
     };
     let Some(expected) = expected.filter(|sha| !sha.trim().is_empty()) else {
         let reason = "the merged head commit is unknown";
@@ -396,11 +409,13 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
             message: format!("declined to delete {branch}: {reason}"),
         });
     };
+    let frozen = std::collections::BTreeMap::from([(DELETE_TIP_VAR.to_owned(), expected.clone())]);
     let local_children = match stacked_worktrees(ctx, branch, &fire.slug).await {
         Ok(children) => children,
         Err(error) => {
             return Ok(BuiltinExecution::Defer {
                 reason: format!("cannot read which worktrees stack on {branch}: {error:#}"),
+                frozen,
             });
         }
     };
@@ -415,7 +430,9 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
     )
     .await?
     {
-        GuardedDelete::Deferred(reason) => return Ok(BuiltinExecution::Defer { reason }),
+        GuardedDelete::Deferred(reason) => {
+            return Ok(BuiltinExecution::Defer { reason, frozen });
+        }
         GuardedDelete::Attempted(outcome) => outcome,
     };
     match outcome {
@@ -448,6 +465,9 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
         }
     }
 }
+
+/// Frozen var naming the merged commit a deferred delete may remove.
+const DELETE_TIP_VAR: &str = "delete_branch_tip";
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuardedDelete {

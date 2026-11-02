@@ -99,7 +99,12 @@ pub enum AutomationOutcome {
     /// again later: it is requeued as is (frozen inputs included), so it
     /// outlives its worktree. Exempt from the breaker by construction, since
     /// nothing is recorded as dispatched.
-    Deferred { reason: String },
+    Deferred {
+        reason: String,
+        /// Facts the run learned that a retry needs after its worktree is
+        /// gone (the proven merged tip). Carried into the fire's frozen vars.
+        frozen: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +171,7 @@ struct ActiveFire {
 struct Deferral {
     reason: String,
     reported: bool,
+    frozen: BTreeMap<String, String>,
 }
 
 /// Queue and ledger coordinator. The caller drives `tick` on source changes
@@ -279,6 +285,44 @@ impl AutomationEngine {
             .reconcile_dispatched(delivered_keys, now_ms, &self.cancellation)
             .await
             .context("reconcile interrupted automation dispatches")
+    }
+
+    /// Requeue the fires a previous process deferred. Their worktrees may be
+    /// gone, so evaluation alone would never produce them again. A record
+    /// this build cannot read is left for a build that can.
+    pub async fn restore_deferred(&mut self, now_ms: i64) -> Result<usize> {
+        let records = self
+            .ledger
+            .deferred()
+            .await
+            .context("read deferred automation fires")?;
+        let mut restored = 0;
+        for (id, record) in records {
+            let Ok(fire) = serde_json::from_value::<AutomationFire>(record["fire"].clone()) else {
+                tracing::warn!(%id, "skipping an unreadable deferred automation fire");
+                continue;
+            };
+            let queued_at_ms = record["queuedAtMs"].as_i64().unwrap_or(now_ms);
+            let frozen = serde_json::from_value(record["frozen"].clone()).unwrap_or_default();
+            self.deferrals.insert(
+                id.clone(),
+                Deferral {
+                    reason: record["reason"].as_str().unwrap_or_default().to_owned(),
+                    reported: false,
+                    frozen,
+                },
+            );
+            self.intents.insert(
+                id,
+                AutomationIntent {
+                    fire,
+                    queued_at_ms,
+                    settle_at_ms: now_ms.saturating_add(DEFER_RETRY_MS),
+                },
+            );
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     pub async fn tick(&mut self, input: AutomationPassInput<'_>) -> Result<AutomationTick> {
@@ -563,6 +607,14 @@ impl AutomationEngine {
                     if manager_run {
                         manager_in_flight = true;
                     }
+                    let mut fire = fire;
+                    if let Some(deferral) = self.deferrals.get(&id)
+                        && !deferral.frozen.is_empty()
+                    {
+                        fire.frozen_vars
+                            .get_or_insert_with(BTreeMap::new)
+                            .extend(deferral.frozen.clone());
+                    }
                     self.active.insert(
                         id.clone(),
                         ActiveFire {
@@ -616,6 +668,13 @@ impl AutomationEngine {
             executing: &executing,
             handled: &handled,
         });
+        // A deferred fire is work already decided on, not a queued trigger:
+        // pausing or clearing the queue must not consume its key, or a
+        // deferred remote branch delete would never run.
+        let fires = fires
+            .into_iter()
+            .filter(|fire| !self.deferrals.contains_key(&fire_identity(fire)))
+            .collect::<Vec<_>>();
         let cancelled = fires
             .iter()
             .flat_map(|fire| fire.fire_keys.iter().cloned())
@@ -638,7 +697,8 @@ impl AutomationEngine {
         // Every remaining pending key is either now durably cancelled or was
         // already handled by another writer. Clear only after persistence
         // succeeds so a ledger error leaves the queue retryable.
-        self.intents.clear();
+        let deferrals = &self.deferrals;
+        self.intents.retain(|id, _| deferrals.contains_key(id));
         Ok(count)
     }
 
@@ -683,13 +743,43 @@ impl AutomationEngine {
                     .release_not_started(&ledger_claim, cancellation)
                     .await
                     .context("release automation claim proven not started")?;
-                self.active.remove(&claim.id);
+                let active = self.active.remove(&claim.id);
+                // A deferred fire may have no row left to re-evaluate it;
+                // keep it queued (its ledger record stays) instead of losing it.
+                if let Some(active) = active
+                    && self.deferrals.contains_key(&claim.id)
+                {
+                    self.intents.insert(
+                        claim.id.clone(),
+                        AutomationIntent {
+                            fire: active.fire,
+                            queued_at_ms: active.queued_at_ms,
+                            settle_at_ms: now_ms.saturating_add(DEFER_RETRY_MS),
+                        },
+                    );
+                }
             }
-            AutomationOutcome::Deferred { reason } => {
+            AutomationOutcome::Deferred { reason, frozen } => {
+                let active = self
+                    .active
+                    .get(&claim.id)
+                    .context("deferred automation dispatch is not active")?;
+                let mut carried = self
+                    .deferrals
+                    .get(&claim.id)
+                    .map(|deferral| deferral.frozen.clone())
+                    .unwrap_or_default();
+                carried.extend(frozen);
+                let record = serde_json::json!({
+                    "fire": serde_json::to_value(&active.fire).context("encode deferred fire")?,
+                    "queuedAtMs": active.queued_at_ms,
+                    "reason": reason,
+                    "frozen": carried,
+                });
                 self.ledger
-                    .release_not_started(&ledger_claim, cancellation)
+                    .release_deferred(&ledger_claim, &claim.id, record, cancellation)
                     .await
-                    .context("release deferred automation claim")?;
+                    .context("record deferred automation fire")?;
                 let active = self
                     .active
                     .remove(&claim.id)
@@ -717,6 +807,7 @@ impl AutomationEngine {
                     Deferral {
                         reason,
                         reported: reported || report,
+                        frozen: carried,
                     },
                 );
                 self.intents.insert(
@@ -733,6 +824,7 @@ impl AutomationEngine {
                     .mark_delivered(&ledger_claim, now_ms, cancellation)
                     .await
                     .context("mark automation delivered")?;
+                self.forget_deferral(&claim.id, cancellation).await?;
                 self.finish_slot(&claim.id, slot, now_ms);
             }
             AutomationOutcome::Ambiguous { reason, slot } => {
@@ -740,6 +832,7 @@ impl AutomationEngine {
                     .mark_ambiguous(&ledger_claim, now_ms, &reason, cancellation)
                     .await
                     .context("mark automation delivery ambiguous")?;
+                self.forget_deferral(&claim.id, cancellation).await?;
                 self.finish_slot(&claim.id, slot, now_ms);
             }
         }
@@ -749,6 +842,16 @@ impl AutomationEngine {
             self.recent = ledger.recent(RECENT_HISTORY);
         }
         Ok(notice)
+    }
+
+    async fn forget_deferral(&mut self, id: &str, cancellation: &CancellationToken) -> Result<()> {
+        if self.deferrals.remove(id).is_some() {
+            self.ledger
+                .clear_deferred(id, cancellation)
+                .await
+                .context("clear deferred automation fire")?;
+        }
+        Ok(())
     }
 
     fn finish_slot(&mut self, id: &str, slot: DeliverySlot, now_ms: i64) {
@@ -1185,12 +1288,24 @@ mod tests {
                 &claim,
                 AutomationOutcome::Deferred {
                     reason: "open PR(s) #7 still target worktree".into(),
+                    frozen: BTreeMap::from([("delete_branch_tip".into(), "abc123".into())]),
                 },
                 start + 1,
             )
             .await
             .unwrap();
         assert_eq!(notice, None);
+
+        // A restart keeps it: a fresh engine on the same ledger requeues it,
+        // since nothing would evaluate a removed row again.
+        drop(engine);
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert_eq!(engine.restore_deferred(start + 1).await.unwrap(), 1);
+        // Pausing or clearing the queue does not consume it either.
+        let mut paused = pass(&[], start + 1);
+        paused.globally_paused = true;
+        engine.cancel_pending(paused).await.unwrap();
+        assert_eq!(engine.pending_count(), 1);
 
         // Still landed, so the condition re-fires, but the re-check waits.
         let early = engine.tick(pass(&landed, start + 2)).await.unwrap();
@@ -1216,6 +1331,16 @@ mod tests {
             let Some(claim) = tick.claims.first() else {
                 panic!("deferred fire was not re-dispatched at +{}ms", at - start);
             };
+            // The tip proven before the worktree went is still carried.
+            assert_eq!(
+                claim
+                    .fire()
+                    .frozen_vars
+                    .as_ref()
+                    .and_then(|vars| vars.get("delete_branch_tip"))
+                    .map(String::as_str),
+                Some("abc123")
+            );
             attempts += 1;
             notices.extend(
                 engine
@@ -1223,6 +1348,7 @@ mod tests {
                         claim,
                         AutomationOutcome::Deferred {
                             reason: "open PR(s) #7 still target worktree".into(),
+                            frozen: BTreeMap::new(),
                         },
                         at,
                     )
@@ -1254,6 +1380,7 @@ mod tests {
             .unwrap();
         assert!(after.claims.is_empty());
         assert_eq!(engine.pending_count(), 0);
+        assert!(ledger.deferred().await.unwrap().is_empty());
     }
 
     #[tokio::test]
