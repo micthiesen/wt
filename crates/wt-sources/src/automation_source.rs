@@ -119,6 +119,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     // longer-lived command context. Only claimed dispatches own that drain.
     context.cancellation = token.clone();
     let drain_token = token.clone();
+    crate::mcp_events::start(scope, &context, token.clone());
     let task = scope.spawn(async move {
         let ledger = AutomationLedger::new(context.config.paths.cache_root.join("automations.json"));
         let mut engine = AutomationEngine::new(ledger, token.clone());
@@ -189,11 +190,21 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             active_dispatches.remove(&id);
                             if let Some(error) = error { latest_error = Some(error); }
                             let advanced_tip = claim.fire().branch_range.as_ref().map(|range| (range.branch.clone(), range.to.clone()));
+                            let delivered_event = claim.fire().mcp_event.as_ref().map(|event| (event.rule.clone(), event.event_id.clone()));
                             let started = !matches!(outcome, AutomationOutcome::NotStarted);
                             if let Err(error) = engine.finish_with_cancellation(
                                 &claim, outcome, now_ms(), &accepted_context.cancellation,
                             ).await {
                                 latest_error = Some(format!("automation ledger finish: {error:#}"));
+                            }
+                            // The ledger already holds the fire's key, so a
+                            // failed drop only leaves an event that cannot
+                            // fire twice.
+                            if started && let Some((rule, event_id)) = delivered_event {
+                                let dropped = context.database.call(move |store| Ok(store.drop_mcp_event(&rule, &event_id)?)).await;
+                                if let Err(error) = dropped {
+                                    latest_error = Some(format!("cannot drop a delivered MCP event: {error:#}"));
+                                }
                             }
                             if started && let Some((branch, tip)) = advanced_tip {
                                 let update = [(branch.clone(), tip.clone())].into_iter().collect();
@@ -805,6 +816,7 @@ fn metadata_facts_key(metadata: Option<&crate::local_source::Metadata>) -> serde
                 "issueId",
                 "githubIssue",
                 "automationsPaused",
+                "guide",
             ] {
                 if let Some(value) = record.get(field) {
                     relevant.insert(field.into(), value.clone());
@@ -826,6 +838,11 @@ fn metadata_facts_key(metadata: Option<&crate::local_source::Metadata>) -> serde
         "pausedStacks": state["pausedStacks"],
         "automationsPaused": state["automationsPaused"],
         "branchTips": state["branchTips"],
+        // Only which events wait matters; the cursor moves on quiet polls.
+        "mcpEvents": state["mcpEvents"].as_object().map(|rules| rules.iter().map(|(rule, entry)| {
+            let ids = entry["pending"].as_array().into_iter().flatten().map(|event| event["eventId"].clone()).collect::<Vec<_>>();
+            (rule.clone(), serde_json::json!({"subscription": entry["subscription"], "pending": ids}))
+        }).collect::<serde_json::Map<_, _>>()),
         "removedPauses": removed_pauses,
     })
 }

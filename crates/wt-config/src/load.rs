@@ -756,7 +756,8 @@ impl Config {
         }
 
         let actions = parse_actions(&raw, &mut errors);
-        let automations = parse_automations(&raw, &actions, &branch, &mut errors);
+        let mcp_servers = parse_mcp_servers(&raw, &mut errors);
+        let automations = parse_automations(&raw, &actions, &branch, &mcp_servers, &mut errors);
         let skills_raw: SkillsSection = section(&raw, "skills", &mut errors);
         let manager_raw: ManagerSection = section(&raw, "manager", &mut errors);
         let update_raw: StartupCheckSection = section(&raw, "update", &mut errors);
@@ -800,6 +801,7 @@ impl Config {
             github,
             actions,
             automations,
+            mcp_servers,
             ui,
             skills: SkillsConfig {
                 startup_check: skills_raw.startup_check,
@@ -1130,10 +1132,66 @@ fn default_actions() -> Vec<ActionDef> {
     ]
 }
 
+fn parse_mcp_servers(
+    raw: &toml::Value,
+    errors: &mut Vec<String>,
+) -> BTreeMap<String, McpServerConfig> {
+    let Some(value) = raw.get("mcp_servers") else {
+        return BTreeMap::new();
+    };
+    let Some(table) = value.as_table() else {
+        errors.push("mcp_servers must be a table of [mcp_servers.<name>] tables".into());
+        return BTreeMap::new();
+    };
+    let mut servers = BTreeMap::new();
+    for (name, value) in table {
+        let tag = format!("mcp_servers.{name}");
+        let server: McpServerConfig = match value.clone().try_into() {
+            Ok(server) => server,
+            Err(error) => {
+                errors.push(format!("{tag}: {error}"));
+                continue;
+            }
+        };
+        let authority = server
+            .url
+            .split_once("://")
+            .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or_default())
+            .unwrap_or_default();
+        let host = authority
+            .rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map_or(authority, |(host, _)| host);
+        let local = server.url.starts_with("http://")
+            && ["localhost", "127.0.0.1", "[::1]"].contains(&host);
+        if authority.is_empty() || authority.contains('@') {
+            errors.push(format!("{tag}.url must name a host and no credentials"));
+            continue;
+        }
+        if !server.url.starts_with("https://") && !local {
+            errors.push(format!(
+                "{tag}.url must be an https:// URL (plain http only for localhost)"
+            ));
+            continue;
+        }
+        if let Some(command) = &server.token_command
+            && (command.is_empty()
+                || command[0].is_empty()
+                || command.iter().any(|arg| arg.contains('\0')))
+        {
+            errors.push(format!("{tag}.token_command must be a non-empty argv list whose first entry names the helper program"));
+            continue;
+        }
+        servers.insert(name.clone(), server);
+    }
+    servers
+}
+
 fn parse_automations(
     raw: &toml::Value,
     actions: &[ActionDef],
     branch: &BranchConfig,
+    mcp_servers: &BTreeMap<String, McpServerConfig>,
     errors: &mut Vec<String>,
 ) -> Vec<AutomationDef> {
     let Some(value) = raw.get("automations") else {
@@ -1175,7 +1233,7 @@ fn parse_automations(
             continue;
         }
         let Some(on) = parse_trigger(&input.on) else {
-            errors.push(format!("{tag}.on must be one of: pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verification_overdue, branch.advanced"));
+            errors.push(format!("{tag}.on must be one of: pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verification_overdue, branch.advanced, mcp.event"));
             continue;
         };
         if input.run.is_empty() {
@@ -1283,6 +1341,71 @@ fn parse_automations(
             errors.push(format!("{tag}.branch \"{name}\" is neither [branch] base nor in [branch] keep_fresh — nothing would advance it, so the rule could never fire"));
             continue;
         }
+        let mcp = on == AutomationTrigger::McpEvent;
+        if !mcp && (input.server.is_some() || input.event.is_some() || input.arguments.is_some()) {
+            errors.push(format!(
+                "{tag}: server, event and arguments only apply to on = \"mcp.event\" (got \"{}\")",
+                trigger_name(on)
+            ));
+            continue;
+        }
+        if mcp {
+            match input.server.as_deref() {
+                None => {
+                    errors.push(format!(
+                        "{tag}: on = \"mcp.event\" requires server = \"<[mcp_servers] name>\""
+                    ));
+                    continue;
+                }
+                Some(name) if !mcp_servers.contains_key(name) => {
+                    errors.push(format!(
+                        "{tag}.server \"{name}\" is not a [mcp_servers] entry"
+                    ));
+                    continue;
+                }
+                Some(_) => {}
+            }
+            if input
+                .event
+                .as_deref()
+                .is_none_or(|event| event.trim().is_empty())
+            {
+                errors.push(format!(
+                    "{tag}: on = \"mcp.event\" requires event = \"<event name>\""
+                ));
+                continue;
+            }
+            // Event payloads are untrusted text; a prompt fences them, a shell
+            // command would run them.
+            // A headless run approves its own tool calls, and a slot is not
+            // the event's audience; only a supervised session or the manager
+            // reads people's text.
+            let prompt_action = actions.iter().any(|action| {
+                action.id == input.run
+                    && action.kind == ActionKind::Claude
+                    && matches!(action.target, ActionTarget::Session | ActionTarget::Manager)
+            });
+            if !prompt_action && input.run != "builtin:notify" {
+                errors.push(format!("{tag}: on = \"mcp.event\" runs a prompt action with target = \"session\" or \"manager\", or builtin:notify; never a shell, headless or slot action"));
+                continue;
+            }
+        }
+        let arguments = match input
+            .arguments
+            .map(|table| {
+                serde_json::to_value(table).map(|value| match value {
+                    serde_json::Value::Object(map) => map.into_iter().collect(),
+                    _ => BTreeMap::new(),
+                })
+            })
+            .transpose()
+        {
+            Ok(arguments) => arguments.unwrap_or_default(),
+            Err(error) => {
+                errors.push(format!("{tag}.arguments: {error}"));
+                continue;
+            }
+        };
         result.push(AutomationDef {
             id: input.id,
             on,
@@ -1292,6 +1415,9 @@ fn parse_automations(
             after_days: input.after_days.unwrap_or(2.0),
             settle_seconds: input.settle_seconds.unwrap_or_else(|| default_settle(on)),
             branch: branch_name,
+            server: input.server,
+            event: input.event.map(|event| event.trim().to_owned()),
+            arguments,
         });
     }
     result
@@ -1317,6 +1443,7 @@ fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
         "status.ready" => AutomationTrigger::StatusReady,
         "status.verification_overdue" => AutomationTrigger::StatusVerificationOverdue,
         "branch.advanced" => AutomationTrigger::BranchAdvanced,
+        "mcp.event" => AutomationTrigger::McpEvent,
         _ => return None,
     })
 }
@@ -1334,6 +1461,7 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::StatusReady => "status.ready",
         AutomationTrigger::StatusVerificationOverdue => "status.verification_overdue",
         AutomationTrigger::BranchAdvanced => "branch.advanced",
+        AutomationTrigger::McpEvent => "mcp.event",
     }
 }
 fn default_settle(on: AutomationTrigger) -> f64 {
@@ -1342,7 +1470,8 @@ fn default_settle(on: AutomationTrigger) -> f64 {
         | AutomationTrigger::StatusNeedsHuman
         | AutomationTrigger::StatusNeedsTesting
         | AutomationTrigger::StatusReady
-        | AutomationTrigger::StatusVerificationOverdue => 0.0,
+        | AutomationTrigger::StatusVerificationOverdue
+        | AutomationTrigger::McpEvent => 0.0,
         AutomationTrigger::WtMerged
         | AutomationTrigger::StackParentMerged
         | AutomationTrigger::BranchAdvanced => 10.0,
@@ -1527,4 +1656,7 @@ struct RawAutomation {
     after_days: Option<f64>,
     settle_seconds: Option<f64>,
     branch: Option<String>,
+    server: Option<String>,
+    event: Option<String>,
+    arguments: Option<toml::Table>,
 }

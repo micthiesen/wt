@@ -288,13 +288,7 @@ impl AutomationEngine {
                 restack_stacks.insert(stack_id.clone());
             }
             if matches!(active.slot, SlotState::Dispatching)
-                && input
-                    .context
-                    .actions
-                    .get(&active.fire.rule.run)
-                    .is_some_and(|traits| {
-                        traits.audience == wt_automations::ActionAudience::Manager
-                    })
+                && manager_bound(&active.fire, input.context)
             {
                 manager_in_flight = true;
             }
@@ -312,10 +306,7 @@ impl AutomationEngine {
             let fire = intent.fire;
             let id = fire_identity(&fire);
             let rule = &fire.rule;
-            let manager_run =
-                input.context.actions.get(&rule.run).is_some_and(|traits| {
-                    traits.audience == wt_automations::ActionAudience::Manager
-                });
+            let manager_run = manager_bound(&fire, input.context);
             let audience = input
                 .context
                 .actions
@@ -672,8 +663,25 @@ fn pair_target(fire: &AutomationFire) -> String {
     fire.stack_id.clone().unwrap_or_else(|| fire.slug.clone())
 }
 
+/// Whether the fire is delivered to the manager: its action targets the
+/// manager, or it is an MCP event no worktree owns, which goes there instead
+/// of the session its action names.
+fn manager_bound(fire: &AutomationFire, context: &wt_automations::AutomationEvalContext) -> bool {
+    let audience = context
+        .actions
+        .get(&fire.rule.run)
+        .map(|traits| traits.audience);
+    audience == Some(wt_automations::ActionAudience::Manager)
+        || (fire.mcp_event.is_some()
+            && fire.slug == wt_automations::FLEET_SLUG
+            && audience == Some(wt_automations::ActionAudience::Session))
+}
+
 fn breaker_exempt(fire: &AutomationFire, manager_run: bool) -> bool {
     fire.rule.on == wt_config::AutomationTrigger::BranchAdvanced
+        // Each event is a distinct occurrence, and the server leaves out the
+        // agents' own writes, so a reply cannot wake its sender in a loop.
+        || fire.rule.on == wt_config::AutomationTrigger::McpEvent
         || fire.rule.run == "builtin:notify"
         || fire.rule.run == "builtin:close-issue"
         || fire.rule.run == "builtin:delete-branch"

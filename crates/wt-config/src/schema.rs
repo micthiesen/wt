@@ -366,6 +366,8 @@ pub enum AutomationTrigger {
     StatusVerificationOverdue,
     #[serde(rename = "branch.advanced")]
     BranchAdvanced,
+    #[serde(rename = "mcp.event")]
+    McpEvent,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -387,6 +389,13 @@ pub struct AutomationDef {
     pub after_days: f64,
     pub settle_seconds: f64,
     pub branch: Option<String>,
+    /// `mcp.event`: the `[mcp_servers]` entry to poll.
+    pub server: Option<String>,
+    /// `mcp.event`: the event type name, such as `comment.created`.
+    pub event: Option<String>,
+    /// `mcp.event`: the subscription's `arguments`, as the server's
+    /// `inputSchema` describes them.
+    pub arguments: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for AutomationDef {
@@ -400,8 +409,21 @@ impl Default for AutomationDef {
             after_days: 2.0,
             settle_seconds: 120.0,
             branch: None,
+            server: None,
+            event: None,
+            arguments: BTreeMap::new(),
         }
     }
+}
+
+/// A remote MCP server (Streamable HTTP) that wt polls for MCP Events.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub url: String,
+    /// Argv whose stdout is the bearer token, such as a Keychain lookup.
+    /// The token is never written to configuration, logs or state.
+    pub token_command: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,6 +624,8 @@ pub struct Config {
     pub github: GithubConfig,
     pub actions: Vec<ActionDef>,
     pub automations: Vec<AutomationDef>,
+    /// Remote MCP servers that `mcp.event` automations poll, by name.
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub ui: UiConfig,
     pub skills: SkillsConfig,
     pub manager: ManagerConfig,

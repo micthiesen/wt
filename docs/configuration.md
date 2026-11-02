@@ -1052,6 +1052,21 @@ Fields:
 
 **Template variables** (`{{var}}`, unknown vars pass through so typos are visible): `{{base}}` resolved diff base, `{{base_branch}}` parent branch or trunk, `{{branch}}`, `{{slug}}`, `{{cwd}}` worktree path, `{{pr}}` PR number or empty, `{{issue_id}}` the worktree's tracker id — the `wt issue --id` / `#` override when set, else the id carried in the slug (`coz-2176-active-louse` → `COZ-2176`); empty when neither exists, empty rather than the slug, because an obviously-wrong request beats a plausible one against the wrong issue, `{{stage}}` the worktree's SST stage, `{{skill_prefix}}` the harness's skill-invocation prefix (`/` for Claude Code, `$` for Codex/OpenCode, `/skill:` for Pi; write `{{skill_prefix}}restack` to invoke a skill portably), and `{{arg}}` for the collected `arg_prompt` value. One var needs no subject worktree and so works in the row-less manager/slot palettes too: `{{today}}` renders the current weekday and date at dispatch time (`Tuesday, August 11, 2026`) — a long-lived session's weakest fact, since the model has a training cutoff and a compaction summary carries no timestamp. The built-in compact actions use it; an explicit var of the same name overrides it.
 
+## `[mcp_servers]` — remote MCP servers for `mcp.event`
+
+Named remote MCP servers (Streamable HTTP) that [`mcp.event` automations](automations.md#mcp-events) poll. Nothing else uses them.
+
+```toml
+[mcp_servers.artifacts]
+url           = "https://cozee.artifacts.boo/mcp"
+token_command = ["security", "find-generic-password", "-s", "wt-artifacts-token", "-w"]
+```
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `url` | **yes** | — | The server's MCP endpoint. Must be `https://`; plain `http://` only for `localhost`, `127.0.0.1` or `[::1]`. |
+| `token_command` | no | *(none: no `Authorization` header)* | Argv whose stdout is the bearer token. Its output is never logged, stored or included in an error, and it runs again once when the server answers 401. Store the token with `security add-generic-password -U -s wt-artifacts-token -a "$USER" -w`. |
+
 ## `[[automations]]` — optional, strictly opt-in
 
 Rules that fire actions (or built-in flows) automatically off PR and stack state ([stacked-prs.md](stacked-prs.md)). No defaults ship; an absent section means nothing is automated. Deep dive on the semantics (fire keys, settle windows, circuit breaker): [automations.md](automations.md).
@@ -1074,13 +1089,16 @@ settle_seconds   = 300
 | key | required | default | meaning |
 |---|---|---|---|
 | `id` | **yes** | — | Unique rule id (used in fire-key bookkeeping and logs). |
-| `on` | **yes** | — | Trigger: `pr.checks.failed`, `review_bot.unresolved` (the `[review_bot]`'s findings; `rabbit.unresolved` is a legacy alias), `review.changes_requested`, `pr.conflict`, `wt.merged` (a non-stacked worktree landed), `stack.parent_merged` (a stack member's parent landed), `status.needs_human` / `status.needs_testing` / `status.ready` (the worktree's asserted work status is that state; hyphenated spellings are accepted aliases). |
+| `on` | **yes** | — | Trigger: `mcp.event` (an event from a `[mcp_servers]` entry; see [automations.md](automations.md#mcp-events)), `pr.checks.failed`, `review_bot.unresolved` (the `[review_bot]`'s findings; `rabbit.unresolved` is a legacy alias), `review.changes_requested`, `pr.conflict`, `wt.merged` (a non-stacked worktree landed), `stack.parent_merged` (a stack member's parent landed), `status.needs_human` / `status.needs_testing` / `status.ready` (the worktree's asserted work status is that state; hyphenated spellings are accepted aliases). |
 | `run` | **yes** | — | An `[[actions]]` id, or a builtin: `builtin:restack` (only valid with `stack.parent_merged`), `builtin:clean` (any single-worktree trigger), `builtin:notify` (any trigger; a macOS banner), `builtin:close-issue` (only valid with `wt.merged`; closes the worktree's attached GitHub issue as completed once the branch lands), `builtin:delete-branch` (only valid with `wt.merged`; deletes the branch's ref on the origin repo once it lands, the same effect as GitHub's "Automatically delete head branches" setting for repos that have not enabled it). |
 | `busy` | no | `"queue"` | When the worktree isn't quiescent at delivery time: `queue` holds the intent until it settles, `skip` drops it. |
 | `cooldown_minutes` | no | *(none)* | Minimum minutes between dispatches per (rule, worktree). |
 | `branch` | no | *(none)* | **`branch.advanced` only** (required there, rejected elsewhere): which branch to watch. Must be `[branch] base` or listed in `[branch] keep_fresh` — nothing else advances a local head, so watching an unfetched branch is a rule that can never fire. No default on purpose: guessing the trunk would watch the wrong thing on exactly the fleets this exists for, where the release branch is the one you *don't* fork from. |
+| `server` | no | *(none)* | **`mcp.event` only** (required there, rejected elsewhere): the `[mcp_servers]` entry to poll. |
+| `event` | no | *(none)* | **`mcp.event` only** (required there): the event type name, such as `comment.created`. |
+| `arguments` | no | `{}` | **`mcp.event` only**: the subscription's arguments as a TOML table, as the server's `events/list` input schema describes them (artifacts.boo takes `artifact` and, for `artifact.answered`, `component`). Changing them starts a new subscription from now. |
 | `after_days` | no | `2` | **`status.verification_overdue` only** (rejected on any other trigger): how long an outstanding post-merge verification may sit before the rule starts firing. A knob because deploy cadence is the one thing wt cannot guess — a fleet that deploys on merge wants `1`, one that batches a weekly release wants `7`, and a default wrong in either direction turns the reminder into noise or into nothing. |
-| `settle_seconds` | no | `120` (merge and `branch.advanced` triggers: `10`; `wt.created` and status triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. |
+| `settle_seconds` | no | `120` (merge and `branch.advanced` triggers: `10`; `wt.created`, status and `mcp.event` triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. |
 
 At runtime, `A` pauses all automations and `Ctrl+A` pauses the selected worktree (or its whole stack); both persist across restarts.
 

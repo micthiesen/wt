@@ -83,6 +83,26 @@ pub struct BranchTip {
     pub seen: Option<String>,
 }
 
+/// An MCP event a rule's poller recorded and no fire has started yet. Its
+/// `data` came from a remote server and people: untrusted, never instructions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpEvent {
+    pub rule: String,
+    pub server: String,
+    pub server_url: String,
+    pub event_id: String,
+    pub name: String,
+    pub timestamp: String,
+    pub data: serde_json::Value,
+}
+
+/// A worktree's recorded change guide, for routing events about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuideOwner {
+    pub slug: String,
+    pub url: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AutomationEvalContext {
     pub github_fresh: bool,
@@ -96,6 +116,10 @@ pub struct AutomationEvalContext {
     pub branch_tips: BTreeMap<String, BranchTip>,
     /// Frozen template values for post-merge external fires.
     pub row_vars: BTreeMap<String, BTreeMap<String, String>>,
+    /// Pending events of `mcp.event` rules, oldest first.
+    pub mcp_events: Vec<McpEvent>,
+    /// Live worktrees' recorded guides (`wt guide <url>`).
+    pub guides: Vec<GuideOwner>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +148,9 @@ pub struct AutomationFire {
     pub branch_range: Option<BranchRange>,
     pub frozen_vars: Option<BTreeMap<String, String>>,
     pub frozen_pr: Option<FrozenPr>,
+    /// The event an `mcp.event` fire delivers. A fire with no owning
+    /// worktree has `slug == FLEET_SLUG` and goes to the manager.
+    pub mcp_event: Option<McpEvent>,
     pub detail: String,
 }
 

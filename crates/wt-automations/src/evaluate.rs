@@ -6,7 +6,7 @@ use wt_core::WorkState;
 
 use crate::types::{
     ActionAudience, AutomationEvalContext, AutomationFire, AutomationRow, BranchRange, FrozenPr,
-    status_is_gated, status_suffix, status_trigger_state,
+    GuideOwner, McpEvent, status_is_gated, status_suffix, status_trigger_state,
 };
 
 pub const FLEET_SLUG: &str = "_fleet";
@@ -30,6 +30,7 @@ pub fn evaluate(
                     fires.push(fire);
                 }
             }
+            AutomationTrigger::McpEvent => fires.extend(evaluate_mcp(rule, rows, context)),
             trigger => {
                 for row in rows {
                     if eligible(row, context)
@@ -68,8 +69,12 @@ pub fn evaluate_breaker_resets(
 
     let mut resets = BTreeSet::new();
     for rule in rules {
-        if rule.on == AutomationTrigger::BranchAdvanced {
-            // Fleet branch movement has no worktree whose condition can clear.
+        if matches!(
+            rule.on,
+            AutomationTrigger::BranchAdvanced | AutomationTrigger::McpEvent
+        ) {
+            // Branch movement and MCP events are each a distinct occurrence;
+            // no worktree condition clears them.
             continue;
         }
         let github_driven = matches!(
@@ -133,11 +138,13 @@ pub fn evaluate_breaker_resets(
 }
 
 pub fn fire_identity(fire: &AutomationFire) -> String {
-    format!(
-        "{}|{}",
-        fire.rule.id,
-        fire.stack_id.as_deref().unwrap_or(&fire.slug)
-    )
+    let target = fire.stack_id.as_deref().unwrap_or(&fire.slug);
+    match &fire.mcp_event {
+        // Each event is its own fire; sharing `rule|slug` would let a burst
+        // for one guide replace itself in the queue, newest first.
+        Some(event) => format!("{}|{target}|{}", fire.rule.id, event.event_id),
+        None => format!("{}|{target}", fire.rule.id),
+    }
 }
 
 pub fn eligible(row: &AutomationRow, context: &AutomationEvalContext) -> bool {
@@ -301,7 +308,9 @@ fn evaluate_row(
                 &format!("merged, verification still owed — {verify}"),
             ))
         }
-        AutomationTrigger::StackParentMerged | AutomationTrigger::BranchAdvanced => None,
+        AutomationTrigger::StackParentMerged
+        | AutomationTrigger::BranchAdvanced
+        | AutomationTrigger::McpEvent => None,
     }
 }
 
@@ -376,6 +385,7 @@ fn evaluate_merged(
             branch_range: None,
             frozen_vars: None,
             frozen_pr: None,
+            mcp_event: None,
             detail: format!("{landed} — closing issue #{issue}"),
         });
     }
@@ -395,6 +405,7 @@ fn evaluate_merged(
             branch_range: None,
             frozen_vars: None,
             frozen_pr: None,
+            mcp_event: None,
             detail: format!("{landed} — deleting remote branch {}", row.branch),
         });
     }
@@ -414,6 +425,7 @@ fn evaluate_merged(
                 state: pr.state.clone(),
                 is_draft: pr.is_draft,
             }),
+            mcp_event: None,
             detail: landed,
         });
     }
@@ -564,6 +576,7 @@ fn evaluate_stack(
             branch_range: None,
             frozen_vars: None,
             frozen_pr: None,
+            mcp_event: None,
             detail: format!("{} under {} open member(s)", parts.join(" + "), open.len()),
         });
     }
@@ -597,8 +610,196 @@ fn evaluate_branch(
         }),
         frozen_vars: None,
         frozen_pr: None,
+        mcp_event: None,
         detail: format!("{branch} advanced {start}..{end}"),
     })
+}
+
+/// One fire per pending event. An event about an artifact a live worktree
+/// recorded as its guide goes to that worktree; it waits while the worktree
+/// is paused, archived or busy. Any other event goes to the manager.
+fn evaluate_mcp(
+    rule: &AutomationDef,
+    rows: &[AutomationRow],
+    context: &AutomationEvalContext,
+) -> Vec<AutomationFire> {
+    let mut fires = Vec::new();
+    for event in context
+        .mcp_events
+        .iter()
+        .filter(|event| event.rule == rule.id)
+    {
+        let owner = guide_owner(&event.data, &event.server_url, &context.guides);
+        let slug = match owner {
+            Some(slug) => match rows.iter().find(|row| row.slug == slug) {
+                Some(row) if eligible(row, context) => slug.to_owned(),
+                _ => continue,
+            },
+            None => FLEET_SLUG.to_owned(),
+        };
+        let text = |field: &str| {
+            event
+                .data
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.chars().take(60).collect::<String>())
+        };
+        let mut detail = event.name.clone();
+        if let Some(title) = text("title") {
+            detail.push_str(&format!(" on {title}"));
+        }
+        if let Some(by) = text("by") {
+            detail.push_str(&format!(" by {by}"));
+        }
+        fires.push(AutomationFire {
+            rule: rule.clone(),
+            quiesce_slugs: if slug == FLEET_SLUG {
+                Vec::new()
+            } else {
+                vec![slug.clone()]
+            },
+            slug,
+            fire_keys: vec![mcp_fire_key(&rule.id, &event.event_id)],
+            stack_id: None,
+            close_issue: None,
+            delete_branch: None,
+            delete_branch_pr: None,
+            branch_range: None,
+            frozen_vars: None,
+            frozen_pr: None,
+            mcp_event: Some(event.clone()),
+            detail: wt_core::sanitize_terminal_text(&detail),
+        });
+    }
+    fires
+}
+
+/// What a rule's stored cursor belongs to. Editing the rule's server, event
+/// or arguments starts a new subscription from now rather than resuming one
+/// cursor against different arguments.
+pub fn mcp_subscription(rule: &AutomationDef) -> String {
+    format!(
+        "{}|{}|{}",
+        rule.server.as_deref().unwrap_or_default(),
+        rule.event.as_deref().unwrap_or_default(),
+        serde_json::to_string(&rule.arguments).unwrap_or_default()
+    )
+}
+
+/// Pending events recorded in wt state for the configured `mcp.event`
+/// rules, skipping any recorded under a subscription the rule no longer has.
+pub fn pending_mcp_events(
+    rules: &[AutomationDef],
+    servers: &BTreeMap<String, wt_config::McpServerConfig>,
+    state: &serde_json::Value,
+) -> Vec<McpEvent> {
+    let mut events = Vec::new();
+    for rule in rules
+        .iter()
+        .filter(|rule| rule.on == AutomationTrigger::McpEvent)
+    {
+        let entry = &state["mcpEvents"][&rule.id];
+        if entry["subscription"].as_str() != Some(mcp_subscription(rule).as_str()) {
+            continue;
+        }
+        for event in entry["pending"].as_array().into_iter().flatten() {
+            let (Some(event_id), Some(name)) = (event["eventId"].as_str(), event["name"].as_str())
+            else {
+                continue;
+            };
+            events.push(McpEvent {
+                rule: rule.id.clone(),
+                server: rule.server.clone().unwrap_or_default(),
+                server_url: rule
+                    .server
+                    .as_ref()
+                    .and_then(|name| servers.get(name))
+                    .map(|server| server.url.clone())
+                    .unwrap_or_default(),
+                event_id: event_id.to_owned(),
+                name: name.to_owned(),
+                timestamp: event["timestamp"].as_str().unwrap_or_default().to_owned(),
+                data: event["data"].clone(),
+            });
+        }
+    }
+    events
+}
+
+/// The ledger key of one event's fire: a replayed or re-polled event with
+/// the same `eventId` is the same fire.
+pub fn mcp_fire_key(rule: &str, event_id: &str) -> String {
+    format!("{rule}:mcp:{event_id}")
+}
+
+/// The worktree whose recorded guide is the event's artifact: the event's
+/// `url` matches the guide's page, or its `artifactId` is the guide's last
+/// path segment.
+pub fn guide_owner<'a>(
+    data: &serde_json::Value,
+    server_url: &str,
+    guides: &'a [GuideOwner],
+) -> Option<&'a str> {
+    let only = |matches: Vec<&'a GuideOwner>| -> Option<Option<&'a str>> {
+        let mut slugs = matches
+            .iter()
+            .map(|guide| guide.slug.as_str())
+            .collect::<Vec<_>>();
+        slugs.dedup();
+        match slugs.as_slice() {
+            [] => None,
+            [slug] => Some(Some(slug)),
+            // Two worktrees claim the page: neither is the owner.
+            _ => Some(None),
+        }
+    };
+    if let Some(url) = data.get("url").and_then(serde_json::Value::as_str) {
+        let url = normalize_url(url);
+        if let Some(owner) = only(
+            guides
+                .iter()
+                .filter(|guide| normalize_url(&guide.url) == url)
+                .collect(),
+        ) {
+            return owner;
+        }
+    }
+    // An id names an artifact only on the server that sent it.
+    let id = data.get("artifactId").and_then(serde_json::Value::as_str)?;
+    let host = url_host(server_url);
+    only(
+        guides
+            .iter()
+            .filter(|guide| {
+                let page = normalize_url(&guide.url);
+                url_host(&guide.url) == host && page.rsplit('/').next() == Some(id)
+            })
+            .collect(),
+    )
+    .flatten()
+}
+
+fn url_host(url: &str) -> String {
+    normalize_url(url)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn normalize_url(url: &str) -> String {
+    let url = url.trim();
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let url = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let (host, path) = url.split_once('/').unwrap_or((url, ""));
+    format!(
+        "{}/{}",
+        host.to_ascii_lowercase(),
+        path.trim_end_matches('/')
+    )
 }
 
 fn fresh_open_pr<'a>(
@@ -632,6 +833,7 @@ fn single(rule: &AutomationDef, row: &AutomationRow, key: String, detail: &str) 
         branch_range: None,
         frozen_vars: None,
         frozen_pr: None,
+        mcp_event: None,
         detail: detail.to_owned(),
     }
 }
@@ -754,6 +956,104 @@ mod tests {
         work.blocked_on = Some("approval".into());
         row.work = Some(work);
         assert!(evaluate(&[ready], &[row], &context).is_empty());
+    }
+
+    #[test]
+    fn mcp_events_route_to_the_guide_owner_else_the_manager_and_key_by_event() {
+        let rule = AutomationDef {
+            id: "guide-comments".into(),
+            on: AutomationTrigger::McpEvent,
+            run: "answer".into(),
+            server: Some("boo".into()),
+            event: Some("comment.created".into()),
+            ..AutomationDef::default()
+        };
+        let state = serde_json::json!({"mcpEvents": {"guide-comments": {
+            "subscription": crate::mcp_subscription(&rule),
+            "pending": [
+                {"eventId": "evt_1", "name": "comment.created", "data": {"artifactId": "a9ib", "url": "https://Cozee.artifacts.boo/a/a9ib", "title": "Guide", "by": "p@x.com"}},
+                {"eventId": "evt_2", "name": "comment.created", "data": {"artifactId": "other", "url": "https://cozee.artifacts.boo/a/other"}},
+                {"eventId": "evt_3", "name": "comment.created", "data": {"artifactId": "a9ib"}}
+            ]
+        }}});
+        let servers = BTreeMap::from([(
+            "boo".to_owned(),
+            wt_config::McpServerConfig {
+                url: "https://cozee.artifacts.boo/mcp".into(),
+                token_command: None,
+            },
+        )]);
+        let mut context = AutomationEvalContext {
+            mcp_events: crate::pending_mcp_events(std::slice::from_ref(&rule), &servers, &state),
+            guides: vec![GuideOwner {
+                slug: "feature-1".into(),
+                url: "https://cozee.artifacts.boo/a/a9ib/".into(),
+            }],
+            ..AutomationEvalContext::default()
+        };
+        let fires = evaluate(std::slice::from_ref(&rule), &[row()], &context);
+        let routed = fires
+            .iter()
+            .map(|fire| (fire.fire_keys[0].as_str(), fire.slug.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            routed,
+            [
+                ("guide-comments:mcp:evt_1", "feature-1"),
+                ("guide-comments:mcp:evt_2", FLEET_SLUG),
+                ("guide-comments:mcp:evt_3", "feature-1"),
+            ]
+        );
+        assert_eq!(fires[0].quiesce_slugs, ["feature-1"]);
+        assert!(fires[1].quiesce_slugs.is_empty());
+        assert_eq!(fires[0].detail, "comment.created on Guide by p@x.com");
+
+        // A paused owner holds its events; the manager does not get them.
+        context.pauses.slugs.insert("feature-1".into());
+        let fires = evaluate(std::slice::from_ref(&rule), &[row()], &context);
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].slug, FLEET_SLUG);
+
+        // A page two worktrees recorded has no owner.
+        context.pauses.slugs.clear();
+        context.guides.push(GuideOwner {
+            slug: "feature-2".into(),
+            url: "https://cozee.artifacts.boo/a/a9ib".into(),
+        });
+        let fires = evaluate(std::slice::from_ref(&rule), &[row()], &context);
+        assert!(fires.iter().all(|fire| fire.slug == FLEET_SLUG));
+        // An id alone never matches a guide on another host.
+        assert_eq!(
+            guide_owner(
+                &serde_json::json!({"artifactId": "12"}),
+                "https://cozee.artifacts.boo/mcp",
+                &[GuideOwner {
+                    slug: "x".into(),
+                    url: "https://github.com/o/r/pull/12".into()
+                }]
+            ),
+            None
+        );
+
+        // A global pause cancels other fires but leaves events pending.
+        let cancellable = crate::cancellable_fires(crate::CancellableFiresInput {
+            rules: std::slice::from_ref(&rule),
+            rows: &[row()],
+            pending: &[],
+            context: &context,
+            paused: true,
+            state_ready: true,
+            handled: &BTreeSet::new(),
+            executing: &BTreeSet::new(),
+        });
+        assert!(cancellable.is_empty());
+
+        // Events recorded under other arguments belong to an old cursor.
+        let mut edited = rule.clone();
+        edited
+            .arguments
+            .insert("artifact".into(), serde_json::json!("a9ib"));
+        assert!(crate::pending_mcp_events(&[edited], &servers, &state).is_empty());
     }
 
     #[test]

@@ -58,6 +58,11 @@ pub fn cancellable_fires(input: CancellableFiresInput<'_>) -> Vec<AutomationFire
     };
     let mut merged: BTreeMap<String, AutomationFire> = BTreeMap::new();
     for mut fire in candidates {
+        // An event stays pending in state across a pause; cancelling its key
+        // would drop it for good, since the server cursor has moved on.
+        if fire.mcp_event.is_some() {
+            continue;
+        }
         let id = fire_identity(&fire);
         if executing.contains(&id) {
             continue;
@@ -205,6 +210,7 @@ mod tests {
             branch_range: None,
             frozen_vars: None,
             frozen_pr: None,
+            mcp_event: None,
             detail: "test".into(),
         }
     }

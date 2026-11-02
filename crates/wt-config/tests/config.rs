@@ -100,6 +100,7 @@ fn snapshot(config: &Config) -> serde_json::Value {
                 wt_config::AutomationTrigger::StatusReady => "status.ready",
                 wt_config::AutomationTrigger::StatusVerificationOverdue => "status.verification_overdue",
                 wt_config::AutomationTrigger::BranchAdvanced => "branch.advanced",
+                wt_config::AutomationTrigger::McpEvent => "mcp.event",
             },
             "run": automation.run, "busy": if automation.busy == wt_config::AutomationBusyPolicy::Skip { "skip" } else { "queue" },
             "cooldownMinutes": automation.cooldown_minutes.map(number), "afterDays": number(automation.after_days),
@@ -676,4 +677,64 @@ fn from_raw_selects_the_same_repository_identity_as_load_in_a_worktree_copy() {
     assert_eq!(raw.repo_id, loaded.repo_id);
     assert_eq!(raw.paths.state_db, loaded.paths.state_db);
     assert_eq!(raw.tmux.socket, loaded.tmux.socket);
+}
+
+#[test]
+fn mcp_event_rules_name_a_server_an_event_and_a_prompt_action() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut text = minimal_config(root.path());
+    text.push_str(
+        "\n[mcp_servers.boo]\nurl='https://cozee.artifacts.boo/mcp'\ntoken_command=['security','find-generic-password','-w']\n\
+         [[actions]]\nid='answer'\nname='Answer'\nprompt='Answer the comment'\ntarget='session'\n\
+         [[automations]]\nid='comments'\non='mcp.event'\nrun='answer'\nserver='boo'\nevent='comment.created'\n\
+         [automations.arguments]\nartifact='a9ib'\n",
+    );
+    let config = Config::from_raw(toml_value(&text), &options(root.path(), &home, &[])).unwrap();
+    let rule = &config.automations[0];
+    assert_eq!(rule.on, wt_config::AutomationTrigger::McpEvent);
+    assert_eq!(rule.event.as_deref(), Some("comment.created"));
+    assert_eq!(rule.arguments["artifact"], serde_json::json!("a9ib"));
+    assert_eq!(rule.settle_seconds, 0.0);
+    assert_eq!(
+        config.mcp_servers["boo"].url,
+        "https://cozee.artifacts.boo/mcp"
+    );
+
+    let mut bad = minimal_config(root.path());
+    bad.push_str(
+        "\n[mcp_servers.plain]\nurl='https://example.com/mcp'\n[mcp_servers.insecure]\nurl='http://example.com/mcp'\n\
+         [[actions]]\nid='sh'\nname='Shell'\nshell='echo {{event}}'\n\
+         [[automations]]\nid='a'\non='mcp.event'\nrun='sh'\nserver='plain'\nevent='x'\n\
+         [[automations]]\nid='b'\non='mcp.event'\nrun='builtin:notify'\nserver='missing'\nevent='x'\n\
+         [[automations]]\nid='c'\non='pr.conflict'\nrun='builtin:notify'\nevent='x'\n\
+         [mcp_servers.sneaky]\nurl='http://localhost:80@evil.example/mcp'\n\
+         [[actions]]\nid='auto'\nname='Auto'\nprompt='Go'\n\
+         [[automations]]\nid='d'\non='mcp.event'\nrun='auto'\nserver='plain'\nevent='x'\n",
+    );
+    let error = Config::from_raw(toml_value(&bad), &options(root.path(), &home, &[]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("mcp_servers.insecure.url must be an https:// URL"),
+        "{error}"
+    );
+    assert!(
+        error.contains("never a shell, headless or slot action"),
+        "{error}"
+    );
+    assert!(
+        error.contains("automations[1].server \"missing\" is not a [mcp_servers] entry"),
+        "{error}"
+    );
+    assert!(
+        error.contains("only apply to on = \"mcp.event\""),
+        "{error}"
+    );
+    assert!(
+        error.contains("mcp_servers.sneaky.url must name a host and no credentials"),
+        "{error}"
+    );
+    assert!(error.contains("automations[3]"), "{error}");
 }

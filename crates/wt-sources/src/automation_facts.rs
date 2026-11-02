@@ -434,6 +434,21 @@ pub async fn prepare(
         },
         branch_tips: branch_tips.tips,
         row_vars,
+        mcp_events: wt_automations::pending_mcp_events(
+            &ctx.config.automations,
+            &ctx.config.mcp_servers,
+            state,
+        ),
+        guides: rows
+            .iter()
+            .filter_map(|row| {
+                let url = state["slugs"][&row.slug]["guide"]["url"].as_str()?;
+                Some(wt_automations::GuideOwner {
+                    slug: row.slug.clone(),
+                    url: url.to_owned(),
+                })
+            })
+            .collect(),
     };
     context.local_day = OffsetDateTime::now_utc().date().to_string();
     let fires = evaluate(&ctx.config.automations, &rows, &context);
@@ -690,9 +705,12 @@ fn requirement_state(
             fire.rule.run
         ));
     };
-    // A branch advance targets the fleet, not a worktree row; dispatch runs
-    // it against an empty row, so judge its requirements the same way.
-    if fire.branch_range.is_some() {
+    // A branch advance, and an MCP event no worktree owns, target the fleet,
+    // not a worktree row; dispatch runs them against an empty row, so judge
+    // their requirements the same way.
+    if fire.branch_range.is_some()
+        || (fire.mcp_event.is_some() && fire.slug == wt_automations::FLEET_SLUG)
+    {
         return match wt_actions::evaluate_requirements(
             &definition.requires,
             &wt_actions::ActionRow::default(),
@@ -822,6 +840,7 @@ mod tests {
             branch_range: None,
             frozen_vars: None,
             frozen_pr: None,
+            mcp_event: None,
             detail: String::new(),
         };
         for run in [
@@ -921,6 +940,7 @@ mod tests {
             branch_range: None,
             frozen_vars: Some(BTreeMap::from([("pr".into(), "3092".into())])),
             frozen_pr: None,
+            mcp_event: None,
             detail: String::new(),
         };
         let mut facts = PreparedAutomationFacts::default();
@@ -958,6 +978,7 @@ mod tests {
             }),
             frozen_vars: None,
             frozen_pr: None,
+            mcp_event: None,
             detail: String::new(),
         };
         let mut actions = [wt_config::ActionDef {

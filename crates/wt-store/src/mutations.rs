@@ -1261,6 +1261,84 @@ impl Store {
         })
     }
 
+    /// Record one `events/poll` result for an automation rule's MCP
+    /// subscription: the new cursor and the events not yet pending.
+    /// `subscription` names what the cursor belongs to (server, event and
+    /// arguments); a cursor recorded for another subscription is replaced,
+    /// never resumed. Pending events wait here until their fire starts, so a
+    /// crash between poll and dispatch replays them instead of losing them.
+    pub fn record_mcp_poll(
+        &mut self,
+        rule: &str,
+        subscription: &str,
+        cursor: Option<&str>,
+        events: &[Value],
+        now_ms: i64,
+    ) -> Result<usize, StoreError> {
+        self.mutate_wt_state(|state| {
+            let rules = object_mut(state, "mcpEvents");
+            let mut entry = rules
+                .get(rule)
+                .and_then(Value::as_object)
+                .filter(|entry| {
+                    entry.get("subscription").and_then(Value::as_str) == Some(subscription)
+                })
+                .cloned()
+                .unwrap_or_default();
+            let mut pending = entry
+                .get("pending")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for event in events {
+                let id = event.get("eventId");
+                if id.is_some() && !pending.iter().any(|seen| seen.get("eventId") == id) {
+                    pending.push(event.clone());
+                }
+            }
+            let before = pending.len();
+            // A fire the engine skipped for good leaves its event here; its
+            // ledger key already stops it firing again.
+            pending.retain(|event| {
+                event
+                    .get("receivedAtMs")
+                    .and_then(Value::as_i64)
+                    .is_none_or(|at| now_ms.saturating_sub(at) < MCP_PENDING_MAX_AGE_MS)
+            });
+            if pending.len() > MCP_PENDING_MAX {
+                let excess = pending.len() - MCP_PENDING_MAX;
+                pending.drain(..excess);
+            }
+            let discarded = before - pending.len();
+            entry.insert("subscription".into(), json!(subscription));
+            entry.insert("cursor".into(), json!(cursor));
+            entry.insert("pending".into(), Value::Array(pending));
+            let next = Value::Object(entry);
+            if rules.get(rule) == Some(&next) {
+                return Ok((discarded, false));
+            }
+            rules.insert(rule.to_owned(), next);
+            Ok((discarded, true))
+        })
+    }
+
+    /// Drop a rule's pending MCP event once its fire has started.
+    pub fn drop_mcp_event(&mut self, rule: &str, event_id: &str) -> Result<(), StoreError> {
+        self.mutate_wt_state(|state| {
+            let Some(pending) = state
+                .get_mut("mcpEvents")
+                .and_then(|rules| rules.get_mut(rule))
+                .and_then(|entry| entry.get_mut("pending"))
+                .and_then(Value::as_array_mut)
+            else {
+                return Ok(((), false));
+            };
+            let before = pending.len();
+            pending.retain(|event| event.get("eventId").and_then(Value::as_str) != Some(event_id));
+            Ok(((), pending.len() != before))
+        })
+    }
+
     pub fn set_merge_edge(&mut self, edge: &MergeEdge) -> Result<(), StoreError> {
         let mut edge = serde_json::to_value(edge)?;
         self.mutate_wt_state(|state| {
@@ -1831,6 +1909,10 @@ fn set_slug_automations_paused(state: &mut Value, slug: &str, paused: bool) {
     }
     object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
 }
+
+/// Events a rule may hold undispatched; a burst beyond this keeps the newest.
+const MCP_PENDING_MAX: usize = 200;
+const MCP_PENDING_MAX_AGE_MS: i64 = 7 * 24 * 3_600_000;
 
 fn object_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Map<String, Value> {
     if !state.get(key).is_some_and(Value::is_object) {
