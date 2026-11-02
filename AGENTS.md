@@ -58,7 +58,11 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   and tracked controller. Use scoped cancellation and preserve accepted
   mutations through shutdown drains.
 - Run focused Cargo tests for changed crates, then the relevant workspace gate
-  when shared contracts are stable. Keep fixtures isolated from live worktrees,
+  when shared contracts are stable. Before pushing to `main` or a release tag,
+  commit and run `cargo xtask preflight` (about 5 minutes; the gate plus the
+  packaging tests and the native end-to-end suite CI runs). It stamps the
+  commit it passed, and the repository pre-push hook refuses an unstamped one.
+  A version-only release commit inherits its parent's stamp. Keep fixtures isolated from live worktrees,
   accounts, and agent sessions.
 
 ## Load-bearing contracts

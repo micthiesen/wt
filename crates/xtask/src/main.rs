@@ -2,6 +2,7 @@
 
 mod deps;
 mod hygiene;
+mod preflight;
 
 use std::{path::PathBuf, process::Command};
 
@@ -122,12 +123,29 @@ fn gate(package: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Point this clone at the committed hooks. They chain to the global hooks
+/// directory, which a repository `core.hooksPath` would otherwise shadow.
+fn install_hooks() -> Result<()> {
+    let status = Command::new("git")
+        .args(["config", "core.hooksPath", ".githooks"])
+        .current_dir(repo_root())
+        .status()
+        .context("running git config")?;
+    if !status.success() {
+        bail!("git config core.hooksPath failed ({status})");
+    }
+    println!("hooks: core.hooksPath = .githooks (global hooks still run through them)");
+    Ok(())
+}
+
 fn strings<const N: usize>(values: [&str; N]) -> Vec<String> {
     values.into_iter().map(str::to_owned).collect()
 }
 
 fn usage() {
-    eprintln!("usage: cargo xtask <gate [--package NAME] | deps-check | hygiene>");
+    eprintln!(
+        "usage: cargo xtask <gate [--package NAME] | preflight | install-hooks | deps-check | hygiene>"
+    );
 }
 
 fn run(args: &[String]) -> Result<()> {
@@ -148,6 +166,8 @@ fn run(args: &[String]) -> Result<()> {
             }
             gate(package)
         }
+        Some("preflight") if args.len() == 1 => preflight::run(&repo_root(), || gate(None)),
+        Some("install-hooks") if args.len() == 1 => install_hooks(),
         Some("deps-check") => deps::check(&repo_root()),
         Some("hygiene") if args.len() <= 1 => hygiene::report(&repo_root()),
         Some("hygiene") if args.len() == 2 && args[1] == "--clean-incremental" => {

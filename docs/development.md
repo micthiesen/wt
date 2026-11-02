@@ -12,6 +12,31 @@ claim that the workspace is green. Formatting and dependency-policy checks
 remain workspace-wide in both modes. Package-scoped gates skip doctests for a
 binary-only package and say so explicitly.
 
+`cargo xtask preflight` is what to run before pushing to `main` or a `v*`
+tag. It runs the workspace gate, the packaging helper tests the CI lint job
+runs, a `WT_BUILD_ID`-stamped debug build, and the native end-to-end suite
+(`scripts/native-check.py`, four checks at a time; `WT_NATIVE_JOBS`
+overrides). On a clean tree whose HEAD did not move during the run it writes a
+stamp for that commit under the common Git directory (`wt-preflight/<sha>`),
+which linked worktrees share. `cargo xtask install-hooks` points the clone at
+`.githooks`, whose `pre-push` refuses a push of an unstamped commit to `main`
+or a `v*` tag before anything reaches CI. A commit whose only change since a
+stamped ancestor is the release version in `Cargo.toml` and `Cargo.lock`
+inherits that stamp, so the release bump does not need a second run.
+`WT_SKIP_PREFLIGHT="<reason>"` skips the check for one push. The hooks chain
+to the global `core.hooksPath` hooks, which a repository hooks path would
+otherwise shadow. Preflight does not cover the optimized release builds, the
+Pi integration check (it needs the pinned Pi runtime) or the Linux-only
+workload check.
+
+The history this addresses: in October most failed release runs were native
+end-to-end checks or deterministic test failures that a local run reproduces
+(a protocol mismatch, a binary size limit, a dev-server start, a removal
+assertion), plus a cluster of terminal timing checks that only failed when CI
+ran them in parallel. The rest were GitHub capacity: macOS arm64 jobs that no
+runner picked up. Preflight covers the first group; nothing local covers the
+last.
+
 `cargo xtask deps-check` checks that dependencies declared by the workspace are
 inherited with `workspace = true`. `wt-core`, `wt-platform`, and `wt-store`
 remain independent foundation crates; `wt-config` may use the pure domain

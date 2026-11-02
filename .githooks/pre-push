@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Refuse to push a commit to main or a release tag unless
+# `cargo xtask preflight` passed on exactly that commit. Every such push runs
+# the full release workflow, and a failure a local run would have caught costs
+# that run. Installed by `cargo xtask install-hooks`; see docs/development.md.
+# WT_SKIP_PREFLIGHT="<reason>" skips the check for one push.
+set -u
+input=$(cat)
+stamps="$(git rev-parse --path-format=absolute --git-common-dir)/wt-preflight"
+zero=0000000000000000000000000000000000000000
+
+# A release commit only bumps the version, so it inherits a stamp from a
+# recent ancestor when everything since is that bump alone.
+verified() {
+    local sha=$1 base
+    [ -e "$stamps/$sha" ] && return 0
+    for base in $(git rev-list --max-count=5 "$sha^" 2>/dev/null); do
+        [ -e "$stamps/$base" ] || continue
+        git diff --name-only "$base" "$sha" | grep -qvxE 'Cargo\.toml|Cargo\.lock' && return 1
+        git diff -U0 "$base" "$sha" -- Cargo.toml Cargo.lock \
+            | grep -E '^[+-][^+-]' | grep -qvE '^[+-]version = "[0-9][0-9.]*"$' && return 1
+        return 0
+    done
+    return 1
+}
+
+failed=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    [ "$local_sha" = "$zero" ] && continue
+    case "$remote_ref" in
+        refs/heads/main | refs/tags/v[0-9]*) ;;
+        *) continue ;;
+    esac
+    commit=$(git rev-parse "$local_sha^{commit}")
+    if [ -n "${WT_SKIP_PREFLIGHT:-}" ]; then
+        echo "pre-push: preflight skipped for $remote_ref: $WT_SKIP_PREFLIGHT" >&2
+        continue
+    fi
+    if ! verified "$commit"; then
+        echo "pre-push: ${commit:0:12} -> $remote_ref has not passed 'cargo xtask preflight'." >&2
+        echo "pre-push: run it on this commit (about 5 minutes), then push again." >&2
+        failed=1
+    fi
+done <<< "$input"
+[ "$failed" -eq 0 ] || exit 1
+
+# A repository hooks path shadows the global one; keep running it.
+global=$(git config --global core.hooksPath || true)
+global=${global/#\~/$HOME}
+if [ -n "$global" ] && [ -x "$global/pre-push" ] && [ -n "$input" ]; then
+    printf '%s\n' "$input" | "$global/pre-push" "$@"
+fi

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The repository hooks path shadows the global hooks; pass through to them.
+global=$(git config --global core.hooksPath || true)
+global=${global/#\~/$HOME}
+if [ -n "$global" ] && [ -x "$global/prepare-commit-msg" ]; then
+    exec "$global/prepare-commit-msg" "$@"
+fi
