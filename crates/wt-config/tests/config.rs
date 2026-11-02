@@ -438,6 +438,37 @@ fn invalid_automation_pairs_and_issue_status_contract_fail_closed() {
 }
 
 #[test]
+fn an_unknown_trigger_skips_its_rule_with_a_warning_instead_of_rejecting_the_config() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let mut text = minimal_config(root.path());
+    text.push_str(
+        "\n[[automations]]\nid='future'\non='status.from_a_newer_wt'\nrun='builtin:notify'\nbusy='a-newer-policy'\nnew_field=1\n\
+         [[automations]]\nid='kept'\non='status.ready'\nrun='builtin:notify'\n",
+    );
+    let config = Config::from_raw(toml_value(&text), &options(root.path(), &home, &[])).unwrap();
+    assert_eq!(
+        config
+            .automations
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect::<Vec<_>>(),
+        ["kept"]
+    );
+    assert_eq!(config.warnings.len(), 1);
+    assert!(config.warnings[0].contains("\"future\""));
+    assert!(config.warnings[0].contains("status.from_a_newer_wt"));
+
+    let mut missing = minimal_config(root.path());
+    missing.push_str("\n[[automations]]\nid='blank'\nrun='builtin:notify'\n");
+    let error = Config::from_raw(toml_value(&missing), &options(root.path(), &home, &[]))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("automations[0].on is required"), "{error}");
+}
+
+#[test]
 fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

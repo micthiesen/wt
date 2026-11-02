@@ -318,6 +318,9 @@ async fn print_banners(ctx: &AppContext) -> Result<()> {
             ctx.config.branch.base
         );
     }
+    for warning in &ctx.config.warnings {
+        println!("warning config: {warning}");
+    }
     let messaging = claude_shim_check(
         &ctx.config.paths.cache_root,
         std::env::var("WT_INSPECT").is_ok_and(|value| value.eq_ignore_ascii_case("off")),

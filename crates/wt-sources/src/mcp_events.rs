@@ -36,6 +36,13 @@ pub fn start(
     ctx: &AppContext,
     token: tokio_util::sync::CancellationToken,
 ) {
+    // The controller polls for the fleet, like the GitHub webhook daemon. A
+    // managed worker polling too would send the manager every unowned event
+    // twice, and it rarely holds the token: `token_command` reads the
+    // controller's Keychain.
+    if ctx.config.instance.role == wt_config::InstanceRole::Worker {
+        return;
+    }
     for rule in ctx
         .config
         .automations

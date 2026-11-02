@@ -169,7 +169,7 @@ tracked action output; its title names which, such as `attention · 2 new` or
 and the message. Attention carries status changes and section moves made
 elsewhere (agents, the manager, another process); your own moves in this TUI,
 including rows a deleted section returns to the Inbox, and statuses you set
-with `u` appear only as the toast and in all activity. Attention entries wrap with a hanging indent; the full feed is
+with `u` appear only as the toast and in all activity. Attention entries wrap with a hanging indent; while following, the newest entry ends on the bottom row and an entry cut off at the top shows its first row (time, source, text cut short) in place of the cut row. The full feed is
 one line per event, colored by level. Entries already marked seen are dimmed
 above a `seen HH:MM:SS` rule; when nothing new follows it and the feed overflows
 the pane, the rule takes the bottom row, and an empty attention feed reads "nothing needs

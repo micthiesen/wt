@@ -136,7 +136,6 @@ impl Model {
         let target = self.output.target.clone();
         // Line ranges of attention entries.
         let mut entries: Vec<(usize, usize)> = Vec::new();
-        let mut trailing_rule = false;
         let (title, mut lines, identity, count) = match &target {
             OutputTarget::Attention => {
                 let seen_ms = self.board.attention_seen_ms;
@@ -174,7 +173,6 @@ impl Model {
                 }
                 if seen_ms > 0 && !marked && !events.is_empty() {
                     lines.extend(self.seen_rule(seen_ms, width, true));
-                    trailing_rule = true;
                 }
                 if events.is_empty() {
                     lines.push(Line::from(vec![
@@ -317,41 +315,48 @@ impl Model {
                 }
             }
         };
+        // Trailing blank rows (a pane capture's empty bottom, a final newline)
+        // would sit under the last real line as if output were missing.
+        while lines.len() > 1
+            && lines
+                .last()
+                .is_some_and(|line| line.spans.iter().all(|span| span.content.trim().is_empty()))
+        {
+            lines.pop();
+        }
         if self.output.identity != identity {
             self.output.identity = identity;
             self.output.stream = 0;
             self.output.top = None;
         }
         self.output.stream_count = count;
-        let mut top = self.output.viewport(lines.len(), height);
-        // Following the newest entries, start at an entry rather than the
-        // wrapped tail of one, so the top row always carries its time.
-        // When no entry starts in view (a seen rule trails the last one),
-        // show the cut entry from its start if it and the rule fit; a taller
-        // entry keeps the plain bottom so its end stays reachable.
-        let snapped = entries
-            .iter()
-            .map(|(start, _)| *start)
-            .find(|start| *start >= top)
-            .or_else(|| {
-                entries
-                    .last()
-                    .filter(|(start, _)| lines.len() - start <= height)
-                    .map(|(start, _)| *start)
-            });
+        let top = self.output.viewport(lines.len(), height);
+        // Following the newest entries keeps the last row on the pane's last
+        // row. When that cuts an entry at the top, its first visible row shows
+        // the entry's head instead (time, source, the text cut short), so the
+        // top row always carries its time without leaving blank rows below.
+        // A one-row pane keeps the newest row itself, so the end of a tall
+        // entry stays visible.
         if self.output.top.is_none()
-            && let Some(start) = snapped
+            && height > 1
+            && let Some((start, _)) = entries
+                .iter()
+                .find(|(start, end)| *start < top && top < *end)
         {
-            // Render only: scrolling still steps from the clamped top.
-            top = start;
-        }
-        // Snapping leaves a varying gap under the last row. A trailing seen
-        // rule takes the bottom row anyway, with the gap above it, so it sits
-        // in the same place however the entries above happen to wrap.
-        if trailing_rule && lines.len() > height {
-            let gap = (top + height).saturating_sub(lines.len());
-            let rule = lines.len() - 1;
-            lines.splice(rule..rule, std::iter::repeat_n(Line::default(), gap));
+            let mut head = lines[*start].clone();
+            if let Some(last) = head
+                .spans
+                .last_mut()
+                .filter(|span| span.content.width() > 0)
+            {
+                // Ellipsize within the row's own width: the rest of the
+                // entry's text is cut, not continued below.
+                let cells = last.content.width();
+                let text = last.content.trim_end();
+                let kept = truncate_end(text, cells.saturating_sub(1));
+                last.content = format!("{}…", kept.trim_end_matches('…')).into();
+            }
+            lines[top] = head;
         }
         let hint = if self.output.top.is_some() {
             " · scrolled"
@@ -545,7 +550,9 @@ fn wrap_hanging(text: &str, first: usize, rest: usize) -> Vec<String> {
 fn wrap_visual_lines(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut wrapped = Vec::new();
-    for source in text.split('\n') {
+    // A captured line or log chunk often keeps its own newline; it is not a
+    // blank row of output.
+    for source in text.trim_end_matches(['\n', '\r']).split('\n') {
         let mut rest = source;
         let mut continuation = false;
         loop {
@@ -775,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn following_attention_starts_at_an_entry_not_a_wrapped_tail() {
+    fn following_attention_fills_to_the_bottom_and_heads_a_cut_entry() {
         let line = |at_ms, text: &str| crate::AttentionLine {
             at_ms,
             source: "wt".into(),
@@ -794,12 +801,43 @@ mod tests {
             }),
             ..Default::default()
         };
+        // The newest entry ends on the bottom row with nothing blank under
+        // it, and the cut entry above still shows its time.
         let lines = model.output_view(3, 30).1;
+        assert_eq!(lines.len(), 3);
+        let top = text(&lines[0]);
+        assert!(top.starts_with("00:00:01") && top.ends_with('…'), "{top:?}");
         assert!(
-            text(&lines[0]).starts_with("00:00:02"),
+            text(&lines[2]).starts_with("00:00:02"),
             "{:?}",
-            text(&lines[0])
+            text(&lines[2])
         );
+    }
+
+    #[test]
+    fn output_never_ends_in_blank_rows_from_trailing_newlines() {
+        let lines = wrap_visual_lines("done\n", Style::default(), 20);
+        assert_eq!(lines.len(), 1);
+        let mut model = Model {
+            board: Arc::new(crate::Board {
+                slot_logs: [(
+                    "wt".to_owned(),
+                    vec![crate::LogView {
+                        id: "run".into(),
+                        title: "fix-ci".into(),
+                        lines: vec!["one".into(), "two\n".into(), String::new(), "  ".into()],
+                    }],
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        model.output.target = OutputTarget::Slot("wt".into());
+        let lines = model.output_view(10, 40).1;
+        let shown = lines.iter().map(text).collect::<Vec<_>>();
+        assert_eq!(shown, ["one", "two"]);
     }
 
     #[test]

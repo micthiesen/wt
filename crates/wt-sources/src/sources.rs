@@ -37,6 +37,9 @@ pub struct BoardSources {
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
+    for warning in &context.config.warnings {
+        tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = "config", event_text = %warning, "config warning");
+    }
     let local_sources = crate::local_source::start(scope, context);
     let history = crate::history_source::start(
         scope,

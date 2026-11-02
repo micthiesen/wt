@@ -757,7 +757,15 @@ impl Config {
 
         let actions = parse_actions(&raw, &mut errors);
         let mcp_servers = parse_mcp_servers(&raw, &mut errors);
-        let automations = parse_automations(&raw, &actions, &branch, &mcp_servers, &mut errors);
+        let mut warnings = Vec::new();
+        let automations = parse_automations(
+            &raw,
+            &actions,
+            &branch,
+            &mcp_servers,
+            &mut errors,
+            &mut warnings,
+        );
         let skills_raw: SkillsSection = section(&raw, "skills", &mut errors);
         let manager_raw: ManagerSection = section(&raw, "manager", &mut errors);
         let update_raw: StartupCheckSection = section(&raw, "update", &mut errors);
@@ -813,6 +821,7 @@ impl Config {
             update: UpdateConfig {
                 startup_check: update_raw.startup_check,
             },
+            warnings,
         })
     }
 }
@@ -1193,6 +1202,7 @@ fn parse_automations(
     branch: &BranchConfig,
     mcp_servers: &BTreeMap<String, McpServerConfig>,
     errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Vec<AutomationDef> {
     let Some(value) = raw.get("automations") else {
         return Vec::new();
@@ -1217,6 +1227,23 @@ fn parse_automations(
             errors.push(format!("{tag} must be a table"));
             continue;
         }
+        // An older wt sharing this config (a session pinned to the build that
+        // started it) must keep working when a newer one adds a trigger, so an
+        // unknown trigger skips its rule instead of failing every command. It
+        // is checked before the rule's other fields, which may use values only
+        // that newer wt understands.
+        let raw_on = value
+            .get("on")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default();
+        if !raw_on.is_empty() && parse_trigger(raw_on).is_none() {
+            let id = value
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default();
+            warnings.push(format!("{tag} (\"{id}\") is skipped: this wt does not know the trigger on = \"{raw_on}\". Known triggers: {KNOWN_TRIGGERS}. A newer wt may support it; a misspelling never fires."));
+            continue;
+        }
         let input: RawAutomation = match value.clone().try_into() {
             Ok(input) => input,
             Err(error) => {
@@ -1232,8 +1259,12 @@ fn parse_automations(
             errors.push(format!("{tag}.id \"{}\" is duplicated", input.id));
             continue;
         }
+        if input.on.is_empty() {
+            errors.push(format!("{tag}.on is required"));
+            continue;
+        }
         let Some(on) = parse_trigger(&input.on) else {
-            errors.push(format!("{tag}.on must be one of: pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verification_due, status.verification_overdue, branch.advanced, mcp.event"));
+            errors.push(format!("{tag}.on must be one of: {KNOWN_TRIGGERS}"));
             continue;
         };
         if input.run.is_empty() {
@@ -1422,6 +1453,8 @@ fn parse_automations(
     }
     result
 }
+
+const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verification_due, status.verification_overdue, branch.advanced, mcp.event";
 
 fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
     let value = match value {

@@ -642,4 +642,7 @@ pub struct Config {
     pub skills: SkillsConfig,
     pub manager: ManagerConfig,
     pub update: UpdateConfig,
+    /// Problems that skip part of the configuration instead of rejecting it,
+    /// such as an automation whose trigger this build does not know.
+    pub warnings: Vec<String>,
 }
