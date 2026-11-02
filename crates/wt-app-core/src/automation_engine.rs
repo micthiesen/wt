@@ -18,6 +18,14 @@ use wt_config::{AutomationBusyPolicy, AutomationDef};
 
 const MAX_CONCURRENT: usize = 2;
 const SESSION_SLOT_MAX_MS: i64 = 10 * 60 * 1000;
+/// A deferred fire is checked again this soon while it is young (a restack
+/// usually retargets stacked PRs within a minute or two)...
+const DEFER_RETRY_MS: i64 = 30 * 1000;
+/// ...and this often once it is older than `DEFER_SLOW_AFTER_MS`.
+const DEFER_SLOW_RETRY_MS: i64 = 5 * 60 * 1000;
+const DEFER_SLOW_AFTER_MS: i64 = 10 * 60 * 1000;
+/// A fire still deferred this long is reported once on the attention feed.
+pub const DEFER_REPORT_AFTER_MS: i64 = 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorktreeQuiescence {
@@ -87,6 +95,11 @@ pub enum AutomationOutcome {
     Delivered { slot: DeliverySlot },
     /// A prompt may have been delivered but its acknowledgement was lost.
     Ambiguous { reason: String, slot: DeliverySlot },
+    /// Positive evidence that nothing was written, and the fire must run
+    /// again later: it is requeued as is (frozen inputs included), so it
+    /// outlives its worktree. Exempt from the breaker by construction, since
+    /// nothing is recorded as dispatched.
+    Deferred { reason: String },
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +157,15 @@ struct ActiveFire {
     claim: DispatchClaim,
     fire: AutomationFire,
     slot: SlotState,
+    /// When its intent first queued; a deferral keeps the age.
+    queued_at_ms: i64,
+}
+
+/// Why a requeued fire is waiting, and whether its age was reported.
+#[derive(Clone, Debug)]
+struct Deferral {
+    reason: String,
+    reported: bool,
 }
 
 /// Queue and ledger coordinator. The caller drives `tick` on source changes
@@ -161,6 +183,8 @@ pub struct AutomationEngine {
     unmet: BTreeSet<String>,
     /// The newest ledger records as of the latest pass, newest first.
     recent: Vec<wt_automations::LedgerRecord>,
+    /// Deferred fires by identity, while their intent is queued or running.
+    deferrals: BTreeMap<String, Deferral>,
 }
 
 impl AutomationEngine {
@@ -173,6 +197,7 @@ impl AutomationEngine {
             waiting: BTreeMap::new(),
             unmet: BTreeSet::new(),
             recent: Vec::new(),
+            deferrals: BTreeMap::new(),
         }
     }
 
@@ -319,6 +344,8 @@ impl AutomationEngine {
             .into_iter()
             .map(|intent| (fire_identity(&intent.fire), intent))
             .collect();
+        self.deferrals
+            .retain(|id, _| self.intents.contains_key(id) || self.active.contains_key(id));
 
         let mut queue = self.intents.values().cloned().collect::<Vec<_>>();
         queue.sort_by_key(|intent| (intent.queued_at_ms, fire_identity(&intent.fire)));
@@ -453,7 +480,11 @@ impl AutomationEngine {
                 continue;
             }
             if input.now_ms < intent.settle_at_ms {
-                self.waiting.insert(id, "its settle delay".into());
+                let reason = match self.deferrals.get(&id) {
+                    Some(deferral) => format!("a re-check: {}", deferral.reason),
+                    None => "its settle delay".into(),
+                };
+                self.waiting.insert(id, reason);
                 continue;
             }
 
@@ -538,6 +569,7 @@ impl AutomationEngine {
                             claim: claim.clone(),
                             fire: fire.clone(),
                             slot: SlotState::Dispatching,
+                            queued_at_ms: intent.queued_at_ms,
                         },
                     );
                     report.claims.push(ClaimedFire { id, fire, claim });
@@ -618,20 +650,22 @@ impl AutomationEngine {
         claim: &ClaimedFire,
         outcome: AutomationOutcome,
         now_ms: i64,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         self.finish_with_cancellation(claim, outcome, now_ms, &self.cancellation.clone())
             .await
     }
 
     /// An admitted dispatch must persist its outcome through the command
     /// drain even after the read/evaluation scope has been cancelled.
+    /// Returns an attention line when a deferred fire has now waited longer
+    /// than `DEFER_REPORT_AFTER_MS`, once per fire.
     pub async fn finish_with_cancellation(
         &mut self,
         claim: &ClaimedFire,
         outcome: AutomationOutcome,
         now_ms: i64,
         cancellation: &CancellationToken,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let Some(active) = self.active.get(&claim.id) else {
             anyhow::bail!("automation dispatch {} is not active", claim.id);
         };
@@ -642,6 +676,7 @@ impl AutomationEngine {
             anyhow::bail!("automation dispatch claim identity does not match active fire");
         }
         let ledger_claim = active.claim.clone();
+        let mut notice = None;
         match outcome {
             AutomationOutcome::NotStarted => {
                 self.ledger
@@ -649,6 +684,49 @@ impl AutomationEngine {
                     .await
                     .context("release automation claim proven not started")?;
                 self.active.remove(&claim.id);
+            }
+            AutomationOutcome::Deferred { reason } => {
+                self.ledger
+                    .release_not_started(&ledger_claim, cancellation)
+                    .await
+                    .context("release deferred automation claim")?;
+                let active = self
+                    .active
+                    .remove(&claim.id)
+                    .context("deferred automation dispatch is not active")?;
+                let age = now_ms.saturating_sub(active.queued_at_ms);
+                let delay = if age < DEFER_SLOW_AFTER_MS {
+                    DEFER_RETRY_MS
+                } else {
+                    DEFER_SLOW_RETRY_MS
+                };
+                let reported = self
+                    .deferrals
+                    .get(&claim.id)
+                    .is_some_and(|deferral| deferral.reported);
+                let report = !reported && age >= DEFER_REPORT_AFTER_MS;
+                if report {
+                    notice = Some(format!(
+                        "auto {}: still waiting after {} min: {reason}",
+                        active.fire.rule.id,
+                        age / 60_000
+                    ));
+                }
+                self.deferrals.insert(
+                    claim.id.clone(),
+                    Deferral {
+                        reason,
+                        reported: reported || report,
+                    },
+                );
+                self.intents.insert(
+                    claim.id.clone(),
+                    AutomationIntent {
+                        fire: active.fire,
+                        queued_at_ms: active.queued_at_ms,
+                        settle_at_ms: now_ms.saturating_add(delay),
+                    },
+                );
             }
             AutomationOutcome::Delivered { slot } => {
                 self.ledger
@@ -670,7 +748,7 @@ impl AutomationEngine {
         if let Ok(ledger) = self.ledger.snapshot().await {
             self.recent = ledger.recent(RECENT_HISTORY);
         }
-        Ok(())
+        Ok(notice)
     }
 
     fn finish_slot(&mut self, id: &str, slot: DeliverySlot, now_ms: i64) {
@@ -1060,6 +1138,122 @@ mod tests {
             "{persisted}"
         );
         assert!(!commands.is_cancelled());
+    }
+
+    /// A deferred remote branch delete (something is still stacked on the
+    /// branch) outlives its worktree and the breaker, is re-checked on a
+    /// backoff rather than immediately, and reports once when it lingers.
+    #[tokio::test]
+    async fn deferred_fire_is_requeued_past_row_death_until_it_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [AutomationDef {
+            id: "delete-branch-on-merge".into(),
+            on: AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            settle_seconds: 0.0,
+            ..AutomationDef::default()
+        }];
+        let landed = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        let context = AutomationEvalContext::default();
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let pass = |rows, at| {
+            input(
+                &rules,
+                rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+
+        let first = engine.tick(pass(&landed, start)).await.unwrap();
+        let claim = first.claims.first().unwrap().clone();
+        assert_eq!(claim.fire().delete_branch.as_deref(), Some("worktree"));
+        let notice = engine
+            .finish(
+                &claim,
+                AutomationOutcome::Deferred {
+                    reason: "open PR(s) #7 still target worktree".into(),
+                },
+                start + 1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(notice, None);
+
+        // Still landed, so the condition re-fires, but the re-check waits.
+        let early = engine.tick(pass(&landed, start + 2)).await.unwrap();
+        assert!(early.claims.is_empty());
+        assert!(
+            engine.queued()[0].waiting_for.contains("#7"),
+            "{:?}",
+            engine.queued()
+        );
+
+        // The restack removed the worktree; the deferred fire stays queued.
+        let mut at = start + 1 + DEFER_RETRY_MS;
+        let gone = engine.tick(pass(&[], at - 1)).await.unwrap();
+        assert!(gone.claims.is_empty());
+        assert_eq!(engine.pending_count(), 1);
+
+        // Deferred over and over well past the breaker limit, and reported
+        // exactly once after an hour.
+        let mut notices = Vec::new();
+        let mut attempts = 0;
+        while at < start + 2 * DEFER_REPORT_AFTER_MS {
+            let tick = engine.tick(pass(&[], at)).await.unwrap();
+            let Some(claim) = tick.claims.first() else {
+                panic!("deferred fire was not re-dispatched at +{}ms", at - start);
+            };
+            attempts += 1;
+            notices.extend(
+                engine
+                    .finish(
+                        claim,
+                        AutomationOutcome::Deferred {
+                            reason: "open PR(s) #7 still target worktree".into(),
+                        },
+                        at,
+                    )
+                    .await
+                    .unwrap(),
+            );
+            at += DEFER_SLOW_RETRY_MS;
+        }
+        assert!(attempts > wt_automations::BREAKER_LIMIT as usize);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("#7"), "{notices:?}");
+
+        // Children retargeted: the delete runs and the fire is done.
+        let last = engine.tick(pass(&[], at)).await.unwrap();
+        let claim = last.claims.first().unwrap();
+        engine
+            .finish(
+                claim,
+                AutomationOutcome::Delivered {
+                    slot: DeliverySlot::None,
+                },
+                at,
+            )
+            .await
+            .unwrap();
+        let after = engine
+            .tick(pass(&landed, at + DEFER_SLOW_RETRY_MS))
+            .await
+            .unwrap();
+        assert!(after.claims.is_empty());
+        assert_eq!(engine.pending_count(), 0);
     }
 
     #[tokio::test]

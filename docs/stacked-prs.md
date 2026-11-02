@@ -118,6 +118,9 @@ the closed-by-base-deletion case during its retarget pass and raises an
 attention line telling you to open a fresh PR. Prefer the repo setting (or the
 web UI's post-merge "Delete branch" button, which also retargets) over
 `--delete-branch`.
+wt's own `builtin:delete-branch` automation therefore waits until no open PR
+and no worktree is based on the branch (the restack moves them to the trunk)
+before deleting it; see [automations.md](automations.md).
 
 Restacks lock **per chain**, not globally: the engine takes every member's
 per-slug flock (the same locks creates/destroys use) for the duration, so

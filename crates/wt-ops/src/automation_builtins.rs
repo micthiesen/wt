@@ -19,6 +19,11 @@ pub enum BuiltinExecution {
     Retry {
         reason: String,
     },
+    /// Nothing was written, and the run must be checked again later even
+    /// after its worktree is gone: the engine requeues the same frozen fire.
+    Defer {
+        reason: String,
+    },
     Completed {
         message: String,
     },
@@ -334,10 +339,23 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
                 .cwd(&ctx.config.paths.main_clone),
             &ctx.cancellation,
         )
-        .await?;
-    let output = output.checked("gh pr list")?;
-    let prs: Vec<PullRequestRef> = serde_json::from_slice(&output.stdout)
-        .context("parse successful `gh pr list` confirmation")?;
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|output| Ok(output.checked("gh pr list")?))
+        .and_then(|output| {
+            serde_json::from_slice::<Vec<PullRequestRef>>(&output.stdout)
+                .context("parse successful `gh pr list` confirmation")
+        });
+    // An unanswered read proves nothing either way: check again later
+    // rather than drop the delete.
+    let prs = match output {
+        Ok(prs) => prs,
+        Err(error) => {
+            return Ok(BuiltinExecution::Defer {
+                reason: format!("cannot confirm the merge of {branch}: {error:#}"),
+            });
+        }
+    };
     let claimed = fire.delete_branch_pr;
     let confirmed = confirms_delete(&prs, claimed);
     if !confirmed {
@@ -378,32 +396,28 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
             message: format!("declined to delete {branch}: {reason}"),
         });
     };
-    let mut outcome = delete_remote_branch_at(
+    let local_children = match stacked_worktrees(ctx, branch, &fire.slug).await {
+        Ok(children) => children,
+        Err(error) => {
+            return Ok(BuiltinExecution::Defer {
+                reason: format!("cannot read which worktrees stack on {branch}: {error:#}"),
+            });
+        }
+    };
+    let outcome = match delete_remote_branch_guarded(
         &ctx.processes,
+        &github_client(ctx),
         &ctx.config.paths.main_clone,
         branch,
         &expected,
+        &local_children,
         &ctx.cancellation,
     )
-    .await?;
-    if let LeasedDelete::Unreachable(push_error) = &outcome {
-        // git could not reach origin (commonly no git credentials when only
-        // gh is authenticated). Fall back to the API with the same head check.
-        let result = github_client(ctx)
-            .delete_remote_branch_at(branch, &expected, &ctx.cancellation)
-            .await;
-        outcome = if result.ok {
-            LeasedDelete::Deleted
-        } else {
-            LeasedDelete::Refused(format!(
-                "{}; git push: {push_error}",
-                result
-                    .error
-                    .as_deref()
-                    .unwrap_or("GitHub API delete failed")
-            ))
-        };
-    }
+    .await?
+    {
+        GuardedDelete::Deferred(reason) => return Ok(BuiltinExecution::Defer { reason }),
+        GuardedDelete::Attempted(outcome) => outcome,
+    };
     match outcome {
         LeasedDelete::Deleted => {
             attention(
@@ -433,6 +447,93 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
             })
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuardedDelete {
+    /// Something may still be based on the branch. Nothing was pushed.
+    Deferred(String),
+    Attempted(LeasedDelete),
+}
+
+/// The one path that deletes a branch on origin. GitHub CLOSES every open PR
+/// whose base ref is deleted by push or API (it retargets them only under its
+/// own "automatically delete head branches" setting), and such a PR cannot be
+/// reopened. So the delete waits until no open PR and no live worktree is
+/// based on the branch; a restack moves them to the trunk, then it proceeds.
+async fn delete_remote_branch_guarded(
+    processes: &ProcessRunner,
+    github: &GithubClient,
+    repository: &Path,
+    branch: &str,
+    expected: &str,
+    local_children: &[String],
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<GuardedDelete> {
+    if !local_children.is_empty() {
+        return Ok(GuardedDelete::Deferred(format!(
+            "worktree(s) {} still stack on {branch}",
+            local_children.join(", ")
+        )));
+    }
+    match github
+        .open_pull_requests_based_on(branch, cancellation)
+        .await
+    {
+        Ok(children) if children.is_empty() => {}
+        Ok(children) => {
+            let numbers = children
+                .iter()
+                .map(|number| format!("#{number}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(GuardedDelete::Deferred(format!(
+                "open PR(s) {numbers} still target {branch}; deleting it would close them"
+            )));
+        }
+        Err(error) => {
+            return Ok(GuardedDelete::Deferred(format!(
+                "cannot list PRs based on {branch}: {error}"
+            )));
+        }
+    }
+    let mut outcome =
+        delete_remote_branch_at(processes, repository, branch, expected, cancellation).await?;
+    if let LeasedDelete::Unreachable(push_error) = &outcome {
+        // git could not reach origin (commonly no git credentials when only
+        // gh is authenticated). Fall back to the API with the same head check.
+        let result = github
+            .delete_remote_branch_at(branch, expected, cancellation)
+            .await;
+        outcome = if result.ok {
+            LeasedDelete::Deleted
+        } else {
+            LeasedDelete::Refused(format!(
+                "{}; git push: {push_error}",
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or("GitHub API delete failed")
+            ))
+        };
+    }
+    Ok(GuardedDelete::Attempted(outcome))
+}
+
+/// Live worktrees other than `own_slug` whose recorded fork base is `branch`:
+/// a restack has yet to move them to the trunk.
+async fn stacked_worktrees(ctx: &AppContext, branch: &str, own_slug: &str) -> Result<Vec<String>> {
+    let rows = ctx.repository.inventory(&ctx.cancellation).await?;
+    let state = ctx
+        .database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await?;
+    Ok(rows
+        .iter()
+        .filter(|row| !row.is_main && row.target.slug() != own_slug)
+        .filter(|row| state["slugs"][row.target.slug()]["baseBranch"].as_str() == Some(branch))
+        .map(|row| row.target.slug().to_owned())
+        .collect())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -577,7 +678,10 @@ fn confirms_delete(prs: &[PullRequestRef], claimed: Option<u64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LeasedDelete, PullRequestRef, confirms_delete, delete_remote_branch_at};
+    use super::{
+        GuardedDelete, LeasedDelete, PullRequestRef, confirms_delete, delete_remote_branch_at,
+        delete_remote_branch_guarded,
+    };
     use std::{path::Path, process::Command};
     use wt_platform::process::ProcessRunner;
 
@@ -669,6 +773,126 @@ mod tests {
             matches!(unreachable, LeasedDelete::Unreachable(_)),
             "{unreachable:?}"
         );
+    }
+
+    /// GitHub closes, for good, every open PR whose base branch is deleted by
+    /// push or API. The delete waits while a PR or a worktree is still based
+    /// on the branch, or while that cannot be ruled out, and goes ahead once
+    /// a restack has moved them.
+    #[tokio::test]
+    async fn branch_deletion_waits_for_everything_stacked_on_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let clone = root.path().join("clone");
+        git(
+            root.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(root.path(), &["init", "-q", clone.to_str().unwrap()]);
+        git(
+            &clone,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&clone, &["checkout", "-qb", "parent"]);
+        let merged = commit(&clone, "merged work");
+        git(&clone, &["push", "-q", "origin", "parent"]);
+
+        // `children` holds gh's answer for `pr list --base parent`; without
+        // it gh fails the way an outage or rate limit does.
+        let children = root.path().join("children");
+        let args = root.path().join("args");
+        let gh = root.path().join("gh");
+        std::fs::write(
+            &gh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}' || {{ echo 'HTTP 502' >&2; exit 1; }}\n",
+                args.display(),
+                children.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let github = wt_github::GithubClient::new(
+            ProcessRunner::default(),
+            clone.clone(),
+            wt_github::GithubOptions {
+                base_branch: "main".into(),
+                reviewers_enabled: false,
+                ignored_checks: vec![],
+                review_bot_name: String::new(),
+                review_bot_login: String::new(),
+                review_bot_contexts: vec![],
+                review_bot_mode: wt_config::ReviewBotMode::Threads,
+                review_bot_summary_markers: vec![],
+                review_bot_pending_marker: None,
+                ignored_review_repositories: vec![],
+                default_reviewer: None,
+                repo_has_ci: false,
+            },
+        )
+        .with_gh_program(&gh);
+        let processes = ProcessRunner::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let attempt = |local: Vec<String>| {
+            let (processes, github, clone, merged, cancel) = (
+                processes.clone(),
+                github.clone(),
+                clone.clone(),
+                merged.clone(),
+                cancel.clone(),
+            );
+            async move {
+                delete_remote_branch_guarded(
+                    &processes, &github, &clone, "parent", &merged, &local, &cancel,
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let remote_tip = || {
+            git(
+                &remote,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname)",
+                    "refs/heads/parent",
+                ],
+            )
+        };
+
+        std::fs::write(&children, r#"[{"number":3248}]"#).unwrap();
+        let open_child = attempt(vec![]).await;
+        assert!(
+            matches!(&open_child, GuardedDelete::Deferred(reason) if reason.contains("#3248")),
+            "{open_child:?}"
+        );
+        assert_eq!(remote_tip(), merged);
+        let asked = std::fs::read_to_string(&args).unwrap();
+        assert!(asked.lines().any(|line| line == "--base"), "{asked}");
+        assert!(asked.lines().any(|line| line == "parent"), "{asked}");
+
+        std::fs::remove_file(&children).unwrap();
+        let unanswered = attempt(vec![]).await;
+        assert!(
+            matches!(unanswered, GuardedDelete::Deferred(_)),
+            "{unanswered:?}"
+        );
+        assert_eq!(remote_tip(), merged);
+
+        std::fs::write(&children, "[]").unwrap();
+        let local_child = attempt(vec!["child".into()]).await;
+        assert!(
+            matches!(local_child, GuardedDelete::Deferred(_)),
+            "{local_child:?}"
+        );
+        assert_eq!(remote_tip(), merged);
+
+        // The restack retargeted the child PR and rebased the worktree.
+        let retargeted = attempt(vec![]).await;
+        assert_eq!(retargeted, GuardedDelete::Attempted(LeasedDelete::Deleted));
+        assert_eq!(remote_tip(), "");
     }
 
     #[test]

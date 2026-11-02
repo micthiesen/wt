@@ -192,11 +192,24 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             if let Some(error) = error { latest_error = Some(error); }
                             let advanced_tip = claim.fire().branch_range.as_ref().map(|range| (range.branch.clone(), range.to.clone()));
                             let delivered_event = claim.fire().mcp_event.as_ref().map(|event| (event.rule.clone(), event.event_id.clone()));
-                            let started = !matches!(outcome, AutomationOutcome::NotStarted);
-                            if let Err(error) = engine.finish_with_cancellation(
+                            let started = !matches!(
+                                outcome,
+                                AutomationOutcome::NotStarted | AutomationOutcome::Deferred { .. }
+                            );
+                            match engine.finish_with_cancellation(
                                 &claim, outcome, now_ms(), &accepted_context.cancellation,
                             ).await {
-                                latest_error = Some(format!("automation ledger finish: {error:#}"));
+                                Ok(Some(notice)) => tracing::warn!(
+                                    target: "wt_attention",
+                                    event_channel = "attention",
+                                    event_source = %claim.fire().slug,
+                                    event_text = %notice,
+                                    "automation still deferred"
+                                ),
+                                Ok(None) => {}
+                                Err(error) => {
+                                    latest_error = Some(format!("automation ledger finish: {error:#}"));
+                                }
                             }
                             // The ledger already holds the fire's key, so a
                             // failed drop only leaves an event that cannot
@@ -513,6 +526,10 @@ async fn dispatch_claim(
             wt_ops::automation_builtins::BuiltinExecution::Retry { reason } => {
                 tracing::info!(rule = %fire.rule.id, %reason, "automation will retry");
                 (AutomationOutcome::NotStarted, None)
+            }
+            wt_ops::automation_builtins::BuiltinExecution::Defer { reason } => {
+                tracing::info!(rule = %fire.rule.id, %reason, "automation deferred");
+                (AutomationOutcome::Deferred { reason }, None)
             }
             wt_ops::automation_builtins::BuiltinExecution::Completed { message } => {
                 tracing::info!(rule = %fire.rule.id, %message, "automation completed");

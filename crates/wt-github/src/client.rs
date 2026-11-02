@@ -373,6 +373,36 @@ impl GithubClient {
         parse_live_pr(&out.stdout).map(Some)
     }
 
+    /// Numbers of the open PRs whose BASE is `branch`. Deleting a branch by
+    /// push or API makes GitHub close these (`base_ref_deleted`) rather than
+    /// retarget them, and such a PR cannot be reopened. A failed request is
+    /// an error, never an empty list.
+    pub async fn open_pull_requests_based_on(
+        &self,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u64>, GithubError> {
+        #[derive(serde::Deserialize)]
+        struct Number {
+            number: u64,
+        }
+        let out = self
+            .run(
+                [
+                    "pr", "list", "--state", "open", "--base", branch, "--limit", "100", "--json",
+                    "number",
+                ],
+                cancellation,
+            )
+            .await?;
+        if !out.status.success() {
+            return Err(classify_output(&out));
+        }
+        let prs: Vec<Number> = serde_json::from_slice(&out.stdout)
+            .map_err(|e| GithubError::Protocol(format!("unparseable gh pr list response: {e}")))?;
+        Ok(prs.into_iter().map(|pr| pr.number).collect())
+    }
+
     pub async fn edit_reviewers(
         &self,
         number: u64,

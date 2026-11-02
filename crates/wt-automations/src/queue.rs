@@ -137,12 +137,18 @@ pub fn queue_intents(input: QueueIntentsInput<'_>) -> Vec<AutomationIntent> {
         } else {
             now_ms
         };
+        let mut settle_at_ms = queued_at_ms.saturating_add(settle_ms);
+        if same {
+            // A deferred run is requeued with a later re-check time; the
+            // unchanged condition must not pull it forward.
+            settle_at_ms = settle_at_ms.max(old.unwrap().settle_at_ms);
+        }
         output.insert(
             id,
             AutomationIntent {
                 fire,
                 queued_at_ms,
-                settle_at_ms: queued_at_ms.saturating_add(settle_ms),
+                settle_at_ms,
             },
         );
     }
