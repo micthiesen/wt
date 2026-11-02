@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "wt-app"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "wt-cli",
 ]
