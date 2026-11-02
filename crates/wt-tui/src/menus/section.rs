@@ -124,6 +124,7 @@ fn option(value: Option<String>, label: String, chord: Option<char>) -> PickerOp
         chord,
         note: None,
         verify_after_merge: None,
+        verify_in: None,
         detail: None,
     }
 }

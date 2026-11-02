@@ -109,8 +109,22 @@ pub struct QueuedFire {
     pub target: String,
     pub detail: String,
     pub queued_at_ms: i64,
+    /// When its settle window ends; it dispatches then if nothing else holds it.
+    pub settle_at_ms: i64,
     pub waiting_for: String,
 }
+
+/// A fire the engine has claimed and is still delivering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningFire {
+    pub rule: String,
+    pub target: String,
+    pub detail: String,
+    pub since_ms: Option<i64>,
+}
+
+/// Recorded fires kept for display.
+const RECENT_HISTORY: usize = 10;
 
 #[derive(Clone, Debug, Default)]
 pub struct AutomationTick {
@@ -145,6 +159,8 @@ pub struct AutomationEngine {
     /// Intents held only by unmet row-backed requirements. They stay queued
     /// with their settle age but are not reported as queued.
     unmet: BTreeSet<String>,
+    /// The newest ledger records as of the latest pass, newest first.
+    recent: Vec<wt_automations::LedgerRecord>,
 }
 
 impl AutomationEngine {
@@ -156,7 +172,34 @@ impl AutomationEngine {
             active: BTreeMap::new(),
             waiting: BTreeMap::new(),
             unmet: BTreeSet::new(),
+            recent: Vec::new(),
         }
+    }
+
+    /// Fires being delivered now, oldest first.
+    pub fn running(&self) -> Vec<RunningFire> {
+        let mut running = self
+            .active
+            .values()
+            .map(|active| RunningFire {
+                rule: active.fire.rule.id.clone(),
+                target: pair_target(&active.fire),
+                detail: active.fire.detail.clone(),
+                since_ms: match &active.slot {
+                    SlotState::Session {
+                        dispatched_at_ms, ..
+                    } => Some(*dispatched_at_ms),
+                    _ => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        running.sort_by(|a, b| (a.since_ms, &a.rule).cmp(&(b.since_ms, &b.rule)));
+        running
+    }
+
+    /// The newest recorded fires as of the latest pass, newest first.
+    pub fn recent(&self) -> &[wt_automations::LedgerRecord] {
+        &self.recent
     }
 
     /// Every retained intent, including requirement-held ones.
@@ -187,6 +230,7 @@ impl AutomationEngine {
                 target: pair_target(&intent.fire),
                 detail: intent.fire.detail.clone(),
                 queued_at_ms: intent.queued_at_ms,
+                settle_at_ms: intent.settle_at_ms,
                 waiting_for: self
                     .waiting
                     .get(id)
@@ -254,6 +298,7 @@ impl AutomationEngine {
             .snapshot()
             .await
             .context("read automation ledger")?;
+        self.recent = ledger.recent(RECENT_HISTORY);
         let handled = candidates
             .into_iter()
             .filter(|key| ledger.has_handled(key, input.now_ms))
@@ -619,6 +664,11 @@ impl AutomationEngine {
                     .context("mark automation delivery ambiguous")?;
                 self.finish_slot(&claim.id, slot, now_ms);
             }
+        }
+        // Display only: the overlay's history shows the outcome now rather
+        // than at the next pass. A failed read keeps the older list.
+        if let Ok(ledger) = self.ledger.snapshot().await {
+            self.recent = ledger.recent(RECENT_HISTORY);
         }
         Ok(())
     }

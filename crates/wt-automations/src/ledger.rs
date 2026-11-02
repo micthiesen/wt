@@ -114,7 +114,50 @@ pub enum DispatchClaimResult {
     BreakerReserved { count: u64, reserved: u64 },
 }
 
+/// One recorded fire: what ran (or was skipped or cancelled), when, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerRecord {
+    pub key: String,
+    pub rule_id: String,
+    pub slug: String,
+    pub state: String,
+    pub at_ms: i64,
+    pub reason: Option<String>,
+}
+
 impl LedgerSnapshot {
+    /// The newest recorded fires first, for display.
+    pub fn recent(&self, limit: usize) -> Vec<LedgerRecord> {
+        let mut records = self
+            .fired
+            .iter()
+            .filter_map(|(key, entry)| {
+                Some(LedgerRecord {
+                    key: key.clone(),
+                    rule_id: entry.get("ruleId")?.as_str()?.to_owned(),
+                    slug: entry
+                        .get("slug")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    state: entry
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    at_ms: number(entry.get("at"))?,
+                    reason: entry
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                })
+            })
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.key.cmp(&b.key)));
+        records.truncate(limit);
+        records
+    }
+
     pub fn has_handled(&self, key: &str, now_ms: i64) -> bool {
         let Some(entry) = self.fired.get(key) else {
             return false;

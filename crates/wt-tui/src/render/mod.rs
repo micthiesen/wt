@@ -4,6 +4,7 @@
 pub(crate) mod details;
 mod list;
 mod overlays;
+pub(crate) use overlays::automation_line_count;
 pub(crate) mod status;
 pub(crate) mod text;
 
@@ -788,6 +789,7 @@ mod tests {
                         chord: None,
                         note: None,
                         verify_after_merge: None,
+                        verify_in: None,
                         detail: None,
                     })
                     .collect(),
@@ -1079,6 +1081,7 @@ mod tests {
                 chord: Some('1'),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
             selected: 0,

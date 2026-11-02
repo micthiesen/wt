@@ -27,13 +27,13 @@ use crate::UiAction;
 
 pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION, REMOVING_SECTION};
 pub use board::{
-    ActivityLine, AttentionLine, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat,
-    DisplayPolicy, GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LogView,
-    MergeQueueView, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
-    PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
-    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
-    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WorkPresentation,
-    WorkRiskCount, WorkStateCount,
+    ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
+    AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
+    GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
+    PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
+    PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot,
+    ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView,
+    TerminalSlotView, TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use interaction::{
     ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,

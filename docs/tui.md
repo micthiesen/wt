@@ -62,9 +62,11 @@ and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
 The work-status block follows when a status is saved: state,
 risk, age, and commits since the status, then the gate and the note behind a
 rail in the state's color. `OPS`, `REVERT`, `IF WRONG`, and `UNTESTED` note
-fields align under a hanging indent. A verify-after-merge obligation shows its
-step count with a two-line preview; `V` expands or collapses the steps, and
-they start expanded when the check is due.
+fields align under a hanging indent. A post-merge obligation shows its stage
+(`verify in staging` / `verify in production`) and step count with a two-line
+preview; `V` expands or collapses the steps, and they start expanded once the
+check is due. A production check on a branch that has only reached base reads
+`awaiting production` and does not ask for attention.
 
 Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
 order and visibility: `branch` (with its landing base), `issue` (also
@@ -279,7 +281,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
 | `V` | Show or hide this row's post-merge verification steps (open by default when the check is due) |
-| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` ready with verification, `x` clears, `m` edits the note) |
+| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
 | `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists every section in board order with its size |
 | `D` | Delete the current section; its worktrees move to the Inbox (confirmation when it has any) |
@@ -423,6 +425,7 @@ that exit successfully close normally.
 
 | Key | Action |
 |---|---|
+| `Q` | Automations overlay: running, queued (with when each runs) and the last ten recorded fires; `A` pauses inside it |
 | `A` | Pause / resume all automations |
 | `Ctrl+A` | Pause / resume automations for the selected worktree |
 | `Ctrl+Shift+A` | Cancel queued automations |

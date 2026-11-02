@@ -62,6 +62,7 @@ pub fn session_picker(
             chord: None,
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         });
         choices.push(entry.selection.clone());
@@ -94,6 +95,7 @@ pub fn session_picker(
             chord: Some(harness_letter(harness)),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         });
         choices.push(selection);
@@ -175,6 +177,7 @@ pub fn harness_picker(
                 chord: Some(harness_letter(id)),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             })
             .collect(),

@@ -939,7 +939,7 @@ async fn enrich(
                         }
                         head_on_production = landed;
                         let merge_oid = pr.and_then(|pr| {
-                            exact_merged_pr_oid(
+                            wt_core::exact_merged_pr_oid(
                                 pr.head_ref_oid.as_deref(),
                                 head,
                                 &pr.state,
@@ -1364,17 +1364,6 @@ fn parse_merge_tree(code: Option<i32>, stdout: &[u8]) -> Option<Vec<String>> {
     }
 }
 
-fn exact_merged_pr_oid<'a>(
-    pr_head: Option<&'a str>,
-    current_head: &str,
-    pr_state: &str,
-    merge_oid: Option<&'a str>,
-) -> Option<&'a str> {
-    (pr_head == Some(current_head) && pr_state.eq_ignore_ascii_case("MERGED"))
-        .then_some(merge_oid)
-        .flatten()
-}
-
 async fn first_commit_title(
     context: &AppContext,
     path: &Path,
@@ -1678,15 +1667,15 @@ mod tests {
     #[test]
     fn a_reused_branch_pr_merge_oid_cannot_mark_the_new_head_landed() {
         assert_eq!(
-            exact_merged_pr_oid(Some("old-head"), "new-head", "MERGED", Some("merge")),
+            wt_core::exact_merged_pr_oid(Some("old-head"), "new-head", "MERGED", Some("merge")),
             None
         );
         assert_eq!(
-            exact_merged_pr_oid(Some("new-head"), "new-head", "OPEN", Some("merge")),
+            wt_core::exact_merged_pr_oid(Some("new-head"), "new-head", "OPEN", Some("merge")),
             None
         );
         assert_eq!(
-            exact_merged_pr_oid(Some("new-head"), "new-head", "MERGED", Some("merge")),
+            wt_core::exact_merged_pr_oid(Some("new-head"), "new-head", "MERGED", Some("merge")),
             Some("merge")
         );
     }

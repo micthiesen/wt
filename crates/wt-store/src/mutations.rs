@@ -1201,6 +1201,7 @@ impl Store {
                         "by",
                         "blockedOn",
                         "verifyAfterMerge",
+                        "verifyIn",
                     ],
                 );
                 entry.insert("work".to_owned(), next_work);
@@ -2151,6 +2152,7 @@ fn merge_optional(
                     "by",
                     "blockedOn",
                     "verifyAfterMerge",
+                    "verifyIn",
                 ],
             );
             target.insert(key.to_owned(), value);

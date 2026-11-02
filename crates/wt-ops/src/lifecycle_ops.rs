@@ -67,6 +67,8 @@ pub async fn resolve_key(ctx: &AppContext, key: &str) -> Result<WorktreeRecord> 
 pub struct LifecycleFacts {
     pub local_merged: Option<bool>,
     pub clean_candidate: bool,
+    /// The landing reached `[branch] production`. False is unknown.
+    pub in_production: bool,
 }
 
 pub struct RemovalPlan {
@@ -219,11 +221,16 @@ pub async fn plan_automation_facts(
         } else {
             false
         };
+        let in_production = landing.landed()
+            && ctx.config.branch.separate_production()
+            && owes_production_check(stored)
+            && reached_production(ctx, &row, github).await;
         evidence.rows.insert(
             slug,
             LifecycleFacts {
                 local_merged: landing.local_merged.then_some(true),
                 clean_candidate,
+                in_production,
             },
         );
     }
@@ -231,6 +238,77 @@ pub async fn plan_automation_facts(
         tracing::debug!(%warning, "automation landing evidence is partial");
     }
     Ok(evidence)
+}
+
+/// The board's "in production" proof: HEAD, or the exact merge commit of the
+/// PR merged at HEAD, is contained in the production branch. The production
+/// branch is in `keep_fresh`, so its local head is current; its remote-tracking
+/// ref is the fallback. Any failure is unknown, which reads as not yet.
+async fn reached_production(ctx: &AppContext, row: &WorktreeRecord, github: &GithubData) -> bool {
+    let Some(production) = ctx.config.branch.production.as_deref() else {
+        return false;
+    };
+    let path = Path::new(&row.target.path);
+    let mut production_ref = None;
+    for candidate in [production.to_owned(), format!("origin/{production}")] {
+        let spec = format!("{candidate}^{{commit}}");
+        if let Ok(output) = run_git(ctx, path, ["rev-parse", "--verify", "--quiet", &spec]).await
+            && output.status.success()
+        {
+            production_ref = Some(candidate);
+            break;
+        }
+    }
+    let Some(production_ref) = production_ref else {
+        tracing::debug!(
+            slug = row.target.slug(),
+            production,
+            "production branch unresolved; landing reads as not yet promoted"
+        );
+        return false;
+    };
+    let Ok(head) = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"]).await else {
+        return false;
+    };
+    if !head.status.success() {
+        return false;
+    }
+    let head = head.stdout_text().trim().to_owned();
+    let merge = github.prs.get(&row.target.branch).and_then(|pr| {
+        wt_core::exact_merged_pr_oid(
+            pr.head_ref_oid.as_deref(),
+            &head,
+            &pr.state,
+            pr.merge_commit_oid.as_deref(),
+        )
+        .map(str::to_owned)
+    });
+    for commit in std::iter::once(head).chain(merge) {
+        if let Ok(output) = run_git(
+            ctx,
+            path,
+            ["merge-base", "--is-ancestor", &commit, &production_ref],
+        )
+        .await
+            && output.status.success()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The probe costs several Git calls per row, so it runs only where its
+/// answer decides something: an undischarged production-stage check.
+fn owes_production_check(stored: &serde_json::Value) -> bool {
+    wt_core::parse_work_status(&stored["work"]).is_some_and(|work| {
+        !matches!(
+            work.state,
+            wt_core::WorkState::Verified | wt_core::WorkState::Dropped
+        ) && work
+            .verification()
+            .is_some_and(|(stage, _)| stage == wt_core::VerifyStage::Production)
+    })
 }
 
 /// An actively edited checkout is busy, not broken.

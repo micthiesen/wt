@@ -11,7 +11,7 @@ pub use evaluate::{
 };
 pub use ledger::{
     AutomationLedger, BREAKER_LIMIT, BreakerState, DispatchClaim, DispatchClaimResult,
-    DispatchKind, DispatchPolicy, DispatchRequest, LedgerError, LedgerSnapshot,
+    DispatchKind, DispatchPolicy, DispatchRequest, LedgerError, LedgerRecord, LedgerSnapshot,
 };
 pub use queue::{CancellableFiresInput, QueueIntentsInput, cancellable_fires, queue_intents};
 pub use types::{

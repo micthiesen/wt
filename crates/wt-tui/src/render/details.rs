@@ -989,13 +989,15 @@ fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> V
     };
     let color = if work.verification_overdue {
         theme::ERR
-    } else if work.blocked || work.verification_owed {
+    } else if work.blocked || (work.verification_owed && !work.verification_waiting) {
         theme::WARN
     } else {
         badges::work_state_color(state)
     };
     let (glyph, text) = if work.blocked {
         ("⊘", format!("blocked · {}", state.as_str()))
+    } else if work.verification_waiting {
+        ("●", format!("awaiting production · {}", state.as_str()))
     } else if work.verification_owed {
         ("●", format!("unverified · {}", state.as_str()))
     } else if work.derived {
@@ -1035,14 +1037,15 @@ fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> V
     if let Some(note) = record.and_then(|record| record.note.as_deref()) {
         lines.extend(note_lines(note, color, width));
     }
-    if let Some(steps) = record.and_then(|record| record.verify_after_merge.as_deref()) {
+    if let Some((stage, steps)) = record.and_then(wt_core::WorkStatusRecord::verification) {
         // The model holds the open state; it defaults to open exactly when
-        // the check is due and `V` toggles it.
+        // the check is owed and `V` toggles it.
         let expanded = show_verification;
         lines.extend(verify_lines(
             steps,
+            stage,
             color,
-            work.verification_owed,
+            work.verification_owed && !work.verification_waiting,
             work.verification_overdue,
             expanded,
             width,
@@ -1156,6 +1159,7 @@ fn split_note_sections(note: &str) -> Vec<(Option<&'static str>, String)> {
 /// dormant and dim.
 fn verify_lines(
     text: &str,
+    stage: wt_core::VerifyStage,
     color: ratatui::style::Color,
     owed: bool,
     overdue: bool,
@@ -1167,8 +1171,9 @@ fn verify_lines(
     let body_color = if owed { theme::FG_MID } else { theme::FG_DIM };
     let mut header = vec![Span::styled(
         format!(
-            "{}verify after merge",
-            if overdue { "OVERDUE · " } else { "" }
+            "{}verify in {}",
+            if overdue { "OVERDUE · " } else { "" },
+            stage.as_str()
         ),
         if owed {
             theme::bold(head_color)

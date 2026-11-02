@@ -1665,6 +1665,7 @@ mod tests {
                     state: None,
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     seen: None,
                 },
             ];

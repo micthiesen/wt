@@ -281,6 +281,7 @@ fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
                     chord: Some('m'),
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 }],
             }),
@@ -334,6 +335,7 @@ fn keys_typed_while_a_menu_loads_replay_into_it_and_escape_cancels() {
                         chord: None,
                         note: None,
                         verify_after_merge: None,
+                        verify_in: None,
                         detail: None,
                     })
                     .collect(),
@@ -395,6 +397,7 @@ fn fast_session_close_never_reaches_board_remove() {
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
         }),
@@ -433,6 +436,7 @@ async fn slow_menus_drop_typeahead_instead_of_replaying_it() {
                 chord: Some('m'),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
         }),
@@ -558,6 +562,7 @@ fn action_palette_chords_and_arguments_keep_the_original_target() {
                 chord: Some('g'),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
         }),
@@ -687,6 +692,7 @@ fn section_picker_creates_from_empty_list_and_remembers_last_target() {
             chord: None,
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         })
         .to_vec();
@@ -1283,6 +1289,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
                     chord: Some('y'),
                     note: Some("old note".into()),
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 },
                 PickerOption {
@@ -1291,6 +1298,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
                     chord: Some('a'),
                     note: None,
                     verify_after_merge: Some("probe".into()),
+                    verify_in: None,
                     detail: None,
                 },
                 PickerOption {
@@ -1299,6 +1307,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
                     chord: Some('x'),
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 },
             ],
@@ -1321,6 +1330,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             state: Some("ready".into()),
             note: Some("needs review".into()),
             verify_after_merge: None,
+            verify_in: None,
             seen: None,
         })
     );
@@ -1338,6 +1348,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
                 chord: Some('y'),
                 note: Some("old note".into()),
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
             selected: 0,
@@ -1351,6 +1362,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             state: Some("ready".into()),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             seen: None,
         })
     );
@@ -1364,10 +1376,11 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             title: "status".into(),
             options: vec![PickerOption {
                 value: Some("ready".into()),
-                label: "ready + verify".into(),
-                chord: Some('a'),
+                label: "ready + verify in production".into(),
+                chord: Some('p'),
                 note: None,
                 verify_after_merge: Some("probe".into()),
+                verify_in: Some(wt_core::VerifyStage::Production),
                 detail: None,
             }],
             selected: 0,
@@ -1375,7 +1388,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
         ..UiReply::default()
     });
     assert_eq!(
-        model.input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), 20),
+        model.input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), 20),
         InputResult::Draw
     );
     assert_eq!(
@@ -1385,6 +1398,7 @@ fn status_picker_supports_chords_notes_and_verify_steps() {
             state: Some("ready".into()),
             note: None,
             verify_after_merge: Some("probe".into()),
+            verify_in: Some(wt_core::VerifyStage::Production),
             seen: None,
         })
     );
@@ -1702,10 +1716,12 @@ fn board_menus_open_without_a_request_and_commit_what_they_showed() {
             state: Some("working".into()),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             seen: Some(crate::Seen(Some(crate::StatusClaim {
                 state: "review".into(),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
             }))),
         }
     );
@@ -1737,6 +1753,7 @@ fn open_board_menus_rebuild_from_newer_boards_and_keep_their_choice() {
                 state: "working".into(),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
             }))),
         }
     );
@@ -1858,7 +1875,7 @@ fn a_menu_reply_message_survives_dropped_typeahead() {
 
 #[test]
 fn a_rebuild_keeps_the_status_row_chosen_among_rows_sharing_a_value() {
-    // `ready` and `ready + verify after merge` both carry the value `ready`.
+    // `ready` and the two `ready + verify in <stage>` rows all carry `ready`.
     let ready_with_steps = || {
         let mut snapshot = board_with_status(Some(wt_core::WorkState::Ready));
         let record = snapshot.test_data_mut().rows[0]
@@ -1881,14 +1898,14 @@ fn a_rebuild_keeps_the_status_row_chosen_among_rows_sharing_a_value() {
     model.input(KeyEvent::from(KeyCode::Char('u')), 20);
     assert_eq!(label(&model), "ready (current)");
     model.input(KeyEvent::from(KeyCode::Down), 20);
-    assert_eq!(label(&model), "ready + verify after merge");
+    assert_eq!(label(&model), "ready + verify in staging");
     model.apply(board_with_status(Some(wt_core::WorkState::Ready)));
-    assert_eq!(label(&model), "ready + verify after merge");
+    assert_eq!(label(&model), "ready + verify in staging");
     // Moved from the current `a` row up to plain `ready`.
     let mut model = Model::default();
     model.apply(ready_with_steps());
     model.input(KeyEvent::from(KeyCode::Char('u')), 20);
-    assert_eq!(label(&model), "ready + verify after merge (current)");
+    assert_eq!(label(&model), "ready + verify in staging (current)");
     model.input(KeyEvent::from(KeyCode::Up), 20);
     assert_eq!(label(&model), "ready");
     model.apply(ready_with_steps());
@@ -1944,6 +1961,7 @@ fn keys_past_the_typeahead_limit_are_reported_when_the_menu_opens() {
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
         }),
@@ -1981,6 +1999,31 @@ fn archive_and_automation_toggles_carry_the_state_the_user_saw() {
             seen: Some(Seen(false)),
         })
     );
+}
+
+#[test]
+fn q_opens_the_automations_overlay_which_pauses_in_place_and_closes() {
+    let mut model = Model::default();
+    assert!(matches!(
+        model.input(KeyEvent::from(KeyCode::Char('Q')), 20),
+        InputResult::Draw
+    ));
+    assert!(matches!(model.interaction, Interaction::None));
+    let mut board = (*model.board).clone();
+    board.display.automations = true;
+    model.board = board.into();
+    model.input(KeyEvent::from(KeyCode::Char('Q')), 20);
+    assert!(matches!(model.interaction, Interaction::Automations { .. }));
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('A')), 20),
+        InputResult::Action(UiAction::ToggleAutomations {
+            key: None,
+            seen: Some(Seen(false)),
+        })
+    );
+    assert!(matches!(model.interaction, Interaction::Automations { .. }));
+    model.input(KeyEvent::from(KeyCode::Esc), 20);
+    assert!(matches!(model.interaction, Interaction::None));
 }
 
 #[test]

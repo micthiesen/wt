@@ -152,6 +152,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut lifecycle_cache = std::collections::BTreeMap::new();
         let mut lifecycle_errors = std::collections::BTreeMap::new();
         let mut lifecycle_retry = LifecycleRetry::default();
+        let mut production_tip = ProductionTip::default();
         let mut requirements_board_revision = None;
         let mut latest_error: Option<String> = None;
         // Whether `facts` reflects the current inputs. A failed preparation
@@ -213,7 +214,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                     Err(error) => latest_error = Some(format!("cannot persist branch tip after dispatch: {error:#}")),
                                 }
                             }
-                            let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
+                            let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
                         }
                         Some(Err(error)) => {
                             latest_error = Some(format!("automation dispatch task failed: {error}"));
@@ -226,7 +227,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             {
                                 latest_error = Some(format!("automation ledger finish: {finish:#}"));
                             }
-                            let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
+                            let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
                         }
                         None => {}
                     }
@@ -250,11 +251,13 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let lanes_ready = *git.state() == SourceState::Ready
                 && *metadata.state() == SourceState::Ready;
             let metadata_key = metadata_facts_key(confirmed_metadata.as_deref());
+            let production = production_tip.current(&context).await;
             let key = (
                 confirmed_git.as_deref().cloned(),
                 lanes_ready,
                 metadata_key,
                 fresh_github.as_deref().cloned(),
+                production.clone(),
             );
             let retry_lifecycle = lifecycle_retry.due();
             if cache_key.as_ref() != Some(&key) || retry_lifecycle {
@@ -277,6 +280,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     confirmed_git.as_deref().cloned(),
                     lifecycle_metadata_key(confirmed_metadata.as_deref()),
                     fresh_github.as_deref().cloned(),
+                    production,
                 );
                 if lifecycle_cache_key.as_ref() != Some(&lifecycle_key) || retry_lifecycle {
                     match automation_facts::lifecycle_facts(
@@ -311,7 +315,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                             cache_key = Some(key);
                             facts_current = false;
                             latest_error = Some(format!("automation facts unavailable: lifecycle evidence: {error:#}"));
-                            let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
+                            let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
                             continue;
                         }
                     }
@@ -339,7 +343,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                 cache_key = Some(key);
                                 facts_current = false;
                                 latest_error = Some(format!("automation facts unavailable: cannot persist branch tip baseline: {error:#}"));
-                                let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
+                                let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
                                 continue;
                             }
                             persisted_tips.extend(next.initial_branch_tips.clone());
@@ -362,7 +366,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             // A dispatch error may since have replaced the message; the
             // flag, not the text, keeps stale facts from ticking.
             if !facts_current {
-                let _ = status_tx.send(EngineStatus::new(engine.queued().len(), latest_error.clone()));
+                let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
                 queue_report.write(&context, &engine.queued(), paused(&facts), latest_error.as_deref());
                 continue;
             }
@@ -406,7 +410,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 active_dispatches.insert(task.id(), (tracked, Instant::now()));
             }
             let queued = engine.queued();
-            let _ = status_tx.send(EngineStatus::new(queued.len(), latest_error.clone()));
+            let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
             report_queue_changes(&reported, &queued);
             reported = queued;
             queue_report.write(&context, &reported, facts.globally_paused, latest_error.as_deref());
@@ -568,13 +572,18 @@ fn overlay(
                 changed = status_rx.changed() => if changed.is_err() { break; },
             }
             let snapshot = updates.borrow_and_update().clone();
-            let EngineStatus { pending, error } = status_rx.borrow_and_update().clone();
+            let EngineStatus {
+                pending,
+                error,
+                view,
+            } = status_rx.borrow_and_update().clone();
             let Some(mut board) = snapshot.data().map(|board| (**board).clone()) else {
                 continue;
             };
             // The paused chip stays the inventory's: it reads durable state
             // and is the witness the pause toggle's Pending settles against.
             board.automations_pending = pending;
+            board.automations_view = view;
             board.activity.retain(|line| {
                 !line.text.starts_with("Automations:")
                     && !line.text.starts_with("Automation error:")
@@ -612,11 +621,54 @@ fn overlay(
 struct EngineStatus {
     pending: usize,
     error: Option<String>,
+    view: wt_tui::AutomationsView,
 }
 
-impl EngineStatus {
-    fn new(pending: usize, error: Option<String>) -> Self {
-        Self { pending, error }
+/// The engine's state as the board shows it: the chip's count and the
+/// automations overlay's lists.
+fn engine_status(engine: &AutomationEngine, error: Option<String>) -> EngineStatus {
+    let queued = engine.queued();
+    EngineStatus {
+        pending: queued.len(),
+        error,
+        view: wt_tui::AutomationsView {
+            enabled: true,
+            running: engine
+                .running()
+                .into_iter()
+                .map(|fire| wt_tui::AutomationRunView {
+                    rule: fire.rule,
+                    target: fire.target,
+                    detail: wt_core::sanitize_terminal_text(&fire.detail),
+                    since_ms: fire.since_ms,
+                })
+                .collect(),
+            queued: queued
+                .into_iter()
+                .map(|fire| wt_tui::AutomationQueueView {
+                    rule: fire.rule,
+                    target: fire.target,
+                    detail: wt_core::sanitize_terminal_text(&fire.detail),
+                    queued_at_ms: fire.queued_at_ms,
+                    settle_at_ms: fire.settle_at_ms,
+                    waiting_for: fire.waiting_for,
+                })
+                .collect(),
+            recent: engine
+                .recent()
+                .iter()
+                .map(|record| wt_tui::AutomationRecordView {
+                    rule: record.rule_id.clone(),
+                    target: record.slug.clone(),
+                    state: record.state.clone(),
+                    at_ms: record.at_ms,
+                    reason: record
+                        .reason
+                        .as_deref()
+                        .map(wt_core::sanitize_terminal_text),
+                })
+                .collect(),
+        },
     }
 }
 
@@ -747,6 +799,54 @@ fn pass_input<'a>(
 fn now_ms() -> i64 {
     i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
         .unwrap_or(i64::MAX)
+}
+
+/// A promotion moves only the production branch, which no worktree snapshot
+/// reflects, so the landing evidence is also keyed on its tips. Read at most
+/// every 30 seconds, and only when a rule waits on a production landing.
+#[derive(Default)]
+struct ProductionTip {
+    checked: Option<Instant>,
+    tip: Option<String>,
+}
+
+impl ProductionTip {
+    const INTERVAL: Duration = Duration::from_secs(30);
+
+    async fn current(&mut self, ctx: &AppContext) -> Option<String> {
+        let branch = &ctx.config.branch;
+        let production = branch
+            .production
+            .as_deref()
+            .filter(|_| branch.separate_production())?;
+        let watched = ctx.config.automations.iter().any(|rule| {
+            matches!(
+                rule.on,
+                wt_config::AutomationTrigger::StatusVerificationDue
+                    | wt_config::AutomationTrigger::StatusVerificationOverdue
+            )
+        });
+        if !watched || self.checked.is_some_and(|at| at.elapsed() < Self::INTERVAL) {
+            return self.tip.clone();
+        }
+        self.checked = Some(Instant::now());
+        let output = wt_ops::commands::resolve::run_git(
+            ctx,
+            &ctx.config.paths.main_clone,
+            [
+                "for-each-ref",
+                "--format=%(objectname)",
+                &format!("refs/heads/{production}"),
+                &format!("refs/remotes/origin/{production}"),
+            ],
+        )
+        .await;
+        self.tip = output
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| output.stdout_text().trim().to_owned());
+        self.tip.clone()
+    }
 }
 
 /// A partial local failure cannot become a permanent cached negative. Keep

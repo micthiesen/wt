@@ -44,6 +44,7 @@ fn merge_picker(surface: &ActionSurface) -> UiModal {
             chord: Some('m'),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         }],
     }

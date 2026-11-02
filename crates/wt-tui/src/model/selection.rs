@@ -358,7 +358,7 @@ impl Model {
         self.show_verification = self
             .selected_row()
             .and_then(|row| row.work.as_ref())
-            .is_some_and(|work| work.verification_owed);
+            .is_some_and(|work| work.verification_owed && !work.verification_waiting);
     }
 
     /// Move the cursor one stop; at an edge, scroll the list to that edge

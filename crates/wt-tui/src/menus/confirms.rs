@@ -103,6 +103,7 @@ pub(super) fn create(
             note: (!choice.sign_in_needed.is_empty())
                 .then(|| format!("sign-in needed: {}", choice.sign_in_needed.join(", "))),
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         })
         .collect();

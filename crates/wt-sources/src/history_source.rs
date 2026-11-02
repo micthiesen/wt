@@ -485,11 +485,11 @@ fn present(
             .as_ref()
             .and_then(|work| work.blocked_on.as_deref())
             .map(sanitize_terminal_text),
-        verify_steps: entry
-            .work
-            .as_ref()
-            .and_then(|work| work.verify_after_merge.as_deref())
-            .map(sanitize_terminal_text),
+        verify_steps: entry.work.as_ref().and_then(|work| {
+            let steps = sanitize_terminal_text(work.verify_after_merge.as_deref()?);
+            let stage = work.verify_in.as_deref().unwrap_or("staging");
+            Some(format!("in {}: {steps}", sanitize_terminal_text(stage)))
+        }),
         verify_owed,
         git_state,
         pr_state,
@@ -1027,6 +1027,7 @@ mod tests {
                 at: "2026-10-09T09:00:00Z".into(),
                 note: Some("saved note".into()),
                 verify_after_merge: Some("check production".into()),
+                verify_in: None,
                 ..serde_json::from_value(json!({"state":"ready","at":"2026-10-09T09:00:00Z"}))
                     .unwrap()
             }),
@@ -1055,7 +1056,10 @@ mod tests {
         assert_eq!(row.production_landed, Some(false));
         assert!(row.automations_paused);
         assert!(row.details.iter().any(|detail| detail == "saved note"));
-        assert_eq!(row.verify_steps.as_deref(), Some("check production"));
+        assert_eq!(
+            row.verify_steps.as_deref(),
+            Some("in staging: check production")
+        );
     }
 
     #[test]

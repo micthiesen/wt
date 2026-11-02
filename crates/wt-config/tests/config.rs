@@ -98,6 +98,7 @@ fn snapshot(config: &Config) -> serde_json::Value {
                 wt_config::AutomationTrigger::StatusNeedsHuman => "status.needs_human",
                 wt_config::AutomationTrigger::StatusNeedsTesting => "status.needs_testing",
                 wt_config::AutomationTrigger::StatusReady => "status.ready",
+                wt_config::AutomationTrigger::StatusVerificationDue => "status.verification_due",
                 wt_config::AutomationTrigger::StatusVerificationOverdue => "status.verification_overdue",
                 wt_config::AutomationTrigger::BranchAdvanced => "branch.advanced",
                 wt_config::AutomationTrigger::McpEvent => "mcp.event",

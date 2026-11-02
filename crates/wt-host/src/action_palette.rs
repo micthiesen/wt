@@ -117,6 +117,7 @@ async fn palette(
             chord: keys.get(&def.id).copied(),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: Some(reason.map_or_else(
                 || action_detail(def, &primary),
                 |reason| format!("({reason})"),
@@ -143,6 +144,7 @@ async fn palette(
                     chord: Some('l'),
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: Some(if running {
                         "live · scrollable".into()
                     } else {
@@ -183,6 +185,7 @@ async fn palette(
             chord: Some('m'),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: Some(if has_pr {
                 "gh · merge queue aware".into()
             } else {
@@ -197,6 +200,7 @@ async fn palette(
             chord: Some('z'),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: Some(
                 blocked
                     .as_ref()
@@ -216,6 +220,7 @@ async fn palette(
         chord: Some('c'),
         note: None,
         verify_after_merge: None,
+        verify_in: None,
         detail: Some(
             blocked
                 .as_ref()
@@ -342,6 +347,7 @@ async fn prepare(
             chord: Some('n'),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         }];
         options.extend(history.into_iter().map(|entry| {
@@ -354,6 +360,7 @@ async fn prepare(
                 chord: None,
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }
         }));

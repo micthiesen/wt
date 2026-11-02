@@ -3925,6 +3925,7 @@ mod tests {
                         by: None,
                         blocked_on: None,
                         verify_after_merge: Some("verify prod".into()),
+                        verify_in: None,
                         extra: serde_json::Map::new(),
                     }),
                 )?;
@@ -5088,6 +5089,7 @@ mod tests {
                         by: None,
                         blocked_on: None,
                         verify_after_merge: Some("check the deployment".into()),
+                        verify_in: None,
                         extra: Default::default(),
                     }),
                 )

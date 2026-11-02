@@ -50,6 +50,9 @@ pub struct Board {
     /// Queued automation fires waiting to dispatch.
     #[serde(default)]
     pub automations_pending: usize,
+    /// What the automations overlay lists: running, queued and recent fires.
+    #[serde(default)]
+    pub automations_view: AutomationsView,
     /// A newer wt release ("v0.1.40 available", "restart for v0.1.40").
     #[serde(default)]
     pub update_notice: Option<String>,
@@ -408,6 +411,51 @@ pub struct DiffStat {
     pub removed: u32,
 }
 
+/// The automation engine's queue and recent history, for display only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AutomationsView {
+    /// False when no engine runs here (no rules, or `WT_AUTOMATIONS=off`).
+    pub enabled: bool,
+    pub running: Vec<AutomationRunView>,
+    pub queued: Vec<AutomationQueueView>,
+    /// Newest first.
+    pub recent: Vec<AutomationRecordView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AutomationRunView {
+    pub rule: String,
+    pub target: String,
+    pub detail: String,
+    /// UTC epoch milliseconds when a session delivery started.
+    pub since_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AutomationQueueView {
+    pub rule: String,
+    pub target: String,
+    pub detail: String,
+    pub queued_at_ms: i64,
+    /// UTC epoch milliseconds when its settle window (the delay) ends.
+    pub settle_at_ms: i64,
+    pub waiting_for: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AutomationRecordView {
+    pub rule: String,
+    pub target: String,
+    /// delivered, skipped, cancelled, ambiguous or dispatched.
+    pub state: String,
+    pub at_ms: i64,
+    pub reason: Option<String>,
+}
+
 /// Persisted status plus display-time derivations. This never authorizes actions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -418,6 +466,8 @@ pub struct WorkPresentation {
     pub age: Option<String>,
     pub stale: Option<bool>,
     pub verification_owed: bool,
+    /// Owed but not yet due: a production check on a branch only in staging.
+    pub verification_waiting: bool,
     pub verification_overdue: bool,
     pub blocked: bool,
 }

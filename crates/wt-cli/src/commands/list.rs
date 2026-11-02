@@ -438,6 +438,7 @@ fn live_json(
         "work_risk": work.as_ref().and_then(|work| work.risk.as_deref()),
         "work_blocked_on": work.as_ref().and_then(|work| work.blocked_on.as_deref()),
         "work_verify_after_merge": work.as_ref().and_then(|work| work.verify_after_merge.as_deref()),
+        "work_verify_in": work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| work.verify_in.as_deref().unwrap_or("staging"))),
         "work_at": work.as_ref().map(|work| work.at.as_str()),
         "inventory_error": snapshot.error,
     })
@@ -472,6 +473,7 @@ fn removed_json(entry: &RemovedWorktree) -> Value {
         "archived_at": entry.removed_at,
         "work_state": work.map(|work| work.state.as_str()),
         "verify_after_merge": verify,
+        "verify_in": work.and_then(|work| work.verify_after_merge.as_ref().map(|_| work.verify_in.as_deref().unwrap_or("staging"))),
         "verification_owed": verification_owed,
     })
 }
@@ -504,6 +506,7 @@ mod tests {
                 state: "ready".into(),
                 at: "2026-10-01T00:00:00Z".into(),
                 verify_after_merge: Some("check staging".into()),
+                verify_in: None,
                 ..serde_json::from_value(json!({"state":"ready","at":"2026-10-01T00:00:00Z"}))
                     .unwrap()
             }),

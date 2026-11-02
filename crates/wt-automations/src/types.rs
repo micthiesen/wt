@@ -14,6 +14,8 @@ pub struct AutomationRow {
     pub created_at: Option<String>,
     pub local_merged: Option<bool>,
     pub gone: Option<bool>,
+    /// The landing is proven on `[branch] production`. False is unknown.
+    pub in_production: bool,
     /// The lifecycle's complete clean-safety predicate, including the
     /// non-vacuous owned-commit guard.
     pub clean_candidate: bool,
@@ -110,6 +112,8 @@ pub struct AutomationEvalContext {
     /// Local date `YYYY-MM-DD`, calculated by the app in its configured zone.
     pub local_day: String,
     pub base_branch: String,
+    /// `[branch] production` names a branch other than base.
+    pub separate_production: bool,
     pub reviewers_enabled: bool,
     pub actions: BTreeMap<String, ActionTraits>,
     pub pauses: PauseSnapshot,
@@ -193,12 +197,8 @@ pub fn status_suffix(work: &WorkStatusRecord) -> String {
     if let Some(blocked) = work.blocked_on.as_deref().filter(|text| !text.is_empty()) {
         suffix.push_str(&format!(" [blocked on: {blocked}]"));
     }
-    if let Some(steps) = work
-        .verify_after_merge
-        .as_deref()
-        .filter(|text| !text.is_empty())
-    {
-        suffix.push_str(&format!(" [verify after merge: {steps}]"));
+    if let Some((stage, steps)) = work.verification() {
+        suffix.push_str(&format!(" [verify in {}: {steps}]", stage.as_str()));
     }
     if let Some(note) = work.note.as_deref().filter(|text| !text.is_empty()) {
         suffix.push_str(&format!(" — {note}"));

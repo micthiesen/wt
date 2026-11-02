@@ -254,7 +254,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         let merged = wt_store::is_merged_removal(&entry);
         let work = entry.work.as_ref().map(serde_json::to_value).transpose()?;
         let verification_owed = wt_store::verification_owed_at_removal(&entry);
-        reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_after_merge":entry.work.and_then(|work| work.verify_after_merge),"verification_owed":verification_owed}));
+        reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_in":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| work.verify_in.clone().unwrap_or_else(|| "staging".into()))),"verify_after_merge":entry.work.and_then(|work| work.verify_after_merge),"verification_owed":verification_owed}));
     }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&reports)?);

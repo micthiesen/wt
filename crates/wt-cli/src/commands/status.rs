@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use wt_config::InstanceRole;
 use wt_core::{
-    WorkRisk, WorkState, WorkStatusRecord, parse_work_status, resolve_work_state,
+    VerifyStage, WorkRisk, WorkState, WorkStatusRecord, parse_work_status, resolve_work_state,
     sanitize_work_note, work_age,
 };
 use wt_platform::process::CommandSpec;
@@ -19,7 +19,7 @@ use wt_store::WorkStatusRecord as StoredWorkStatusRecord;
 use wt_app_core::{context::AppContext, database::Database};
 use wt_ops::commands::resolve::resolve_worktree;
 
-const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo; --verify-after-merge records checks owed after deployment.";
+const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo; --verify-in-staging / --verify-in-production record a check owed once the change deploys there.";
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StatusArgs {
@@ -41,10 +41,24 @@ pub struct StatusArgs {
     /// External gate that must happen before merging (for `ready` or `todo`).
     #[arg(long, allow_hyphen_values = true)]
     pub blocked_on: Option<String>,
-    /// Numbered steps for a check only the deployed environment can prove;
-    /// returns the worktree as needs-testing after merge. Without a state,
-    /// amends in place.
-    #[arg(long, allow_hyphen_values = true)]
+    /// Numbered steps for a check only staging can prove, once this lands on
+    /// the base branch; the worktree returns as needs-testing then. Without a
+    /// state, amends in place.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_name = "STEPS",
+        conflicts_with = "verify_in_production"
+    )]
+    pub verify_in_staging: Option<String>,
+    /// Numbered steps for a check only production can prove, once the landing
+    /// reaches `[branch] production` (the base landing when there is none).
+    /// Without a state, amends in place.
+    #[arg(long, allow_hyphen_values = true, value_name = "STEPS")]
+    pub verify_in_production: Option<String>,
+    /// Replaced: say where the check runs with --verify-in-staging or
+    /// --verify-in-production.
+    #[arg(long, allow_hyphen_values = true, hide = true)]
     pub verify_after_merge: Option<String>,
     /// Record that you examined this row and your verdict, without changing its status.
     #[arg(long, allow_hyphen_values = true)]
@@ -66,6 +80,13 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+/// An owed post-merge check and where it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Verify {
+    stage: VerifyStage,
+    steps: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     All {
@@ -83,7 +104,7 @@ enum Action {
         note: Option<String>,
         risk: Option<WorkRisk>,
         blocked: Option<String>,
-        verify: Option<String>,
+        verify: Option<Verify>,
         append: bool,
     },
     Amend {
@@ -91,7 +112,7 @@ enum Action {
         note: Option<String>,
         risk: Option<WorkRisk>,
         blocked: Option<Option<String>>,
-        verify: Option<String>,
+        verify: Option<Verify>,
         append: bool,
     },
     Error(String),
@@ -112,12 +133,30 @@ fn parse_status_args(args: &StatusArgs) -> Action {
         },
         None => None,
     };
-    let verify = match args.verify_after_merge.as_deref() {
-        Some(value) => match sanitize(value) {
-            Some(value) => Some(value),
-            None => return fail("--verify-after-merge requires non-empty steps"),
-        },
-        None => None,
+    if args.verify_after_merge.is_some() {
+        return fail(
+            "--verify-after-merge is replaced: say where the check runs with --verify-in-staging <steps> (once it lands on the base branch) or --verify-in-production <steps> (once it reaches production)",
+        );
+    }
+    let verify = match (
+        args.verify_in_staging.as_deref(),
+        args.verify_in_production.as_deref(),
+    ) {
+        (Some(_), Some(_)) => {
+            return fail("pick one of --verify-in-staging and --verify-in-production");
+        }
+        (Some(value), None) | (None, Some(value)) => {
+            let (stage, flag) = if args.verify_in_staging.is_some() {
+                (VerifyStage::Staging, "--verify-in-staging")
+            } else {
+                (VerifyStage::Production, "--verify-in-production")
+            };
+            match sanitize(value) {
+                Some(steps) => Some(Verify { stage, steps }),
+                None => return Action::Error(format!("{flag} requires non-empty steps")),
+            }
+        }
+        (None, None) => None,
     };
     let verdict = match args.examined.as_deref() {
         Some(value) => match sanitize(value) {
@@ -283,7 +322,7 @@ fn parse_status_args(args: &StatusArgs) -> Action {
         return fail("verified requires -m explaining what you checked and where");
     }
     if verify.is_some() && matches!(state, WorkState::Verified | WorkState::Dropped) {
-        return fail("--verify-after-merge doesn't apply to verified or dropped");
+        return fail("--verify-in-* doesn't apply to verified or dropped");
     }
     Action::Set {
         target,
@@ -337,7 +376,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                         Some(sha == head && old_base == base)
                     }
                 };
-                entries.push(json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"at":work.as_ref().map(|x|x.at.as_str()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}));
+                entries.push(json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}));
             }
             if wants_json {
                 let live = worktrees
@@ -516,12 +555,20 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             );
             next.risk = risk;
             next.blocked_on = blocked;
-            next.verify_after_merge =
-                if matches!(work_state, WorkState::Verified | WorkState::Dropped) {
-                    None
-                } else {
-                    verify.or_else(|| previous.and_then(|p| p.verify_after_merge))
-                };
+            if !matches!(work_state, WorkState::Verified | WorkState::Dropped) {
+                match verify {
+                    Some(verify) => {
+                        next.verify_after_merge = Some(verify.steps);
+                        next.verify_in = Some(verify.stage);
+                    }
+                    None => {
+                        if let Some(previous) = previous {
+                            next.verify_after_merge = previous.verify_after_merge;
+                            next.verify_in = previous.verify_in;
+                        }
+                    }
+                }
+            }
             let stored: StoredWorkStatusRecord =
                 serde_json::from_value(serde_json::to_value(&next)?)
                     .context("encode status record")?;
@@ -541,11 +588,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 println!("  note: {note}");
             }
             note_budget_hint(work_state, next.note.as_deref());
-            print_guidance(
-                work_state,
-                next.blocked_on.as_deref(),
-                next.verify_after_merge.as_deref(),
-            );
+            print_guidance(work_state, next.blocked_on.as_deref(), next.verification());
             Ok(0)
         }
         Action::Amend {
@@ -594,13 +637,13 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             }
             if verify.is_some() && matches!(next.state, WorkState::Verified | WorkState::Dropped) {
                 eprintln!(
-                    "--verify-after-merge does not apply to {}",
+                    "--verify-in-* does not apply to {}",
                     work_state_name(next.state)
                 );
                 return Ok(2);
             }
             let old_gate = next.blocked_on.clone();
-            let old_verify = next.verify_after_merge.clone();
+            let old_verify = (next.verify_after_merge.clone(), next.verify_in);
             next.note = merge_note(next.note.as_deref(), note.as_deref(), append, true);
             if let Some(risk) = risk {
                 next.risk = Some(risk);
@@ -609,7 +652,8 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 next.blocked_on = blocked;
             }
             if let Some(verify) = verify {
-                next.verify_after_merge = Some(verify);
+                next.verify_after_merge = Some(verify.steps);
+                next.verify_in = Some(verify.stage);
             }
             if next.risk.is_some_and(|r| r != WorkRisk::Low) && next.note.is_none() {
                 eprintln!("--risk medium|high requires -m explaining uncertainty");
@@ -634,20 +678,18 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             if let Some(gate) = &next.blocked_on {
                 println!("  blocked on: {gate}");
             }
-            if let Some(verify) = &next.verify_after_merge {
-                println!("  verify after merge: {verify}");
+            if let Some((stage, steps)) = next.verification() {
+                println!("  verify in {}: {steps}", stage.as_str());
             }
             if let Some(note) = &next.note {
                 println!("  note: {note}");
             }
             report_replaced_note(previous_note.as_deref(), next.note.as_deref(), append);
             note_budget_hint(next.state, next.note.as_deref());
-            if old_gate != next.blocked_on || old_verify != next.verify_after_merge {
-                print_guidance(
-                    next.state,
-                    next.blocked_on.as_deref(),
-                    next.verify_after_merge.as_deref(),
-                );
+            if old_gate != next.blocked_on
+                || old_verify != (next.verify_after_merge.clone(), next.verify_in)
+            {
+                print_guidance(next.state, next.blocked_on.as_deref(), next.verification());
             }
             Ok(0)
         }
@@ -762,17 +804,22 @@ fn hints_off() -> bool {
     std::env::var("WT_NO_HINTS").is_ok_and(|value| value == "1")
 }
 
-fn print_guidance(state: WorkState, blocked_on: Option<&str>, verify: Option<&str>) {
+fn print_guidance(state: WorkState, blocked_on: Option<&str>, verify: Option<(VerifyStage, &str)>) {
     if hints_off() {
         return;
     }
-    if let Some(steps) = verify {
+    if let Some((stage, steps)) = verify {
+        let due = match stage {
+            VerifyStage::Staging => "once this lands on the base branch",
+            VerifyStage::Production => "once this reaches production",
+        };
         println!(
-            "after this merges, the row becomes needs-testing and stays out of `wt clean` until verified."
+            "{due}, the row becomes needs-testing; it stays out of `wt clean` from the merge until verified."
         );
-        println!("owed: {steps}");
+        println!("owed in {}: {steps}", stage.as_str());
         println!(
-            "first confirm the deploy carrying this change landed; then use `wt status verified -m <what you checked and where>`."
+            "first confirm the {} deploy carrying this change finished; then use `wt status verified -m <what you checked and where>`.",
+            stage.as_str()
         );
     }
     if let Some(gate) = blocked_on {
@@ -877,8 +924,8 @@ fn describe(slug: &str, record: Option<&WorkStatusRecord>, head: Option<&str>, n
     if let Some(gate) = &record.blocked_on {
         out.push_str(&format!("\n  blocked on: {gate}"));
     }
-    if let Some(verify) = &record.verify_after_merge {
-        out.push_str(&format!("\n  verify after merge: {verify}"));
+    if let Some((stage, steps)) = record.verification() {
+        out.push_str(&format!("\n  verify in {}: {steps}", stage.as_str()));
     }
     if let Some(note) = &record.note {
         out.push_str(&format!("\n  note: {note}"));
@@ -927,7 +974,7 @@ fn removed_json(entry: wt_store::RemovedWorktree) -> Value {
     let work_state = entry.work.as_ref().map(|work| work.state.as_str());
     let verification_owed = wt_store::verification_owed_at_removal(&entry);
     let merged = wt_store::is_merged_removal(&entry);
-    json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_after_merge":entry.work.and_then(|work|work.verify_after_merge),"verification_owed":verification_owed})
+    json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_in":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_ref().map(|_|work.verify_in.clone().unwrap_or_else(||"staging".into()))),"verify_after_merge":entry.work.and_then(|work|work.verify_after_merge),"verification_owed":verification_owed})
 }
 
 #[cfg(test)]
@@ -986,6 +1033,53 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn verify_flags_record_a_stage_and_the_stageless_flag_is_refused() {
+        use wt_app_core::test_support::CommandFixture;
+        let legacy = StatusArgs {
+            positionals: vec!["ready".into()],
+            risk: Some("low".into()),
+            verify_after_merge: Some("check it".into()),
+            ..Default::default()
+        };
+        let Action::Error(message) = parse_status_args(&legacy) else {
+            panic!("the stage-less flag must be refused");
+        };
+        assert!(message.contains("--verify-in-staging"), "{message}");
+        let fixture = CommandFixture::new().await.unwrap();
+        let production = StatusArgs {
+            positionals: vec!["ready".into()],
+            risk: Some("low".into()),
+            verify_in_production: Some("STEPS: 1. check prod".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &production).await.unwrap(), 0);
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        assert_eq!(state["slugs"]["one"]["work"]["verifyIn"], "production");
+        // A later assertion carries the obligation and its stage.
+        let working = StatusArgs {
+            positionals: vec!["working".into()],
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &working).await.unwrap(), 0);
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        assert_eq!(state["slugs"]["one"]["work"]["verifyIn"], "production");
+        assert_eq!(
+            state["slugs"]["one"]["work"]["verifyAfterMerge"],
+            "STEPS: 1. check prod"
+        );
+        // Amending moves it to staging in place.
+        let amend = StatusArgs {
+            verify_in_staging: Some("STEPS: 1. check staging".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &amend).await.unwrap(), 0);
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        assert_eq!(state["slugs"]["one"]["work"]["verifyIn"], "staging");
+        assert_eq!(state["slugs"]["one"]["work"]["state"], "working");
+        fixture.close().await.unwrap();
+    }
+
     #[test]
     fn status_record_serialization_matches_store_shape() {
         let record = WorkStatusRecord::new(WorkState::Ready, "2026-10-09T00:00:00Z");
@@ -1039,6 +1133,7 @@ mod tests {
                 by: None,
                 blocked_on: None,
                 verify_after_merge: verify.map(str::to_owned),
+                verify_in: None,
                 extra: Default::default(),
             }),
             automations_paused: None,

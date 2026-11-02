@@ -65,6 +65,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
             scroll,
         } => log(frame, area, title, lines, scroll),
         Interaction::Confirm(confirm) => confirmation(frame, area, confirm),
+        Interaction::Automations { scroll } => automations(frame, area, &model.board, scroll),
         Interaction::Picker(picker) => {
             let summary = session_summary(&model.board, picker);
             self::picker(frame, area, picker, &primary, summary.as_deref())
@@ -1192,6 +1193,128 @@ fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll:
         *scroll,
         body.height as usize,
     );
+}
+
+/// Rows of the automations overlay. Every entry is one line (cut, never
+/// wrapped), so the count is the scroll range at any width.
+pub(crate) fn automation_line_count(board: &crate::Board) -> usize {
+    automation_lines(board, 0).len()
+}
+
+fn automation_lines(board: &crate::Board, now: u64) -> Vec<Line<'static>> {
+    let view = &board.automations_view;
+    let ago = |at: i64| super::text::age(u64::try_from(at).unwrap_or(0), now);
+    let heading = |text: &str| Line::styled(text.to_owned(), theme::bold(theme::FG));
+    let entry = |rule: &str, target: &str, tail: Vec<Span<'static>>| {
+        let mut spans = vec![
+            Span::styled(format!("  {rule}"), theme::fg(theme::ACCENT)),
+            Span::styled(format!(" → {target}"), theme::fg(theme::FG)),
+        ];
+        spans.extend(tail);
+        Line::from(spans)
+    };
+    let mut lines = Vec::new();
+    let state = if board.automations_paused {
+        Span::styled("paused · A resumes", theme::fg(theme::WARN))
+    } else if !view.enabled {
+        Span::styled("not running in this process", theme::dim())
+    } else {
+        Span::styled("running · A pauses", theme::fg(theme::OK))
+    };
+    lines.push(Line::from(vec![
+        Span::styled("Engine ", theme::dim()),
+        state,
+    ]));
+    lines.push(Line::default());
+    lines.push(heading(&format!("Running ({})", view.running.len())));
+    if view.running.is_empty() {
+        lines.push(Line::styled("  nothing", theme::dim()));
+    }
+    for fire in &view.running {
+        let mut tail = vec![Span::styled(format!("  {}", fire.detail), theme::dim())];
+        if let Some(since) = fire.since_ms {
+            tail.insert(
+                0,
+                Span::styled(format!("  {} ago", ago(since)), theme::fg(theme::FG_MID)),
+            );
+        }
+        lines.push(entry(&fire.rule, &fire.target, tail));
+    }
+    lines.push(Line::default());
+    lines.push(heading(&format!("Queued ({})", view.queued.len())));
+    if view.queued.is_empty() {
+        lines.push(Line::styled("  nothing", theme::dim()));
+    }
+    for fire in &view.queued {
+        let remaining = fire.settle_at_ms.saturating_sub(now as i64);
+        let when = if now > 0 && remaining > 0 {
+            format!(
+                "  runs in {}",
+                super::text::age(now, now + remaining as u64)
+            )
+        } else {
+            format!("  waiting for {}", fire.waiting_for)
+        };
+        lines.push(entry(
+            &fire.rule,
+            &fire.target,
+            vec![
+                Span::styled(when, theme::fg(theme::WARN)),
+                Span::styled(format!("  {}", fire.detail), theme::dim()),
+            ],
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(heading(&format!("Recent ({})", view.recent.len())));
+    if view.recent.is_empty() {
+        lines.push(Line::styled("  nothing recorded", theme::dim()));
+    }
+    for record in &view.recent {
+        let color = match record.state.as_str() {
+            "delivered" => theme::OK,
+            "ambiguous" => theme::WARN,
+            "skipped" | "cancelled" => theme::FG_DIM,
+            _ => theme::FG_MID,
+        };
+        let mut tail = vec![
+            Span::styled(format!("  {}", record.state), theme::fg(color)),
+            Span::styled(format!("  {} ago", ago(record.at_ms)), theme::dim()),
+        ];
+        if let Some(reason) = &record.reason {
+            tail.push(Span::styled(format!("  {reason}"), theme::dim()));
+        }
+        lines.push(entry(&record.rule, &record.target, tail));
+    }
+    lines
+}
+
+fn automations(frame: &mut Frame<'_>, area: Rect, board: &crate::Board, scroll: &mut usize) {
+    let lines = automation_lines(board, super::text::now_ms());
+    let modal = Modal::new(
+        "Automations",
+        vec![
+            hint("j/k", "scroll"),
+            hint("A", "pause / resume"),
+            hint("esc / q", "close"),
+        ],
+    );
+    let width = lines.iter().map(Line::width).max().unwrap_or(0);
+    let outer = modal.place(area, width, lines.len(), false);
+    let body = modal.draw(frame, area, outer);
+    let (width, visible) = (body.width as usize, body.height as usize);
+    if visible == 0 || width == 0 {
+        return;
+    }
+    *scroll = (*scroll).min(lines.len().saturating_sub(visible));
+    let rendered = lines
+        .into_iter()
+        .skip(*scroll)
+        .take(visible)
+        .map(|line| Line::from(fit_spans(line.spans, width, Style::default())))
+        .collect::<Vec<_>>();
+    let total = automation_line_count(board);
+    frame.render_widget(Paragraph::new(rendered), body);
+    scrollbar(frame, outer, modal.border, total, *scroll, visible);
 }
 
 fn cleanup_log(
@@ -2746,6 +2869,7 @@ mod tests {
                     chord: None,
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 })
                 .collect(),
@@ -2769,6 +2893,7 @@ mod tests {
             chord,
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         };
         let mut model = Model {
@@ -2802,6 +2927,7 @@ mod tests {
             chord: Some(chord),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         };
         let mut model = Model {
@@ -2820,6 +2946,7 @@ mod tests {
                         chord: Some('x'),
                         note: None,
                         verify_after_merge: None,
+                        verify_in: None,
                         detail: None,
                     },
                 ],
@@ -2847,6 +2974,7 @@ mod tests {
             chord,
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: None,
         };
         let mut model = Model {
@@ -2971,6 +3099,7 @@ mod tests {
             chord,
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             detail: detail.map(str::to_owned),
         }
     }
@@ -3111,6 +3240,7 @@ mod tests {
                     chord: Some('a'),
                     note: None,
                     verify_after_merge: Some("probe".into()),
+                    verify_in: None,
                     detail: None,
                 }],
                 selected: 0,
@@ -3299,6 +3429,58 @@ mod tests {
         let buffer = draw(&mut model, 100, 30);
         let (x, y) = find(&buffer, "Performance snapshot failed").unwrap();
         assert_eq!(buffer[(x, y)].fg, theme::ERR);
+    }
+
+    #[test]
+    fn automations_overlay_lists_running_queued_and_recent_fires() {
+        let now = super::super::text::now_ms() as i64;
+        let mut model = Model {
+            interaction: Interaction::Automations { scroll: 0 },
+            ..Model::default()
+        };
+        model.board = crate::Board {
+            automations_view: crate::AutomationsView {
+                enabled: true,
+                running: vec![crate::AutomationRunView {
+                    rule: "auto-fix-ci".into(),
+                    target: "one".into(),
+                    detail: "checks failing".into(),
+                    since_ms: Some(now - 120_000),
+                }],
+                queued: vec![crate::AutomationQueueView {
+                    rule: "verify-when-due".into(),
+                    target: "two".into(),
+                    detail: "verify in production: check it".into(),
+                    queued_at_ms: now,
+                    settle_at_ms: now + 600_000,
+                    waiting_for: "its turn in the queue".into(),
+                }],
+                recent: vec![crate::AutomationRecordView {
+                    rule: "ping-ready".into(),
+                    target: "three".into(),
+                    state: "delivered".into(),
+                    at_ms: now - 3_600_000,
+                    reason: None,
+                }],
+            },
+            ..Default::default()
+        }
+        .into();
+        let buffer = draw(&mut model, 120, 30);
+        let text = rows(&buffer).join("\n");
+        assert!(text.contains("Running (1)"), "{text}");
+        assert!(text.contains("auto-fix-ci → one  2m ago"), "{text}");
+        assert!(
+            text.contains("verify-when-due → two  runs in 9m")
+                || text.contains("verify-when-due → two  runs in 10m"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ping-ready → three  delivered  1h ago"),
+            "{text}"
+        );
+        let (x, y) = find(&buffer, "delivered").unwrap();
+        assert_eq!(buffer[(x, y)].fg, theme::OK);
     }
 
     #[test]

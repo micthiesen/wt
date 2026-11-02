@@ -106,7 +106,7 @@ impl Model {
                     .filter(|_| !untouched)
                     .and_then(|current| {
                         // Two options may share a value (`ready` and `ready +
-                        // verify after merge`); their chord tells them apart.
+                        // verify in <stage>`); their chord tells them apart.
                         options
                             .iter()
                             .position(|option| {

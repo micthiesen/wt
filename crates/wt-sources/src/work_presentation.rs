@@ -90,7 +90,7 @@ fn compose(
                 }),
                 _ => None,
             });
-        prepare_work(row, now_ms);
+        prepare_work(row, config.branch.separate_production(), now_ms);
         if row.automations_paused {
             // The details pane renders the typed flag; drop the inventory's
             // prose copy so the fact is not shown twice.
@@ -105,7 +105,7 @@ fn compose(
 /// The inventory's prose copy of the typed `automations_paused` flag.
 const PAUSED_DETAIL: &str = "Automations paused for this worktree";
 
-fn prepare_work(row: &mut BoardRow, now_ms: i64) {
+fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
     let record = row.work.as_ref().and_then(|work| work.record.as_ref());
     let asking = row
         .sessions
@@ -114,8 +114,13 @@ fn prepare_work(row: &mut BoardRow, now_ms: i64) {
     // Only the Git facts lane may establish landing after checking the
     // non-vacuous own-commit and advertised-base proof.
     let landed = row.git.landed_on.is_some();
+    let landing = wt_core::Landing::new(
+        landed,
+        row.git.landed_on == Some(wt_tui::LandingKind::Production),
+        separate_production,
+    );
     let session_state = asking.then_some(DerivedState::Asking);
-    let effective = wt_core::effective_work_state(record, session_state, landed);
+    let effective = wt_core::effective_work_state(record, session_state, landing);
     let Some(mut work) = row
         .work
         .clone()
@@ -137,15 +142,19 @@ fn prepare_work(row: &mut BoardRow, now_ms: i64) {
         .zip(row.git.head_sha.as_deref())
         .map(|(recorded, head)| recorded != head);
     work.verification_owed = wt_core::owes_post_merge_verification(record, landed);
-    work.verification_overdue = wt_core::verification_overdue(record, landed, now_ms);
-    row.needs_attention |= matches!(
-        work.effective_state,
-        Some(
-            wt_core::WorkState::NeedsHuman
-                | wt_core::WorkState::NeedsTesting
-                | wt_core::WorkState::Ready
-        )
-    );
+    work.verification_waiting =
+        work.verification_owed && !wt_core::verification_due(record, landing);
+    work.verification_overdue = wt_core::verification_overdue(record, landing, now_ms);
+    // A landed check waiting on promotion has nothing for anyone to do yet.
+    row.needs_attention |= !work.verification_waiting
+        && matches!(
+            work.effective_state,
+            Some(
+                wt_core::WorkState::NeedsHuman
+                    | wt_core::WorkState::NeedsTesting
+                    | wt_core::WorkState::Ready
+            )
+        );
     row.work = Some(work);
 }
 
@@ -622,7 +631,7 @@ mod tests {
             work: Some(WorkPresentation::default()),
             ..Default::default()
         };
-        prepare_work(&mut row, 100_000);
+        prepare_work(&mut row, false, 100_000);
         assert_eq!(row.work.as_ref().unwrap().effective_state, None);
         assert_eq!(row.work.as_ref().unwrap().stale, None);
         row.work.as_mut().unwrap().record = Some(WorkStatusRecord {
@@ -631,13 +640,14 @@ mod tests {
             at: "1970-01-01T00:00:00Z".into(),
             sha: Some("head-1".into()),
             verify_after_merge: Some("check production".into()),
+            verify_in: None,
             note: Some("Keep the title".into()),
             blocked_on: Some("approval".into()),
             by: None,
             extra: Default::default(),
         });
         row.git.landed_on = Some(wt_tui::LandingKind::Base);
-        prepare_work(&mut row, 200_000_000);
+        prepare_work(&mut row, false, 200_000_000);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
         assert!(work.derived);
@@ -673,7 +683,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        prepare_work(&mut row, 1_800_000_000_000);
+        prepare_work(&mut row, false, 1_800_000_000_000);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::Ready));
         assert!(work.blocked);
@@ -685,6 +695,7 @@ mod tests {
     fn exact_head_merged_pr_alone_does_not_prove_landing() {
         let record = WorkStatusRecord {
             verify_after_merge: Some("check production".into()),
+            verify_in: None,
             ..WorkStatusRecord::new(WorkState::Ready, "2026-10-08T00:00:00Z")
         };
         let mut row = BoardRow {
@@ -703,26 +714,59 @@ mod tests {
             }),
             ..Default::default()
         };
-        prepare_work(&mut row, 1_800_000_000_000);
+        prepare_work(&mut row, false, 1_800_000_000_000);
         assert_eq!(
             row.work.as_ref().unwrap().effective_state,
             Some(WorkState::Ready)
         );
         assert!(!row.work.as_ref().unwrap().verification_owed);
         row.pr.as_mut().unwrap().head_sha = Some("current".into());
-        prepare_work(&mut row, 1_800_000_000_000);
+        prepare_work(&mut row, false, 1_800_000_000_000);
         assert_eq!(
             row.work.as_ref().unwrap().effective_state,
             Some(WorkState::Ready)
         );
         assert!(!row.work.as_ref().unwrap().verification_owed);
         row.git.landed_on = Some(wt_tui::LandingKind::Base);
-        prepare_work(&mut row, 1_800_000_000_000);
+        prepare_work(&mut row, false, 1_800_000_000_000);
         assert_eq!(
             row.work.as_ref().unwrap().effective_state,
             Some(WorkState::NeedsTesting)
         );
         assert!(row.work.as_ref().unwrap().verification_owed);
+    }
+
+    #[test]
+    fn a_production_check_waits_quietly_in_staging_and_comes_due_on_promotion() {
+        let record = WorkStatusRecord {
+            verify_after_merge: Some("check production".into()),
+            verify_in: Some(wt_core::VerifyStage::Production),
+            ..WorkStatusRecord::new(WorkState::Ready, "2026-10-08T00:00:00Z")
+        };
+        let mut row = BoardRow {
+            git: GitPresentation {
+                landed_on: Some(wt_tui::LandingKind::Base),
+                ..Default::default()
+            },
+            needs_attention: false,
+            work: Some(WorkPresentation {
+                record: Some(record),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        prepare_work(&mut row, true, 1_800_000_000_000);
+        let work = row.work.as_ref().unwrap();
+        assert_eq!(work.effective_state, Some(WorkState::Ready));
+        assert!(work.verification_owed && work.verification_waiting);
+        assert!(!work.verification_overdue);
+        assert!(!row.needs_attention);
+        row.git.landed_on = Some(wt_tui::LandingKind::Production);
+        prepare_work(&mut row, true, 1_800_000_000_000);
+        let work = row.work.as_ref().unwrap();
+        assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
+        assert!(!work.verification_waiting);
+        assert!(row.needs_attention);
     }
 
     #[test]
@@ -735,7 +779,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        prepare_work(&mut row, 100_000);
+        prepare_work(&mut row, false, 100_000);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.record, None);
         assert_eq!(work.effective_state, Some(WorkState::NeedsHuman));

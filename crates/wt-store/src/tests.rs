@@ -735,6 +735,7 @@ fn work_status_amends_verification_steps_and_keeps_idempotent_assertion_time() {
         by: None,
         blocked_on: None,
         verify_after_merge: Some(verify_after_merge.to_owned()),
+        verify_in: None,
         extra: Map::new(),
     };
     assert!(
@@ -783,6 +784,7 @@ fn work_status_reassertion_and_amend_preserve_unknown_fields() {
         by: None,
         blocked_on: None,
         verify_after_merge: Some(verify_after_merge.to_owned()),
+        verify_in: None,
         extra: Map::new(),
     };
     assert!(
@@ -845,6 +847,7 @@ fn removed_history_keeps_verification_obligation_and_pause_across_minimal_confir
         by: None,
         blocked_on: None,
         verify_after_merge: Some("check staging".to_owned()),
+        verify_in: None,
         extra: Map::new(),
     };
     let rich = RemovedWorktree {

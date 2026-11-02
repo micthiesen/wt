@@ -107,7 +107,7 @@ def main() -> None:
         git("push", "origin", "main")
         (worktrees / "dirty/untracked.txt").write_text("keep this file\n")
         run(str(binary), "status", "verification", "ready", "--risk", "low",
-            "--verify-after-merge", "Confirm fixture environment after deployment")
+            "--verify-in-staging", "Confirm fixture environment after deployment")
         output = run(str(binary), "clean", "--yes", "--foreground", "--no-destroy-stage")
         assert "removed landed" in output, output
         assert not (worktrees / "landed").exists(), output

@@ -92,6 +92,7 @@ pub async fn lifecycle_facts(
             rule.on,
             wt_config::AutomationTrigger::WtMerged
                 | wt_config::AutomationTrigger::StackParentMerged
+                | wt_config::AutomationTrigger::StatusVerificationDue
                 | wt_config::AutomationTrigger::StatusVerificationOverdue
                 | wt_config::AutomationTrigger::WtCreated
         )
@@ -293,6 +294,7 @@ pub async fn prepare(
         let lifecycle = input.lifecycle.get(&slug).copied().unwrap_or_default();
         let clean_candidate = lifecycle.clean_candidate;
         let local_merged = lifecycle.local_merged;
+        let in_production = lifecycle.in_production;
         let locked = match FileLock::try_acquire(
             &ctx.config.paths.lock_dir,
             &slug,
@@ -320,6 +322,7 @@ pub async fn prepare(
             created_at: stored["createdAt"].as_str().map(str::to_owned),
             local_merged,
             gone: None,
+            in_production,
             clean_candidate,
             pr,
             conflict,
@@ -425,6 +428,7 @@ pub async fn prepare(
         now_ms,
         local_day: OffsetDateTime::now_utc().date().to_string(),
         base_branch: ctx.config.branch.base.clone(),
+        separate_production: ctx.config.branch.separate_production(),
         reviewers_enabled: ctx.config.github.reviewers,
         actions,
         pauses: PauseSnapshot {

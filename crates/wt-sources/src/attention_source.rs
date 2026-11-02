@@ -532,7 +532,13 @@ fn describe_status(record: &Value) -> String {
     let verify = record
         .get("verifyAfterMerge")
         .and_then(Value::as_str)
-        .map(|value| format!(" [verify after merge: {}]", truncate(value, 100)))
+        .map(|value| {
+            let stage = match record.get("verifyIn").and_then(Value::as_str) {
+                Some("production") => "production",
+                _ => "staging",
+            };
+            format!(" [verify in {stage}: {}]", truncate(value, 100))
+        })
         .unwrap_or_default();
     format!("{label}{risk}{blocked}{verify}{note}")
 }

@@ -255,6 +255,9 @@ pub enum UiAction {
         note: Option<String>,
         /// `None` preserves the current obligation; `Some("")` clears it.
         verify_after_merge: Option<String>,
+        /// Where the new steps are checked; required with non-empty steps.
+        #[serde(default)]
+        verify_in: Option<wt_core::VerifyStage>,
         /// The claim state the status menu showed.
         #[serde(default)]
         seen: Option<Seen<Option<StatusClaim>>>,
@@ -408,6 +411,8 @@ pub struct StatusClaim {
     pub state: String,
     pub note: Option<String>,
     pub verify_after_merge: Option<String>,
+    #[serde(default)]
+    pub verify_in: Option<wt_core::VerifyStage>,
 }
 
 /// What a board menu showed for a value its commit depends on. The owning
@@ -639,6 +644,7 @@ pub enum TextAction {
     VerifyAfterMerge {
         key: String,
         state: String,
+        stage: wt_core::VerifyStage,
         #[serde(default)]
         seen: Option<Seen<Option<StatusClaim>>>,
     },
@@ -653,6 +659,8 @@ pub struct PickerOption {
     /// selection starts a fresh status assertion and does not carry this note.
     pub note: Option<String>,
     pub verify_after_merge: Option<String>,
+    #[serde(default)]
+    pub verify_in: Option<wt_core::VerifyStage>,
     /// Dim right-aligned text: an action's kind and id, or why it is
     /// unavailable.
     #[serde(default)]

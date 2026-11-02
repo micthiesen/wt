@@ -58,6 +58,10 @@ pub enum Interaction {
         lines: Vec<String>,
         scroll: usize,
     },
+    /// The automations overlay. Its lists come from the live board.
+    Automations {
+        scroll: usize,
+    },
     Reviewers(ReviewerPrompt),
 }
 
@@ -114,6 +118,29 @@ impl Model {
                     return InputResult::Draw;
                 }
                 let maximum = lines.len().saturating_sub(1);
+                let moved = overlay_scroll(key, scroll, maximum, height);
+                self.interaction = interaction;
+                if moved {
+                    InputResult::Draw
+                } else {
+                    InputResult::Unchanged
+                }
+            }
+            Interaction::Automations { scroll } => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'Q'))
+                    || (control && key.code == KeyCode::Char('c'))
+                {
+                    return InputResult::Draw;
+                }
+                if code == KeyCode::Char('A') && !control {
+                    let paused = self.board.automations_paused;
+                    self.interaction = interaction;
+                    return InputResult::Action(UiAction::ToggleAutomations {
+                        key: None,
+                        seen: Some(crate::Seen(paused)),
+                    });
+                }
+                let maximum = crate::render::automation_line_count(&self.board).saturating_sub(1);
                 let moved = overlay_scroll(key, scroll, maximum, height);
                 self.interaction = interaction;
                 if moved {
@@ -258,14 +285,22 @@ impl Model {
                                 state: Some(state.clone()),
                                 note: Some(text),
                                 verify_after_merge: clear_verification_for(state),
+                                verify_in: None,
                                 seen: seen.clone(),
                             },
-                            TextAction::VerifyAfterMerge { key, state, seen } => {
+                            TextAction::VerifyAfterMerge {
+                                key,
+                                state,
+                                stage,
+                                seen,
+                            } => {
+                                let verify_in = (!text.is_empty()).then_some(*stage);
                                 UiAction::SetStatus {
                                     key: key.clone(),
                                     state: Some(state.clone()),
                                     note: None,
                                     verify_after_merge: Some(text),
+                                    verify_in,
                                     seen: seen.clone(),
                                 }
                             }
@@ -461,13 +496,15 @@ impl Model {
                     // The note starts empty, as in TS: a new assertion
                     // carries a fresh note.
                     let (action, prompt, initial) = if let Some(steps) = option.verify_after_merge {
+                        let stage = option.verify_in.unwrap_or(wt_core::VerifyStage::Staging);
                         (
                             TextAction::VerifyAfterMerge {
                                 key: key.clone(),
                                 state,
+                                stage,
                                 seen: seen.clone(),
                             },
-                            "verify after merge: ".into(),
+                            verify_prompt(stage),
                             steps,
                         )
                     } else {
@@ -639,13 +676,15 @@ impl Model {
                     }),
                     PickerAction::Status { key, seen } => {
                         if let Some(steps) = option.verify_after_merge {
+                            let stage = option.verify_in.unwrap_or(wt_core::VerifyStage::Staging);
                             self.interaction = Interaction::Text(TextPrompt {
                                 action: TextAction::VerifyAfterMerge {
                                     key: key.clone(),
                                     state: option.value.unwrap_or_else(|| "ready".into()),
+                                    stage,
                                     seen: seen.clone(),
                                 },
-                                prompt: "verify after merge: ".into(),
+                                prompt: verify_prompt(stage),
                                 editor: LineEditor::new(&steps),
                                 allow_empty: true,
                             });
@@ -661,6 +700,7 @@ impl Model {
                                 state,
                                 note: None,
                                 verify_after_merge,
+                                verify_in: None,
                                 seen: seen.clone(),
                             })
                         }
@@ -874,4 +914,8 @@ pub(crate) fn digit_rows(picker: &PickerPrompt) -> Vec<usize> {
         })
         .take(9)
         .collect()
+}
+
+fn verify_prompt(stage: wt_core::VerifyStage) -> String {
+    format!("verify in {}: ", stage.as_str())
 }

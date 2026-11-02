@@ -116,14 +116,9 @@ pub fn board(
                 .as_ref()
                 .and_then(|work| work.verify_after_merge.as_deref())
                 .map(clean_text),
-            needs_attention: work.is_some_and(|work| {
-                matches!(
-                    work.state,
-                    wt_core::WorkState::NeedsHuman
-                        | wt_core::WorkState::NeedsTesting
-                        | wt_core::WorkState::Ready
-                )
-            }),
+            // The work overlay owns the status contribution: only it knows
+            // whether a landed row's owed check is due or still waiting.
+            needs_attention: false,
             details,
             archived: archived.contains(target.slug()),
             issue_id: issue_id(&stored["issueId"], target.slug()),

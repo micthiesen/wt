@@ -33,6 +33,92 @@ pub enum WorkState {
     Dropped,
 }
 
+/// Where an owed post-merge check runs, which decides when it is due:
+/// `Staging` once the branch lands on `[branch] base`, `Production` once the
+/// landing reaches `[branch] production` (or lands on base when no separate
+/// production branch is configured).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerifyStage {
+    Staging,
+    Production,
+}
+
+impl VerifyStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Staging => "staging",
+            Self::Production => "production",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "staging" => Some(Self::Staging),
+            "production" => Some(Self::Production),
+            _ => None,
+        }
+    }
+}
+
+/// The merge commit of a PR merged at exactly `current_head`, if any. Only
+/// that commit (or HEAD itself) proves where the branch's work landed; a PR
+/// merged at an older head says nothing about the current one.
+pub fn exact_merged_pr_oid<'a>(
+    pr_head: Option<&'a str>,
+    current_head: &str,
+    pr_state: &str,
+    merge_oid: Option<&'a str>,
+) -> Option<&'a str> {
+    (pr_head == Some(current_head) && pr_state.eq_ignore_ascii_case("MERGED"))
+        .then_some(merge_oid)
+        .flatten()
+}
+
+/// An unknown stage (from a newer writer) reads as absent rather than
+/// failing the whole record.
+fn lenient_stage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<VerifyStage>, D::Error> {
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(VerifyStage::parse))
+}
+
+/// How far a worktree's branch has landed, as far as an owed check cares.
+/// `production` is true once the landing reached production, and also for any
+/// base landing when the repository configures no separate production branch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Landing {
+    pub base: bool,
+    pub production: bool,
+}
+
+impl Landing {
+    pub const NONE: Self = Self {
+        base: false,
+        production: false,
+    };
+
+    /// `separate_production` is whether `[branch] production` names a branch
+    /// other than base; without one a base landing is the release.
+    pub fn new(base: bool, in_production: bool, separate_production: bool) -> Self {
+        let base = base || in_production;
+        Self {
+            base,
+            production: in_production || (base && !separate_production),
+        }
+    }
+
+    fn reached(self, stage: VerifyStage) -> bool {
+        match stage {
+            VerifyStage::Staging => self.base,
+            VerifyStage::Production => self.production,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkRisk {
@@ -60,6 +146,14 @@ pub struct WorkStatusRecord {
     pub blocked_on: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verify_after_merge: Option<String>,
+    /// Absent on records written before the stage existed; those were due
+    /// on the base landing, so they read as staging.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_stage"
+    )]
+    pub verify_in: Option<VerifyStage>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -75,8 +169,17 @@ impl WorkStatusRecord {
             by: None,
             blocked_on: None,
             verify_after_merge: None,
+            verify_in: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// The owed check's steps and stage, if one is owed at all.
+    pub fn verification(&self) -> Option<(VerifyStage, &str)> {
+        self.verify_after_merge
+            .as_deref()
+            .filter(|steps| !steps.is_empty())
+            .map(|steps| (self.verify_in.unwrap_or(VerifyStage::Staging), steps))
     }
 }
 
@@ -150,6 +253,7 @@ pub fn same_work_claim(a: &WorkStatusRecord, b: &WorkStatusRecord) -> bool {
         && a.sha == b.sha
         && a.blocked_on == b.blocked_on
         && a.verify_after_merge == b.verify_after_merge
+        && a.verify_in == b.verify_in
 }
 
 pub fn work_state_rank(state: Option<WorkState>) -> u8 {
@@ -186,21 +290,30 @@ pub fn work_record_rank(record: Option<&WorkStatusRecord>) -> u8 {
     }
 }
 
+/// A landed branch with an undischarged check. This holds from the base
+/// landing whatever the stage: it is what keeps the worktree from cleanup.
 pub fn owes_post_merge_verification(record: Option<&WorkStatusRecord>, landed: bool) -> bool {
     record.is_some_and(|record| {
         landed
-            && record
-                .verify_after_merge
-                .as_deref()
-                .is_some_and(|steps| !steps.is_empty())
+            && record.verification().is_some()
             && !matches!(record.state, WorkState::Verified | WorkState::Dropped)
     })
+}
+
+/// An owed check whose environment now has the change: the landing reached
+/// the check's stage. A production check on a branch only in staging is owed
+/// but not yet due.
+pub fn verification_due(record: Option<&WorkStatusRecord>, landing: Landing) -> bool {
+    owes_post_merge_verification(record, landing.base)
+        && record
+            .and_then(WorkStatusRecord::verification)
+            .is_some_and(|(stage, _)| landing.reached(stage))
 }
 
 pub fn effective_work_state(
     record: Option<&WorkStatusRecord>,
     session_state: Option<DerivedState>,
-    landed: bool,
+    landing: Landing,
 ) -> Option<EffectiveWorkState> {
     if session_state == Some(DerivedState::Asking) {
         return Some(EffectiveWorkState {
@@ -209,7 +322,7 @@ pub fn effective_work_state(
             blocked: false,
         });
     }
-    if owes_post_merge_verification(record, landed) {
+    if verification_due(record, landing) {
         return Some(EffectiveWorkState {
             state: WorkState::NeedsTesting,
             derived: true,
@@ -223,17 +336,23 @@ pub fn effective_work_state(
     })
 }
 
-pub fn verification_overdue(record: Option<&WorkStatusRecord>, landed: bool, now_ms: i64) -> bool {
-    verification_overdue_with_days(record, landed, now_ms, VERIFY_OVERDUE_DAYS as f64)
+pub fn verification_overdue(
+    record: Option<&WorkStatusRecord>,
+    landing: Landing,
+    now_ms: i64,
+) -> bool {
+    verification_overdue_with_days(record, landing, now_ms, VERIFY_OVERDUE_DAYS as f64)
 }
 
+/// Only a due check can be overdue: a production check waiting on a
+/// promotion is nobody's lapse yet.
 pub fn verification_overdue_with_days(
     record: Option<&WorkStatusRecord>,
-    landed: bool,
+    landing: Landing,
     now_ms: i64,
     days: f64,
 ) -> bool {
-    if !owes_post_merge_verification(record, landed) {
+    if !verification_due(record, landing) {
         return false;
     }
     let Some(record) = record else {
@@ -320,6 +439,7 @@ pub fn parse_work_status(raw: &Value) -> Option<WorkStatusRecord> {
         "by",
         "blockedOn",
         "verifyAfterMerge",
+        "verifyIn",
     ];
     let extra = object
         .iter()
@@ -335,6 +455,10 @@ pub fn parse_work_status(raw: &Value) -> Option<WorkStatusRecord> {
         by,
         blocked_on: clean_optional("blockedOn"),
         verify_after_merge: clean_optional("verifyAfterMerge"),
+        verify_in: object
+            .get("verifyIn")
+            .and_then(Value::as_str)
+            .and_then(VerifyStage::parse),
         extra,
     })
 }
@@ -412,10 +536,14 @@ pub fn work_status_suffix(record: &WorkStatusRecord) -> String {
         .map(|s| format!(" [blocked on: {}]", clamp_for_line(s, 120, 60)))
         .unwrap_or_default();
     let verify = record
-        .verify_after_merge
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| format!(" [verify after merge: {}]", clamp_for_line(s, 120, 35)))
+        .verification()
+        .map(|(stage, s)| {
+            format!(
+                " [verify in {}: {}]",
+                stage.as_str(),
+                clamp_for_line(s, 120, 35)
+            )
+        })
         .unwrap_or_default();
     let note = record
         .note
@@ -493,7 +621,7 @@ mod tests {
         assert!(is_gated(Some(&ready)));
         assert_eq!(work_record_rank(Some(&ready)), BLOCKED_RANK);
         assert_eq!(
-            effective_work_state(Some(&ready), Some(DerivedState::Asking), false),
+            effective_work_state(Some(&ready), Some(DerivedState::Asking), Landing::NONE),
             Some(EffectiveWorkState {
                 state: WorkState::NeedsHuman,
                 derived: true,
@@ -519,25 +647,73 @@ mod tests {
 
     #[test]
     fn post_merge_verification_is_dormant_until_landing_then_ages_out() {
+        let landed = Landing::new(true, false, false);
         let mut ready = record(WorkState::Ready);
         ready.verify_after_merge = Some("run deployed flow".into());
         assert!(!owes_post_merge_verification(Some(&ready), false));
         assert!(owes_post_merge_verification(Some(&ready), true));
         assert_eq!(
-            effective_work_state(Some(&ready), None, true)
+            effective_work_state(Some(&ready), None, landed)
                 .unwrap()
                 .state,
             WorkState::NeedsTesting
         );
         let now = parse_iso_millis("2026-08-22T12:00:00Z").unwrap();
-        assert!(verification_overdue_with_days(Some(&ready), true, now, 2.0));
+        assert!(verification_overdue_with_days(
+            Some(&ready),
+            landed,
+            now,
+            2.0
+        ));
         ready.state = WorkState::Verified;
-        assert!(!verification_overdue(Some(&ready), true, now));
+        assert!(!verification_overdue(Some(&ready), landed, now));
         ready.state = WorkState::Dropped;
         assert!(!owes_post_merge_verification(Some(&ready), true));
         ready.state = WorkState::Ready;
         ready.at = "invalid".into();
-        assert!(verification_overdue(Some(&ready), true, now));
+        assert!(verification_overdue(Some(&ready), landed, now));
+    }
+
+    #[test]
+    fn a_production_check_waits_for_promotion_but_still_holds_the_worktree() {
+        let staged = Landing::new(true, false, true);
+        let promoted = Landing::new(true, true, true);
+        let mut ready = record(WorkState::Ready);
+        ready.verify_after_merge = Some("check prod".into());
+        ready.verify_in = Some(VerifyStage::Production);
+        assert!(owes_post_merge_verification(Some(&ready), staged.base));
+        assert!(!verification_due(Some(&ready), staged));
+        assert_eq!(
+            effective_work_state(Some(&ready), None, staged)
+                .unwrap()
+                .state,
+            WorkState::Ready
+        );
+        let now = parse_iso_millis("2026-09-22T12:00:00Z").unwrap();
+        assert!(!verification_overdue(Some(&ready), staged, now));
+        assert!(verification_due(Some(&ready), promoted));
+        assert!(verification_overdue(Some(&ready), promoted, now));
+        // Without a separate production branch the base landing ships it.
+        assert!(verification_due(
+            Some(&ready),
+            Landing::new(true, false, false)
+        ));
+        // Legacy records (no stage) were due on the base landing.
+        ready.verify_in = None;
+        assert!(verification_due(Some(&ready), staged));
+        assert_eq!(
+            parse_work_status(
+                &json!({"state":"ready","at":AT,"verifyAfterMerge":"x","verifyIn":"production"})
+            )
+            .unwrap()
+            .verify_in,
+            Some(VerifyStage::Production)
+        );
+        let future: WorkStatusRecord = serde_json::from_value(
+            json!({"state":"ready","at":AT,"verifyAfterMerge":"x","verifyIn":"canary"}),
+        )
+        .unwrap();
+        assert_eq!(future.verify_in, None);
     }
 
     #[test]
@@ -568,6 +744,9 @@ mod tests {
         assert!(!same_work_claim(&a, &b));
         b = a.clone();
         b.verify_after_merge = Some("steps".into());
+        assert!(!same_work_claim(&a, &b));
+        b = a.clone();
+        b.verify_in = Some(VerifyStage::Production);
         assert!(!same_work_claim(&a, &b));
         b = a.clone();
         b.extra

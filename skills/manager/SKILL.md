@@ -156,7 +156,8 @@ evidence; label theories, and verify a destructive remedy before proposing it.
 - **Merged but unverified** (`unverified/<state>` in `wt fleet`; in JSON,
   `.work.verifyAfterMerge` on a landed live row, `verification_owed` on a
   merged one): the worktree is kept alive for a post-merge check, so it is not
-  a cleanup candidate. The owning session runs the check and asserts
+  a cleanup candidate. `.work.verifyIn` says where it runs; a `production`
+  check waits for the promotion and needs nothing before then. The owning session runs the check and asserts
   `verified`; nudge it once. A red, overdue one gets a digest line, not a second
   reminder.
 - **Removing a worktree:** if `wt guide <slug> --json` shows a recorded

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use time::OffsetDateTime;
 use wt_config::{AutomationDef, AutomationTrigger};
 use wt_core::WorkState;
 
@@ -84,6 +83,7 @@ pub fn evaluate_breaker_resets(
                 | AutomationTrigger::ReviewChangesRequested
                 | AutomationTrigger::WtMerged
                 | AutomationTrigger::StackParentMerged
+                | AutomationTrigger::StatusVerificationDue
         );
         if github_driven && !context.github_fresh {
             continue;
@@ -277,35 +277,45 @@ fn evaluate_row(
                 &format!("{}{}", work.state.as_str(), status_suffix(work)),
             ))
         }
+        AutomationTrigger::StatusVerificationDue => {
+            let work = row.work.as_ref()?;
+            if !wt_core::verification_due(Some(work), row_landing(row, context)) {
+                return None;
+            }
+            let (stage, steps) = work.verification()?;
+            // Keyed by the obligation, not the assertion: a run that fails and
+            // re-asserts needs-human must not be rerun by its own status write.
+            // New steps are a new check.
+            Some(single(
+                rule,
+                row,
+                format!(
+                    "{}:verify:{}:{}:{:016x}",
+                    rule.id,
+                    slug,
+                    stage.as_str(),
+                    stable_hash(steps)
+                ),
+                &format!("verify in {}: {steps}", stage.as_str()),
+            ))
+        }
         AutomationTrigger::StatusVerificationOverdue => {
             let work = row.work.as_ref()?;
-            let landed = row.local_merged == Some(true)
-                || row.gone == Some(true)
-                || (context.github_fresh && row.pr.as_ref().is_some_and(|pr| pr.state == "MERGED"));
-            let verify = work.verify_after_merge.as_deref()?;
-            if verify.is_empty()
-                || !landed
-                || matches!(work.state, WorkState::Verified | WorkState::Dropped)
-            {
+            let landing = row_landing(row, context);
+            if !wt_core::verification_overdue_with_days(
+                Some(work),
+                landing,
+                context.now_ms,
+                rule.after_days,
+            ) {
                 return None;
             }
-            let overdue =
-                OffsetDateTime::parse(&work.at, &time::format_description::well_known::Rfc3339)
-                    .map(|at| {
-                        context
-                            .now_ms
-                            .saturating_sub((at.unix_timestamp_nanos() / 1_000_000) as i64)
-                            >= (rule.after_days * 86_400_000.0) as i64
-                    })
-                    .unwrap_or(true);
-            if !overdue {
-                return None;
-            }
+            let (stage, verify) = work.verification()?;
             Some(single(
                 rule,
                 row,
                 format!("{}:unverified:{}:{}", rule.id, slug, context.local_day),
-                &format!("merged, verification still owed — {verify}"),
+                &format!("in {}, verification still owed — {verify}", stage.as_str()),
             ))
         }
         AutomationTrigger::StackParentMerged
@@ -820,6 +830,23 @@ fn action_traits<'a>(
     context.actions.get(&rule.run)
 }
 
+/// How far the row landed. The PR-merged leg needs fresh GitHub data, so a
+/// boot-stale cache cannot report a merge it has not confirmed.
+fn row_landing(row: &AutomationRow, context: &AutomationEvalContext) -> wt_core::Landing {
+    let base = row.local_merged == Some(true)
+        || row.gone == Some(true)
+        || (context.github_fresh && row.pr.as_ref().is_some_and(|pr| pr.state == "MERGED"));
+    wt_core::Landing::new(base, row.in_production, context.separate_production)
+}
+
+/// FNV-1a: fire keys persist in the ledger, so the hash must not change
+/// between builds the way `DefaultHasher` may.
+fn stable_hash(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
 fn single(rule: &AutomationDef, row: &AutomationRow, key: String, detail: &str) -> AutomationFire {
     AutomationFire {
         rule: rule.clone(),
@@ -899,6 +926,92 @@ mod tests {
             }),
             ..AutomationRow::default()
         }
+    }
+
+    #[test]
+    fn verification_due_waits_for_its_stage_and_fires_once_per_obligation() {
+        let due = rule("verify", AutomationTrigger::StatusVerificationDue, "verify");
+        let mut context = AutomationEvalContext {
+            separate_production: true,
+            ..AutomationEvalContext::default()
+        };
+        let mut row = row();
+        let mut work = WorkStatusRecord::new(WorkState::Ready, "2026-01-01T00:00:00Z");
+        work.verify_after_merge = Some("check prod".into());
+        work.verify_in = Some(wt_core::VerifyStage::Production);
+        row.work = Some(work.clone());
+        // Not landed: nothing owed yet.
+        assert!(
+            evaluate(
+                std::slice::from_ref(&due),
+                std::slice::from_ref(&row),
+                &context
+            )
+            .is_empty()
+        );
+        // In staging only: a production check is not due.
+        row.local_merged = Some(true);
+        assert!(
+            evaluate(
+                std::slice::from_ref(&due),
+                std::slice::from_ref(&row),
+                &context
+            )
+            .is_empty()
+        );
+        row.in_production = true;
+        let fire = evaluate(
+            std::slice::from_ref(&due),
+            std::slice::from_ref(&row),
+            &context,
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(fire.detail, "verify in production: check prod");
+        let key = fire.fire_keys[0].clone();
+        assert!(key.starts_with("verify:verify:feature-1:production:"));
+        // Its own failure report re-asserts the status; the key is unchanged.
+        let mut failed = work.clone();
+        failed.state = WorkState::NeedsHuman;
+        failed.at = "2026-01-02T00:00:00Z".into();
+        row.work = Some(failed);
+        let again = evaluate(
+            std::slice::from_ref(&due),
+            std::slice::from_ref(&row),
+            &context,
+        );
+        assert_eq!(again[0].fire_keys, std::slice::from_ref(&key));
+        // Verified discharges it.
+        let mut verified = work.clone();
+        verified.state = WorkState::Verified;
+        row.work = Some(verified);
+        assert!(
+            evaluate(
+                std::slice::from_ref(&due),
+                std::slice::from_ref(&row),
+                &context
+            )
+            .is_empty()
+        );
+        // A staging check is due on the base landing alone.
+        let mut staging = work;
+        staging.verify_in = Some(wt_core::VerifyStage::Staging);
+        row.work = Some(staging);
+        row.in_production = false;
+        let fire = evaluate(
+            std::slice::from_ref(&due),
+            std::slice::from_ref(&row),
+            &context,
+        )
+        .pop()
+        .unwrap();
+        assert!(fire.fire_keys[0].starts_with("verify:verify:feature-1:staging:"));
+        // Without a separate production branch the base landing is the release.
+        context.separate_production = false;
+        let mut production = row.work.clone().unwrap();
+        production.verify_in = Some(wt_core::VerifyStage::Production);
+        row.work = Some(production);
+        assert_eq!(evaluate(&[due], &[row], &context).len(), 1);
     }
 
     #[test]
@@ -1269,7 +1382,7 @@ mod tests {
         let ledger = AutomationLedger::new(dir.path().join("automations.json"));
         let cancel = CancellationToken::new();
         // The ledger prunes against the wall clock.
-        let now = (OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        let now = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
         let claim = |fire: AutomationFire| {
             let ledger = &ledger;
             let cancel = &cancel;

@@ -58,6 +58,7 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
         chord: None,
         note: None,
         verify_after_merge: None,
+        verify_in: None,
         detail: None,
     };
     let mut options = vec![option(None, format!("none (diff against {trunk})"))];

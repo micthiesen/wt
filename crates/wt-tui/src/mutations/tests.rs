@@ -544,6 +544,7 @@ fn every_declared_domain_can_settle() {
             state: Some("review".into()),
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             seen: None,
         },
         UiAction::SetStatus {
@@ -551,6 +552,7 @@ fn every_declared_domain_can_settle() {
             state: None,
             note: None,
             verify_after_merge: None,
+            verify_in: None,
             seen: None,
         },
         UiAction::SetBase {

@@ -362,6 +362,8 @@ pub enum AutomationTrigger {
     StatusNeedsTesting,
     #[serde(rename = "status.ready")]
     StatusReady,
+    #[serde(rename = "status.verification_due")]
+    StatusVerificationDue,
     #[serde(rename = "status.verification_overdue")]
     StatusVerificationOverdue,
     #[serde(rename = "branch.advanced")]
@@ -452,6 +454,16 @@ pub struct BranchConfig {
     pub slug_max_len: f64,
     pub keep_fresh: Vec<String>,
     pub production: Option<String>,
+}
+
+impl BranchConfig {
+    /// A promotion branch other than base. Without one, landing on base is
+    /// the release.
+    pub fn separate_production(&self) -> bool {
+        self.production
+            .as_ref()
+            .is_some_and(|production| production != &self.base)
+    }
 }
 
 impl Default for BranchConfig {

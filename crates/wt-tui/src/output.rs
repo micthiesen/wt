@@ -119,6 +119,7 @@ impl Model {
                     chord: None,
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 })
                 .collect(),

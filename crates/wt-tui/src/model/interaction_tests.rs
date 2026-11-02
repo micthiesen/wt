@@ -83,6 +83,7 @@ fn option(index: usize, label: &str) -> PickerOption {
         chord: None,
         note: None,
         verify_after_merge: None,
+        verify_in: None,
         detail: None,
     }
 }
@@ -362,6 +363,7 @@ fn palettes_confirm_on_their_own_opener_and_ignore_digits() {
                     chord: Some('d'),
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 }],
                 selected: 0,
@@ -407,6 +409,7 @@ fn shift_f12_opens_the_harness_picker_and_letters_or_f12_commit() {
                     chord: Some(chord),
                     note: None,
                     verify_after_merge: None,
+                    verify_in: None,
                     detail: None,
                 })
                 .collect(),
@@ -783,6 +786,7 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
     value.rows[0].work = Some(WorkPresentation {
         record: Some(wt_core::WorkStatusRecord {
             verify_after_merge: Some("check prod".into()),
+            verify_in: None,
             ..wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "2026-10-09T00:00:00Z")
         }),
         effective_state: Some(wt_core::WorkState::Ready),
@@ -920,6 +924,7 @@ fn status_note_starts_empty() {
                 chord: Some('w'),
                 note: Some("old note".into()),
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
             selected: 0,
@@ -1320,6 +1325,7 @@ fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
                 chord: Some('x'),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
                 detail: None,
             }],
             selected: 0,

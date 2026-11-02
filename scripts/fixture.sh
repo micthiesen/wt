@@ -261,7 +261,7 @@ ENV
   land_in_trunk landed-unverified
   wtfx section mv landed-clean landed-dirty landed-unverified "Landed" >/dev/null
   wtfx status landed-unverified ready --risk low \
-    --verify-after-merge "sign in with Google on staging, revoke the grant, confirm the reconnect prompt" \
+    --verify-in-staging "sign in with Google on staging, revoke the grant, confirm the reconnect prompt" \
     -m "Sample landed-unverified note.
 OPS:      none
 REVERT:   safe

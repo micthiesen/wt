@@ -135,8 +135,10 @@ required check has not reported yet: wait and re-run, never escalate.
 
 ## After it lands
 
-- `verifyAfterMerge` set: confirm the deploy carrying the change is live, run
-  the steps, then `wt status verified -m "<what you checked, where>"`.
+- `verifyAfterMerge` set: `verifyIn` names the environment. Confirm its
+  deploy carrying the change is live (a `production` check waits for the
+  promotion), run the steps, then `wt status verified -m "<what you checked,
+  where>"`.
 - Do not remove the worktree; merge cleanup archives it.
 - Stop when merged with verification done, blocked on a human, or a pass finds
   nothing to do or wait for. Never keep polling a clean current-head review;

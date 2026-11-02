@@ -46,6 +46,8 @@ pub struct WorkStatusRecord {
     pub blocked_on: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_after_merge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_in: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -60,6 +62,7 @@ impl WorkStatusRecord {
             && self.sha == other.sha
             && self.blocked_on == other.blocked_on
             && self.verify_after_merge == other.verify_after_merge
+            && self.verify_in == other.verify_in
     }
 }
 

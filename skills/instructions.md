@@ -82,18 +82,19 @@ The ready note is about 400 characters of fragments:
   an external prerequisite happens, never only in the note. A manual deploy or
   follow-up that leaves the status quo unchanged is not a gate; it goes in
   `OPS:`. `wt status --unblock` clears a satisfied gate.
-- `--verify-after-merge` as soon as you know a specific check can only run
-  after deployment. It does not block merging; after merge the row returns as
-  `needs-testing`. Write it as:
+- `--verify-in-staging` or `--verify-in-production` as soon as you know a
+  specific check can only run once deployed there. It does not block merging;
+  when the change reaches that stage the row returns as `needs-testing`.
+  Write it as:
 
       <one line: what only the deployed environment can prove>
       <why a local run cannot, when that is not obvious>
       STEPS: 1. <exact step: literal values, expected output> 2. ...
 
-  Once the deployment contains the change, run the steps, then
+  Confirm that environment's deploy contains the change, run the steps, then
   `wt status verified -m "<what was checked and where>"`. While the follow-up
   fix for a carried obligation is unmerged, keep that change
-  `ready --verify-after-merge`; carrying an obligation never shows an earlier
+  `ready --verify-in-<stage>`; carrying an obligation never shows an earlier
   check passed.
 - A branch that will never land: close its PR, then
   `wt status dropped -m "<why>"`.

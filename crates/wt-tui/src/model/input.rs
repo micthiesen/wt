@@ -458,6 +458,13 @@ impl Model {
                     seen,
                 })
             }
+            KeyCode::Char('Q') if !control => {
+                if !self.board.display.automations {
+                    return self.notify("no [[automations]] configured");
+                }
+                self.interaction = Interaction::Automations { scroll: 0 };
+                InputResult::Draw
+            }
             KeyCode::Char('A') if !control => {
                 if !self.board.display.automations {
                     return self.notify("no [[automations]] configured");

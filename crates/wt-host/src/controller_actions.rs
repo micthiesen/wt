@@ -619,8 +619,9 @@ pub async fn execute_with_shutdown(
             state,
             note,
             verify_after_merge,
+            verify_in,
             seen,
-        } => set_status(ctx, &key, state, note, verify_after_merge, seen).await,
+        } => set_status(ctx, &key, state, note, verify_after_merge, verify_in, seen).await,
         UiAction::SetBase { key, base, seen } => set_base(ctx, &key, base, seen).await,
         UiAction::SetIssueOverride { key, issue_id } => {
             let row = resolve_key(ctx, &key).await?;
@@ -903,8 +904,16 @@ async fn set_status(
     state: Option<String>,
     note: Option<String>,
     verify: Option<String>,
+    verify_in: Option<wt_core::VerifyStage>,
     seen: Option<wt_tui::Seen<Option<wt_tui::StatusClaim>>>,
 ) -> Result<UiReply> {
+    if verify
+        .as_deref()
+        .is_some_and(|steps| !steps.trim().is_empty())
+        && verify_in.is_none()
+    {
+        anyhow::bail!("post-merge steps need a stage: staging or production");
+    }
     let row = resolve_key(ctx, key).await?;
     let slug = row.target.slug().to_owned();
     let state = state
@@ -936,6 +945,10 @@ async fn set_status(
                     state: work.state.clone(),
                     note: work.note.clone(),
                     verify_after_merge: work.verify_after_merge.clone(),
+                    verify_in: work
+                        .verify_in
+                        .as_deref()
+                        .and_then(wt_core::VerifyStage::parse),
                 });
                 if current != *seen {
                     return Err(wt_app_core::host_errors::stale(format!(
@@ -949,6 +962,25 @@ async fn set_status(
                     state,
                     wt_core::WorkState::Verified | wt_core::WorkState::Dropped
                 );
+                let (verify_after_merge, verify_in) = if terminal {
+                    (None, None)
+                } else {
+                    match verify {
+                        Some(text) => {
+                            let steps = (!text.trim().is_empty())
+                                .then(|| wt_core::sanitize_work_note(&text));
+                            let stage = steps
+                                .as_ref()
+                                .and(verify_in)
+                                .map(|stage| stage.as_str().to_owned());
+                            (steps, stage)
+                        }
+                        None => previous
+                            .as_ref()
+                            .map(|work| (work.verify_after_merge.clone(), work.verify_in.clone()))
+                            .unwrap_or_default(),
+                    }
+                };
                 wt_store::WorkStatusRecord {
                     state: state.as_str().into(),
                     at,
@@ -963,15 +995,8 @@ async fn set_status(
                     sha: Some(head),
                     by: Some("human".into()),
                     blocked_on: None,
-                    verify_after_merge: if terminal {
-                        None
-                    } else {
-                        match verify {
-                            Some(text) => (!text.trim().is_empty())
-                                .then(|| wt_core::sanitize_work_note(&text)),
-                            None => previous.and_then(|work| work.verify_after_merge),
-                        }
-                    },
+                    verify_after_merge,
+                    verify_in,
                     extra: Default::default(),
                 }
             });
@@ -1095,6 +1120,7 @@ mod tests {
             Some("ready".into()),
             Some("checked locally".into()),
             Some("STEPS: check deployed version".into()),
+            Some(wt_core::VerifyStage::Production),
             None,
         )
         .await
@@ -1106,10 +1132,12 @@ mod tests {
             Some("working".into()),
             None,
             None,
+            None,
             Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
                 state: "review".into(),
                 note: None,
                 verify_after_merge: None,
+                verify_in: None,
             }))),
         )
         .await
@@ -1122,10 +1150,12 @@ mod tests {
             Some("working".into()),
             None,
             None,
+            None,
             Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
                 state: "ready".into(),
                 note: Some("checked locally".into()),
                 verify_after_merge: Some("STEPS: older steps".into()),
+                verify_in: None,
             }))),
         )
         .await
@@ -1137,10 +1167,12 @@ mod tests {
             Some("working".into()),
             None,
             None,
+            None,
             Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
                 state: "ready".into(),
                 note: Some("checked locally".into()),
                 verify_after_merge: Some("STEPS: check deployed version".into()),
+                verify_in: Some(wt_core::VerifyStage::Production),
             }))),
         )
         .await
@@ -1155,12 +1187,28 @@ mod tests {
             state["slugs"]["one"]["work"]["verifyAfterMerge"],
             "STEPS: check deployed version"
         );
+        assert_eq!(state["slugs"]["one"]["work"]["verifyIn"], "production");
+        // Steps without a stage are refused rather than guessed.
+        assert!(
+            set_status(
+                &fixture.ctx,
+                &key,
+                Some("ready".into()),
+                None,
+                Some("other steps".into()),
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
         set_status(
             &fixture.ctx,
             &key,
             Some("ready".into()),
             None,
             Some(String::new()),
+            None,
             None,
         )
         .await
