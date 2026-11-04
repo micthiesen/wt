@@ -29,6 +29,29 @@ pub fn recorded_fork_base<'a>(base: Option<&'a str>, trunk: &str) -> Option<&'a 
     base.filter(|base| !base.is_empty() && *base != trunk)
 }
 
+/// The trunk a worktree finally lands on: follow recorded fork bases through
+/// parent worktrees until a base no worktree owns. `parent_base(branch)` is the
+/// recorded base of the worktree on `branch` (`Some(None)` for trunk), or
+/// `None` when no worktree has that branch.
+pub fn stack_trunk(
+    own_base: Option<&str>,
+    trunk: &str,
+    parent_base: impl Fn(&str) -> Option<Option<String>>,
+) -> String {
+    let normal = |base: &str| base.strip_prefix("origin/").unwrap_or(base).to_owned();
+    let mut base = normal(recorded_fork_base(own_base, trunk).unwrap_or(trunk));
+    let mut seen = std::collections::BTreeSet::new();
+    while base != trunk && seen.insert(base.clone()) {
+        match parent_base(&base) {
+            Some(next) => {
+                base = normal(recorded_fork_base(next.as_deref(), trunk).unwrap_or(trunk))
+            }
+            None => break,
+        }
+    }
+    base
+}
+
 /// Branches `chooser` may record as its fork base, in candidate order.
 ///
 /// Excluded: the chooser itself, main and detached checkouts, archived
@@ -114,6 +137,29 @@ pub fn fork_base_allowed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_trunk_follows_parent_worktrees_to_the_base_none_of_them_own() {
+        let parents = |branch: &str| match branch {
+            "m/parent" => Some(Some("m/root".to_owned())),
+            "m/root" => Some(None),
+            "m/hotfix-parent" => Some(Some("origin/main".to_owned())),
+            "m/loop-a" => Some(Some("m/loop-b".to_owned())),
+            "m/loop-b" => Some(Some("m/loop-a".to_owned())),
+            _ => None,
+        };
+        assert_eq!(stack_trunk(Some("m/parent"), "staging", parents), "staging");
+        assert_eq!(stack_trunk(None, "staging", parents), "staging");
+        assert_eq!(stack_trunk(Some("main"), "staging", parents), "main");
+        assert_eq!(
+            stack_trunk(Some("m/hotfix-parent"), "staging", parents),
+            "main"
+        );
+        assert_eq!(
+            stack_trunk(Some("m/loop-a"), "staging", parents),
+            "m/loop-a"
+        );
+    }
 
     fn candidate<'a>(
         slug: &'a str,

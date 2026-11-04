@@ -343,4 +343,28 @@ pub struct PrMergeTarget {
     pub number: u64,
     pub base_ref_name: String,
     pub head_ref_oid: String,
+    /// Where this worktree may land. Arming checks the PR's GitHub stack
+    /// against it, because merging any stack member merges every PR below it
+    /// onto the stack's base at once.
+    pub landing: MergeLanding,
+}
+
+/// The trunk a worktree lands on and the repository's trunk branches. An
+/// empty `trunks` refuses every stacked PR.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MergeLanding {
+    /// The base the worktree's fork-base chain ends at.
+    pub lands_on: String,
+    /// `[branch].base` first, then a separate production branch.
+    pub trunks: Vec<String>,
+}
+
+impl MergeLanding {
+    /// A stack may be based where the worktree lands, or on the trunk when
+    /// the chain ends at a parent wt no longer has (merged or cleaned).
+    pub fn accepts_stack_base(&self, base: &str) -> bool {
+        base == self.lands_on
+            || (!self.trunks.contains(&self.lands_on)
+                && self.trunks.first().is_some_and(|trunk| trunk == base))
+    }
 }

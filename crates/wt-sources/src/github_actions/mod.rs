@@ -16,8 +16,8 @@ use std::ops::ControlFlow;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 use wt_github::{
-    CoveredPr, GhActionResult, GithubClient, GithubData, GithubOptions, PrChecks, PrMergeTarget,
-    PullRequest,
+    CoveredPr, GhActionResult, GithubClient, GithubData, GithubOptions, MergeLanding, PrChecks,
+    PrMergeTarget, PullRequest,
 };
 use wt_runtime::{Confirmed, Stamp, TaskScope};
 use wt_tui::{Board, PrPin, UiModal, UiReply};
@@ -62,6 +62,8 @@ pub struct GithubActions {
     cancellation: CancellationToken,
     reviewers_enabled: bool,
     default_reviewer: Option<String>,
+    /// Trunk and production, for checking GitHub stacks before arming.
+    branch: wt_config::BranchConfig,
 }
 
 /// What a ship request will do, decided before anything is sent.
@@ -99,6 +101,7 @@ impl GithubActions {
             cancellation: context.cancellation.clone(),
             reviewers_enabled: context.config.github.reviewers,
             default_reviewer: context.config.github.default_reviewer.clone(),
+            branch: context.config.branch.clone(),
         }
     }
 
@@ -117,6 +120,19 @@ impl GithubActions {
             )));
         };
         let branch = row.branch.clone();
+        // The trunk this row lands on; arming refuses a GitHub stack based
+        // elsewhere.
+        let lands_on =
+            wt_core::stack_trunk(row.base_branch.as_deref(), &self.branch.base, |parent| {
+                board
+                    .rows
+                    .iter()
+                    .find(|other| {
+                        !other.is_main && other.host == row.host && other.branch == parent
+                    })
+                    .map(|other| other.base_branch.clone())
+            });
+        let landing = wt_ops::fork_base::landing(&self.branch, lands_on);
         let Some(github) = github else {
             return Ok(UiReply::failure("GitHub data is still loading"));
         };
@@ -151,10 +167,10 @@ impl GithubActions {
         match action {
             GithubAction::MarkReady { .. } => self.mark_ready(pr, &branch, github).await,
             GithubAction::SetAutoMerge { enable, .. } => {
-                self.set_auto_merge(pr, &branch, &row.slug, github, enable)
+                self.set_auto_merge(pr, &branch, &row.slug, github, enable, &landing)
                     .await
             }
-            GithubAction::Ship { .. } => Ok(self.ship(pr, &branch, github).await),
+            GithubAction::Ship { .. } => Ok(self.ship(pr, &branch, github, &landing).await),
             GithubAction::FailedChecks { .. } => self.failed_checks(pr, &branch).await,
         }
     }
@@ -196,9 +212,10 @@ impl GithubActions {
         worktree: &str,
         github: &Confirmed<GithubData>,
         enable: bool,
+        landing: &MergeLanding,
     ) -> Result<UiReply> {
         if enable {
-            self.enable(pr, branch, worktree, github).await
+            self.enable(pr, branch, worktree, github, landing).await
         } else {
             self.disarm(pr, branch, github).await
         }
@@ -210,6 +227,7 @@ impl GithubActions {
         branch: &str,
         worktree: &str,
         github: &Confirmed<GithubData>,
+        landing: &MergeLanding,
     ) -> Result<UiReply> {
         let number = pr.number;
         match self.ledger.guard(github, branch, number, true) {
@@ -226,7 +244,7 @@ impl GithubActions {
                 "PR #{number} is already waiting on checks"
             )));
         }
-        let Some(target) = merge_target(pr) else {
+        let Some(target) = merge_target(pr, landing) else {
             return Ok(UiReply::failure(missing_target(number)));
         };
         let result = self
@@ -377,8 +395,9 @@ impl GithubActions {
         pr: &PullRequest,
         branch: &str,
         github: &Confirmed<GithubData>,
+        landing: &MergeLanding,
     ) -> UiReply {
-        let plan = match self.ship_plan(pr, branch, github) {
+        let plan = match self.ship_plan(pr, branch, github, landing) {
             ControlFlow::Continue(plan) => plan,
             ControlFlow::Break(reply) => return reply,
         };
@@ -405,6 +424,7 @@ impl GithubActions {
         pr: &PullRequest,
         branch: &str,
         github: &Confirmed<GithubData>,
+        landing: &MergeLanding,
     ) -> ControlFlow<UiReply, ShipPlan> {
         let number = pr.number;
         let effective = self.ledger.effective(github);
@@ -424,7 +444,7 @@ impl GithubActions {
         // deciding whether arming is needed.
         let needs_arm = shown.auto_merge.is_none();
         let target = if needs_arm {
-            match merge_target(pr) {
+            match merge_target(pr, landing) {
                 Some(target) => Some(target),
                 None => return ControlFlow::Break(UiReply::failure(missing_target(number))),
             }
@@ -646,12 +666,13 @@ fn resolve_row<'a>(board: &'a Board, key: &str) -> Option<&'a wt_tui::BoardRow> 
     matching.next().is_none().then_some(first)
 }
 
-fn merge_target(pr: &PullRequest) -> Option<PrMergeTarget> {
+fn merge_target(pr: &PullRequest, landing: &MergeLanding) -> Option<PrMergeTarget> {
     Some(PrMergeTarget {
         id: pr.id.clone().filter(|id| !id.is_empty())?,
         number: pr.number,
         base_ref_name: pr.base_ref_name.clone(),
         head_ref_oid: pr.head_ref_oid.clone().filter(|sha| !sha.is_empty())?,
+        landing: landing.clone(),
     })
 }
 
@@ -661,5 +682,6 @@ fn merge_target_for_disable(pr: &PullRequest) -> Option<PrMergeTarget> {
         number: pr.number,
         base_ref_name: pr.base_ref_name.clone(),
         head_ref_oid: pr.head_ref_oid.clone().unwrap_or_default(),
+        landing: MergeLanding::default(),
     })
 }

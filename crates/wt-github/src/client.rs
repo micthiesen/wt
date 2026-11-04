@@ -576,6 +576,134 @@ impl GithubClient {
         target: &PrMergeTarget,
         cancellation: &CancellationToken,
     ) -> GhActionResult {
+        let stack = match self.stack_check(target, cancellation).await {
+            Ok(stack) => stack,
+            Err(refusal) => return refusal,
+        };
+        let mut result = self.arm_auto_merge(target, cancellation).await;
+        if let (Some(stack), Some(error)) = (stack, result.error.as_mut())
+            && error.contains("stacked pull request")
+        {
+            error.push_str(&format!(
+                "\n  #{} is in GitHub stack #{} on {}{}. GitHub cannot arm merge-when-ready on a stacked PR, and merging it any other way (the merge API, the PR page) lands it together with every PR below it. Dissolve the stack on GitHub and run wt merge again.",
+                target.number,
+                stack.number,
+                stack.base,
+                stack.below_text(),
+            ));
+        }
+        result
+    }
+
+    /// Reads the PR's GitHub stack and refuses one that would carry PRs onto
+    /// the wrong trunk. Unknown stack state refuses too: a merge onto the
+    /// wrong trunk cannot be taken back.
+    async fn stack_check(
+        &self,
+        target: &PrMergeTarget,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PrStack>, GhActionResult> {
+        let refuse = |(why, retryable): (String, bool)| {
+            GhActionResult::failed(
+                format!(
+                    "cannot tell whether #{} is in a GitHub stack ({why}); refusing to arm merge-when-ready",
+                    target.number
+                ),
+                retryable,
+            )
+        };
+        let repo = self
+            .repository(cancellation)
+            .await
+            .map_err(|error| refuse((error.to_string(), error.retryable())))?;
+        let read = |path: String| async move {
+            let out = self
+                .run(
+                    [
+                        "api".to_owned(),
+                        "-H".to_owned(),
+                        "X-GitHub-Api-Version: 2026-03-10".to_owned(),
+                        path,
+                    ],
+                    cancellation,
+                )
+                .await
+                .map_err(|error| (error.to_string(), error.retryable()))?;
+            if !out.status.success() {
+                return Err(output_failure(&out));
+            }
+            serde_json::from_slice::<serde_json::Value>(&out.stdout)
+                .map_err(|error| (error.to_string(), false))
+        };
+        let pr = read(format!("repos/{}/pulls/{}", repo.as_str(), target.number))
+            .await
+            .map_err(refuse)?;
+        let Some(stack) = pr.get("stack").filter(|stack| !stack.is_null()) else {
+            return Ok(None);
+        };
+        let (Some(number), Some(base)) = (
+            stack["number"].as_u64(),
+            stack["base"]["ref"].as_str().map(str::to_owned),
+        ) else {
+            return Err(refuse(("the stack has no number or base".into(), false)));
+        };
+        let detail = read(format!("repos/{}/stacks/{number}", repo.as_str()))
+            .await
+            .map_err(refuse)?;
+        let Some(members) = detail["pull_requests"].as_array() else {
+            return Err(refuse(("the stack lists no pull requests".into(), false)));
+        };
+        // Members are listed bottom first; everything below this PR merges
+        // with it.
+        let below = members
+            .iter()
+            .map(|member| StackMember {
+                number: member["number"].as_u64().unwrap_or_default(),
+                head: member["head"]["ref"].as_str().unwrap_or("?").to_owned(),
+                base: member["base"]["ref"].as_str().unwrap_or("?").to_owned(),
+            })
+            .take_while(|member| member.number != target.number)
+            .collect::<Vec<_>>();
+        let stack = PrStack {
+            number,
+            base,
+            below,
+        };
+        let landing = &target.landing;
+        // A trunk branch as a member's head is a release PR: merging under it
+        // moves that whole trunk, whatever the stack's base.
+        let release = stack
+            .below
+            .iter()
+            .find(|member| landing.trunks.contains(&member.head));
+        if landing.accepts_stack_base(&stack.base) && release.is_none() {
+            return Ok(Some(stack));
+        }
+        let why = match release {
+            Some(member) => format!(
+                "#{} ({} → {}) is below it in the stack",
+                member.number, member.head, member.base
+            ),
+            None => format!(
+                "the stack is based on {}, but this worktree lands on {}",
+                stack.base, landing.lands_on
+            ),
+        };
+        Err(GhActionResult::error(format!(
+            "refusing to arm #{}: it is in GitHub stack #{} on {}{}, and {why}. Merging any PR in a GitHub stack merges every PR below it onto {} at once.\n  Fix the stack on GitHub first: take out the PRs that must not land with it, or dissolve the stack. Then run wt merge again. Until then, do not merge it through the merge API or the PR page.",
+            target.number,
+            stack.number,
+            stack.base,
+            stack.below_text(),
+            stack.base,
+        )))
+    }
+
+    async fn arm_auto_merge(
+        &self,
+        target: &PrMergeTarget,
+        cancellation: &CancellationToken,
+    ) -> GhActionResult {
         let _guard = match MergeGuard::acquire(self.merge_requests.clone(), target.number) {
             Ok(g) => g,
             Err(message) => return GhActionResult::error(message),
@@ -1058,6 +1186,34 @@ impl GithubClient {
                 })
             })
             .collect())
+    }
+}
+
+/// A PR's GitHub stack, with the members that merge along with it.
+struct PrStack {
+    number: u64,
+    base: String,
+    below: Vec<StackMember>,
+}
+
+struct StackMember {
+    number: u64,
+    head: String,
+    base: String,
+}
+
+impl PrStack {
+    fn below_text(&self) -> String {
+        if self.below.is_empty() {
+            return String::new();
+        }
+        let list = self
+            .below
+            .iter()
+            .map(|member| format!("#{} ({} → {})", member.number, member.head, member.base))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" (below it: {list})")
     }
 }
 
@@ -2313,12 +2469,13 @@ else:
             .with_gh_program(script)
             .with_repository(RepoSlug::parse("acme/app").unwrap());
         let result = client
-            .enable_auto_merge(
+            .arm_auto_merge(
                 &PrMergeTarget {
                     id: "PR_node".into(),
                     number: 42,
                     base_ref_name: "release".into(),
                     head_ref_oid: "deadbeef".into(),
+                    landing: MergeLanding::default(),
                 },
                 &CancellationToken::new(),
             )
@@ -2403,12 +2560,13 @@ esac
             .with_gh_program(script)
             .with_repository(RepoSlug::parse("acme/app").unwrap());
         let result = client
-            .enable_auto_merge(
+            .arm_auto_merge(
                 &PrMergeTarget {
                     id: "PR_node".into(),
                     number: 42,
                     base_ref_name: "release".into(),
                     head_ref_oid: "deadbeef".into(),
+                    landing: MergeLanding::default(),
                 },
                 &CancellationToken::new(),
             )
@@ -2417,6 +2575,162 @@ esac
             result,
             fs::read_to_string(dir.path().join("calls")).unwrap(),
         )
+    }
+
+    const RELEASE_BELOW: &str = r#"{"number":5,"head":{"ref":"staging"},"base":{"ref":"main"}},{"number":6,"head":{"ref":"m/a"},"base":{"ref":"staging"}}"#;
+    const CLEAN_BELOW: &str = r#"{"number":6,"head":{"ref":"m/a"},"base":{"ref":"staging"}}"#;
+
+    /// A fake gh whose PR #42 tops GitHub stack #7 on `stack_base`, above
+    /// `below`, for a worktree landing on `lands_on` (trunks staging, main).
+    async fn stack_fixture(
+        stack_base: &str,
+        below: &str,
+        lands_on: &str,
+        classic_error: Option<&str>,
+    ) -> (GhActionResult, String) {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("fake-gh");
+        let classic = match classic_error {
+            Some(error) => format!("echo '{error}' >&2; exit 1"),
+            None => "printf '%s' '{\"data\":{\"enablePullRequestAutoMerge\":{\"pullRequest\":{\"number\":42}}}}'".into(),
+        };
+        fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> calls
+case "$*" in
+  *'repos/acme/app/pulls/42'* ) printf '%s' '{{"number":42,"stack":{{"id":1,"number":7,"position":3,"size":3,"base":{{"ref":"{stack_base}"}}}}}}' ;;
+  *'repos/acme/app/stacks/7'* ) printf '%s' '{{"pull_requests":[{below},{{"number":42,"head":{{"ref":"m/b"}},"base":{{"ref":"m/a"}}}}]}}' ;;
+  *'query=query('* ) printf '%s' '{{"data":{{"repository":{{"mergeQueue":null}}}}}}' ;;
+  *'enablePullRequestAutoMerge'* ) {classic} ;;
+  * ) exit 99 ;;
+esac
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(script)
+            .with_repository(RepoSlug::parse("acme/app").unwrap());
+        let result = client
+            .enable_auto_merge(
+                &PrMergeTarget {
+                    id: "PR_node".into(),
+                    number: 42,
+                    base_ref_name: "m/a".into(),
+                    head_ref_oid: "deadbeef".into(),
+                    landing: MergeLanding {
+                        lands_on: lands_on.into(),
+                        trunks: vec!["staging".into(), "main".into()],
+                    },
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        let calls = fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        (result, calls)
+    }
+
+    fn wrote_nothing(calls: &str) -> bool {
+        !calls.contains("mergeQueue")
+            && !calls.contains("enablePullRequestAutoMerge")
+            && !calls.contains("merge-async")
+    }
+
+    #[tokio::test]
+    async fn a_stack_based_on_another_trunk_is_refused_before_any_merge_write() {
+        let (result, calls) = stack_fixture("main", CLEAN_BELOW, "staging", None).await;
+        assert!(!result.ok && !result.ambiguous, "{result:?}");
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("based on main, but this worktree lands on staging"),
+            "{error}"
+        );
+        assert!(
+            error.contains("do not merge it through the merge API"),
+            "{error}"
+        );
+        assert!(wrote_nothing(&calls), "{calls}");
+    }
+
+    #[tokio::test]
+    async fn a_release_pr_below_is_refused_even_when_the_stack_base_matches() {
+        // The incident shape, and a hotfix row that lands on main.
+        for (stack_base, lands_on) in [("main", "staging"), ("main", "main")] {
+            let (result, calls) = stack_fixture(stack_base, RELEASE_BELOW, lands_on, None).await;
+            let error = result.error.unwrap();
+            assert!(error.contains("#5 (staging → main) is below it"), "{error}");
+            assert!(
+                error.contains("below it: #5 (staging → main), #6 (m/a → staging)"),
+                "{error}"
+            );
+            assert!(wrote_nothing(&calls), "{calls}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_stack_on_the_landing_trunk_arms_and_explains_githubs_stacked_refusal() {
+        let (result, _) = stack_fixture("staging", CLEAN_BELOW, "staging", None).await;
+        assert!(result.ok, "{result:?}");
+        // A chain ending at a parent wt no longer has lands on the trunk.
+        let (result, _) = stack_fixture("staging", CLEAN_BELOW, "m/merged-parent", None).await;
+        assert!(result.ok, "{result:?}");
+
+        let (result, _) = stack_fixture(
+            "staging",
+            CLEAN_BELOW,
+            "staging",
+            Some("Auto-merge is not supported for stacked pull requests"),
+        )
+        .await;
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("#42 is in GitHub stack #7 on staging (below it: #6"),
+            "{error}"
+        );
+        assert!(error.contains("Dissolve the stack"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_stack_refuses_and_keeps_transient_failures_retryable() {
+        let dir = tempdir().unwrap();
+        let script = dir.path().join("fake-gh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> calls\necho 'HTTP 502: Bad Gateway' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(script)
+            .with_repository(RepoSlug::parse("acme/app").unwrap());
+        let result = client
+            .enable_auto_merge(
+                &PrMergeTarget {
+                    id: "PR_node".into(),
+                    number: 42,
+                    base_ref_name: "staging".into(),
+                    head_ref_oid: "deadbeef".into(),
+                    landing: MergeLanding::default(),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!result.ok && !result.ambiguous, "{result:?}");
+        assert!(
+            result
+                .error
+                .unwrap()
+                .contains("cannot tell whether #42 is in a GitHub stack")
+        );
+        let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert!(wrote_nothing(&calls), "{calls}");
     }
 
     #[tokio::test]

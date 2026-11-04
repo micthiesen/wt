@@ -88,20 +88,26 @@ fn row_resolution_rejects_ambiguous_key_or_slug_matches() {
 
 #[test]
 fn merge_target_keeps_the_exact_head_and_requires_identity() {
-    let target = merge_target(&pr("feature/one")).unwrap();
+    let target = merge_target(&pr("feature/one"), &MergeLanding::default()).unwrap();
     assert_eq!(target.head_ref_oid, "deadbeef");
     assert!(
-        merge_target(&PullRequest {
-            id: None,
-            ..pr("feature/one")
-        })
+        merge_target(
+            &PullRequest {
+                id: None,
+                ..pr("feature/one")
+            },
+            &MergeLanding::default()
+        )
         .is_none()
     );
     assert!(
-        merge_target(&PullRequest {
-            head_ref_oid: None,
-            ..pr("feature/one")
-        })
+        merge_target(
+            &PullRequest {
+                head_ref_oid: None,
+                ..pr("feature/one")
+            },
+            &MergeLanding::default()
+        )
         .is_none()
     );
 }
@@ -167,6 +173,7 @@ async fn fake_gh() -> FakeGh {
         cancellation: fixture.ctx.cancellation.clone(),
         reviewers_enabled: false,
         default_reviewer: None,
+        branch: fixture.ctx.config.branch.clone(),
     };
     FakeGh {
         fixture,

@@ -56,11 +56,18 @@ async fn run_with_client(
             pr.number
         );
     }
+    let landing = if args.cancel {
+        // Cancelling merges nothing; the stack check applies to arming only.
+        wt_github::MergeLanding::default()
+    } else {
+        wt_ops::fork_base::merge_landing(context, &worktree.target.branch).await?
+    };
     let target = PrMergeTarget {
         id: pr.id,
         number: pr.number,
         base_ref_name: pr.base_ref_name,
         head_ref_oid: pr.head_ref_oid,
+        landing,
     };
     let result = if args.cancel {
         client

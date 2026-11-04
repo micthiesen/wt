@@ -147,3 +147,7 @@ The `stack.parent_merged` automation trigger paired with `builtin:restack`
 makes the whole loop hands-off: when a parent merges under open members, wt
 cleans the landed worktrees and restacks the survivors (see
 [automations.md](automations.md)).
+
+## GitHub stacks
+
+wt's stacks are its own fork-base records; GitHub's stacked pull requests are a separate object that wt does not create. Merging a PR in a GitHub stack lands every unmerged PR below it on the stack's base in one operation. `wt merge` and the TUI's merge keys refuse a PR whose GitHub stack is based on a different trunk than the worktree lands on, or holds a trunk branch's PR (a `staging → main` release PR, say) below it, because that merge would carry those PRs along. See [`wt merge`](cli.md#wt-merge-slug--wt-merge---cancel-slug).

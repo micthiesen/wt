@@ -189,6 +189,45 @@ pub async fn set(
     }
 }
 
+/// Where the worktree on `branch` lands: its recorded fork bases followed
+/// through parent worktrees (see `wt_core::stack_trunk`).
+pub async fn merge_landing(ctx: &AppContext, branch: &str) -> Result<wt_github::MergeLanding> {
+    let inventory = ctx.repository.inventory(&ctx.cancellation).await?;
+    let slugs = inventory
+        .iter()
+        .filter(|row| !row.is_main)
+        .map(|row| (row.target.branch.clone(), row.target.slug().to_owned()))
+        .collect::<BTreeMap<_, _>>();
+    let states = ctx
+        .database
+        .call(move |store| {
+            let mut bases = BTreeMap::new();
+            for (branch, slug) in slugs {
+                let state = store.read_slug_state(&slug)?.unwrap_or_default();
+                bases.insert(branch, state["baseBranch"].as_str().map(str::to_owned));
+            }
+            Ok(bases)
+        })
+        .await?;
+    let own = states.get(branch).cloned().flatten();
+    let lands_on = wt_core::stack_trunk(own.as_deref(), &ctx.config.branch.base, |parent| {
+        states.get(parent).cloned()
+    });
+    Ok(landing(&ctx.config.branch, lands_on))
+}
+
+/// `lands_on` with the repository's trunk branches, for checking a GitHub
+/// stack before arming a merge.
+pub fn landing(branch: &wt_config::BranchConfig, lands_on: String) -> wt_github::MergeLanding {
+    let mut trunks = vec![branch.base.clone()];
+    if branch.separate_production()
+        && let Some(production) = &branch.production
+    {
+        trunks.push(production.clone());
+    }
+    wt_github::MergeLanding { lands_on, trunks }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
