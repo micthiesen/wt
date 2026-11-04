@@ -13,6 +13,9 @@ pub(crate) const BG: Color = rgb(0x1b1d23);
 /// Title bar, footer, and modal surfaces sit one step above the board.
 pub(crate) const BG_ALT: Color = rgb(0x23262e);
 pub(crate) const SELECTED_BG: Color = rgb(0x3b4252);
+/// A row the open cleanup menu will remove: the one fill on the board that
+/// is not the cursor, so candidates stand out even beside a modal.
+pub(crate) const CLEAN_BG: Color = rgb(0x35523f);
 pub(crate) const BORDER: Color = rgb(0x3b4252);
 /// Section rules: present but quieter than pane borders.
 pub(crate) const BORDER_DIM: Color = rgb(0x2e3440);

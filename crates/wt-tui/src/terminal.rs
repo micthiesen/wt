@@ -431,22 +431,7 @@ async fn run_inner<'a>(
                     if std::mem::take(&mut model.refresh_requested) {
                         source.refresh();
                     }
-                    if let Some(action) = model.follow_up.take() {
-                        let id = model.next_op_id();
-                        let action = model.resolve(action);
-                        let feedback = action.clone();
-                        let cancellation = action.is_cancellable().then(CancellationToken::new);
-                        if actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }).is_err() {
-                            model.request_not_sent();
-                            model.toast = Some(("Action queue is busy; retry the action".into(), ToastTone::Failed));
-                        } else {
-                            model.begin_action(id, &feedback);
-                            if let Some(request) = &mut model.pending_request {
-                                request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
-                            }
-                            model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
-                        }
-                    }
+                    send_follow_up(&mut model, &actions.requests);
                     if history_was_open && !model.history.active {
                         let _ = actions.requests.try_send(crate::UiRequest {
                             id: 0,
@@ -548,6 +533,7 @@ async fn run_inner<'a>(
                 let before = model.toast.clone();
                 model.apply(snapshots.borrow_and_update().clone());
                 send_background(&mut model, &actions.requests);
+                send_follow_up(&mut model, &actions.requests);
                 if model.toast != before {
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                 }
@@ -695,6 +681,46 @@ const BACKGROUND_HEADROOM: usize = 3;
 
 /// Send read-only warm-up requests a board menu asked for. They carry no
 /// foreground feedback and never block input; a full queue drops them.
+/// Send the action a reply or a new snapshot queued behind it.
+fn send_follow_up(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
+    model.release_creation_moves();
+    let Some(action) = model.follow_up.take() else {
+        return;
+    };
+    let id = model.next_op_id();
+    let action = model.resolve(action);
+    let feedback = action.clone();
+    let cancellation = action.is_cancellable().then(CancellationToken::new);
+    let request = crate::UiRequest {
+        id,
+        generation: model.ui_generation,
+        action,
+        cancellation: cancellation.clone(),
+    };
+    if requests.try_send(request).is_err() {
+        model.request_not_sent();
+        model.toast = Some((
+            "Action queue is busy; retry the action".into(),
+            ToastTone::Failed,
+        ));
+        return;
+    }
+    model.begin_action(id, &feedback);
+    if let Some(request) = &mut model.pending_request {
+        request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
+    }
+    let preparing = model
+        .pending_request
+        .as_ref()
+        .is_some_and(|request| request.preparation);
+    let text = if preparing {
+        "Loading menu… Esc cancels"
+    } else {
+        "Working…"
+    };
+    model.toast = Some((text.into(), ToastTone::Info));
+}
+
 fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
     let now = tokio::time::Instant::now();
     model.plan_palette_warm(now);

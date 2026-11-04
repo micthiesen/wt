@@ -520,7 +520,7 @@ impl Model {
             KeyCode::Char('d') if control => self.jump_section(true),
             KeyCode::Char('J' | 'K') if !control => {
                 if self.selected_row().is_some_and(|row| row.pending_creation) {
-                    return self.notify("Worktree is still being created");
+                    return self.notify("Still being created; press l to move it to a section");
                 }
                 let Some(section) = self.selected_section().map(|section| section.key.clone())
                 else {
@@ -576,9 +576,15 @@ impl Model {
                     refresh: false,
                 })
             }
-            KeyCode::Char('l') if !control => {
-                self.row_action(|key| UiAction::PrepareSection { key })
-            }
+            KeyCode::Char('l') if !control => match self.selected_row() {
+                // Filing a row needs no checkout, so creation does not block it.
+                Some(row) if row.pending_creation => {
+                    InputResult::Action(UiAction::PrepareSection {
+                        key: row.key.clone(),
+                    })
+                }
+                _ => self.row_action(|key| UiAction::PrepareSection { key }),
+            },
             KeyCode::Char('D') if !control => {
                 let Some(section) = self.selected_section() else {
                     return self.notify("no section here to delete");

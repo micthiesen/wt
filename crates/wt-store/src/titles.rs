@@ -2,8 +2,9 @@
 //!
 //! A title is only ever set deliberately. Each stored title records its
 //! source; a lower source never overwrites a higher one, and a user rename is
-//! final. The agent can replace an issue or fallback title, which also makes
-//! its rename a one-time step: afterwards the title is the agent's own.
+//! final. Agents may retitle as often as the outcome changes. Only starting a
+//! new PR in the worktree (`wt next`) replaces a person's title, because that
+//! title names work that has landed.
 
 use serde_json::Value;
 
@@ -16,7 +17,7 @@ pub enum TitleSource {
     Issue,
     /// The worktree's agent, or an agent creating it.
     Agent,
-    /// A person: the TUI `t` rename or `wt new` typed at a terminal.
+    /// A person: the TUI `t` rename, or creating from the TUI.
     User,
 }
 
@@ -42,13 +43,35 @@ impl TitleSource {
 
     /// Whether a title from `self` may replace one from `current`.
     pub fn may_replace(self, current: Option<Self>) -> bool {
-        self == Self::User || current.is_none_or(|current| self > current)
+        current.is_none_or(|current| self >= current)
     }
+}
+
+/// Capitalize a title's first word when it is plain lowercase. Agents and
+/// trackers often pass words shaped like a slug, which read inconsistently
+/// beside PR titles. Anything else in first place may be an identifier with
+/// its own casing (`iOS`, `wt.toml`, `v2`), so it stays as written.
+pub fn sentence_case(title: &str) -> String {
+    let title = title.trim();
+    let first = title.split_whitespace().next().unwrap_or_default();
+    let plain = first.chars().next().is_some_and(char::is_lowercase)
+        && first
+            .chars()
+            .all(|c| c.is_lowercase() || matches!(c, '-' | '\''));
+    if !plain {
+        return title.to_owned();
+    }
+    let mut chars = title.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
 }
 
 /// A slug's stored title and its source. Titles saved before sources were
 /// recorded were set with the TUI rename or an explicit request, so they read
-/// as the user's.
+/// as the user's. A person's casing is kept; every other title reads in
+/// sentence case, including those saved before that rule existed.
 pub fn stored_title(state: &Value, slug: &str) -> Option<(String, TitleSource)> {
     let entry = &state["slugs"][slug];
     let title = entry["manualTitle"]
@@ -59,7 +82,12 @@ pub fn stored_title(state: &Value, slug: &str) -> Option<(String, TitleSource)> 
         .as_str()
         .and_then(TitleSource::parse)
         .unwrap_or(TitleSource::User);
-    Some((title.to_owned(), source))
+    let title = if source == TitleSource::User {
+        title.to_owned()
+    } else {
+        sentence_case(title)
+    };
+    Some((title, source))
 }
 
 /// The outcome of a title write.
@@ -77,12 +105,12 @@ mod tests {
     use super::TitleSource::{self, *};
 
     #[test]
-    fn a_lower_source_never_replaces_a_higher_one_and_the_user_always_can() {
+    fn only_a_higher_or_equal_source_replaces_a_title() {
         let all = [Fallback, Issue, Agent, User];
         for new in all {
             assert!(new.may_replace(None), "{new:?} sets an untitled worktree");
             for current in all {
-                let expected = new == User || new > current;
+                let expected = new >= current;
                 assert_eq!(
                     new.may_replace(Some(current)),
                     expected,
@@ -90,9 +118,38 @@ mod tests {
                 );
             }
         }
-        // The agent's one rename: an issue or fallback title, then never again.
-        assert!(Agent.may_replace(Some(Issue)) && Agent.may_replace(Some(Fallback)));
-        assert!(!Agent.may_replace(Some(Agent)) && !Agent.may_replace(Some(User)));
+        // An agent retitles freely, but never over a person.
+        assert!(Agent.may_replace(Some(Issue)) && Agent.may_replace(Some(Agent)));
+        assert!(!Agent.may_replace(Some(User)) && User.may_replace(Some(User)));
+    }
+
+    #[test]
+    fn plain_lowercase_titles_read_in_sentence_case_and_identifiers_keep_theirs() {
+        for (raw, shown) in [
+            ("better background effects", "Better background effects"),
+            ("  follow-up on blur ", "Follow-up on blur"),
+            ("Already cased", "Already cased"),
+            ("iOS share sheet", "iOS share sheet"),
+            ("wt.toml loading", "wt.toml loading"),
+            ("v2 migration", "v2 migration"),
+            ("ship: calendar", "ship: calendar"),
+            ("", ""),
+        ] {
+            assert_eq!(super::sentence_case(raw), shown);
+        }
+    }
+
+    #[test]
+    fn stored_titles_read_in_sentence_case_except_a_persons() {
+        let state = serde_json::json!({"slugs": {
+            "agent": {"manualTitle": "chat name search", "titleSource": "agent"},
+            "issue": {"manualTitle": "calendar renders twice", "titleSource": "issue"},
+            "person": {"manualTitle": "chat name search", "titleSource": "user"},
+        }});
+        let title = |slug| super::stored_title(&state, slug).unwrap().0;
+        assert_eq!(title("agent"), "Chat name search");
+        assert_eq!(title("issue"), "Calendar renders twice");
+        assert_eq!(title("person"), "chat name search");
     }
 
     #[test]

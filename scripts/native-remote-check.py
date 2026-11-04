@@ -54,7 +54,8 @@ def native_target() -> str:
 
 
 def run(argv: list[str], *, cwd: Path, env: dict[str, str], expected: int = 0) -> str:
-    result = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=30)
+    # Provisioning copies a debug binary of about 185 MB; loaded machines need minutes.
+    result = subprocess.run(argv, cwd=cwd, env=env, text=True, capture_output=True, timeout=180)
     if result.returncode != expected:
         raise AssertionError(
             f"{argv!r} exited {result.returncode}, expected {expected}\n"

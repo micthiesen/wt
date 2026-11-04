@@ -29,10 +29,10 @@ queued and the new text belongs to that same task.
 ## 2. Create
 
     wt new <TRACKER-ID> --slug <short words> --no-open [--gh <n>] [--base <current-branch>]
-    wt new <title words> --no-open [--gh <n>] [--base <current-branch>]
+    wt new <Title words in sentence case> --no-open [--gh <n>] [--base <current-branch>]
 
 - Give the tracker id only when the user supplied one. With an id, `--slug`
-  keeps the tracker's title so the new agent can retitle it once; a second
+  keeps the tracker's title for the new agent to retitle; a second
   worktree for the same id needs a distinct slug. Without one, the words are
   the slug and the title. Add `--gh` only for a related issue
   the user supplied.

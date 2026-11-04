@@ -19,6 +19,37 @@ use wt_vcs::WorktreeRecord;
 use wt_app_core::context::AppContext;
 use wt_app_core::harness::{AgentRoute, AgentTarget, AgentTargetKind, AppHarness, SelectionSource};
 
+fn needs_pr(definition: &wt_config::ActionDef) -> bool {
+    definition.requires.iter().any(|tag| {
+        matches!(
+            tag,
+            wt_config::RequireTag::Pr | wt_config::RequireTag::PrReady
+        )
+    })
+}
+
+/// A landing seen before GitHub reported its PR freezes without a number, and
+/// the fire waits for that PR while the row lives. Dispatch runs from the
+/// frozen variables, so the number has to come from the row here. Only a merged
+/// PR is that landing's; an open one is follow-up work on the same row.
+fn frozen_pr(
+    vars: &std::collections::BTreeMap<String, String>,
+    board: Option<&Board>,
+    slug: &str,
+) -> Option<String> {
+    vars.get("pr")
+        .filter(|number| !number.is_empty())
+        .cloned()
+        .or_else(|| {
+            let row = board?.rows.iter().find(|row| row.slug == slug)?;
+            let pr = row
+                .pr
+                .as_ref()
+                .filter(|pr| pr.state.as_deref() == Some("MERGED"))?;
+            pr.number.map(|number| number.to_string())
+        })
+}
+
 /// Dispatch an automation fire while retaining the durable-write ambiguity
 /// boundary that the interactive palette's `Result<String>` API cannot express.
 pub async fn dispatch_automation(
@@ -53,6 +84,11 @@ pub async fn dispatch_automation(
         };
         let mut action_context = prepare(context, &surface, github, board, None).await?;
         let mut overrides = fire.frozen_vars.clone().unwrap_or_default();
+        if fire.frozen_vars.is_some() && needs_pr(definition) {
+            let number = frozen_pr(&overrides, board, &fire.slug)
+                .with_context(|| format!("no PR is known for {}", fire.slug))?;
+            overrides.insert("pr".into(), number);
+        }
         if let Some(range) = &fire.branch_range {
             action_context.slug = "fleet".into();
             action_context.action_key = "fleet".into();
@@ -834,6 +870,30 @@ fn today() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frozen_fire_takes_its_pr_from_the_row_when_none_was_captured() {
+        let mut board = Board {
+            rows: vec![wt_tui::BoardRow {
+                slug: "one".into(),
+                pr: Some(wt_tui::PrPresentation {
+                    number: Some(7),
+                    state: Some("MERGED".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = [("pr".to_owned(), "3".to_owned())].into();
+        let empty = [("pr".to_owned(), String::new())].into();
+        assert_eq!(frozen_pr(&captured, None, "one").as_deref(), Some("3"));
+        assert_eq!(frozen_pr(&empty, Some(&board), "one").as_deref(), Some("7"));
+        assert_eq!(frozen_pr(&empty, Some(&board), "gone"), None);
+        assert_eq!(frozen_pr(&empty, None, "one"), None);
+        board.rows[0].pr.as_mut().unwrap().state = Some("OPEN".into());
+        assert_eq!(frozen_pr(&empty, Some(&board), "one"), None);
+    }
     use wt_app_core::test_support::CommandFixture;
 
     #[test]

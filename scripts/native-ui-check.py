@@ -463,10 +463,12 @@ def main():
                 rb"\x1b\[[0-?]*[ -/]*[@-~]|\s+", b"", data
             ))
             # First Esc clears the search, second closes help.
+            # Escapes read in one batch parse as a single Alt-Escape, which on
+            # a loaded machine would leave the help open under the next keys.
             os.write(master, b"\x1b")
-            drain_for(0.1)
+            drain_for(0.5)
             os.write(master, b"\x1b")
-            drain_for(0.2)
+            drain_for(0.5)
         # Palette preparation reads inventory off-thread. A complete shortcut
         # typed before that read finishes must stay with its original menu,
         # rather than running the board's second-key command and losing the

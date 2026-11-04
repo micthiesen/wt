@@ -67,7 +67,7 @@ pub fn cancellable_fires(input: CancellableFiresInput<'_>) -> Vec<AutomationFire
         if executing.contains(&id) {
             continue;
         }
-        fire.fire_keys.retain(|key| !handled.contains(key));
+        fire.fire_keys = open_keys(&fire.fire_keys, handled);
         if fire.fire_keys.is_empty() {
             continue;
         }
@@ -84,6 +84,29 @@ pub fn cancellable_fires(input: CancellableFiresInput<'_>) -> Vec<AutomationFire
         }
     }
     merged.into_values().collect()
+}
+
+/// A fire's keys not yet handled. One landing can be seen through its PR or
+/// through trunk alone, and the `merged` key differs between the two. A handled
+/// landing key ends the fire when either sighting was the PR-less one. Two
+/// numbered PRs are two landings, even from one branch.
+fn open_keys(keys: &[String], handled: &BTreeSet<String>) -> Vec<String> {
+    let landed = keys
+        .iter()
+        .any(|key| key.contains(":landed:") && handled.contains(key));
+    let same_landing = keys.iter().any(|key| {
+        key.rsplit_once(':').is_some_and(|(stem, tail)| {
+            stem.contains(":merged:")
+                && (tail == "local" || handled.contains(&format!("{stem}:local")))
+        })
+    });
+    if landed && same_landing {
+        return Vec::new();
+    }
+    keys.iter()
+        .filter(|key| !handled.contains(*key))
+        .cloned()
+        .collect()
 }
 
 /// Upsert current fires while preserving settle age for unchanged key sets,
@@ -115,12 +138,7 @@ pub fn queue_intents(input: QueueIntentsInput<'_>) -> Vec<AutomationIntent> {
         if executing.contains(&id) {
             continue;
         }
-        let keys: Vec<_> = fire
-            .fire_keys
-            .iter()
-            .filter(|key| !handled.contains(*key))
-            .cloned()
-            .collect();
+        let keys = open_keys(&fire.fire_keys, handled);
         if keys.is_empty() {
             continue;
         }
@@ -253,6 +271,31 @@ mod tests {
         });
         assert_eq!(changed[0].queued_at_ms, 5_000);
         assert_eq!(changed[0].settle_at_ms, 15_000);
+    }
+
+    #[test]
+    fn a_handled_landing_stops_the_same_landing_seen_without_its_pr() {
+        let set = |keys: &[&str]| {
+            keys.iter()
+                .map(|&key| key.to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        let fire = |keys: &[&str]| keys.iter().map(|&key| key.to_owned()).collect::<Vec<_>>();
+        let landed = "r:landed:s:b:t";
+        // Seen through its PR, then through trunk alone.
+        let handled = set(&["r:merged:s:7", landed]);
+        assert!(open_keys(&fire(&["r:merged:s:local", landed]), &handled).is_empty());
+        // Seen through trunk alone, then through its PR.
+        let handled = set(&["r:merged:s:local", landed]);
+        assert!(open_keys(&fire(&["r:merged:s:7", landed]), &handled).is_empty());
+        // A second PR merged from the same branch is a new landing.
+        let handled = set(&["r:merged:s:7", landed]);
+        assert_eq!(
+            open_keys(&fire(&["r:merged:s:8", landed]), &handled),
+            ["r:merged:s:8"]
+        );
+        // Other keys stay independent.
+        assert_eq!(open_keys(&fire(&["a", "b"]), &set(&["a"])), ["b"]);
     }
 
     #[test]

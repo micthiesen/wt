@@ -61,11 +61,11 @@ worktrees, stacking) and get an explicit go.
 1. **Group** tasks that share a code area into one reviewable worktree.
 2. **Create** each with `wt new <ID> --slug <short words> --no-open`, never
    raw `git worktree add`. The id leads the slug and the tracker supplies the
-   title, which the worktree's agent replaces once with its outcome; a second
+   title, which the worktree's agent replaces with its outcome; a second
    worktree for the same id just needs a different slug. Add `--base <branch>` to stack on
    another worktree in the batch. A GitHub issue is a secondary link
    (`--gh <n>`, or later `wt issue <slug> --gh <n>`), never part of the branch
-   name. Work without a tracker task: `wt new <words>`.
+   name. Work without a tracker task: `wt new <Sentence-case words>`.
 3. **GitHub issues only where they earn their keep:** multi-part groups that
    several sessions or worktrees will coordinate on, and design-worthy tasks.
    Small self-contained fixes need none. Reference each as `GH: #N` in the

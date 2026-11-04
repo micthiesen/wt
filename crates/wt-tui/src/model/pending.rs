@@ -5,8 +5,19 @@ use std::sync::Arc;
 
 use wt_runtime::SourceSnapshot;
 
-use super::{Board, Model, ToastTone};
-use crate::{UiAction, UiReply};
+use super::{Board, Interaction, Model, ToastTone};
+use crate::{TextAction, UiAction, UiReply};
+
+/// A section chosen while its row is still being created. The host places the
+/// row as requested at creation and can only move a row it lists, so the move
+/// waits for that and then runs as an ordinary section move. It carries no
+/// witness: what the user saw was a placeholder, and the host may have placed
+/// the row elsewhere, which must not cost them the section they chose.
+pub(crate) struct CreationMove {
+    section: Option<String>,
+    /// The created row, once the host has reported it.
+    key: Option<String>,
+}
 
 impl Model {
     pub fn apply(&mut self, snapshot: SourceSnapshot<Board>) {
@@ -89,6 +100,91 @@ impl Model {
         self.rebuild_local_menu();
     }
 
+    /// The creation behind a row that is still a placeholder. The request
+    /// can be accepted while the row waits to be listed, and until then the
+    /// host still cannot move it.
+    fn creation_request(&self, key: &str) -> Option<(u64, Option<String>)> {
+        if !self
+            .board
+            .rows
+            .iter()
+            .any(|row| row.key == key && row.pending_creation)
+        {
+            return None;
+        }
+        self.pending
+            .mutations()
+            .find_map(|mutation| match &mutation.kind {
+                crate::MutationKind::Lifecycle(crate::LifecycleChange::Create {
+                    request_id,
+                    resolved,
+                    ..
+                }) if mutation.target.key.as_deref() == Some(key) => {
+                    Some((*request_id, resolved.clone()))
+                }
+                _ => None,
+            })
+    }
+
+    /// File a row still being created: show it in `section` now and move it
+    /// once it exists. `None` when `key` is an ordinary row.
+    pub(super) fn defer_creation_move(
+        &mut self,
+        key: &str,
+        section: &Option<String>,
+    ) -> Option<super::InputResult> {
+        let (id, resolved) = self.creation_request(key)?;
+        self.pending.refine(id, |mutation| {
+            if let crate::MutationKind::Lifecycle(crate::LifecycleChange::Create {
+                placement,
+                ..
+            }) = &mut mutation.kind
+            {
+                *placement = Some(crate::CreatePlacement {
+                    section: section.clone(),
+                    after: None,
+                });
+            }
+        });
+        self.creation_moves.insert(
+            id,
+            CreationMove {
+                section: section.clone(),
+                key: resolved,
+            },
+        );
+        self.reproject(tokio::time::Instant::now());
+        let name = section.as_deref().unwrap_or("Inbox");
+        Some(self.notify(format!("Moves to {name} once it is created")))
+    }
+
+    /// Queue a filed row's move once the host lists the row. A foreground
+    /// request is left alone: starting another would cancel a loading menu.
+    pub(crate) fn release_creation_moves(&mut self) {
+        let pending = &self.pending;
+        self.creation_moves
+            .retain(|id, moved| moved.key.is_some() || pending.contains(*id));
+        if self.follow_up.is_some() || self.pending_request.is_some() {
+            return;
+        }
+        let board = &self.board;
+        let ready = self.creation_moves.iter().find_map(|(id, moved)| {
+            let key = moved.key.as_deref()?;
+            board
+                .rows
+                .iter()
+                .any(|row| row.key == key && !row.pending_creation)
+                .then_some(*id)
+        });
+        if let Some(moved) = ready.and_then(|id| self.creation_moves.remove(&id)) {
+            self.follow_up = moved.key.map(|key| UiAction::MoveSection {
+                key,
+                section: moved.section,
+                seen: None,
+            });
+        }
+    }
+
     /// When a pending change next needs re-checking against its deadline.
     pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
         [self.pending.next_deadline(), self.palette_warm_deadline()]
@@ -120,6 +216,19 @@ impl Model {
         let selected = self.selected_row().is_some_and(|row| {
             Some(&row.key) == mutation.target.key.as_ref() && row.host == mutation.target.host
         });
+        // A section menu open on the placeholder follows it to its real key.
+        let placeholder = mutation.target.key.clone();
+        if let Some(UiAction::PrepareSection { key }) = &mut self.local_menu
+            && Some(&*key) == placeholder.as_ref()
+        {
+            key.clone_from(&prepared.key);
+        }
+        if let Interaction::Text(prompt) = &mut self.interaction
+            && let TextAction::NewSection { key, .. } = &mut prompt.action
+            && Some(&*key) == placeholder.as_ref()
+        {
+            key.clone_from(&prepared.key);
+        }
         self.pending.refine(id, |mutation| {
             mutation.target.key = Some(prepared.key.clone());
             if prepared.already_exists
@@ -300,6 +409,9 @@ impl Model {
             match reply.outcome {
                 Some(crate::ReplyOutcome::Accepted(at)) => {
                     let resolved = reply.select_when_visible.clone();
+                    if let Some(moved) = self.creation_moves.get_mut(&id) {
+                        moved.key.clone_from(&resolved);
+                    }
                     if is_create && resolved.is_none() {
                         self.pending.remove(id);
                     } else {

@@ -1,6 +1,13 @@
 //! One native ref-maintenance boundary shared by UI, events and CLI work.
 use anyhow::Result;
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 use wt_core::Domain;
 use wt_runtime::{
@@ -8,7 +15,7 @@ use wt_runtime::{
     derived_channel, start_source,
 };
 use wt_tui::Board;
-use wt_vcs::{FetchOriginOptions, FetchOriginReport};
+use wt_vcs::{FetchOriginOptions, FetchOriginReport, RepositoryError};
 
 use wt_app_core::context::AppContext;
 
@@ -52,20 +59,46 @@ pub async fn refresh_for(
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let report = match report {
         Ok(report) => report,
+        // Shutdown or a superseded fetch says nothing about origin.
+        Err(error @ RepositoryError::Cancelled) => return Err(error.into()),
         Err(error) => {
-            tracing::info!(target: "wt::origin", trigger, elapsed_ms, %error, "origin fetch failed");
+            if FETCH_FAILING.swap(true, Ordering::Relaxed) {
+                tracing::info!(target: "wt::origin", trigger, elapsed_ms, %error, "origin fetch failed");
+            } else {
+                let text = wt_core::sanitize_terminal_text(&format!(
+                    "git origin fetch is failing: {error}"
+                ));
+                tracing::warn!(target: "wt::origin", trigger, elapsed_ms, event_source = "origin", event_text = %text, "origin fetch failed");
+            }
             return Err(error.into());
         }
     };
-    // The activity feed shows each fetch, as TS did; ref-maintenance
-    // warnings join it so they stay visible.
+    FETCH_FAILING.store(false, Ordering::Relaxed);
+    // The activity feed shows each fetch, as TS did.
     let text = format!("fetched git origin ({elapsed_ms}ms, {trigger})");
     tracing::info!(target: "wt::origin", trigger, elapsed_ms, event_source = "origin", event_text = %text, "origin fetch");
-    for warning in &report.warnings {
-        let text = wt_core::sanitize_terminal_text(&warning.to_string());
-        tracing::warn!(target: "wt::origin", event_source = "origin", event_text = %text, "Git ref maintenance");
+    let current = report.warnings.iter().map(ToString::to_string).collect();
+    let mut seen = REPORTED_WARNINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for warning in newly_raised(&mut seen, current) {
+        let text = wt_core::sanitize_terminal_text(&warning);
+        tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = "origin", event_text = %text, "Git ref maintenance");
     }
+    drop(seen);
     Ok(report)
+}
+
+/// Ref-maintenance warnings repeat on every fetch until someone acts, so each
+/// reaches attention once and again only if it clears and comes back.
+static REPORTED_WARNINGS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// One outage is one line in the feed, however many fetches it fails.
+static FETCH_FAILING: AtomicBool = AtomicBool::new(false);
+
+fn newly_raised(seen: &mut BTreeSet<String>, current: BTreeSet<String>) -> Vec<String> {
+    let raised = current.difference(seen).cloned().collect();
+    *seen = current;
+    raised
 }
 
 pub fn backstop(ctx: &AppContext) -> Duration {
@@ -215,6 +248,17 @@ fn spawn_overlay(
 mod tests {
     use super::*;
     use wt_runtime::{RefreshPolicy, leaf_channel};
+
+    #[test]
+    fn a_warning_is_raised_once_until_it_clears() {
+        let set = |items: &[&str]| items.iter().map(|&item| item.to_owned()).collect();
+        let mut seen = BTreeSet::new();
+        assert_eq!(newly_raised(&mut seen, set(&["a"])), ["a"]);
+        assert!(newly_raised(&mut seen, set(&["a"])).is_empty());
+        assert_eq!(newly_raised(&mut seen, set(&["a", "b"])), ["b"]);
+        assert!(newly_raised(&mut seen, set(&[])).is_empty());
+        assert_eq!(newly_raised(&mut seen, set(&["a"])), ["a"]);
+    }
 
     fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
         SourceSpec {

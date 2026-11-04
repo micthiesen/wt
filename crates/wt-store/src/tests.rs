@@ -607,7 +607,8 @@ fn title_sources_only_climb_and_a_user_rename_is_final() {
             ("Calendar renders twice".into(), TitleSource::Issue)
         )
     );
-    // The agent renames once; a second rename and a later issue seed are refused.
+    // The agent renames as often as the outcome changes; a later issue seed
+    // is refused.
     assert_eq!(
         set(
             "Render the calendar once per week change",
@@ -617,8 +618,8 @@ fn title_sources_only_climb_and_a_user_rename_is_final() {
         TitleWrite::Saved
     );
     assert_eq!(
-        set("Something else", TitleSource::Agent).0,
-        TitleWrite::Outranked(TitleSource::Agent)
+        set("Render the calendar once", TitleSource::Agent).0,
+        TitleWrite::Saved
     );
     assert_eq!(
         set("Calendar renders twice", TitleSource::Issue).0,
@@ -643,6 +644,19 @@ fn title_sources_only_climb_and_a_user_rename_is_final() {
             )
         );
     }
+    // The next PR in the worktree is new work, so its title replaces even a
+    // person's, and the rename rules then apply to the new title.
+    assert_eq!(
+        store
+            .reset_slug_title("task", "Next PR", TitleSource::Agent)
+            .unwrap(),
+        TitleWrite::Saved
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(
+        crate::stored_title(&state, "task").unwrap(),
+        ("Next PR".into(), TitleSource::Agent)
+    );
 }
 
 #[test]

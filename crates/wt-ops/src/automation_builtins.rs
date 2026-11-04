@@ -360,12 +360,27 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
         }
     };
     let claimed = fire.delete_branch_pr;
-    let confirmed = confirms_delete(&prs, claimed);
+    // A retry may run after the worktree's cleanup deleted the local branch,
+    // so a tip proven on an earlier attempt is carried with the fire.
+    let carried = fire
+        .frozen_vars
+        .as_ref()
+        .and_then(|vars| vars.get(DELETE_TIP_VAR))
+        .cloned();
+    let proven_tip = match (claimed, carried) {
+        (Some(_), _) => None,
+        (None, Some(tip)) => Some(tip),
+        (None, None) => local_branch_tip(ctx, branch).await,
+    };
+    let confirmed = confirms_delete(&prs, claimed, proven_tip.as_deref());
     if !confirmed {
         let reason = if let Some(number) = claimed {
             format!("fire claimed PR #{number}, but no matching merged PR was returned")
         } else {
-            format!("{} PR(s) exist, so absence was not proven", prs.len())
+            format!(
+                "{} PR(s) exist and none merged at the landed tip",
+                prs.len()
+            )
         };
         attention(
             ctx,
@@ -380,22 +395,12 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
     // Delete only the commit that was proven merged: the merged PR's head,
     // or without a PR the local branch tip that Git proved landed. Commits
     // pushed to the branch since then must survive.
-    // A retry may run after the worktree's cleanup deleted the local branch,
-    // so a tip proven on an earlier attempt is carried with the fire.
-    let carried = fire
-        .frozen_vars
-        .as_ref()
-        .and_then(|vars| vars.get(DELETE_TIP_VAR))
-        .cloned();
     let expected = match claimed {
         Some(number) => prs
             .iter()
             .find(|pr| pr.number == number)
             .and_then(|pr| pr.head_oid.clone()),
-        None => match carried {
-            Some(tip) => Some(tip),
-            None => local_branch_tip(ctx, branch).await,
-        },
+        None => proven_tip,
     };
     let Some(expected) = expected.filter(|sha| !sha.trim().is_empty()) else {
         let reason = "the merged head commit is unknown";
@@ -684,7 +689,10 @@ async fn attention(ctx: &AppContext, level: &str, text: &str) -> Result<()> {
     .context("append automation report")?
 }
 
-fn confirms_delete(prs: &[PullRequestRef], claimed: Option<u64>) -> bool {
+/// With no PR claimed, the row saw no PR when it landed, which can mean the
+/// board had not read that branch yet. A PR merged at the tip Git proved
+/// landed confirms the same commit, so it does not block the delete.
+fn confirms_delete(prs: &[PullRequestRef], claimed: Option<u64>, tip: Option<&str>) -> bool {
     if prs.iter().any(|pr| pr.state == "OPEN") {
         return false;
     }
@@ -692,7 +700,12 @@ fn confirms_delete(prs: &[PullRequestRef], claimed: Option<u64>) -> bool {
         Some(number) => prs
             .iter()
             .any(|pr| pr.number == number && pr.state == "MERGED"),
-        None => prs.is_empty(),
+        None => {
+            prs.is_empty()
+                || prs.iter().any(|pr| {
+                    pr.state == "MERGED" && tip.is_some() && pr.head_oid.as_deref() == tip
+                })
+        }
     }
 }
 
@@ -945,11 +958,20 @@ mod tests {
             },
         ];
 
-        assert!(confirms_delete(&merged, Some(42)));
-        assert!(!confirms_delete(&open, Some(42)));
-        assert!(!confirms_delete(&unrelated, Some(42)));
-        assert!(!confirms_delete(&reopened, Some(42)));
-        assert!(confirms_delete(&[], None));
-        assert!(!confirms_delete(&merged, None));
+        assert!(confirms_delete(&merged, Some(42), None));
+        assert!(!confirms_delete(&open, Some(42), None));
+        assert!(!confirms_delete(&unrelated, Some(42), None));
+        assert!(!confirms_delete(&reopened, Some(42), None));
+        assert!(confirms_delete(&[], None, None));
+        assert!(!confirms_delete(&merged, None, None));
+        // No claim: a merged PR confirms only the tip Git proved landed.
+        let at_tip = [PullRequestRef {
+            number: 42,
+            state: "MERGED".into(),
+            head_oid: Some("tip".into()),
+        }];
+        assert!(confirms_delete(&at_tip, None, Some("tip")));
+        assert!(!confirms_delete(&at_tip, None, Some("newer")));
+        assert!(!confirms_delete(&at_tip, None, None));
     }
 }

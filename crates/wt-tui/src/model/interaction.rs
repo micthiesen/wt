@@ -7,6 +7,7 @@ use super::{InputResult, Model};
 use crate::{
     ConfirmAction, LineEditor, PickerAction, PickerOption, Seen, SessionTarget, TextAction,
     UiAction,
+    cleanup::{self, CleanupPreview},
     editor::EditResult,
     menus::{NEW_SECTION, sessions::choice_for_value},
 };
@@ -266,6 +267,10 @@ impl Model {
                             },
                             TextAction::NewSection { key, seen } => {
                                 self.last_section_target = Some(Some(text.clone()));
+                                let section = Some(text.clone());
+                                if let Some(result) = self.defer_creation_move(key, &section) {
+                                    return result;
+                                }
                                 UiAction::MoveSection {
                                     key: key.clone(),
                                     section: Some(text),
@@ -663,6 +668,9 @@ impl Model {
                             return InputResult::Draw;
                         }
                         self.last_section_target = Some(option.value.clone());
+                        if let Some(result) = self.defer_creation_move(key, &option.value) {
+                            return result;
+                        }
                         InputResult::Action(UiAction::MoveSection {
                             key: key.clone(),
                             section: option.value,
@@ -918,4 +926,28 @@ pub(crate) fn digit_rows(picker: &PickerPrompt) -> Vec<usize> {
 
 fn verify_prompt(stage: wt_core::VerifyStage) -> String {
     format!("verify in {}: ", stage.as_str())
+}
+
+impl Model {
+    /// The cleanup menu's decisions while it is open.
+    pub(crate) fn cleanup_preview(&self) -> Option<CleanupPreview<'_>> {
+        match &self.interaction {
+            Interaction::Confirm(ConfirmPrompt {
+                action: ConfirmAction::CleanupTargets { targets },
+                ..
+            }) => Some(CleanupPreview::new(
+                targets.iter().map(|target| target.key.as_str()),
+            )),
+            Interaction::Confirm(ConfirmPrompt {
+                action: ConfirmAction::Cleanup { revisions },
+                ..
+            }) => Some(CleanupPreview::new(
+                revisions.iter().map(|revision| revision.key.as_str()),
+            )),
+            Interaction::Log { title, .. } if title == cleanup::LOG_TITLE => {
+                Some(CleanupPreview::new([]))
+            }
+            _ => None,
+        }
+    }
 }

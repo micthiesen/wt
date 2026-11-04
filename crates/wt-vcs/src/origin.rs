@@ -23,6 +23,8 @@ use crate::{
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Waiting for admission only: a started fast-forward always finishes.
+const FAST_FORWARD_ADMISSION: Duration = Duration::from_secs(60);
 const GIT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
@@ -535,22 +537,14 @@ impl GitRepository {
                 )
                 .await?;
             if !status.is_empty() {
+                if local.as_deref() != Some(remote.as_str()) {
+                    warnings.push(format!(
+                        "The main clone has local changes, so {branch} stays behind origin/{branch}; clean it to resume updates."
+                    ));
+                }
                 return Ok(());
             }
-            let result = self
-                .run_git_status(
-                    &self.origin_config().main_clone,
-                    [
-                        "merge",
-                        "--ff-only",
-                        "--quiet",
-                        "--",
-                        &format!("origin/{branch}"),
-                    ],
-                    cancellation,
-                    "fast-forward checked out branch",
-                )
-                .await?;
+            let result = self.fast_forward_checkout(branch, cancellation).await?;
             if !result {
                 warnings.push(format!(
                     "could not fast-forward checked out branch {branch}"
@@ -753,6 +747,39 @@ impl GitRepository {
             "check commit availability",
         )
         .await
+    }
+
+    /// A merge killed partway leaves the work tree updated with the index and
+    /// ref behind, and every later fetch then sees a dirty clone. A large
+    /// update can outlast any fixed limit, so this one runs to completion.
+    async fn fast_forward_checkout(
+        &self,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let cwd = &self.origin_config().main_clone;
+        let operation = "fast-forward checked out branch";
+        let mut spec = CommandSpec::new("git").args([
+            "merge",
+            "--ff-only",
+            "--quiet",
+            "--",
+            &format!("origin/{branch}"),
+        ]);
+        spec.cwd = Some(cwd.clone());
+        spec.env = common_git_env();
+        spec.timeout = FAST_FORWARD_ADMISSION;
+        spec.output_limit = GIT_OUTPUT_LIMIT;
+        let output = self
+            .origin_runner()
+            .run_to_completion(spec, cancellation)
+            .await
+            .map_err(|source| RepositoryError::Process {
+                operation,
+                path: cwd.clone(),
+                source,
+            })?;
+        Ok(output.status.success())
     }
 
     async fn run_git_status<const N: usize>(
@@ -1086,7 +1113,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.before_main_head, report.after_main_head);
-        assert_eq!(report.warnings.len(), 3);
+        assert_eq!(report.warnings.len(), 4, "{:?}", report.warnings);
+        assert!(report.warnings[3].contains("stays behind origin/main"));
         assert_eq!(
             std::fs::read_to_string(main.join("base.txt")).unwrap(),
             "working edit\n"
@@ -1094,6 +1122,27 @@ mod tests {
         assert_eq!(
             git(&runner, &main, &["show", ":base.txt"]).await,
             "staged edit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dirty_main_clone_says_it_is_falling_behind_only_when_it_is() {
+        let (_root, runner, seed, main, worktrees) = fixture().await;
+        std::fs::write(main.join("scratch.txt"), "local\n").unwrap();
+        let repository = repository(&main, &worktrees);
+        let cancellation = CancellationToken::new();
+        let fetch = || repository.fetch_origin(FetchOriginOptions::default(), &cancellation);
+        assert!(fetch().await.unwrap().warnings.is_empty());
+
+        commit_file(&runner, &seed, "next.txt", "next\n", "advance trunk").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        let report = fetch().await.unwrap();
+        assert_eq!(report.before_main_head, report.after_main_head);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(
+            report.warnings[0]
+                .to_string()
+                .contains("stays behind origin/main")
         );
     }
 

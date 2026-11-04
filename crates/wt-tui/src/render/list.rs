@@ -14,7 +14,9 @@ use unicode_width::UnicodeWidthStr;
 
 use super::text::{fit, truncate_end};
 use crate::{
-    BoardRow, BoardSection, Model, ReviewRequestRow, SectionRollup, badges, glyphs,
+    BoardRow, BoardSection, Model, ReviewRequestRow, SectionRollup, badges,
+    cleanup::{CleanupMark, CleanupPreview},
+    glyphs,
     model::{ARCHIVED_SECTION, REMOVING_SECTION, VisualItem},
     theme,
 };
@@ -131,6 +133,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
         model,
         width,
         gutter,
+        cleanup: model.cleanup_preview(),
     };
     if board.sections.is_empty() {
         lines.push(blank());
@@ -196,6 +199,7 @@ struct RowContext<'a> {
     model: &'a Model,
     width: usize,
     gutter: usize,
+    cleanup: Option<CleanupPreview<'a>>,
 }
 
 impl RowContext<'_> {
@@ -230,14 +234,24 @@ impl RowContext<'_> {
         }
         if section.folded {
             let item = positions.get(&VisualItem::Section(index)).copied();
-            lines.push(folded_header(
+            let mut header = folded_header(
                 &section.title,
                 rows.len(),
                 Some(&section.rollup),
                 item.is_some() && item == self.model.selected,
                 self.width,
                 item,
-            ));
+            );
+            // A candidate hidden by a fold must still show.
+            if rows
+                .iter()
+                .any(|(_, row)| self.cleanup_mark(row) == Some(CleanupMark::Remove))
+            {
+                for span in &mut header.line.spans {
+                    span.style = span.style.bg(theme::CLEAN_BG);
+                }
+            }
+            lines.push(header);
             return;
         }
         lines.push(divider(&section.title, self.width));
@@ -247,10 +261,19 @@ impl RowContext<'_> {
         }
     }
 
+    fn cleanup_mark(&self, row: &BoardRow) -> Option<CleanupMark> {
+        self.cleanup.as_ref()?.mark(&self.model.board, row)
+    }
+
     fn row(&self, row: &BoardRow, item: Option<usize>) -> ListLine {
         let selected = item.is_some() && item == self.model.selected;
         let policy = &self.model.board.display;
-        let background = selected.then_some(theme::SELECTED_BG);
+        let mark = self.cleanup_mark(row);
+        let background = if mark == Some(CleanupMark::Remove) {
+            Some(theme::CLEAN_BG)
+        } else {
+            selected.then_some(theme::SELECTED_BG)
+        };
         let style = |color: Color| {
             let style = Style::new().fg(color);
             background.map_or(style, |bg| style.bg(bg))
@@ -311,9 +334,14 @@ impl RowContext<'_> {
             title_style = title_style
                 .fg(theme::FG_DIM)
                 .add_modifier(Modifier::CROSSED_OUT);
+        } else if mark == Some(CleanupMark::Remove) {
+            title_style = title_style
+                .fg(theme::FG_BRIGHT)
+                .add_modifier(Modifier::BOLD);
         } else if selected {
             title_style = title_style.add_modifier(Modifier::BOLD);
         }
+        let title_span = spans.len();
         spans.push(Span::styled(label, title_style));
         if !reference.is_empty() {
             spans.push(Span::styled(reference, style(theme::FG_DIM)));
@@ -324,6 +352,18 @@ impl RowContext<'_> {
         }
         spans.extend(badges::cluster_spans(&cluster, background));
         spans.push(Span::styled(" ", style(theme::FG)));
+        // Kept rows recede so candidates carry the color; the title alone
+        // says why a row stays.
+        if let Some(mark) = mark.filter(|mark| *mark != CleanupMark::Remove) {
+            for (index, span) in spans.iter_mut().enumerate() {
+                let color = if index == title_span {
+                    mark.color()
+                } else {
+                    theme::FG_DIM
+                };
+                span.style = span.style.fg(color);
+            }
+        }
         ListLine {
             line: Line::from(spans),
             item,
@@ -541,6 +581,7 @@ mod tests {
             model: &model,
             width: 60,
             gutter: 0,
+            cleanup: None,
         };
         let text = |line: &ListLine| {
             line.line
@@ -579,6 +620,7 @@ mod tests {
             model: &model,
             width: 60,
             gutter: 0,
+            cleanup: None,
         };
         let mut row = BoardRow {
             title: "Pending deletion".into(),
@@ -668,6 +710,60 @@ mod tests {
             assert!(bottom.contains("Archived"), "{height}: {bottom:?}");
             assert_eq!(model.selected, selected);
         }
+    }
+
+    #[test]
+    fn the_open_cleanup_menu_fills_candidates_and_colors_kept_rows_by_reason() {
+        let landed = |key: &str| BoardRow {
+            key: key.into(),
+            slug: key.into(),
+            title: key.into(),
+            path: format!("/worktrees/{key}"),
+            git: crate::GitPresentation {
+                head_sha: Some("head".into()),
+                landed_on: Some(crate::LandingKind::Base),
+                tracked_changes: Some(0),
+                untracked_files: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut dirty = landed("dirty");
+        dirty.git.untracked_files = Some(1);
+        let mut unlanded = landed("unlanded");
+        unlanded.git.landed_on = None;
+        let board = crate::Board {
+            rows: vec![landed("done"), dirty, unlanded],
+            ..Default::default()
+        };
+        let model = Model {
+            board: board.clone().into(),
+            ..Default::default()
+        };
+        let preview = CleanupPreview::new(["done"]);
+        let context = RowContext {
+            model: &model,
+            width: 60,
+            gutter: 0,
+            cleanup: Some(preview),
+        };
+        let title = |row: usize| {
+            let line = context.row(&board.rows[row], None).line;
+            let name = board.rows[row].title.as_str();
+            let span = line.spans.iter().find(|span| span.content.contains(name));
+            (line.clone(), span.unwrap().style)
+        };
+        let (done, style) = title(0);
+        assert!(
+            done.spans
+                .iter()
+                .all(|span| span.style.bg == Some(theme::CLEAN_BG))
+        );
+        assert_eq!(style.fg, Some(theme::FG_BRIGHT));
+        let (held, style) = title(1);
+        assert_eq!(style.fg, Some(theme::WARN));
+        assert!(held.spans.iter().all(|span| span.style.bg.is_none()));
+        assert_eq!(title(2).1.fg, Some(theme::FG_DIM));
     }
 
     #[test]
@@ -781,6 +877,7 @@ mod tests {
                     model: &model,
                     width,
                     gutter: 0,
+                    cleanup: None,
                 };
                 let rendered = context.row(&row, Some(0));
                 let text: String = rendered

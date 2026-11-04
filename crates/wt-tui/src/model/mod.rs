@@ -79,6 +79,8 @@ pub struct Model {
     pub(crate) local_domains: wt_runtime::DomainMap,
     pub(crate) source_board: Arc<Board>,
     pub(crate) follow_up: Option<UiAction>,
+    /// Sections chosen for rows still being created, by creation request.
+    pub(crate) creation_moves: std::collections::BTreeMap<u64, pending::CreationMove>,
     /// Typeahead left after a replayed key requested another menu.
     pub(crate) carry_typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
     /// The request whose board-built menu is open.
@@ -169,6 +171,7 @@ impl Default for Model {
             next_op: 0,
             local_domains: Default::default(),
             follow_up: None,
+            creation_moves: Default::default(),
             carry_typeahead: Vec::new(),
             local_menu: None,
             local_menu_default: None,

@@ -28,9 +28,9 @@ wt edge <from> before|enables|conflicts <to> [--blocks] [-m why]
 wt restack [<branch>]
 wt restack prune-backups [--days <n>]   # delete old backup/restack-* branches
 wt merge [slug] [--cancel]             # arm merge-when-ready
-wt next [branch] [--issue <ID>|none] [--gh <n>|none]
+wt next [branch] --title <outcome> [--issue <ID>|none] [--gh <n>|none]
 wt issue [slug] [--gh <n> | --clear-gh | --read]
-wt title [title…] [-w slug]          # show, or set once over an issue title
+wt title [title…] [-w slug]          # show, or set any but a person's title
 wt rm [slug] [--keep-branch]           # deletes the branch by default
 ```
 
@@ -38,12 +38,12 @@ wt rm [slug] [--keep-branch]           # deletes the branch by default
 
 - **Naming a new worktree.** Lead with the tracker id:
   `wt new ENG-1953 --slug calendar-week-view`. Pass the id, never a URL. The
-  tracker supplies the title, which the worktree's agent replaces once with
-  its outcome (`wt title`). Title words after the id
-  (`wt new ENG-1953 fix calendar`) become a title no agent can replace; a
-  bare id gets a random slug suffix (another worktree for that id). Without an
-  id, the words alone make the slug and title. `wt title` shows or sets the
-  title; nothing generates one. With `[issue_tracker] prefix` set, only
+  tracker supplies the title, which the worktree's agent replaces with its
+  outcome (`wt title`). Title words after the id
+  (`wt new ENG-1953 Fix calendar`) set the first title; a bare id gets a
+  random slug suffix (another worktree for that id). Without an id, the words
+  alone make the slug and title. Write title words in sentence case.
+  `wt title` shows or sets the title; nothing generates one. With `[issue_tracker] prefix` set, only
   that prefix may lead; a GitHub issue never names a worktree, so pass it as
   `--gh <n>` next to a slug.
 - **Stacking.** `--base <branch>` on `wt new` stacks the new worktree on that
@@ -57,8 +57,9 @@ wt rm [slug] [--keep-branch]           # deletes the branch by default
 - **Merging.** Use `wt merge`, never `gh pr merge --auto`: only `wt merge`
   enqueues on a merge-queue base, and gh's error there looks like a
   permission problem that isn't one.
-- **Another PR in the same worktree.** After its PR merged, run `wt next`
-  there instead of a new worktree or a hand reset, then push as below.
+- **Another PR in the same worktree.** After its PR merged, run
+  `wt next --title "<outcome>"` there instead of a new worktree or a hand
+  reset, then push as below. `--issue <ID>` alone takes the tracker's title.
 - **First push.** If `git push` says the upstream branch does not match the
   current branch, run `git push -u origin HEAD`. Never push to the
   `HEAD:<trunk>` it suggests.

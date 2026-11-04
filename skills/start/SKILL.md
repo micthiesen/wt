@@ -75,10 +75,10 @@ brief or user references, sibling PRs (`gh pr list --state all --search
 
 ## 5. Implement, review, test
 
-1. `wt status working`. If `wt title` shows an `issue` or `fallback` title,
-   replace it once with the outcome your PR will deliver, about its PR
-   title: `wt title "<outcome>"`. Then build, running typecheck and tests as
-   you go.
+1. `wt status working`. Unless `wt title` already states it, set the outcome
+   your PR will deliver in sentence case, about its PR title:
+   `wt title "<outcome>"`, and again if the outcome changes. Then build,
+   running typecheck and tests as you go.
 2. `wt status review`, then run the project's code-review flow, or review the
    full diff yourself (correctness, edge cases, security, conventions) and fix
    what you find.

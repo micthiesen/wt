@@ -214,9 +214,25 @@ impl Drop for IssueTitleLookup {
     }
 }
 
-/// Save a new worktree's title: the words it was created with (from
-/// `creator`), else the tracker's title, else the bare issue id. A failure
-/// only costs the title, so it is logged rather than failing the creation.
+/// The title a worktree starts from: the words it was given (from `creator`),
+/// else the tracker's title, else the bare issue id.
+pub fn initial_title(
+    title: CreationTitle,
+    creator: TitleSource,
+    issue_title: Option<String>,
+) -> Option<(String, TitleSource)> {
+    match title {
+        CreationTitle::None => None,
+        CreationTitle::Given(title) => Some((wt_store::sentence_case(&title), creator)),
+        CreationTitle::Issue(id) => Some(match issue_title {
+            Some(title) => (title, TitleSource::Issue),
+            None => (id, TitleSource::Fallback),
+        }),
+    }
+}
+
+/// Save a new worktree's title. A failure only costs the title, so it is
+/// logged rather than failing the creation.
 pub async fn record_title(
     ctx: &AppContext,
     slug: &str,
@@ -224,13 +240,8 @@ pub async fn record_title(
     creator: TitleSource,
     issue_title: Option<String>,
 ) {
-    let (title, source) = match title {
-        CreationTitle::None => return,
-        CreationTitle::Given(title) => (title, creator),
-        CreationTitle::Issue(id) => match issue_title {
-            Some(title) => (title, TitleSource::Issue),
-            None => (id, TitleSource::Fallback),
-        },
+    let Some((title, source)) = initial_title(title, creator, issue_title) else {
+        return;
     };
     let db_slug = slug.to_owned();
     if let Err(error) = ctx
@@ -591,7 +602,7 @@ mod tests {
         );
         assert_eq!(
             title_after(&fixture, "ENG-42 fix calendar week view").await,
-            Some(("fix calendar week view".into(), TitleSource::Agent))
+            Some(("Fix calendar week view".into(), TitleSource::Agent))
         );
         let fresh = wt_app_core::test_support::CommandFixture::new()
             .await

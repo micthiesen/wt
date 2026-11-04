@@ -11,12 +11,15 @@ use anyhow::{Context, Result};
 use clap::Args;
 use serde::Deserialize;
 use wt_platform::{lock::FileLock, process::CommandSpec};
-use wt_store::BaseUpdate;
+use wt_store::{BaseUpdate, TitleSource};
+use wt_tui::CreationTitle;
 
 use wt_app_core::context::AppContext;
+use wt_ops::commands::new::{IssueTitleLookup, initial_title};
 use wt_ops::commands::resolve::{resolve_worktree, run_git};
 
-const USAGE: &str = "usage: wt next [BRANCH] [--slug SLUG] [--issue ID|none] [--gh N|none]";
+const USAGE: &str =
+    "usage: wt next [BRANCH] (--title TITLE | --issue ID) [--slug SLUG] [--gh N|none]";
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct NextArgs {
@@ -27,6 +30,10 @@ pub struct NextArgs {
     /// Worktree to continue; defaults to the one containing the current directory.
     #[arg(long, value_name = "SLUG")]
     pub slug: Option<String>,
+    /// What the next PR delivers. Required unless `--issue` names a tracker
+    /// issue to take the title from.
+    #[arg(long, short = 't', value_name = "TITLE")]
+    pub title: Option<String>,
     /// Tracker issue of the next PR (`none` asserts that it has none).
     #[arg(long, value_name = "ID")]
     pub issue: Option<String>,
@@ -68,6 +75,20 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
             }
         },
     };
+    // The old title names work that landed, so the new PR must bring its own.
+    let given = args.title.as_deref().map(str::trim).unwrap_or_default();
+    let title = match issue.as_deref() {
+        _ if !given.is_empty() => CreationTitle::Given(given.to_owned()),
+        Some(id) if !id.is_empty() => CreationTitle::Issue(id.to_owned()),
+        _ => {
+            eprintln!("wt next needs the next PR's title: pass --title or --issue <ID>\n{USAGE}");
+            return Ok(2);
+        }
+    };
+    if given.chars().any(char::is_control) {
+        eprintln!("a title is one line of text");
+        return Ok(2);
+    }
     let row = match resolve_worktree(ctx, args.slug.as_deref()).await {
         Ok(row) if !row.is_main => row,
         Ok(_) => {
@@ -232,6 +253,7 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
         }
     };
 
+    let lookup = IssueTitleLookup::start(ctx, &title);
     // Record the base first. With the trunk tip as the anchor and HEAD still
     // on the landed branch (contained in, or squashed into, the trunk), the
     // worktree has no own commits, so a later failure can never leave it
@@ -286,6 +308,20 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
         );
         return Ok(1);
     }
+    let issue_title = lookup.finish().await;
+    let (new_title, source) = initial_title(title, TitleSource::Agent, issue_title)
+        .context("wt next always has a title")?;
+    let write_slug = slug.clone();
+    let shown = new_title.clone();
+    let title_note = ctx
+        .database
+        .call(move |store| Ok(store.reset_slug_title(&write_slug, &new_title, source)?))
+        .await
+        .err()
+        .map(|error| {
+            format!("  warning: the title was not updated ({error:#}); set it with `wt title`")
+        })
+        .unwrap_or_else(|| format!("  title: {shown}"));
     let mut issue_note = None;
     if issue.is_some() || gh.is_some() {
         let write_slug = slug.clone();
@@ -332,6 +368,7 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
     } else {
         println!("  kept local branch {old_branch}: it could not be deleted at its landed head");
     }
+    println!("{title_note}");
     if let Some(note) = issue_note {
         println!("{note}");
     }
@@ -521,6 +558,31 @@ fn short(sha: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_next_pr_needs_a_title_or_an_issue_to_take_one_from() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        for args in [
+            NextArgs::default(),
+            NextArgs {
+                title: Some("  ".into()),
+                ..Default::default()
+            },
+            NextArgs {
+                issue: Some("none".into()),
+                ..Default::default()
+            },
+            NextArgs {
+                title: Some("two\nlines".into()),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(run(&fixture.ctx, &args).await.unwrap(), 2, "{args:?}");
+        }
+        fixture.close().await.unwrap();
+    }
 
     fn pr(number: u64, state: &str, head: &str, base: &str, fork: bool) -> BranchPr {
         BranchPr {

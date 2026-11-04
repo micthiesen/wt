@@ -821,6 +821,93 @@ fn bind_creation(model: &mut Model, id: u64, key: &str) {
 }
 
 #[test]
+fn a_row_being_created_can_be_filed_and_moves_once_it_exists() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["old"]));
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            placement: None,
+            input: "new".into(),
+        },
+    );
+    let placeholder = model.selected_row().unwrap().key.clone();
+    model.input(KeyEvent::from(KeyCode::Char('l')), 20);
+    assert!(matches!(
+        &model.interaction,
+        Interaction::Picker(picker)
+            if matches!(&picker.action, crate::PickerAction::Section { key, .. } if *key == placeholder)
+    ));
+    model.interaction = Interaction::None;
+    // Filing it sends nothing yet: the host has no such row to move.
+    let section = Some("Later".to_owned());
+    assert!(model.defer_creation_move(&placeholder, &section).is_some());
+    assert!(model.toast.as_ref().unwrap().0.contains("Later"));
+    bind_creation(&mut model, 1, "new");
+    let section = Some("Soon".to_owned());
+    assert!(model.defer_creation_move("new", &section).is_some());
+    assert!(model.defer_creation_move("old", &section).is_none());
+
+    // Accepted but not yet listed: a move sent now would be refused, so it
+    // still defers, and the latest choice wins.
+    model.reply(UiReply {
+        operation_id: Some(1),
+        select_when_visible: Some("new".into()),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    let section = Some("Latest".to_owned());
+    assert!(model.defer_creation_move("new", &section).is_some());
+    model.release_creation_moves();
+    assert!(model.follow_up.is_none());
+
+    // Listed, but a menu is loading: starting a request would cancel it.
+    model.begin_action(2, &UiAction::PrepareCleanup);
+    model.apply(snapshot(&["old", "new"]));
+    model.release_creation_moves();
+    assert!(model.follow_up.is_none());
+    model.pending_request = None;
+
+    model.release_creation_moves();
+    assert_eq!(
+        model.follow_up.take(),
+        Some(UiAction::MoveSection {
+            key: "new".into(),
+            section,
+            seen: None,
+        })
+    );
+    model.release_creation_moves();
+    assert!(model.follow_up.is_none(), "the move runs once");
+    assert!(model.defer_creation_move("new", &None).is_none());
+}
+
+#[test]
+fn a_failed_creation_forgets_the_section_chosen_for_it() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["old"]));
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            placement: None,
+            input: "new".into(),
+        },
+    );
+    let key = model.selected_row().unwrap().key.clone();
+    model.defer_creation_move(&key, &Some("Later".into()));
+    model.reply(UiReply {
+        operation_id: Some(1),
+        failed: true,
+        message: "no".into(),
+        ..Default::default()
+    });
+    model.apply(snapshot(&["old"]));
+    model.release_creation_moves();
+    assert!(model.creation_moves.is_empty());
+    assert!(model.follow_up.is_none());
+}
+
+#[test]
 fn creation_immediately_selects_one_pending_row_and_f12_never_queues_entry() {
     let mut model = Model::default();
     model.apply(snapshot(&["old"]));

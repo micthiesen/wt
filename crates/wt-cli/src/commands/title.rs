@@ -61,13 +61,8 @@ pub async fn run(ctx: &AppContext, args: &TitleArgs) -> Result<i32> {
         }
         TitleWrite::Outranked(kept) => {
             eprintln!(
-                "{slug} keeps its {} title; {}",
-                kept.as_str(),
-                if kept == TitleSource::User {
-                    "a person's rename is final"
-                } else {
-                    "an agent renames an issue or fallback title only once"
-                }
+                "{slug} keeps its {} title; a person's rename is final",
+                kept.as_str()
             );
             Ok(1)
         }
@@ -81,7 +76,7 @@ mod tests {
     use wt_app_core::test_support::CommandFixture;
 
     #[tokio::test]
-    async fn an_agent_replaces_an_issue_title_once() {
+    async fn an_agent_retitles_freely_but_never_over_a_person() {
         let fixture = CommandFixture::new().await.unwrap();
         let slug = "one".to_owned();
         let seeded = slug.clone();
@@ -103,7 +98,17 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(run(&fixture.ctx, &set("Second try")).await.unwrap(), 1);
+        assert_eq!(run(&fixture.ctx, &set("Second try")).await.unwrap(), 0);
+        let renamed = slug.clone();
+        fixture
+            .ctx
+            .database
+            .call(move |store| {
+                Ok(store.set_slug_title(&renamed, "A person's name", TitleSource::User, None)?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(run(&fixture.ctx, &set("Third try")).await.unwrap(), 1);
         let state = fixture
             .ctx
             .database
@@ -112,7 +117,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             wt_store::stored_title(&state, &slug),
-            Some(("Render the calendar once".into(), TitleSource::Agent))
+            Some(("A person's name".into(), TitleSource::User))
         );
         fixture.close().await.unwrap();
     }

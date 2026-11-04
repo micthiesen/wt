@@ -40,9 +40,16 @@ fn response(text: &str) -> Result<AsyncResponse, String> {
         .nth(1)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| "async merge response has invalid HTTP status".to_owned())?;
-    let body: Value =
-        serde_json::from_str(&text[re + if text[re..].starts_with("\r\n") { 4 } else { 2 }..])
-            .map_err(|_| "async merge response body is invalid JSON".to_owned())?;
+    let raw_body = &text[re + if text[re..].starts_with("\r\n") { 4 } else { 2 }..];
+    let body: Value = serde_json::from_str(raw_body).map_err(|_| {
+        // What GitHub sent is the only clue to what an uncertain merge did.
+        let excerpt: String = raw_body
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(200)
+            .collect();
+        format!("async merge response body is invalid JSON (HTTP {code}): {excerpt}")
+    })?;
     let status = body
         .get("status")
         .and_then(Value::as_str)

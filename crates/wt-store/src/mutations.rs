@@ -891,6 +891,28 @@ impl Store {
         source: TitleSource,
         expected_revision: Option<u64>,
     ) -> Result<TitleWrite, StoreError> {
+        self.write_slug_title(slug, title, source, expected_revision, false)
+    }
+
+    /// Title a worktree's next PR. The old title, even a person's, names work
+    /// that has landed, so precedence does not apply.
+    pub fn reset_slug_title(
+        &mut self,
+        slug: &str,
+        title: &str,
+        source: TitleSource,
+    ) -> Result<TitleWrite, StoreError> {
+        self.write_slug_title(slug, title, source, None, true)
+    }
+
+    fn write_slug_title(
+        &mut self,
+        slug: &str,
+        title: &str,
+        source: TitleSource,
+        expected_revision: Option<u64>,
+        reset: bool,
+    ) -> Result<TitleWrite, StoreError> {
         let title = title.trim().to_owned();
         if title.is_empty() || title.chars().any(char::is_control) {
             return Err(StoreError::InvalidTitle {
@@ -913,7 +935,7 @@ impl Store {
                 return Ok((TitleWrite::Stale, false));
             }
             let current = crate::stored_title(state, slug).map(|(_, source)| source);
-            if !source.may_replace(current) {
+            if !reset && !source.may_replace(current) {
                 return Ok((TitleWrite::Outranked(current.unwrap_or(source)), false));
             }
             if revision >= MAX_SAFE_INTEGER {

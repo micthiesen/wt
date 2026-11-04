@@ -1,5 +1,81 @@
 //! Cleanup review from the prepared board. Opening this menu does no I/O.
-use crate::{Board, BoardRow, CleanupTarget, ConfirmAction, UiModal};
+use std::collections::BTreeSet;
+
+use ratatui::style::Color;
+
+use crate::{Board, BoardRow, CleanupTarget, ConfirmAction, UiModal, theme};
+
+/// Title of the overlay shown when nothing can be cleaned.
+pub(crate) const LOG_TITLE: &str = "Clean worktrees";
+const NOT_LANDED: &str = "landing of its own work is not proven";
+const HOST_UNAVAILABLE: &str = "host is unavailable";
+const CHECKOUT_UNAVAILABLE: &str = "checkout is unavailable";
+const OPERATION_IN_PROGRESS: &str = "operation in progress";
+const GIT_UNAVAILABLE: &str = "Git state is unavailable";
+const CHANGES_LOADING: &str = "checkout changes are still loading";
+
+/// What the open cleanup menu decided for a row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupMark {
+    /// Confirming removes it.
+    Remove,
+    /// Its work landed, but something still holds the checkout.
+    Held,
+    /// wt cannot tell yet.
+    Unknown,
+    /// Its work has not landed.
+    Unlanded,
+}
+
+impl CleanupMark {
+    pub(crate) fn from_reason(reason: &str) -> Self {
+        match reason {
+            NOT_LANDED => Self::Unlanded,
+            HOST_UNAVAILABLE
+            | CHECKOUT_UNAVAILABLE
+            | OPERATION_IN_PROGRESS
+            | GIT_UNAVAILABLE
+            | CHANGES_LOADING => Self::Unknown,
+            _ => Self::Held,
+        }
+    }
+
+    /// The color of a kept row's title and of its reason in the menu.
+    pub(crate) fn color(self) -> Color {
+        match self {
+            Self::Remove => theme::OK,
+            Self::Held => theme::WARN,
+            Self::Unknown => theme::INFO,
+            Self::Unlanded => theme::FG_DIM,
+        }
+    }
+}
+
+/// The open cleanup menu's decisions, for painting the list behind it.
+pub(crate) struct CleanupPreview<'a> {
+    targets: BTreeSet<&'a str>,
+}
+
+impl<'a> CleanupPreview<'a> {
+    pub(crate) fn new(targets: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            targets: targets.into_iter().collect(),
+        }
+    }
+
+    /// The displayed targets are what confirming acts on, so they decide
+    /// `Remove` even after a refresh. A row that became cleanable since the
+    /// menu opened is not one of them, and reads as unknown until reopened.
+    pub(crate) fn mark(&self, board: &Board, row: &BoardRow) -> Option<CleanupMark> {
+        if row.key.starts_with('\0') {
+            return None;
+        }
+        if self.targets.contains(row.key.as_str()) {
+            return Some(CleanupMark::Remove);
+        }
+        Some(hold_reason(board, row).map_or(CleanupMark::Unknown, CleanupMark::from_reason))
+    }
+}
 
 pub(crate) fn menu(board: &Board) -> UiModal {
     let mut targets = Vec::new();
@@ -24,16 +100,7 @@ pub(crate) fn menu(board: &Board) -> UiModal {
         } else {
             &row.slug
         };
-        let reason = if row
-            .host
-            .as_ref()
-            .is_some_and(|host| board.host_errors.contains_key(host))
-        {
-            Some("host is unavailable")
-        } else {
-            keep_reason(row)
-        };
-        if let Some(reason) = reason {
+        if let Some(reason) = hold_reason(board, row) {
             kept.push(format!("{label}Keep {name}: {reason}"));
         } else {
             removed.push(format!("{label}Remove {name}"));
@@ -58,7 +125,7 @@ pub(crate) fn menu(board: &Board) -> UiModal {
     if targets.is_empty() {
         lines.insert(0, "Nothing safe to clean in the background results.".into());
         return UiModal::Log {
-            title: "Clean worktrees".into(),
+            title: LOG_TITLE.into(),
             lines,
             close_key: Some('c'),
             refresh: None,
@@ -84,6 +151,18 @@ fn host_label<'a>(board: &'a Board, host: &'a str) -> &'a str {
         .map_or(host, |choice| choice.label.as_str())
 }
 
+fn hold_reason(board: &Board, row: &BoardRow) -> Option<&'static str> {
+    let host_down = row
+        .host
+        .as_ref()
+        .is_some_and(|host| board.host_errors.contains_key(host));
+    if host_down {
+        Some(HOST_UNAVAILABLE)
+    } else {
+        keep_reason(row)
+    }
+}
+
 fn keep_reason(row: &BoardRow) -> Option<&'static str> {
     checkout_hold_reason(row, true)
 }
@@ -94,13 +173,13 @@ fn keep_reason(row: &BoardRow) -> Option<&'static str> {
 /// unpushed work itself and returns its hazards for review.
 pub(crate) fn checkout_hold_reason(row: &BoardRow, landing_required: bool) -> Option<&'static str> {
     if row.path_missing || row.path.is_empty() {
-        Some("checkout is unavailable")
+        Some(CHECKOUT_UNAVAILABLE)
     } else if row.busy.is_some() {
-        Some("operation in progress")
+        Some(OPERATION_IN_PROGRESS)
     } else if row.git.error.is_some() || row.git.head_sha.as_deref().is_none_or(str::is_empty) {
-        Some("Git state is unavailable")
+        Some(GIT_UNAVAILABLE)
     } else if landing_required && row.git.landed_on.is_none() {
-        Some("landing of its own work is not proven")
+        Some(NOT_LANDED)
     } else if landing_required
         && row.work.as_ref().is_some_and(|work| {
             matches!(
@@ -117,7 +196,7 @@ pub(crate) fn checkout_hold_reason(row: &BoardRow, landing_required: bool) -> Op
     } else if row.git.rebasing || !row.git.conflict_files.is_empty() {
         Some("rebase or merge is in progress")
     } else if row.git.tracked_changes.is_none() || row.git.untracked_files.is_none() {
-        Some("checkout changes are still loading")
+        Some(CHANGES_LOADING)
     } else if row.git.tracked_changes != Some(0) || row.git.untracked_files != Some(0) {
         Some("uncommitted changes")
     } else {
@@ -145,6 +224,37 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn marks_follow_the_displayed_targets_and_each_rows_reason() {
+        let mut dirty = landed("dirty");
+        dirty.git.untracked_files = Some(1);
+        let mut unlanded = landed("unlanded");
+        unlanded.git.landed_on = None;
+        let mut loading = landed("loading");
+        loading.git.tracked_changes = None;
+        let mut down = landed("down");
+        down.host = Some("builder".into());
+        // Its checkout changed after the menu opened; it stays a target.
+        let mut target = landed("target");
+        target.git.untracked_files = Some(1);
+        let fresh = landed("fresh");
+        let mut temporary = landed("creating");
+        temporary.key = "\0creating".into();
+        let board = Board {
+            host_errors: [("builder".to_owned(), "down".to_owned())].into(),
+            ..Default::default()
+        };
+        let preview = CleanupPreview::new(["target"]);
+        let mark = |row: &BoardRow| preview.mark(&board, row);
+        assert_eq!(mark(&target), Some(CleanupMark::Remove));
+        assert_eq!(mark(&dirty), Some(CleanupMark::Held));
+        assert_eq!(mark(&unlanded), Some(CleanupMark::Unlanded));
+        assert_eq!(mark(&loading), Some(CleanupMark::Unknown));
+        assert_eq!(mark(&down), Some(CleanupMark::Unknown));
+        assert_eq!(mark(&fresh), Some(CleanupMark::Unknown));
+        assert_eq!(mark(&temporary), None);
     }
 
     #[test]

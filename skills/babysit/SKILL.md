@@ -146,8 +146,9 @@ required check has not reported yet: wait and re-run, never escalate.
 
 ## Next PR from this worktree
 
-When asked for more work after the merge, run `wt next` (with
-`--issue <ID>|none` or `--gh <N>|none` for a different issue): it moves the
+When asked for more work after the merge, run
+`wt next --title "<outcome>"` (`--issue <ID>` alone takes the tracker's title;
+add `--issue none` or `--gh <N>|none` to change the links): it moves the
 worktree to a fresh branch from the latest base and keeps its sessions,
 section and history. Then `wt status working`, commit,
 `git push -u origin HEAD`, open the PR and run this loop. Never reset the

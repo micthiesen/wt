@@ -27,7 +27,9 @@ use super::{
 use crate::{
     BoardRow, BusyView, CheckState, ConfirmAction, DisplayPolicy, GitPresentation, Interaction,
     LandingKind, Model, PickerAction, PrPresentation, ReviewBotView, ReviewState, SessionMode,
-    WorkPresentation, badges, glyphs,
+    WorkPresentation, badges,
+    cleanup::{self, CleanupMark},
+    glyphs,
     model::{ConfirmPrompt, PickerPrompt, ReviewerPrompt},
     theme,
 };
@@ -996,7 +998,8 @@ fn cleanup_rows(lines: &[String], width: usize) -> Vec<Vec<Line<'static>>> {
                         .map_or((subject, None), |(name, reason)| (name, Some(reason)))
                 };
                 let label = host.map_or_else(|| name.to_owned(), |host| format!("{name} · {host}"));
-                let color = if remove { theme::OK } else { theme::FG_DIM };
+                let mark = reason.map_or(CleanupMark::Remove, CleanupMark::from_reason);
+                let color = mark.color();
                 let glyph = if remove { glyphs::TRASH } else { glyphs::SLASH };
                 let mut rows: Vec<_> = wrap(&label, width.saturating_sub(4).max(1))
                     .into_iter()
@@ -1029,7 +1032,7 @@ fn cleanup_rows(lines: &[String], width: usize) -> Vec<Vec<Line<'static>>> {
                             .map(|text| {
                                 Line::from(vec![
                                     Span::raw("     "),
-                                    Span::styled(text, theme::dim()),
+                                    Span::styled(text, theme::fg(color)),
                                 ])
                             }),
                     );
@@ -1149,7 +1152,7 @@ fn max_entry_offset(rows: &[Vec<Line<'static>>], visible: usize) -> usize {
 // ── Logs and performance ────────────────────────────────────────────────
 
 fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll: &mut usize) {
-    if title == "Clean worktrees" {
+    if title == cleanup::LOG_TITLE {
         cleanup_log(frame, area, title, lines, scroll);
         return;
     }
@@ -2747,7 +2750,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_log_keeps_muted_reasons_visible_and_indented() {
+    fn cleanup_log_keeps_colored_reasons_visible_and_indented() {
         let mut model = Model {
             interaction: Interaction::Log {
                 title: "Clean worktrees".into(),
@@ -2771,7 +2774,7 @@ mod tests {
         assert_ne!(buffer[(reason_x, reason_y + 1)].symbol(), " ");
         assert_eq!(buffer[(reason_x - 1, reason_y + 1)].symbol(), " ");
         assert!(reason_x > x);
-        assert_eq!(buffer[(reason_x, reason_y)].fg, theme::FG_DIM);
+        assert_eq!(buffer[(reason_x, reason_y)].fg, theme::WARN);
         assert!(screen.contains("c / esc / q close"));
     }
 
@@ -2788,18 +2791,22 @@ mod tests {
         assert_eq!(rendered[1][0].spans[0].style.fg, Some(theme::OK));
         assert_eq!(rendered[1][0].spans[1].style.fg, Some(theme::FG_BRIGHT));
         assert_eq!(rendered[3][0].spans[1].style.fg, Some(theme::FG_DIM));
-        assert_eq!(rendered[3][1].spans[1].style.fg, Some(theme::FG_DIM));
+        assert_eq!(rendered[3][0].spans[0].style.fg, Some(theme::WARN));
+        assert_eq!(rendered[3][1].spans[1].style.fg, Some(theme::WARN));
     }
 
     #[test]
     fn cleanup_host_colons_do_not_hide_the_keep_decision() {
         let rows = cleanup_rows(
-            &["MaxBook: work: Keep smoke: landing is not proven".into()],
+            &["MaxBook: work: Keep smoke: landing of its own work is not proven".into()],
             80,
         );
         assert_eq!(rows[0][0].spans[0].style.fg, Some(theme::FG_DIM));
         assert_eq!(rows[0][0].spans[1].content, "smoke · MaxBook: work");
-        assert_eq!(rows[0][1].spans[1].content, "landing is not proven");
+        assert_eq!(
+            rows[0][1].spans[1].content,
+            "landing of its own work is not proven"
+        );
     }
 
     #[test]

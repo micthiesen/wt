@@ -147,7 +147,12 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T> for S
         if let Err(reason) = &result
             && *reason != Rejected::Missing
         {
-            tracing::warn!(source = name, ?reason, path = %path.display(), "discarding source cache");
+            // Every new build or config changes the scope: routine, not a fault.
+            if *reason == Rejected::Mismatched {
+                tracing::info!(source = name, path = %path.display(), "discarding source cache");
+            } else {
+                tracing::warn!(source = name, ?reason, path = %path.display(), "discarding source cache");
+            }
             if let Err(error) = std::fs::remove_file(&path)
                 && error.kind() != std::io::ErrorKind::NotFound
             {

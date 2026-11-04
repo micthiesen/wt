@@ -390,7 +390,7 @@ def check_active_action_survives_remote_runtime_upgrade(
     action_command = [
         "/bin/sh",
         "-c",
-        f"printf 'native-host-action-ready\\n'; echo $$ > {shlex.quote(str(pid_file))}; exec sleep 120",
+        f"printf 'native-host-action-ready\\n'; echo $$ > {shlex.quote(str(pid_file))}; exec sleep 900",
     ]
     meta = {
         "version": 1,
@@ -561,7 +561,7 @@ def check_active_action_survives_remote_runtime_upgrade(
 
     try:
         for candidate in (first, second):
-            run([str(candidate), "remote", "version"], cwd=controller_cwd, env=controller_env)
+            run([str(candidate), "remote", "version"], cwd=controller_cwd, env=controller_env, timeout=180)
             run(
                 [tmux, "-L", host["socket"], "has-session", "-t", "=native-host-active-action"],
                 cwd=host["main"],

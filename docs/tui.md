@@ -275,7 +275,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `d` | Remove the selected worktree after confirmation |
 | `c` | Open cleanup review from background results, including archived rows |
 | `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
-| `t` | Rename the worktree. A rename is final: no agent or tracker title replaces it |
+| `t` | Rename the worktree. A rename is final: no agent or tracker title replaces it, until `wt next` starts new work there |
 | `#` | Set or clear the worktree's issue identity |
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
@@ -299,7 +299,7 @@ records its source, and a lower source never replaces a higher one:
 | Source | Set by |
 |---|---|
 | `user` | `t`, or creating from the TUI. Final |
-| `agent` | `wt new <words>` or `wt title` from an agent. It may replace an `issue` or `fallback` title once, with the outcome its PR will have |
+| `agent` | `wt new <words>`, `wt next --title`, or `wt title` from an agent. It may replace any title but a person's, as often as the outcome changes |
 | `issue` | `wt new <ID>` with no title words: the tracker's title (`[issue_tracker] status_command`) |
 | `fallback` | The same, when the tracker gave no title: the bare ID |
 
@@ -307,7 +307,16 @@ A worktree nobody titled (created from a branch or a one-word slug) shows its
 PR title, then its first commit, then its slug, tagged `pr`, `commit`, or
 `slug`. Titles change only the display, never the branch or directory.
 
-Creation selects the row after it appears in the prepared board. Remote
+Titles read in sentence case: `wt new fix calendar week` shows `Fix calendar
+week`. Only a plain lowercase first word is capitalized, so `iOS` or `wt.toml`
+stay as written, and a person's `t` rename is shown exactly as typed.
+[`wt next`](cli.md#wt-next-branch---title-title---slug-slug---issue-idnone---gh-nnone)
+starts new work, so its title replaces any earlier one, even a person's.
+
+Creation selects the row after it appears in the prepared board. A row still
+being created can already be filed with `l`: it shows in the chosen section at
+once and moves there as soon as it exists. Everything else that needs a
+checkout waits, including `J`/`K`. Remote
 worktrees use the same host service for commands and sessions. On a
 [managed remote](remote.md#managed-remotes), a request that needs a missing
 sign-in (Codex for agents, GitHub for creation) first asks `Sign in on
@@ -319,8 +328,17 @@ The `c` menu opens at once from the prepared background board. It does not wait
 for Git, GitHub, or SSH. It also requests the same background refresh as `r`.
 With no candidates, the overlay stays open and shows
 why each row is kept. Candidates appear first with green trash glyphs; kept
-worktrees and their reasons are muted under a separate count. Long names and
+worktrees and their reasons follow under a separate count. Long names and
 reasons wrap below their own column, including in the no-candidates view.
+
+While the menu is open the worktree list shows the same decision, so rows the
+modal does not cover still read. Rows it will clean fill with green, and a
+folded section holding one takes the same fill. Everything else recedes to dim
+with only its title colored by why it stays: yellow when the work landed but
+something still holds the checkout (uncommitted changes, owed verification,
+work in progress), purple when wt cannot tell yet (loading, busy, unavailable),
+and dim when the work has not landed. The menu's reasons use the same colors.
+
 Press `c` or `Esc` to close it. Reopen it to use newer
 background results. Confirmation checks only the displayed candidate identities
 against current landing evidence and removal hazards before queuing removal.

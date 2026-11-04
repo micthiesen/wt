@@ -123,7 +123,7 @@ Tabs the human attached by hand are released rather than closed — except on th
 
 And it reaps hand-started servers: any process holding a **listening TCP socket** whose cwd is inside the worktree (an agent's backgrounded `pnpm preview`, a stray vite) is SIGTERM'd — SIGKILL'd if it lingers — before the checkout is removed, with a `reaped …` line in the destroy log per kill. The listening-socket filter is the safety boundary: an editor or shell sitting in the directory holds no socket and is never touched. This is the cleanup half of the process contract — the managed half (`wt dev`) covers the one process meant to *outlive* an agent's session; everything else may run unmanaged precisely because destroy guarantees it can't outlive the worktree. Best-effort and silent when nothing is listening, which is the common case.
 
-### `wt next [branch] [--slug <slug>] [--issue <ID>|none] [--gh <n>|none]`
+### `wt next [branch] --title <title> [--slug <slug>] [--issue <ID>|none] [--gh <n>|none]`
 
 Keep a worktree whose PR landed and start its next PR there. An opt-in step for
 continuing in the same checkout; worktrees that are never reused are unaffected.
@@ -136,6 +136,11 @@ to a fresh branch at the trunk tip, records that tip as the fork base, and
 deletes the landed local branch. The branch name is the argument (a name
 without `/` gets the `[branch] prefix`), or `<prefix>/<slug>-<n>` with the
 first `n` from 2 that is unused locally and on origin.
+
+The old title names work that landed, so the next PR must bring its own:
+`--title` sets it (source `agent`), and `--issue <ID>` alone takes the
+tracker's title, or the bare id if the tracker has none. With neither it exits
+2 and changes nothing. This is the one write that replaces a person's title.
 
 The slug, directory, sessions, section, status history and any owed
 `--verify-in-*` steps stay with the worktree; only the branch changes.
@@ -368,7 +373,7 @@ Record or show the worktree's change guide; requires `[guides] enabled` (see [co
 
 ### `wt title [<title…>] [-w <slug>]`
 
-Show or set the worktree's title (default: the current worktree). Bare `wt title` prints the title and its source. Setting one records source `agent`; people rename with the TUI's `t`. A lower source never replaces a higher one, so an agent can replace an `issue` or `fallback` title once and never a person's; a refused write exits 1 and names the title it kept. See [Worktree titles](tui.md#worktree-titles).
+Show or set the worktree's title (default: the current worktree). Bare `wt title` prints the title and its source. Setting one records source `agent`; people rename with the TUI's `t`. A lower source never replaces a higher one, so an agent can retitle as often as the outcome changes but never over a person's title; a refused write exits 1 and names the title it kept. See [Worktree titles](tui.md#worktree-titles).
 
 ### `wt edge [<from> <kind> <to>]`
 

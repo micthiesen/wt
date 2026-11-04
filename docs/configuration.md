@@ -194,7 +194,9 @@ Each named branch is advanced in the main clone on every fetch:
   way, and that is what the semantic checks read.
 
 **Fast-forward only, in every branch of it.** A local head that has
-diverged is left exactly where it is, with a warning in the app log.
+diverged is left exactly where it is, with one warning on the attention feed
+until the condition clears. A main clone with local changes stays behind the
+same way, and says so.
 This runs unattended; the one thing it must never do is pick a winner.
 
 Only the main clone is touched. Under the `rift` backend each worktree
