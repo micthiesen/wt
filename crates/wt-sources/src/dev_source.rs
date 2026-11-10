@@ -6,8 +6,8 @@ use notify::{RecursiveMode, Watcher};
 use wt_core::Domain;
 use wt_dev::{DevServerStatus, DevStatusRow, DevWorktree};
 use wt_runtime::{
-    DiskCache, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot, SourceSpec,
-    SourceState, TaskScope, derived_channel, start_source,
+    DiskCache, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSnapshot,
+    SourceSpec, SourceState, Stamp, TaskScope, derived_channel, start_skippable_source,
 };
 use wt_tui::Board;
 
@@ -32,19 +32,24 @@ pub fn overlay(
             status: None,
         };
     }
-    let dev = start_source(scope, status_spec(context), {
+    let dev = start_skippable_source(scope, status_spec(context), {
         let context = context.clone();
         let local = local.clone();
         move |cancel| {
             let context = context.clone();
-            let rows = worktrees(&local.snapshot());
+            // The key set comes from the local board. Restored rows cannot
+            // name the worktrees to probe; `project` asks again once the
+            // rows are confirmed.
+            let rows = confirmed_worktrees(&local.snapshot());
+            let observed = Stamp::now();
             async move {
-                Ok::<_, anyhow::Error>(
-                    wt_app_core::dev::service(&context)?
-                        .status_all(&rows, &cancel)
-                        .await?
-                        .worktrees,
-                )
+                let Some(rows) = rows else {
+                    return Ok(None);
+                };
+                let status = wt_app_core::dev::service(&context)?
+                    .status_all(&rows, &cancel)
+                    .await?;
+                Ok::<_, anyhow::Error>(Some(Fetched::new(status.worktrees, observed)))
             }
         }
     });
@@ -72,6 +77,12 @@ fn status_spec(context: &AppContext) -> SourceSpec<Vec<DevStatusRow>> {
     }
 }
 
+/// The worktrees to probe, only when the rows naming them were scanned live
+/// by this process.
+fn confirmed_worktrees(snapshot: &SourceSnapshot<Board>) -> Option<Vec<DevWorktree>> {
+    crate::sources::rows_confirmed(snapshot).then(|| worktrees(snapshot))
+}
+
 fn worktrees(snapshot: &SourceSnapshot<Board>) -> Vec<DevWorktree> {
     snapshot
         .data()
@@ -97,7 +108,7 @@ fn project(
         let mut local_updates = local.subscribe();
         let mut board_updates = board.subscribe();
         let mut dev_updates = dev.subscribe();
-        let mut inventory = Vec::new();
+        let mut inventory = (false, Vec::new());
         // The upstream may already have published before this task subscribed.
         local_updates.mark_changed();
         board_updates.mark_changed();
@@ -113,8 +124,12 @@ fn project(
                 }
                 changed = local_updates.changed() => {
                     if changed.is_err() { break; }
-                    let next = worktrees(&local_updates.borrow_and_update()).into_iter()
+                    let snapshot = local_updates.borrow_and_update().clone();
+                    let rows = worktrees(&snapshot).into_iter()
                         .map(|row| (row.slug, row.path, row.branch)).collect::<Vec<_>>();
+                    // Confirmation of unchanged rows also counts: the fetch
+                    // skipped while they were restored.
+                    let next = (crate::sources::rows_confirmed(&snapshot), rows);
                     if next != inventory {
                         inventory = next;
                         dev.refresh();
@@ -263,6 +278,15 @@ mod tests {
         SourceSnapshot::test_live(Some(data), SourceState::Ready, domain)
     }
 
+    /// Rows scanned live by this process: Git and metadata both live.
+    fn live_rows(board: Board) -> SourceSnapshot<Board> {
+        snapshot(board, Domain::Git).with_input(&SourceSnapshot::<()>::test_live(
+            None,
+            SourceState::Ready,
+            Domain::Metadata,
+        ))
+    }
+
     fn test_spec<T>(domain: Domain) -> SourceSpec<T> {
         SourceSpec {
             name: "test",
@@ -404,6 +428,36 @@ mod tests {
         assert_eq!(upstream_writer.requested().await, Some(()));
         assert_eq!(status_writer.requested().await, Some(()));
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    /// Restored rows are display data. When the live scan confirms the very
+    /// same rows, the dev lane is asked again so its skipped fetch runs.
+    #[tokio::test(start_paused = true)]
+    async fn confirming_unchanged_rows_requests_the_dev_fetch_again() {
+        let scope = TaskScope::new();
+        let (local, local_writer) = derived_channel(&scope, "test");
+        let (upstream, _upstream_writer) = derived_channel::<Board>(&scope, "test");
+        let (status, mut status_writer) = leaf_channel(&scope, test_spec(Domain::Dev));
+        local_writer.publish(SourceSnapshot::test_restored(board(), Domain::Git, 1));
+        let _output = project(&scope, local, upstream, status.view());
+        assert_eq!(status_writer.requested().await, Some(()));
+        local_writer.publish(live_rows(board()));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), status_writer.requested()).await,
+            Ok(Some(()))
+        );
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[test]
+    fn restored_rows_do_not_key_a_dev_fetch() {
+        let restored = SourceSnapshot::test_restored(board(), Domain::Git, 1);
+        assert!(confirmed_worktrees(&restored).is_none());
+        // Git alone going live is not enough: metadata names the rows too.
+        assert!(confirmed_worktrees(&snapshot(board(), Domain::Git)).is_none());
+        let rows = confirmed_worktrees(&live_rows(board())).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].slug, "one");
     }
 
     #[tokio::test(start_paused = true)]

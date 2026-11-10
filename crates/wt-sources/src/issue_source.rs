@@ -74,7 +74,8 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
                         observed,
                     )));
                 };
-                let statuses = read_with_fallback(&context, &command, &ids, &cancel).await?;
+                let statuses =
+                    read_with_fallback(&context, &command, &ids, READ_TIMEOUT, &cancel).await?;
                 Ok(Some(Fetched::new(StatusBatch { statuses, ids }, observed)))
             }
         }
@@ -102,35 +103,34 @@ fn ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Vec<String> {
 /// The id set, only when the rows it comes from were scanned live by this
 /// process. `None` while Git or metadata is restored or missing.
 fn confirmed_ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Option<Vec<String>> {
-    let live = |domain| {
-        board
-            .domains()
-            .get(&domain)
-            .is_some_and(|meta| meta.is_live())
-    };
-    (board.data().is_some() && live(Domain::Git) && live(Domain::Metadata))
-        .then(|| ids(board, prefix))
+    crate::sources::rows_confirmed(board).then(|| ids(board, prefix))
 }
+
+/// Bound on one run of the status command.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Read every status in one batch. A tracker may refuse a whole batch over
 /// one id it cannot resolve; statuses are display-only, so the rest are then
-/// read one at a time and only that row stays blank.
+/// read one at a time and only that row stays blank. A run that does not
+/// complete ends the pass.
 async fn read_with_fallback(
     context: &AppContext,
     command: &[String],
     ids: &[String],
+    timeout: Duration,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
-    let batch = match read_statuses(context, command, ids, cancel).await {
+    let batch = match read_statuses(context, command, ids, timeout, cancel).await {
         Ok(statuses) => return Ok(statuses),
-        Err(error) if ids.len() > 1 && !cancel.is_cancelled() => error,
+        Err(error) if ids.len() > 1 && !cancel.is_cancelled() && !incomplete(&error) => error,
         Err(error) => return Err(error),
     };
     let mut statuses = BTreeMap::new();
     for id in ids {
-        match read_statuses(context, command, std::slice::from_ref(id), cancel).await {
+        match read_statuses(context, command, std::slice::from_ref(id), timeout, cancel).await {
             Ok(one) => statuses.extend(one),
             Err(_) if cancel.is_cancelled() => return Err(batch),
+            Err(error) if incomplete(&error) => return Err(error),
             Err(error) => tracing::warn!(
                 issue = %id,
                 error = %format!("{error:#}"),
@@ -144,14 +144,23 @@ async fn read_with_fallback(
     Ok(statuses)
 }
 
+/// The status command did not run to completion (it could not start, hung
+/// past its timeout, or its output was cut off). That says nothing about any
+/// one id, so the pass fails as a whole instead of repeating it per id.
+fn incomplete(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<wt_platform::process::ProcessError>()
+        .is_some()
+}
+
 async fn read_statuses(
     context: &AppContext,
     command: &[String],
     ids: &[String],
+    timeout: Duration,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
-    let issues =
-        issue_tracker::read(context, command, ids, Duration::from_secs(30), cancel).await?;
+    let issues = issue_tracker::read(context, command, ids, timeout, cancel).await?;
     Ok(issues
         .into_iter()
         .map(|(id, issue)| (id, issue.status))
@@ -272,7 +281,7 @@ mod tests {
         let command = vec![script.to_string_lossy().into_owned(), "{ids}".into()];
         let ids = ["COZ-1".to_owned(), "COZ-2".into(), "COZ-3".into()];
         let cancel = tokio_util::sync::CancellationToken::new();
-        let statuses = read_with_fallback(&fixture.ctx, &command, &ids, &cancel)
+        let statuses = read_with_fallback(&fixture.ctx, &command, &ids, READ_TIMEOUT, &cancel)
             .await
             .unwrap();
         assert_eq!(
@@ -282,10 +291,39 @@ mod tests {
         // With nothing readable, the batch error stands.
         let only_bad = ["COZ-2".to_owned()];
         assert!(
-            read_with_fallback(&fixture.ctx, &command, &only_bad, &cancel)
+            read_with_fallback(&fixture.ctx, &command, &only_bad, READ_TIMEOUT, &cancel)
                 .await
                 .is_err()
         );
+        fixture.close().await.unwrap();
+    }
+
+    /// A tracker that hangs is not one unresolvable id: the pass fails on
+    /// the first run that does not complete instead of timing out once per id.
+    #[tokio::test]
+    async fn a_hung_tracker_fails_the_pass_after_one_run() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let script = fixture.ctx.config.paths.main_clone.join("hung.sh");
+        let runs = fixture.ctx.config.paths.main_clone.join("runs");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho run >> {runs:?}\nexec sleep 30\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let command = vec![script.to_string_lossy().into_owned(), "{ids}".into()];
+        let ids = ["COZ-1".to_owned(), "COZ-2".into(), "COZ-3".into()];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let timeout = Duration::from_millis(300);
+        assert!(
+            read_with_fallback(&fixture.ctx, &command, &ids, timeout, &cancel)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
         fixture.close().await.unwrap();
     }
 

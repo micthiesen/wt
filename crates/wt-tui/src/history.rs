@@ -130,6 +130,7 @@ impl Model {
             },
             KeyCode::Char('a' | 'A') if control => UiAction::ToggleRemovedAutomations {
                 key: row.key.clone(),
+                seen: Some(crate::Seen(row.automations_paused)),
             },
             KeyCode::Char('p') => match &row.pr_url {
                 Some(url) => UiAction::OpenPrDefault { url: url.clone() },
@@ -639,7 +640,10 @@ mod tests {
         );
         assert_eq!(
             model.history_input(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL), 20),
-            InputResult::Action(UiAction::ToggleRemovedAutomations { key })
+            InputResult::Action(UiAction::ToggleRemovedAutomations {
+                key,
+                seen: Some(crate::Seen(false)),
+            })
         );
         assert_eq!(
             model.history_input(KeyEvent::from(KeyCode::Esc), 20),

@@ -184,7 +184,13 @@ async fn native_candidate_for_platform(
     let state = tokio::task::spawn_blocking(move || store.load())
         .await
         .context("join native release identity read")??;
+    // A tmux server keeps the launcher identity of the build that started
+    // it, so a tag is the launcher's word only next to this build's ID.
     let launcher_release = std::env::var_os(wt_launcher::INSTALL_VERSION_ENV)
+        .filter(|_| {
+            std::env::var_os(wt_launcher::BUILD_ID_ENV)
+                .is_some_and(|build| build == wt_app_core::build_info::build_id())
+        })
         .map(|value| {
             value.into_string().map_err(|_| {
                 anyhow::anyhow!(

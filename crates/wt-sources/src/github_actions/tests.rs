@@ -374,3 +374,78 @@ async fn covered_absence_is_no_pr_but_cannot_match_a_visible_pr_pin() {
     assert!(!fake.calls.exists());
     fake.fixture.close().await.unwrap();
 }
+
+/// The text of attention events logged on this thread.
+struct AttentionLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for AttentionLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        #[derive(Default)]
+        struct Fields {
+            attention: bool,
+            text: Option<String>,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                match field.name() {
+                    "event_channel" => self.attention = format!("{value:?}").contains("attention"),
+                    "event_text" => self.text = Some(format!("{value:?}")),
+                    _ => {}
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if let (true, Some(text)) = (fields.attention, fields.text) {
+            self.0.lock().unwrap().push(text);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// "Will arm when checks report" is a promise held only by the retry owner.
+/// Quitting while it waits must say which PR was left unarmed.
+#[cfg(unix)]
+#[tokio::test]
+async fn quitting_while_an_arm_waits_for_checks_names_the_pr_in_attention() {
+    let fake = fake_gh().await;
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _log = tracing::subscriber::set_default(AttentionLog(lines.clone()));
+    let scope = TaskScope::new();
+    let retries = Retries::start(
+        &scope,
+        fake.actions.client.clone(),
+        WriteLedger::new(GithubRefresh::detached()),
+    );
+    let target = merge_target(&pr("feature/one"), &MergeLanding::default()).unwrap();
+    assert_eq!(
+        retries
+            .start_arm(target, "feature/one".into(), "one".into())
+            .await
+            .unwrap(),
+        RetryStart::Started
+    );
+    scope
+        .shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    let lines = lines.lock().unwrap().clone();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("#7") && line.contains("not armed")),
+        "{lines:?}"
+    );
+    // Nothing was sent: the first retry was still 30 seconds away.
+    assert!(!fake.calls.exists());
+    fake.fixture.close().await.unwrap();
+}

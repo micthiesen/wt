@@ -5,6 +5,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -89,9 +90,45 @@ fn snapshot_channel<T>(
     watch::channel(initial)
 }
 
+/// Why a source was asked to fetch, weakest first. Requests that coalesce
+/// into one fetch merge to the strongest, so a hint that shares a fetch with a
+/// refresh never weakens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Request {
+    /// Something the source watches may have changed; the fetch may find
+    /// nothing worth reading.
+    Recheck = 1,
+    /// Read again. What `refresh` asks for.
+    Refresh,
+    /// Read the origin itself, not an intermediate copy of it.
+    Direct,
+}
+
+/// The strongest request made of a source since its last fetch started.
+#[derive(Clone, Default)]
+struct Strongest(Arc<AtomicU8>);
+
+impl Strongest {
+    fn raise(&self, request: Request) {
+        self.0.fetch_max(request as u8, Ordering::AcqRel);
+    }
+
+    /// Nothing recorded means the request that woke this fetch was already
+    /// taken, at full strength, by the fetch before it.
+    fn take(&self) -> Request {
+        match self.0.swap(0, Ordering::AcqRel) {
+            3.. => Request::Direct,
+            2 => Request::Refresh,
+            _ => Request::Recheck,
+        }
+    }
+}
+
 /// Display access to a source. It has no way to produce a `Confirmed` value.
 pub struct SourceHandle<T> {
     requests: mpsc::Sender<()>,
+    strongest: Strongest,
     snapshots: watch::Receiver<SourceSnapshot<T>>,
 }
 
@@ -99,6 +136,7 @@ impl<T> Clone for SourceHandle<T> {
     fn clone(&self) -> Self {
         Self {
             requests: self.requests.clone(),
+            strongest: self.strongest.clone(),
             snapshots: self.snapshots.clone(),
         }
     }
@@ -108,6 +146,14 @@ impl<T> SourceHandle<T> {
     /// Mark the source dirty. Full means a refresh is already queued, not an
     /// error. This queue carries invalidations, never commands or writes.
     pub fn refresh(&self) -> bool {
+        self.request(Request::Refresh)
+    }
+
+    /// `refresh` with its reason, for a source whose fetch distinguishes them
+    /// (`start_requested_source`).
+    pub fn request(&self, request: Request) -> bool {
+        // Recorded before the wake-up, so a fetch never runs without it.
+        self.strongest.raise(request);
         match self.requests.try_send(()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(())) => true,
             Err(mpsc::error::TrySendError::Closed(())) => false,
@@ -128,6 +174,7 @@ impl<T> SourceHandle<T> {
         let (_, snapshots) = snapshot_channel(snapshot);
         Self {
             requests,
+            strongest: Strongest::default(),
             snapshots,
         }
     }
@@ -323,6 +370,7 @@ pub fn derived_channel<T>(
     (
         SourceHandle {
             requests,
+            strongest: Strongest::default(),
             snapshots,
         },
         DerivedPublisher {
@@ -350,6 +398,7 @@ pub fn leaf_channel<T: Send + Sync + 'static>(
         LeafHandle {
             handle: SourceHandle {
                 requests,
+                strongest: Strongest::default(),
                 snapshots,
             },
             domain,
@@ -574,8 +623,25 @@ where
     F: FnMut(CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Option<Fetched<T>>, E>> + Send + 'static,
 {
+    start_requested_source(scope, spec, move |_, token| fetch(token))
+}
+
+/// Like `start_skippable_source`, but the fetch is told the strongest reason
+/// among the requests it serves.
+pub fn start_requested_source<T, E, F, Fut>(
+    scope: &TaskScope,
+    spec: SourceSpec<T>,
+    mut fetch: F,
+) -> LeafHandle<T>
+where
+    T: Send + Sync + 'static,
+    E: Display + Send + 'static,
+    F: FnMut(Request, CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Option<Fetched<T>>, E>> + Send + 'static,
+{
     let policy = spec.policy;
     let (handle, mut publisher) = leaf_channel(scope, spec);
+    let strongest = handle.strongest.clone();
     let token = scope.token();
     scope.spawn(async move {
         let mut last_start = None::<Instant>;
@@ -596,12 +662,14 @@ where
             // Events before the fetch are included in it. Do not carry them
             // forward as a spurious extra refresh.
             while publisher.requests.try_recv().is_ok() {}
+            let request = strongest.take();
             let previous = publisher.sender.borrow().state().clone();
             let started = Instant::now();
             // Include the factory call inside the protected future: it can
             // panic before producing its future. Keep this lane alive and its
             // last good data visible so the next invalidation can recover.
-            let work = AssertUnwindSafe(async { fetch(token.child_token()).await }).catch_unwind();
+            let work = AssertUnwindSafe(async { fetch(request, token.child_token()).await })
+                .catch_unwind();
             tokio::pin!(work);
             // Only a fetch that takes a while reads as refreshing; a quick
             // fetch or a skip publishes nothing until it has a result.

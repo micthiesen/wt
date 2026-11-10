@@ -60,7 +60,7 @@ pub async fn move_row(
         bail!("Restore the archived row before moving it to a section");
     }
     // Fail before recording the write when the menu is already out of date;
-    // the same check repeats inside the write's own database call.
+    // the same check repeats inside the write's own transaction.
     check_section_witness(&state, &row.key, seen.as_ref())?;
     let destination = section
         .map(|name| {
@@ -104,8 +104,9 @@ pub async fn move_row(
     let changed = ctx
         .database
         .call(move |store| {
-            check_section_witness(&store.read_wt_state()?, &witness_key, seen.as_ref())?;
-            Ok(store.move_worktrees_to_section(&moving, to.as_deref())?)
+            store.move_worktrees_to_section_checked(&moving, to.as_deref(), |state| {
+                check_section_witness(state, &witness_key, seen.as_ref())
+            })?
         })
         .await?;
     tracing::info!(slugs = ?changed, section = ?destination, "moved worktrees to section");
@@ -387,25 +388,26 @@ pub async fn delete(
     let moved = ctx
         .database
         .call(move |store| {
-            let state = store.read_wt_state()?;
-            let mut current = movable
-                .into_iter()
-                .filter(|key| stored_section(&state, key).as_deref() == Some(name.as_str()))
-                .collect::<Vec<_>>();
-            current.sort();
-            if current != seen.0 {
-                return Err(stale(&name));
-            }
-            // Every row filed here (archived and remote too) lands in the
-            // Inbox; none of those moves is news to the user who deleted it.
-            let members = ["slugs", "remoteLayouts"]
-                .into_iter()
-                .filter_map(|collection| state[collection].as_object())
-                .flatten()
-                .filter(|(_, entry)| entry["section"].as_str() == Some(name.as_str()))
-                .map(|(key, _)| key.clone());
-            writes.record(members, None);
-            Ok(store.remove_section(&name)?)
+            store.remove_section_checked(&name, |state| {
+                let mut current = movable
+                    .into_iter()
+                    .filter(|key| stored_section(state, key).as_deref() == Some(name.as_str()))
+                    .collect::<Vec<_>>();
+                current.sort();
+                if current != seen.0 {
+                    return Err(stale(&name));
+                }
+                // Every row filed here (archived and remote too) lands in the
+                // Inbox; none of those moves is news to the user who deleted it.
+                let members = ["slugs", "remoteLayouts"]
+                    .into_iter()
+                    .filter_map(|collection| state[collection].as_object())
+                    .flatten()
+                    .filter(|(_, entry)| entry["section"].as_str() == Some(name.as_str()))
+                    .map(|(key, _)| key.clone());
+                writes.record(members, None);
+                Ok(())
+            })?
         })
         .await?;
     tracing::info!(%section, moved, "deleted section");

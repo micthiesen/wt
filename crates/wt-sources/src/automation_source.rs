@@ -124,7 +124,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let ledger = AutomationLedger::new(context.config.paths.cache_root.join("automations.json"));
         let mut engine = AutomationEngine::new(ledger, token.clone());
         let delivered = match wt_app_core::actions::service(&context) {
-            Ok(service) => match service.list_runs(500).await {
+            Ok(service) => match service.list_runs_bounded(500).await {
                 Ok(runs) => runs.into_iter().flat_map(|run| run.meta.auto_fire_keys).collect::<BTreeSet<_>>(),
                 Err(error) => { tracing::warn!(%error, "cannot inspect prior action runs during automation startup"); BTreeSet::new() }
             },

@@ -21,8 +21,8 @@ pub use snapshot::{
     merge_domains, settling, stamps_advanced,
 };
 pub use source::{
-    DerivedPublisher, Fetched, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, SourceHandle,
-    SourceInfo, SourceKind, SourceSpec, derived_channel, leaf_channel, start_observed_source,
-    start_skippable_source, start_source,
+    DerivedPublisher, Fetched, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, Request,
+    SourceHandle, SourceInfo, SourceKind, SourceSpec, derived_channel, leaf_channel,
+    start_observed_source, start_requested_source, start_skippable_source, start_source,
 };
 pub use stamp::Stamp;

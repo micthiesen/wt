@@ -255,6 +255,7 @@ struct CreateProgress {
 /// an owed post-merge check, so neither a failed attempt nor a restore drops
 /// the stack anchor or an obligation.
 struct PriorSlugState {
+    entry: Option<Value>,
     base: Option<(String, Option<String>)>,
     work: Option<wt_store::WorkStatusRecord>,
     removed: Option<RemovedWorktree>,
@@ -480,6 +481,11 @@ impl LifecycleService {
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
         let path = root.join(slug);
         self.ensure_managed_path(&path, &root)?;
+        if let Some(other) = session_name_collision(&root, slug) {
+            return Err(LifecycleError::Refused(format!(
+                "slug {slug:?} would share tmux session names with worktree {other:?}; choose another slug"
+            )));
+        }
         if fs::try_exists(&path)
             .await
             .map_err(|source| LifecycleError::Io {
@@ -665,7 +671,12 @@ impl LifecycleService {
                     Some(prior) => {
                         let slug = slug.to_owned();
                         self.mutate_store(&CancellationToken::new(), move |store| {
-                            restore_slug_record(store, &slug, prior.base, prior.work, prior.removed)
+                            // Nothing was created, so the whole record
+                            // returns: title, section and issue too.
+                            if let Some(entry) = prior.entry {
+                                store.restore_slug_state(&slug, entry)?;
+                            }
+                            restore_slug_record(store, &slug, None, None, prior.removed)
                         })
                         .await
                     }
@@ -840,7 +851,7 @@ impl LifecycleService {
                 branch: row.target.branch.clone(),
                 head: String::new(),
                 digest: MISSING_CHECKOUT_DIGEST.into(),
-                hazards: vec![MISSING_CHECKOUT_HAZARD.into()],
+                hazards: self.missing_checkout_hazards(&row, cancellation).await?,
                 published_base: None,
             });
         }
@@ -863,9 +874,11 @@ impl LifecycleService {
             let hazards = self
                 .collect_removal_hazards(row, landed, cancellation)
                 .await?;
-            let mut after = self.capture_revision_for_row(row, cancellation).await?;
+            let mut after = self
+                .capture_revision_like(row, &before, cancellation)
+                .await?;
             if before == after {
-                after.hazards = hazards;
+                after.hazards = with_capture_hazards(hazards, &after);
                 return Ok(after);
             }
         }
@@ -1088,29 +1101,20 @@ impl LifecycleService {
                         // Revalidate immediately before the external destructive
                         // operation. Hooks above may have changed the checkout
                         // since the user's confirmation was captured.
-                        if let Some(expected) = verified_revision.as_ref() {
-                            self.verify_removal_revision(
-                                &row,
-                                options.landed || cleanup,
-                                expected,
-                                cancellation,
-                            )
-                            .await?;
-                        }
-                        let before_sst = if verified_revision.is_some() {
-                            let snapshot =
-                                self.capture_revision_for_row(&row, cancellation).await?;
-                            if let Some(expected) = verified_revision.as_ref()
-                                && !same_checkout_revision(&snapshot, expected)
-                            {
-                                return Err(LifecycleError::Refused(
-                                    "checkout changed before SST removal; review the new state before removing".into(),
-                                ));
-                            }
+                        let before_sst = if let Some(expected) = verified_revision.as_ref() {
+                            let snapshot = self
+                                .verify_removal_revision(
+                                    &row,
+                                    options.landed || cleanup,
+                                    expected,
+                                    cancellation,
+                                )
+                                .await?;
                             let outside = self
                                 .capture_revision_for_row_excluding(
                                     &row,
                                     &self.config.auto_regen_paths,
+                                    hashes_untracked(expected),
                                     cancellation,
                                 )
                                 .await?;
@@ -1268,8 +1272,23 @@ impl LifecycleService {
         } else if backend == BackendKind::Rift && !row.target.branch.is_empty() {
             deleted_branch = true;
         }
-        if deleted_branch
+        // An unmerged parent that origin still carries keeps its children:
+        // moving them to its base would make the next restack drop its
+        // commits from under them and retarget their PRs.
+        let release_children = deleted_branch
             && !row.target.branch.is_empty()
+            && (options.landed
+                || match self
+                    .stack_parent_gone(main, &row.target.branch, &durable_write)
+                    .await
+                {
+                    Ok(gone) => gone,
+                    Err(error) => {
+                        warnings.push(format!("check stack parent refs: {error}"));
+                        false
+                    }
+                });
+        if release_children
             && let Err(error) = self
                 .mutate_store(&durable_write, {
                     let branch = row.target.branch.clone();
@@ -1318,6 +1337,20 @@ impl LifecycleService {
         }
     }
 
+    async fn stack_parent_gone(
+        &self,
+        main: &Path,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, LifecycleError> {
+        for reference in wt_vcs::stack_parent_refs(branch) {
+            if self.ref_exists(main, &reference, cancellation).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Finish removing a worktree whose checkout is already gone (Git lists
     /// it as prunable). Nothing in the checkout can be lost, so this only
     /// stops what still runs for it, prunes Git's registration and records
@@ -1332,11 +1365,24 @@ impl LifecycleService {
         lock: &FileLock,
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
-        if expected_revision.is_some_and(|expected| expected.digest != MISSING_CHECKOUT_DIGEST) {
+        let hazards = self.missing_checkout_hazards(row, cancellation).await?;
+        if expected_revision.is_some_and(|expected| {
+            expected.digest != MISSING_CHECKOUT_DIGEST || expected.hazards != hazards
+        }) {
             return Err(LifecycleError::Refused(
-                "checkout changed after the removal warning; review the new state before removing"
+                "checkout or removal hazards changed after the warning; review the new state before removing"
                     .into(),
             ));
+        }
+        if !options.force
+            && hazards
+                .iter()
+                .any(|hazard| hazard == OWED_VERIFICATION_HAZARD)
+        {
+            return Err(LifecycleError::Refused(format!(
+                "{}: {OWED_VERIFICATION_HAZARD}; explicit force is required",
+                row.target.slug()
+            )));
         }
         if options.delete_branch && !options.force {
             return Err(LifecycleError::Refused(format!(
@@ -1715,6 +1761,7 @@ impl LifecycleService {
                         .map(str::to_owned)
                 };
                 let prior = PriorSlugState {
+                    entry: entry.clone(),
                     base: field("baseBranch").map(|branch| (branch, field("baseSha"))),
                     work: entry
                         .as_ref()
@@ -2545,12 +2592,26 @@ impl LifecycleService {
             })
     }
 
+    /// Capture the checkout's revision. Its `hazards` hold only what the
+    /// capture itself found (untracked content it could not hash); callers
+    /// join them to the collected hazards with `with_capture_hazards`.
     async fn capture_revision_for_row(
         &self,
         row: &WorktreeRecord,
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
-        self.capture_revision_for_row_excluding(row, &[], cancellation)
+        self.capture_revision_for_row_excluding(row, &[], true, cancellation)
+            .await
+    }
+
+    /// Capture the way `expected` was captured, for comparing against it.
+    async fn capture_revision_like(
+        &self,
+        row: &WorktreeRecord,
+        expected: &RemovalRevision,
+        cancellation: &CancellationToken,
+    ) -> Result<RemovalRevision, LifecycleError> {
+        self.capture_revision_for_row_excluding(row, &[], hashes_untracked(expected), cancellation)
             .await
     }
 
@@ -2558,6 +2619,7 @@ impl LifecycleService {
         &self,
         row: &WorktreeRecord,
         excluded_paths: &[String],
+        hash_untracked: bool,
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
         let path = Path::new(&row.target.path);
@@ -2613,8 +2675,13 @@ impl LifecycleService {
             .stdout;
         let checkout = PathBuf::from(&row.target.path);
         let snapshot_cancellation = cancellation.clone();
-        let metadata = tokio::task::spawn_blocking(move || {
-            untracked_metadata(&checkout, &untracked, &snapshot_cancellation)
+        let untracked = tokio::task::spawn_blocking(move || {
+            untracked_metadata(
+                &checkout,
+                &untracked,
+                hash_untracked.then_some(UNTRACKED_HASH_BUDGET),
+                &snapshot_cancellation,
+            )
         })
         .await
         .map_err(|error| LifecycleError::Join(error.to_string()))?
@@ -2631,18 +2698,27 @@ impl LifecycleService {
             status.as_slice(),
             worktree_diff.as_slice(),
             index_diff.as_slice(),
-            &metadata,
+            &untracked.metadata,
         ] {
             digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
+        let digest = digest.finalize();
         Ok(RemovalRevision {
             key: wt_core::worktree_target_key(&row.target),
             path: row.target.path.clone(),
             branch: row.target.branch.clone(),
             head,
-            digest: format!("{:x}", digest.finalize()),
-            hazards: Vec::new(),
+            digest: if untracked.stat_only {
+                format!("{STAT_ONLY_DIGEST_PREFIX}{digest:x}")
+            } else {
+                format!("{digest:x}")
+            },
+            hazards: if untracked.unhashed {
+                vec![UNHASHED_UNTRACKED_HAZARD.to_owned()]
+            } else {
+                Vec::new()
+            },
             published_base: None,
         })
     }
@@ -2667,8 +2743,9 @@ impl LifecycleService {
             ));
         }
 
+        let hash = hashes_untracked(expected);
         let after_outside = self
-            .capture_revision_for_row_excluding(row, allowed, cancellation)
+            .capture_revision_for_row_excluding(row, allowed, hash, cancellation)
             .await?;
         if !same_checkout_revision(&after_outside, before_outside) {
             return Err(LifecycleError::Refused(
@@ -2678,6 +2755,10 @@ impl LifecycleService {
         let hazards = self
             .collect_removal_hazards(row, landed, cancellation)
             .await?;
+        let full = self
+            .capture_revision_like(row, expected, cancellation)
+            .await?;
+        let hazards = with_capture_hazards(hazards, &full);
         if removal_hazards_without_checkout_dirty(&hazards)
             != removal_hazards_without_checkout_dirty(&expected.hazards)
         {
@@ -2687,9 +2768,8 @@ impl LifecycleService {
             ));
         }
 
-        let full = self.capture_revision_for_row(row, cancellation).await?;
         let after_full_outside = self
-            .capture_revision_for_row_excluding(row, allowed, cancellation)
+            .capture_revision_for_row_excluding(row, allowed, hash, cancellation)
             .await?;
         if !same_checkout_revision(&after_full_outside, &after_outside) {
             return Err(LifecycleError::Refused(
@@ -2708,14 +2788,7 @@ impl LifecycleService {
         landed: bool,
         expected: &RemovalRevision,
         cancellation: &CancellationToken,
-    ) -> Result<(), LifecycleError> {
-        let before = self.capture_revision_for_row(row, cancellation).await?;
-        if !same_checkout_revision(&before, expected) {
-            return Err(LifecycleError::Refused(
-                "checkout changed after the removal warning; review the new state before removing"
-                    .into(),
-            ));
-        }
+    ) -> Result<RemovalRevision, LifecycleError> {
         if let Some((reference, tip)) = expected.published_base.as_deref() {
             if !reference.starts_with("refs/heads/")
                 || !matches!(tip.len(), 40 | 64)
@@ -2754,13 +2827,23 @@ impl LifecycleService {
         let hazards = self
             .collect_removal_hazards(row, landed, cancellation)
             .await?;
-        let after = self.capture_revision_for_row(row, cancellation).await?;
-        if hazards != expected.hazards || !same_checkout_revision(&after, expected) {
+        // One capture, taken after every other read: the state it pins is
+        // the latest one, and the hazards beside it were read no later.
+        let current = self
+            .capture_revision_like(row, expected, cancellation)
+            .await?;
+        if !same_checkout_revision(&current, expected) {
+            return Err(LifecycleError::Refused(
+                "checkout changed after the removal warning; review the new state before removing"
+                    .into(),
+            ));
+        }
+        if with_capture_hazards(hazards, &current) != expected.hazards {
             return Err(LifecycleError::Refused(
                 "checkout or removal hazards changed after the warning; review the new state before removing".into(),
             ));
         }
-        Ok(())
+        Ok(current)
     }
 
     async fn git_snapshot_output<const N: usize>(
@@ -2880,6 +2963,24 @@ impl LifecycleService {
         }
     }
 
+    /// The hazards of a registration whose checkout is gone. Nothing in the
+    /// checkout can be read, but an owed post-merge check lives in the store
+    /// and is dropped with the row all the same.
+    async fn missing_checkout_hazards(
+        &self,
+        row: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, LifecycleError> {
+        let state = self
+            .read_slug_state(row.target.slug(), cancellation)
+            .await?;
+        let mut hazards = vec![MISSING_CHECKOUT_HAZARD.to_owned()];
+        if owes_verification(state.as_ref()) {
+            hazards.push(OWED_VERIFICATION_HAZARD.to_owned());
+        }
+        Ok(hazards)
+    }
+
     async fn collect_removal_hazards(
         &self,
         row: &WorktreeRecord,
@@ -2898,17 +2999,8 @@ impl LifecycleService {
         }
         let slug = row.target.slug().to_owned();
         let state = self.read_slug_state(&slug, cancellation).await?;
-        let work = state.as_ref().and_then(|value| value.get("work"));
-        if work.is_some_and(|work| {
-            work.get("verifyAfterMerge")
-                .and_then(Value::as_str)
-                .is_some_and(|steps| !steps.trim().is_empty())
-                && !matches!(
-                    work.get("state").and_then(Value::as_str),
-                    Some("verified" | "dropped")
-                )
-        }) {
-            hazards.push("post-merge verification still owed".to_owned());
+        if owes_verification(state.as_ref()) {
+            hazards.push(OWED_VERIFICATION_HAZARD.to_owned());
         }
         // Landing evidence covers what was pushed and merged. Commits beyond
         // the branch's own origin ref exist only here, landed or not, so a
@@ -3108,6 +3200,32 @@ fn process_error(operation: &'static str, path: &Path, source: ProcessError) -> 
     }
 }
 
+/// Suffixes wt appends to a slug to name a worktree's tmux sessions.
+const SESSION_SUFFIXES: [&str; 7] = [
+    "-opencode",
+    "-codex",
+    "-pi",
+    "-action",
+    "-shell",
+    "-diff",
+    "-dev",
+];
+
+/// The existing worktree whose session names `slug` would collide with:
+/// tmux names are flat, so worktree `x-codex` is also `x`'s Codex slot, and
+/// stopping or recycling one would hit the other.
+fn session_name_collision(root: &Path, slug: &str) -> Option<String> {
+    SESSION_SUFFIXES.iter().find_map(|suffix| {
+        let shorter = slug.strip_suffix(suffix).filter(|rest| !rest.is_empty());
+        let longer = format!("{slug}{suffix}");
+        shorter
+            .map(str::to_owned)
+            .into_iter()
+            .chain([longer])
+            .find(|other| root.join(other).is_dir())
+    })
+}
+
 fn validate_slug(slug: &str) -> Result<(), LifecycleError> {
     if slug.is_empty()
         || slug == "."
@@ -3199,6 +3317,20 @@ fn exclusion_pathspecs(paths: &[String]) -> Result<Vec<OsString>, LifecycleError
     Ok(result)
 }
 
+fn owes_verification(state: Option<&Value>) -> bool {
+    state
+        .and_then(|value| value.get("work"))
+        .is_some_and(|work| {
+            work.get("verifyAfterMerge")
+                .and_then(Value::as_str)
+                .is_some_and(|steps| !steps.trim().is_empty())
+                && !matches!(
+                    work.get("state").and_then(Value::as_str),
+                    Some("verified" | "dropped")
+                )
+        })
+}
+
 fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
     hazards
         .iter()
@@ -3206,6 +3338,18 @@ fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
         .filter(|hazard| *hazard != UNCOMMITTED_HAZARD)
         .collect()
 }
+
+/// Join the hazards a capture found to the ones collected beside it.
+fn with_capture_hazards(mut hazards: Vec<String>, capture: &RemovalRevision) -> Vec<String> {
+    hazards.extend(capture.hazards.iter().cloned());
+    hazards
+}
+
+fn hashes_untracked(revision: &RemovalRevision) -> bool {
+    !revision.digest.starts_with(STAT_ONLY_DIGEST_PREFIX)
+}
+
+const UNTRACKED_HASH_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 enum UntrackedSnapshotError {
@@ -3220,39 +3364,72 @@ impl From<String> for UntrackedSnapshotError {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct UntrackedSnapshot {
+    metadata: Vec<u8>,
+    /// Some entry is pinned by name and stat data only.
+    unhashed: bool,
+    /// No file contents were read at all.
+    stat_only: bool,
+}
+
+/// Fingerprint the untracked set: every entry by name, size, mtime and mode,
+/// plus file contents and symlink targets. Contents are read only within
+/// `hash_budget` and `MAX_UNTRACKED_FILES`; past either, and with no budget,
+/// the whole set is pinned by stat data alone, so the result never depends
+/// on where the clock ran out. An entry that is neither a file nor a symlink
+/// (a nested repository, a socket, a FIFO) is always pinned that way.
 fn untracked_metadata(
     checkout: &Path,
     paths: &[u8],
+    hash_budget: Option<Duration>,
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>, UntrackedSnapshotError> {
-    use std::io::Read;
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
+) -> Result<UntrackedSnapshot, UntrackedSnapshotError> {
     let mut entries = paths
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .map(<[u8]>::to_vec)
         .collect::<Vec<_>>();
-    if entries.len() > MAX_UNTRACKED_FILES {
-        return Err(UntrackedSnapshotError::Unsafe(format!(
-            "more than {MAX_UNTRACKED_FILES} untracked paths"
-        )));
-    }
     entries.sort();
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let check_budget = || {
+    let deadline = hash_budget
+        .filter(|_| entries.len() <= MAX_UNTRACKED_FILES)
+        .map(|budget| std::time::Instant::now() + budget);
+    if deadline.is_some()
+        && let Some(snapshot) = untracked_entries(checkout, &entries, deadline, cancellation)?
+    {
+        return Ok(snapshot);
+    }
+    untracked_entries(checkout, &entries, None, cancellation)?
+        .ok_or_else(|| UntrackedSnapshotError::Unsafe("untracked snapshot timed out".into()))
+}
+
+/// One pass over the sorted entries, reading contents until `deadline` or
+/// not at all without one. `None` means the deadline passed.
+fn untracked_entries(
+    checkout: &Path,
+    entries: &[Vec<u8>],
+    deadline: Option<std::time::Instant>,
+    cancellation: &CancellationToken,
+) -> Result<Option<UntrackedSnapshot>, UntrackedSnapshotError> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    let cancelled = || {
         if cancellation.is_cancelled() {
             Err("untracked snapshot cancelled".to_owned())
-        } else if std::time::Instant::now() >= deadline {
-            Err("untracked snapshot timed out after 30 seconds".to_owned())
         } else {
             Ok(())
         }
     };
+    let out_of_time = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
     let mut result = Vec::new();
+    let mut unhashed = deadline.is_none();
     for relative in entries {
-        check_budget()?;
-        let relative_path = git_path_from_bytes(&relative)?;
+        cancelled()?;
+        if out_of_time() {
+            return Ok(None);
+        }
+        let relative_path = git_path_from_bytes(relative)?;
         if relative_path.is_absolute()
             || relative_path.components().any(|c| {
                 matches!(
@@ -3284,7 +3461,7 @@ fn untracked_metadata(
             .map_err(|_| format!("mtime predates Unix epoch: {}", full_path.display()))?
             .as_nanos();
         result.extend_from_slice(&(relative.len() as u64).to_be_bytes());
-        result.extend_from_slice(&relative);
+        result.extend_from_slice(relative);
         result.extend_from_slice(&metadata.len().to_be_bytes());
         result.extend_from_slice(&modified_ns.to_be_bytes());
         #[cfg(unix)]
@@ -3295,14 +3472,19 @@ fn untracked_metadata(
             let target = os_path_bytes(target.as_os_str());
             result.extend_from_slice(&(target.len() as u64).to_be_bytes());
             result.extend_from_slice(target);
-        } else if metadata.is_file() {
+        } else if !metadata.is_file() {
+            unhashed = true;
+        } else if deadline.is_some() {
             let mut file = std::fs::File::open(&full_path)
                 .map_err(|error| format!("read {}: {error}", full_path.display()))?;
             let mut digest = Sha256::new();
             let mut buffer = [0; 64 * 1024];
             let mut total = 0u64;
             loop {
-                check_budget()?;
+                cancelled()?;
+                if out_of_time() {
+                    return Ok(None);
+                }
                 let read = file
                     .read(&mut buffer)
                     .map_err(|error| format!("read {}: {error}", full_path.display()))?;
@@ -3320,14 +3502,13 @@ fn untracked_metadata(
             }
             let hash = digest.finalize();
             result.extend_from_slice(&hash);
-        } else {
-            return Err(UntrackedSnapshotError::Unsafe(format!(
-                "unsupported untracked file type: {}",
-                full_path.display()
-            )));
         }
     }
-    Ok(result)
+    Ok(Some(UntrackedSnapshot {
+        metadata: result,
+        unhashed,
+        stat_only: deadline.is_none(),
+    }))
 }
 
 #[cfg(unix)]
@@ -3644,6 +3825,15 @@ pub const IN_PROGRESS_HAZARD: &str = "a rebase, merge or cherry-pick is in progr
 /// branch could not be checked for unpushed commits.
 pub const MISSING_CHECKOUT_HAZARD: &str =
     "the checkout is already gone, so its branch was not checked for unpushed commits";
+const OWED_VERIFICATION_HAZARD: &str = "post-merge verification still owed";
+/// Removal hazard for untracked content the removal witness pins only by
+/// name and stat data: a nested repository, a socket or FIFO, or a set too
+/// large or too slow to hash.
+const UNHASHED_UNTRACKED_HAZARD: &str = "untracked files that could not be fully checked";
+/// Marks a revision digest whose untracked set was pinned without reading
+/// any file contents. Rechecks of such a witness skip hashing too, so they
+/// compare like with like and do not spend the hashing budget again.
+const STAT_ONLY_DIGEST_PREFIX: &str = "stat:";
 /// Revision digest that witnesses a plan made against a missing checkout.
 const MISSING_CHECKOUT_DIGEST: &str = "missing-checkout";
 
@@ -3657,6 +3847,7 @@ pub fn unpushed_hazard(count: u32) -> String {
 /// an obligation or an unknown that the confirm states on its own line.
 pub fn is_lost_work_hazard(hazard: &str) -> bool {
     hazard == UNCOMMITTED_HAZARD
+        || hazard == UNHASHED_UNTRACKED_HAZARD
         || hazard == IN_PROGRESS_HAZARD
         || hazard == MISSING_CHECKOUT_HAZARD
         || hazard.split_once(' ').is_some_and(|(count, rest)| {
@@ -4245,6 +4436,18 @@ mod tests {
         assert!(state.get("baseBranch").is_none(), "{state}");
     }
 
+    #[test]
+    fn a_slug_that_names_another_worktrees_session_is_a_collision() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("fix")).unwrap();
+        std::fs::create_dir(root.path().join("other-dev")).unwrap();
+        let collision = |slug| session_name_collision(root.path(), slug);
+        assert_eq!(collision("fix-codex"), Some("fix".into()));
+        assert_eq!(collision("other"), Some("other-dev".into()));
+        assert_eq!(collision("fix-codex-notes"), None);
+        assert_eq!(collision("-dev"), None);
+    }
+
     #[tokio::test]
     async fn failed_create_keeps_the_removed_row_and_its_slug_record() {
         let (_scratch, mut service, _runner, _main, root) = setup().await;
@@ -4260,6 +4463,7 @@ mod tests {
             .unwrap();
         service
             .mutate_store(&cancellation, |store| {
+                store.set_slug_issue_id("flaky", Some("COZ-1"))?;
                 store
                     .set_slug_work_status("flaky", Some(&owed_verification()))
                     .map(|_| ())
@@ -4308,9 +4512,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(after["baseBranch"], before["baseBranch"]);
-        assert_eq!(after["baseSha"], before["baseSha"]);
-        assert_eq!(after["work"], before["work"]);
+        assert_eq!(after, before);
     }
 
     #[tokio::test]
@@ -4874,7 +5076,13 @@ mod tests {
         std::fs::write(&path, &content).unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         let cancellation = CancellationToken::new();
-        let first = untracked_metadata(scratch.path(), b"large\0", &cancellation).unwrap();
+        let first = untracked_metadata(
+            scratch.path(),
+            b"large\0",
+            Some(UNTRACKED_HASH_BUDGET),
+            &cancellation,
+        )
+        .unwrap();
         content[PROCESS_OUTPUT_LIMIT + 1] = b'b';
         std::fs::write(&path, &content).unwrap();
         std::fs::File::options()
@@ -4883,15 +5091,26 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        let second = untracked_metadata(scratch.path(), b"large\0", &cancellation).unwrap();
+        let second = untracked_metadata(
+            scratch.path(),
+            b"large\0",
+            Some(UNTRACKED_HASH_BUDGET),
+            &cancellation,
+        )
+        .unwrap();
         assert_ne!(first, second);
         cancellation.cancel();
         assert!(matches!(
-            untracked_metadata(scratch.path(), b"large\0", &cancellation),
+            untracked_metadata(scratch.path(), b"large\0", Some(UNTRACKED_HASH_BUDGET), &cancellation),
             Err(UntrackedSnapshotError::Unsafe(message)) if message.contains("cancelled")
         ));
         assert!(matches!(
-            untracked_metadata(scratch.path(), b"vanished\0", &CancellationToken::new()),
+            untracked_metadata(
+                scratch.path(),
+                b"vanished\0",
+                Some(UNTRACKED_HASH_BUDGET),
+                &CancellationToken::new()
+            ),
             Err(UntrackedSnapshotError::Changed(_))
         ));
     }
@@ -5907,5 +6126,286 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_an_unmerged_parent_keeps_its_children_stacked_on_it() {
+        let (_scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let options = |base: &str| CreateOptions {
+            base: Some(base.into()),
+            fetch_origin: false,
+            run_install: false,
+        };
+        let remove = |landed| RemoveOptions {
+            force: true,
+            delete_branch: true,
+            landed,
+            ..RemoveOptions::default()
+        };
+        let base_of = |slug: &'static str| {
+            let service = service.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                service
+                    .read_slug_state(slug, &cancellation)
+                    .await
+                    .unwrap()
+                    .unwrap()["baseBranch"]
+                    .clone()
+            }
+        };
+        for (parent, child) in [("michael/pushed", "michael/onpushed")] {
+            let parent_target = service
+                .create(parent, options("refs/heads/main"), &cancellation)
+                .await
+                .unwrap();
+            service
+                .create(
+                    child,
+                    options(&format!("refs/heads/{parent}")),
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+            // The parent is pushed and unmerged: origin still carries it.
+            run(
+                &runner,
+                &main,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/{parent}"),
+                    &format!("refs/heads/{parent}"),
+                ],
+            )
+            .await;
+            let result = service
+                .remove(&parent_target.target, remove(false), &cancellation)
+                .await
+                .unwrap();
+            assert!(result.deleted_branch);
+        }
+        assert_eq!(base_of("onpushed").await, "michael/pushed");
+
+        // A landed parent, and one gone from origin too, still release their
+        // children to the parent's own base.
+        let landed = service
+            .create("michael/landed", options("refs/heads/main"), &cancellation)
+            .await
+            .unwrap();
+        service
+            .create(
+                "michael/onlanded",
+                options("refs/heads/michael/landed"),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        run(
+            &runner,
+            &main,
+            &[
+                "update-ref",
+                "refs/remotes/origin/michael/landed",
+                "refs/heads/michael/landed",
+            ],
+        )
+        .await;
+        service
+            .remove(&landed.target, remove(true), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(base_of("onlanded").await, "main");
+
+        let local = service
+            .create("michael/local", options("refs/heads/main"), &cancellation)
+            .await
+            .unwrap();
+        service
+            .create(
+                "michael/onlocal",
+                options("refs/heads/michael/local"),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        service
+            .remove(&local.target, remove(false), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(base_of("onlocal").await, "main");
+    }
+
+    #[tokio::test]
+    async fn missing_checkout_removal_keeps_owed_verification_as_a_hazard() {
+        let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let created = service
+            .create(
+                "michael/owed",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        service
+            .mutate_store(&cancellation, |store| {
+                store
+                    .set_slug_work_status("owed", Some(&owed_verification()))
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        fs::remove_dir_all(&created.target.path).await.unwrap();
+
+        let revision = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            revision.hazards,
+            [MISSING_CHECKOUT_HAZARD, OWED_VERIFICATION_HAZARD]
+        );
+        let unforced = service
+            .remove_with_revision(
+                &created.target,
+                RemoveOptions::default(),
+                &revision,
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(&unforced, Err(LifecycleError::Refused(message)) if message.contains(OWED_VERIFICATION_HAZARD)),
+            "{unforced:?}"
+        );
+
+        // A warning made before the obligation existed does not cover it.
+        let mut stale = revision.clone();
+        stale.hazards = vec![MISSING_CHECKOUT_HAZARD.into()];
+        let forced = RemoveOptions {
+            force: true,
+            ..RemoveOptions::default()
+        };
+        assert!(matches!(
+            service
+                .remove_with_revision(&created.target, forced.clone(), &stale, &cancellation)
+                .await,
+            Err(LifecycleError::Refused(message)) if message.contains("changed")
+        ));
+        let result = service
+            .remove_with_revision(&created.target, forced, &revision, &cancellation)
+            .await
+            .unwrap();
+        assert!(result.removed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unhashable_untracked_content_is_a_confirmed_hazard_not_a_dead_end() {
+        let (_scratch, service, runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let created = service
+            .create(
+                "michael/nested",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(&created.target.path);
+        run(&runner, &path, &["init", "-b", "main", "reference"]).await;
+        fs::write(path.join("reference/notes.txt"), "kept\n")
+            .await
+            .unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(path.join("dev.sock")).unwrap();
+
+        let revision = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            revision.hazards,
+            [UNCOMMITTED_HAZARD, UNHASHED_UNTRACKED_HAZARD]
+        );
+        assert!(is_lost_work_hazard(UNHASHED_UNTRACKED_HAZARD));
+        let force = |force| RemoveOptions {
+            force,
+            delete_branch: true,
+            ..RemoveOptions::default()
+        };
+        assert!(matches!(
+            service
+                .remove_with_revision(&created.target, force(false), &revision, &cancellation)
+                .await,
+            Err(LifecycleError::Refused(message)) if message.contains("explicit force is required")
+        ));
+        assert!(path.exists());
+
+        // What can be hashed still pins the witness.
+        fs::write(path.join("scratch.txt"), "one\n").await.unwrap();
+        let with_file = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_ne!(with_file.digest, revision.digest);
+        fs::write(path.join("scratch.txt"), "two\n").await.unwrap();
+        assert!(matches!(
+            service
+                .remove_with_revision(&created.target, force(true), &with_file, &cancellation)
+                .await,
+            Err(LifecycleError::Refused(message)) if message.contains("changed")
+        ));
+        assert!(path.exists());
+
+        let current = service
+            .removal_revision(&created.target, false, &cancellation)
+            .await
+            .unwrap();
+        let result = service
+            .remove_with_revision(&created.target, force(true), &current, &cancellation)
+            .await
+            .unwrap();
+        assert!(result.removed);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn untracked_snapshot_over_its_limits_pins_names_and_stat_data() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut listing = Vec::new();
+        for index in 0..=MAX_UNTRACKED_FILES {
+            let name = format!("file-{index:05}");
+            std::fs::write(scratch.path().join(&name), "x").unwrap();
+            listing.extend_from_slice(name.as_bytes());
+            listing.push(0);
+        }
+        let cancellation = CancellationToken::new();
+        let snapshot = |listing: &[u8], deadline| {
+            untracked_metadata(scratch.path(), listing, deadline, &cancellation).unwrap()
+        };
+        let hashing = Some(Duration::from_secs(30));
+        let first = snapshot(&listing, hashing);
+        assert!(first.unhashed);
+        assert_eq!(first, snapshot(&listing, hashing));
+        std::fs::write(scratch.path().join("file-00007"), "longer").unwrap();
+        assert_ne!(first, snapshot(&listing, hashing));
+
+        // Under the count limit a spent time budget degrades the same way,
+        // and a witness made that way is rechecked without hashing again.
+        let few = b"file-00001\0file-00002\0";
+        let hashed = snapshot(few, hashing);
+        assert!(!hashed.unhashed);
+        let timed_out = snapshot(few, Some(Duration::ZERO));
+        assert!(timed_out.unhashed);
+        assert_eq!(timed_out, snapshot(few, None));
+        assert_ne!(timed_out.metadata, hashed.metadata);
     }
 }

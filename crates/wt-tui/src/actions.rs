@@ -60,6 +60,10 @@ pub enum UiAction {
     },
     ToggleRemovedAutomations {
         key: String,
+        /// Whether the history row showed automations paused; a mismatch
+        /// refuses the toggle instead of flipping it the other way.
+        #[serde(default)]
+        seen: Option<Seen<bool>>,
     },
     OpenLink {
         url: String,

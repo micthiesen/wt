@@ -694,22 +694,21 @@ impl ActionService {
         slug: &str,
         cancellation: &CancellationToken,
     ) -> Result<bool, ActionServiceError> {
-        let Some(run) = self.list_runs(usize::MAX).await?.into_iter().find(|run| {
-            run.meta.slug == slug
+        let Some((meta, _)) = self.run_metas().await?.into_iter().find(|(meta, _)| {
+            meta.slug == slug
                 && matches!(
-                    run.meta.status,
+                    meta.status,
                     ActionRunStatus::Running | ActionRunStatus::Ambiguous
                 )
         }) else {
             return Ok(false);
         };
-        let action_key = if run.meta.action_key.is_empty() {
-            run.meta.slug.as_str()
+        let action_key = if meta.action_key.is_empty() {
+            meta.slug.as_str()
         } else {
-            run.meta.action_key.as_str()
+            meta.action_key.as_str()
         };
-        self.kill_run(action_key, &run.meta.run_id, cancellation)
-            .await
+        self.kill_run(action_key, &meta.run_id, cancellation).await
     }
 
     /// Kill only the exact active run the caller confirmed. A replacement run
@@ -722,28 +721,28 @@ impl ActionService {
         cancellation: &CancellationToken,
     ) -> Result<bool, ActionServiceError> {
         validate_run_id(expected_run_id)?;
-        let Some(candidate) = self
-            .list_runs(usize::MAX)
-            .await?
-            .into_iter()
-            .find(|run| run.meta.run_id == expected_run_id)
-        else {
+        // The run id is its directory name, so the archive is not scanned.
+        let run_dir = self.config.log_dir.join("actions").join(expected_run_id);
+        let Ok(candidate) = read_json::<ActionMeta>(&run_dir.join("meta.json")).await else {
             return Ok(false);
         };
-        let candidate_key = if candidate.meta.action_key.is_empty() {
-            candidate.meta.slug.as_str()
+        if candidate.version != 1 || candidate.run_id != expected_run_id {
+            return Ok(false);
+        }
+        let candidate_key = if candidate.action_key.is_empty() {
+            candidate.slug.as_str()
         } else {
-            candidate.meta.action_key.as_str()
+            candidate.action_key.as_str()
         };
         if candidate_key != action_key
             || !matches!(
-                candidate.meta.status,
+                candidate.status,
                 ActionRunStatus::Running | ActionRunStatus::Ambiguous
             )
         {
             return Ok(false);
         }
-        let identity = scoped_identity(&self.config.log_dir, &candidate.meta.slug);
+        let identity = scoped_identity(&self.config.log_dir, &candidate.slug);
         let lock_key = format!("action-{:016x}", stable_hash(&identity));
         let _lock = FileLock::acquire(
             &self.config.lock_dir,
@@ -753,21 +752,21 @@ impl ActionService {
         )
         .await?;
         let latest_for_slot = self
-            .list_runs(usize::MAX)
+            .run_metas()
             .await?
             .into_iter()
-            .filter(|run| run.meta.slug == candidate.meta.slug)
+            .map(|(meta, _)| meta)
+            .filter(|meta| meta.slug == candidate.slug)
             .max_by(|left, right| {
-                left.meta
-                    .started_at
-                    .cmp(&right.meta.started_at)
-                    .then_with(|| left.meta.run_id.cmp(&right.meta.run_id))
+                left.started_at
+                    .cmp(&right.started_at)
+                    .then_with(|| left.run_id.cmp(&right.run_id))
             });
         let current_run = latest_for_slot
             .as_ref()
-            .is_some_and(|latest| latest.meta.run_id == expected_run_id);
+            .is_some_and(|latest| latest.run_id == expected_run_id);
         let _state_lock = self.state_lock(expected_run_id).await?;
-        let mut meta: ActionMeta = read_json(&candidate.run_dir.join("meta.json")).await?;
+        let mut meta: ActionMeta = read_json(&run_dir.join("meta.json")).await?;
         let meta_key = if meta.action_key.is_empty() {
             meta.slug.as_str()
         } else {
@@ -785,7 +784,7 @@ impl ActionService {
         meta.status = ActionRunStatus::Killed;
         meta.ended_at = Some(now_ms());
         meta.extra.insert("error".into(), "killed by user".into());
-        write_json_atomic(&candidate.run_dir.join("meta.json"), &meta).await?;
+        write_json_atomic(&run_dir.join("meta.json"), &meta).await?;
 
         // An orphaned older run may still have ambiguous/running metadata.
         // Tombstone that exact run so a delayed worker refuses to execute,
@@ -795,7 +794,7 @@ impl ActionService {
         }
 
         let session = action_session_name(&identity);
-        let legacy_session = format!("{}-action", candidate.meta.slug);
+        let legacy_session = format!("{}-action", candidate.slug);
         for session in [session, legacy_session] {
             if self
                 .config
@@ -871,30 +870,7 @@ impl ActionService {
         &self,
         terminal_limit: usize,
     ) -> Result<Vec<ActionRun>, ActionServiceError> {
-        let root = self.config.log_dir.join("actions");
-        let mut dirs = match fs::read_dir(&root).await {
-            Ok(dirs) => dirs,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(io_error("list action runs", &root, source)),
-        };
-        let mut records = Vec::new();
-        while let Some(entry) = dirs
-            .next_entry()
-            .await
-            .map_err(|source| io_error("read action run entry", &root, source))?
-        {
-            if !entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let run_dir = entry.path();
-            let Ok(meta) = read_json::<ActionMeta>(&run_dir.join("meta.json")).await else {
-                continue;
-            };
-            if meta.version == 1 && meta.run_id == entry.file_name().to_string_lossy() {
-                records.push((meta, run_dir));
-            }
-        }
-        records.sort_by_key(|record| std::cmp::Reverse(record.0.started_at));
+        let records = self.run_metas().await?;
         let mut retained = Vec::new();
         let mut terminal_count = 0usize;
         for (meta, run_dir) in records {
@@ -931,6 +907,35 @@ impl ActionService {
             });
         }
         Ok(runs)
+    }
+
+    /// Every run's metadata, newest first. No job file is opened.
+    async fn run_metas(&self) -> Result<Vec<(ActionMeta, PathBuf)>, ActionServiceError> {
+        let root = self.config.log_dir.join("actions");
+        let mut dirs = match fs::read_dir(&root).await {
+            Ok(dirs) => dirs,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(io_error("list action runs", &root, source)),
+        };
+        let mut records = Vec::new();
+        while let Some(entry) = dirs
+            .next_entry()
+            .await
+            .map_err(|source| io_error("read action run entry", &root, source))?
+        {
+            if !entry.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let run_dir = entry.path();
+            let Ok(meta) = read_json::<ActionMeta>(&run_dir.join("meta.json")).await else {
+                continue;
+            };
+            if meta.version == 1 && meta.run_id == entry.file_name().to_string_lossy() {
+                records.push((meta, run_dir));
+            }
+        }
+        records.sort_by_key(|record| std::cmp::Reverse(record.0.started_at));
+        Ok(records)
     }
 
     /// Reconcile persisted `running` records against one batched tmux session
@@ -1752,6 +1757,43 @@ mod tests {
         let still_running: ActionMeta = read_json(&new_dir.join("meta.json")).await.unwrap();
         assert_eq!(still_running.run_id, new_meta.run_id);
         assert_eq!(still_running.status, ActionRunStatus::Running);
+    }
+
+    /// Stopping an action reads the runs it concerns, not every archived
+    /// run's job: an old run's unreadable job file must not matter.
+    #[tokio::test]
+    async fn kill_does_not_read_archived_job_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        for started_at in 1..=3 {
+            let job = prepared_job(temp.path(), request(temp.path(), &["true"])).await;
+            let dir = job.parent().unwrap().to_path_buf();
+            let mut meta: ActionMeta = read_json(&dir.join("meta.json")).await.unwrap();
+            meta.started_at = started_at;
+            if started_at == 1 {
+                meta.status = ActionRunStatus::Succeeded;
+                fs::write(&job, b"not json").await.unwrap();
+            }
+            write_json_atomic(&dir.join("meta.json"), &meta)
+                .await
+                .unwrap();
+            dirs.push((dir, meta.run_id));
+        }
+        let service = service(temp.path());
+        let cancel = CancellationToken::new();
+        assert!(!service.kill("another-slug", &cancel).await.unwrap());
+        // Not the slot's latest run, so only its record is tombstoned.
+        let (dir, run_id) = &dirs[1];
+        assert!(
+            service
+                .kill_run("feature-1", run_id, &cancel)
+                .await
+                .unwrap()
+        );
+        let killed: ActionMeta = read_json(&dir.join("meta.json")).await.unwrap();
+        assert_eq!(killed.status, ActionRunStatus::Killed);
+        let latest: ActionMeta = read_json(&dirs[2].0.join("meta.json")).await.unwrap();
+        assert_eq!(latest.status, ActionRunStatus::Running);
     }
 
     #[tokio::test]

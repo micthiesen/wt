@@ -353,6 +353,19 @@ impl Store {
             .cloned())
     }
 
+    /// Put back a whole slug entry read earlier with `read_slug_state`,
+    /// replacing whatever is stored for it now. Returns whether it changed.
+    pub fn restore_slug_state(&mut self, slug: &str, entry: Value) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let slugs = object_mut(state, "slugs");
+            if slugs.get(slug) == Some(&entry) {
+                return Ok((false, false));
+            }
+            slugs.insert(slug.to_owned(), entry);
+            Ok((true, true))
+        })
+    }
+
     pub fn clear_slug_state(&mut self, slug: &str) -> Result<bool, StoreError> {
         self.mutate_wt_state(|state| {
             let slugs = object_mut(state, "slugs");
@@ -511,6 +524,27 @@ impl Store {
         })
     }
 
+    /// `move_worktrees_to_section` for a caller holding a witness of the
+    /// layout it was shown. `check` reads the stored state inside the write's
+    /// own transaction, so no other process can change the layout between
+    /// the compare and the move. An `Err` from `check` refuses: nothing is
+    /// written.
+    pub fn move_worktrees_to_section_checked<E>(
+        &mut self,
+        keys: &[String],
+        section: Option<&str>,
+        check: impl FnOnce(&WtState) -> Result<(), E>,
+    ) -> Result<Result<Vec<String>, E>, StoreError> {
+        self.mutate_wt_state(|state| {
+            if let Err(refusal) = check(state) {
+                return Ok((Err(refusal), false));
+            }
+            let changed = move_to_section(state, keys, section);
+            let mutated = !changed.is_empty();
+            Ok((Ok(changed), mutated))
+        })
+    }
+
     pub fn set_slug_github_issue(
         &mut self,
         slug: &str,
@@ -656,38 +690,23 @@ impl Store {
     }
 
     pub fn remove_section(&mut self, name: &str) -> Result<usize, StoreError> {
+        self.mutate_wt_state(|state| Ok(remove_section_from(state, name)))
+    }
+
+    /// `remove_section` for a caller holding a witness of the section's
+    /// members. `check` reads the stored state inside the write's own
+    /// transaction; an `Err` from it refuses and nothing is written.
+    pub fn remove_section_checked<E>(
+        &mut self,
+        name: &str,
+        check: impl FnOnce(&WtState) -> Result<(), E>,
+    ) -> Result<Result<usize, E>, StoreError> {
         self.mutate_wt_state(|state| {
-            let local = layout_refs_for_section(state, name)
-                .into_iter()
-                .filter(|(remote, _, _)| !remote)
-                .collect::<Vec<_>>();
-            let remote = layout_refs_for_section(state, name)
-                .into_iter()
-                .filter(|(remote, _, _)| *remote)
-                .collect::<Vec<_>>();
-            let order_has = array_mut(state, "sectionsOrder")
-                .iter()
-                .any(|section| section.as_str() == Some(name));
-            if local.is_empty() && remote.is_empty() && !order_has {
-                return Ok((0, false));
+            if let Err(refusal) = check(state) {
+                return Ok((Err(refusal), false));
             }
-            let mut order = max_layout_order(state, None).map_or(0.0, |max| max + 1.0);
-            for (is_remote, key, _) in local.iter().chain(remote.iter()) {
-                let collection = if *is_remote { "remoteLayouts" } else { "slugs" };
-                if let Some(layout) = state
-                    .get_mut(collection)
-                    .and_then(Value::as_object_mut)
-                    .and_then(|map| map.get_mut(key))
-                    .and_then(Value::as_object_mut)
-                {
-                    layout.insert("section".to_owned(), Value::Null);
-                    layout.insert("order".to_owned(), number(order));
-                    order += 1.0;
-                }
-            }
-            array_mut(state, "foldedSections").retain(|key| key.as_str() != Some(name));
-            array_mut(state, "sectionsOrder").retain(|key| key.as_str() != Some(name));
-            Ok((local.len() + remote.len(), true))
+            let (moved, mutated) = remove_section_from(state, name);
+            Ok((Ok(moved), mutated))
         })
     }
 
@@ -1527,6 +1546,19 @@ impl Store {
         &mut self,
         slug: &str,
     ) -> Result<Option<bool>, StoreError> {
+        Ok(self
+            .toggle_removed_automations_paused_seen(slug, None)?
+            .map(SeenToggle::applied))
+    }
+
+    /// Flip a removed worktree's pause flag, refusing a `seen` value that no
+    /// longer matches inside the same transaction. `None` when the slug has
+    /// no removed record.
+    pub fn toggle_removed_automations_paused_seen(
+        &mut self,
+        slug: &str,
+        seen: Option<bool>,
+    ) -> Result<Option<SeenToggle>, StoreError> {
         self.mutate_wt_state(|state| {
             let Some(entry) = array_mut(state, "removed")
                 .iter_mut()
@@ -1534,13 +1566,18 @@ impl Store {
             else {
                 return Ok((None, false));
             };
-            let paused = entry.get("automationsPaused").and_then(Value::as_bool) != Some(true);
-            if paused {
-                entry["automationsPaused"] = Value::Bool(true);
-            } else if let Some(object) = entry.as_object_mut() {
-                object.remove("automationsPaused");
+            let current = entry.get("automationsPaused").and_then(Value::as_bool) == Some(true);
+            if let Some(stale) = SeenToggle::stale(current, seen) {
+                return Ok((Some(stale), false));
             }
-            Ok((Some(paused), true))
+            if current {
+                if let Some(object) = entry.as_object_mut() {
+                    object.remove("automationsPaused");
+                }
+            } else {
+                entry["automationsPaused"] = Value::Bool(true);
+            }
+            Ok((Some(SeenToggle::Set(!current)), true))
         })
     }
 
@@ -1868,6 +1905,42 @@ pub(crate) fn fold_section(state: &mut WtState, section_key: &str, folded: bool)
         keys.retain(|key| key.as_str() != Some(section_key));
     }
     true
+}
+
+/// Return a section's rows to the end of the Inbox and forget the section.
+/// Returns the number of rows moved and whether the state changed.
+fn remove_section_from(state: &mut WtState, name: &str) -> (usize, bool) {
+    let local = layout_refs_for_section(state, name)
+        .into_iter()
+        .filter(|(remote, _, _)| !remote)
+        .collect::<Vec<_>>();
+    let remote = layout_refs_for_section(state, name)
+        .into_iter()
+        .filter(|(remote, _, _)| *remote)
+        .collect::<Vec<_>>();
+    let order_has = array_mut(state, "sectionsOrder")
+        .iter()
+        .any(|section| section.as_str() == Some(name));
+    if local.is_empty() && remote.is_empty() && !order_has {
+        return (0, false);
+    }
+    let mut order = max_layout_order(state, None).map_or(0.0, |max| max + 1.0);
+    for (is_remote, key, _) in local.iter().chain(remote.iter()) {
+        let collection = if *is_remote { "remoteLayouts" } else { "slugs" };
+        if let Some(layout) = state
+            .get_mut(collection)
+            .and_then(Value::as_object_mut)
+            .and_then(|map| map.get_mut(key))
+            .and_then(Value::as_object_mut)
+        {
+            layout.insert("section".to_owned(), Value::Null);
+            layout.insert("order".to_owned(), number(order));
+            order += 1.0;
+        }
+    }
+    array_mut(state, "foldedSections").retain(|key| key.as_str() != Some(name));
+    array_mut(state, "sectionsOrder").retain(|key| key.as_str() != Some(name));
+    (local.len() + remote.len(), true)
 }
 
 /// File each key at the end of `section` unless it is already there. Returns

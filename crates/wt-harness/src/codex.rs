@@ -10,7 +10,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use wt_platform::process::{ProcessError, ProcessRunner};
-use wt_tmux::{CreateSession, OptionScope, TmuxClient, TmuxError};
+use wt_tmux::{CreateSession, TmuxClient, TmuxError};
 
 use crate::{
     DerivedState, DiscoveryRequest, HarnessExtras, HarnessSession, HarnessSpawnRequest,
@@ -349,10 +349,15 @@ impl CodexHarness {
             return Ok(false);
         }
         let command = self.build_spawn_command(request);
+        // A resumed slot left unstamped refuses every later send.
+        let stamp = request
+            .resume_session_id
+            .as_deref()
+            .map(|session_id| ("@wt-harness-session-id", session_id));
         self.tmux
-            .create_session(
+            .create_session_with_options(
                 &CreateSession {
-                    name: name.clone(),
+                    name,
                     cwd: request.worktree_path.clone(),
                     command: std::iter::once(command.program.to_string_lossy().into_owned())
                         .chain(command.args)
@@ -360,20 +365,10 @@ impl CodexHarness {
                     width: None,
                     height: None,
                 },
+                stamp.as_slice(),
                 cancellation,
             )
             .await?;
-        if let Some(session_id) = request.resume_session_id.as_deref() {
-            let _ = self
-                .tmux
-                .set_option(
-                    &OptionScope::Session(name),
-                    "@wt-harness-session-id",
-                    Some(session_id),
-                    cancellation,
-                )
-                .await;
-        }
         Ok(true)
     }
 
@@ -1182,5 +1177,76 @@ mod tests {
         let with_live = harness.discover_sync(&request, Some("old-live")).unwrap();
         assert!(with_live.iter().any(|s| s.session_id == "old-live"));
         assert!(current.exists() && old.exists());
+    }
+
+    /// The stamp is written by the command that creates the slot. A second
+    /// tmux request that never arrives (here the socket is gone by the time
+    /// `new-session` replies) used to leave a resumed slot with no recorded
+    /// thread, which refuses every later send.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resumed_slot_is_stamped_by_the_command_that_creates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (socket, moved) = (dir.path().join("tmux.sock"), dir.path().join("moved.sock"));
+        let runner = ProcessRunner::new(NonZeroUsize::new(2).unwrap());
+        let client = |socket: &Path| {
+            TmuxClient::new(
+                runner.clone(),
+                TmuxServer::at(socket)
+                    .with_cwd(dir.path())
+                    .with_config_file("/dev/null"),
+            )
+            .with_command_prefix(
+                ["/bin/sh", "-c", "exec /bin/sleep 30", "sh"]
+                    .map(String::from)
+                    .to_vec(),
+            )
+        };
+        let cancel = CancellationToken::new();
+        let keeper = CreateSession {
+            name: "keeper".into(),
+            cwd: dir.path().into(),
+            command: vec!["true".into()],
+            width: None,
+            height: None,
+        };
+        client(&socket)
+            .create_session(&keeper, &cancel)
+            .await
+            .unwrap();
+        let hook = format!(
+            "run-shell \"mv '{}' '{}'\"",
+            socket.display(),
+            moved.display()
+        );
+        let installed = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(&socket)
+            .args(["set-hook", "-g", "after-new-session", &hook])
+            .status()
+            .unwrap();
+        assert!(installed.success());
+        let paths = CodexPaths::new(dir.path(), dir.path().join("cache"));
+        let started = CodexHarness::new(paths, runner.clone(), client(&socket))
+            .start(
+                &HarnessSpawnRequest {
+                    worktree_path: dir.path().into(),
+                    slug: "fixture".into(),
+                    managed_name: None,
+                    resume_session_id: Some("thread-1".into()),
+                    display_label: None,
+                },
+                &cancel,
+            )
+            .await;
+        let sessions = client(&moved).list_sessions(&cancel).await;
+        let _ = client(&moved).kill_server(&cancel).await;
+        assert!(started.unwrap());
+        let slot = sessions
+            .unwrap()
+            .into_iter()
+            .find(|session| session.name == "fixture-codex")
+            .expect("slot");
+        assert_eq!(slot.harness_session_id.as_deref(), Some("thread-1"));
     }
 }

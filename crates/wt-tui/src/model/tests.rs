@@ -57,6 +57,8 @@ fn github_keys_capture_target_and_require_confirmation() {
         }),
         ..Default::default()
     });
+    // The prompt has been on screen past its settle window.
+    model.confirm_settles_at = None;
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::Enter), 20),
         InputResult::Action(UiAction::GithubShip {
@@ -1271,6 +1273,8 @@ fn remove_confirm_captures_target_and_cancel_key_never_mutates() {
         }),
         ..UiReply::default()
     });
+    // The prompt has been on screen past its settle window.
+    model.confirm_settles_at = None;
     assert_eq!(
         model.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 20),
         InputResult::Action(UiAction::Remove {
@@ -1298,6 +1302,8 @@ fn cleanup_confirmation_keeps_the_prepared_candidate_set() {
         }),
         ..UiReply::default()
     });
+    // The prompt has been on screen past its settle window.
+    model.confirm_settles_at = None;
     assert_eq!(
         model.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), 20),
         InputResult::Action(UiAction::Cleanup {
@@ -2158,6 +2164,8 @@ fn delayed_removal_reviews_survive_navigation_and_keep_each_host_and_witness() {
         assert!(
             matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review one")
         );
+        // Each review has been on screen past its settle window.
+        model.confirm_settles_at = None;
         // Cancelling the first review must neither discard nor approve the second.
         let result = model.input(
             KeyEvent::from(KeyCode::Char(if cancel_first { 'n' } else { 'y' })),
@@ -2172,6 +2180,7 @@ fn delayed_removal_reviews_survive_navigation_and_keep_each_host_and_witness() {
             matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review two")
         );
         assert_eq!(model.interaction_host.as_deref(), Some("remote"));
+        model.confirm_settles_at = None;
         let InputResult::Action(UiAction::OnHost { host, action }) =
             model.input(KeyEvent::from(KeyCode::Char('y')), 20)
         else {
@@ -2534,4 +2543,248 @@ fn removal_review_never_opens_over_the_yank_menu_or_takes_its_keys() {
     assert!(
         matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review one")
     );
+}
+
+fn removal_review(key: &str) -> UiReply {
+    UiReply {
+        modal: Some(UiModal::Confirm {
+            action: ConfirmAction::Remove {
+                key: key.into(),
+                force: true,
+                seen: None,
+                revision: Some(crate::RemovalRevision {
+                    key: key.into(),
+                    path: format!("/trees/{key}"),
+                    branch: key.into(),
+                    head: "head".into(),
+                    digest: key.into(),
+                    hazards: vec!["dirty".into()],
+                    published_base: None,
+                }),
+            },
+            title: format!("Review {key}"),
+            lines: vec!["dirty".into()],
+            cancel_key: Some('d'),
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_confirm_opened_by_a_reply_ignores_commit_keys_until_it_settles() {
+    for commit in [KeyCode::Char('y'), KeyCode::Enter] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one", "two"]));
+        // Nothing is open: the review appears over the bare board.
+        model.reply(removal_review("one"));
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+        let result = model.input(KeyEvent::from(commit), 20);
+        assert!(
+            !matches!(result, InputResult::Action(_)),
+            "{commit:?} typed for the board force-removed a worktree: {result:?}"
+        );
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+        assert_eq!(model.toast.as_ref().unwrap().1, ToastTone::Notice);
+        // Scrolling is not a commit and works at once.
+        model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+        tokio::time::advance(super::reply::CONFIRM_SETTLE).await;
+        assert!(matches!(
+            model.input(KeyEvent::from(commit), 20),
+            InputResult::Action(UiAction::Remove { force: true, .. })
+        ));
+    }
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    model.reply(removal_review("one"));
+    model.input(KeyEvent::from(KeyCode::Char('n')), 20);
+    assert!(
+        matches!(model.interaction, Interaction::None),
+        "cancel works without waiting"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_menu_the_user_opened_confirms_without_a_settle_wait() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    model.reply(removal_review("one"));
+    model.input(KeyEvent::from(KeyCode::Char('n')), 20);
+    // A confirm opened by the user's own key right after is theirs to answer.
+    model.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), 20);
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('y')), 20),
+        InputResult::Action(UiAction::HardRefresh)
+    );
+}
+
+#[test]
+fn a_modal_from_a_request_in_flight_does_not_discard_an_open_removal_review() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    model.reply(removal_review("one"));
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+    // The request sent by the user's last key answers with its own dialog.
+    model.reply(UiReply {
+        ui_generation: Some(model.ui_generation),
+        modal: Some(UiModal::Log {
+            title: "Cannot open remote session".into(),
+            lines: vec![],
+            close_key: None,
+            refresh: None,
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::Log { .. }));
+    model.input(KeyEvent::from(KeyCode::Esc), 20);
+    assert!(
+        matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review one"),
+        "the review was dropped"
+    );
+}
+
+#[test]
+fn keys_after_a_cancelled_loading_menu_never_reach_the_board() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one", "two"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    let generation = model.ui_generation;
+    model.begin_action(42, &action);
+    assert_eq!(
+        model.input(KeyEvent::from(KeyCode::Char('q')), 20),
+        InputResult::Draw
+    );
+    // The rest of what was typed for the menu: `h` is removed history, `j`
+    // moves the cursor.
+    for key in ['h', 'j'] {
+        let result = model.input(KeyEvent::from(KeyCode::Char(key)), 20);
+        assert!(
+            !matches!(result, InputResult::Action(_)),
+            "{key}: {result:?}"
+        );
+    }
+    assert!(!model.history.active, "`h` reached the board");
+    assert_eq!(
+        model.selected_row().unwrap().key,
+        "one",
+        "`j` reached the board"
+    );
+    let (text, tone) = model.toast.clone().unwrap();
+    assert_eq!(tone, ToastTone::Notice);
+    assert!(text.contains("dropped"), "{text}");
+    // Its reply ends the hold; the cancelled menu still does not open.
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Picker {
+            action: PickerAction::Actions {
+                surface: crate::ActionSurface::Row { key: "one".into() },
+            },
+            title: "Actions".into(),
+            selected: 0,
+            options: vec![],
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::None));
+    model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+    assert_eq!(model.selected_row().unwrap().key, "two");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_menu_that_never_answers_stops_holding_keys() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one", "two"]));
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+        panic!()
+    };
+    model.begin_action(42, &action);
+    model.input(KeyEvent::from(KeyCode::Esc), 20);
+    tokio::time::advance(super::input::TYPEAHEAD_TTL + std::time::Duration::from_millis(1)).await;
+    model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+    assert_eq!(model.selected_row().unwrap().key, "two");
+}
+
+#[test]
+fn the_opener_letter_is_text_for_a_loading_text_prompt() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one"]));
+    let surface = crate::ActionSurface::Row { key: "one".into() };
+    let action = UiAction::PrepareAction {
+        surface: surface.clone(),
+        id: "custom".into(),
+        arg: None,
+    };
+    // Palette chord `c` requested the custom prompt.
+    model.last_key = Some(KeyEvent::from(KeyCode::Char('c')));
+    model.begin_action(42, &action);
+    let generation = model.ui_generation;
+    for key in "check".chars() {
+        model.input(KeyEvent::from(KeyCode::Char(key)), 20);
+    }
+    assert!(
+        model.pending_request.is_some(),
+        "typing cancelled the prompt"
+    );
+    assert!(!model.history.active);
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Text {
+            action: TextAction::ActionExtras {
+                surface,
+                id: "custom".into(),
+                arg: None,
+            },
+            prompt: "Prompt".into(),
+            initial: String::new(),
+            allow_empty: false,
+        }),
+        ..Default::default()
+    });
+    let Interaction::Text(prompt) = &model.interaction else {
+        panic!("the prompt opens")
+    };
+    assert_eq!(prompt.editor.text(), "check");
+}
+
+#[test]
+fn typeahead_is_dropped_when_a_palette_request_returns_a_confirm() {
+    for typed in [KeyCode::Enter, KeyCode::Char('y')] {
+        let mut model = Model::default();
+        model.apply(snapshot(&["one"]));
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        else {
+            panic!()
+        };
+        let generation = model.ui_generation;
+        model.begin_action(42, &action);
+        model.input(KeyEvent::from(typed), 20);
+        model.reply(UiReply {
+            operation_id: Some(42),
+            ui_generation: Some(generation),
+            modal: Some(UiModal::Confirm {
+                action: ConfirmAction::KillAction {
+                    action_key: "one:check".into(),
+                    run_id: "run".into(),
+                },
+                title: "Stop check?".into(),
+                lines: vec![],
+                cancel_key: Some('!'),
+            }),
+            ..Default::default()
+        });
+        assert!(
+            model.follow_up.is_none(),
+            "{typed:?} typed for the palette stopped the action: {:?}",
+            model.follow_up
+        );
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+        let (text, tone) = model.toast.clone().unwrap();
+        assert_eq!(tone, ToastTone::Notice);
+        assert!(text.contains("dropped"), "{text}");
+    }
 }

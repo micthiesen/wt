@@ -531,7 +531,14 @@ async fn scheduler(
                 };
                 let local = match branch_refresh.await {
                     Ok(branches) => { local_known = true; branches },
-                    Err(e) => { local_known = false; set_error(&durable, format!("local worktree inventory failed: {e}")).await; continue; }
+                    Err(e) => {
+                        local_known = false;
+                        failures = failures.saturating_add(1);
+                        fetch_interval_ms = backoff_interval_ms(config.min_fetch_interval_ms, failures, false);
+                        pending_deadline = Some(now + Duration::from_millis(fetch_interval_ms));
+                        set_error(&durable, format!("local worktree inventory failed: {e}")).await;
+                        continue;
+                    }
                 };
                 local_branches = local.iter().cloned().collect();
                 let mut fetch_branches: BTreeSet<String> = local.into_iter().collect();
@@ -578,15 +585,7 @@ async fn scheduler(
                 // began: a write accepted after this moment may be missing.
                 let fetch_started_at_ms = now_millis();
                 let fetched = source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await;
-                (failures, fetch_interval_ms) = match &fetched {
-                    Ok(_) => (0, config.min_fetch_interval_ms),
-                    Err(e) => {
-                        let failures = failures.saturating_add(1);
-                        let interval = backoff_interval_ms(config.min_fetch_interval_ms, failures, rate_limited(e));
-                        (failures, interval)
-                    }
-                };
-                match fetched {
+                let failure = match fetched {
                     Ok(data) => {
                         let snapshot = GithubSnapshot {
                             updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
@@ -602,11 +601,24 @@ async fn scheduler(
                                 state.last_error = None;
                                 let _ = durable.write_state_locked(&state).await;
                                 if let Err(e) = atomic_write(&config.events_dir.join("github.touch"), snapshot.updated_at.to_string().as_bytes()).await { warn!(error = %e, "cannot write GitHub snapshot marker"); }
+                                None
                             }
-                            Err(e) => set_error(&durable, format!("cannot persist GitHub snapshot: {e}")).await,
+                            Err(e) => Some(format!("cannot persist GitHub snapshot: {e}")),
                         }
                     }
-                    Err(e) => set_error(&durable, format!("GitHub refresh failed: {e}")).await,
+                    Err(e) => Some(format!("GitHub refresh failed: {e}")),
+                };
+                match failure {
+                    None => (failures, fetch_interval_ms) = (0, config.min_fetch_interval_ms),
+                    Some(message) => {
+                        failures = failures.saturating_add(1);
+                        fetch_interval_ms = backoff_interval_ms(config.min_fetch_interval_ms, failures, rate_limited(&message));
+                        // No webhook may follow the one this refresh served
+                        // (or the startup read), so the retry is scheduled
+                        // here, on the same floor an arriving event would get.
+                        pending_deadline = Some(now + Duration::from_millis(fetch_interval_ms));
+                        set_error(&durable, message).await;
+                    }
                 }
             }
         }
@@ -1116,6 +1128,37 @@ mod tests {
         assert_eq!(signed(daemon.local_addr(), "push", push).await, 200);
         wait_for_fetches(&source, 3).await;
         assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// No webhook follows the startup refresh, so only the daemon's own
+    /// retry can publish a snapshot after it failed.
+    #[tokio::test]
+    async fn a_failed_refresh_is_retried_without_another_event() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        source.fail.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        wait_for_fetches(&source, 2).await;
+        source.fail.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while read_snapshot(dir.path()).await.unwrap().is_none()
+                || read_state(dir.path())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .last_error
+                    .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the retry published a snapshot and cleared the error");
         cancel.cancel();
         daemon.shutdown().await;
     }

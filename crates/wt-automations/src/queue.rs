@@ -28,6 +28,9 @@ pub struct QueueIntentsInput<'a> {
     pub state_ready: bool,
     pub handled: &'a BTreeSet<String>,
     pub executing: &'a BTreeSet<String>,
+    /// Identities of deferred fires. A per-worktree pause holds these
+    /// instead of dropping them, as the global pause does.
+    pub deferred: &'a BTreeSet<String>,
 }
 
 /// Reconstruct exact cancellable fires while paused. The queue itself is
@@ -123,6 +126,7 @@ pub fn queue_intents(input: QueueIntentsInput<'_>) -> Vec<AutomationIntent> {
         state_ready,
         handled,
         executing,
+        deferred,
     } = input;
     if paused || !state_ready {
         return Vec::new();
@@ -181,6 +185,11 @@ pub fn queue_intents(input: QueueIntentsInput<'_>) -> Vec<AutomationIntent> {
             continue;
         }
         if context.pauses.slugs.contains(&fire.slug) {
+            // A deferred fire's row may be gone, so nothing would produce
+            // it again once the worktree is resumed.
+            if deferred.contains(&id) {
+                output.insert(id, intent.clone());
+            }
             continue;
         }
         match row_by_slug.get(fire.slug.as_str()) {
@@ -256,6 +265,7 @@ mod tests {
             state_ready: true,
             handled: &BTreeSet::new(),
             executing: &BTreeSet::new(),
+            deferred: &BTreeSet::new(),
         });
         assert_eq!(unchanged[0].queued_at_ms, 100);
         let changed = queue_intents(QueueIntentsInput {
@@ -268,6 +278,7 @@ mod tests {
             state_ready: true,
             handled: &BTreeSet::new(),
             executing: &BTreeSet::new(),
+            deferred: &BTreeSet::new(),
         });
         assert_eq!(changed[0].queued_at_ms, 5_000);
         assert_eq!(changed[0].settle_at_ms, 15_000);

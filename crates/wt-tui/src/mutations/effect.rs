@@ -154,7 +154,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
             "restoring",
             &[Domain::Git, Domain::Metadata],
         ),
-        UiAction::ToggleRemovedAutomations { key } => {
+        UiAction::ToggleRemovedAutomations { key, .. } => {
             unprojected(host, Some(key), "toggling automations", &[Domain::Metadata])
         }
         UiAction::PerfInvestigate { .. } => {

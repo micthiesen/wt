@@ -5,8 +5,8 @@ use serde_json::{Map, json};
 use tempfile::tempdir;
 
 use crate::{
-    CURRENT_WT_STATE_VERSION, MergeEdge, RemovedWorktree, RepositoryIdentity, Store, StoreError,
-    TitleSource, TitleWrite, WorkStatusRecord, migrate_wt_state,
+    CURRENT_WT_STATE_VERSION, MergeEdge, RemovedWorktree, RepositoryIdentity, SeenToggle, Store,
+    StoreError, TitleSource, TitleWrite, WorkStatusRecord, WtState, migrate_wt_state,
 };
 
 fn identity(id: &str, path: &str) -> RepositoryIdentity {
@@ -1571,5 +1571,174 @@ fn status_update_reads_and_writes_in_one_transaction() {
     assert_eq!(
         first.read_wt_state().unwrap()["slugs"]["task"]["work"]["state"],
         "needs-testing"
+    );
+}
+
+#[test]
+fn witnessed_section_writes_compare_and_write_in_one_transaction() {
+    use std::sync::mpsc;
+
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut first = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let keys = |keys: &[&str]| keys.iter().map(|key| (*key).to_owned()).collect::<Vec<_>>();
+    first
+        .move_worktrees_to_section(&keys(&["task", "one"]), Some("A"))
+        .unwrap();
+    let section = |store: &mut Store, key: &str| {
+        store.read_wt_state().unwrap()["slugs"][key]["section"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let shows = |key: &'static str, seen: Option<&'static str>| {
+        move |state: &WtState| {
+            (state["slugs"][key]["section"].as_str() == seen)
+                .then_some(())
+                .ok_or("stale")
+        }
+    };
+
+    // Another process refiles the row while this one is between comparing
+    // its witness and writing.
+    let mut second = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let (checking_tx, checking_rx) = mpsc::channel();
+    let other = thread::spawn(move || {
+        checking_rx.recv().unwrap();
+        second
+            .move_worktrees_to_section(&["task".to_owned()], Some("C"))
+            .unwrap();
+    });
+    let moved = first
+        .move_worktrees_to_section_checked(&keys(&["task"]), Some("B"), |state| {
+            checking_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            shows("task", Some("A"))(state)
+        })
+        .unwrap();
+    other.join().unwrap();
+    assert_eq!(moved, Ok(keys(&["task"])));
+    assert_eq!(
+        section(&mut first, "task").as_deref(),
+        Some("C"),
+        "the other writer's move was overwritten after a stale compare"
+    );
+    assert_eq!(
+        first
+            .move_worktrees_to_section_checked(&keys(&["task"]), None, shows("task", Some("B")))
+            .unwrap(),
+        Err("stale")
+    );
+    assert_eq!(section(&mut first, "task").as_deref(), Some("C"));
+
+    // Another process files a row into the section while its deletion is
+    // between comparing the members the user saw and removing it.
+    let mut second = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let (checking_tx, checking_rx) = mpsc::channel();
+    let other = thread::spawn(move || {
+        checking_rx.recv().unwrap();
+        second
+            .move_worktrees_to_section(&["two".to_owned()], Some("A"))
+            .unwrap();
+    });
+    let removed = first
+        .remove_section_checked("A", |state| {
+            checking_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            shows("two", None)(state)
+        })
+        .unwrap();
+    other.join().unwrap();
+    assert_eq!(removed, Ok(1));
+    assert_eq!(section(&mut first, "one"), None);
+    assert_eq!(
+        section(&mut first, "two").as_deref(),
+        Some("A"),
+        "a row filed during the delete was sent to the Inbox unseen"
+    );
+    assert_eq!(
+        first
+            .remove_section_checked("A", shows("two", None))
+            .unwrap(),
+        Err("stale")
+    );
+    assert_eq!(section(&mut first, "two").as_deref(), Some("A"));
+}
+
+#[test]
+fn removed_pause_toggle_refuses_a_flag_the_caller_did_not_see() {
+    let temp = tempdir().unwrap();
+    let mut store =
+        Store::open(temp.path().join("state.sqlite"), identity("repo", "/repo")).unwrap();
+    store
+        .record_removed_worktrees(
+            &[RemovedWorktree {
+                slug: "gone".into(),
+                branch: "feature/gone".into(),
+                removed_at: "2026-10-09T00:00:00Z".into(),
+                work: None,
+                automations_paused: None,
+                extra: Map::new(),
+            }],
+            1_791_540_000_000,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .toggle_removed_automations_paused_seen("gone", Some(false))
+            .unwrap(),
+        Some(SeenToggle::Set(true))
+    );
+    // The same press again, from a view that still shows it running.
+    assert_eq!(
+        store
+            .toggle_removed_automations_paused_seen("gone", Some(false))
+            .unwrap(),
+        Some(SeenToggle::Stale { current: true })
+    );
+    assert_eq!(
+        store.read_removed_worktrees().unwrap()[0].automations_paused,
+        Some(true)
+    );
+    assert_eq!(
+        store
+            .toggle_removed_automations_paused_seen("absent", Some(false))
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn restoring_a_slug_entry_replaces_it_whole_and_leaves_other_slugs_alone() {
+    let temp = tempdir().unwrap();
+    let mut store =
+        Store::open(temp.path().join("state.sqlite"), identity("repo", "/repo")).unwrap();
+    store
+        .write_repository_state_json(
+            &json!({
+                "version": crate::CURRENT_WT_STATE_VERSION,
+                "slugs": {
+                    "task": {"section": "A", "order": 2, "futureField": {"kept": true}},
+                    "other": {"section": "B"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let before = store.read_slug_state("task").unwrap().unwrap();
+
+    store
+        .move_worktrees_to_section(&["task".to_owned()], Some("B"))
+        .unwrap();
+    assert!(store.toggle_slug_automations_paused("task").unwrap());
+    assert!(store.restore_slug_state("task", before.clone()).unwrap());
+    assert_eq!(store.read_slug_state("task").unwrap(), Some(before.clone()));
+    assert!(!store.restore_slug_state("task", before.clone()).unwrap());
+
+    assert!(store.clear_slug_state("task").unwrap());
+    assert!(store.restore_slug_state("task", before.clone()).unwrap());
+    assert_eq!(store.read_slug_state("task").unwrap(), Some(before));
+    assert_eq!(
+        store.read_slug_state("other").unwrap(),
+        Some(json!({"section": "B"}))
     );
 }

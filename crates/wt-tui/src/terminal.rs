@@ -424,39 +424,26 @@ async fn run_inner<'a>(
             }
             reply = actions.replies.recv(), if controller_open => {
                 if let Some(reply) = reply {
-                    let history_was_open = model.history.active;
-                    let perf_was_open = model.show_perf;
-                    let handoff = model.reply(reply);
-                    send_background(&mut model, &actions.requests);
-                    if std::mem::take(&mut model.refresh_requested) {
-                        source.refresh();
-                    }
-                    send_follow_up(&mut model, &actions.requests);
-                    if history_was_open && !model.history.active {
-                        let _ = actions.requests.try_send(crate::UiRequest {
-                            id: 0,
-                        cancellation: None,
-                            generation: model.ui_generation,
-                            action: crate::UiAction::SetHistoryActive { active: false },
-                        });
-                    }
-                    if perf_was_open && !model.show_perf {
-                        let _ = actions.requests.try_send(crate::UiRequest {
-                            id: 0,
-                        cancellation: None,
-                            generation: model.ui_generation,
-                            action: crate::UiAction::SetPerf {
-                                active: false,
-                                continuous: model.perf_continuous,
-                                refresh: false,
-                            },
-                        });
-                    }
+                    let handoff = apply_reply(&mut model, reply, &actions.requests, &source);
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                     dirty = true;
                     if let Some(ticket) = handoff {
                         drop(events);
-                        match suspend_for_handoff(ticket, &mut guard, &cancel).await? {
+                        let suspended = suspend_for_handoff(
+                            ticket,
+                            &mut guard,
+                            &cancel,
+                            &mut actions.replies,
+                            |reply| {
+                                // No key can ask for a session while one holds
+                                // the terminal. Dropping a ticket releases
+                                // its controller.
+                                drop(apply_reply(&mut model, reply, &actions.requests, &source));
+                            },
+                        )
+                        .await?;
+                        model.restart_confirm_settle();
+                        match suspended {
                             HandoffResult::Resumed(Ok(())) => {
                                 // Fullscreen resize clears both render buffers
                                 // without querying the terminal cursor. `clear`
@@ -637,10 +624,51 @@ enum HandoffResult {
     Cancelled,
 }
 
+/// Apply a host reply and send what it queued. Returns the session the
+/// terminal should be handed to, if the reply carries one.
+fn apply_reply(
+    model: &mut Model,
+    reply: crate::UiReply,
+    requests: &tokio::sync::mpsc::Sender<crate::UiRequest>,
+    source: &SourceHandle<Board>,
+) -> Option<TerminalHandoff> {
+    let history_was_open = model.history.active;
+    let perf_was_open = model.show_perf;
+    let handoff = model.reply(reply);
+    send_background(model, requests);
+    if std::mem::take(&mut model.refresh_requested) {
+        source.refresh();
+    }
+    send_follow_up(model, requests);
+    if history_was_open && !model.history.active {
+        let _ = requests.try_send(crate::UiRequest {
+            id: 0,
+            cancellation: None,
+            generation: model.ui_generation,
+            action: crate::UiAction::SetHistoryActive { active: false },
+        });
+    }
+    if perf_was_open && !model.show_perf {
+        let _ = requests.try_send(crate::UiRequest {
+            id: 0,
+            cancellation: None,
+            generation: model.ui_generation,
+            action: crate::UiAction::SetPerf {
+                active: false,
+                continuous: model.perf_continuous,
+                refresh: false,
+            },
+        });
+    }
+    handoff
+}
+
 async fn suspend_for_handoff(
     ticket: TerminalHandoff,
     guard: &mut TerminalGuard,
     cancel: &CancellationToken,
+    replies: &mut tokio::sync::mpsc::Receiver<crate::UiReply>,
+    on_reply: impl FnMut(crate::UiReply),
 ) -> io::Result<HandoffResult> {
     guard.suspend()?;
     if ticket.ready.send(()).is_err() {
@@ -649,16 +677,38 @@ async fn suspend_for_handoff(
             "session handoff could not start".into(),
         )));
     }
-    let result = tokio::select! {
-        _ = cancel.cancelled() => HandoffResult::Cancelled,
-        result = ticket.resumed => HandoffResult::Resumed(
-            result.unwrap_or_else(|_| Err("session handoff ended without a result".into()))
-        ),
-    };
+    let result = wait_for_handoff(ticket.resumed, cancel, replies, on_reply).await;
     // Even cancellation restores the screen before the UI loop exits. Dropping
     // the receiver above tells the controller to terminate and reap its child.
     guard.resume()?;
     Ok(result)
+}
+
+/// Wait for the session to give the terminal back. Host replies are still
+/// applied, undrawn: a creation does not start its checkout until the model
+/// acknowledges it, and the user may stay in the session for hours.
+async fn wait_for_handoff(
+    resumed: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    cancel: &CancellationToken,
+    replies: &mut tokio::sync::mpsc::Receiver<crate::UiReply>,
+    mut on_reply: impl FnMut(crate::UiReply),
+) -> HandoffResult {
+    tokio::pin!(resumed);
+    let mut controller_open = true;
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return HandoffResult::Cancelled,
+            result = &mut resumed => return HandoffResult::Resumed(
+                result.unwrap_or_else(|_| Err("session handoff ended without a result".into()))
+            ),
+            reply = replies.recv(), if controller_open => match reply {
+                Some(reply) => on_reply(reply),
+                // The UI loop reports a stopped controller once it resumes.
+                None => controller_open = false,
+            },
+        }
+    }
 }
 
 fn log_latencies(samples: &mut Vec<f64>) {
@@ -740,6 +790,54 @@ fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate
         if !sent {
             model.background_not_sent(&action, now);
         }
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_creation_is_acknowledged_while_a_session_holds_the_terminal() {
+        let (host, mut replies) = tokio::sync::mpsc::channel(16);
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        let cancel = CancellationToken::new();
+        let mut model = Model::default();
+        model.begin_action(
+            7,
+            &crate::UiAction::Create {
+                placement: None,
+                input: "new".into(),
+            },
+        );
+        // The host resolved the name after the user entered another session
+        // and now waits for the model before it creates the checkout.
+        let (ready, acknowledged) = tokio::sync::oneshot::channel();
+        host.send(crate::UiReply {
+            operation_id: Some(7),
+            creation_prepared: Some(crate::CreationPrepared {
+                key: "new".into(),
+                already_exists: false,
+                ready,
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let session = async {
+            tokio::time::timeout(Duration::from_secs(2), acknowledged)
+                .await
+                .expect("the creation waited for the session to end")
+                .unwrap();
+            resume.send(Ok(())).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            wait_for_handoff(resumed, &cancel, &mut replies, |reply| {
+                drop(model.reply(reply));
+            }),
+            session
+        );
+        assert!(matches!(result, HandoffResult::Resumed(Ok(()))));
     }
 }
 

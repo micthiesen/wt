@@ -197,11 +197,12 @@ fn spawn_retry_owner(
         }
         for token in active.values() { token.cancel(); }
         while let Some(joined) = jobs.join_next().await {
-            if let Ok(finished) = joined
-                && let Some(waiters) = cancel_waiters.remove(&finished.number)
-            {
+            let Ok(finished) = joined else { continue };
+            if let Some(waiters) = cancel_waiters.remove(&finished.number) {
                 let result = retry_cancel_result(&finished.result);
                 for waiter in waiters { let _ = waiter.send(result.clone()); }
+            } else if matches!(finished.result, RetryOutcome::Cancelled) {
+                log_dropped(&finished);
             }
         }
         for waiters in cancel_waiters.into_values() {
@@ -233,6 +234,18 @@ fn log_finished(finished: &RetryFinished) {
             tracing::info!(pr = number, %branch, %worktree, "cancelled pending merge-when-ready retry")
         }
     }
+}
+
+/// Shutdown, not the user, cancelled a retry the user was told would arm the
+/// PR. Nothing persists it, so say so where the next session shows it.
+fn log_dropped(finished: &RetryFinished) {
+    let RetryFinished {
+        number,
+        branch,
+        worktree,
+        ..
+    } = finished;
+    tracing::warn!(pr = number, %branch, %worktree, event_channel = "attention", event_source = %worktree, event_text = %format_args!("#{number}: merge when ready was still waiting for required checks when wt quit and was not armed"), "dropped pending merge-when-ready retry at shutdown");
 }
 
 async fn retry_arm(

@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result, bail};
 use wt_lifecycle::{CreateOptions, LifecycleError};
-use wt_tui::UiReply;
+use wt_store::SeenToggle;
+use wt_tui::{Seen, UiReply};
 
 use wt_app_core::context::AppContext;
 
@@ -39,14 +40,28 @@ pub async fn restore(
     })
 }
 
-pub async fn toggle_automations_paused(ctx: &AppContext, key: &str) -> Result<UiReply> {
+/// Flip the pause flag the history row showed; a flag that changed since
+/// (a second press, another controller) is refused as stale.
+pub async fn toggle_automations_paused_seen(
+    ctx: &AppContext,
+    key: &str,
+    seen: Option<Seen<bool>>,
+) -> Result<UiReply> {
     let slug = local_slug(key)?;
+    let seen = seen.map(|Seen(seen)| seen);
     let changed = ctx
         .database
-        .call(move |store| Ok(store.toggle_removed_automations_paused(&slug)?))
+        .call(move |store| Ok(store.toggle_removed_automations_paused_seen(&slug, seen)?))
         .await?;
-    let Some(paused) = changed else {
-        bail!("removed history entry is no longer available");
+    let paused = match changed {
+        Some(SeenToggle::Set(paused)) => paused,
+        Some(SeenToggle::Stale { current }) => {
+            return Err(wt_app_core::host_errors::stale(format!(
+                "automations are already {} for this removed worktree",
+                if current { "paused" } else { "running" }
+            )));
+        }
+        None => bail!("removed history entry is no longer available"),
     };
     Ok(UiReply {
         message: if paused {
@@ -119,7 +134,7 @@ mod tests {
             .await
             .unwrap();
 
-        let paused = toggle_automations_paused(&fixture.ctx, "archived")
+        let paused = toggle_automations_paused_seen(&fixture.ctx, "archived", None)
             .await
             .unwrap();
         assert!(paused.message.contains("paused"));
@@ -131,6 +146,19 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].automations_paused, Some(true));
         assert_eq!(records[0].extra["futureField"], "kept");
+
+        // The same press again, from a history row that still shows running.
+        let repeated = toggle_automations_paused_seen(&fixture.ctx, "archived", Some(Seen(false)))
+            .await
+            .unwrap_err();
+        assert!(wt_app_core::host_errors::error_reply(&repeated).stale);
+        let records = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_removed_worktrees()?))
+            .await
+            .unwrap();
+        assert_eq!(records[0].automations_paused, Some(true));
         fixture.close().await.unwrap();
     }
 }

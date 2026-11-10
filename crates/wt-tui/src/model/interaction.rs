@@ -345,6 +345,17 @@ impl Model {
                     return InputResult::Draw;
                 }
                 if code == KeyCode::Enter || code == KeyCode::Char('y') {
+                    if self
+                        .confirm_settles_at
+                        .is_some_and(|at| tokio::time::Instant::now() < at)
+                    {
+                        self.interaction = interaction;
+                        self.toast = Some((
+                            "key ignored: this prompt just appeared".into(),
+                            ToastTone::Notice,
+                        ));
+                        return InputResult::Draw;
+                    }
                     return InputResult::Action(match &confirm.action {
                         ConfirmAction::CopyDetails { details } => UiAction::Copy {
                             value: details.clone(),

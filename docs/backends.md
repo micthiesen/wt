@@ -101,7 +101,8 @@ and it drives the rest of the design:
   as interruption after the child is stopped and joined, not cleanup failure.
   Branch deletion is moot — the branch vanishes with the clone. The
   fork-base reparenting of *dependents* is backend-agnostic (it edits
-  the durable state) and still runs.
+  the durable state) and still runs, under the same rule as Git worktrees:
+  only for a landed parent or one whose branch is gone locally and on origin.
   **`force` is advisory here, so callers own the dirty guard.** wt passes
   `--force` through for symmetry with the git backend, but rift trashes a
   dirty checkout with or without it — there is no refusal to rely on. That

@@ -10,8 +10,10 @@ use wt_tmux::PaneTarget;
 
 use super::{
     ClaudeInjectFailureKind, ClaudeInjectOutcome, ClaudeInjector, ClaudeSessionManager,
-    ClaudeSessionManagerError, ClaudeSessionTarget, RegistryStatus, identity::session_jsonl_path,
-    lifecycle::SessionLock, transcript::parse_timestamp_ms,
+    ClaudeSessionManagerError, ClaudeSessionTarget, RegistryStatus,
+    identity::session_jsonl_path,
+    lifecycle::{SessionLock, canonical},
+    transcript::parse_timestamp_ms,
 };
 
 const HUMAN_WAIT_POLL: Duration = Duration::from_millis(250);
@@ -318,6 +320,16 @@ impl ClaudeMessenger {
                 maybe_submitted: false,
             });
         }
+        if let Err(error) = self
+            .sessions
+            .refuse_foreign_slot("send", target, cancel)
+            .await
+        {
+            return Ok(TerminalOutcome::Failed {
+                reason: error.to_string(),
+                maybe_submitted: false,
+            });
+        }
         if let Some(session) = self.sessions.find(target)?
             && session.status == RegistryStatus::Waiting
         {
@@ -446,16 +458,31 @@ impl ClaudeMessenger {
         cancel: &CancellationToken,
     ) -> Option<bool> {
         let deadline = tokio::time::Instant::now() + CONFIRM_MAX;
+        // The live process writes to the conversation it holds now, which is
+        // not the deterministic one after `/clear` or `/resume`.
+        let live_id = self
+            .sessions
+            .find(target)
+            .ok()
+            .flatten()
+            .map(|session| session.session_id);
         loop {
             // Each check may read and parse up to 16 MiB of transcript; keep it
             // off the async workers.
-            let (paths, target_owned, text_owned) = (
+            let (paths, target_owned, text_owned, live_id) = (
                 self.sessions.paths().clone(),
                 target.clone(),
                 text.to_owned(),
+                live_id.clone(),
             );
             let found = tokio::task::spawn_blocking(move || {
-                transcript_has_prompt(&paths, &target_owned, &text_owned, since_ms)
+                transcript_has_prompt(
+                    &paths,
+                    &target_owned,
+                    live_id.as_deref(),
+                    &text_owned,
+                    since_ms,
+                )
             });
             let found = tokio::select! {
                 biased;
@@ -511,11 +538,17 @@ async fn wait_for_pane_ready(
 fn transcript_has_prompt(
     paths: &super::ClaudePaths,
     target: &ClaudeSessionTarget,
+    live_id: Option<&str>,
     text: &str,
     since_ms: i64,
 ) -> bool {
-    let id = crate::claude_session_id(&target.cwd, target.managed_name.as_deref());
-    let path = session_jsonl_path(&paths.home, &target.cwd, &id);
+    // Claude names the project directory after the resolved cwd it runs in.
+    let cwd = canonical(&target.cwd);
+    let id = match live_id {
+        Some(id) => id.to_owned(),
+        None => crate::claude_session_id(&cwd, target.managed_name.as_deref()),
+    };
+    let path = session_jsonl_path(&paths.home, &cwd, &id);
     let Ok(mut file) = File::open(path) else {
         return false;
     };
@@ -665,19 +698,61 @@ mod tests {
         assert!(transcript_has_prompt(
             &paths,
             &target,
+            None,
             "[a] peer1 needs signing in",
             since
         ));
         assert!(!transcript_has_prompt(
             &paths,
             &target,
+            None,
             "[a] old note",
             since
         ));
         assert!(!transcript_has_prompt(
             &paths,
             &target,
+            None,
             "[a] removed note",
+            since
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn confirmation_reads_the_transcript_of_the_resolved_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        let paths = super::super::ClaudePaths::new(&home_path, home_path.join("cache"));
+        let real = home_path.join("repo");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = home_path.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd: real,
+            managed_name: None,
+        };
+        // Claude runs in, and names its project directory after, the path
+        // `find` and the spawn resolve.
+        transcript(
+            &home_path,
+            &resolved,
+            &[
+                serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                "timestamp": "2026-10-29T20:48:05.000Z", "content": "[a] note"}),
+            ],
+        );
+        let through_link = ClaudeSessionTarget {
+            cwd: link,
+            ..resolved
+        };
+        let since = parse_timestamp_ms("2026-10-29T20:48:00.000Z").unwrap();
+        assert!(transcript_has_prompt(
+            &paths,
+            &through_link,
+            None,
+            "[a] note",
             since
         ));
     }

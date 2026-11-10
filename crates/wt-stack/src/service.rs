@@ -551,10 +551,7 @@ impl StackService {
         branch: &str,
         cancellation: &CancellationToken,
     ) -> Result<bool, StackError> {
-        for reference in [
-            format!("refs/heads/{branch}"),
-            format!("refs/remotes/origin/{branch}"),
-        ] {
+        for reference in wt_vcs::stack_parent_refs(branch) {
             if git_sha(
                 &self.processes,
                 &self.config.main_clone,

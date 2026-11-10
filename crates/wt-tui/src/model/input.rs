@@ -91,10 +91,20 @@ impl Model {
         {
             self.presentation_changed();
         }
+        self.cancelled_menu = None;
         self.input(key, height)
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
+        if let Some(cancelled) = &mut self.cancelled_menu {
+            if cancelled.started.elapsed() <= TYPEAHEAD_TTL {
+                if !std::mem::replace(&mut cancelled.noticed, true) {
+                    self.append_typeahead_notice("keys typed while the menu loaded were dropped");
+                }
+                return InputResult::Draw;
+            }
+            self.cancelled_menu = None;
+        }
         if let Some(request) = &mut self.pending_request
             && request.generation == self.ui_generation
             && request.preparation
@@ -104,6 +114,11 @@ impl Model {
                 || (key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c' | 'C')))
             {
+                self.cancelled_menu = Some(super::CancelledMenu {
+                    id: request.id,
+                    started: request.started,
+                    noticed: false,
+                });
                 self.pending_request = None;
                 self.ui_generation = self.ui_generation.wrapping_add(1);
                 return self.notify("Menu cancelled");
@@ -169,6 +184,9 @@ impl Model {
         // Only a request the terminal is about to send has an opener.
         if !matches!(result, InputResult::Action(_)) {
             self.last_key = None;
+        }
+        if !matches!(self.interaction, Interaction::Confirm(_)) {
+            self.confirm_settles_at = None;
         }
         let can_review = match &result {
             InputResult::Quit => false,
@@ -705,10 +723,7 @@ impl Model {
                 self.row_action(|key| UiAction::PrepareRemove { key })
             }
             KeyCode::Char('c') if !control => {
-                self.reply(crate::UiReply {
-                    modal: Some(crate::cleanup::menu(&self.board)),
-                    ..Default::default()
-                });
+                self.show_modal(crate::cleanup::menu(&self.board), None);
                 // Use the normal background refresh path after opening the
                 // cached menu. The displayed confirmation keeps its targets.
                 InputResult::Refresh

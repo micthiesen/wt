@@ -642,6 +642,9 @@ operation locks. A confirmed removal moves its row to Archived with a
 removal glyph at once. Revision capture streams complete Git output and
 untracked file contents into fingerprints with bounded memory, cancellation,
 and deadlines; evidence is never truncated to satisfy a capture limit.
+Untracked content that cannot be hashed (a nested repository, a socket or
+FIFO, a set past the path or time budget) is pinned by name and stat data and
+surfaced as a hazard the user confirms; it no longer makes removal impossible.
 The worker archives the row before its startup reply and retains that state
 on failure. TUI actions await the durable
 job's terminal outcome off the input path, so startup does not settle the pending

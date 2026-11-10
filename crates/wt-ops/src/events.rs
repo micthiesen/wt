@@ -180,7 +180,7 @@ pub async fn reconcile(context: &AppContext) -> Result<Reconciled> {
     let events_dir = events_directory(&context.config);
     let prior_state = wt_events::read_state(&events_dir).await.ok().flatten();
     if prior_state.as_ref().is_some_and(|state| {
-        state.writer_sha.as_deref() == Some(build.as_str()) && state.pid.is_some_and(pid_alive)
+        state.writer_sha.as_deref() == Some(build.as_str()) && daemon_alive(state)
     }) {
         return Ok(Reconciled::Current);
     }
@@ -341,15 +341,7 @@ async fn unload_agent(context: &AppContext, plist: &Path) -> Result<()> {
     let prior_state = wt_events::read_state(&events_directory(&context.config))
         .await
         .context("read GitHub events daemon state before unload")?;
-    let mut known_pids = Vec::new();
-    if let Some(pid) = prior_launchd.pid {
-        known_pids.push(pid);
-    }
-    if let Some(pid) = prior_state.and_then(|state| state.pid)
-        && !known_pids.contains(&pid)
-    {
-        known_pids.push(pid);
-    }
+    let known_pids = known_daemon_pids(prior_launchd.pid, prior_state.as_ref());
 
     let unload = launchctl(context, "unload", plist).await;
     let unload_error = match unload {
@@ -408,6 +400,72 @@ async fn unload_agent(context: &AppContext, plist: &Path) -> Result<()> {
             _ = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
     }
+}
+
+/// The PIDs an unload must see exit: the one launchd runs the job as, and
+/// the one the daemon recorded for itself while that daemon still runs.
+fn known_daemon_pids(
+    launchd: Option<u32>,
+    state: Option<&wt_events::EventDaemonState>,
+) -> Vec<u32> {
+    let mut pids = Vec::from_iter(launchd);
+    if let Some(pid) = state
+        .filter(|state| daemon_alive(state))
+        .and_then(|state| state.pid)
+        && !pids.contains(&pid)
+    {
+        pids.push(pid);
+    }
+    pids
+}
+
+/// Whether the daemon that wrote `state` is still running. `state.json`
+/// keeps the daemon's PID after it exits, and the number can later belong to
+/// an unrelated process. The daemon records `startedAt` after its own
+/// process began, and a process given the PID afterwards began later than
+/// that, so the process start time tells the two apart without the daemon
+/// having to clean up on the way out (it may be killed, or be an older
+/// build). Without a readable start time the PID alone decides, as before.
+fn daemon_alive(state: &wt_events::EventDaemonState) -> bool {
+    let Some(pid) = state.pid else {
+        return false;
+    };
+    if !pid_alive(pid) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(recorded) = state.started_at {
+        // Another user's process cannot be read, and it cannot be this
+        // user's launch agent either.
+        return process_started_ms(pid).is_some_and(|started| started <= recorded);
+    }
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn process_started_ms(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the kernel writes at most `size` bytes into `info` and reports
+    // how many; the struct is read only when it was filled completely.
+    let info = unsafe {
+        let written = libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        );
+        if written != size {
+            return None;
+        }
+        info.assume_init()
+    };
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000)
+            .saturating_add(info.pbi_start_tvusec / 1_000),
+    )
 }
 
 #[derive(Default)]
@@ -569,7 +627,7 @@ pub async fn status(context: &AppContext) -> Result<()> {
         println!("[github.events] not configured");
         return Ok(());
     }
-    let state_alive = state.as_ref().and_then(|s| s.pid).is_some_and(pid_alive);
+    let state_alive = state.as_ref().is_some_and(daemon_alive);
     let config = events.unwrap();
     println!("GitHub events daemon");
     println!(
@@ -617,7 +675,7 @@ pub async fn status(context: &AppContext) -> Result<()> {
             "  last fetch   {}",
             state.last_fetch_at.map_or("never".into(), ago)
         );
-        if state.pid.is_some_and(pid_alive)
+        if daemon_alive(&state)
             && state.writer_sha.as_deref() != Some(agent_build(&context.home).await.as_str())
         {
             println!("  daemon build stale; run `wt events restart`");
@@ -728,9 +786,8 @@ async fn wait_for_new_daemon(
         let state = wt_events::read_state(&events_dir).await.ok().flatten();
         if state.as_ref().is_some_and(|state| {
             state.writer_sha.as_deref() == Some(build)
-                && state
-                    .pid
-                    .is_some_and(|pid| Some(pid) != prior_pid && pid_alive(pid))
+                && state.pid != prior_pid
+                && daemon_alive(state)
         }) {
             return Ok(());
         }
@@ -1069,6 +1126,29 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "no secret");
         assert_eq!(*steps.lock().unwrap(), ["unload", "install", "load"]);
+    }
+
+    /// `state.json` keeps the daemon's PID after it exits. This process
+    /// stands in for an unrelated one that was later given the same number.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reused_daemon_pid_is_not_the_daemon() {
+        let recorded = |started_at| wt_events::EventDaemonState {
+            pid: Some(std::process::id()),
+            started_at: Some(started_at),
+            ..Default::default()
+        };
+        let gone = recorded(now_millis() - 86_400_000);
+        assert!(known_daemon_pids(None, Some(&gone)).is_empty());
+        // launchd's own PID for the job is never second-guessed.
+        assert_eq!(known_daemon_pids(Some(7), Some(&gone)), [7]);
+        // A daemon records its start after its process began, so one that
+        // is still running, hung or not, keeps blocking the unload.
+        let running = recorded(now_millis());
+        assert_eq!(
+            known_daemon_pids(None, Some(&running)),
+            [std::process::id()]
+        );
     }
 
     #[test]

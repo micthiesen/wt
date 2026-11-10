@@ -4,10 +4,6 @@
 //! whose request began before a local write can never confirm that write.
 use std::{
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,7 +11,7 @@ use notify::{RecursiveMode, Watcher};
 use tokio::time::Instant;
 use wt_events::GithubSnapshot;
 use wt_github::GithubData;
-use wt_runtime::{SourceHandle, Stamp, TaskScope};
+use wt_runtime::{Request, SourceHandle, Stamp, TaskScope};
 
 use wt_app_core::context::AppContext;
 
@@ -136,14 +132,9 @@ fn validate(
 }
 
 /// Ask the GitHub leaf to recheck the daemon snapshot when it changes, and on
-/// a slow backstop. `file_event` marks these requests so a recheck that finds
+/// a slow backstop. These are `Request::Recheck`, so a recheck that finds
 /// nothing usable does not become a network read by itself.
-pub fn watch(
-    scope: &TaskScope,
-    context: &AppContext,
-    github: SourceHandle<GithubData>,
-    file_event: Arc<AtomicBool>,
-) {
+pub fn watch(scope: &TaskScope, context: &AppContext, github: SourceHandle<GithubData>) {
     if context.config.github.events.is_none() {
         return;
     }
@@ -151,7 +142,6 @@ pub fn watch(
     let cancellation = scope.token();
     scope.spawn(async move {
         let notify = github.clone();
-        let notify_hint = file_event.clone();
         let watcher = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&directory)?;
             let mut watcher = wt_app_core::watcher::new(
@@ -161,8 +151,7 @@ pub fn watch(
                         if !event.paths.is_empty()
                             && !event.paths.iter().any(|path| snapshot_event(path)) => {}
                     _ => {
-                        notify_hint.store(true, Ordering::Release);
-                        notify.refresh();
+                        notify.request(Request::Recheck);
                     }
                 },
             )?;
@@ -182,8 +171,7 @@ pub fn watch(
             tokio::select! { biased;
                 _ = cancellation.cancelled() => break,
                 _ = interval.tick() => {
-                    file_event.store(true, Ordering::Release);
-                    github.refresh();
+                    github.request(Request::Recheck);
                 }
             }
         }

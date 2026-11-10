@@ -127,7 +127,7 @@ fn visit_keys(
         | UiAction::Restack { key }
         | UiAction::PrepareRestoreRemoved { key }
         | UiAction::RestoreRemoved { key, .. }
-        | UiAction::ToggleRemovedAutomations { key }
+        | UiAction::ToggleRemovedAutomations { key, .. }
         | UiAction::SetTitle { key, .. }
         | UiAction::OpenEditor { key }
         | UiAction::PrepareRemove { key }

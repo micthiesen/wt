@@ -12,6 +12,6 @@ pub use mainline::{
 pub use origin::{FetchOriginOptions, FetchOriginReport};
 pub use repository::{
     DiffStats, GitRepository, RepositoryConfig, RepositoryError, RepositoryKind, StageConfig,
-    WorktreeRecord, WorktreeSnapshot, operation_in_progress,
+    WorktreeRecord, WorktreeSnapshot, operation_in_progress, stack_parent_refs,
 };
 pub use status::GitStatus;

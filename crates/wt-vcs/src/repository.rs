@@ -737,6 +737,17 @@ pub(crate) async fn git_metadata_paths(path: &Path) -> (Option<PathBuf>, Option<
     (git_dir, common_dir)
 }
 
+/// The main-clone refs that keep a stack parent standing. While either
+/// exists and the parent is not proven merged, its children still build on
+/// commits only it carries, so they stay stacked on it. Removal and restack
+/// both decide "the parent is gone" from this list.
+pub fn stack_parent_refs(branch: &str) -> [String; 2] {
+    [
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    ]
+}
+
 /// A rebase, merge, cherry-pick or revert is stopped in this checkout. Its
 /// HEAD is then transient (a rebase starts by checking out its target), so
 /// no landing or cleanup decision may be read from it. Without a known git

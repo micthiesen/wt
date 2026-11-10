@@ -26,6 +26,11 @@ use super::{
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const START_POLL: Duration = Duration::from_millis(200);
 const PANE_TAIL: u32 = 8;
+/// The deterministic session id of the checkout and name a Claude slot was
+/// created for. tmux names are one flat space shared with every other slot
+/// kind, so the name alone does not say whose session it is.
+const CLAUDE_SLOT_OPTION: &str = "@wt-claude-session-id";
+const HARNESS_SLOT_OPTION: &str = "@wt-harness-session-id";
 const CLAUDE_ENV_TO_CLEAR: &[&str] = &[
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -223,18 +228,18 @@ impl ClaudeSessionManager {
         if let Some(found) = exact.into_iter().next() {
             return Ok(Some(found));
         }
-        // A primary may adopt a pre-wt process only when cwd identifies it
-        // unambiguously. Named slots always require their deterministic UUID.
-        if target.managed_name.is_some() {
-            return Ok(None);
-        }
+        // Claude rewrites `sessionId` when the conversation in a process
+        // changes (`/clear`, `/resume`) and keeps the name it was launched
+        // with, so the slot's own name still identifies its live process. A
+        // primary may also adopt a pre-wt process when cwd identifies it
+        // unambiguously.
         let candidates: Vec<_> = all
             .into_iter()
             .filter(|s| {
                 s.cwd == cwd
-                    && (s.name.is_none()
-                        || s.name.as_deref() == Some("primary")
-                        || s.name.as_deref() == Some(&tmux_name))
+                    && (s.name.as_deref() == Some(&tmux_name)
+                        || (target.managed_name.is_none()
+                            && (s.name.is_none() || s.name.as_deref() == Some("primary"))))
             })
             .collect();
         if candidates.len() > 1 {
@@ -308,7 +313,48 @@ impl ClaudeSessionManager {
         .await?;
         let name = self.tmux_name(target);
         if self.tmux.session_exists(&name, cancel).await? {
+            self.refuse_foreign_slot("stop", target, cancel).await?;
             self.tmux.kill_session(&name, cancel).await?;
+        }
+        Ok(())
+    }
+
+    /// Whose slot the tmux session with this target's name is. `None` is a
+    /// session with no recorded identity, which is how Claude slots created
+    /// before the stamp existed look.
+    async fn slot_is_own(
+        &self,
+        target: &ClaudeSessionTarget,
+        cancel: &CancellationToken,
+    ) -> Result<Option<bool>, ClaudeSessionManagerError> {
+        let scope = OptionScope::Session(self.tmux_name(target));
+        if let Some(stamp) = self
+            .tmux
+            .get_option(&scope, CLAUDE_SLOT_OPTION, cancel)
+            .await?
+        {
+            let expected =
+                claude_session_id(&canonical(&target.cwd), target.managed_name.as_deref());
+            return Ok(Some(stamp == expected));
+        }
+        Ok(self
+            .tmux
+            .get_option(&scope, HARNESS_SLOT_OPTION, cancel)
+            .await?
+            .map(|_| false))
+    }
+
+    /// Worktree `x-codex` and the Codex slot of worktree `x` share one tmux
+    /// name. Refuse to stop or type into a session recorded as another
+    /// slot's, which would kill or prompt that worktree's agent.
+    pub(super) async fn refuse_foreign_slot(
+        &self,
+        operation: &'static str,
+        target: &ClaudeSessionTarget,
+        cancel: &CancellationToken,
+    ) -> Result<(), ClaudeSessionManagerError> {
+        if self.slot_is_own(target, cancel).await? == Some(false) {
+            return Err(foreign_slot(operation, &self.tmux_name(target)));
         }
         Ok(())
     }
@@ -341,6 +387,7 @@ impl ClaudeSessionManager {
                 ),
             ));
         }
+        self.refuse_foreign_slot("stop", target, cancel).await?;
         self.tmux
             .kill_session(&self.tmux_name(target), cancel)
             .await?;
@@ -392,13 +439,17 @@ impl ClaudeSessionManager {
     ) -> Result<Vec<PathBuf>, ClaudeSessionManagerError> {
         reap_claude_names(&self.paths.cache_dir, live_slugs)
             .map_err(|error| operation("reap", error.to_string()))?;
-        // A handoff outlives its launch only if wt or tmux died before the
-        // pane read it. Registration has long finished by this age.
+        self.reap_handoffs();
+        self.reap_inspector_sockets(cancel).await
+    }
+
+    /// A handoff outlives its launch only if wt or tmux died before the pane
+    /// read it. Registration has long finished by this age.
+    fn reap_handoffs(&self) {
         auth::reap_stale_handoffs(
             &self.paths.cache_dir.join("auth"),
             self.start_timeout.max(Duration::from_secs(60)) * 2,
         );
-        self.reap_inspector_sockets(cancel).await
     }
 
     pub fn tmux_name(&self, target: &ClaudeSessionTarget) -> String {
@@ -411,6 +462,9 @@ impl ClaudeSessionManager {
         cancel: &CancellationToken,
     ) -> Result<(ClaudeSessionInfo, bool), ClaudeSessionManagerError> {
         let name = self.tmux_name(target);
+        // The only regular caller of the handoff reaper: every cold start of
+        // any slot removes tokens left by a wt that died mid-launch.
+        self.reap_handoffs();
         // Query the explicit tmux server before touching the socket path.
         // Errors propagate, preventing a duplicate cold start on uncertainty.
         let existed = self.tmux.session_exists(&name, cancel).await?;
@@ -441,6 +495,11 @@ impl ClaudeSessionManager {
             return Ok((session, started));
         }
         if started {
+            // Only a session stamped at creation as this slot is known to
+            // hold nothing but a Claude that never registered.
+            if self.slot_is_own(target, cancel).await? != Some(true) {
+                return Err(foreign_slot("start", &name));
+            }
             let before = self.pane_tail(&name, cancel).await;
             // Select the account before stopping the unregistered slot, so a
             // failing helper leaves it exactly as it was.
@@ -627,19 +686,15 @@ impl ClaudeSessionManager {
             width: Some(200),
             height: Some(50),
         };
-        self.tmux.create_session(&create, cancel).await?;
+        let slot = claude_session_id(&create.cwd, target.managed_name.as_deref());
+        let mut options = vec![(CLAUDE_SLOT_OPTION, slot.as_str())];
         if handoff.is_some() {
             // Recorded for the restart notice only; Claude has its token.
-            let _ = self
-                .tmux
-                .set_option(
-                    &OptionScope::Session(tmux_name.to_owned()),
-                    LAUNCH_AUTH_OPTION,
-                    Some(LAUNCH_AUTH_TOKEN_COMMAND),
-                    cancel,
-                )
-                .await;
+            options.push((LAUNCH_AUTH_OPTION, LAUNCH_AUTH_TOKEN_COMMAND));
         }
+        self.tmux
+            .create_session_with_options(&create, &options, cancel)
+            .await?;
         Ok(())
     }
 
@@ -707,7 +762,7 @@ fn info_from_registry(r: RegistrySession) -> ClaudeSessionInfo {
     }
 }
 
-fn canonical(path: &Path) -> PathBuf {
+pub(super) fn canonical(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_owned()
@@ -715,6 +770,14 @@ fn canonical(path: &Path) -> PathBuf {
             std::env::current_dir().unwrap_or_default().join(path)
         }
     })
+}
+fn foreign_slot(operation: &'static str, name: &str) -> ClaudeSessionManagerError {
+    self::operation(
+        operation,
+        format!(
+            "tmux session {name} is not recorded as this worktree's Claude session and was left running. Another worktree's agent, dev server or shell owns the name when one slug is the other plus -codex, -pi, -opencode, -dev or -shell. A Claude session started by an older wt carries no record either: stop it and retry"
+        ),
+    )
 }
 fn operation(operation: &'static str, detail: impl Into<String>) -> ClaudeSessionManagerError {
     ClaudeSessionManagerError::Operation {
@@ -1297,7 +1360,7 @@ exec /bin/sleep 30
                 .with_config_file("/dev/null"),
         );
         let cancel = CancellationToken::new();
-        tmux.create_session(
+        tmux.create_session_with_options(
             &CreateSession {
                 name: "wt".into(),
                 cwd: wt_source.clone(),
@@ -1305,6 +1368,10 @@ exec /bin/sleep 30
                 width: None,
                 height: None,
             },
+            &[(
+                CLAUDE_SLOT_OPTION,
+                &claude_session_id(&canonical(&wt_source), None),
+            )],
             &cancel,
         )
         .await
@@ -1411,5 +1478,162 @@ exec /bin/sleep 30
             "{wt}"
         );
         assert!(!ordinary.contains("--permission-mode"), "{ordinary}");
+    }
+
+    #[cfg(unix)]
+    fn fixture_manager(tmp: &Path) -> (ClaudeSessionManager, TmuxClient, ClaudePaths) {
+        let paths = ClaudePaths::new(tmp.join("home"), tmp.join("cache"));
+        let tmux = TmuxClient::new(
+            ProcessRunner::new(NonZeroUsize::new(4).unwrap()),
+            TmuxServer::at(tmp.join("tmux.sock"))
+                .with_cwd(tmp)
+                .with_config_file("/dev/null"),
+        );
+        let manager = ClaudeSessionManager::new(ClaudeHarness::new(paths.clone()), tmux.clone())
+            .with_start_timeout(Duration::from_millis(500))
+            .with_spawn_path("/usr/bin:/bin");
+        (manager, tmux, paths)
+    }
+
+    #[cfg(unix)]
+    async fn fixture_session(tmux: &TmuxClient, name: &str, cwd: &Path, stamp: &[(&str, &str)]) {
+        tmux.create_session_with_options(
+            &CreateSession {
+                name: name.into(),
+                cwd: cwd.to_owned(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                width: None,
+                height: None,
+            },
+            stamp,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn tmux_session_id(tmux: &TmuxClient, name: &str) -> Option<String> {
+        tmux.list_sessions(&CancellationToken::new())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|session| session.name == name)
+            .map(|session| session.id)
+    }
+
+    /// `/clear` or `/resume` inside a named slot makes Claude rewrite its
+    /// registry `sessionId`. The slot is still live: it is adopted, never
+    /// killed and resumed on the old transcript.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_named_slot_whose_conversation_changed_is_live_not_recycled() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let own = claude_session_id(&cwd, Some("review"));
+        fixture_session(&tmux, "repo~review", &cwd, &[(CLAUDE_SLOT_OPTION, &own)]).await;
+        let before = tmux_session_id(&tmux, "repo~review").await;
+        fs::create_dir_all(paths.sessions_dir()).unwrap();
+        // This test process stands in for the live Claude.
+        fs::write(
+            paths
+                .sessions_dir()
+                .join(format!("{}.json", std::process::id())),
+            serde_json::json!({"pid": std::process::id(), "sessionId": "after-clear",
+                "cwd": cwd, "name": "repo~review", "status": "idle",
+                "startedAt": 1, "updatedAt": 2})
+            .to_string(),
+        )
+        .unwrap();
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd,
+            managed_name: Some("review".into()),
+        };
+        let ensured = manager.ensure(&target, &cancel).await;
+        let after = tmux_session_id(&tmux, "repo~review").await;
+        let _ = tmux.kill_server(&cancel).await;
+        assert_eq!(after, before, "the live slot was recycled");
+        let (session, cold) = ensured.unwrap();
+        assert_eq!(session.session_id, "after-clear");
+        assert!(!cold);
+    }
+
+    /// Worktree `x-codex` has the tmux name of worktree `x`'s Codex slot. A
+    /// session that is not recorded as this Claude slot is never recycled,
+    /// and one recorded as another slot is never stopped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_session_owned_by_another_slot_is_never_recycled_or_stopped() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, _) = fixture_manager(tmp.path());
+        let cancel = CancellationToken::new();
+        fixture_session(
+            &tmux,
+            "x-codex",
+            tmp.path(),
+            &[(HARNESS_SLOT_OPTION, "codex-thread")],
+        )
+        .await;
+        fixture_session(&tmux, "x-dev", tmp.path(), &[]).await;
+        let before = (
+            tmux_session_id(&tmux, "x-codex").await,
+            tmux_session_id(&tmux, "x-dev").await,
+        );
+        let target = |slug: &str| ClaudeSessionTarget {
+            slug: slug.into(),
+            cwd: tmp.path().to_owned(),
+            managed_name: None,
+        };
+        let codex = manager.ensure(&target("x-codex"), &cancel).await;
+        let dev = manager.ensure(&target("x-dev"), &cancel).await;
+        let stopped = manager.stop(&target("x-codex"), &cancel).await;
+        let after = (
+            tmux_session_id(&tmux, "x-codex").await,
+            tmux_session_id(&tmux, "x-dev").await,
+        );
+        let _ = tmux.kill_server(&cancel).await;
+        assert_eq!(after, before, "another slot's session was killed");
+        for refused in [codex.err(), dev.err(), stopped.err()] {
+            let refused = refused.expect("refused").to_string();
+            assert!(refused.contains("left running"), "{refused}");
+        }
+    }
+
+    /// A token handoff left by a wt that died mid-launch is removed by the
+    /// next cold start of any slot; a launch in progress keeps its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cold_start_reaps_token_handoffs_left_by_a_dead_launch() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        let cancel = CancellationToken::new();
+        let auth = paths.cache_dir.join("auth");
+        fs::create_dir_all(&auth).unwrap();
+        let (stale, fresh) = (auth.join("old~slot.1.token"), auth.join("new.1.token"));
+        fs::write(&stale, "secret\n").unwrap();
+        fs::write(&fresh, "secret\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        // The start itself fails: this fixture has no `claude` to run.
+        let _ = manager
+            .ensure(
+                &ClaudeSessionTarget {
+                    slug: "repo".into(),
+                    cwd: tmp.path().to_owned(),
+                    managed_name: None,
+                },
+                &cancel,
+            )
+            .await;
+        let _ = tmux.kill_server(&cancel).await;
+        assert!(!stale.exists(), "the stale handoff survived a cold start");
+        assert!(fresh.exists());
     }
 }

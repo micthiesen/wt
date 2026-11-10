@@ -347,3 +347,37 @@ async fn only_a_slow_fetch_reads_as_refreshing_and_a_skip_publishes_nothing() {
     assert_eq!(*source.snapshot().state(), SourceState::Ready);
     scope.shutdown(Duration::from_secs(1)).await.unwrap();
 }
+
+/// A recheck hint that shares a fetch with a refresh must not describe the
+/// whole fetch: the fetch is told the strongest reason it serves.
+#[tokio::test(start_paused = true)]
+async fn coalesced_requests_reach_the_fetch_as_their_strongest_reason() {
+    use wt_runtime::Request;
+    let scope = TaskScope::new();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let policy = RefreshPolicy {
+        debounce: Duration::from_millis(100),
+        minimum_interval: Duration::ZERO,
+    };
+    let source = wt_runtime::start_requested_source(&scope, spec::<()>(policy), {
+        let seen = seen.clone();
+        move |request, _| {
+            seen.lock().unwrap().push(request);
+            async { Ok::<_, &str>(None) }
+        }
+    });
+    source.refresh();
+    source.request(Request::Recheck);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    source.request(Request::Recheck);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    source.request(Request::Recheck);
+    source.request(Request::Direct);
+    source.refresh();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [Request::Refresh, Request::Recheck, Request::Direct]
+    );
+    scope.shutdown(Duration::from_secs(1)).await.unwrap();
+}

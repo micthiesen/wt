@@ -5,6 +5,10 @@ use super::{
 };
 use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 
+/// How long a confirmation the user did not ask for ignores the keys that
+/// commit it. It can appear under a key already on its way to the board.
+pub(crate) const CONFIRM_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
 impl Model {
     /// Something other than the board takes the next key: a menu, overlay or
     /// prompt that is open, or a host menu still loading. A confirm opened
@@ -28,10 +32,45 @@ impl Model {
         }
         if let Some((prompt, host)) = self.removal_reviews.pop_front() {
             self.interaction_host = host;
-            self.interaction = Interaction::Confirm(prompt);
+            self.interaction = self.reply_confirm(prompt, false);
         }
     }
-    pub fn reply(&mut self, mut reply: UiReply) -> Option<crate::TerminalHandoff> {
+
+    /// A confirmation that arrived in a reply. One the user did not ask for
+    /// (a hazard review, a dialog answering some other request) can appear
+    /// under a key meant for the board, so the keys that commit it wait out
+    /// [`CONFIRM_SETTLE`]. Cancelling and scrolling work at once.
+    fn reply_confirm(&mut self, prompt: ConfirmPrompt, requested: bool) -> Interaction {
+        self.confirm_settles_at =
+            (!requested).then(|| tokio::time::Instant::now() + CONFIRM_SETTLE);
+        Interaction::Confirm(prompt)
+    }
+
+    /// The user is back from a session. A confirmation that opened while
+    /// they were away is new to them now.
+    pub(crate) fn restart_confirm_settle(&mut self) {
+        if self.confirm_settles_at.is_some() {
+            self.confirm_settles_at = Some(tokio::time::Instant::now() + CONFIRM_SETTLE);
+        }
+    }
+
+    pub fn reply(&mut self, reply: UiReply) -> Option<crate::TerminalHandoff> {
+        self.reply_from(reply, false)
+    }
+
+    /// Open a modal built from the board for the key being dispatched.
+    pub(super) fn show_modal(&mut self, modal: UiModal, host: Option<String>) {
+        self.reply_from(
+            UiReply {
+                modal: Some(modal),
+                modal_host: host,
+                ..Default::default()
+            },
+            true,
+        );
+    }
+
+    fn reply_from(&mut self, mut reply: UiReply, by_key: bool) -> Option<crate::TerminalHandoff> {
         if let Some(progress) = reply.progress.take() {
             if self.pending_request.as_ref().is_some_and(|request| {
                 Some(request.id) == reply.operation_id
@@ -62,6 +101,13 @@ impl Model {
             self.creation_prepared(reply.operation_id, prepared);
             return None;
         }
+        if self
+            .cancelled_menu
+            .as_ref()
+            .is_some_and(|menu| Some(menu.id) == reply.operation_id)
+        {
+            self.cancelled_menu = None;
+        }
         let mut completed_request = if self
             .pending_request
             .as_ref()
@@ -82,6 +128,18 @@ impl Model {
                 )
             })
             .filter(|(keys, _, _)| !keys.is_empty());
+        // A confirm is the user's own when the menu they asked for is one. A
+        // palette request asks for a list or a prompt, never for a confirm.
+        let requested_menu = by_key
+            || completed_request.as_ref().is_some_and(|request| {
+                request.generation == self.ui_generation
+                    && request.preparation
+                    && !matches!(
+                        request.action,
+                        crate::UiAction::PrepareActions { .. }
+                            | crate::UiAction::PrepareAction { .. }
+                    )
+            });
         let selected_create = self.reply_pending(&reply);
         let (stale, stale_id, stale_message) =
             (reply.stale, reply.operation_id, reply.message.clone());
@@ -141,7 +199,24 @@ impl Model {
             self.history.active = false;
         }
         if reply.modal.is_some() && presentation_current {
+            // A dialog answering the request in flight must not discard a
+            // removal review already on screen; the review waits its turn.
+            if matches!(
+                &self.interaction,
+                Interaction::Confirm(ConfirmPrompt {
+                    action: crate::ConfirmAction::Remove {
+                        revision: Some(_),
+                        ..
+                    },
+                    ..
+                })
+            ) && let Interaction::Confirm(prompt) = std::mem::take(&mut self.interaction)
+            {
+                self.removal_reviews
+                    .push_front((prompt, self.interaction_host.take()));
+            }
             self.interaction_host = reply.modal_host;
+            self.confirm_settles_at = None;
         }
         if reply.handoff.is_some() {
             // Entering a session (perf `i` included) closes the overlays so
@@ -233,13 +308,16 @@ impl Model {
                 title,
                 lines,
                 cancel_key,
-            }) => Interaction::Confirm(ConfirmPrompt {
-                action,
-                title,
-                lines,
-                selected: 0,
-                cancel_key,
-            }),
+            }) => self.reply_confirm(
+                ConfirmPrompt {
+                    action,
+                    title,
+                    lines,
+                    selected: 0,
+                    cancel_key,
+                },
+                requested_menu,
+            ),
             Some(UiModal::Picker {
                 action,
                 title,
@@ -297,9 +375,11 @@ impl Model {
             }
         }
         if let Some((keys, started, overflow)) = typeahead {
+            // A confirm the user did not ask for takes none of it.
             if presentation_current
                 && !reply.failed
                 && !matches!(self.interaction, Interaction::None)
+                && self.confirm_settles_at.is_none()
                 && started.elapsed() <= super::input::TYPEAHEAD_TTL
             {
                 self.replay_typeahead(keys);
@@ -323,7 +403,7 @@ impl Model {
 
     /// Report what happened to typeahead without hiding the reply's own
     /// message; the keys are secondary.
-    fn append_typeahead_notice(&mut self, notice: &str) {
+    pub(super) fn append_typeahead_notice(&mut self, notice: &str) {
         let text = match self.toast.take() {
             Some((text, _)) if !text.trim().is_empty() => format!("{text}; {notice}"),
             _ => {

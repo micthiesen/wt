@@ -44,14 +44,20 @@ release tag, full build ID, and target architecture.
 The launcher performs a config-free boot probe before dispatching user
 arguments. It checks the candidate's compiled build and target. A new version
 is pending until the application confirms startup using the same unique attempt
-token. If the pending binary fails before confirmation, the launcher selects
-the prior fallback on the next launch. Once an ordinary command has started,
+token. A process whose token is not the pending attempt, such as a worker
+started by a tmux server that inherited an earlier launch's token, confirms
+nothing, changes no state and runs normally. If the pending binary fails
+before confirmation, the launcher selects the prior fallback on the next
+launch. Once an ordinary command has started,
 its exit status does not trigger rollback or argument replay. Explicit early
 startup failure can restore the fallback immediately. On Unix the launcher
 dispatches with `exec`, so the application keeps the launcher's PID and
 receives signals sent to it (launchd's SIGTERM, terminal hangups) directly.
 
 Update-state transitions use an OS file lock and atomic state-file replacement.
+Every launcher start holds that lock for one read, so a transition waits up to
+3 seconds for it rather than failing as busy; a second installer is refused by
+the separate install lock.
 Downloads and archive validation happen before activation. Extraction rejects
 path traversal, links, unexpected files, and mismatched size or digest. The
 candidate is placed in its immutable directory before state points at it, so a

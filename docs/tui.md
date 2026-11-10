@@ -125,7 +125,13 @@ absent and unlisted. Removing rows survive restart, even after partial deletion.
 the list only after the worker confirms success and inventory drops it. A request
 cancelled before worker startup restores the normal name style. Delayed hazard reviews are queued separately for each checkout
 and host. They appear one at a time after the current menu closes; navigation
-does not discard them. Each confirmation still rechecks its checkout witness.
+does not discard them, and neither does a dialog that another request opens
+over one. Each confirmation still rechecks its checkout witness.
+A confirmation you did not ask for (a hazard review, a sign-in prompt, or a
+"Stop …?" prompt answering a palette key) ignores Enter and `y` for its first
+400 ms, with a notice, so a key meant for the board cannot confirm it. Cancel
+and scroll keys work at once. A confirmation that opened while you were in a
+session waits again when you return.
 Commands taking more than three seconds show elapsed progress. A queued command
 names the conflicting operation or capacity wait; this is progress, not a
 completed request. Independent controls do not wait for checkout creation.
@@ -417,10 +423,19 @@ action arguments, reviewers, failed checks, fleet cleanup, retained or remote
 terminals) show
 `Loading menu… Esc cancels`. Keys typed meanwhile belong to that menu, never to
 the board: they replay in order once it opens, so a fast `; d` or `! m` acts
-inside the menu. Escape, `q`, Ctrl+C, or the menu's own key cancels it.
+inside the menu. Escape, `q`, Ctrl+C, or the menu's own key cancels it; for
+a text prompt (an action's argument or extra instructions, a new worktree on
+another host) the menu's own key is text instead. After a cancel, keys are
+still dropped, with a notice, until the cancelled request answers or two
+seconds have passed since it was sent, so the rest of what was typed for the
+menu cannot act on the board.
 Replay stops if the menu closes. Keys are dropped, with a notice, when the
-menu fails or takes longer than two seconds. Mouse wheel input still acts
+menu fails, takes longer than two seconds, or answers with a confirmation
+instead of the menu that was asked for. Mouse wheel input still acts
 where the pointer is and abandons the loading menu.
+Host replies are still applied while a session holds the terminal, so a
+worktree created just before entering a session starts its checkout without
+waiting for you to come back.
 
 The session picker runs on the selected host. A running Codex, OpenCode, or Pi slot
 whose conversation UUID cannot be proven appears as **current session

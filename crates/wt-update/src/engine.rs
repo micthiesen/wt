@@ -30,6 +30,13 @@ impl InstallManager {
         &self.store
     }
 
+    /// Every launcher start holds the state lock for one read, so a
+    /// transition waits out that window instead of failing as busy. A
+    /// concurrent installer is refused by the install lock, not this one.
+    fn transition_lock(&self) -> Result<crate::store::StateLock, StoreError> {
+        self.store.lock_wait(std::time::Duration::from_secs(3))
+    }
+
     /// Install already-verified bytes into a new immutable version directory
     /// and mark it pending. The launcher decides whether it can boot it.
     pub fn install_verified(
@@ -58,7 +65,7 @@ impl InstallManager {
             sync_directory(&bin).map_err(|source| io_error(&bin, source))?;
             let parent = version_dir.parent().expect("version path has parent");
             fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
-            let _lock = self.store.lock()?;
+            let _lock = self.transition_lock()?;
             let previous_state = self.store.load()?;
             if version_dir.exists() {
                 if previous_state.current.as_ref() == Some(&release.version) {
@@ -121,7 +128,7 @@ impl InstallManager {
         token: &str,
         now_unix: u64,
     ) -> Result<(), BootTransitionError> {
-        let _lock = self.store.lock_wait(std::time::Duration::from_secs(3))?;
+        let _lock = self.transition_lock()?;
         let mut state = self.store.load()?;
         if state.pending_boot.is_none()
             && state.current.as_ref() == Some(version)
@@ -165,7 +172,7 @@ impl InstallManager {
         detail: String,
         now_unix: u64,
     ) -> Result<Option<VersionId>, BootTransitionError> {
-        let _lock = self.store.lock()?;
+        let _lock = self.transition_lock()?;
         let mut state = self.store.load()?;
         let pending = state
             .pending_boot
@@ -197,7 +204,7 @@ impl InstallManager {
         token: &str,
         now_unix: u64,
     ) -> Result<Option<VersionId>, BootTransitionError> {
-        let _lock = self.store.lock()?;
+        let _lock = self.transition_lock()?;
         let mut state = self.store.load()?;
         let pending = state
             .pending_boot
@@ -225,7 +232,7 @@ impl InstallManager {
         if !crate::validate_component(build_id) {
             return Err(InstallError::InvalidBuildId);
         }
-        let _lock = self.store.lock()?;
+        let _lock = self.transition_lock()?;
         let mut state = self.store.load()?;
         state.declined_build_id = Some(build_id.into());
         self.store.save(&state)?;
@@ -234,7 +241,7 @@ impl InstallManager {
 
     /// Record the channel and the last attempted check in one durable write.
     pub fn record_check(&self, channel: crate::Channel, now_unix: u64) -> Result<(), InstallError> {
-        let _lock = self.store.lock()?;
+        let _lock = self.transition_lock()?;
         let mut state = self.store.load()?;
         state.channel = channel;
         state.last_check_unix = Some(now_unix);
@@ -258,7 +265,7 @@ impl InstallManager {
         if !paths.app_binary(version).is_file() || !paths.launcher_binary(version).is_file() {
             return Err(InstallError::VersionFilesMissing(version.clone()));
         }
-        let _lock = self.store.lock()?;
+        let _lock = self.transition_lock()?;
         let mut state = self.store.load()?;
         let from = state.current.clone();
         if from.as_ref() == Some(version) {
@@ -467,5 +474,47 @@ mod tests {
         let state = manager.store().load().unwrap();
         assert_eq!(state.channel, crate::Channel::Preview);
         assert_eq!(state.last_check_unix, Some(123));
+    }
+
+    /// Every launcher start holds the state lock for one read.
+    #[test]
+    fn transitions_wait_out_a_briefly_held_state_lock() {
+        let dir = tempdir().unwrap();
+        let manager = InstallManager::new(InstallPaths::new(dir.path().join("install")).unwrap());
+        let hold = |manager: &InstallManager| {
+            let lock = manager.store().lock().unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                drop(lock);
+            })
+        };
+        let v1 = release("v1");
+        let held = hold(&manager);
+        manager.install_verified(&v1, "attempt1".into(), 1).unwrap();
+        held.join().unwrap();
+        let held = hold(&manager);
+        manager.record_check(crate::Channel::Preview, 2).unwrap();
+        held.join().unwrap();
+        let held = hold(&manager);
+        manager.decline("other").unwrap();
+        held.join().unwrap();
+        let held = hold(&manager);
+        manager
+            .report_boot_failure(&v1.version, "attempt1", "broken".into(), 3)
+            .unwrap();
+        held.join().unwrap();
+        manager
+            .install_verified(&release("v2"), "attempt2".into(), 4)
+            .unwrap();
+        let held = hold(&manager);
+        manager
+            .reject_unlaunchable(&release("v2").version, "attempt2", 5)
+            .unwrap();
+        held.join().unwrap();
+        let held = hold(&manager);
+        manager
+            .activate_existing(&v1.version, "attempt3".into(), 6)
+            .unwrap();
+        held.join().unwrap();
     }
 }

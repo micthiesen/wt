@@ -171,6 +171,19 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     }
 }
 
+/// Whether a board's rows were scanned live by this process: Git and
+/// metadata both live. Restored rows may name worktrees or issues that no
+/// longer exist, so a fetch keyed by them waits for this.
+pub(crate) fn rows_confirmed(board: &SourceSnapshot<Board>) -> bool {
+    let live = |domain| {
+        board
+            .domains()
+            .get(&domain)
+            .is_some_and(|meta| meta.is_live())
+    };
+    board.data().is_some() && live(wt_core::Domain::Git) && live(wt_core::Domain::Metadata)
+}
+
 fn project(
     scope: &TaskScope,
     local: SourceHandle<Board>,

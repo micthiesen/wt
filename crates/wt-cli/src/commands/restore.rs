@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::Args;
 use wt_core::{WorktreeRef, parse_worktree_ledger_key, worktree_target_key};
-use wt_lifecycle::{LifecycleService, ServiceConfig};
 
 use wt_app_core::context::AppContext;
 use wt_ops::commands::resolve::resolve_named_worktree;
@@ -25,12 +24,7 @@ pub async fn run(ctx: &AppContext, args: &RestoreArgs) -> Result<i32> {
             );
             return Ok(2);
         }
-        let key = args.target.clone();
-        let changed = ctx
-            .database
-            .call(move |store| Ok(store.set_archived(&key, false)?))
-            .await?;
-        if changed {
+        if super::archive::set_archived(ctx, args.target.clone(), false).await? {
             println!("✓ restored remote {host}/{slug}");
         } else {
             println!("remote {host}/{slug} is already active");
@@ -48,16 +42,13 @@ pub async fn run(ctx: &AppContext, args: &RestoreArgs) -> Result<i32> {
             return Ok(1);
         }
     };
-    let service = LifecycleService::new(
-        ServiceConfig::from_config(&ctx.config),
-        (*ctx.repository).clone(),
-        ctx.processes.clone(),
-    );
-    let key = worktree_target_key(&target);
-    if service.restore(&key, &ctx.cancellation).await? {
-        println!("✓ restored {}", target.slug());
-    } else {
-        println!("{} is already active", target.slug());
+    match super::archive::set_archived(ctx, worktree_target_key(&target), false).await {
+        Ok(true) => println!("✓ restored {}", target.slug()),
+        Ok(false) => println!("{} is already active", target.slug()),
+        Err(error) => {
+            eprintln!("{error:#}");
+            return Ok(1);
+        }
     }
     Ok(0)
 }

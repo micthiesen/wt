@@ -164,6 +164,7 @@ struct ActiveFire {
     slot: SlotState,
     /// When its intent first queued; a deferral keeps the age.
     queued_at_ms: i64,
+    settle_at_ms: i64,
 }
 
 /// Why a requeued fire is waiting, and whether its age was reported.
@@ -326,6 +327,50 @@ impl AutomationEngine {
     }
 
     pub async fn tick(&mut self, input: AutomationPassInput<'_>) -> Result<AutomationTick> {
+        let mut report = AutomationTick::default();
+        match self.pass(input, &mut report).await {
+            Ok(()) => Ok(report),
+            Err(error) => {
+                self.release_unstarted(report.claims).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Give back the claims a failed pass made. The caller never received
+    /// them, so no dispatch began and a release cannot replay one. Left
+    /// `dispatched`, they would hold their slots until restart and then
+    /// become `ambiguous`, which is never retried.
+    async fn release_unstarted(&mut self, claims: Vec<ClaimedFire>) {
+        // The pass usually failed because its own token was cancelled at quit.
+        let cancellation = CancellationToken::new();
+        for claim in claims {
+            let Some(active) = self.active.remove(&claim.id) else {
+                continue;
+            };
+            if let Err(error) = self
+                .ledger
+                .release_not_started(&active.claim, &cancellation)
+                .await
+            {
+                tracing::warn!(rule = %active.fire.rule.id, %error, "cannot release an automation claim that never started");
+            }
+            self.intents.insert(
+                claim.id,
+                AutomationIntent {
+                    fire: active.fire,
+                    queued_at_ms: active.queued_at_ms,
+                    settle_at_ms: active.settle_at_ms,
+                },
+            );
+        }
+    }
+
+    async fn pass(
+        &mut self,
+        input: AutomationPassInput<'_>,
+        report: &mut AutomationTick,
+    ) -> Result<()> {
         self.release_finished_slots(input.now_ms, input.activity);
         if !input.state_ready {
             // A transient store read failure must pause dispatch, not silently
@@ -333,14 +378,14 @@ impl AutomationEngine {
             // Git and metadata refresh often, so the queue keeps the last
             // pass's reasons; clearing them would flash requirement-held
             // intents into the reported queue on every refresh.
-            return Ok(AutomationTick::default());
+            return Ok(());
         }
         // Reasons describe this pass only.
         self.waiting.clear();
         self.unmet.clear();
         if input.globally_paused || !input.enabled {
             self.cancel_pending(input).await?;
-            return Ok(AutomationTick::default());
+            return Ok(());
         }
 
         for (rule_id, target) in evaluate_breaker_resets(input.rules, input.rows, input.context) {
@@ -373,6 +418,7 @@ impl AutomationEngine {
             .filter(|key| ledger.has_handled(key, input.now_ms))
             .collect::<BTreeSet<_>>();
         let executing = self.active.keys().cloned().collect::<BTreeSet<_>>();
+        let deferred = self.deferrals.keys().cloned().collect::<BTreeSet<_>>();
         let intents = queue_intents(QueueIntentsInput {
             existing: &existing,
             current: &current,
@@ -383,6 +429,7 @@ impl AutomationEngine {
             state_ready: true,
             handled: &handled,
             executing: &executing,
+            deferred: &deferred,
         });
         self.intents = intents
             .into_iter()
@@ -410,7 +457,6 @@ impl AutomationEngine {
             }
         }
 
-        let mut report = AutomationTick::default();
         for intent in queue {
             if self.active.len() >= MAX_CONCURRENT {
                 self.waiting.insert(
@@ -432,6 +478,10 @@ impl AutomationEngine {
                 });
             let breaker_exempt = breaker_exempt(&fire, manager_run);
 
+            if self.deferrals.contains_key(&id) && input.context.pauses.slugs.contains(&fire.slug) {
+                self.waiting.insert(id, "its worktree to be resumed".into());
+                continue;
+            }
             if fire
                 .quiesce_slugs
                 .iter()
@@ -622,6 +672,7 @@ impl AutomationEngine {
                             fire: fire.clone(),
                             slot: SlotState::Dispatching,
                             queued_at_ms: intent.queued_at_ms,
+                            settle_at_ms: intent.settle_at_ms,
                         },
                     );
                     report.claims.push(ClaimedFire { id, fire, claim });
@@ -629,7 +680,7 @@ impl AutomationEngine {
             }
         }
         report.pending = self.intents.len();
-        Ok(report)
+        Ok(())
     }
 
     /// Persist cancellation before dropping pending intents. Active claims
@@ -736,6 +787,45 @@ impl AutomationEngine {
             anyhow::bail!("automation dispatch claim identity does not match active fire");
         }
         let ledger_claim = active.claim.clone();
+        let slot = match &outcome {
+            AutomationOutcome::Delivered { slot } | AutomationOutcome::Ambiguous { slot, .. } => {
+                *slot
+            }
+            AutomationOutcome::NotStarted | AutomationOutcome::Deferred { .. } => {
+                DeliverySlot::None
+            }
+        };
+        let recorded = self
+            .record_outcome(claim, ledger_claim, outcome, now_ms, cancellation)
+            .await;
+        // A failed ledger write must not leave the slot `Dispatching`, which
+        // nothing else ever clears. The key stays handled in the ledger, so
+        // freeing the slot cannot run the fire again.
+        if recorded.is_err()
+            && self
+                .active
+                .get(&claim.id)
+                .is_some_and(|active| active.slot == SlotState::Dispatching)
+        {
+            self.finish_slot(&claim.id, slot, now_ms);
+        }
+        let notice = recorded?;
+        // Display only: the overlay's history shows the outcome now rather
+        // than at the next pass. A failed read keeps the older list.
+        if let Ok(ledger) = self.ledger.snapshot().await {
+            self.recent = ledger.recent(RECENT_HISTORY);
+        }
+        Ok(notice)
+    }
+
+    async fn record_outcome(
+        &mut self,
+        claim: &ClaimedFire,
+        ledger_claim: DispatchClaim,
+        outcome: AutomationOutcome,
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>> {
         let mut notice = None;
         match outcome {
             AutomationOutcome::NotStarted => {
@@ -835,11 +925,6 @@ impl AutomationEngine {
                 self.forget_deferral(&claim.id, cancellation).await?;
                 self.finish_slot(&claim.id, slot, now_ms);
             }
-        }
-        // Display only: the overlay's history shows the outcome now rather
-        // than at the next pass. A failed read keeps the older list.
-        if let Ok(ledger) = self.ledger.snapshot().await {
-            self.recent = ledger.recent(RECENT_HISTORY);
         }
         Ok(notice)
     }
@@ -973,6 +1058,8 @@ fn duration_ms(seconds: f64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future as _;
+
     use super::*;
     use wt_config::AutomationTrigger;
 
@@ -1381,6 +1468,204 @@ mod tests {
         assert!(after.claims.is_empty());
         assert_eq!(engine.pending_count(), 0);
         assert!(ledger.deferred().await.unwrap().is_empty());
+    }
+
+    /// Quitting between two claims of one pass must not strand the first:
+    /// nobody was handed it, so a restart would find it `dispatched` with no
+    /// proof and keep it `ambiguous`, never retried.
+    #[tokio::test]
+    async fn claim_made_before_a_failed_pass_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(ledger_path.clone());
+        let evaluation = CancellationToken::new();
+        let mut engine = AutomationEngine::new(ledger.clone(), evaluation.clone());
+        let rules = [rule("builtin:notify", 0.0)];
+        let rows = ["first", "second"].map(|slug| AutomationRow {
+            slug: slug.into(),
+            branch: slug.into(),
+            ..row()
+        });
+        let context = AutomationEvalContext::default();
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let pass = |at| {
+            input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+
+        // Cancel evaluation as soon as the first claim is on disk, before
+        // the pass reaches the second fire's ledger lock.
+        let result = {
+            let mut tick = std::pin::pin!(engine.tick(pass(start)));
+            std::future::poll_fn(|cx| {
+                let polled = tick.as_mut().poll(cx);
+                if polled.is_pending()
+                    && std::fs::read_to_string(&ledger_path)
+                        .is_ok_and(|ledger| ledger.contains("dispatched"))
+                {
+                    evaluation.cancel();
+                }
+                polled
+            })
+            .await
+        };
+        assert!(result.is_err(), "the second claim should be cancelled");
+        assert!(engine.running().is_empty(), "{:?}", engine.running());
+        assert_eq!(engine.pending_count(), 2);
+
+        let mut restarted = AutomationEngine::new(ledger, CancellationToken::new());
+        assert_eq!(
+            restarted
+                .reconcile_boot(&BTreeSet::new(), start + 1)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+        let tick = restarted.tick(pass(start + 2)).await.unwrap();
+        assert_eq!(tick.claims.len(), 2);
+    }
+
+    /// A finish whose ledger write fails must still free its slot: the
+    /// ledger keeps the key handled, but two stuck slots stop every rule.
+    #[tokio::test]
+    async fn failed_finish_frees_its_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(ledger_path.clone());
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let rules = [rule("builtin:notify", 0.0)];
+        let context = AutomationEvalContext::default();
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let rows = [row()];
+        let tick = engine
+            .tick(input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        let claim = tick.claims.first().unwrap();
+
+        // A directory where the ledger file belongs fails every read.
+        let aside = dir.path().join("aside.json");
+        std::fs::rename(&ledger_path, &aside).unwrap();
+        std::fs::create_dir(&ledger_path).unwrap();
+        engine
+            .finish(
+                claim,
+                AutomationOutcome::Delivered {
+                    slot: DeliverySlot::None,
+                },
+                start + 1,
+            )
+            .await
+            .unwrap_err();
+        std::fs::remove_dir(&ledger_path).unwrap();
+        std::fs::rename(&aside, &ledger_path).unwrap();
+        assert!(engine.running().is_empty(), "{:?}", engine.running());
+
+        // The same worktree can run its next fire.
+        let recreated = [AutomationRow {
+            created_at: Some("2026-10-10T12:00:00Z".into()),
+            ..row()
+        }];
+        let next = engine
+            .tick(input(
+                &rules,
+                &recreated,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start + 2,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next.claims.len(), 1);
+    }
+
+    /// Pausing a removed worktree (Ctrl+A in the history) holds its deferred
+    /// branch delete; nothing would evaluate that row again after a resume.
+    #[tokio::test]
+    async fn worktree_pause_holds_a_deferred_fire_until_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let rules = [AutomationDef {
+            id: "delete-branch-on-merge".into(),
+            on: AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            settle_seconds: 0.0,
+            ..AutomationDef::default()
+        }];
+        let landed = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        let context = AutomationEvalContext::default();
+        let mut paused = AutomationEvalContext::default();
+        paused.pauses.slugs.insert("worktree".into());
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let pass = |rows, context, at| {
+            input(
+                &rules,
+                rows,
+                context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+
+        let first = engine.tick(pass(&landed, &context, start)).await.unwrap();
+        let claim = first.claims.first().unwrap().clone();
+        engine
+            .finish(
+                &claim,
+                AutomationOutcome::Deferred {
+                    reason: "open PR(s) #7 still target worktree".into(),
+                    frozen: BTreeMap::new(),
+                },
+                start + 1,
+            )
+            .await
+            .unwrap();
+
+        let due = start + 1 + DEFER_RETRY_MS;
+        let held = engine.tick(pass(&[], &paused, due)).await.unwrap();
+        assert!(held.claims.is_empty());
+        assert_eq!(engine.pending_count(), 1);
+        assert!(
+            engine.queued()[0].waiting_for.contains("resumed"),
+            "{:?}",
+            engine.queued()
+        );
+
+        let resumed = engine.tick(pass(&[], &context, due + 1)).await.unwrap();
+        assert_eq!(resumed.claims.len(), 1);
     }
 
     #[tokio::test]

@@ -2,12 +2,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncWriteExt, sync::OnceCell};
 use tokio_util::sync::CancellationToken;
 use wt_platform::lock::{FileLock, LockError};
 
@@ -35,6 +38,29 @@ pub struct AutomationLedger {
     path: PathBuf,
     lock_dir: PathBuf,
     lock_key: String,
+    /// Taken at this handle's first claim and held until its last clone
+    /// drops. Engines in other processes share the ledger; this is how one
+    /// starting tells a claim still in flight from one whose owner died.
+    owner: Arc<OnceCell<ClaimOwner>>,
+}
+
+struct ClaimOwner {
+    id: String,
+    lock_path: PathBuf,
+    _lock: FileLock,
+}
+
+impl std::fmt::Debug for ClaimOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimOwner").field("id", &self.id).finish()
+    }
+}
+
+impl Drop for ClaimOwner {
+    fn drop(&mut self) {
+        // The identity is never reused, so its lock file has no later user.
+        let _ = std::fs::remove_file(&self.lock_path);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -210,7 +236,60 @@ impl AutomationLedger {
             path,
             lock_dir,
             lock_key,
+            owner: Arc::default(),
         }
+    }
+
+    fn owner_lock_key(&self, id: &str) -> String {
+        format!("{}.owner-{id}", self.lock_key)
+    }
+
+    async fn owner_id(&self) -> Result<&str, LedgerError> {
+        let owner = self
+            .owner
+            .get_or_try_init(|| async {
+                let id = new_claim_id()?;
+                let key = self.owner_lock_key(&id);
+                let lock = FileLock::try_acquire(&self.lock_dir, &key, "own automation claims")
+                    .await?
+                    .ok_or_else(|| LedgerError::Invalid {
+                        path: self.path.clone(),
+                        message: "claim owner identity is already locked".into(),
+                    })?;
+                Ok::<_, LedgerError>(ClaimOwner {
+                    id,
+                    lock_path: self.lock_dir.join(format!("{key}.lock")),
+                    _lock: lock,
+                })
+            })
+            .await?;
+        Ok(&owner.id)
+    }
+
+    /// Owners of unfinished claims whose lock is free, so their process is
+    /// gone. An owner that still holds its lock finishes its own claims.
+    async fn dead_owners(&self) -> Result<BTreeSet<String>, LedgerError> {
+        let root = self.read_root().await?;
+        let owners: BTreeSet<String> = root
+            .get("fired")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(Map::values)
+            .filter(|entry| entry.get("state").and_then(Value::as_str) == Some("dispatched"))
+            .filter_map(|entry| entry.get("owner")?.as_str().map(str::to_owned))
+            .collect();
+        let mut dead = BTreeSet::new();
+        for id in owners {
+            let key = self.owner_lock_key(&id);
+            if FileLock::try_acquire(&self.lock_dir, &key, "probe automation claim owner")
+                .await?
+                .is_some()
+            {
+                let _ = fs::remove_file(self.lock_dir.join(format!("{key}.lock"))).await;
+                dead.insert(id);
+            }
+        }
+        Ok(dead)
     }
 
     pub fn path(&self) -> &Path {
@@ -288,6 +367,7 @@ impl AutomationLedger {
             breaker_reserved: policy.breaker_limit.is_some(),
         };
         let claim_for_write = claim.clone();
+        let owner = self.owner_id().await?.to_owned();
         self.mutate("claim dispatch", cancellation, move |root| {
             let pair = pair_key(&claim_for_write.rule_id, &claim_for_write.slug);
             let active = {
@@ -361,6 +441,7 @@ impl AutomationLedger {
                         "ruleId":claim_for_write.rule_id, "slug":claim_for_write.slug,
                         "claimId":claim_for_write.claim_id, "kind":claim_for_write.kind,
                         "breakerReserved":claim_for_write.breaker_reserved,
+                        "owner":owner,
                     }),
                 );
             }
@@ -548,19 +629,27 @@ impl AutomationLedger {
 
     /// On boot, matching durable action runs prove delivery. Any unmatched
     /// dispatch remains handled as ambiguous: absence from a bounded run scan
-    /// is not proof that no external write happened.
+    /// is not proof that no external write happened. A claim whose owner is
+    /// still running is left alone: rewriting it would turn that owner's
+    /// later release or deferral into a no-op and consume the fire.
     pub async fn reconcile_dispatched(
         &self,
         delivered_keys: &BTreeSet<String>,
         now_ms: i64,
         cancellation: &CancellationToken,
     ) -> Result<(usize, usize), LedgerError> {
+        let dead = self.dead_owners().await?;
         self.mutate("reconcile dispatches", cancellation, |root| {
             let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
             {
                 let fired = ensure_object(root, "fired");
                 for (key, value) in fired.iter().filter(|(_, value)| {
                     value.get("state").and_then(Value::as_str) == Some("dispatched")
+                        // An owner first seen after the probe is alive.
+                        && value
+                            .get("owner")
+                            .and_then(Value::as_str)
+                            .is_none_or(|owner| dead.contains(owner))
                 }) {
                     let claim_id = value
                         .get("claimId")
@@ -1175,6 +1264,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // The claiming process crashed; the next one to start reconciles.
+        drop(ledger);
+        let ledger = AutomationLedger::new(&path);
         assert_eq!(
             ledger
                 .reconcile_dispatched(&BTreeSet::new(), now + 1, &cancel)
@@ -1204,6 +1296,73 @@ mod tests {
         let root = ledger.read_root().await.unwrap();
         assert_eq!(root["fired"]["legacy"]["state"], "ambiguous");
         assert_eq!(root["fired"]["future"]["opaque"], true);
+    }
+
+    /// Two engines share one ledger (a local TUI and an SSH worker, or two
+    /// controllers). One starting must not consume the other's dispatch.
+    #[tokio::test]
+    async fn reconcile_leaves_a_live_owners_claim_until_the_owner_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let running = AutomationLedger::new(&path);
+        let starting = AutomationLedger::new(&path);
+        let cancel = CancellationToken::new();
+        let now = now_ms();
+        let claim = |key: &str, at| {
+            let keys = [key.to_owned()];
+            let running = running.clone();
+            let cancel = cancel.clone();
+            async move {
+                running
+                    .claim_dispatch(&keys, "r", "s", DispatchKind::ExternalSend, at, &cancel)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+
+        let in_flight = claim("in-flight", now).await;
+        assert_eq!(
+            starting
+                .reconcile_dispatched(&BTreeSet::new(), now + 1, &cancel)
+                .await
+                .unwrap(),
+            (0, 0)
+        );
+        // The owner's own outcome still applies: a retry releases the key.
+        assert_eq!(
+            running
+                .release_not_started(&in_flight, &cancel)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            !starting
+                .snapshot()
+                .await
+                .unwrap()
+                .has_handled("in-flight", now + 2)
+        );
+
+        // An owner that died mid-dispatch proves nothing about delivery.
+        claim("crashed", now + 3).await;
+        drop(running);
+        assert_eq!(
+            starting
+                .reconcile_dispatched(&BTreeSet::new(), now + 4, &cancel)
+                .await
+                .unwrap(),
+            (0, 1)
+        );
+        let root = starting.read_root().await.unwrap();
+        assert_eq!(root["fired"]["crashed"]["state"], "ambiguous");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".owner-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[tokio::test]

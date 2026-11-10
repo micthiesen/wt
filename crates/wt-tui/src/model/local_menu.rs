@@ -4,7 +4,7 @@
 use std::mem::discriminant;
 
 use super::{ConfirmPrompt, InputResult, Interaction, Model, PickerPrompt, ToastTone};
-use crate::{LocalMenu, Menu, PickerOption, UiAction, UiModal, UiReply};
+use crate::{LocalMenu, Menu, PickerOption, UiAction, UiModal};
 
 /// What identifies a picker choice across rebuilds: its value, plus its
 /// chord for options that share a value.
@@ -29,11 +29,7 @@ impl Model {
     fn show_local_menu(&mut self, action: UiAction, menu: LocalMenu) {
         match menu {
             LocalMenu::Modal { modal, warm, host } => {
-                self.reply(UiReply {
-                    modal: Some(*modal),
-                    modal_host: host,
-                    ..Default::default()
-                });
+                self.show_modal(*modal, host);
                 self.local_menu = Some(action);
                 self.local_menu_default = self.picker_identity();
                 self.picker_choice_lost = false;

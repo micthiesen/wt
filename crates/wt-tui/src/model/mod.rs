@@ -57,6 +57,7 @@ pub(crate) struct PendingRequest {
     pub generation: u64,
     pub preparation: bool,
     /// The key that requested this menu; pressing it again cancels it.
+    /// `None` when the menu is a text prompt, where that letter is text.
     pub opener: Option<crossterm::event::KeyEvent>,
     /// Keys typed while the menu loads, replayed into it when it opens. They
     /// never reach the board underneath.
@@ -67,6 +68,14 @@ pub(crate) struct PendingRequest {
     pub started: tokio::time::Instant,
     pub action: UiAction,
     pub _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
+}
+/// A loading menu the user cancelled. The rest of what they typed for it is
+/// still arriving and must not reach the board, so keys are dropped until
+/// its reply arrives or it is older than typeahead is kept for.
+pub(crate) struct CancelledMenu {
+    pub id: u64,
+    pub started: tokio::time::Instant,
+    pub noticed: bool,
 }
 /// Everything the terminal shows and the keys act on: the presented board
 /// (source board with pending changes applied), cursor, panes and prompts.
@@ -110,6 +119,7 @@ pub struct Model {
     pub(crate) output: crate::output::OutputState,
     pub(crate) ui_generation: u64,
     pub(crate) pending_request: Option<PendingRequest>,
+    pub(crate) cancelled_menu: Option<CancelledMenu>,
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
     pub(crate) help_scroll: usize,
@@ -132,6 +142,9 @@ pub struct Model {
     pub title_prompt: Option<TitlePrompt>,
     pub interaction: Interaction,
     pub(crate) interaction_host: Option<String>,
+    /// When the open confirmation starts taking the keys that commit it.
+    /// Set for one a reply opened without the user asking for it.
+    pub(crate) confirm_settles_at: Option<tokio::time::Instant>,
     /// Each removal review keeps its own checkout witness and host.
     pub(crate) removal_reviews: std::collections::VecDeque<(ConfirmPrompt, Option<String>)>,
     /// Host chosen with Tab in the last new-worktree prompt; `None` is local.
@@ -193,6 +206,7 @@ impl Default for Model {
             output: Default::default(),
             ui_generation: 0,
             pending_request: None,
+            cancelled_menu: None,
             pr_chord: None,
             help: false,
             help_scroll: 0,
@@ -211,6 +225,7 @@ impl Default for Model {
             title_prompt: None,
             interaction: Interaction::None,
             interaction_host: None,
+            confirm_settles_at: None,
             removal_reviews: Default::default(),
             last_create_host: None,
             yank: None,

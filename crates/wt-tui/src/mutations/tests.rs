@@ -457,7 +457,10 @@ fn every_declared_domain_can_settle() {
             removed_at: String::new(),
             branch: String::new(),
         },
-        UiAction::ToggleRemovedAutomations { key: "a".into() },
+        UiAction::ToggleRemovedAutomations {
+            key: "a".into(),
+            seen: None,
+        },
         UiAction::PerfInvestigate { report: Vec::new() },
         UiAction::Restack { key: "a".into() },
         UiAction::ReviewCheckout {

@@ -4,10 +4,7 @@
 
 use std::{
     path::Path,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{sync::Notify, time::Instant};
@@ -15,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use wt_core::Domain;
 use wt_github::{GithubClient, GithubData, GithubError, GithubOptions};
 use wt_runtime::{
-    DiskCache, Fetched, LeafHandle, Persistence, RefreshPolicy, SourceHandle, SourceSpec, Stamp,
-    TaskScope, start_skippable_source,
+    DiskCache, Fetched, LeafHandle, Persistence, RefreshPolicy, Request, SourceHandle, SourceSpec,
+    Stamp, TaskScope, start_requested_source,
 };
 use wt_vcs::WorktreeSnapshot;
 
@@ -35,7 +32,6 @@ const DAEMON_MINIMUM: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct GithubRefresh {
     github: LeafHandle<GithubData>,
-    bypass_daemon: Arc<AtomicBool>,
     reads: Arc<Mutex<ReadTimes>>,
 }
 
@@ -68,8 +64,7 @@ impl GithubRefresh {
     /// After an accepted GitHub write: the read that may confirm it must be a
     /// direct fetch stamped here, not the events daemon's older snapshot.
     pub fn refresh_live(&self) {
-        self.bypass_daemon.store(true, Ordering::Release);
-        self.github.refresh();
+        self.github.request(Request::Direct);
     }
 
     #[cfg(test)]
@@ -85,7 +80,6 @@ impl GithubRefresh {
         );
         Self {
             github,
-            bypass_daemon: Arc::default(),
             reads: Arc::default(),
         }
     }
@@ -102,7 +96,7 @@ pub fn start(
     backstop: Duration,
 ) -> (LeafHandle<GithubData>, GithubRefresh) {
     let lane = Arc::new(GithubLane::new(context.clone(), git.clone(), enabled));
-    let github = start_skippable_source(
+    let github = start_requested_source(
         scope,
         SourceSpec {
             name: "github",
@@ -115,21 +109,20 @@ pub fn start(
         },
         {
             let lane = lane.clone();
-            move |cancel| {
+            move |request, cancel| {
                 let lane = lane.clone();
-                async move { lane.fetch(&cancel).await }
+                async move { lane.fetch(request, &cancel).await }
             }
         },
     );
     let refresh = GithubRefresh {
         github: github.clone(),
-        bypass_daemon: lane.bypass_daemon.clone(),
         reads: lane.reads.clone(),
     };
     spawn_deferred_reads(scope, &lane, github.view());
     spawn_github_driver(scope, git, github.view(), backstop);
     if enabled {
-        crate::github_events_source::watch(scope, context, github.view(), lane.file_event.clone());
+        crate::github_events_source::watch(scope, context, github.view());
     }
     (github, refresh)
 }
@@ -138,10 +131,6 @@ struct GithubLane {
     context: AppContext,
     git: LeafHandle<Vec<WorktreeSnapshot>>,
     enabled: bool,
-    bypass_daemon: Arc<AtomicBool>,
-    /// Set by the events-dir watcher: the request only rechecks the daemon
-    /// snapshot and is not by itself a reason to read GitHub.
-    file_event: Arc<AtomicBool>,
     clock: Mutex<LaneClock>,
     reads: Arc<Mutex<ReadTimes>>,
     wake: Notify,
@@ -164,6 +153,9 @@ struct LaneClock {
     shown: Option<(GithubData, Stamp)>,
     /// A network read the floor postponed is due then.
     deferred: Option<Instant>,
+    /// A `Request::Direct` has been made and no network read has started
+    /// since: daemon snapshots are not served until one does.
+    direct_owed: bool,
 }
 
 /// What one fetch does.
@@ -179,8 +171,10 @@ enum Plan {
 struct PlanInput<'a> {
     branches: &'a [String],
     daemon: Option<DaemonRead>,
-    file_event: bool,
-    bypass: bool,
+    /// The strongest reason among the requests this fetch serves. Only a
+    /// fetch asked for nothing but a recheck of the daemon snapshot may
+    /// decline to read GitHub when that snapshot is unusable.
+    request: Request,
     now: Instant,
 }
 
@@ -191,8 +185,7 @@ impl LaneClock {
         let PlanInput {
             branches,
             daemon,
-            file_event,
-            bypass,
+            request,
             now,
         } = input;
         let same_branches = self.published.as_deref() == Some(branches);
@@ -230,7 +223,11 @@ impl LaneClock {
         }
         // A recheck that found nothing usable only reads GitHub when the
         // daemon data it had shown has aged out or the branch set changed.
-        if file_event && !bypass && same_branches && self.served_daemon.is_none() {
+        if request == Request::Recheck
+            && !self.direct_owed
+            && same_branches
+            && self.served_daemon.is_none()
+        {
             return Plan::Skip;
         }
         self.network(now)
@@ -249,6 +246,7 @@ impl LaneClock {
         self.live_started = Some(now);
         self.served_daemon = None;
         self.deferred = None;
+        self.direct_owed = false;
         Plan::Network
     }
 
@@ -296,8 +294,6 @@ impl GithubLane {
             context,
             git,
             enabled,
-            bypass_daemon: Arc::default(),
-            file_event: Arc::default(),
             clock: Mutex::default(),
             reads: Arc::default(),
             wake: Notify::new(),
@@ -319,9 +315,16 @@ impl GithubLane {
 
     async fn fetch(
         &self,
+        request: Request,
         cancel: &CancellationToken,
     ) -> Result<Option<Fetched<GithubData>>, GithubError> {
-        let file_event = self.file_event.swap(false, Ordering::AcqRel);
+        // Recorded before any early return: a direct read stays owed until
+        // one starts, however many fetches skip or defer first.
+        let bypass = {
+            let mut clock = self.clock();
+            clock.direct_owed |= request == Request::Direct;
+            clock.direct_owed
+        };
         // The key set comes from Git. Restored or missing inventory cannot
         // name the branches to read; the inventory's next change re-arms this.
         let Some(inventory) = self.git.confirmed() else {
@@ -338,7 +341,6 @@ impl GithubLane {
             clock.shown = None;
             return Ok(Some(Fetched::new(GithubData::default(), Stamp::now())));
         }
-        let bypass = self.bypass_daemon.load(Ordering::Acquire);
         let daemon = if bypass {
             None
         } else {
@@ -348,8 +350,7 @@ impl GithubLane {
         let plan = self.clock().plan(PlanInput {
             branches: &branches,
             daemon,
-            file_event,
-            bypass,
+            request,
             now,
         });
         match plan {
@@ -361,7 +362,6 @@ impl GithubLane {
             Plan::Publish(fetched) => return Ok(Some(fetched)),
             Plan::Network => {}
         }
-        self.bypass_daemon.store(false, Ordering::Release);
         let config = &self.context.config;
         let ci = has_workflows(&config.paths.main_clone).await;
         let client = GithubClient::new(
@@ -563,7 +563,12 @@ mod tests {
         // Disabled GitHub still proves the gate without a network client.
         let lane = GithubLane::new(fixture.ctx.clone(), git, false);
         let cancel = CancellationToken::new();
-        assert!(lane.fetch(&cancel).await.unwrap().is_none());
+        assert!(
+            lane.fetch(Request::Refresh, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
         git_publisher.publish_live(
             vec![
                 worktree("main", "main", true),
@@ -572,14 +577,19 @@ mod tests {
             Stamp::now(),
         );
         let fetched = lane
-            .fetch(&cancel)
+            .fetch(Request::Refresh, &cancel)
             .await
             .unwrap()
             .expect("confirmed Git fetches");
         assert!(fetched.data.prs.is_empty());
         assert_eq!(*lane.clock().published.as_ref().unwrap(), ["feature/one"]);
         // The same branch set does not republish.
-        assert!(lane.fetch(&cancel).await.unwrap().is_none());
+        assert!(
+            lane.fetch(Request::Refresh, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
         fixture.close().await.unwrap();
     }
@@ -607,8 +617,7 @@ mod tests {
         PlanInput {
             branches,
             daemon,
-            file_event: false,
-            bypass: false,
+            request: Request::Refresh,
             now,
         }
     }
@@ -747,13 +756,12 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_file_event_without_usable_daemon_data_reads_only_when_needed() {
+    async fn a_recheck_without_usable_daemon_data_reads_only_when_needed() {
         let branches = branches();
         let now = Instant::now();
-        let recheck = |clock: &mut LaneClock, bypass: bool| {
+        let plan = |clock: &mut LaneClock, request| {
             clock.plan(PlanInput {
-                file_event: true,
-                bypass,
+                request,
                 ..input(&branches, None, now)
             })
         };
@@ -762,16 +770,63 @@ mod tests {
             published: Some(branches.clone()),
             ..LaneClock::default()
         };
-        assert!(matches!(recheck(&mut clock, false), Plan::Skip));
-        // A bypass request reads regardless.
-        assert!(matches!(recheck(&mut clock, true), Plan::Network));
+        assert!(matches!(plan(&mut clock, Request::Recheck), Plan::Skip));
+        // An owed direct read happens regardless, and is then no longer owed.
+        clock.direct_owed = true;
+        assert!(matches!(plan(&mut clock, Request::Recheck), Plan::Network));
+        assert!(!clock.direct_owed);
         // Daemon data had been shown and has aged out: read GitHub.
         let mut clock = LaneClock {
             published: Some(branches.clone()),
             served_daemon: Some((1_000, branches.clone())),
             ..LaneClock::default()
         };
-        assert!(matches!(recheck(&mut clock, false), Plan::Network));
+        assert!(matches!(plan(&mut clock, Request::Recheck), Plan::Network));
         assert_eq!(clock.served_daemon, None);
+    }
+
+    /// The backstop tick and the events watcher's reconcile tick are
+    /// phase-locked (600 s is a multiple of 15 s), so they share one debounce
+    /// window. With no usable daemon snapshot the shared fetch must still
+    /// read GitHub, or nothing ever rereads it.
+    #[tokio::test(start_paused = true)]
+    async fn a_backstop_coalesced_with_a_recheck_still_reads_github() {
+        let scope = TaskScope::new();
+        let plans = Arc::new(Mutex::new(Vec::new()));
+        let mut clock = LaneClock {
+            published: Some(branches()),
+            ..LaneClock::default()
+        };
+        let source = start_requested_source(
+            &scope,
+            SourceSpec::<GithubData> {
+                policy: RefreshPolicy {
+                    debounce: Duration::from_millis(100),
+                    minimum_interval: DAEMON_MINIMUM,
+                },
+                ..spec("github", Domain::Github)
+            },
+            {
+                let plans = plans.clone();
+                move |request, _| {
+                    let plan = clock.plan(PlanInput {
+                        request,
+                        ..input(&branches(), None, Instant::now())
+                    });
+                    plans.lock().unwrap().push(matches!(plan, Plan::Network));
+                    async { Ok::<_, GithubError>(None) }
+                }
+            },
+        );
+        // The backstop, then the watcher's recheck inside its debounce.
+        source.refresh();
+        source.request(Request::Recheck);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        // A recheck alone, past the rate floor, still declines to read.
+        tokio::time::sleep(GITHUB_MINIMUM).await;
+        source.request(Request::Recheck);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(*plans.lock().unwrap(), [true, false]);
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

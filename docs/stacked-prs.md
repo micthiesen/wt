@@ -106,7 +106,9 @@ it does the right thing for the shape under the cursor:
 Cleaning a merged member (`c`, or the `wt.merged`/`stack.parent_merged`
 automations) reparents its children automatically when the branch is deleted —
 onto the deleted branch's own recorded base, anchors kept — so the stack heals
-itself as PRs land; the replay stays an explicit `R`/`wt restack`.
+itself as PRs land; the replay stays an explicit `R`/`wt restack`. Removing an
+unmerged parent whose branch still exists locally or on origin does not
+reparent: its children stay stacked on it.
 
 **How the parent's branch gets deleted matters for the CHILD PRs.** With the
 repo's "automatically delete head branches" setting, GitHub retargets open

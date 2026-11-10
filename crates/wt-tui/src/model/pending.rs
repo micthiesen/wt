@@ -326,9 +326,14 @@ impl Model {
             generation: self.ui_generation,
             preparation,
             // Enter, Space and Tab commit or move inside menus; repeating one
-            // must not cancel the menu it opened.
+            // must not cancel the menu it opened. Nor may the first letter of
+            // text typed ahead into a prompt.
             opener: self.last_key.take().filter(|key| {
                 preparation
+                    && !matches!(
+                        inner,
+                        UiAction::PrepareAction { .. } | UiAction::PrepareCreate { .. }
+                    )
                     && !matches!(
                         key.code,
                         crossterm::event::KeyCode::Enter

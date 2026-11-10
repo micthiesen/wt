@@ -416,7 +416,7 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::Restack { key }
         | A::RestoreRemoved { key, .. }
         | A::PrepareRestoreRemoved { key }
-        | A::ToggleRemovedAutomations { key }
+        | A::ToggleRemovedAutomations { key, .. }
         | A::ToggleArchive { key, .. }
         | A::MoveSection { key, .. }
         | A::OpenEditor { key }

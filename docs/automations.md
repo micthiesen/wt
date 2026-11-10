@@ -218,4 +218,4 @@ One identity caveat: the circuit breaker and cooldown for `stack.parent_merged` 
 
 Both persist across restarts. Paused rules still evaluate (so state stays current); they just don't dispatch.
 
-There is also a process-level kill switch: `WT_AUTOMATIONS=off` in the environment pins the engine paused for that wt instance regardless of the persisted flags. It exists for probe instances (the TUI test harness, `scripts/tui-test.sh`) running alongside your live one — two engines over the same ledger could double-dispatch.
+There is also a process-level kill switch: `WT_AUTOMATIONS=off` in the environment pins the engine paused for that wt instance regardless of the persisted flags. It exists for probe instances (the TUI test harness, `scripts/tui-test.sh`) running alongside your live one — two engines over the same ledger could double-dispatch. A starting engine leaves another live engine's in-flight claims alone and reconciles only claims whose owner is gone.

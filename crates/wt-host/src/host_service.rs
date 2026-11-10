@@ -418,9 +418,9 @@ impl HostService {
                 ))
                 .await?
             }
-            UiAction::ToggleRemovedAutomations { key } => {
-                Box::pin(crate::history_actions::toggle_automations_paused(
-                    &context, &key,
+            UiAction::ToggleRemovedAutomations { key, seen } => {
+                Box::pin(crate::history_actions::toggle_automations_paused_seen(
+                    &context, &key, seen,
                 ))
                 .await?
             }

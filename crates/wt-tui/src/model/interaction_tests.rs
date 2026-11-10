@@ -1156,6 +1156,8 @@ fn deferred_remote_create_confirms_sign_in_with_original_input_and_host() {
             .iter()
             .any(|row| row.key.starts_with("\0creating:"))
     );
+    // The prompt has been on screen past its settle window.
+    model.confirm_settles_at = None;
     assert_eq!(
         press(&mut model, KeyCode::Enter),
         InputResult::Action(UiAction::OnHost {

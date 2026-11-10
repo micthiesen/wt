@@ -26,6 +26,8 @@ const EXTENSION: &str = include_str!("pi/extension.ts");
 pub const PI_VERSION: &str = "1.2.0";
 const MAX_TAIL: u64 = 512 * 1024;
 const MAX_REPLY: u64 = 1024 * 1024;
+/// How long a cold-started Pi has to bind its control socket.
+const COLD_START_READY: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PiPaths {
@@ -267,7 +269,8 @@ impl PiHarness {
         )
         .await?;
         if self.tmux.session_exists(&name, cancel).await? {
-            self.validate_live(request, cancel).await?;
+            self.validate_live_once_bound(request, &name, cancel)
+                .await?;
             return Ok(false);
         }
         let mut version = CommandSpec::new("pi").args(["--version"]);
@@ -320,26 +323,66 @@ impl PiHarness {
             command.args[index + 1] = path.to_string_lossy().into_owned();
         }
         self.tmux
-            .create_session(
+            .create_session_with_options(
                 &CreateSession {
-                    name: name.clone(),
+                    name,
                     cwd: request.worktree_path.clone(),
                     command: std::iter::once("pi".into()).chain(command.args).collect(),
                     width: None,
                     height: None,
                 },
-                cancel,
-            )
-            .await?;
-        self.tmux
-            .set_option(
-                &OptionScope::Session(name),
-                "@wt-harness-session-id",
-                Some(&id),
+                &[("@wt-harness-session-id", id.as_str())],
                 cancel,
             )
             .await?;
         Ok(true)
+    }
+
+    /// Another caller's cold start creates the slot before Pi binds its
+    /// control socket. Wait out that window, bounded by the slot's age, so a
+    /// second sender or an attach does not fail on the missing socket.
+    async fn validate_live_once_bound(
+        &self,
+        request: &HarnessSpawnRequest,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PiStatus, PiError> {
+        let mut deadline = None;
+        loop {
+            let error = match self.validate_live(request, cancel).await {
+                Err(PiError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    error
+                }
+                other => return other,
+            };
+            let deadline = match deadline {
+                Some(deadline) => deadline,
+                None => {
+                    let sessions = self.tmux.list_sessions(cancel).await?;
+                    let Some(created) = sessions
+                        .iter()
+                        .find(|session| session.name == name)
+                        .and_then(|session| u64::try_from(session.created_at).ok())
+                    else {
+                        return Err(PiError::Io(error));
+                    };
+                    let age = SystemTime::now()
+                        .duration_since(UNIX_EPOCH + Duration::from_secs(created))
+                        .unwrap_or_default();
+                    *deadline
+                        .insert(tokio::time::Instant::now() + COLD_START_READY.saturating_sub(age))
+                }
+            };
+            if cancel.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                return Err(PiError::Io(error));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn identity(&self, slug: &str, cancel: &CancellationToken) -> Result<String, PiError> {
@@ -434,7 +477,7 @@ impl PiHarness {
         let cold_started = self.start(request, cancel).await?;
         let id = self.identity(slug, cancel).await?;
         if cold_started {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let deadline = tokio::time::Instant::now() + COLD_START_READY;
             loop {
                 if self
                     .request(slug, cwd, &id, "status", None, cancel)
@@ -1080,6 +1123,71 @@ mod tests {
         assert!(wrong_thread.is_err());
         assert!(!correct.unwrap());
         assert_eq!(unchanged.unwrap().as_deref(), Some("actual-thread"));
+    }
+
+    /// One caller's cold start has created the slot and Pi has not bound its
+    /// control socket yet. A second sender or an attach waits for it.
+    #[tokio::test]
+    async fn a_second_caller_during_a_cold_start_waits_for_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = ProcessRunner::default();
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            wt_tmux::TmuxServer::at(dir.path().join("tmux.sock"))
+                .with_cwd(dir.path())
+                .with_config_file("/dev/null"),
+        );
+        let paths = PiPaths::new(dir.path(), dir.path());
+        let socket = paths.socket("fixture");
+        private_directory(socket.parent().unwrap()).unwrap();
+        let cancel = CancellationToken::new();
+        tmux.create_session_with_options(
+            &CreateSession {
+                name: "fixture-pi".into(),
+                cwd: dir.path().into(),
+                command: vec!["cat".into()],
+                width: Some(80),
+                height: Some(24),
+            },
+            &[("@wt-harness-session-id", "thread")],
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let bound = socket.clone();
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let listener = tokio::net::UnixListener::bind(&bound).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let response = json!({"id":request["id"],"ok":true,"result":{
+                "session_id":"thread","cwd":"/checkout","state":"waiting","queued":0,"compacting":false,
+                "context_percent":null,"status_since":42,"session_file":null}});
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let started = PiHarness::new(paths, runner, tmux.clone())
+            .start(
+                &HarnessSpawnRequest {
+                    slug: "fixture".into(),
+                    worktree_path: "/checkout".into(),
+                    managed_name: None,
+                    resume_session_id: None,
+                    display_label: None,
+                },
+                &cancel,
+            )
+            .await;
+        tmux.kill_server(&cancel).await.unwrap();
+        server.abort();
+        let _ = fs::remove_file(socket);
+        assert!(!started.unwrap());
     }
 
     fn transcript(root: &Path, id: &str, cwd: &str, name: &str) -> PathBuf {
