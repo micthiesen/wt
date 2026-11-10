@@ -192,6 +192,10 @@ pub struct AutomationEngine {
     recent: Vec<wt_automations::LedgerRecord>,
     /// Deferred fires by identity, while their intent is queued or running.
     deferrals: BTreeMap<String, Deferral>,
+    /// Quit arriving right after this many claims of one pass: timing alone
+    /// cannot place a cancellation between two claims on every platform.
+    #[cfg(test)]
+    quit_after_claims: Option<usize>,
 }
 
 impl AutomationEngine {
@@ -205,6 +209,8 @@ impl AutomationEngine {
             unmet: BTreeSet::new(),
             recent: Vec::new(),
             deferrals: BTreeMap::new(),
+            #[cfg(test)]
+            quit_after_claims: None,
         }
     }
 
@@ -676,6 +682,11 @@ impl AutomationEngine {
                         },
                     );
                     report.claims.push(ClaimedFire { id, fire, claim });
+                    #[cfg(test)]
+                    if self.quit_after_claims == Some(report.claims.len()) {
+                        self.cancellation.cancel();
+                        anyhow::bail!("evaluation cancelled between claims");
+                    }
                 }
             }
         }
@@ -1058,7 +1069,6 @@ fn duration_ms(seconds: f64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future as _;
 
     use super::*;
     use wt_config::AutomationTrigger;
@@ -1503,22 +1513,9 @@ mod tests {
             )
         };
 
-        // Cancel evaluation as soon as the first claim is on disk, before
-        // the pass reaches the second fire's ledger lock.
-        let result = {
-            let mut tick = std::pin::pin!(engine.tick(pass(start)));
-            std::future::poll_fn(|cx| {
-                let polled = tick.as_mut().poll(cx);
-                if polled.is_pending()
-                    && std::fs::read_to_string(&ledger_path)
-                        .is_ok_and(|ledger| ledger.contains("dispatched"))
-                {
-                    evaluation.cancel();
-                }
-                polled
-            })
-            .await
-        };
+        engine.quit_after_claims = Some(1);
+        let result = engine.tick(pass(start)).await;
+        assert!(evaluation.is_cancelled());
         assert!(result.is_err(), "the second claim should be cancelled");
         assert!(engine.running().is_empty(), "{:?}", engine.running());
         assert_eq!(engine.pending_count(), 2);

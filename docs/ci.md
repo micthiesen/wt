@@ -8,6 +8,14 @@ The repository is public, so GitHub-hosted runners are free. The standard
 runners are what we use: macOS (`macos-15`, `macos-latest`) has 3 cores, Linux
 x86 and Linux arm (`ubuntu-22.04-arm`, free for public repositories) have 4.
 
+The `test`, `native` and `build` jobs in `rust-ci.yml` run on `ubuntu-24.04`,
+not `ubuntu-latest`. When `ubuntu-latest` moved to 26.04 (2026-11), thirteen
+Codex messaging tests failed with "slot did not start": their fixture copies
+`/bin/cat` under the name `codex`, and it did not run there (most likely a
+multi-call coreutils that dispatches on its own name). Fix that fixture before
+moving the pin. `lint` stays on `ubuntu-latest` because its cache key does not
+include the runner label, so a pin would restore artifacts built on 26.04.
+
 ## Workflows
 
 | Workflow | Trigger | What it does |
