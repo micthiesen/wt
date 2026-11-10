@@ -593,6 +593,11 @@ def main():
             if not removal_started.exists():
                 assert b"reviewremovalhazards" in compact_terminal(reviewed)
                 assert (root / "worktrees" / "bench-000").exists()
+                # The review arrived in a reply, so a commit key typed as it
+                # appears is ignored; one typed after it settles confirms.
+                os.write(master, b"y")
+                drain_for(0.6)
+                assert not removal_started.exists(), "a key typed as the review appeared forced the removal"
                 os.write(master, b"y")
                 wait_for(lambda _: removal_started.exists(), timeout=10)
             first_removed = removal_started.read_text()
