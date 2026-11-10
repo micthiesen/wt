@@ -36,6 +36,7 @@ impl Model {
                 });
                 self.local_menu = Some(action);
                 self.local_menu_default = self.picker_identity();
+                self.picker_choice_lost = false;
                 self.background.extend(warm.map(|warm| *warm));
             }
             LocalMenu::Notice(text) => {
@@ -69,7 +70,8 @@ impl Model {
 
     /// Rebuild the open board menu from the newly presented board. A cursor
     /// the user moved follows its option value, so a re-sort never moves it
-    /// onto a different choice. A cursor still on the builder's default
+    /// onto a different choice. If that option is gone the cursor keeps its
+    /// place and the next commit key is dropped. A cursor still on the builder's default
     /// follows the new default: a menu opened from an older board must not
     /// keep a choice nobody made. A board that no longer offers the menu
     /// keeps the last view; the host checks the commit anyway.
@@ -79,6 +81,7 @@ impl Model {
         };
         if matches!(self.interaction, Interaction::None) {
             self.local_menu = None;
+            self.picker_choice_lost = false;
             return;
         }
         let Menu::Local(LocalMenu::Modal { modal, .. }) = action.menu(&self.board) else {
@@ -102,27 +105,36 @@ impl Model {
                     &options,
                     default,
                 );
-                let selected = current
-                    .filter(|_| !untouched)
-                    .and_then(|current| {
-                        // Two options may share a value (`ready` and `ready +
-                        // verify in <stage>`); their chord tells them apart.
-                        options
-                            .iter()
-                            .position(|option| {
-                                current.value.is_some() && identity(option) == identity(current)
+                let found = current.filter(|_| !untouched).and_then(|current| {
+                    // Two options may share a value (`ready` and `ready +
+                    // verify in <stage>`); their chord tells them apart.
+                    options
+                        .iter()
+                        .position(|option| {
+                            current.value.is_some() && identity(option) == identity(current)
+                        })
+                        .or_else(|| {
+                            options.iter().position(|option| {
+                                current.value.is_some() && option.value == current.value
                             })
-                            .or_else(|| {
-                                options.iter().position(|option| {
-                                    current.value.is_some() && option.value == current.value
-                                })
-                            })
-                            .or_else(|| {
-                                options
-                                    .iter()
-                                    .position(|option| option.label == current.label)
-                            })
-                    })
+                        })
+                        .or_else(|| {
+                            options
+                                .iter()
+                                .position(|option| option.label == current.label)
+                        })
+                });
+                // The cursor stays near where it was, but that row is now a
+                // different choice: a commit key already on its way must not
+                // act on it.
+                if let Some(current) = current.filter(|_| !untouched && found.is_none()) {
+                    self.picker_choice_lost = true;
+                    self.toast = Some((
+                        format!("{} is no longer available", current.label),
+                        ToastTone::Notice,
+                    ));
+                }
+                let selected = found
                     .unwrap_or(if untouched { default } else { picker.selected })
                     .min(options.len().saturating_sub(1));
                 if untouched {

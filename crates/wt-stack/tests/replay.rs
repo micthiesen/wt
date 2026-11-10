@@ -807,3 +807,99 @@ async fn nonblocking_busy_probe_checks_the_whole_resolved_chain() -> Result<()> 
     assert!(fixture.service.is_busy("child", &cancellation).await?);
     Ok(())
 }
+
+/// Push one commit to `origin/child` from a second clone, so it exists on the
+/// remote and nowhere in the fixture's local history.
+fn push_remote_only_commit(fixture: &Fixture) -> Result<String> {
+    let remote = fixture.root.path().join("origin.git");
+    let other = fixture.root.path().join("other clone");
+    if !other.exists() {
+        git(
+            fixture.root.path(),
+            ["clone", remote.to_str().unwrap(), other.to_str().unwrap()],
+        )?;
+        git(&other, ["config", "user.name", "Remote Author"])?;
+        git(&other, ["config", "user.email", "remote@example.invalid"])?;
+    }
+    git(&other, ["fetch", "origin"])?;
+    git(&other, ["checkout", "-B", "child", "origin/child"])?;
+    fs::write(other.join("suggestion.txt"), "accepted suggestion\n")?;
+    git(&other, ["add", "suggestion.txt"])?;
+    git(&other, ["commit", "-m", "suggestion applied on the remote"])?;
+    git(&other, ["push", "origin", "child"])?;
+    output(&other, ["rev-parse", "HEAD"])
+}
+
+fn remote_child_tip(fixture: &Fixture) -> Result<String> {
+    let remote = fixture.root.path().join("origin.git");
+    output(
+        &fixture.main,
+        [
+            "--git-dir",
+            remote.to_str().unwrap(),
+            "rev-parse",
+            "refs/heads/child",
+        ],
+    )
+}
+
+#[tokio::test]
+async fn replay_refuses_to_overwrite_commits_that_exist_only_on_origin() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    let remote_only = push_remote_only_commit(&fixture)?;
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert!(
+        matches!(&result, RestackOutcome::Refused { error } if error.contains("child") && error.contains("never had")),
+        "a remote-only commit must refuse the push, got {result:?}"
+    );
+    assert_eq!(remote_child_tip(&fixture)?, remote_only);
+    Ok(())
+}
+
+#[tokio::test]
+async fn branch_already_on_base_does_not_push_over_remote_only_commits() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    let first = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert_eq!(
+        first,
+        RestackOutcome::Complete {
+            replayed: 1,
+            total: 1
+        }
+    );
+    let local_tip = output(&fixture.child, ["rev-parse", "HEAD"])?;
+    assert_eq!(remote_child_tip(&fixture)?, local_tip);
+    let remote_only = push_remote_only_commit(&fixture)?;
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert!(
+        matches!(&result, RestackOutcome::Refused { error } if error.contains("child") && error.contains("never had")),
+        "a remote-only commit must refuse the push, got {result:?}"
+    );
+    assert_eq!(remote_child_tip(&fixture)?, remote_only);
+    assert_eq!(output(&fixture.child, ["rev-parse", "HEAD"])?, local_tip);
+    Ok(())
+}

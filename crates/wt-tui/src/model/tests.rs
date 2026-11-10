@@ -2491,3 +2491,47 @@ fn a_section_witness_counts_only_rows_a_delete_would_move() {
     }
     assert_eq!(board.data().unwrap().section_witness("Batch"), ["live"]);
 }
+
+#[test]
+fn removal_review_never_opens_over_the_yank_menu_or_takes_its_keys() {
+    let mut model = Model::default();
+    model.apply(snapshot(&["one", "two"]));
+    model.input(KeyEvent::from(KeyCode::Char('y')), 20);
+    assert!(model.yank.is_some());
+    model.reply(UiReply {
+        modal: Some(UiModal::Confirm {
+            action: ConfirmAction::Remove {
+                key: "one".into(),
+                force: true,
+                seen: None,
+                revision: Some(crate::RemovalRevision {
+                    key: "one".into(),
+                    path: "/trees/one".into(),
+                    branch: "one".into(),
+                    head: "head".into(),
+                    digest: "one".into(),
+                    hazards: vec!["dirty".into()],
+                    published_base: None,
+                }),
+            },
+            title: "Review one".into(),
+            lines: vec!["dirty".into()],
+            cancel_key: Some('d'),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::None));
+    // The yank menu's own `y` must copy, not approve the removal.
+    let result = model.input(KeyEvent::from(KeyCode::Char('y')), 20);
+    assert!(
+        !matches!(result, InputResult::Action(UiAction::Remove { .. })),
+        "{result:?}"
+    );
+    assert!(matches!(model.interaction, Interaction::None));
+    // The review is kept and shown once the yank menu closes.
+    model.input(KeyEvent::from(KeyCode::Esc), 20);
+    assert!(model.yank.is_none());
+    assert!(
+        matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review one")
+    );
+}

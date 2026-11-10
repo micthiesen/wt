@@ -37,6 +37,8 @@ pub struct SupervisorConfig {
     pub tmux: TmuxClient,
     pub processes: ProcessRunner,
     pub shell: PathBuf,
+    /// The tmux pane this supervisor runs in (`$TMUX_PANE`).
+    pub pane: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,14 +87,14 @@ pub async fn run_supervisor(
         .dev_dir
         .join(format!("{}.state.attempts", config.slug));
     let crash_log = config.dev_dir.join(format!("{}.crash.log", config.slug));
+    let own = own_pane(&config).await?;
     let mut failures = 0_u32;
     let mut previous_signature: Option<String> = None;
     let mut delay = RESTART_INITIAL;
 
     loop {
         if cancellation.is_cancelled() {
-            write_bounded(&marker, b"stopped", 32).await?;
-            release_session(&config).await?;
+            release_session(&config, &own, &marker).await?;
             return Err(SupervisorError::Cancelled);
         }
         write_bounded(&marker, b"running", 32).await?;
@@ -103,26 +105,22 @@ pub async fn run_supervisor(
             biased;
             _ = cancellation.cancelled() => {
                 terminate_child(&mut child).await?;
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Err(SupervisorError::Cancelled);
             }
             _ = interrupt.recv() => {
                 terminate_child(&mut child).await?;
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Ok(SupervisorExit::Stopped);
             }
             _ = terminate.recv() => {
                 terminate_child(&mut child).await?;
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Ok(SupervisorExit::Stopped);
             }
             _ = hangup.recv() => {
                 terminate_child(&mut child).await?;
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Ok(SupervisorExit::Stopped);
             }
             result = child.wait() => result.map_err(SupervisorError::Spawn)?,
@@ -131,8 +129,7 @@ pub async fn run_supervisor(
         let elapsed = started.elapsed();
         let exit = exit_code(child_result);
         if matches!(exit, 130 | 143) {
-            write_bounded(&marker, b"stopped", 32).await?;
-            release_session(&config).await?;
+            release_session(&config, &own, &marker).await?;
             return Ok(SupervisorExit::Stopped);
         }
 
@@ -177,10 +174,9 @@ pub async fn run_supervisor(
             run_stop_command(&config, &cancellation).await?;
             // The saved pane is the diagnostic source; ending this session
             // releases its capacity slot and leaves `crashed` in durable cache.
-            let _ = config
-                .tmux
-                .kill_session(&format!("{}-dev", config.slug), &cancellation)
-                .await;
+            if let Ok(Some(session)) = owned_session(&config, &own).await {
+                let _ = config.tmux.kill_session_id(&session, &cancellation).await;
+            }
             return Ok(SupervisorExit::Crashed);
         }
 
@@ -192,23 +188,19 @@ pub async fn run_supervisor(
         );
         tokio::select! {
             _ = cancellation.cancelled() => {
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Err(SupervisorError::Cancelled);
             }
             _ = interrupt.recv() => {
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Ok(SupervisorExit::Stopped);
             }
             _ = terminate.recv() => {
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Ok(SupervisorExit::Stopped);
             }
             _ = hangup.recv() => {
-                write_bounded(&marker, b"stopped", 32).await?;
-                release_session(&config).await?;
+                release_session(&config, &own, &marker).await?;
                 return Ok(SupervisorExit::Stopped);
             }
             _ = tokio::time::sleep(delay) => {}
@@ -217,11 +209,76 @@ pub async fn run_supervisor(
     }
 }
 
-async fn release_session(config: &SupervisorConfig) -> Result<(), SupervisorError> {
-    config
+/// This supervisor's pane, as tmux knew it at startup. The pane process id
+/// is part of the identity because a tmux server that exits with its last
+/// session restarts its session and pane ids from zero.
+struct OwnPane {
+    id: String,
+    pid: u32,
+}
+
+async fn own_pane(config: &SupervisorConfig) -> Result<Option<OwnPane>, SupervisorError> {
+    let Some(id) = config.pane.clone() else {
+        return Ok(None);
+    };
+    let name = format!("{}-dev", config.slug);
+    let panes = config
         .tmux
-        .kill_session(&format!("{}-dev", config.slug), &CancellationToken::new())
+        .list_all_panes(&CancellationToken::new())
         .await?;
+    Ok(panes
+        .into_iter()
+        .find(|pane| pane.id == id && pane.session_name == name)
+        .and_then(|pane| pane.pid)
+        .map(|pid| OwnPane { id, pid }))
+}
+
+/// The id of the session still holding this supervisor's pane. The name
+/// `<slug>-dev` passes to a replacement while a stopped supervisor is still
+/// terminating its process group, so teardown never targets the name.
+async fn owned_session(
+    config: &SupervisorConfig,
+    own: &Option<OwnPane>,
+) -> Result<Option<String>, SupervisorError> {
+    let Some(own) = own else {
+        return Ok(None);
+    };
+    let name = format!("{}-dev", config.slug);
+    let cancellation = CancellationToken::new();
+    // Sessions first: a name seen here that holds this pane afterwards was
+    // this pane's session at both reads.
+    let sessions = config.tmux.list_sessions(&cancellation).await?;
+    let panes = config.tmux.list_all_panes(&cancellation).await?;
+    if !panes
+        .iter()
+        .any(|pane| pane.id == own.id && pane.pid == Some(own.pid) && pane.session_name == name)
+    {
+        return Ok(None);
+    }
+    Ok(sessions
+        .into_iter()
+        .find(|session| session.name == name)
+        .map(|session| session.id))
+}
+
+/// Ends this supervisor's own session and records `stopped` only when that
+/// session was still alive. Once it is gone, whoever killed it owns the
+/// marker, and a successor may already have written `running`.
+async fn release_session(
+    config: &SupervisorConfig,
+    own: &Option<OwnPane>,
+    marker: &Path,
+) -> Result<(), SupervisorError> {
+    let Some(session) = owned_session(config, own).await? else {
+        return Ok(());
+    };
+    if config
+        .tmux
+        .kill_session_id(&session, &CancellationToken::new())
+        .await?
+    {
+        write_bounded(marker, b"stopped", 32).await?;
+    }
     Ok(())
 }
 
@@ -439,6 +496,93 @@ mod tests {
         let started = Instant::now();
         terminate_orphaned_group(pid).await;
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_supervisor_spares_a_successor_session_of_the_same_name() {
+        let (session_exists, marker) = stop_supervisor(true).await;
+        assert!(
+            session_exists,
+            "the old supervisor killed its successor's session"
+        );
+        assert_eq!(marker, "running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_supervisor_releases_its_own_session() {
+        let (session_exists, marker) = stop_supervisor(false).await;
+        assert!(!session_exists);
+        assert_eq!(marker, "stopped");
+    }
+
+    /// Runs a supervisor for the pane of a private `fixture-dev` session,
+    /// stops it, and returns whether a session of that name remains and the
+    /// marker. `replaced` first swaps in a successor, as `wt dev reset` does
+    /// while the old supervisor is still terminating its process group.
+    #[cfg(unix)]
+    async fn stop_supervisor(replaced: bool) -> (bool, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let tmux = TmuxClient::new(
+            ProcessRunner::default(),
+            wt_tmux::TmuxServer::at(temp.path().join("tmux.sock")).with_config_file("/dev/null"),
+        );
+        let cancel = CancellationToken::new();
+        let result = async {
+            let session = wt_tmux::CreateSession {
+                name: "fixture-dev".into(),
+                cwd: temp.path().into(),
+                command: vec!["cat".into()],
+                width: None,
+                height: None,
+            };
+            tmux.create_session(&session, &cancel).await?;
+            let pane = tmux.list_panes("fixture-dev", &cancel).await?[0].id.clone();
+            let marker = temp.path().join("dev/fixture.state");
+            let stop = CancellationToken::new();
+            let supervisor = tokio::spawn(run_supervisor(
+                SupervisorConfig {
+                    slug: "fixture".into(),
+                    path: temp.path().into(),
+                    command: "sleep 600".into(),
+                    command_prefix: Vec::new(),
+                    stop_command: None,
+                    port: 1,
+                    dev_dir: temp.path().join("dev"),
+                    tmux: tmux.clone(),
+                    processes: ProcessRunner::default(),
+                    shell: "/bin/sh".into(),
+                    pane: Some(pane),
+                },
+                stop.clone(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::fs::read_to_string(&marker).ok().as_deref() != Some("running") {
+                assert!(Instant::now() < deadline, "supervisor never started");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            if replaced {
+                tmux.kill_session("fixture-dev", &cancel).await?;
+                tmux.create_session(&session, &cancel).await?;
+                std::fs::write(&marker, "running").unwrap();
+            }
+            stop.cancel();
+            assert!(matches!(
+                supervisor.await.unwrap(),
+                Err(SupervisorError::Cancelled)
+            ));
+
+            Ok::<_, TmuxError>((
+                tmux.session_exists("fixture-dev", &cancel).await?,
+                std::fs::read_to_string(&marker).unwrap(),
+            ))
+        }
+        .await;
+        // The server is already gone once its only session was released.
+        let _ = tmux.kill_server(&cancel).await;
+        result.unwrap()
     }
 
     #[cfg(unix)]

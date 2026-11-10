@@ -932,75 +932,76 @@ async fn set_status(
     let at = OffsetDateTime::now_utc().format(&Rfc3339)?;
     ctx.database
         .call(move |store| {
-            let previous = store
-                .read_slug_state(&slug)?
-                .and_then(|entry| entry.get("work").cloned())
-                .and_then(|work| serde_json::from_value::<wt_store::WorkStatusRecord>(work).ok());
-            // Another writer (often the worktree's agent) may have claimed a
-            // status since the menu opened. Never overwrite a claim unseen.
-            // The note and owed check are carried into the new claim, so a
-            // change to either is as unseen as a change of state.
-            if let Some(wt_tui::Seen(seen)) = &seen {
-                let current = previous.as_ref().map(|work| wt_tui::StatusClaim {
-                    state: work.state.clone(),
-                    note: work.note.clone(),
-                    verify_after_merge: work.verify_after_merge.clone(),
-                    verify_in: work
-                        .verify_in
-                        .as_deref()
-                        .and_then(wt_core::VerifyStage::parse),
-                });
-                if current != *seen {
-                    return Err(wt_app_core::host_errors::stale(format!(
-                        "status is now {}",
-                        current.map_or("unset".into(), |claim| claim.state)
-                    )));
-                }
-            }
-            let record = state.map(|state| {
-                let terminal = matches!(
-                    state,
-                    wt_core::WorkState::Verified | wt_core::WorkState::Dropped
-                );
-                let (verify_after_merge, verify_in) = if terminal {
-                    (None, None)
-                } else {
-                    match verify {
-                        Some(text) => {
-                            let steps = (!text.trim().is_empty())
-                                .then(|| wt_core::sanitize_work_note(&text));
-                            let stage = steps
-                                .as_ref()
-                                .and(verify_in)
-                                .map(|stage| stage.as_str().to_owned());
-                            (steps, stage)
-                        }
-                        None => previous
-                            .as_ref()
-                            .map(|work| (work.verify_after_merge.clone(), work.verify_in.clone()))
-                            .unwrap_or_default(),
+            // The compare and the carry-over read the record under the
+            // write's own transaction: `wt status` in another process can
+            // otherwise land between them and be overwritten.
+            store.update_slug_work_status(&slug, |previous| {
+                // Another writer (often the worktree's agent) may have claimed a
+                // status since the menu opened. Never overwrite a claim unseen.
+                // The note and owed check are carried into the new claim, so a
+                // change to either is as unseen as a change of state.
+                if let Some(wt_tui::Seen(seen)) = &seen {
+                    let current = previous.map(|work| wt_tui::StatusClaim {
+                        state: work.state.clone(),
+                        note: work.note.clone(),
+                        verify_after_merge: work.verify_after_merge.clone(),
+                        verify_in: work
+                            .verify_in
+                            .as_deref()
+                            .and_then(wt_core::VerifyStage::parse),
+                    });
+                    if current != *seen {
+                        return Err(wt_app_core::host_errors::stale(format!(
+                            "status is now {}",
+                            current.map_or("unset".into(), |claim| claim.state)
+                        )));
                     }
-                };
-                wt_store::WorkStatusRecord {
-                    state: state.as_str().into(),
-                    at,
-                    note: note
-                        .map(|text| wt_core::sanitize_work_note(&text))
-                        .filter(|text| !text.is_empty()),
-                    risk: if state == wt_core::WorkState::Ready {
-                        previous.as_ref().and_then(|work| work.risk.clone())
-                    } else {
-                        None
-                    },
-                    sha: Some(head),
-                    by: Some("human".into()),
-                    blocked_on: None,
-                    verify_after_merge,
-                    verify_in,
-                    extra: Default::default(),
                 }
-            });
-            store.set_slug_work_status(&slug, record.as_ref())?;
+                Ok(state.map(|state| {
+                    let terminal = matches!(
+                        state,
+                        wt_core::WorkState::Verified | wt_core::WorkState::Dropped
+                    );
+                    let (verify_after_merge, verify_in) = if terminal {
+                        (None, None)
+                    } else {
+                        match verify {
+                            Some(text) => {
+                                let steps = (!text.trim().is_empty())
+                                    .then(|| wt_core::sanitize_work_note(&text));
+                                let stage = steps
+                                    .as_ref()
+                                    .and(verify_in)
+                                    .map(|stage| stage.as_str().to_owned());
+                                (steps, stage)
+                            }
+                            None => previous
+                                .map(|work| {
+                                    (work.verify_after_merge.clone(), work.verify_in.clone())
+                                })
+                                .unwrap_or_default(),
+                        }
+                    };
+                    wt_store::WorkStatusRecord {
+                        state: state.as_str().into(),
+                        at,
+                        note: note
+                            .map(|text| wt_core::sanitize_work_note(&text))
+                            .filter(|text| !text.is_empty()),
+                        risk: if state == wt_core::WorkState::Ready {
+                            previous.and_then(|work| work.risk.clone())
+                        } else {
+                            None
+                        },
+                        sha: Some(head),
+                        by: Some("human".into()),
+                        blocked_on: None,
+                        verify_after_merge,
+                        verify_in,
+                        extra: Default::default(),
+                    }
+                }))
+            })??;
             Ok(())
         })
         .await?;

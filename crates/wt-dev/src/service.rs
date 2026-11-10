@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet},
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -714,15 +714,7 @@ impl DevServerService {
             path: state_path,
             source: io::Error::other(error.to_string()),
         })??;
-        let session_names = self
-            .config
-            .tmux
-            .list_sessions(cancellation)
-            .await?
-            .into_iter()
-            .map(|session| session.name)
-            .collect::<Vec<_>>();
-        let sessions = session_names.iter().cloned().collect::<HashSet<_>>();
+        let sessions = self.dev_sessions(cancellation).await?;
         let waiters = queue::list(&self.config.dev_dir, &self.config.lock_dir, cancellation)
             .await?
             .waiters;
@@ -739,7 +731,7 @@ impl DevServerService {
                     .and_then(|slugs| slugs.get(&worktree.slug))
                     .cloned()
                     .unwrap_or(Value::Null);
-                let has_session = sessions.contains(&session_name(&worktree.slug));
+                let session = DevSession::of(&sessions, &worktree.slug);
                 let queue = waiters.clone();
                 let service = self.clone();
                 let cancellation = cancellation.clone();
@@ -750,7 +742,7 @@ impl DevServerService {
                             &worktree.slug,
                             &worktree.path,
                             &row_state,
-                            has_session,
+                            session,
                             &queue,
                             &cancellation,
                         )
@@ -782,21 +774,7 @@ impl DevServerService {
                 },
             });
         }
-        let mut holders = Vec::new();
-        for name in session_names {
-            if let Some(slug) = name.strip_suffix(SESSION_SUFFIX) {
-                let state = if self.read_marker(slug).await?.as_deref() == Some("crashed") {
-                    HolderState::Crashed
-                } else {
-                    HolderState::Up
-                };
-                holders.push(DevSlotHolder {
-                    slug: slug.to_owned(),
-                    state,
-                });
-            }
-        }
-        holders.sort_by(|a, b| a.slug.cmp(&b.slug));
+        let holders = self.holders(&sessions).await?;
         let limit = self.config.settings.max_concurrent;
         let free = limit.map(|limit| limit.saturating_sub(holders.len() as u32));
         Ok(DevStatusSnapshot {
@@ -815,7 +793,7 @@ impl DevServerService {
         slug: &str,
         path: &Path,
         state: &Value,
-        session_exists: bool,
+        session: DevSession,
         waiters: &[DevWaiter],
         cancellation: &CancellationToken,
     ) -> Result<DevServerStatus, DevServerError> {
@@ -834,7 +812,9 @@ impl DevServerService {
         let started_sha = state.get("devStartedSha").and_then(Value::as_str);
         // A stopped server has no running environment that can be stale. Avoid
         // a Git subprocess per idle worktree on every fleet snapshot.
-        let rebased_since = if session_exists && let Some(started_sha) = started_sha {
+        let rebased_since = if session == DevSession::Supervised
+            && let Some(started_sha) = started_sha
+        {
             let output = self
                 .processes
                 .run(
@@ -865,15 +845,17 @@ impl DevServerService {
             rebased_since,
             restarts: attempts,
         };
-        if !session_exists {
-            return Ok(if marker.as_deref() == Some("crashed") {
-                DevServerStatus {
-                    crashed: true,
-                    ..base
-                }
-            } else {
-                base
-            });
+        if session != DevSession::Supervised {
+            return Ok(
+                if session == DevSession::Orphaned || marker.as_deref() == Some("crashed") {
+                    DevServerStatus {
+                        crashed: true,
+                        ..base
+                    }
+                } else {
+                    base
+                },
+            );
         }
         let probe = match port {
             Some(port) => probe_port(port).await,
@@ -976,12 +958,10 @@ impl DevServerService {
             cancellation,
             || async {
                 let marker = self.read_marker(&worktree.slug).await?;
-                let session_exists = self
-                    .config
-                    .tmux
-                    .session_exists(&session_name(&worktree.slug), cancellation)
-                    .await?;
-                if marker.as_deref() == Some("crashed") || !session_exists {
+                let sessions = self.dev_sessions(cancellation).await?;
+                if marker.as_deref() == Some("crashed")
+                    || DevSession::of(&sessions, &worktree.slug) != DevSession::Supervised
+                {
                     return Ok(ServerPhase::Crashed);
                 }
                 Ok(match self.read_port(&worktree.slug).await? {
@@ -1087,26 +1067,50 @@ impl DevServerService {
         .await?)
     }
 
-    pub async fn slot_report(
+    /// Slug of every `<slug>-dev` session, with whether its supervisor is
+    /// still running. `remain-on-exit` keeps the pane of a supervisor that
+    /// exited outside its own cleanup, so a session alone proves nothing.
+    async fn dev_sessions(
         &self,
         cancellation: &CancellationToken,
-    ) -> Result<DevSlotReport, DevServerError> {
-        let sessions = self.config.tmux.list_sessions(cancellation).await?;
+    ) -> Result<BTreeMap<String, bool>, DevServerError> {
+        let mut sessions = BTreeMap::new();
+        for pane in self.config.tmux.list_all_panes(cancellation).await? {
+            if let Some(slug) = pane.session_name.strip_suffix(SESSION_SUFFIX) {
+                *sessions.entry(slug.to_owned()).or_insert(false) |= !pane.dead;
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// A session whose supervisor is gone holds its slot as a crashed one:
+    /// what its command created outside the process tree may still be up.
+    async fn holders(
+        &self,
+        sessions: &BTreeMap<String, bool>,
+    ) -> Result<Vec<DevSlotHolder>, DevServerError> {
         let mut holders = Vec::new();
-        for session in sessions {
-            if let Some(slug) = session.name.strip_suffix(SESSION_SUFFIX) {
-                let state = if self.read_marker(slug).await?.as_deref() == Some("crashed") {
+        for (slug, supervised) in sessions {
+            let state =
+                if !supervised || self.read_marker(slug).await?.as_deref() == Some("crashed") {
                     HolderState::Crashed
                 } else {
                     HolderState::Up
                 };
-                holders.push(DevSlotHolder {
-                    slug: slug.to_owned(),
-                    state,
-                });
-            }
+            holders.push(DevSlotHolder {
+                slug: slug.clone(),
+                state,
+            });
         }
-        holders.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(holders)
+    }
+
+    pub async fn slot_report(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<DevSlotReport, DevServerError> {
+        let sessions = self.dev_sessions(cancellation).await?;
+        let holders = self.holders(&sessions).await?;
         let limit = self.config.settings.max_concurrent;
         let free = limit.map(|limit| limit.saturating_sub(holders.len() as u32));
         let waiters = queue::list(&self.config.dev_dir, &self.config.lock_dir, cancellation)
@@ -1177,6 +1181,7 @@ impl DevServerService {
                 shell: std::env::var_os("SHELL")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("/bin/bash")),
+                pane: std::env::var("TMUX_PANE").ok(),
             },
             cancellation,
         )
@@ -1660,6 +1665,25 @@ pub fn decide_slot(
     }
 }
 
+/// What tmux holds for a slug's dev session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DevSession {
+    Absent,
+    Supervised,
+    /// The session outlived its supervisor: crashed, whatever the marker says.
+    Orphaned,
+}
+
+impl DevSession {
+    fn of(sessions: &BTreeMap<String, bool>, slug: &str) -> Self {
+        match sessions.get(slug) {
+            None => Self::Absent,
+            Some(true) => Self::Supervised,
+            Some(false) => Self::Orphaned,
+        }
+    }
+}
+
 pub(crate) fn session_name(slug: &str) -> String {
     format!("{slug}{SESSION_SUFFIX}")
 }
@@ -1821,6 +1845,148 @@ mod tests {
             service.allocate_port("starting", &cancellation).await,
             Err(DevServerError::NoPort)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dead_supervisor_pane_is_crashed_not_adopted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let main = temp.path().join("main");
+        let root = temp.path().join("worktrees");
+        std::fs::create_dir_all(&main).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        git(&main, &["config", "core.fsmonitor", "false"]);
+        git(
+            &main,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        );
+        let path = root.join("live");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "live",
+                path.to_str().unwrap(),
+            ],
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let state = StateConfig {
+            path: temp.path().join("state.sqlite"),
+            identity: RepositoryIdentity::new("port-test", "/isolated/port-test"),
+        };
+        drop(port_store(&state.path));
+        // Stands in for a supervisor that dies before its own cleanup. The
+        // delay lets `start` set remain-on-exit before the pane exits.
+        let supervisor = temp.path().join("supervisor");
+        std::fs::write(&supervisor, "#!/bin/sh\nsleep 1\nexit 1\n").unwrap();
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let processes = ProcessRunner::default();
+        let tmux = TmuxClient::new(
+            processes.clone(),
+            wt_tmux::TmuxServer::at(temp.path().join("tmux.sock")).with_config_file("/dev/null"),
+        );
+        let service = DevServerService::new(
+            DevServerConfig {
+                main_clone: main.clone(),
+                dev_dir: temp.path().join("dev"),
+                lock_dir: temp.path().join("locks"),
+                state,
+                settings: Settings {
+                    command: "true".into(),
+                    port_base: port,
+                    port_range: 1,
+                    max_concurrent: Some(1),
+                    ..Settings::default()
+                },
+                tmux: tmux.clone(),
+                executable: supervisor,
+                config_selector: None,
+                home: temp.path().to_path_buf(),
+            },
+            GitRepository::new(
+                wt_vcs::RepositoryConfig {
+                    main_clone: main.clone(),
+                    worktree_root: root.clone(),
+                    trunk_branch: "main".into(),
+                    stage: wt_vcs::StageConfig {
+                        prefix: "stage-".into(),
+                        issue_id_pattern: String::new(),
+                    },
+                },
+                processes.clone(),
+            ),
+            processes,
+        );
+        let worktree = DevWorktree {
+            slug: "live".into(),
+            path,
+            branch: "live".into(),
+        };
+        let cancellation = CancellationToken::new();
+        let result = async {
+            let started = service
+                .start(&worktree, DevStartOptions::default(), &cancellation)
+                .await?;
+            assert!(matches!(started, DevStartOutcome::Started { .. }));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while !tmux.list_panes("live-dev", &cancellation).await?[0].dead {
+                assert!(tokio::time::Instant::now() < deadline, "pane never died");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let status = service
+                .status(&worktree.slug, &worktree.path, &cancellation)
+                .await?;
+            assert!(
+                status.crashed && !status.starting && !status.running,
+                "{status:?}"
+            );
+            // A crashed holder keeps its slot until it is restarted or stopped.
+            assert_eq!(
+                service.slot_report(&cancellation).await?.holders,
+                Some(vec![DevSlotHolder {
+                    slug: "live".into(),
+                    state: HolderState::Crashed,
+                }])
+            );
+            assert_eq!(
+                service
+                    .wait_ready(&worktree, Duration::from_secs(1), &cancellation)
+                    .await?,
+                ReadyOutcome::Crashed
+            );
+            let restarted = service
+                .start(&worktree, DevStartOptions::default(), &cancellation)
+                .await?;
+            assert!(
+                matches!(restarted, DevStartOutcome::Started { .. }),
+                "{restarted:?}"
+            );
+            Ok::<(), DevServerError>(())
+        }
+        .await;
+        tmux.kill_server(&cancellation).await.unwrap();
+        result.unwrap();
     }
 
     #[tokio::test]

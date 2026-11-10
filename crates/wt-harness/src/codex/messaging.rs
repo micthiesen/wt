@@ -202,6 +202,28 @@ impl CodexMessenger {
             false
         };
 
+        // `start` found a slot that the inventory above did not: another
+        // attach created it meanwhile, possibly on a different conversation.
+        // The thread chosen for a resume is addressed only if that slot
+        // records it.
+        if !was_live
+            && !cold_started
+            && let Some(expected) = session_id.as_deref()
+        {
+            let stamp = self
+                .tmux
+                .list_sessions(cancel)
+                .await?
+                .into_iter()
+                .find(|s| s.name == tmux_name)
+                .and_then(|s| s.harness_session_id);
+            if stamp.as_deref() != Some(expected) {
+                return Ok(CodexMessageOutcome::Failed {
+                    reason: identity_mismatch(&tmux_name, expected, stamp.as_deref()),
+                });
+            }
+        }
+
         if cold_started && session_id.is_none() {
             // Codex creates the thread's rollout only with its first prompt.
             // Manager and main launches carry that prompt, so they must
@@ -1976,6 +1998,39 @@ mod tests {
             "{idle:?}"
         );
         assert_eq!(queued_to(&seen), ["idle"]);
+    }
+
+    #[tokio::test]
+    async fn losing_the_cold_start_race_never_queues_to_the_thread_it_meant_to_resume() {
+        let fixture = Fixture::new();
+        let (seen, server) = fake_app_server(&fixture.paths);
+        fixture.rollout("meant", &fixture.cwd, 3600);
+        // Hold the start lock as a concurrent attach would, so the send has
+        // already seen an absent slot and chosen `meant` when the slot appears.
+        let attach =
+            FileLock::acquire(&fixture.paths.lock_dir.join("__start__feature-codex.lock")).unwrap();
+        let mut messenger = fixture.messenger();
+        let target = fixture.target("DO NOT MISADDRESS");
+        let send = messenger.send_target(&target, &fixture.cancel);
+        let other_attach = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            fixture.rollout("other", &fixture.cwd, 0);
+            fixture
+                .slot("history\n› Ask a follow-up question\n", Some("other"))
+                .await;
+            drop(attach);
+        };
+        let (outcome, ()) = tokio::join!(send, other_attach);
+        let pane = fixture.pane().await;
+        server.abort();
+        fixture.close().await;
+        assert!(
+            matches!(&outcome, Ok(CodexMessageOutcome::Failed { reason })
+                if reason.contains("other") && reason.contains("Nothing was sent")),
+            "{outcome:?}"
+        );
+        assert!(queued_to(&seen).is_empty(), "{:?}", queued_to(&seen));
+        assert!(!pane.contains("DO NOT MISADDRESS"));
     }
 
     #[tokio::test]

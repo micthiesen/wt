@@ -653,6 +653,14 @@ async fn force_with_lease(
     remote_tip: &str,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
+    if !local_branch_had(runner, cwd, branch, local_tip, remote_tip, cancellation)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err(format!(
+            "push {branch}: origin/{branch} has commits the local branch never had; pull them or reset origin/{branch} first"
+        ));
+    }
     let out = run_git(
         runner,
         cwd,
@@ -679,6 +687,43 @@ async fn force_with_lease(
             })
         ))
     }
+}
+
+/// Whether `remote_tip` is work the local branch already holds or once held.
+/// The lease value is read straight after a fetch, so it always matches and
+/// cannot tell a remote-only commit (a suggestion, a bot fix, a push from
+/// another host) from the tip this checkout pushed. An interrupted restack or
+/// a local amend leaves the remote on an earlier value of the branch, which
+/// its reflog still names; `--force-if-includes` applies the same rule but is
+/// ignored when the lease names an explicit value.
+async fn local_branch_had(
+    runner: &ProcessRunner,
+    cwd: &Path,
+    branch: &str,
+    local_tip: &str,
+    remote_tip: &str,
+    cancellation: &CancellationToken,
+) -> Result<bool, StackError> {
+    if is_ancestor(runner, cwd, remote_tip, local_tip, cancellation).await? {
+        return Ok(true);
+    }
+    let reflog = run_git(
+        runner,
+        cwd,
+        [
+            "reflog",
+            "show",
+            "--format=%H",
+            &format!("refs/heads/{branch}"),
+        ],
+        cancellation,
+    )
+    .await?;
+    Ok(reflog.status.success()
+        && reflog
+            .stdout_text()
+            .lines()
+            .any(|entry| entry.trim() == remote_tip))
 }
 
 async fn abort_rebase(runner: &ProcessRunner, cwd: &Path) -> bool {

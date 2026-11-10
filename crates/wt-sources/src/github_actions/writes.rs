@@ -301,9 +301,14 @@ fn auto_merge_guard(
                 && write.change == WriteChange::AutoMerge { enable: wanted }
         })
     };
-    // A read cannot answer an arm while one of our disarms is unconfirmed:
-    // it may predate the disarm.
-    if enable && confirmed_armed && !unconfirmed(false) {
+    // A read cannot answer an arm while one of our disarms is still in the
+    // ledger, accepted or unconfirmed: it may predate the disarm.
+    let disarm_recorded = state.mutations().any(|write| {
+        write.branch == branch
+            && write.number == number
+            && write.change == WriteChange::AutoMerge { enable: false }
+    });
+    if enable && confirmed_armed && !disarm_recorded {
         return Guard::AlreadyDone;
     }
     if enable && unconfirmed(true) {
@@ -470,6 +475,32 @@ mod tests {
         assert_eq!(
             auto_merge_guard(&mut ledger, &armed, "feature", 7, true, Instant::now()),
             Guard::Send
+        );
+    }
+
+    /// Disarm accepted, then re-arm before a read that started after the
+    /// disarm lands: the older read still shows the arm and must not answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_cannot_answer_an_arm_while_a_disarm_is_accepted() {
+        let _ = Stamp::now();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let armed = Confirmed::for_test(with_auto_merge(open_pr_data("feature")));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let mut ledger = LedgerState::default();
+        record_accepted(
+            &mut ledger,
+            1,
+            GithubWrite::auto_merge("feature", 7, false),
+            Stamp::now(),
+        );
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &armed, "feature", 7, true, Instant::now()),
+            Guard::Send
+        );
+        // The disarm itself is still a no-op, not a resend.
+        assert_eq!(
+            auto_merge_guard(&mut ledger, &armed, "feature", 7, false, Instant::now()),
+            Guard::AlreadyDone
         );
     }
 

@@ -11,7 +11,7 @@ use serde_json::{Map, Number, Value, json};
 
 use crate::{
     GuideRecord, MergeEdge, RemovedWorktree, ReviewRequestDismissal, Store, StoreError,
-    TitleSource, TitleWrite, WorkStatusRecord, WtState,
+    TitleSource, TitleWrite, WorkStatusRecord, WorkStatusWrite, WtState,
 };
 
 const GROUP_INBOX: &str = "\0inbox";
@@ -1192,46 +1192,38 @@ impl Store {
         record: Option<&WorkStatusRecord>,
     ) -> Result<bool, StoreError> {
         self.mutate_wt_state(|state| {
-            if record.is_none() && !has_slug(state, slug) {
-                return Ok((false, false));
-            }
-            if let (Some(record), Some(previous)) = (
-                record,
-                state
-                    .get("slugs")
-                    .and_then(|slugs| slugs.get(slug))
-                    .and_then(|slug| slug.get("work"))
-                    .and_then(|value| {
-                        serde_json::from_value::<WorkStatusRecord>(value.clone()).ok()
-                    }),
-            ) && previous.same_claim(record)
-            {
-                return Ok((false, false));
-            }
-            let mut entry = slug_entry(state, slug);
-            if let Some(record) = record {
-                let mut next_work = serde_json::to_value(record)?;
-                preserve_unknown_fields(
-                    entry.get("work"),
-                    &mut next_work,
-                    &[
-                        "state",
-                        "at",
-                        "note",
-                        "risk",
-                        "sha",
-                        "by",
-                        "blockedOn",
-                        "verifyAfterMerge",
-                        "verifyIn",
-                    ],
-                );
-                entry.insert("work".to_owned(), next_work);
-            } else {
-                entry.remove("work");
-            }
-            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
-            Ok((true, true))
+            let previous = stored_work_status(state, slug);
+            let changed = write_work_status(state, slug, previous.as_ref(), record)?;
+            Ok((changed, changed))
+        })
+    }
+
+    /// Replace a worktree's status with one computed from the record stored
+    /// at the moment of writing. `update` runs inside the write's own
+    /// transaction, so a witness it compares and anything it carries over
+    /// from the previous record cannot be overtaken by another process
+    /// before the write lands. An `Err` from `update` refuses: nothing is
+    /// written.
+    pub fn update_slug_work_status<E>(
+        &mut self,
+        slug: &str,
+        update: impl FnOnce(Option<&WorkStatusRecord>) -> Result<Option<WorkStatusRecord>, E>,
+    ) -> Result<Result<WorkStatusWrite, E>, StoreError> {
+        self.mutate_wt_state(|state| {
+            let previous = stored_work_status(state, slug);
+            let record = match update(previous.as_ref()) {
+                Ok(record) => record,
+                Err(refusal) => return Ok((Err(refusal), false)),
+            };
+            let changed = write_work_status(state, slug, previous.as_ref(), record.as_ref())?;
+            Ok((
+                Ok(WorkStatusWrite {
+                    previous,
+                    record,
+                    changed,
+                }),
+                changed,
+            ))
         })
     }
 
@@ -2184,4 +2176,53 @@ fn merge_optional(
     } else if let Some(value) = previous.and_then(|previous| previous.get(key)) {
         target.insert(key.to_owned(), value.clone());
     }
+}
+
+fn stored_work_status(state: &WtState, slug: &str) -> Option<WorkStatusRecord> {
+    state
+        .get("slugs")
+        .and_then(|slugs| slugs.get(slug))
+        .and_then(|slug| slug.get("work"))
+        .and_then(|value| serde_json::from_value::<WorkStatusRecord>(value.clone()).ok())
+}
+
+/// Returns whether the stored status changed.
+fn write_work_status(
+    state: &mut WtState,
+    slug: &str,
+    previous: Option<&WorkStatusRecord>,
+    record: Option<&WorkStatusRecord>,
+) -> Result<bool, StoreError> {
+    if record.is_none() && !has_slug(state, slug) {
+        return Ok(false);
+    }
+    if let (Some(record), Some(previous)) = (record, previous)
+        && previous.same_claim(record)
+    {
+        return Ok(false);
+    }
+    let mut entry = slug_entry(state, slug);
+    if let Some(record) = record {
+        let mut next_work = serde_json::to_value(record)?;
+        preserve_unknown_fields(
+            entry.get("work"),
+            &mut next_work,
+            &[
+                "state",
+                "at",
+                "note",
+                "risk",
+                "sha",
+                "by",
+                "blockedOn",
+                "verifyAfterMerge",
+                "verifyIn",
+            ],
+        );
+        entry.insert("work".to_owned(), next_work);
+    } else {
+        entry.remove("work");
+    }
+    object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+    Ok(true)
 }

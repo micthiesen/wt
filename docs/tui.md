@@ -221,7 +221,7 @@ against a bounded local GitHub-merge and production-history scan while history
 is open. A landing only moves forward: once a removal is proven in
 production its record keeps that (`landedOn`), so a later refresh or restart
 never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
-verification, landing, and notes. `Enter` restores, `p` opens the PR, `i` opens
+verification, landing, and notes. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
@@ -405,7 +405,9 @@ section move, sessions `;`, start agent Shift+F12, stop a running terminal
 Shift+F10/F11, GitHub `e`/`E`, review checkout `w`, history restore, hard
 refresh, create, removal of a clean worktree `d`, and an action palette that
 was prefetched for the selected row. An open menu updates as newer data
-arrives and keeps the highlighted choice. If what the menu showed changed
+arrives and keeps the highlighted choice. If the highlighted choice
+disappears, the cursor stays in place, a notice names it, and the next key is
+ignored unless it moves the cursor or cancels. If what the menu showed changed
 before the host applied the choice (a PR moved, a session was replaced, an
 agent set a status), nothing is written: the menu reopens with the current
 data and the toast says what changed.
@@ -539,4 +541,5 @@ from tmux by its host.
 The `d` delete menu opens from cached worktree data, including dirty and remote
 rows. It shows current cached warnings. After confirmation, the host checks
 identity and removal hazards. Any hazards or stage destruction require a fresh
-confirmation before removal. A missing HEAD shows an information menu only.
+confirmation before removal. That confirmation waits until any open menu,
+overlay or prompt closes. A missing HEAD shows an information menu only.

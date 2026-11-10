@@ -263,8 +263,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let base_board = board_rx.borrow_and_update().clone();
             let confirmed_git = sources.git.confirm(&git);
             let confirmed_metadata = sources.metadata.confirm(&metadata);
-            let confirmed_sessions = sources.sessions.confirm(&sessions);
-            let confirmed_inventory = sources.inventory.confirm(&inventory);
+            let (confirmed_sessions, confirmed_inventory) =
+                confirm_session_inputs(&sources.sessions, &sources.inventory, &sessions, &inventory);
             let fresh_github = automation_facts::fresh_github(sources.github.confirm(&github));
             let lanes_ready = *git.state() == SourceState::Ready
                 && *metadata.state() == SourceState::Ready;
@@ -991,6 +991,31 @@ fn lifecycle_metadata_key(metadata: Option<&crate::local_source::Metadata>) -> s
     serde_json::json!({"slugs": slugs, "removals": removals})
 }
 
+/// A failed session lane keeps its last data as live, so it confirms nothing
+/// here: a session started since then would read as absent and its slug as
+/// idle. Discoveries stop while the inventory is failed and go with it.
+fn confirm_session_inputs(
+    sessions: &LeafHandle<SessionDiscoveries>,
+    inventory: &LeafHandle<SessionInventory>,
+    sessions_snapshot: &wt_runtime::SourceSnapshot<SessionDiscoveries>,
+    inventory_snapshot: &wt_runtime::SourceSnapshot<SessionInventory>,
+) -> (
+    Option<Confirmed<SessionDiscoveries>>,
+    Option<Confirmed<SessionInventory>>,
+) {
+    let failed = |state: &SourceState| matches!(state, SourceState::Failed(_));
+    let inventory_failed = failed(inventory_snapshot.state());
+    let discoveries_current = !inventory_failed && !failed(sessions_snapshot.state());
+    (
+        discoveries_current
+            .then(|| sessions.confirm(sessions_snapshot))
+            .flatten(),
+        (!inventory_failed)
+            .then(|| inventory.confirm(inventory_snapshot))
+            .flatten(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,6 +1148,72 @@ mod tests {
         fixture.ctx.cancellation.cancel();
         result.expect("read-only evidence must stop and reap its process on quit");
         fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_lane_confirms_no_session_facts() {
+        use wt_core::Domain;
+        use wt_runtime::{
+            LeafPublisher, Persistence, RefreshPolicy, SourceSpec, Stamp, leaf_channel,
+        };
+
+        fn leaf<T: Default + Send + Sync + 'static>(
+            scope: &TaskScope,
+        ) -> (LeafHandle<T>, LeafPublisher<T>) {
+            let (leaf, publisher) = leaf_channel(
+                scope,
+                SourceSpec {
+                    name: "session-fixture",
+                    domain: Domain::Sessions,
+                    persistence: Persistence::Never("isolated test"),
+                    policy: RefreshPolicy::default(),
+                },
+            );
+            publisher.publish_live(T::default(), Stamp::now());
+            (leaf, publisher)
+        }
+        let scope = TaskScope::new();
+        let (sessions, sessions_publisher) = leaf::<SessionDiscoveries>(&scope);
+        let (inventory, inventory_publisher) = leaf::<SessionInventory>(&scope);
+        let confirm = || {
+            confirm_session_inputs(
+                &sessions,
+                &inventory,
+                &sessions.view().snapshot(),
+                &inventory.view().snapshot(),
+            )
+        };
+        let (discovered, running) = confirm();
+        assert!(discovered.is_some() && running.is_some());
+
+        // A slug whose session started after the last good tmux pass is
+        // absent from the kept inventory; it must read as busy, not idle.
+        inventory_publisher.set_state(SourceState::Failed(
+            "tmux session inventory: timeout".into(),
+        ));
+        let (discovered, running) = confirm();
+        assert!(discovered.is_none() && running.is_none());
+        let mut facts = PreparedAutomationFacts {
+            rows: vec![wt_automations::AutomationRow {
+                slug: "one".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        automation_facts::refresh_sessions(&mut facts, discovered.as_ref(), running.as_ref());
+        assert!(facts.quiescence["one"].session_busy);
+        assert!(facts.quiescence["one"].action_running);
+
+        // A failed discovery pass keeps older per-target entries: the
+        // inventory is still current, the discoveries are not.
+        inventory_publisher.publish_live(SessionInventory::default(), Stamp::now());
+        sessions_publisher.publish_live_with_state(
+            SessionDiscoveries::default(),
+            Stamp::now(),
+            SourceState::Failed("one Codex: timeout".into()),
+        );
+        let (discovered, running) = confirm();
+        assert!(discovered.is_none() && running.is_some());
     }
 
     #[tokio::test(start_paused = true)]

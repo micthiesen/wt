@@ -247,6 +247,17 @@ struct CreateProgress {
     checkout_created: bool,
     checkout_attempted: bool,
     branch_created: bool,
+    prior_state: Option<PriorSlugState>,
+}
+
+/// What a slug's record held before a create cleared it. A create that fails
+/// puts this back, and a restore of the same branch keeps the fork base and
+/// an owed post-merge check, so neither a failed attempt nor a restore drops
+/// the stack anchor or an obligation.
+struct PriorSlugState {
+    base: Option<(String, Option<String>)>,
+    work: Option<wt_store::WorkStatusRecord>,
+    removed: Option<RemovedWorktree>,
 }
 
 struct ReviewHead {
@@ -646,10 +657,21 @@ impl LifecycleService {
                 is_main: false,
             }),
             Err(primary) => {
+                let prior = progress.prior_state.take();
                 let rollback = self
                     .rollback_create(&path, &main, branch, progress, &CancellationToken::new())
                     .await;
-                match rollback {
+                let restored = match prior {
+                    Some(prior) => {
+                        let slug = slug.to_owned();
+                        self.mutate_store(&CancellationToken::new(), move |store| {
+                            restore_slug_record(store, &slug, prior.base, prior.work, prior.removed)
+                        })
+                        .await
+                    }
+                    None => Ok(()),
+                };
+                match rollback.and(restored) {
                     Ok(()) => Err(primary),
                     Err(rollback) => Err(LifecycleError::Rollback {
                         primary: primary.to_string(),
@@ -678,7 +700,29 @@ impl LifecycleService {
         progress: &mut CreateProgress,
         cancellation: &CancellationToken,
     ) -> Result<WorktreeTarget, LifecycleError> {
-        self.reset_slug_state(slug, cancellation).await?;
+        let prior = self.reset_slug_state(slug, cancellation).await?;
+        // The slug alone does not identify a branch: only the removal record
+        // proves the previous state belonged to this one.
+        let restoring = existing
+            && prior
+                .removed
+                .as_ref()
+                .is_some_and(|removed| removed.branch == branch);
+        let prior = progress.prior_state.insert(prior);
+        if restoring {
+            let base = prior.base.clone();
+            let owed = prior.work.clone().filter(|work| {
+                work.verify_after_merge
+                    .as_deref()
+                    .is_some_and(|steps| !steps.trim().is_empty())
+                    && !matches!(work.state.as_str(), "verified" | "dropped")
+            });
+            self.mutate_store(cancellation, {
+                let slug = slug.to_owned();
+                move |store| restore_slug_record(store, &slug, base, owed, None)
+            })
+            .await?;
+        }
         self.create_backend(
             branch,
             slug,
@@ -1658,14 +1702,33 @@ impl LifecycleService {
         &self,
         slug: &str,
         cancellation: &CancellationToken,
-    ) -> Result<(), LifecycleError> {
+    ) -> Result<PriorSlugState, LifecycleError> {
         self.mutate_store(cancellation, {
             let slug = slug.to_owned();
             move |store| {
+                let entry = store.read_slug_state(&slug)?;
+                let field = |name: &str| {
+                    entry
+                        .as_ref()
+                        .and_then(|entry| entry.get(name))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                let prior = PriorSlugState {
+                    base: field("baseBranch").map(|branch| (branch, field("baseSha"))),
+                    work: entry
+                        .as_ref()
+                        .and_then(|entry| entry.get("work"))
+                        .and_then(|work| serde_json::from_value(work.clone()).ok()),
+                    removed: store
+                        .read_removed_worktrees()?
+                        .into_iter()
+                        .find(|removed| removed.slug == slug),
+                };
                 store.clear_slug_state(&slug)?;
                 store.clear_removed_worktree(&slug)?;
                 store.set_archived(&slug, false)?;
-                Ok(())
+                Ok(prior)
             }
         })
         .await
@@ -3361,6 +3424,25 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 /// The branch name a base ref denotes, as recorded in `baseBranch` and
 /// `gh-merge-base`. `baseBranch == trunk` means "no parent", so every spelling
 /// of the trunk must normalize to the same name.
+fn restore_slug_record(
+    store: &mut Store,
+    slug: &str,
+    base: Option<(String, Option<String>)>,
+    work: Option<wt_store::WorkStatusRecord>,
+    removed: Option<RemovedWorktree>,
+) -> Result<(), StoreError> {
+    if let Some((branch, sha)) = &base {
+        store.set_slug_base(slug, Some((branch, sha.as_deref())))?;
+    }
+    if let Some(work) = &work {
+        store.set_slug_work_status(slug, Some(work))?;
+    }
+    if let Some(removed) = &removed {
+        store.restore_removed_worktree_if_absent(slug, removed)?;
+    }
+    Ok(())
+}
+
 fn logical_base_branch(base: &str) -> &str {
     ["refs/remotes/origin/", "origin/", "refs/heads/"]
         .into_iter()
@@ -4040,6 +4122,195 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    fn owed_verification() -> wt_store::WorkStatusRecord {
+        wt_store::WorkStatusRecord {
+            state: "ready".into(),
+            at: "2026-10-09T00:00:00Z".into(),
+            note: Some("latest note".into()),
+            risk: Some("low".into()),
+            sha: None,
+            by: None,
+            blocked_on: None,
+            verify_after_merge: Some("verify prod".into()),
+            verify_in: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn restoring_an_existing_branch_keeps_its_fork_base_and_owed_verification() {
+        let (_scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let options = || CreateOptions {
+            base: Some("refs/heads/michael/parent".into()),
+            fetch_origin: false,
+            run_install: false,
+        };
+        run(&runner, &main, &["branch", "michael/parent", "main"]).await;
+        let created = service
+            .create("michael/child", options(), &cancellation)
+            .await
+            .unwrap();
+        let before = service
+            .read_slug_state("child", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before["baseBranch"], "michael/parent");
+        assert!(before["baseSha"].as_str().is_some());
+        service
+            .mutate_store(&cancellation, |store| {
+                store
+                    .set_slug_work_status("child", Some(&owed_verification()))
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        // The branch survives removal, as it does on origin after a pushed
+        // worktree is removed, so the restore checks out an existing branch.
+        service
+            .remove(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: false,
+                    ..RemoveOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let history = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        service
+            .create_from_removed(
+                "child",
+                "michael/child",
+                &history[0].removed_at,
+                options(),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let after = service
+            .read_slug_state("child", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["baseBranch"], before["baseBranch"]);
+        assert_eq!(after["baseSha"], before["baseSha"]);
+        assert_eq!(after["work"]["verifyAfterMerge"], "verify prod");
+    }
+
+    #[tokio::test]
+    async fn existing_branch_does_not_inherit_another_branchs_slug_record() {
+        let (_scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let options = || CreateOptions {
+            base: Some("refs/heads/main".into()),
+            fetch_origin: false,
+            run_install: false,
+        };
+        let created = service
+            .create("michael/shared", options(), &cancellation)
+            .await
+            .unwrap();
+        service
+            .remove(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: true,
+                    ..RemoveOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        run(&runner, &main, &["branch", "shared", "main"]).await;
+        let other = service
+            .create("shared", options(), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(other.target.slug(), "shared");
+        let state = service
+            .read_slug_state("shared", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.get("baseBranch").is_none(), "{state}");
+    }
+
+    #[tokio::test]
+    async fn failed_create_keeps_the_removed_row_and_its_slug_record() {
+        let (_scratch, mut service, _runner, _main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let options = |run_install| CreateOptions {
+            base: Some("refs/heads/main".into()),
+            fetch_origin: false,
+            run_install,
+        };
+        let created = service
+            .create("michael/flaky", options(false), &cancellation)
+            .await
+            .unwrap();
+        service
+            .mutate_store(&cancellation, |store| {
+                store
+                    .set_slug_work_status("flaky", Some(&owed_verification()))
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        service
+            .remove(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: true,
+                    ..RemoveOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let before = service
+            .read_slug_state("flaky", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        let history = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+
+        service.config.install_command = Some("exit 7".into());
+        let failed = service
+            .create("michael/flaky", options(true), &cancellation)
+            .await;
+        assert!(failed.is_err(), "the install command must fail the create");
+        assert!(!root.join("flaky").exists());
+        assert_eq!(
+            service
+                .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+                .await
+                .unwrap(),
+            history,
+            "a create that produced nothing must keep the removed row"
+        );
+        let after = service
+            .read_slug_state("flaky", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after["baseBranch"], before["baseBranch"]);
+        assert_eq!(after["baseSha"], before["baseSha"]);
+        assert_eq!(after["work"], before["work"]);
     }
 
     #[tokio::test]

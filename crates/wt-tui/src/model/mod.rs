@@ -87,6 +87,10 @@ pub struct Model {
     pub(crate) local_menu: Option<UiAction>,
     /// The open board menu's default choice, while the user has not moved.
     pub(crate) local_menu_default: Option<local_menu::OptionIdentity>,
+    /// A rebuild removed the option under the picker's cursor, which now
+    /// rests on one the user has not chosen. The next key may move or cancel
+    /// but not commit.
+    pub(crate) picker_choice_lost: bool,
     /// A board menu whose commit was just produced, until it is sent.
     pub(crate) committed_menu: Option<UiAction>,
     /// The board menu behind the request in flight, reopened if it is stale.
@@ -175,6 +179,7 @@ impl Default for Model {
             carry_typeahead: Vec::new(),
             local_menu: None,
             local_menu_default: None,
+            picker_choice_lost: false,
             committed_menu: None,
             last_menu: None,
             background: Vec::new(),

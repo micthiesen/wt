@@ -3,7 +3,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::{InputResult, Model};
+use super::{InputResult, Model, ToastTone};
 use crate::{
     ConfirmAction, LineEditor, PickerAction, PickerOption, Seen, SessionTarget, TextAction,
     UiAction,
@@ -438,6 +438,19 @@ impl Model {
                 InputResult::Unchanged
             }
             Interaction::Picker(picker) => {
+                if std::mem::take(&mut self.picker_choice_lost) {
+                    let mut probe = picker.selected;
+                    let cancel = matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+                        || (control && code == KeyCode::Char('c'));
+                    if !cancel && !picker_move(code, &mut probe, picker.options.len()) {
+                        self.interaction = interaction;
+                        self.toast = Some((
+                            "key ignored: the highlighted choice changed".into(),
+                            ToastTone::Notice,
+                        ));
+                        return InputResult::Draw;
+                    }
+                }
                 if let PickerAction::Sessions { choices } = &picker.action
                     && !control
                     && !key.modifiers.contains(KeyModifiers::SHIFT)

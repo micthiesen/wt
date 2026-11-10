@@ -185,11 +185,12 @@ pub async fn reconcile(context: &AppContext) -> Result<Reconciled> {
         return Ok(Reconciled::Current);
     }
     let prior_pid = prior_state.and_then(|state| state.pid);
-    unload_agent(context, &plist).await?;
-    // The plist is rewritten by this build; if that fails, reload the old one.
-    let installed = install_agent_locked(context, &plist).await;
-    let result = reload_after_unload(context, &plist).await?;
-    installed?;
+    let result = while_unloaded(
+        unload_agent(context, &plist),
+        install_agent_locked(context, &plist),
+        reload_after_unload(context, &plist),
+    )
+    .await?;
     if !result.status.success() {
         bail!(
             "could not reload GitHub events launch agent: {}",
@@ -274,6 +275,29 @@ pub async fn launchctl(
     plist: &Path,
 ) -> Result<wt_platform::process::ProcessOutput> {
     launchctl_with(context, action, plist, &context.cancellation).await
+}
+
+/// Rewrite the plist between an unload and a reload of the launch agent.
+/// `unload -w` disables the job even when confirming the unload then fails
+/// (cancellation, a `launchctl list` error, a daemon slow to exit), so the
+/// reload runs whatever the unload reported and the earliest failure is the
+/// one returned. A failed unload leaves the old plist to be reloaded, as
+/// does a failed rewrite.
+async fn while_unloaded<T>(
+    unload: impl Future<Output = Result<()>>,
+    change: impl Future<Output = Result<()>>,
+    reload: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let unloaded = unload.await;
+    let changed = match &unloaded {
+        Ok(()) => change.await,
+        Err(_) => Ok(()),
+    };
+    let reloaded = reload.await;
+    unloaded?;
+    let reloaded = reloaded?;
+    changed?;
+    Ok(reloaded)
 }
 
 /// Reload after a completed unload. `unload -w` also disables the job, so a
@@ -651,11 +675,12 @@ pub async fn agent_mutation(context: &AppContext, action: &str) -> Result<i32> {
     };
     let verb = if action == "restart" { "load" } else { action };
     let result = if action == "restart" {
-        unload_agent(context, &plist).await?;
-        let installed = install_agent_locked(context, &plist).await;
-        let result = reload_after_unload(context, &plist).await?;
-        installed?;
-        result
+        while_unloaded(
+            unload_agent(context, &plist),
+            install_agent_locked(context, &plist),
+            reload_after_unload(context, &plist),
+        )
+        .await?
     } else {
         if action == "load" {
             install_agent_locked(context, &plist).await?;
@@ -1008,6 +1033,42 @@ mod tests {
         );
         std::fs::write(paths.state_file(), state.to_json().unwrap()).unwrap();
         assert_eq!(installed_build(root.path().to_path_buf()).await, "newbuild");
+    }
+
+    #[tokio::test]
+    async fn a_failed_unload_still_reloads_the_agent_and_reports_the_unload() {
+        let steps = std::sync::Mutex::new(Vec::new());
+        let step = |name: &'static str, result: Result<()>| {
+            let steps = &steps;
+            async move {
+                steps.lock().unwrap().push(name);
+                result
+            }
+        };
+        let error = while_unloaded(
+            step(
+                "unload",
+                Err(anyhow::anyhow!("cancelled before confirming")),
+            ),
+            step("install", Ok(())),
+            step("load", Ok(())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "cancelled before confirming");
+        // The old plist is reloaded: nothing rewrote it after a failed unload.
+        assert_eq!(*steps.lock().unwrap(), ["unload", "load"]);
+
+        steps.lock().unwrap().clear();
+        let error = while_unloaded(
+            step("unload", Ok(())),
+            step("install", Err(anyhow::anyhow!("no secret"))),
+            step("load", Ok(())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "no secret");
+        assert_eq!(*steps.lock().unwrap(), ["unload", "install", "load"]);
     }
 
     #[test]

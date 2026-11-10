@@ -34,6 +34,40 @@ mod cli_tests {
     use super::*;
 
     #[test]
+    fn boot_token_does_not_reach_child_processes() {
+        const CHILD: &str = "WT_TEST_BOOT_TOKEN_CHILD";
+        let token = wt_launcher::BOOT_ATTEMPT_TOKEN_ENV;
+        if std::env::var_os(CHILD).is_some() {
+            // SAFETY: this re-executed process runs only this test, and the
+            // harness thread waiting on it does not read the environment.
+            let options = unsafe { startup_options() };
+            assert_eq!(options.env.get(token).map(String::as_str), Some("attempt"));
+            let inherited = std::process::Command::new("/usr/bin/env").output().unwrap();
+            assert!(
+                !String::from_utf8_lossy(&inherited.stdout).contains(token),
+                "a child process inherited the boot token"
+            );
+            return;
+        }
+        // The environment is process-wide, so the startup path runs in a
+        // process of its own, launched the way the launcher starts wt.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli_tests::boot_token_does_not_reach_child_processes",
+            ])
+            .env(CHILD, "1")
+            .env(token, "attempt")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+    }
+
+    #[test]
     fn error_chain_prints_an_embedded_source_once() {
         let io = std::io::Error::from_raw_os_error(1);
         let error = anyhow::Error::new(wt_harness::CodexTrustError::Io {
@@ -263,8 +297,22 @@ fn error_chain(error: &anyhow::Error) -> String {
     text
 }
 
-fn run(cli: Cli) -> Result<i32> {
+/// Snapshot the startup environment, then drop the launcher's boot token
+/// from this process. The token acknowledges this one launch. A worker or
+/// tmux server that inherited it would present it against a later install
+/// state and be refused at startup.
+///
+/// # Safety
+/// No other thread may exist: the process environment is not synchronized.
+unsafe fn startup_options() -> LoadOptions {
     let options = LoadOptions::default();
+    unsafe { std::env::remove_var(wt_launcher::BOOT_ATTEMPT_TOKEN_ENV) };
+    options
+}
+
+fn run(cli: Cli) -> Result<i32> {
+    // SAFETY: the worker runtime below starts the first other thread.
+    let options = unsafe { startup_options() };
     let boot = if matches!(
         cli.command,
         Some(Command::Install(_) | Command::Update(_) | Command::Rollback(_))

@@ -93,7 +93,8 @@ it does the right thing for the shape under the cursor:
    does not contain the parent's current tip (commits that never landed), and
    it fails rather than guessing when a parent's PR state cannot be read.
 3. **Replay** each member onto its (possibly rewritten) parent in its own
-   worktree, parents before children; force-with-lease push; retarget the PR
+   worktree, parents before children; force-with-lease push, refused when origin's tip was never part of the
+   local branch (neither an ancestor of it nor in its reflog); retarget the PR
    base to match. A member reconcile observed **landed** (a merged parent that
    is itself still a live, uncleaned worktree) is skipped, not replayed —
    replaying it would re-apply its squash-merged commits onto trunk and

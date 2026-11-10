@@ -21,7 +21,7 @@ pub use store::{Store, StoreError};
 pub use titles::{TitleSource, TitleWrite, sentence_case, stored_title};
 pub use types::{
     ForeignRepositoryRow, GuideRecord, MergeEdge, RemovedWorktree, RepositoryIdentity,
-    ReviewRequestDismissal, WorkStatusRecord, WtState,
+    ReviewRequestDismissal, WorkStatusRecord, WorkStatusWrite, WtState,
 };
 
 #[cfg(test)]

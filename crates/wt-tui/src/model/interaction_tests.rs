@@ -1391,3 +1391,59 @@ fn missing_remote_build_dialog_dismisses_and_copies_on_this_device() {
         assert_eq!(model.selected, Some(0));
     }
 }
+
+#[test]
+fn a_vanished_picker_option_drops_the_next_commit_key() {
+    use wt_core::HarnessId::Claude;
+    let entry = |name: &str| crate::SessionMenuEntry {
+        selection: crate::SessionSelection {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+            harness: Claude,
+            session_id: Some(name.into()),
+            live_slot: None,
+            managed_name: Some(name.into()),
+            mode: SessionMode::Resume,
+            live: true,
+            seen_live: None,
+        },
+        display_name: name.into(),
+        state: None,
+        is_live: true,
+        last_active_ms: None,
+    };
+    let menu_key = crate::session_menu_key(Some("one"), SessionTarget::Harness);
+    let mut before = board(&["one"]);
+    before.display.harnesses = vec![Claude];
+    before.session_menus.insert(
+        menu_key.clone(),
+        vec![entry("s1"), entry("s2"), entry("s3")],
+    );
+    let mut after = before.clone();
+    after
+        .session_menus
+        .insert(menu_key, vec![entry("s1"), entry("s3")]);
+    for commit in [KeyCode::Char('x'), KeyCode::Enter] {
+        let mut model = Model::default();
+        model.apply(ready(before.clone()));
+        ch(&mut model, ';');
+        ch(&mut model, 'j');
+        assert_eq!(picker_selected(&model), Some(1));
+        // s2 exits; s3 now sits where the cursor was.
+        model.apply(ready(after.clone()));
+        let result = press(&mut model, commit);
+        assert!(
+            !matches!(result, InputResult::Action(_)),
+            "{commit:?} acted on a session the user never chose: {result:?}"
+        );
+        assert!(matches!(model.interaction, Interaction::Picker(_)));
+        assert!(toast(&model).is_some());
+        // The user has now seen where the cursor is; the next key is theirs.
+        assert!(matches!(
+            press(&mut model, commit),
+            InputResult::Action(
+                UiAction::KillSession { selection } | UiAction::SelectSession { selection }
+            ) if selection.session_id.as_deref() == Some("s3")
+        ));
+    }
+}

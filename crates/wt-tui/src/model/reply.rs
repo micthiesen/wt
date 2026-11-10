@@ -6,8 +6,12 @@ use super::{
 use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 
 impl Model {
-    pub(crate) fn show_next_removal_review(&mut self) {
-        if !matches!(self.interaction, Interaction::None)
+    /// Something other than the board takes the next key: a menu, overlay or
+    /// prompt that is open, or a host menu still loading. A confirm opened
+    /// here by a reply would take a key typed for that layer.
+    pub(crate) fn layer_open(&self) -> bool {
+        !matches!(self.interaction, Interaction::None)
+            || self.yank.is_some()
             || self.help
             || self.show_perf
             || self.history.active
@@ -16,7 +20,10 @@ impl Model {
                 .pending_request
                 .as_ref()
                 .is_some_and(|request| request.preparation)
-        {
+    }
+
+    pub(crate) fn show_next_removal_review(&mut self) {
+        if self.layer_open() {
             return;
         }
         if let Some((prompt, host)) = self.removal_reviews.pop_front() {

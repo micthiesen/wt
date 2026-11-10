@@ -66,6 +66,14 @@ impl WorkStatusRecord {
     }
 }
 
+/// What `Store::update_slug_work_status` read and wrote in its transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkStatusWrite {
+    pub previous: Option<WorkStatusRecord>,
+    pub record: Option<WorkStatusRecord>,
+    pub changed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemovedWorktree {

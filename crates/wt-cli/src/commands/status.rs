@@ -535,48 +535,44 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
-            let previous = state
-                .get("slugs")
-                .and_then(|s| s.get(&slug))
-                .and_then(|v| v.get("work"))
-                .and_then(parse_work_status);
-            let previous_note = previous.as_ref().and_then(|previous| previous.note.clone());
             let mut next = WorkStatusRecord::new(work_state, now_iso());
             next.sha = record.head_sha.clone();
             next.by = std::env::var("WT_AGENT")
                 .ok()
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty());
-            next.note = merge_note(
-                previous.as_ref().and_then(|p| p.note.as_deref()),
-                note.as_deref(),
-                append,
-                false,
-            );
             next.risk = risk;
             next.blocked_on = blocked;
-            if !matches!(work_state, WorkState::Verified | WorkState::Dropped) {
-                match verify {
-                    Some(verify) => {
-                        next.verify_after_merge = Some(verify.steps);
-                        next.verify_in = Some(verify.stage);
-                    }
-                    None => {
-                        if let Some(previous) = previous {
-                            next.verify_after_merge = previous.verify_after_merge;
-                            next.verify_in = previous.verify_in;
+            let StatusWrite {
+                previous,
+                next,
+                wrote,
+            } = update_status(&ctx.database, &slug, move |previous| {
+                next.note = merge_note(
+                    previous.as_ref().and_then(|p| p.note.as_deref()),
+                    note.as_deref(),
+                    append,
+                    false,
+                );
+                if !matches!(work_state, WorkState::Verified | WorkState::Dropped) {
+                    match verify {
+                        Some(verify) => {
+                            next.verify_after_merge = Some(verify.steps);
+                            next.verify_in = Some(verify.stage);
+                        }
+                        None => {
+                            if let Some(previous) = previous {
+                                next.verify_after_merge = previous.verify_after_merge;
+                                next.verify_in = previous.verify_in;
+                            }
                         }
                     }
                 }
-            }
-            let stored: StoredWorkStatusRecord =
-                serde_json::from_value(serde_json::to_value(&next)?)
-                    .context("encode status record")?;
-            let db_slug = slug.clone();
-            let wrote = ctx
-                .database
-                .call(move |s| Ok(s.set_slug_work_status(&db_slug, Some(&stored))?))
-                .await?;
+                Ok(next)
+            })
+            .await?
+            .map_err(anyhow::Error::msg)?;
+            let previous_note = previous.and_then(|previous| previous.note);
             println!(
                 "✓ {} {}{}",
                 record.target.slug(),
@@ -611,61 +607,26 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
-            let Some(mut next) = state
-                .get("slugs")
-                .and_then(|s| s.get(&slug))
-                .and_then(|v| v.get("work"))
-                .and_then(parse_work_status)
-            else {
-                eprintln!("{slug} has no status asserted; set a state first");
-                return Ok(2);
+            let write = update_status(&ctx.database, &slug, {
+                let slug = slug.clone();
+                move |previous| amend_record(&slug, previous, note, risk, blocked, verify, append)
+            })
+            .await?;
+            let StatusWrite {
+                previous,
+                next,
+                wrote,
+            } = match write {
+                Ok(write) => write,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return Ok(2);
+                }
             };
-            let previous_note = next.note.clone();
-            if risk.is_some() && next.state != WorkState::Ready {
-                eprintln!("--risk only applies to ready");
-                return Ok(2);
-            }
-            if let Some(Some(_)) = blocked
-                && !matches!(next.state, WorkState::Ready | WorkState::Todo)
-            {
-                eprintln!("--blocked-on applies to ready and todo");
-                return Ok(2);
-            }
-            if blocked == Some(None) && next.blocked_on.is_none() {
-                eprintln!("{slug} has no gate to clear");
-                return Ok(2);
-            }
-            if verify.is_some() && matches!(next.state, WorkState::Verified | WorkState::Dropped) {
-                eprintln!(
-                    "--verify-in-* does not apply to {}",
-                    work_state_name(next.state)
-                );
-                return Ok(2);
-            }
-            let old_gate = next.blocked_on.clone();
-            let old_verify = (next.verify_after_merge.clone(), next.verify_in);
-            next.note = merge_note(next.note.as_deref(), note.as_deref(), append, true);
-            if let Some(risk) = risk {
-                next.risk = Some(risk);
-            }
-            if let Some(blocked) = blocked {
-                next.blocked_on = blocked;
-            }
-            if let Some(verify) = verify {
-                next.verify_after_merge = Some(verify.steps);
-                next.verify_in = Some(verify.stage);
-            }
-            if next.risk.is_some_and(|r| r != WorkRisk::Low) && next.note.is_none() {
-                eprintln!("--risk medium|high requires -m explaining uncertainty");
-                return Ok(2);
-            }
-            let stored: StoredWorkStatusRecord =
-                serde_json::from_value(serde_json::to_value(&next)?)?;
-            let db_slug = slug.clone();
-            let wrote = ctx
-                .database
-                .call(move |s| Ok(s.set_slug_work_status(&db_slug, Some(&stored))?))
-                .await?;
+            let previous = previous.expect("an amend is refused without a previous status");
+            let previous_note = previous.note;
+            let old_gate = previous.blocked_on;
+            let old_verify = (previous.verify_after_merge, previous.verify_in);
             println!(
                 "✓ {slug} {}{}",
                 work_state_name(next.state),
@@ -695,6 +656,106 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
         }
         Action::Error(_) => unreachable!(),
     }
+}
+
+struct StatusWrite {
+    previous: Option<WorkStatusRecord>,
+    next: WorkStatusRecord,
+    wrote: bool,
+}
+
+/// Write the status `build` computes from the record stored at the moment of
+/// writing. Agents assert statuses constantly, so a record read before the
+/// write's transaction may already be replaced; building from it would drop
+/// the newer claim's owed check, note or risk. `Err` from `build` refuses the
+/// write with a usage message.
+async fn update_status(
+    database: &Database,
+    slug: &str,
+    build: impl FnOnce(Option<WorkStatusRecord>) -> Result<WorkStatusRecord, String> + Send + 'static,
+) -> Result<Result<StatusWrite, String>> {
+    enum Refusal {
+        Usage(String),
+        Failed(anyhow::Error),
+    }
+    let slug = slug.to_owned();
+    database
+        .call(move |store| {
+            let mut built = None;
+            let write = store.update_slug_work_status(&slug, |stored| {
+                let previous = stored
+                    .and_then(|stored| serde_json::to_value(stored).ok())
+                    .as_ref()
+                    .and_then(parse_work_status);
+                let next = build(previous.clone()).map_err(Refusal::Usage)?;
+                let stored: StoredWorkStatusRecord = serde_json::to_value(&next)
+                    .and_then(serde_json::from_value)
+                    .context("encode status record")
+                    .map_err(Refusal::Failed)?;
+                built = Some((previous, next));
+                Ok(Some(stored))
+            })?;
+            match write {
+                Ok(write) => {
+                    let (previous, next) = built.expect("a written status was built");
+                    Ok(Ok(StatusWrite {
+                        previous,
+                        next,
+                        wrote: write.changed,
+                    }))
+                }
+                Err(Refusal::Usage(message)) => Ok(Err(message)),
+                Err(Refusal::Failed(error)) => Err(error),
+            }
+        })
+        .await
+}
+
+/// The current status with only its note, risk, gate or owed check changed.
+fn amend_record(
+    slug: &str,
+    previous: Option<WorkStatusRecord>,
+    note: Option<String>,
+    risk: Option<WorkRisk>,
+    blocked: Option<Option<String>>,
+    verify: Option<Verify>,
+    append: bool,
+) -> Result<WorkStatusRecord, String> {
+    let Some(mut next) = previous else {
+        return Err(format!("{slug} has no status asserted; set a state first"));
+    };
+    if risk.is_some() && next.state != WorkState::Ready {
+        return Err("--risk only applies to ready".into());
+    }
+    if let Some(Some(_)) = blocked
+        && !matches!(next.state, WorkState::Ready | WorkState::Todo)
+    {
+        return Err("--blocked-on applies to ready and todo".into());
+    }
+    if blocked == Some(None) && next.blocked_on.is_none() {
+        return Err(format!("{slug} has no gate to clear"));
+    }
+    if verify.is_some() && matches!(next.state, WorkState::Verified | WorkState::Dropped) {
+        return Err(format!(
+            "--verify-in-* does not apply to {}",
+            work_state_name(next.state)
+        ));
+    }
+    next.note = merge_note(next.note.as_deref(), note.as_deref(), append, true);
+    if let Some(risk) = risk {
+        next.risk = Some(risk);
+    }
+    if let Some(blocked) = blocked {
+        next.blocked_on = blocked;
+    }
+    if let Some(verify) = verify {
+        next.verify_after_merge = Some(verify.steps);
+        next.verify_in = Some(verify.stage);
+    }
+    if next.risk.is_some_and(|r| r != WorkRisk::Low) && next.note.is_none() {
+        return Err("--risk medium|high requires -m explaining uncertainty".into());
+    }
+    Ok(next)
 }
 
 /// Record the outcome of a removed row's owed post-merge check.
@@ -1077,6 +1138,50 @@ mod tests {
         let state = read_state(&fixture.ctx.database).await.unwrap();
         assert_eq!(state["slugs"]["one"]["work"]["verifyIn"], "staging");
         assert_eq!(state["slugs"]["one"]["work"]["state"], "working");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn amend_decides_from_the_status_stored_when_it_writes() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let gated = StatusArgs {
+            positionals: vec!["todo".into()],
+            blocked_on: Some("release train lands".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &gated).await.unwrap(), 0);
+        // `--unblock` was valid against the gated `todo` its caller saw, but
+        // the worktree's agent has asked for a human since.
+        let claim = StatusArgs {
+            positionals: vec!["needs-human".into()],
+            note: Some("approve the migration".into()),
+            verify_in_production: Some("STEPS: 1. check prod".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &claim).await.unwrap(), 0);
+        let refused = update_status(&fixture.ctx.database, "one", |previous| {
+            amend_record("one", previous, None, None, Some(None), None, false)
+        })
+        .await
+        .unwrap();
+        assert_eq!(refused.err().as_deref(), Some("one has no gate to clear"));
+        // A new assertion carries the check owed by the record it replaces.
+        let write = update_status(&fixture.ctx.database, "one", |previous| {
+            let mut next = WorkStatusRecord::new(WorkState::Review, "t");
+            next.verify_after_merge = previous.and_then(|previous| previous.verify_after_merge);
+            Ok(next)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(write.previous.unwrap().state, WorkState::NeedsHuman);
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        assert_eq!(state["slugs"]["one"]["work"]["state"], "review");
+        assert_eq!(
+            state["slugs"]["one"]["work"]["verifyAfterMerge"],
+            "STEPS: 1. check prod"
+        );
         fixture.close().await.unwrap();
     }
 

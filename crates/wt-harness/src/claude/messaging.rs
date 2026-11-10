@@ -15,6 +15,12 @@ use super::{
 };
 
 const HUMAN_WAIT_POLL: Duration = Duration::from_millis(250);
+/// One bound for a send's turn at the slot: queueing for the send lock, and
+/// holding it while the session waits on a human.
+const SEND_TURN_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+/// One missing registry read may be Claude rewriting its entry, not an exit;
+/// absence lasting this long is treated as one.
+const GONE_GRACE: Duration = Duration::from_secs(2);
 const WARM_SETTLE: Duration = Duration::from_millis(300);
 const READY_POLL: Duration = Duration::from_millis(350);
 const READY_MAX: Duration = Duration::from_secs(12);
@@ -87,7 +93,7 @@ impl ClaudeMessenger {
         let _send_lock = SessionLock::acquire(
             &self.sessions.paths().lock_dir,
             &format!("__claude_send__{}", self.sessions.tmux_name(target)),
-            Duration::from_secs(24 * 60 * 60),
+            SEND_TURN_MAX,
             cancel,
         )
         .await?;
@@ -101,7 +107,7 @@ impl ClaudeMessenger {
             !std::env::var("WT_INSPECT").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
         if inspector_enabled {
             loop {
-                snapshot = self
+                snapshot = match self
                     .wait_until_unblocked(
                         target,
                         tmux_name.as_str(),
@@ -109,7 +115,16 @@ impl ClaudeMessenger {
                         require_ready,
                         cancel,
                     )
-                    .await?;
+                    .await?
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(reason) => {
+                        return Ok(ClaudeMessageOutcome::Failed {
+                            reason,
+                            maybe_submitted: false,
+                        });
+                    }
+                };
                 let since_ms = now_ms();
                 let outcome = self
                     .injector
@@ -216,9 +231,15 @@ impl ClaudeMessenger {
                 }
             }
         }
-        let _snapshot = self
+        if let Err(reason) = self
             .wait_until_unblocked(target, &tmux_name, snapshot, require_ready, cancel)
-            .await?;
+            .await?
+        {
+            return Ok(ClaudeMessageOutcome::Failed {
+                reason,
+                maybe_submitted: false,
+            });
+        }
         match self
             .terminal_send(target, &tmux_name, &text, cold_started, cancel)
             .await?
@@ -240,6 +261,10 @@ impl ClaudeMessenger {
         }
     }
 
+    /// Wait while the session waits on a human. The inner error is why the
+    /// wait ended with nothing submitted: the session exited (no later poll
+    /// can find it again, and the caller holds the slot's send lock), or the
+    /// human never answered.
     async fn wait_until_unblocked(
         &self,
         target: &ClaudeSessionTarget,
@@ -247,16 +272,32 @@ impl ClaudeMessenger {
         mut snapshot: Option<super::ClaudeSessionInfo>,
         require_ready: bool,
         cancel: &CancellationToken,
-    ) -> Result<Option<super::ClaudeSessionInfo>, ClaudeSessionManagerError> {
-        while snapshot
-            .as_ref()
-            .is_some_and(|s| s.status == RegistryStatus::Waiting)
-            || (require_ready && snapshot.is_none())
-        {
+    ) -> Result<Result<Option<super::ClaudeSessionInfo>, String>, ClaudeSessionManagerError> {
+        let deadline = tokio::time::Instant::now() + SEND_TURN_MAX;
+        let mut gone_since = None;
+        loop {
+            let now = tokio::time::Instant::now();
+            match &snapshot {
+                Some(session) if session.status == RegistryStatus::Waiting => {
+                    gone_since = None;
+                    if now >= deadline {
+                        return Ok(Err(format!(
+                            "{name} was still waiting on a human after 24 hours. Nothing was sent"
+                        )));
+                    }
+                }
+                None if require_ready => {
+                    if now.duration_since(*gone_since.get_or_insert(now)) >= GONE_GRACE {
+                        return Ok(Err(format!(
+                            "{name} exited while the message waited for a human. Nothing was sent, so a retry is safe and starts a new session"
+                        )));
+                    }
+                }
+                _ => return Ok(Ok(snapshot)),
+            }
             tokio::select! { biased; _ = cancel.cancelled() => return Err(ClaudeSessionManagerError::Operation { operation: "send", detail: format!("cancelled while {name} waits for a human") }), _ = tokio::time::sleep(HUMAN_WAIT_POLL) => {} }
             snapshot = self.sessions.find(target)?;
         }
-        Ok(snapshot)
     }
 
     async fn terminal_send(
@@ -639,5 +680,65 @@ mod tests {
             "[a] removed note",
             since
         ));
+    }
+
+    /// A registry entry for this test process, so the pid is alive.
+    fn register(home: &Path, target: &ClaudeSessionTarget, status: &str) -> std::path::PathBuf {
+        let dir = home.join(".claude/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = target.cwd.canonicalize().unwrap();
+        let id = crate::claude_session_id(&cwd, target.managed_name.as_deref());
+        let file = dir.join(format!("{}.json", std::process::id()));
+        let entry = serde_json::json!({"pid": std::process::id(), "sessionId": id,
+            "cwd": cwd, "name": "repo~review", "status": status, "waitingFor": "permission",
+            "startedAt": 1, "updatedAt": 2});
+        std::fs::write(&file, entry.to_string()).unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn a_session_that_exits_while_a_send_waits_on_a_human_fails_the_send() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths = super::super::ClaudePaths::new(&home, tmp.path().join("cache"));
+        let tmux = wt_tmux::TmuxClient::new(
+            wt_platform::process::ProcessRunner::default(),
+            wt_tmux::TmuxServer::at(tmp.path().join("tmux.sock")).with_config_file("/dev/null"),
+        );
+        let sessions =
+            ClaudeSessionManager::new(super::super::ClaudeHarness::new(paths.clone()), tmux);
+        let messenger = ClaudeMessenger::new(sessions, ClaudeInjector::new(&paths.cache_dir));
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd,
+            managed_name: Some("review".into()),
+        };
+        let entry = register(&home, &target, "waiting");
+        let cancel = CancellationToken::new();
+        let send = messenger.send_with_sender(&target, "hello", None, &cancel);
+        let exit = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            std::fs::remove_file(&entry).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(tokio::time::timeout(Duration::from_secs(10), send), exit);
+        let outcome = outcome
+            .expect("send still waits after its session exited")
+            .unwrap();
+        assert!(
+            matches!(&outcome, ClaudeMessageOutcome::Failed { reason, maybe_submitted: false }
+                if reason.contains("exited")),
+            "{outcome:?}"
+        );
+        // The send lock is free again for the next sender.
+        SessionLock::acquire(
+            &paths.lock_dir,
+            "__claude_send__repo~review",
+            Duration::from_millis(200),
+            &cancel,
+        )
+        .await
+        .unwrap();
     }
 }

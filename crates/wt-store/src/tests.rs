@@ -1497,3 +1497,79 @@ fn a_removal_records_a_later_production_landing_once() {
     // Only the exact removal: an older record of the same slug is untouched.
     assert!(state["removed"][1].get("landedOn").is_none());
 }
+
+#[test]
+fn status_update_reads_and_writes_in_one_transaction() {
+    use std::{convert::Infallible, sync::mpsc};
+
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut first = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let mut second = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let status = |state: &str, verify_after_merge: Option<&str>| WorkStatusRecord {
+        state: state.into(),
+        at: "t".into(),
+        note: None,
+        risk: None,
+        sha: None,
+        by: None,
+        blocked_on: None,
+        verify_after_merge: verify_after_merge.map(str::to_owned),
+        verify_in: verify_after_merge.map(|_| "production".to_owned()),
+        extra: Map::new(),
+    };
+    let carried = |state: &'static str| {
+        move |previous: Option<&WorkStatusRecord>| {
+            let mut next = status(state, None);
+            if let Some(previous) = previous {
+                next.verify_after_merge = previous.verify_after_merge.clone();
+                next.verify_in = previous.verify_in.clone();
+            }
+            Ok::<_, Infallible>(Some(next))
+        }
+    };
+
+    // Another process asserts an owed check while this one is between
+    // reading the previous record and writing its own.
+    let owed = status("ready", Some("STEPS: 1. check production"));
+    let (reading_tx, reading_rx) = mpsc::channel();
+    let other = thread::spawn(move || {
+        reading_rx.recv().unwrap();
+        second.set_slug_work_status("task", Some(&owed)).unwrap();
+    });
+    first
+        .update_slug_work_status("task", |previous| {
+            reading_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(300));
+            carried("review")(previous)
+        })
+        .unwrap()
+        .unwrap();
+    other.join().unwrap();
+    assert_eq!(
+        first.read_wt_state().unwrap()["slugs"]["task"]["work"]["verifyAfterMerge"],
+        "STEPS: 1. check production",
+        "the other writer's owed check was overwritten from a stale read"
+    );
+
+    let write = first
+        .update_slug_work_status("task", carried("needs-testing"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(write.previous.unwrap().state, "ready");
+    assert!(write.changed);
+    let work = &first.read_wt_state().unwrap()["slugs"]["task"]["work"];
+    assert_eq!(work["state"], "needs-testing");
+    assert_eq!(work["verifyAfterMerge"], "STEPS: 1. check production");
+
+    assert_eq!(
+        first
+            .update_slug_work_status("task", |_| Err::<Option<WorkStatusRecord>, _>("stale"))
+            .unwrap(),
+        Err("stale")
+    );
+    assert_eq!(
+        first.read_wt_state().unwrap()["slugs"]["task"]["work"]["state"],
+        "needs-testing"
+    );
+}
