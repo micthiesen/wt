@@ -117,7 +117,7 @@ def main() -> int:
             " line = next(x for x in cfg.splitlines() if x.startswith('cache_db = '))\n"
             " cache_db = pathlib.Path(line.split('=', 1)[1].strip().strip('\\\"'))\n"
             " events = cache_db.parent / 'events'; events.mkdir(parents=True, exist_ok=True)\n"
-            " state = {'pid': int(os.environ['WT_TEST_PID']), 'port': 8765, 'writerSha': os.environ['WT_TEST_BUILD'], 'startedAt': 1, 'lastEventAt': None, 'lastFetchAt': None, 'eventCount': 0, 'lastError': None}\n"
+            " state = {'pid': int(os.environ['WT_TEST_PID']), 'port': 8765, 'writerSha': os.environ['WT_TEST_BUILD'], 'startedAt': int(__import__('time').time() * 1000), 'lastEventAt': None, 'lastFetchAt': None, 'eventCount': 0, 'lastError': None}\n"
             " (events / 'state.json').write_text(json.dumps(state))\n"
             "sys.exit(0)\n",
             encoding="utf-8",
@@ -177,7 +177,8 @@ def main() -> int:
         }
         plist_path.write_bytes(plistlib.dumps(legacy))
         legacy_bytes = plist_path.read_bytes()
-        (events_dir / "state.json").write_text(json.dumps({"pid": 2147483647, "port": port, "writerSha": "legacy-build", "startedAt": 1, "lastEventAt": None, "lastFetchAt": None, "eventCount": 0, "lastError": None}))
+        legacy_state = json.dumps({"pid": 2147483647, "port": port, "writerSha": "legacy-build", "startedAt": 1, "lastEventAt": None, "lastFetchAt": None, "eventCount": 0, "lastError": None})
+        (events_dir / "state.json").write_text(legacy_state)
         env["WT_TEST_UNLOAD_MODE"] = "fail-loaded"
         failed_restart = checked([str(binary), "events", "restart"], env=env, cwd=repo, ok=False)
         assert "plist was left in place" in failed_restart.stderr, failed_restart.stderr
@@ -187,6 +188,10 @@ def main() -> int:
         assert "job state is unknown" in malformed_restart.stderr, malformed_restart.stderr
         assert plist_path.read_bytes() == legacy_bytes, "unknown launchd output must preserve the plist"
         del env["WT_TEST_LIST_MODE"]
+        # A failed unload still reloads, and the fake load records this
+        # process as the daemon: put the exited legacy daemon back.
+        assert (root / "launchctl.log").read_text().splitlines()[-1] == "load -w " + str(plist_path)
+        (events_dir / "state.json").write_text(legacy_state)
         env["WT_TEST_UNLOAD_MODE"] = "success"
         checked([str(binary), "events", "restart"], env=env, cwd=repo)
         refreshed = plistlib.loads(plist_path.read_bytes())
@@ -265,7 +270,7 @@ def main() -> int:
 
         # A missing launchd row does not permit removal while the recorded daemon lives.
         state_path = events_dir / "state.json"
-        state_path.write_text(json.dumps({"pid": os.getpid(), "port": port, "writerSha": build, "startedAt": 1, "lastEventAt": None, "lastFetchAt": None, "eventCount": 0, "lastError": None}))
+        state_path.write_text(json.dumps({"pid": os.getpid(), "port": port, "writerSha": build, "startedAt": int(time.time() * 1000), "lastEventAt": None, "lastFetchAt": None, "eventCount": 0, "lastError": None}))
         env["WT_TEST_UNLOAD_MODE"] = "success"
         live_state = checked([str(binary), "events", "uninstall"], env=env, cwd=repo, ok=False)
         assert "recorded daemon PID(s) are still alive" in live_state.stderr, live_state.stderr
