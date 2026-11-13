@@ -101,6 +101,8 @@ Remove a worktree (with dirty/unpushed guards, optional SST stage destroy, optio
 
 "Unpushed" is measured against `origin/<branch>`, the same `unpushed` field [`wt ls --json`](#wt-ls) reports, never against the branch's configured upstream. Proven landing can waive this guard because squash merges leave the original commits outside the base history. Proof requires an exact merged-PR head or containment by the base tip currently advertised by origin. A cached ref or local base branch alone is insufficient. Background removal retains the advertised-base proof and checks it again under the removal lock before teardown and deletion; a changed or unavailable base requires a new review. The CLI, TUI and cleanup automations share these checks.
 
+A clone-backed (Rift) worktree owns its refs, so removal also checks its other local branches and its stashes: any whose commits neither origin nor the main clone still holds is a hazard needing `--force`, and proven landing does not waive it. Restack backups of the worktree's own branch are exempt. See [backends](backends.md).
+
 Successful SST removal may regenerate configured `auto_regen_paths`. Those
 changes are allowed in the final removal check; edits outside that allowlist,
 changed HEAD/identity, and new verification obligations still stop removal.

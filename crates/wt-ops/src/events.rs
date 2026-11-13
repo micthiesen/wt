@@ -437,7 +437,9 @@ fn daemon_alive(state: &wt_events::EventDaemonState) -> bool {
     if let Some(recorded) = state.started_at {
         // Another user's process cannot be read, and it cannot be this
         // user's launch agent either.
-        return process_started_ms(pid).is_some_and(|started| started <= recorded);
+        // The slack absorbs a wall clock stepped back between the fork and
+        // the daemon recording its start.
+        return process_started_ms(pid).is_some_and(|started| started <= recorded + 5_000);
     }
     true
 }

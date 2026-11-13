@@ -170,12 +170,8 @@ pub async fn worker(context: &AppContext, branch: &str) -> Result<i32> {
             eprintln!("restack conflict: {error}");
             eprintln!("failing branch: {branch}");
             eprintln!("backup branch: {backup_ref}");
-            match handoff_conflict(context, &branch, &error, &backup_ref).await {
-                Ok(()) => eprintln!("sent /restack recovery instructions to the failing worktree"),
-                Err(handoff_error) => eprintln!(
-                    "could not hand off /restack recovery ({handoff_error:#}); resolve in that worktree manually"
-                ),
-            }
+            let handoff = handoff_conflict(context, &branch, &error, &backup_ref).await;
+            eprintln!("{}", handoff_report(&handoff));
             Ok(3)
         }
         RestackOutcome::Refused { error } => {
@@ -190,7 +186,7 @@ async fn handoff_conflict(
     branch: &str,
     detail: &str,
     backup_ref: &str,
-) -> Result<()> {
+) -> Result<Handoff> {
     let inventory = context
         .repository
         .inventory_status(&context.cancellation)
@@ -237,61 +233,81 @@ async fn handoff_conflict(
         .selected
         .context("could not inspect the wt tmux session registry")?;
     let text = conflict_handoff_text(selected, detail, backup_ref);
-    match harness.send(route, &text, None, context).await {
-        Ok(wt_harness::HarnessMessageOutcome::Claude(wt_harness::ClaudeMessageOutcome::Sent {
+    let outcome = harness
+        .send(route, &text, None, context)
+        .await
+        .context("send /restack conflict handoff")?;
+    classify_handoff(outcome)
+}
+
+/// What is known about the conflict handoff after its one send attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum Handoff {
+    Delivered,
+    /// The message may have reached the session. Enqueue is not idempotent,
+    /// so this is reported and never retried.
+    Unconfirmed,
+}
+
+fn classify_handoff(outcome: wt_harness::HarnessMessageOutcome) -> Result<Handoff> {
+    use wt_harness::{ClaudeMessageOutcome, CodexMessageOutcome, HarnessMessageOutcome};
+    match outcome {
+        HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
             delivered: Some(true),
             ..
-        }))
-        | Ok(wt_harness::HarnessMessageOutcome::Codex(
-            wt_harness::CodexMessageOutcome::Queued(_)
-            | wt_harness::CodexMessageOutcome::CliQueued { .. },
-        ))
-        | Ok(wt_harness::HarnessMessageOutcome::OpenCode(_))
-        | Ok(wt_harness::HarnessMessageOutcome::Pi(_)) => Ok(()),
-        Ok(wt_harness::HarnessMessageOutcome::Claude(wt_harness::ClaudeMessageOutcome::Sent {
-            delivered: None,
-            ..
-        }))
-        | Ok(wt_harness::HarnessMessageOutcome::Codex(
-            wt_harness::CodexMessageOutcome::Terminal {
-                delivered: None, ..
-            }
-            | wt_harness::CodexMessageOutcome::Ambiguous { .. },
-        )) => {
-            eprintln!("/restack handoff may have been delivered; not retrying to avoid duplicates");
-            Ok(())
-        }
-        Ok(wt_harness::HarnessMessageOutcome::Claude(wt_harness::ClaudeMessageOutcome::Sent {
-            delivered: Some(false),
-            ..
-        }))
-        | Ok(wt_harness::HarnessMessageOutcome::Codex(
-            wt_harness::CodexMessageOutcome::Terminal {
-                delivered: Some(false),
-                ..
-            }
-            | wt_harness::CodexMessageOutcome::NeedsTerminalFallback { .. }
-            | wt_harness::CodexMessageOutcome::Failed { .. },
-        )) => bail!("the harness did not confirm delivery"),
-        Ok(wt_harness::HarnessMessageOutcome::Claude(
-            wt_harness::ClaudeMessageOutcome::Failed {
-                reason,
-                maybe_submitted: true,
-            },
-        )) => bail!("delivery is uncertain ({reason}); not retrying to avoid duplicates"),
-        Ok(wt_harness::HarnessMessageOutcome::Claude(
-            wt_harness::ClaudeMessageOutcome::Failed {
-                reason,
-                maybe_submitted: false,
-            },
-        )) => bail!("{reason}"),
-        Ok(wt_harness::HarnessMessageOutcome::Codex(
-            wt_harness::CodexMessageOutcome::Terminal {
+        })
+        | HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::Queued(_)
+            | CodexMessageOutcome::CliQueued { .. }
+            | CodexMessageOutcome::Terminal {
                 delivered: Some(true),
                 ..
             },
-        )) => Ok(()),
-        Err(error) => Err(error).context("send /restack conflict handoff"),
+        )
+        | HarnessMessageOutcome::OpenCode(_)
+        | HarnessMessageOutcome::Pi(_) => Ok(Handoff::Delivered),
+        HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
+            delivered: None, ..
+        })
+        | HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::Terminal {
+                delivered: None, ..
+            }
+            | CodexMessageOutcome::Ambiguous { .. },
+        ) => Ok(Handoff::Unconfirmed),
+        HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
+            delivered: Some(false),
+            ..
+        })
+        | HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::Terminal {
+                delivered: Some(false),
+                ..
+            }
+            | CodexMessageOutcome::NeedsTerminalFallback { .. }
+            | CodexMessageOutcome::Failed { .. },
+        ) => bail!("the harness did not confirm delivery"),
+        HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
+            reason,
+            maybe_submitted: true,
+        }) => bail!("delivery is uncertain ({reason}); not retrying to avoid duplicates"),
+        HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
+            reason,
+            maybe_submitted: false,
+        }) => bail!("{reason}"),
+    }
+}
+
+/// The single line the worker prints about the handoff.
+fn handoff_report(handoff: &Result<Handoff>) -> String {
+    match handoff {
+        Ok(Handoff::Delivered) => {
+            "sent /restack recovery instructions to the failing worktree".into()
+        }
+        Ok(Handoff::Unconfirmed) => "/restack recovery instructions may have reached the failing worktree; not retrying to avoid duplicates, check that worktree's session".into(),
+        Err(error) => format!(
+            "could not hand off /restack recovery ({error:#}); resolve in that worktree manually"
+        ),
     }
 }
 
@@ -345,8 +361,36 @@ fn stack_service(context: &AppContext) -> StackService {
 
 #[cfg(test)]
 mod tests {
-    use super::{conflict_handoff_text, worker_command};
+    use super::{Handoff, classify_handoff, conflict_handoff_text, handoff_report, worker_command};
     use std::path::Path;
+    use wt_harness::{CodexMessageOutcome, HarnessMessageOutcome};
+
+    #[test]
+    fn ambiguous_handoff_is_reported_once_and_not_as_sent() {
+        let ambiguous = classify_handoff(HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::Ambiguous {
+                reason: "lost reply".into(),
+            },
+        ));
+        assert_eq!(ambiguous.as_ref().ok(), Some(&Handoff::Unconfirmed));
+        let report = handoff_report(&ambiguous);
+        assert_eq!(report.lines().count(), 1);
+        assert!(report.contains("may have reached"), "{report}");
+        assert!(!report.starts_with("sent "), "{report}");
+
+        let queued = classify_handoff(HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::CliQueued {
+                thread_id: "thread".into(),
+            },
+        ));
+        assert_eq!(queued.as_ref().ok(), Some(&Handoff::Delivered));
+        assert!(handoff_report(&queued).starts_with("sent /restack"));
+
+        let failed = classify_handoff(HarnessMessageOutcome::Codex(CodexMessageOutcome::Failed {
+            reason: "no session".into(),
+        }));
+        assert!(handoff_report(&failed).starts_with("could not hand off"));
+    }
 
     #[test]
     fn worker_receives_branch_as_one_literal_argument() {

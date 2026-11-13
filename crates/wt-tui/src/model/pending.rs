@@ -150,12 +150,44 @@ impl Model {
             id,
             CreationMove {
                 section: section.clone(),
-                key: resolved,
+                key: resolved.clone(),
             },
         );
+        if let Some(key) = resolved {
+            self.hold_creation_move(&key, section);
+        }
         self.reproject(tokio::time::Instant::now());
         let name = section.as_deref().unwrap_or("Inbox");
         Some(self.notify(format!("Moves to {name} once it is created")))
+    }
+
+    /// Whether a move chosen for `key` while it was being created has yet
+    /// to be sent.
+    pub(super) fn creation_move_owed(&self, key: &str) -> bool {
+        self.creation_moves.iter().any(|(id, moved)| {
+            moved.key.as_deref() == Some(key)
+                || self
+                    .pending
+                    .mutation(*id)
+                    .is_some_and(|mutation| mutation.target.key.as_deref() == Some(key))
+        })
+    }
+
+    /// Keep showing a filed row in its chosen section from the moment its
+    /// creation is accepted until the move itself is sent, which replaces
+    /// this entry. Without it the row shows where the host created it
+    /// whenever the creation settles before the move can go out.
+    fn hold_creation_move(&mut self, key: &str, section: &Option<String>) {
+        let action = UiAction::MoveSection {
+            key: key.to_owned(),
+            section: section.clone(),
+            seen: None,
+        };
+        if let crate::Effect::Mutation(mutation) = action.effect(&self.board) {
+            let id = self.next_op_id();
+            self.pending
+                .begin(id, mutation, tokio::time::Instant::now());
+        }
     }
 
     /// Queue a filed row's move once the host lists the row. A foreground
@@ -414,9 +446,10 @@ impl Model {
             match reply.outcome {
                 Some(crate::ReplyOutcome::Accepted(at)) => {
                     let resolved = reply.select_when_visible.clone();
-                    if let Some(moved) = self.creation_moves.get_mut(&id) {
+                    let held = self.creation_moves.get_mut(&id).and_then(|moved| {
                         moved.key.clone_from(&resolved);
-                    }
+                        Some((moved.key.clone()?, moved.section.clone()))
+                    });
                     if is_create && resolved.is_none() {
                         self.pending.remove(id);
                     } else {
@@ -431,6 +464,9 @@ impl Model {
                             }
                             mutation.on_accepted(reply);
                         });
+                        if let Some((key, section)) = held {
+                            self.hold_creation_move(&key, &section);
+                        }
                     }
                 }
                 Some(crate::ReplyOutcome::NoChange | crate::ReplyOutcome::Deferred) => {

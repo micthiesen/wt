@@ -356,7 +356,10 @@ when the outcome is ambiguous. It is shown over confirmed data until a fetch
 that started at or after the accept stamp shows the change, the write fails, or
 a bounded deadline passes (60 s in flight; 30 s accepted for GitHub, reviews and
 issues; 12 s for local domains; 30 s unconfirmed; creation and removal, which can
-legitimately take minutes, 10 minutes). A change waits only on domains that a
+legitimately take minutes, 10 minutes). A fleet-wide cleanup is one entry: the
+controller folds the owning hosts' answers into accepted (its own stamp, taken
+after the last answer), unconfirmed only when a host's reply was ambiguous, or
+failed. A change waits only on domains that a
 leaf publishes (`wt_tui::SETTLING_DOMAINS`, checked by the source registry
 test). While a write waits, `hold_for_settlement` lets identical refetches carry
 their newer stamps through derived stages and remote frames, which otherwise

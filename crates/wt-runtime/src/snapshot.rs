@@ -292,6 +292,14 @@ impl<T> SourceSnapshot<T> {
         snapshot
     }
 
+    /// Test fixtures only: also mark `domain` as read live just now.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_also_live(mut self, domain: Domain) -> Self {
+        let state = self.state.clone();
+        self.set_meta(domain, DomainMeta::live(Stamp::now(), state));
+        self
+    }
+
     /// Test fixtures only: edit the data in place.
     #[cfg(any(test, feature = "testing"))]
     pub fn test_data_mut(&mut self) -> &mut T

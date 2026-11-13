@@ -1,10 +1,12 @@
 //! Read-only Git repository and worktree inventory services.
 
+mod backup;
 mod mainline;
 mod origin;
 mod repository;
 mod status;
 
+pub use backup::backup_owner;
 pub use mainline::{
     MAINLINE_WALK, branch_reflog_args, committed_on_branch, contained_head_landed, mainline_args,
     on_first_parent_line,

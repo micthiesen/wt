@@ -1,58 +1,67 @@
 ---
 name: wt-state
-description: Read-only inspection of the local wt instance — TanStack Query cache (~/.cache/wt/cache.sqlite), wt-private tmux sessions, JSON state files, locks, and the daily app log. Use when debugging stuck rows, stale data, "why isn't this refreshing", or peeking at runtime state without attaching to a session.
+description: Read-only inspection of a local wt instance's runtime state: the daily JSON app log, action run logs, the source snapshot cache, the SQLite state database, locks, the events daemon and wt's private tmux server. Use when debugging stuck rows, stale data, "why isn't this refreshing", an automation or action that misbehaved, or to see what wt did without attaching to a session.
 ---
 
 # wt-state
 
-Read-only scripts for inspecting the running wt instance's local state.
-Hardcoded for this user's setup; assumes `~/.cache/wt/` and
-`~/.config/wt/config.toml` exist.
+Everything here is read-only. Never edit, delete or "refresh" these files to
+fix a problem: SQLite state is authoritative, and the rest is rebuilt by wt.
 
-All scripts live in `scripts/` next to this file. Bash, no install step.
-Requires `sqlite3`, `jq`, `tmux`, `bun` (all already on the user's box).
+## Where state lives
 
-## Snapshot
+Paths are per repository. `<repo-id>` is the main clone's path relative to
+home, lowercased with every non-alphanumeric run replaced by `-`
+(`~/Code/My.App` gives `code-my-app`). `[paths]` in the config can override
+each one (`docs/configuration.md`); a setup with no repository `.wt.toml` uses
+`~/.cache/wt/` itself as the cache root.
 
-`scripts/snapshot` — one-shot overview: `wt ls`, live tmux sessions
-(per kind), held locks, archived slugs, last 20 lines of today's app log.
-Start here.
+    ROOT=~/.cache/wt/<repo-id>      # cache root; `ls -dt ~/.cache/wt/*/logs/app` finds live ones
 
-## Cache (cache.sqlite)
+| Path | Contents |
+| --- | --- |
+| `$ROOT/logs/app/wt-native.YYYY-MM-DD.log` | App log: JSON lines, UTC, rotated daily at UTC midnight, 7 files kept |
+| `$ROOT/logs/actions/<run-id>/` | One action run: `meta.json`, `stream.log`, `stderr.log`, `done.json` |
+| `$ROOT/logs/<slug>-<time>.log` | Worktree removal logs |
+| `$ROOT/query/*.json`, `$ROOT/remote-query/` | Last snapshot of each board source (`git`, `github`, ...); display-only cache |
+| `$ROOT/events/` | Events daemon: `state.json`, `github.json`, `daemon.out.log`, `daemon.err.log` |
+| `$ROOT/locks/*.lock` | Held operation locks, per slug or `__name__` |
+| `$ROOT/automations.json` | Automation ledger (handled fires, breakers, deferrals) |
+| `$ROOT/dev/`, `$ROOT/manager/`, `$ROOT/harness.json`, `$ROOT/*-sessions.json` | Dev servers, manager reports, agent session records |
+| `~/.local/state/wt/wt.sqlite` | Authoritative state for all repositories, partitioned by `repo_id` |
 
-`scripts/cache <subcommand>`:
+Prefer the CLI where it answers the question: `wt ls`, `wt status`,
+`wt automations`, `wt events status`, `wt dev status`, `wt doctor [<slug>]`.
 
-- `keys [pattern]` — list IDs with size + age, optional substring filter
-- `get <pattern>` — pretty-print one matching entry (errors on multi-match)
-- `summary` — counts + bytes grouped by key shape
+## App log
 
-Key shapes seen in the wild: `worktrees`, `tmuxSessions`, `archive`,
-`wtState`, `fetchOrigin`, `wt/*/dirty|deploy|diffContext|gitActivity`,
-`github/*` (keyed by branch list), `stack/*`, `aiSummary/*` (content hash).
+Each line is `{"timestamp", "level", "fields": {"message", ...}, "target"}`.
+Timestamps are UTC, so "today" may be in yesterday's or tomorrow's file.
+Lines carrying `fields.event_text` are what the activity pane showed;
+`fields.event_channel == "attention"` marks the attention feed. The default
+level is `info`; `WT_LOG=debug` (a tracing filter) at launch records more.
+
+    LOG=$ROOT/logs/app/wt-native.$(date -u +%F).log
+    jq -c 'select(.level == "WARN" or .level == "ERROR")' "$LOG" | tail -50
+    jq -r 'select(.fields.event_text) | "\(.timestamp) \(.fields.event_text)"' "$LOG" | tail -50
+    jq -r '.target' "$LOG" | sort | uniq -c | sort -rn | head    # what is noisy
+    grep -h '<slug>' "$ROOT"/logs/app/wt-native.*.log | jq -c '[.timestamp, .level, .fields]'
+
+## State database
+
+    sqlite3 -readonly ~/.local/state/wt/wt.sqlite '.tables'
+    sqlite3 -readonly ~/.local/state/wt/wt.sqlite 'select * from repositories'
+
+Open it `-readonly`; a running wt holds it in WAL mode.
 
 ## Tmux
 
-`scripts/tmux` — sessions on the `-L wt` private server, classified as
-claude (`<slug>`), diff (`<slug>-diff`), or shell (`<slug>-shell`), with
-each pane's cwd and current command. "(no server running)" is the steady
-state until the first F12.
+Agent, shell, diff, dev and action sessions run on a private server whose
+socket is `wt-<repo-id>` (`wt` without a repository `.wt.toml`; `[tmux].socket`
+or `WT_TMUX_SOCKET` overrides it):
 
-## Logs
+    tmux -L wt-<repo-id> list-sessions -F '#{session_name}	#{pane_current_command}	#{pane_current_path}'
 
-`scripts/logs [options] [pattern]` — searches
-`~/.cache/wt/logs/app/wt-YYYY-MM-DD.log`. Defaults to today, last 50 lines.
-
-- `-d, --date YYYY-MM-DD` — different day
-- `-e, --errors` — ERROR lines only
-- `-E, --events` — EVENT lines only (what the activity pane showed)
-- `-n, --lines N` — different tail size (default 50)
-- `-f, --follow` — `tail -f`
-- positional pattern — substring grep, applied last
-
-## Conventions
-
-- Cache, locks, and log paths are not user-overridable in the loader, so
-  the scripts hardcode `~/.cache/wt/`.
-- For worktree listings, `snapshot` shells out to `bun src/main.ts ls`
-  in `$WT_REPO` (default `~/.wt`). Override `WT_REPO` if it moves.
-- Strictly read-only. No write paths exist.
+A session is named for its slug, with `-diff`, `-shell` or similar suffixes
+for the other kinds. Use `capture-pane -p -t <session>` to read one; do not
+`attach` or `send-keys`.

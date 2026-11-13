@@ -115,6 +115,32 @@ and it drives the rest of the design:
   the branch, the objects and the reflog with it — there is nothing to
   recover from. Every destroy path checks dirtiness itself before calling remove; keep that
   guard in `crates/wt-lifecycle` and the CLI cleanup planning path.
+  **Every ref the clone alone holds is a hazard, not only HEAD.** Besides the
+  checked-out branch's unpushed commits, removal of a clone refuses (without
+  force) on each other local branch and on stashes whose commits nothing else
+  keeps, reported as `N unpushed commits on branch <name> (<tip>)` and
+  `N stashes (latest <tip>)`. A branch or stash is kept elsewhere when the
+  clone's own remote-tracking refs (`refs/remotes/*`) contain it, or when the
+  main clone still has the commits reachable from its refs or the entry in
+  its stash list; that second rule is what keeps the main clone's local
+  branches and stashes, which every clone starts with a copy of, from
+  blocking removal. A copy whose original the main clone later deleted or
+  dropped becomes a hazard, because the clone is then the last holder.
+  Landing proof waives none of this: it covers the row's own branch only. If
+  Git cannot answer any of these questions the hazard is `could not verify
+  the clone's other branches and stashes`. The tip in the wording makes the
+  confirmation witness the content, so a branch rewritten after the warning
+  is refused as changed. One exemption: a recognized restack backup
+  (`backup/restack-*`, `backup/stack-sync-*`) of the row's own branch is an
+  earlier copy of that branch kept as a recovery aid, so it is not a hazard
+  and goes with the clone as the branch does; otherwise every restacked clone
+  would refuse cleanup. A backup of any other branch, and an unrecognized
+  `backup/*` name, is still reported. Not covered: commits reachable only from the
+  clone's reflogs, local tags, and refs outside `refs/heads` and the stash.
+  Linked Git worktrees skip the check, since their branches and stashes live
+  in the shared main-clone database. Cost: three Git reads when the clone's
+  remote-tracking refs cover everything, five when the main clone has to be
+  asked, plus one or two per branch only while something is unaccounted for.
 - **Restacking.** `R` / `wt restack` replays each slice in its own
   worktree. A rift slice can't see a sibling slice's branch as a LOCAL ref
   (separate object stores), so the engine resolves a parent through the

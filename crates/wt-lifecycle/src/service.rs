@@ -3016,7 +3016,190 @@ impl LifecycleService {
             Some(count) => hazards.push(unpushed_hazard(count)),
             None => hazards.push("could not verify pushed state".to_owned()),
         }
+        // A linked worktree's other branches live in the main clone's shared
+        // database and survive it. An independent clone owns its refs, so
+        // deleting it deletes every branch and stash it alone holds.
+        if self.backend_for(Path::new(&row.target.path)).await? == BackendKind::Rift {
+            match self.clone_only_ref_hazards(row, cancellation).await? {
+                Some(found) => hazards.extend(found),
+                None => hazards.push(UNVERIFIED_CLONE_REFS_HAZARD.to_owned()),
+            }
+        }
         Ok(hazards)
+    }
+
+    /// Hazards for the branches and stashes, other than the checked-out
+    /// branch, that only this independent clone holds: their commits are on
+    /// none of its remote-tracking refs and the main clone does not keep
+    /// them either. `None` when Git could not answer, which is not safety.
+    async fn clone_only_ref_hazards(
+        &self,
+        row: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<String>>, LifecycleError> {
+        let path = Path::new(&row.target.path);
+        let main = self.config.main_clone.as_path();
+        let Some(listed) = self
+            .git_lines(
+                path,
+                &[
+                    "for-each-ref",
+                    "--format=%(objectname) %(refname)",
+                    "refs/heads",
+                ],
+                None,
+                cancellation,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut branches = Vec::new();
+        for line in &listed {
+            let Some((sha, name)) = line
+                .split_once(' ')
+                .and_then(|(sha, name)| Some((sha, name.strip_prefix("refs/heads/")?)))
+            else {
+                return Ok(None);
+            };
+            // The checked-out branch is judged above, against its own base.
+            // Its restack backups are earlier copies of that same work, kept
+            // as recovery aids; they go with the checkout as the branch does.
+            // Another branch's backup, or an unrecognized name, is not ours
+            // to discard.
+            if name != row.target.branch
+                && wt_vcs::backup_owner(name) != Some(row.target.branch.as_str())
+            {
+                branches.push((sha, name));
+            }
+        }
+        let Some(stashes) = self
+            .git_lines(path, &["stash", "list", "--format=%H"], None, cancellation)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let tips = branches
+            .iter()
+            .map(|(sha, _)| *sha)
+            .chain(stashes.iter().map(String::as_str))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        match self
+            .count_commits_beyond(path, &tips, &[], Some("--remotes"), cancellation)
+            .await?
+        {
+            None => return Ok(None),
+            Some(0) => return Ok(Some(Vec::new())),
+            Some(_) => {}
+        }
+        // The clone copied the main clone's local branches and stashes; one
+        // the main clone still holds is not lost with this checkout.
+        let Some(checked) = self
+            .git_lines(
+                main,
+                &["cat-file", "--batch-check"],
+                Some(
+                    tips.iter()
+                        .flat_map(|tip| [tip, "\n"])
+                        .collect::<String>()
+                        .into_bytes(),
+                ),
+                cancellation,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if checked.len() != tips.len() {
+            return Ok(None);
+        }
+        let in_main = tips
+            .iter()
+            .zip(&checked)
+            .filter(|(_, line)| !line.ends_with(" missing"))
+            .map(|(tip, _)| *tip)
+            .collect::<Vec<_>>();
+        let mut kept = std::collections::BTreeSet::new();
+        match self
+            .count_commits_beyond(main, &in_main, &[], Some("--all"), cancellation)
+            .await?
+        {
+            None => return Ok(None),
+            Some(0) => kept.extend(in_main.iter().copied()),
+            Some(_) => {
+                for tip in &in_main {
+                    match self
+                        .count_commits_beyond(main, &[tip], &[], Some("--all"), cancellation)
+                        .await?
+                    {
+                        None => return Ok(None),
+                        Some(0) => {
+                            kept.insert(*tip);
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        let mut lone_stashes = stashes
+            .iter()
+            .map(String::as_str)
+            .filter(|sha| !kept.contains(sha))
+            .collect::<Vec<_>>();
+        if !lone_stashes.is_empty() {
+            // Only the newest stash is reachable from `refs/stash`.
+            let Some(main_stashes) = self
+                .git_lines(main, &["stash", "list", "--format=%H"], None, cancellation)
+                .await?
+            else {
+                return Ok(None);
+            };
+            lone_stashes.retain(|sha| !main_stashes.iter().any(|kept| kept == sha));
+        }
+        let kept = kept.into_iter().collect::<Vec<_>>();
+        let mut hazards = Vec::new();
+        for (sha, name) in branches {
+            if kept.contains(&sha) {
+                continue;
+            }
+            match self
+                .count_commits_beyond(path, &[sha], &kept, Some("--remotes"), cancellation)
+                .await?
+            {
+                None => return Ok(None),
+                Some(0) => {}
+                Some(count) => hazards.push(unpushed_branch_hazard(count, name, sha)),
+            }
+        }
+        if let Some(latest) = lone_stashes.first() {
+            hazards.push(stash_hazard(lone_stashes.len(), latest));
+        }
+        Ok(Some(hazards))
+    }
+
+    /// Stdout lines of a read-only Git query, or `None` when Git refused it.
+    async fn git_lines(
+        &self,
+        cwd: &Path,
+        args: &[&str],
+        input: Option<Vec<u8>>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Vec<String>>, LifecycleError> {
+        let mut spec = git_spec(cwd, args.iter().map(OsString::from).collect());
+        spec.input = input;
+        let output = self
+            .runner
+            .run(spec, cancellation)
+            .await
+            .map_err(|source| process_error("read local refs", cwd, source))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(String::from_utf8(output.stdout)
+            .ok()
+            .map(|text| text.lines().map(str::to_owned).collect()))
     }
 
     /// Count commits on HEAD that the branch's origin ref lacks. A branch
@@ -3044,19 +3227,46 @@ impl LifecycleService {
         base: &str,
         cancellation: &CancellationToken,
     ) -> Result<Option<u32>, LifecycleError> {
+        self.count_commits_beyond(path, &["HEAD"], &[base], None, cancellation)
+            .await
+    }
+
+    /// Count the commits reachable from `tips` in `cwd` that none of `known`
+    /// reaches, nor any ref `known_refs` selects (`--remotes` or `--all`).
+    /// Every unpushed-commit check counts through here. `None` when Git
+    /// could not count, which callers must not read as zero.
+    async fn count_commits_beyond(
+        &self,
+        cwd: &Path,
+        tips: &[&str],
+        known: &[&str],
+        known_refs: Option<&'static str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<u32>, LifecycleError> {
+        let mut args = vec![OsString::from("rev-list"), OsString::from("--count")];
+        if let Some(selector) = known_refs {
+            args.extend([OsString::from("--not"), OsString::from(selector)]);
+        }
+        args.push(OsString::from("--stdin"));
+        // Revisions go through stdin: a clone can hold more branches than an
+        // argument list fits, and stdin revisions cannot be read as options.
+        let mut input = String::new();
+        for tip in tips {
+            input.push_str(tip);
+            input.push('\n');
+        }
+        for revision in known {
+            input.push('^');
+            input.push_str(revision);
+            input.push('\n');
+        }
+        let mut spec = git_spec(cwd, args);
+        spec.input = Some(input.into_bytes());
         let count = self
-            .run_git_raw(
-                path,
-                [
-                    "rev-list",
-                    "--count",
-                    "--end-of-options",
-                    &format!("{base}..HEAD"),
-                ],
-                cancellation,
-                "count unpushed commits",
-            )
-            .await?;
+            .runner
+            .run(spec, cancellation)
+            .await
+            .map_err(|source| process_error("count unpushed commits", cwd, source))?;
         if !count.status.success() {
             return Ok(None);
         }
@@ -3843,6 +4053,26 @@ pub fn unpushed_hazard(count: u32) -> String {
     format!("{count} unpushed commit{plural}")
 }
 
+/// Removal hazard for an independent clone whose other branches and stashes
+/// could not be compared with origin and the main clone.
+const UNVERIFIED_CLONE_REFS_HAZARD: &str =
+    "could not verify the clone's other branches and stashes";
+
+/// Removal hazard for commits only another local branch of an independent
+/// clone holds. The tip is part of the wording so a confirmation witnesses
+/// the branch's content, not just its commit count.
+fn unpushed_branch_hazard(count: u32, branch: &str, tip: &str) -> String {
+    let tip = tip.get(..10).unwrap_or(tip);
+    format!("{} on branch {branch} ({tip})", unpushed_hazard(count))
+}
+
+/// Removal hazard for stashes only an independent clone holds.
+fn stash_hazard(count: usize, latest: &str) -> String {
+    let noun = if count == 1 { "stash" } else { "stashes" };
+    let latest = latest.get(..10).unwrap_or(latest);
+    format!("{count} {noun} (latest {latest})")
+}
+
 /// Whether a removal hazard means work that removal destroys, as opposed to
 /// an obligation or an unknown that the confirm states on its own line.
 pub fn is_lost_work_hazard(hazard: &str) -> bool {
@@ -3852,7 +4082,12 @@ pub fn is_lost_work_hazard(hazard: &str) -> bool {
         || hazard == MISSING_CHECKOUT_HAZARD
         || hazard.split_once(' ').is_some_and(|(count, rest)| {
             count.parse::<u64>().is_ok()
-                && (rest == "unpushed commit" || rest == "unpushed commits")
+                && (rest == "unpushed commit"
+                    || rest == "unpushed commits"
+                    || rest.starts_with("unpushed commit on branch ")
+                    || rest.starts_with("unpushed commits on branch ")
+                    || rest.starts_with("stash (latest ")
+                    || rest.starts_with("stashes (latest "))
         })
 }
 
@@ -3883,6 +4118,21 @@ mod tests {
         assert!(is_lost_work_hazard(&unpushed_hazard(12)));
         assert!(!is_lost_work_hazard("post-merge verification still owed"));
         assert!(!is_lost_work_hazard("could not verify pushed state"));
+        let branch = super::unpushed_branch_hazard(2, "team/side", "0123456789abcdef");
+        assert_eq!(
+            branch,
+            "2 unpushed commits on branch team/side (0123456789)"
+        );
+        assert!(is_lost_work_hazard(&branch));
+        assert_eq!(
+            super::stash_hazard(1, "0123456789abcdef"),
+            "1 stash (latest 0123456789)"
+        );
+        assert!(is_lost_work_hazard(&super::stash_hazard(
+            3,
+            "0123456789abcdef"
+        )));
+        assert!(!is_lost_work_hazard(super::UNVERIFIED_CLONE_REFS_HAZARD));
     }
 
     #[tokio::test]
@@ -5919,6 +6169,301 @@ mod tests {
         drop(held);
         removal.await.unwrap().unwrap();
         assert!(!Path::new(&target.path).exists());
+    }
+
+    /// Commit `content` to `tracked.txt` on a new branch `branch`, then
+    /// return to `back`, leaving HEAD with nothing unpushed.
+    async fn commit_on_side_branch(
+        runner: &ProcessRunner,
+        path: &Path,
+        branch: &str,
+        content: &str,
+        back: &str,
+    ) {
+        run(runner, path, &["switch", "-c", branch]).await;
+        fs::write(path.join("tracked.txt"), content).await.unwrap();
+        run(runner, path, &["commit", "-am", "side work"]).await;
+        run(runner, path, &["switch", back]).await;
+    }
+
+    #[tokio::test]
+    async fn clone_removal_refuses_commits_held_only_by_another_local_branch() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let cancellation = CancellationToken::new();
+        let target = retired_clone_fixture(&runner, &main, &root, "side-work").await;
+        let path = PathBuf::from(&target.path);
+        commit_on_side_branch(&runner, &path, "experiment", "only here\n", "side-work").await;
+        let tip = String::from_utf8(run(&runner, &path, &["rev-parse", "experiment"]).await)
+            .unwrap()
+            .trim()
+            .to_owned();
+
+        let hazards = service
+            .removal_hazards(&target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            hazards,
+            [format!(
+                "1 unpushed commit on branch experiment ({})",
+                &tip[..10]
+            )]
+        );
+        assert!(is_lost_work_hazard(&hazards[0]));
+        // Landing proof covers the row's own branch, never its siblings.
+        for landed in [false, true] {
+            let result = service
+                .remove(
+                    &target,
+                    RemoveOptions {
+                        landed,
+                        ..RemoveOptions::default()
+                    },
+                    &cancellation,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(LifecycleError::Refused(ref message))
+                    if message.contains("unpushed commit on branch experiment")),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            String::from_utf8(run(&runner, &path, &["rev-parse", "experiment"]).await)
+                .unwrap()
+                .trim(),
+            tip
+        );
+
+        // Once origin carries the commits the clone holds nothing alone.
+        run(
+            &runner,
+            &path,
+            &["update-ref", "refs/remotes/origin/experiment", "experiment"],
+        )
+        .await;
+        service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    async fn rev(runner: &ProcessRunner, path: &Path, revision: &str) -> String {
+        String::from_utf8(run(runner, path, &["rev-parse", revision]).await)
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn clone_removal_ignores_only_its_own_branch_restack_backups() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let cancellation = CancellationToken::new();
+        let target = retired_clone_fixture(&runner, &main, &root, "restacked").await;
+        let path = PathBuf::from(&target.path);
+        for backup in [
+            "backup/restack-1700000000000-restacked",
+            "backup/stack-sync-2026-10-01T120000000Z-restacked",
+        ] {
+            commit_on_side_branch(&runner, &path, backup, "before the restack\n", "restacked")
+                .await;
+        }
+        assert_eq!(
+            service
+                .removal_hazards(&target, false, &cancellation)
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+
+        for foreign in ["backup/restack-1700000000000-sibling", "backup/restacked"] {
+            commit_on_side_branch(&runner, &path, foreign, "someone else's\n", "restacked").await;
+            let result = service
+                .remove(&target, RemoveOptions::default(), &cancellation)
+                .await;
+            let expected = format!("1 unpushed commit on branch {foreign} ");
+            assert!(
+                matches!(result, Err(LifecycleError::Refused(ref message)) if message.contains(&expected)),
+                "{result:?}"
+            );
+            assert!(path.exists());
+            run(&runner, &path, &["branch", "-D", foreign]).await;
+        }
+
+        service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn clone_removal_refuses_a_stash_held_only_by_the_clone() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let cancellation = CancellationToken::new();
+        let target = retired_clone_fixture(&runner, &main, &root, "stashed").await;
+        let path = PathBuf::from(&target.path);
+        fs::write(path.join("tracked.txt"), "shelved\n")
+            .await
+            .unwrap();
+        run(&runner, &path, &["stash"]).await;
+        let stash = rev(&runner, &path, "refs/stash").await;
+
+        let result = service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await;
+        let expected = format!("1 stash (latest {})", &stash[..10]);
+        assert!(
+            matches!(result, Err(LifecycleError::Refused(ref message)) if message.contains(&expected)),
+            "{result:?}"
+        );
+        assert_eq!(rev(&runner, &path, "refs/stash").await, stash);
+    }
+
+    /// A Rift clone starts as a copy of the main clone's refs. What the main
+    /// clone still holds is not lost with the copy; what it dropped is.
+    #[tokio::test]
+    async fn clone_removal_allows_refs_the_main_clone_still_holds() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let cancellation = CancellationToken::new();
+        commit_on_side_branch(&runner, &main, "shared", "main-local work\n", "main").await;
+        fs::write(main.join("tracked.txt"), "main stash\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["stash"]).await;
+        let target = retired_clone_fixture(&runner, &main, &root, "copied").await;
+        let path = PathBuf::from(&target.path);
+        // `git clone` turns the source's branches into remote-tracking refs;
+        // a Rift copy keeps them as local branches with no such ref.
+        run(&runner, &path, &["branch", "shared", "origin/shared"]).await;
+        run(
+            &runner,
+            &path,
+            &["update-ref", "-d", "refs/remotes/origin/shared"],
+        )
+        .await;
+        run(&runner, &path, &["fetch", "origin", "refs/stash"]).await;
+        run(&runner, &path, &["stash", "store", "FETCH_HEAD"]).await;
+        assert_eq!(
+            service
+                .removal_hazards(&target, false, &cancellation)
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+
+        // The main clone moving on keeps the copies: its branch still
+        // contains the copied tip, and its stash list still has the entry.
+        run(&runner, &main, &["switch", "shared"]).await;
+        fs::write(main.join("tracked.txt"), "later\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["commit", "-am", "later main-local work"]).await;
+        fs::write(main.join("tracked.txt"), "newer main stash\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["stash"]).await;
+        run(&runner, &main, &["switch", "main"]).await;
+        assert_eq!(
+            service
+                .removal_hazards(&target, false, &cancellation)
+                .await
+                .unwrap(),
+            Vec::<String>::new()
+        );
+
+        // Dropped from the main clone, the copies are the only ones left.
+        run(&runner, &main, &["branch", "-D", "shared"]).await;
+        run(&runner, &main, &["stash", "clear"]).await;
+        let hazards = service
+            .removal_hazards(&target, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            hazards,
+            [
+                format!(
+                    "1 unpushed commit on branch shared ({})",
+                    &rev(&runner, &path, "shared").await[..10]
+                ),
+                format!(
+                    "1 stash (latest {})",
+                    &rev(&runner, &path, "refs/stash").await[..10]
+                ),
+            ]
+        );
+        assert!(matches!(
+            service
+                .remove(&target, RemoveOptions::default(), &cancellation)
+                .await,
+            Err(LifecycleError::Refused(_))
+        ));
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn clone_removal_refuses_when_other_branches_cannot_be_read() {
+        let (_scratch, mut service, runner, main, root) = setup().await;
+        service.config.rift_binary = "/nonexistent/rift-must-not-run".into();
+        let cancellation = CancellationToken::new();
+        let target = retired_clone_fixture(&runner, &main, &root, "unreadable").await;
+        let path = PathBuf::from(&target.path);
+        fs::write(
+            path.join(".git/refs/heads/broken"),
+            "1111111111111111111111111111111111111111\n",
+        )
+        .await
+        .unwrap();
+        let result = service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await;
+        assert!(
+            matches!(result, Err(LifecycleError::Refused(ref message))
+                if message.contains(UNVERIFIED_CLONE_REFS_HAZARD)),
+            "{result:?}"
+        );
+        assert!(path.exists());
+    }
+
+    /// A linked worktree's sibling branches live in the main clone's shared
+    /// database and survive its removal, so they are no hazard.
+    #[tokio::test]
+    async fn linked_worktree_removal_ignores_other_unpushed_branches() {
+        let (_scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let created = service
+            .create(
+                "michael/ENG-11-linked",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(&created.target.path);
+        commit_on_side_branch(
+            &runner,
+            &path,
+            "elsewhere",
+            "kept by the main clone\n",
+            "michael/ENG-11-linked",
+        )
+        .await;
+        let tip = rev(&runner, &main, "elsewhere").await;
+        service
+            .remove(&created.target, RemoveOptions::default(), &cancellation)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+        assert_eq!(rev(&runner, &main, "elsewhere").await, tip);
     }
 
     #[tokio::test]

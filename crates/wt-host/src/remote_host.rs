@@ -63,6 +63,14 @@ pub enum RemoteHostError {
     Stopped { host: String },
 }
 
+impl RemoteHostError {
+    /// Whether `error` is a reply lost after the command was sent: the write
+    /// may have happened, so it is reported as uncertain and never resent.
+    pub(crate) fn is_ambiguous(error: &anyhow::Error) -> bool {
+        matches!(error.downcast_ref::<Self>(), Some(Self::Ambiguous { .. }))
+    }
+}
+
 enum Request {
     Command {
         connection: u64,

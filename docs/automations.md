@@ -153,7 +153,8 @@ remediation normally waits two minutes before delivery; it may wait longer for
 an idle session or another dispatch to finish. Pausing and resuming starts a
 fresh settle window for conditions that still hold.
 
-An action whose row-backed `requires` are not met is not counted as queued.
+An action whose row-backed `requires` are not met is not counted as queued,
+whatever else it would also wait for (a free slot, its worktree, its stack).
 For example, a `wt.created` tracker action does not occupy the queue for a
 worktree with no tracker issue; attaching one later makes it eligible on the
 next evaluation. Frozen post-merge fires retain their separate terminal-skip

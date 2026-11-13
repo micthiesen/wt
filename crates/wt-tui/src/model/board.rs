@@ -747,6 +747,10 @@ pub struct BoardRow {
     pub title_source: TitleSource,
     #[serde(default)]
     pub busy: Option<BusyView>,
+    /// The dependency install started by creation is still running. Unlike
+    /// `busy` it holds no worktree lock and blocks no action.
+    #[serde(default)]
+    pub installing: bool,
     /// The checkout directory no longer exists.
     #[serde(default)]
     pub path_missing: bool,

@@ -9,6 +9,7 @@
 
 // Row status markers.
 pub(crate) const ROCKET: &str = "\u{F427}"; // busy, non-destructive op
+pub(crate) const HOURGLASS: &str = "\u{F252}"; // initializing: creating or installing
 pub(crate) const TRASH: &str = "\u{F48E}"; // busy, destructive (remove)
 pub(crate) const UNLINK: &str = "\u{F529}"; // worktree path vanished
 pub(crate) const SLASH: &str = "\u{F468}"; // circle-slash: gone / dropped / gated

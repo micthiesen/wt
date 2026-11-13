@@ -33,7 +33,10 @@ needs-testing or blocked, cyan for working, purple for review, green for ready
 or verified, and a dim hollow dot for todo or unset. A slash marks a gated or
 dropped status. A hollow marker in a state's color means the saved status SHA
 differs from the current observed HEAD, and overdue post-merge verification is
-red. A landed branch without a newer status shows the green merge glyph. Landed
+red. A yellow hourglass replaces the marker while a
+worktree initializes: from the creation request until its checkout exists, and
+then while the dependency install that creation started is still running. The
+ordinary marker returns when the worktree is ready for a session. A landed branch without a newer status shows the green merge glyph. Landed
 means the branch's own commits reached the base: its PR merged, or its HEAD is
 in the base and was either merged in or committed on the branch itself. A
 worktree only fast-forwarded (or reset) to a base commit is never landed, even
@@ -98,14 +101,16 @@ restarts. Under status sorting, its work status takes precedence once assigned;
 manual reordering also replaces the initial position. An existing worktree keeps
 its section when its name is entered again.
 
-Creation immediately selects one optimistic row with its title and a progress
-glyph. Normal list navigation, attention controls and default-harness switching
+Creation immediately selects one optimistic row with its title and the
+initializing hourglass. Normal list navigation, attention controls and default-harness switching
 remain available. The
 chosen host resolves the exact checkout identity before creation starts, so
 inventory replaces that row without a duplicate. Navigation away is preserved
 when preparation or creation finishes. Worktree actions, including F12, become
 available when the real checkout is ready; F12 is never queued automatically.
-Dependency installation continues as a background action. A removal request
+Dependency installation continues as a background action; the row keeps the
+hourglass, and its details git line reads `installing dependencies`, until that
+action ends, whatever its outcome. A removal request
 keeps the row in place with a dim gray, struck-through name while safety
 checks run. When the worker accepts removal, the row moves to **Removing**, directly
 above **Archived**, and file cleanup continues in the background. Active

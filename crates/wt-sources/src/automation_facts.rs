@@ -135,11 +135,6 @@ pub async fn lifecycle_facts(
     let plans = wt_ops::lifecycle_ops::plan_automation_facts(ctx, rows, state, github)
         .await
         .context("prepare automation lifecycle evidence")?;
-    if !plans.busy.is_empty() {
-        // Active edits are expected; retry once the checkout settles.
-        tracing::debug!(busy = ?plans.busy, "automation lifecycle evidence deferred");
-        result.deferred = true;
-    }
     let mut fresh_state = None;
     for (slug, error) in plans.row_errors {
         // An operation can start after the initial probe. Its changing checkout
@@ -1265,7 +1260,7 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
-    /// Keep rewriting an untracked file so every checkout digest differs.
+    /// Keep rewriting an untracked file, as an agent editing the checkout does.
     fn churn(
         path: std::path::PathBuf,
     ) -> (
@@ -1305,8 +1300,8 @@ mod tests {
                     .path,
             )
         };
-        // An unlanded row never captures a removal revision, so edits there
-        // cannot make its evidence fail.
+        // An unlanded row reads no checkout hazards, so edits there cannot
+        // make its evidence fail.
         let (task, stop) = churn(path("two").join("scratch.txt"));
         let unlanded = facts_for(ctx, snapshots.clone()).await;
         stop.cancel();
@@ -1315,19 +1310,14 @@ mod tests {
         assert!(!unlanded.rows["two"].clean_candidate);
         assert!(unlanded.rows["one"].clean_candidate);
 
-        // A landed row still captures its revision; one that keeps changing
-        // is busy, retried later, and never a cleanup candidate.
+        // A landed row reads only its hazards, so a file that keeps changing
+        // is uncommitted work: no error, and never a cleanup candidate.
         let (task, stop) = churn(path("one").join("scratch.txt"));
         let landed = facts_for(ctx, snapshots).await;
         stop.cancel();
         task.await.unwrap();
         assert!(landed.errors.is_empty(), "{:?}", landed.errors);
-        if landed.rows.contains_key("one") {
-            // Capture won a race against the writer; the file is still a hazard.
-            assert!(!landed.rows["one"].clean_candidate);
-        } else {
-            assert!(landed.deferred);
-        }
+        assert!(!landed.rows["one"].clean_candidate);
         fixture.close().await.unwrap();
     }
 

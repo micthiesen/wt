@@ -4,9 +4,14 @@
 use std::collections::BTreeMap;
 
 use tokio::task::JoinSet;
-use wt_tui::{CleanupTarget, ConfirmAction, RemovalRevision, UiAction, UiModal, UiReply};
+use wt_tui::{
+    CleanupTarget, ConfirmAction, RemovalRevision, ReplyOutcome, UiAction, UiModal, UiReply,
+};
 
-use crate::{remote_board::Fleet, remote_host::RemoteHost};
+use crate::{
+    remote_board::Fleet,
+    remote_host::{RemoteHost, RemoteHostError},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HostIdentity {
@@ -239,7 +244,10 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
         .collect::<Vec<_>>();
     let mut partition = partition_items(revisions, &hosts);
     let mut lines = std::mem::take(&mut partition.lines);
-    let mut failed = partition.failed;
+    let mut summary = CleanupSummary {
+        failed: partition.failed,
+        ..Default::default()
+    };
     let local = std::mem::take(&mut partition.local);
     let remote = std::mem::take(&mut partition.remote);
 
@@ -266,7 +274,7 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
         else {
             // The configuration cannot change during this call, but retain a
             // fail-closed guard should that invariant change later.
-            failed = true;
+            summary.failed = true;
             lines.push(format!("Unavailable host {host}: candidates skipped"));
             continue;
         };
@@ -290,18 +298,22 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
 
     while let Some(result) = tasks.join_next().await {
         match result {
+            // An ambiguous remote error is surfaced once; this coordinator
+            // never retries a potentially delivered write.
+            Ok((label, count, Err(error))) if RemoteHostError::is_ambiguous(&error) => {
+                summary.uncertain = true;
+                lines.push(format!(
+                    "{label}: cleanup of {count} candidate(s) is unconfirmed: {error:#}; the result is unknown and will not be resent; check before retrying"
+                ));
+            }
             Ok((label, count, Err(error))) => {
-                failed = true;
-                // In particular, an Ambiguous remote error is surfaced once;
-                // this coordinator never retries a potentially delivered write.
+                summary.failed = true;
                 lines.push(format!(
                     "{label}: cleanup of {count} candidate(s) failed: {error:#}"
                 ));
             }
             Ok((label, count, Ok(reply))) => {
-                if reply.failed {
-                    failed = true;
-                }
+                summary.record(&reply);
                 let detail = if reply.message.trim().is_empty() {
                     format!("cleanup request finished for {count} candidate(s)")
                 } else {
@@ -310,7 +322,7 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
                 lines.push(format!("{label}: {detail}"));
             }
             Err(error) => {
-                failed = true;
+                summary.failed = true;
                 lines.push(format!("cleanup request ended unexpectedly: {error}"));
             }
         }
@@ -329,10 +341,54 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
         }
     }
 
-    UiReply {
-        message: lines.join("\n"),
-        failed,
-        ..Default::default()
+    summary.reply(lines.join("\n"))
+}
+
+/// What the owning hosts answered, folded into the one reply the pending
+/// removal settles on. Each host classified its own write; this only combines
+/// those answers and never upgrades an ambiguous one.
+#[derive(Default)]
+struct CleanupSummary {
+    failed: bool,
+    uncertain: bool,
+    accepted: bool,
+}
+
+impl CleanupSummary {
+    fn record(&mut self, reply: &UiReply) {
+        if reply.failed {
+            self.failed = true;
+            return;
+        }
+        match reply.outcome {
+            Some(ReplyOutcome::Uncertain) => self.uncertain = true,
+            Some(ReplyOutcome::NoChange | ReplyOutcome::Deferred) => {}
+            Some(ReplyOutcome::Accepted(_)) | None => self.accepted = true,
+        }
+    }
+
+    fn reply(self, message: String) -> UiReply {
+        if self.failed {
+            return UiReply {
+                message,
+                failed: true,
+                ..Default::default()
+            };
+        }
+        if self.uncertain {
+            return UiReply::uncertain(message);
+        }
+        UiReply {
+            // Hosts stamp on their own clocks. The pending removal spans
+            // hosts and is confirmed by this process's board, so it takes a
+            // stamp here, after the last host answered.
+            outcome: Some(if self.accepted {
+                ReplyOutcome::Accepted(wt_runtime::Stamp::now())
+            } else {
+                ReplyOutcome::NoChange
+            }),
+            ..UiReply::message(message)
+        }
     }
 }
 
@@ -385,6 +441,47 @@ fn partition_items<T: CleanupItem>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_reply_is_classified_from_the_hosts_answers() {
+        let accepted = || UiReply {
+            outcome: Some(ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+            ..Default::default()
+        };
+        let fold = |replies: &[UiReply]| {
+            let mut summary = CleanupSummary::default();
+            for reply in replies {
+                summary.record(reply);
+            }
+            summary.reply("done".into())
+        };
+
+        let before = wt_runtime::Stamp::now();
+        let reply = fold(&[accepted(), UiReply::no_change("nothing")]);
+        let Some(ReplyOutcome::Accepted(at)) = reply.outcome else {
+            panic!("accepted removals must not be left unclassified: {reply:?}");
+        };
+        assert_eq!(at.at_or_after(&before), Some(true));
+        assert!(!reply.failed && !reply.notice);
+
+        let reply = fold(&[accepted(), UiReply::uncertain("lost")]);
+        assert_eq!(reply.outcome, Some(ReplyOutcome::Uncertain));
+        assert!(!reply.failed);
+
+        let failed = UiReply {
+            failed: true,
+            ..Default::default()
+        };
+        let reply = fold(&[accepted(), UiReply::uncertain("lost"), failed]);
+        assert!(reply.failed);
+        assert_eq!(reply.outcome, None);
+
+        assert_eq!(
+            fold(&[UiReply::no_change("nothing")]).outcome,
+            Some(ReplyOutcome::NoChange)
+        );
+        assert_eq!(fold(&[]).outcome, Some(ReplyOutcome::NoChange));
+    }
 
     #[test]
     fn board_targets_keep_host_and_checkout_identity_through_partitioning() {

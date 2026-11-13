@@ -140,7 +140,9 @@ leaves a `backup/restack-*` ref at the old tip, and names the failing branch
 (exit 3 at the CLI). From the TUI (`R`, or an auto-restack) the bail hands off
 automatically — the bundled `/restack` skill, which knows the full recovery
 loop, is sent to the failing worktree's harness session (cold-started if
-needed) with the bail context. From the CLI, run it yourself or resolve by
+needed) with the bail context. The handoff is sent once: if delivery cannot be
+confirmed, the restack log says the instructions may have reached the worktree
+and nothing is resent, so check that session before sending them again. From the CLI, run it yourself or resolve by
 hand, then re-run; the anchor logic self-heals around hand-rebases. Leftover
 backups: `wt restack prune-backups --days <n>` removes recognized backups
 older than the cutoff; omitting `--days` removes all recognized restack

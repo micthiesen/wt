@@ -2087,8 +2087,13 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
     };
     let mut status_items = vec![
         glyph_item(
+            loud(row(&|row| row.installing = true)),
+            "initializing · creating the checkout or installing dependencies",
+            "hourglass create install not ready",
+        ),
+        glyph_item(
             loud(busy("init")),
-            "busy · creating or installing",
+            "busy · another operation holds the worktree",
             "rocket",
         ),
         glyph_item(loud(busy("remove")), "busy · removing", "trash"),

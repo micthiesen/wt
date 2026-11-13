@@ -54,6 +54,10 @@ const TAIL_LINES: usize = 100;
 const TAIL_SEED_BYTES: usize = 64 * 1024;
 const TAIL_DELTA_BYTES: usize = 32 * 1024;
 
+/// Action id of the dependency install that creation starts. The board marks
+/// a row initializing while a run with this id is running.
+pub const CREATE_INSTALL_ACTION_ID: &str = "builtin:create-install";
+
 /// Spacing of follow-up tracker reads while an expectation is unconfirmed.
 const CONFIRM_POLL: Duration = Duration::from_secs(5);
 
@@ -753,10 +757,10 @@ fn compose(
             row.issue_status = Some(status.clone());
         }
         let history = runs.data().map(Arc::as_ref);
-        let latest = history
+        let mut row_runs = history
             .into_iter()
             .flat_map(|history| history.runs.iter())
-            .find(|run| {
+            .filter(|run| {
                 run.meta
                     .worktree_ref
                     .as_ref()
@@ -764,6 +768,13 @@ fn compose(
                     .unwrap_or_else(|| run.meta.slug.clone())
                     == row.key
             });
+        let latest = row_runs.next();
+        // Any run, not only the latest: an action started during the install
+        // must not make the row look ready.
+        row.installing = latest.into_iter().chain(row_runs).any(|run| {
+            run.meta.action_id == CREATE_INSTALL_ACTION_ID
+                && run.meta.status == ActionRunStatus::Running
+        });
         if let Some(run) = latest {
             let label = match run.meta.status {
                 ActionRunStatus::Running => "running",
@@ -995,6 +1006,59 @@ mod tests {
             tokio::time::Instant::now(),
         );
         assert!(tracker.pending.is_empty());
+    }
+
+    #[test]
+    fn a_running_create_install_marks_the_row_installing_until_it_ends() {
+        let install = |id: &str, status: &str, started: u64| {
+            let mut run = run(id, status, started);
+            run.meta.action_id = CREATE_INSTALL_ACTION_ID.into();
+            run.meta.issue_status = None;
+            run
+        };
+        let compose_with = |runs: Vec<ActionRun>| {
+            let board = Board {
+                rows: vec![
+                    wt_tui::BoardRow {
+                        key: "row".into(),
+                        ..Default::default()
+                    },
+                    wt_tui::BoardRow {
+                        key: "other".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Board::default()
+            };
+            let output = compose(
+                SourceSnapshot::test_live(Some(board), SourceState::Ready, Domain::Git),
+                SourceSnapshot::test_live(
+                    Some(ActionHistory { runs }),
+                    SourceState::Ready,
+                    Domain::Git,
+                ),
+                SourceSnapshot::default(),
+                &Tracker::new(0),
+                &mut wt_app_core::feeds::FailureClock::default(),
+            );
+            let data = output.data().unwrap();
+            (data.rows[0].installing, data.rows[1].installing)
+        };
+        // A newer action on the row does not hide the running install.
+        let mut newer = run("newer", "running", 120);
+        newer.meta.issue_status = None;
+        assert_eq!(
+            compose_with(vec![newer, install("install", "running", 110)]),
+            (true, false)
+        );
+        for ended in ["succeeded", "failed", "killed", "ambiguous"] {
+            assert_eq!(
+                compose_with(vec![install("install", ended, 110)]),
+                (false, false),
+                "{ended}"
+            );
+        }
+        assert_eq!(compose_with(Vec::new()), (false, false));
     }
 
     #[tokio::test(start_paused = true)]

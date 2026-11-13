@@ -464,15 +464,22 @@ impl AutomationEngine {
         }
 
         for intent in queue {
-            if self.active.len() >= MAX_CONCURRENT {
-                self.waiting.insert(
-                    fire_identity(&intent.fire),
-                    format!("{MAX_CONCURRENT} automations already running"),
-                );
-                continue;
-            }
             let fire = intent.fire;
             let id = fire_identity(&fire);
+            let requirements = input.requirements.get(&id);
+            // Decided before any capacity or exclusion wait, so an intent
+            // that cannot run anyway is never reported as queued behind one.
+            if matches!(requirements, Some(RequirementState::Waiting)) {
+                // Preserve the original settle age while a row-backed
+                // prerequisite changes. The trigger still has to remain true.
+                self.unmet.insert(id);
+                continue;
+            }
+            if self.active.len() >= MAX_CONCURRENT {
+                self.waiting
+                    .insert(id, format!("{MAX_CONCURRENT} automations already running"));
+                continue;
+            }
             let rule = &fire.rule;
             let manager_run = manager_bound(&fire, input.context);
             let audience = input
@@ -512,13 +519,6 @@ impl AutomationEngine {
                 continue;
             }
 
-            let requirements = input.requirements.get(&id);
-            if matches!(requirements, Some(RequirementState::Waiting)) {
-                // Preserve the original settle age while a row-backed
-                // prerequisite changes. The trigger still has to remain true.
-                self.unmet.insert(id);
-                continue;
-            }
             if matches!(requirements, Some(RequirementState::FrozenUnmet(_))) {
                 let keys = fire.fire_keys.clone();
                 self.ledger
@@ -1223,6 +1223,61 @@ mod tests {
             waiting_for,
             [None, Some("session busy on worktree".to_owned())]
         );
+    }
+
+    #[tokio::test]
+    async fn unmet_requirement_is_not_queued_behind_running_automations() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let rules = [rule("custom-action", 0.0)];
+        let rows = ["a", "b", "c", "d"].map(|slug| AutomationRow {
+            slug: slug.into(),
+            branch: slug.into(),
+            ..row()
+        });
+        let context = AutomationEvalContext::default();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let requirements = BTreeMap::from([
+            ("test|a".into(), RequirementState::Ready),
+            ("test|b".into(), RequirementState::Ready),
+            ("test|c".into(), RequirementState::Waiting),
+            ("test|d".into(), RequirementState::Ready),
+        ]);
+        let start = now_ms();
+        for step in 0..2 {
+            let tick = engine
+                .tick(input(
+                    &rules,
+                    &rows,
+                    &context,
+                    &requirements,
+                    &quiescence,
+                    &activity,
+                    start + step,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                tick.claims.len(),
+                if step == 0 { MAX_CONCURRENT } else { 0 }
+            );
+            // Only the runnable fire waits for a slot; the requirement-held
+            // one stays out of the queue while both slots are taken.
+            let queued = engine
+                .queued()
+                .into_iter()
+                .map(|fire| (fire.target, fire.waiting_for))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                queued,
+                [(
+                    "d".to_owned(),
+                    format!("{MAX_CONCURRENT} automations already running")
+                )]
+            );
+        }
     }
 
     #[tokio::test]

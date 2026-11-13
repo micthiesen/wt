@@ -104,9 +104,11 @@ impl Family for LayoutChange {
     fn observed(&self, target: &Target, board: &Board) -> bool {
         let row = target_row(board, target);
         match self {
-            Self::Creation { placement } => {
-                row.is_none_or(|row| row.creation_placement.as_ref() == Some(placement))
-            }
+            // The host filed the row before stamping the accept, so any
+            // read that started after it is the truth, including a later
+            // move. Comparing positions would hold a moved row here until
+            // the deadline.
+            Self::Creation { .. } => true,
             Self::Archive { archived } => row.is_none_or(|row| row.archived == *archived),
             Self::MoveSection { section } => row.is_none_or(|_| {
                 target_index(board, target)

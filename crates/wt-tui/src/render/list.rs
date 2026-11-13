@@ -653,6 +653,43 @@ mod tests {
     }
 
     #[test]
+    fn initializing_rows_wear_the_hourglass_marker_until_ready() {
+        let model = Model::default();
+        let context = RowContext {
+            model: &model,
+            width: 60,
+            gutter: 0,
+            cleanup: None,
+        };
+        let marker = |row: &BoardRow| context.row(row, None).line.spans[1].clone();
+        let creating = BoardRow {
+            title: "New task".into(),
+            pending_creation: true,
+            busy: Some(crate::BusyView {
+                op: "create".into(),
+                label: "creating".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut installing = BoardRow {
+            title: "New task".into(),
+            installing: true,
+            ..Default::default()
+        };
+        for row in [&creating, &installing] {
+            let span = marker(row);
+            assert_eq!(span.content, format!("{}  ", crate::glyphs::HOURGLASS));
+            assert_eq!(span.style.fg, Some(theme::WARN));
+        }
+        // Ready for a session: the ordinary work marker returns.
+        installing.installing = false;
+        let span = marker(&installing);
+        assert_eq!(span.content, format!("{}  ", crate::glyphs::DOT_OUTLINE));
+        assert_eq!(span.style.fg, Some(theme::FG_DIM));
+    }
+
+    #[test]
     fn scrolloff_keeps_context_and_clamps_to_the_end() {
         assert_eq!(scroll_offset(0, Some(2), 40, 10), 0);
         assert_eq!(scroll_offset(0, Some(8), 40, 10), 2);

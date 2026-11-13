@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio_util::sync::CancellationToken;
 use wt_github::GithubClient;
 use wt_platform::process::ProcessRunner;
+use wt_vcs::backup_owner;
 
 use crate::{
-    backup::backup_owner,
     chain::{RestackChain, StackStep},
     git::{checked_git, git_sha, is_ancestor, process_message, run_git},
     service::{StackConfig, StackError, StackEvent, StackService},

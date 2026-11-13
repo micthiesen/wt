@@ -1,7 +1,7 @@
 //! Shared lifecycle planning for CLI, TUI and automation callers. A plan is
 //! presentation data, not permission to skip the service's locked rechecks.
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     path::{Path, PathBuf},
 };
 
@@ -91,9 +91,6 @@ pub struct RemovalPlans {
 pub struct AutomationLifecycleEvidence {
     pub rows: BTreeMap<String, LifecycleFacts>,
     pub row_errors: BTreeMap<String, String>,
-    /// Checkouts that kept changing while their landed state was being read.
-    /// They contribute no facts and are retried later.
-    pub busy: BTreeSet<String>,
 }
 
 pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<RemovalPlans> {
@@ -160,10 +157,13 @@ pub async fn plan_with_facts(
 /// can proceed, but the failed row contributes no cleanup or landing proof.
 /// GitHub remains a single confirmed, all-or-nothing batch input.
 ///
-/// Facts use only `local_merged` and "landed with no hazards", so the removal
-/// revision (which digests the whole checkout, untracked contents included) is
-/// captured only for landed rows. That is not a safety shortcut: an unlanded
-/// row is never a cleanup candidate, and removal itself recaptures and
+/// Facts use only `local_merged` and "landed with no hazards", so this reads
+/// the hazards alone and never captures a removal revision: that digests the
+/// whole checkout, untracked contents included, and this pass reruns on every
+/// input change for every landed checkout awaiting cleanup. The one hazard a
+/// capture adds (untracked content it could not hash) implies untracked files,
+/// which the hazards already report as uncommitted changes. That is not a
+/// safety shortcut: the fired cleanup plans afresh, and removal recaptures and
 /// rechecks everything under its own lock.
 pub async fn plan_automation_facts(
     ctx: &AppContext,
@@ -200,16 +200,12 @@ pub async fn plan_automation_facts(
             }
             Err(error) => return Err(error),
         };
-        let clean_candidate = if landing.landed() {
+        let clean_candidate = if landing.landed() && !wt_lifecycle::checkout_missing(&row).await {
             match lifecycle
-                .removal_revision(&row.target, true, &ctx.cancellation)
+                .removal_hazards(&row.target, true, &ctx.cancellation)
                 .await
             {
-                Ok(revision) => revision.hazards.is_empty(),
-                Err(error) if checkout_kept_changing(&error) => {
-                    evidence.busy.insert(slug);
-                    continue;
-                }
+                Ok(hazards) => hazards.is_empty(),
                 Err(error) if !ctx.cancellation.is_cancelled() => {
                     evidence
                         .row_errors
@@ -309,11 +305,6 @@ fn owes_production_check(stored: &serde_json::Value) -> bool {
             .verification()
             .is_some_and(|(stage, _)| stage == wt_core::VerifyStage::Production)
     })
-}
-
-/// An actively edited checkout is busy, not broken.
-fn checkout_kept_changing(error: &wt_lifecycle::LifecycleError) -> bool {
-    matches!(error, wt_lifecycle::LifecycleError::CheckoutChanging(_))
 }
 
 struct Landing {
@@ -1121,6 +1112,78 @@ mod tests {
             .await
             .unwrap();
         assert!(!plan.rows[0].landed);
+        fixture.close().await.unwrap();
+    }
+
+    /// The facts pass reruns on every board change for every landed checkout
+    /// awaiting cleanup, so it must not read file contents: an unreadable
+    /// untracked file is a hazard there, never a failed read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn automation_facts_judge_landed_checkouts_without_reading_contents() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, path, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(
+            ctx,
+            path,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        let base = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&base))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(path.join("work.txt"), "landed work\n").unwrap();
+        git(ctx, path, &["add", "work.txt"]).await;
+        git(ctx, path, &["commit", "-m", "feature work"]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let row = ctx
+            .repository
+            .inventory(&ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "one")
+            .unwrap();
+        let facts = || async {
+            let evidence = plan_automation_facts(ctx, vec![row.clone()], &state, None)
+                .await
+                .unwrap();
+            assert!(evidence.row_errors.is_empty(), "{:?}", evidence.row_errors);
+            evidence.rows["one"].clean_candidate
+        };
+        assert!(facts().await);
+        assert!(facts().await);
+
+        let secret = path.join("secret.bin");
+        std::fs::write(&secret, "untracked").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(!facts().await);
+        std::fs::remove_file(&secret).unwrap();
+        assert!(facts().await);
+
+        std::fs::write(path.join("work.txt"), "edited\n").unwrap();
+        assert!(!facts().await);
+        git(ctx, path, &["add", "work.txt"]).await;
+        assert!(!facts().await);
+        // A commit beyond the published base is no longer landed at all.
+        git(ctx, path, &["commit", "-m", "local only"]).await;
+        assert!(!facts().await);
+        git(ctx, path, &["reset", "--hard", "HEAD~1"]).await;
+        assert!(facts().await);
         fixture.close().await.unwrap();
     }
 }

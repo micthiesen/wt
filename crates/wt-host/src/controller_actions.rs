@@ -879,7 +879,7 @@ async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Re
                 worktree_ref: Some(wt_core::WorktreeRef::Local {
                     slug: target.slug().to_owned(),
                 }),
-                action_id: "builtin:create-install".into(),
+                action_id: wt_sources::action_source::CREATE_INSTALL_ACTION_ID.into(),
                 action_name: "Install dependencies".into(),
                 arg_history: None,
                 prompt: plan.label,

@@ -8,13 +8,16 @@ The repository is public, so GitHub-hosted runners are free. The standard
 runners are what we use: macOS (`macos-15`, `macos-latest`) has 3 cores, Linux
 x86 and Linux arm (`ubuntu-22.04-arm`, free for public repositories) have 4.
 
-The `test`, `native` and `build` jobs in `rust-ci.yml` run on `ubuntu-24.04`,
-not `ubuntu-latest`. When `ubuntu-latest` moved to 26.04 (2026-11), thirteen
-Codex messaging tests failed with "slot did not start": their fixture copies
-`/bin/cat` under the name `codex`, and it did not run there (most likely a
-multi-call coreutils that dispatches on its own name). Fix that fixture before
-moving the pin. `lint` stays on `ubuntu-latest` because its cache key does not
-include the runner label, so a pin would restore artifacts built on 26.04.
+Test fixtures must not copy or rename a system tool to fake another program.
+When `ubuntu-latest` moved to 26.04 (2026-11), thirteen Codex messaging tests
+failed with "slot did not start": their fixture copied `/bin/cat` under the
+name `codex`, and it did not run there (most likely a multi-call coreutils that
+dispatches on its own name). The fixture now links the test binary itself under
+that name and re-runs it as an ignored helper test, so it depends on no system
+binary's name. `rust-ci.yml` was pinned to `ubuntu-24.04` in between; if a
+runner image breaks tests again, pin `test`, `native` and `build` but leave
+`lint` on `ubuntu-latest`, because its cache key does not include the runner
+label and a pin would restore artifacts built on the newer image.
 
 ## Workflows
 

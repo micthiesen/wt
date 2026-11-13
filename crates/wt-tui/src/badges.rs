@@ -106,6 +106,9 @@ pub(crate) fn loud_status_badge(row: &BoardRow) -> Option<Badge> {
     if let Some(busy) = &row.busy {
         return Some(busy_badge(&busy.op));
     }
+    if row.pending_creation || row.installing {
+        return Some(INITIALIZING);
+    }
     if row.path_missing {
         return Some(badge(glyphs::UNLINK, theme::ERR));
     }
@@ -115,8 +118,15 @@ pub(crate) fn loud_status_badge(row: &BoardRow) -> Option<Badge> {
     row.git.landed_on.map(|_| badge(glyphs::MERGE, theme::OK))
 }
 
+/// A worktree that is not ready for a session yet: its checkout is being
+/// created or its create-time dependency install is still running. A shape
+/// and color no settled row wears, so the change back to the work marker
+/// reads at a glance.
+const INITIALIZING: Badge = badge(glyphs::HOURGLASS, theme::WARN);
+
 fn busy_badge(op: &str) -> Badge {
     match op {
+        "create" => INITIALIZING,
         "remove" => badge(glyphs::TRASH, theme::ERR),
         "restack" => badge(glyphs::RESTACK, theme::ACCENT),
         _ => badge(glyphs::ROCKET, theme::ACCENT),
@@ -143,6 +153,9 @@ pub(crate) fn status_verb(row: &BoardRow) -> (Badge, String) {
             None => busy.label.clone(),
         };
         return (busy_badge(&busy.op), text);
+    }
+    if row.installing {
+        return (INITIALIZING, "installing dependencies".into());
     }
     if row.path_missing {
         return (badge(glyphs::UNLINK, theme::ERR), "missing".into());
@@ -666,6 +679,24 @@ mod tests {
         assert_eq!(marker(&busy, &policy), badge(glyphs::TRASH, theme::ERR));
         busy.archived = true;
         assert_eq!(marker(&busy, &policy).color, theme::FG_DIM);
+        // A removal outranks a leftover install; other lock holders keep the rocket.
+        let mut installing = row();
+        installing.installing = true;
+        assert_eq!(marker(&installing, &policy), INITIALIZING);
+        assert_eq!(status_verb(&installing).1, "installing dependencies");
+        installing.busy = Some(crate::BusyView {
+            op: "remove".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            marker(&installing, &policy),
+            badge(glyphs::TRASH, theme::ERR)
+        );
+        installing.busy.as_mut().unwrap().op = "init".into();
+        assert_eq!(
+            marker(&installing, &policy),
+            badge(glyphs::ROCKET, theme::ACCENT)
+        );
     }
 
     #[test]

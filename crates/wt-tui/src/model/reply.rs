@@ -82,6 +82,11 @@ impl Model {
             return None;
         }
         if let Some(accepted) = reply.creation_placement.take() {
+            // The user has since filed the row elsewhere; showing where it
+            // was created would move it back until that move runs.
+            if self.creation_move_owed(&accepted.key) {
+                return None;
+            }
             let now = tokio::time::Instant::now();
             let id = self.next_op_id();
             let mutation = crate::UiMutation {
@@ -217,6 +222,9 @@ impl Model {
             }
             self.interaction_host = reply.modal_host;
             self.confirm_settles_at = None;
+            // A picker that lost its highlighted choice is being replaced;
+            // its guard must not eat a key meant for the new dialog.
+            self.picker_choice_lost = false;
         }
         if reply.handoff.is_some() {
             // Entering a session (perf `i` included) closes the overlays so

@@ -30,7 +30,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, warn};
 
 const MAX_HTTP_HEADERS: usize = 32;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
@@ -573,7 +573,8 @@ async fn scheduler(
                     let result = source.fetch_origin(&cancel).await;
                     let elapsed_ms = origin_started.elapsed().as_millis() as u64;
                     match result {
-                        Ok(()) => info!(%trigger, elapsed_ms, "fetched origin before GitHub refresh"),
+                        // The fetch itself logs its trigger and duration at info.
+                        Ok(()) => debug!(%trigger, elapsed_ms, "fetched origin before GitHub refresh"),
                         Err(e) => {
                             warn!(%trigger, elapsed_ms, error = %e, "git fetch origin failed before GitHub refresh");
                             // Keep the request so the next refresh retries it.

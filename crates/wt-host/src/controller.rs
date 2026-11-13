@@ -723,11 +723,7 @@ fn action_reply_with_context(
             false,
         ),
         Err(error) => {
-            let ambiguous = error
-                .downcast_ref::<crate::remote_host::RemoteHostError>()
-                .is_some_and(|error| {
-                    matches!(error, crate::remote_host::RemoteHostError::Ambiguous { .. })
-                });
+            let ambiguous = crate::remote_host::RemoteHostError::is_ambiguous(&error);
             // A lost reply after sending is not a failure: the write may
             // have happened. The TUI keeps showing it as unconfirmed until
             // a read settles it or its deadline passes; nothing is resent.

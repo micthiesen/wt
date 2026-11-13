@@ -1576,6 +1576,24 @@ mod tests {
         }
     }
 
+    const FAKE_CODEX_ENV: &str = "WT_TEST_FAKE_CODEX";
+    const FAKE_CODEX_ARGS: [&str; 4] = [
+        "--exact",
+        "codex::messaging::tests::fake_codex_process",
+        "--ignored",
+        "--nocapture",
+    ];
+
+    /// The body of `Fixture::codex_bin`: `cat`, writing to stderr.
+    #[test]
+    #[ignore = "subprocess Codex fixture"]
+    fn fake_codex_process() {
+        if std::env::var_os(FAKE_CODEX_ENV).is_none() {
+            return;
+        }
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::stderr());
+    }
+
     /// Isolated Codex home, tmux server and optional fake app-server. Paths
     /// live under /tmp so Unix socket names stay within the platform limit.
     struct Fixture {
@@ -1626,29 +1644,39 @@ mod tests {
             }
         }
 
-        /// A stand-in Codex TUI: prints `screen`, then echoes typed input.
-        /// A copy of a system tool whose process name is `codex`, so process
-        /// evidence sees a Codex TUI without running Codex.
-        fn codex_bin(&self, tool: &str, dir: &str) -> PathBuf {
+        /// This test binary under the name `codex`, so process evidence sees
+        /// a Codex TUI without running Codex. Run it with `FAKE_CODEX_ARGS`.
+        /// Not a renamed system tool: a multi-call coreutils (Ubuntu 26.04)
+        /// picks its applet from its own file name and rejects `codex`.
+        fn codex_bin(&self, dir: &str) -> PathBuf {
             let path = self.root.join(dir).join("codex");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             if !path.exists() {
-                std::fs::copy(tool, &path).unwrap();
+                let test_binary = std::env::current_exe().unwrap();
+                if std::fs::hard_link(&test_binary, &path).is_err() {
+                    std::fs::copy(&test_binary, &path).unwrap();
+                }
             }
             path
         }
 
+        /// A stand-in Codex TUI: prints `screen`, then echoes typed input.
         async fn slot(&self, screen: &str, stamp: Option<&str>) -> wt_tmux::SessionInfo {
-            let tui = self.codex_bin("/bin/cat", "tui");
-            self.slot_running(screen, stamp, &tui.to_string_lossy())
-                .await
+            let tui = self.codex_bin("tui");
+            // libtest's own lines go to stdout; keep them off the screen.
+            let command = format!(
+                "env {FAKE_CODEX_ENV}=1 '{}' {} >/dev/null",
+                tui.display(),
+                FAKE_CODEX_ARGS.join(" ")
+            );
+            self.slot_running(screen, stamp, &command).await
         }
 
         async fn slot_running(
             &self,
             screen: &str,
             stamp: Option<&str>,
-            program: &str,
+            command: &str,
         ) -> wt_tmux::SessionInfo {
             let script = self.root.join("screen.txt");
             std::fs::write(&script, screen).unwrap();
@@ -1660,7 +1688,7 @@ mod tests {
                         command: vec![
                             "sh".into(),
                             "-c".into(),
-                            format!("cat '{}'; exec '{program}'", script.display()),
+                            format!("cat '{}'; exec {command}", script.display()),
                         ],
                         width: Some(120),
                         height: Some(30),
@@ -2261,10 +2289,15 @@ mod tests {
             .await;
         // A hand-run Codex TUI in the same worktree, outside wt's pane, could
         // have created the only new rollout.
-        let foreign_bin = fixture.codex_bin("/bin/sleep", "foreign");
+        let foreign_bin = fixture.codex_bin("foreign");
+        // It lives until its stdin, held by `foreign`, closes.
         let mut foreign = std::process::Command::new(&foreign_bin)
-            .arg("30")
+            .args(FAKE_CODEX_ARGS)
+            .env(FAKE_CODEX_ENV, "1")
             .current_dir(&fixture.cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         fixture.rollout("someone-elses", &fixture.cwd, 0);

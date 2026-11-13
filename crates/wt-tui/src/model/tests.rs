@@ -884,6 +884,161 @@ fn a_row_being_created_can_be_filed_and_moves_once_it_exists() {
     assert!(model.defer_creation_move("new", &None).is_none());
 }
 
+fn section_of(model: &Model, key: &str) -> String {
+    let index = model
+        .board
+        .rows
+        .iter()
+        .position(|row| row.key == key)
+        .expect("row is on the board");
+    model
+        .board
+        .sections
+        .iter()
+        .find(|section| section.rows.contains(&index))
+        .map(|section| section.key.clone())
+        .expect("row is filed in a section")
+}
+
+/// Two sections, `old` in Batch; `new`, once listed, wherever `new_in` says.
+fn two_sections(new_in: Option<&str>) -> SourceSnapshot<Board> {
+    let keys: &[&str] = if new_in.is_some() {
+        &["old", "new"]
+    } else {
+        &["old"]
+    };
+    let mut state = snapshot(keys);
+    let board = state.test_data_mut();
+    let rows_in = |name: &str| -> Vec<usize> {
+        let mut rows = Vec::new();
+        if name == "Batch" {
+            rows.push(0);
+        }
+        if new_in == Some(name) {
+            rows.push(1);
+        }
+        rows
+    };
+    board.sections = ["Batch", "Later"]
+        .into_iter()
+        .map(|name| BoardSection {
+            key: name.into(),
+            title: name.into(),
+            rows: rows_in(name),
+            ..Default::default()
+        })
+        .collect();
+    state.test_also_live(wt_core::Domain::Metadata)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_row_filed_while_being_created_never_returns_to_where_it_was_created() {
+    let mut model = Model::default();
+    model.apply(two_sections(None));
+    let created_at = crate::CreatePlacement {
+        section: Some("Batch".into()),
+        after: Some("old".into()),
+    };
+    model.begin_action(
+        1,
+        &UiAction::Create {
+            placement: Some(created_at.clone()),
+            input: "new".into(),
+        },
+    );
+    bind_creation(&mut model, 1, "new");
+    assert_eq!(section_of(&model, "new"), "Batch");
+    assert!(
+        model
+            .defer_creation_move("new", &Some("Later".into()))
+            .is_some()
+    );
+    assert_eq!(section_of(&model, "new"), "Later");
+
+    // The host finishes the checkout and files it where it was requested.
+    model.reply(UiReply {
+        creation_placement: Some(crate::CreationPlacementAccepted {
+            key: "new".into(),
+            placement: created_at,
+            accepted_at: wt_runtime::Stamp::now(),
+        }),
+        ..Default::default()
+    });
+    assert_eq!(section_of(&model, "new"), "Later");
+    model.reply(UiReply {
+        operation_id: Some(1),
+        select_when_visible: Some("new".into()),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    assert_eq!(section_of(&model, "new"), "Later");
+
+    // Listed where the host filed it, while a menu holds the move back.
+    model.begin_action(2, &UiAction::PrepareCleanup);
+    tokio::time::advance(std::time::Duration::from_millis(5)).await;
+    model.apply(two_sections(Some("Batch")));
+    model.release_creation_moves();
+    assert!(model.follow_up.is_none());
+    assert_eq!(section_of(&model, "new"), "Later");
+    model.pending_request = None;
+
+    model.release_creation_moves();
+    let action = model.follow_up.take().expect("the move is sent");
+    model.begin_action(3, &action);
+    model.reply(UiReply {
+        operation_id: Some(3),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    assert_eq!(section_of(&model, "new"), "Later");
+    tokio::time::advance(std::time::Duration::from_millis(5)).await;
+    model.apply(two_sections(Some("Later")));
+    assert_eq!(section_of(&model, "new"), "Later");
+    assert!(
+        model.pending.is_empty(),
+        "nothing keeps holding the row: {:?}",
+        model.pending.views()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn moving_a_new_row_ends_the_hold_on_its_creation_position() {
+    let mut model = Model::default();
+    model.apply(two_sections(Some("Batch")));
+    // The host filed the new row; no read has confirmed it yet.
+    model.reply(UiReply {
+        creation_placement: Some(crate::CreationPlacementAccepted {
+            key: "new".into(),
+            placement: crate::CreatePlacement {
+                section: Some("Batch".into()),
+                after: Some("old".into()),
+            },
+            accepted_at: wt_runtime::Stamp::now(),
+        }),
+        ..Default::default()
+    });
+    let action = UiAction::MoveSection {
+        key: "new".into(),
+        section: Some("Later".into()),
+        seen: None,
+    };
+    model.begin_action(7, &action);
+    assert_eq!(section_of(&model, "new"), "Later");
+    model.reply(UiReply {
+        operation_id: Some(7),
+        outcome: Some(crate::ReplyOutcome::Accepted(wt_runtime::Stamp::now())),
+        ..Default::default()
+    });
+    tokio::time::advance(std::time::Duration::from_millis(5)).await;
+    model.apply(two_sections(Some("Later")));
+    assert_eq!(section_of(&model, "new"), "Later");
+    assert!(
+        model.pending.is_empty(),
+        "nothing keeps holding the row: {:?}",
+        model.pending.views()
+    );
+}
+
 #[test]
 fn a_failed_creation_forgets_the_section_chosen_for_it() {
     let mut model = Model::default();
