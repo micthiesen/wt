@@ -1,4 +1,6 @@
 # Post unsuccessful main-branch CI and release-cache completions, except cancellations, to Discord #github.
+# A run that failed only because jobs were cancelled (a runner that never
+# arrived) is rerun once without an alert; a second such attempt is posted.
 # Secret: DISCORD_GITHUB_WEBHOOK (the channel webhook URL, without /github).
 name: discord-ci-alert
 
@@ -8,7 +10,8 @@ on:
     types: [completed]
     branches: [main]
 
-permissions: {}
+permissions:
+  actions: write
 
 jobs:
   notify:
@@ -16,8 +19,34 @@ jobs:
       github.event.workflow_run.conclusion != 'success' &&
       github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
+      - name: Rerun a run whose jobs were only cancelled
+        id: triage
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          # Unknown job state must alert, so only an explicit zero skips it.
+          failed=$(gh api --paginate \
+            "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out")] | length' \
+            | awk '{ total += $1 } END { print total + 0 }') || failed=unknown
+          # The rerun is watched here because a rerun started with this
+          # token may not raise another workflow_run event for this workflow.
+          if [ "$failed" = "0" ] && [ "$RUN_ATTEMPT" = "1" ] \
+            && gh api --method POST "repos/$REPOSITORY/actions/runs/$RUN_ID/rerun-failed-jobs" \
+            && sleep 15 \
+            && gh run watch "$RUN_ID" --repo "$REPOSITORY" --exit-status --interval 30 > /dev/null; then
+            echo "alert=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "alert=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Post CI result to Discord
+        if: steps.triage.outputs.alert == 'true'
         env:
           ACTOR: ${{ github.event.workflow_run.actor.login }}
           CONCLUSION: ${{ github.event.workflow_run.conclusion }}

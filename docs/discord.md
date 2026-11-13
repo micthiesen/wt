@@ -57,7 +57,8 @@ for pull-request comments. Hook id `662175381`.
 
 `.github/workflows/discord-ci-alert.yml` separately posts unsuccessful
 completions of `Native release` on `main`, including failures and timeouts.
-Cancelled runs are silent. The alert includes the conclusion, commit, actor, and a direct
+Cancelled runs are silent. A first attempt whose only unsuccessful jobs were
+cancelled is rerun once and watched; it posts only if that rerun fails. The alert includes the conclusion, commit, actor, and a direct
 link to the Actions run. It uses the Actions secret `DISCORD_GITHUB_WEBHOOK`,
 which is the same channel webhook URL without the native integration's
 `/github` suffix.

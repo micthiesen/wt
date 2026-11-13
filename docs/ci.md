@@ -26,7 +26,7 @@ label and a pin would restore artifacts built on the newer image.
 | `release.yml` (Native release) | push to `main`, push of a `v*` or `rust-test-*` tag, manual dispatch | Calls `rust-ci.yml` for lint, unit and native checks. Only for a tag or a dispatch does it also build the three release packages and publish. |
 | `rust-ci.yml` (Rust CI) | called by `release.yml`, pull requests | `lint`, `test` and `native` on Linux and macOS. |
 | `release-cache.yml` (Release cache) | push to `main` | Compiles the release binaries only to keep `main`'s optimized cache warm for tags. |
-| `discord-ci-alert.yml` | completion of Native release or Release cache on `main` | Posts unsuccessful, non-cancelled runs to #github. |
+| `discord-ci-alert.yml` | completion of Native release or Release cache on `main` | Posts unsuccessful, non-cancelled runs to #github. A first attempt that failed only through cancelled jobs (a runner that never arrived) is rerun once and watched instead; it posts only if the rerun also fails. |
 | `discord-release.yml` | completion of a tag's Native release run | Posts the stable release and its notes to #updates ([discord.md](discord.md)). |
 
 A `main` push therefore reports its checks in about the time of the slowest
