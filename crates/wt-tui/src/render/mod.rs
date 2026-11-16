@@ -11,7 +11,7 @@ pub(crate) mod text;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
@@ -261,26 +261,22 @@ const STALE_USAGE_MS: u64 = 30 * 60 * 1000;
 /// The primary harness's rate-limit windows, each colored by how close it is
 /// to the limit, with the time until it resets. Codex reports headroom, so
 /// its figure is the percentage left. A stale reading is dim and says how old
-/// it is; a window it saw reset is unknown, not 0%.
+/// it is; a window it saw reset is unknown, not 0%. The format and colors
+/// match Claude Code's status line: `5h 52% (5m) · 7f 20% · 7d 20% (1d13h)`.
 fn usage_spans(model: &Model, base: Style, now: u64) -> Vec<Span<'static>> {
     let primary = model.primary_harness();
     let codex = primary.eq_ignore_ascii_case("codex");
-    let mut spans = Vec::new();
     let mut stale_since = None;
+    // (text, color, countdown) per window, before countdowns are deduplicated.
+    let mut clusters: Vec<(String, Color, Option<String>)> = Vec::new();
     for item in model
         .board
         .usage
         .iter()
         .filter(|item| item.harness.eq_ignore_ascii_case(primary))
     {
-        if !spans.is_empty() {
-            spans.push(Span::styled(" · ", base.fg(theme::FG_DIM)));
-        }
         if let Some(cost) = &item.cost {
-            spans.push(Span::styled(
-                format!("{} {cost}", item.period),
-                base.fg(theme::FG),
-            ));
+            clusters.push((format!("{} {cost}", item.period), theme::FG, None));
             continue;
         }
         let Some(mut percent) = item.percent else {
@@ -293,10 +289,7 @@ fn usage_spans(model: &Model, base: Style, now: u64) -> Vec<Span<'static>> {
         if let Some(at) = observed {
             stale_since = Some(stale_since.map_or(at, |since: u64| since.min(at)));
             if expired {
-                spans.push(Span::styled(
-                    format!("{} ?", item.period),
-                    base.fg(theme::FG_DIM),
-                ));
+                clusters.push((format!("{} ?", item.period), theme::FG_DIM, None));
                 continue;
             }
         }
@@ -306,22 +299,45 @@ fn usage_spans(model: &Model, base: Style, now: u64) -> Vec<Span<'static>> {
         let used = percent.min(100);
         let color = match used {
             _ if observed.is_some() => theme::FG_DIM,
-            80.. => theme::ERR,
-            60..80 => theme::WARN,
-            _ => theme::FG,
+            80.. => theme::USAGE_HIGH,
+            60..80 => theme::USAGE_MID,
+            _ => theme::USAGE_LOW,
         };
         let shown = if codex { 100 - used } else { used };
-        spans.push(Span::styled(
+        clusters.push((
             format!(
                 "{} {shown}%{}",
                 item.period,
                 if codex { " left" } else { "" }
             ),
-            base.fg(color),
+            color,
+            item.resets_at_ms
+                .filter(|_| !expired)
+                .map(|reset| text::remaining(now, reset)),
         ));
-        if let Some(reset) = item.resets_at_ms.filter(|_| !expired) {
+    }
+    // Weekly windows share a reset instant, so only the last of a run keeps
+    // the countdown. Compared formatted: each window's timestamp carries its
+    // own microseconds, so equal resets are never byte-identical.
+    for index in 0..clusters.len() {
+        let repeated = clusters[index].2.as_ref().is_some_and(|countdown| {
+            clusters[index + 1..]
+                .iter()
+                .any(|later| later.2.as_ref() == Some(countdown))
+        });
+        if repeated {
+            clusters[index].2 = None;
+        }
+    }
+    let mut spans = Vec::new();
+    for (text, color, countdown) in clusters {
+        if !spans.is_empty() {
+            spans.push(Span::styled(" · ", base.fg(theme::FG_DIM)));
+        }
+        spans.push(Span::styled(text, base.fg(color)));
+        if let Some(countdown) = countdown {
             spans.push(Span::styled(
-                format!(" ({})", text::age(now, reset)),
+                format!(" ({countdown})"),
                 base.fg(theme::FG_DIM),
             ));
         }
@@ -628,6 +644,60 @@ mod tests {
             render(Some(now - 3 * HOUR)),
             "5h ? · 7d 13% (2h) · as of 3h ago"
         );
+    }
+
+    #[test]
+    fn usage_matches_the_claude_status_line_and_shares_one_weekly_countdown() {
+        const MINUTE: u64 = 60_000;
+        let now = 1_000_000 * MINUTE;
+        let week_reset = now + (37 * 60 + 20) * MINUTE;
+        let mut model = Model::default();
+        let board = Arc::make_mut(&mut model.board);
+        for (period, percent, resets_at_ms) in [
+            ("5h", 52, now + 5 * MINUTE + 30_000),
+            ("7f", 85, week_reset + 400),
+            ("7d", 61, week_reset),
+        ] {
+            board.usage.push(UsageItem {
+                harness: "Claude".into(),
+                period: period.into(),
+                percent: Some(percent),
+                resets_at_ms: Some(resets_at_ms),
+                observed_at_ms: None,
+                cost: None,
+            });
+        }
+        let spans = usage_spans(&model, Style::new(), now);
+        let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(text, "5h 52% (5m) · 7f 85% · 7d 61% (1d13h)");
+        let color = |label: &str| {
+            spans
+                .iter()
+                .find(|span| span.content.starts_with(label))
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(color("5h"), Some(theme::USAGE_LOW));
+        assert_eq!(color("7f"), Some(theme::USAGE_HIGH));
+        assert_eq!(color("7d"), Some(theme::USAGE_MID));
+
+        // Only the 7d window: no leading separator.
+        Arc::make_mut(&mut model.board).usage.drain(..2);
+        let text: String = usage_spans(&model, Style::new(), now)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "7d 61% (1d13h)");
+    }
+
+    #[test]
+    fn countdowns_keep_the_two_coarsest_nonzero_units() {
+        let at = |seconds: u64| text::remaining(0, seconds * 1000);
+        assert_eq!(at(86_400 + 13 * 3600 + 59), "1d13h");
+        assert_eq!(at(2 * 86_400 + 5 * 60), "2d");
+        assert_eq!(at(2 * 3600 + 5 * 60), "2h5m");
+        assert_eq!(at(2 * 3600 + 30), "2h");
+        assert_eq!(at(5 * 60 + 59), "5m");
+        assert_eq!(at(20), "0m");
     }
 
     #[test]

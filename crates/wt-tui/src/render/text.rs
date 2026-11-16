@@ -141,6 +141,24 @@ pub(crate) fn age(at_ms: u64, now_ms: u64) -> String {
     }
 }
 
+/// Time until `until_ms` in its two coarsest non-zero units (`1d13h`,
+/// `2h5m`, `2h`, `5m`), as Claude Code's status line prints countdowns.
+pub(crate) fn remaining(now_ms: u64, until_ms: u64) -> String {
+    let seconds = until_ms.saturating_sub(now_ms) / 1000;
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        seconds % 86_400 / 3600,
+        seconds % 3600 / 60,
+    );
+    match (days, hours, minutes) {
+        (1.., 0, _) => format!("{days}d"),
+        (1.., _, _) => format!("{days}d{hours}h"),
+        (0, 1.., 0) => format!("{hours}h"),
+        (0, 1.., _) => format!("{hours}h{minutes}m"),
+        _ => format!("{minutes}m"),
+    }
+}
+
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

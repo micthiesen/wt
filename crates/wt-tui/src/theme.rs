@@ -32,6 +32,11 @@ pub(crate) const TEAL: Color = rgb(0x6a9b8e);
 pub(crate) const OK: Color = rgb(0xa3be8c);
 pub(crate) const WARN: Color = rgb(0xebcb8b);
 pub(crate) const ERR: Color = rgb(0xbf616a);
+/// Usage percentages, in the 256-color steel, peach and coral that Claude
+/// Code's status line uses, so the two read alike side by side.
+pub(crate) const USAGE_LOW: Color = Color::Indexed(75);
+pub(crate) const USAGE_MID: Color = Color::Indexed(215);
+pub(crate) const USAGE_HIGH: Color = Color::Indexed(203);
 pub(crate) const INFO: Color = rgb(0xb48ead);
 pub(crate) const REMOTE: Color = rgb(0xe9967a);
 pub(crate) const CLAUDE: Color = rgb(0xc47b3a);

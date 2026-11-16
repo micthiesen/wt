@@ -9,7 +9,7 @@ use wt_harness::DerivedState;
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
 use wt_tui::{Board, SessionTarget, SessionView, TerminalSlotView};
 
-use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto};
+use crate::session_activity::{SessionActivitySnapshot, UsagePeriodDto, UsageSnapshot};
 use crate::session_source::{SessionDiscoveries, SessionInventory, SessionSources};
 use wt_app_core::feeds::FailureClock;
 use wt_app_core::harness::{AgentTarget, AgentTargetKind, AppHarness};
@@ -317,29 +317,7 @@ fn compose(
             }
         }
         if let Some(usage) = &feed.usage {
-            let claude_observed = usage
-                .claude_observed_at_ms
-                .and_then(|ms| u64::try_from(ms).ok());
-            for (harness, five, week, observed) in [
-                (
-                    "Claude",
-                    &usage.claude_five_hour,
-                    &usage.claude_seven_day,
-                    claude_observed,
-                ),
-                (
-                    "Codex",
-                    &usage.codex_five_hour,
-                    &usage.codex_seven_day,
-                    None,
-                ),
-            ] {
-                for (period, value) in [("5h", five), ("7d", week)] {
-                    if let Some(item) = usage_item(harness, period, value.as_ref(), observed) {
-                        board.usage.push(item);
-                    }
-                }
-            }
+            board.usage.extend(rate_limit_items(usage));
             for (period, cost) in [
                 ("5h", usage.opencode_five_hour),
                 ("7d", usage.opencode_seven_day),
@@ -392,6 +370,50 @@ fn terminal_slots(inventory: &SessionInventory, slug: &str) -> Vec<TerminalSlotV
         })
     })
     .collect()
+}
+
+/// Claude and Codex windows in display order. Claude's matches its status
+/// line: session, each per-model weekly (already sorted busiest first), then
+/// the account weekly. Absent windows are left out, never shown as 0%.
+fn rate_limit_items(usage: &UsageSnapshot) -> Vec<wt_tui::UsageItem> {
+    let claude_observed = usage
+        .claude_observed_at_ms
+        .and_then(|ms| u64::try_from(ms).ok());
+    let scoped = usage
+        .claude_seven_day_scoped
+        .iter()
+        .map(|value| (scoped_window_key(value), Some(value)));
+    let claude = std::iter::once(("5h".to_owned(), usage.claude_five_hour.as_ref()))
+        .chain(scoped)
+        .chain(std::iter::once((
+            "7d".to_owned(),
+            usage.claude_seven_day.as_ref(),
+        )))
+        .map(|(period, value)| ("Claude", period, value, claude_observed));
+    let codex = [
+        ("5h", usage.codex_five_hour.as_ref()),
+        ("7d", usage.codex_seven_day.as_ref()),
+    ]
+    .into_iter()
+    .map(|(period, value)| ("Codex", period.to_owned(), value, None));
+    claude
+        .chain(codex)
+        .filter_map(|(harness, period, value, observed)| {
+            usage_item(harness, &period, value, observed)
+        })
+        .collect()
+}
+
+/// `7` plus the initial of the model's last name word: "Fable" is `7f`.
+fn scoped_window_key(value: &UsagePeriodDto) -> String {
+    wt_harness::usage_window_key(
+        &wt_harness::UsagePeriod {
+            utilization: value.utilization,
+            resets_at: None,
+            label: value.label.clone(),
+        },
+        true,
+    )
 }
 
 fn usage_item(
@@ -451,6 +473,37 @@ fn state_name(state: Option<DerivedState>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_windows_follow_the_status_line_and_omit_what_the_plan_lacks() {
+        use crate::session_activity::{UsagePeriodDto, UsageSnapshot};
+        let period = |utilization, label: Option<&str>| UsagePeriodDto {
+            utilization,
+            resets_at: Some("2026-11-23T14:00:00+00:00".into()),
+            label: label.map(str::to_owned),
+        };
+        // A verified account reports no session window at all.
+        let usage = UsageSnapshot {
+            claude_seven_day: Some(period(20.0, None)),
+            claude_seven_day_scoped: vec![
+                period(31.0, Some("Claude Fable")),
+                period(4.0, Some("Sonnet")),
+            ],
+            ..Default::default()
+        };
+        let periods: Vec<_> = super::rate_limit_items(&usage)
+            .into_iter()
+            .map(|item| (item.harness, item.period, item.percent))
+            .collect();
+        assert_eq!(
+            periods,
+            [
+                ("Claude".into(), "7f".into(), Some(31)),
+                ("Claude".into(), "7s".into(), Some(4)),
+                ("Claude".into(), "7d".into(), Some(20)),
+            ]
+        );
+    }
+
     #[test]
     fn native_pending_input_is_exact_and_clears_back_to_observed_state() {
         use crate::session_activity::{OpenCodeInputSnapshot, SessionActivitySnapshot};

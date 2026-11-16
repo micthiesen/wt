@@ -195,7 +195,12 @@ automations, a dim `↑` notice when a newer wt release is available or installe
 and awaiting a restart ([updates.md](updates.md)), the primary harness's rate-limit windows (colored as they near
 the limit, with time to reset), and the primary harness glyph. Claude's
 windows come from `~/.cache/claude-statusline-usage.json`, written by a
-statusline outside wt; a reading over 30 minutes old turns dim and ends with
+statusline outside wt, and read like Claude Code's status line:
+`5h 52% (5m) · 7f 20% · 7d 20% (1d13h)`. The order is the session window, each
+per-model weekly (`7` plus the model's initial, busiest first), then the
+account weekly; a window the plan lacks is left out, countdowns use the two
+coarsest units, and a countdown repeated by a later window shows only on the
+last. A reading over 30 minutes old turns dim and ends with
 `as of <age> ago`, and a window it saw reset shows `?` instead of `0%`. Refreshing uses
 a traveling bar wave in a reserved 12-cell slot, so counts and
 right-aligned telemetry stay put as refreshes start and finish. The wave follows
