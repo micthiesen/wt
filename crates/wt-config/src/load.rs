@@ -312,6 +312,13 @@ impl Config {
             }
         }
 
+        let claude_env = harness_raw.claude_env;
+        for (name, value) in &claude_env {
+            if let Some(reason) = claude_env_refusal(name, value) {
+                errors.push(format!("harness.claude_env.{name}: {reason}"));
+            }
+        }
+
         let mut branch: BranchConfig = section(&raw, "branch", &mut errors);
         required(&branch.prefix, "branch.prefix", &mut errors);
         if branch.base.is_empty() {
@@ -801,6 +808,7 @@ impl Config {
                 wt_session,
                 wt_session_claude_token_command,
                 wt_session_claude_args,
+                claude_env,
             },
             diff,
             editor,
@@ -1543,6 +1551,44 @@ struct HarnessRaw {
     wt_session: Option<String>,
     wt_session_claude_token_command: Option<Vec<String>>,
     wt_session_claude_args: Vec<String>,
+    claude_env: BTreeMap<String, String>,
+}
+
+/// Why a `harness.claude_env` entry is refused. Account-selecting names would
+/// override the `wt` slot's token or silently move every session to another
+/// account or provider; the rest are variables wt sets on each launch.
+fn claude_env_refusal(name: &str, value: &str) -> Option<&'static str> {
+    const WT_OWNED: &[&str] = &[
+        "PATH",
+        "HOME",
+        "WT_AGENT",
+        "TMUX",
+        "TMUX_PANE",
+        "BUN_INSPECT",
+        "CLAUDE_ENV_FILE",
+    ];
+    let valid = name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase() || first == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !valid {
+        Some("names are uppercase letters, digits and underscores")
+    } else if value.contains('\0') {
+        Some("values cannot contain NUL")
+    } else if WT_OWNED.contains(&name) {
+        Some("wt sets this variable itself")
+    } else if name.starts_with("ANTHROPIC_")
+        || name.starts_with("CLAUDE_CODE_USE_")
+        || name == "CLAUDE_CODE_OAUTH_TOKEN"
+        || name == "CLAUDE_CONFIG_DIR"
+    {
+        Some("it selects Claude's account or provider, which this setting must not change")
+    } else {
+        None
+    }
 }
 
 /// `claude` flags wt sets itself, or that would make the slot non-interactive.

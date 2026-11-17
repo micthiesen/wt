@@ -112,6 +112,7 @@ pub struct ClaudeSessionManager {
     spawn_path: Option<String>,
     launch_auth: Option<ClaudeLaunchAuth>,
     launch_args: Option<ClaudeLaunchArgs>,
+    launch_env: Vec<(String, String)>,
 }
 
 impl ClaudeSessionManager {
@@ -125,6 +126,7 @@ impl ClaudeSessionManager {
             spawn_path: None,
             launch_auth: None,
             launch_args: None,
+            launch_env: Vec::new(),
         }
     }
 
@@ -148,6 +150,13 @@ impl ClaudeSessionManager {
     /// Append `args` to each `claude` this manager creates in their slot.
     pub fn with_launch_args(mut self, args: Option<ClaudeLaunchArgs>) -> Self {
         self.launch_args = args;
+        self
+    }
+
+    /// Set `env` on each `claude` this manager creates, in every slot.
+    /// Configuration has already refused account-selecting names.
+    pub fn with_launch_env(mut self, env: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.launch_env = env.into_iter().collect();
         self
     }
 
@@ -644,6 +653,11 @@ impl ClaudeSessionManager {
         command.push(format!("PATH={shim_path}"));
         command.push(format!("HOME={}", self.paths.home.to_string_lossy()));
         command.push(format!("WT_AGENT={}", target.slug));
+        command.extend(
+            self.launch_env
+                .iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
         if let Some(url) = inspector_url {
             command.push(format!("BUN_INSPECT={url}"));
             // Claude's Bash children would inherit the variable, and a child
@@ -1429,6 +1443,7 @@ exec /bin/sleep 30
             &bin.join("claude"),
             r##"#!/bin/sh
 printf '%s\n' "$*" > "$HOME/args-$WT_AGENT-${PWD##*/}"
+printf '%s\n' "${WT_QA_FEATURE-unset}" > "$HOME/env-$WT_AGENT-${PWD##*/}"
 id=
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -1456,7 +1471,8 @@ exec /bin/sleep 30
             "wt",
             &wt_source,
             vec!["--permission-mode".into(), "accept edits".into()],
-        )));
+        )))
+        .with_launch_env([("WT_QA_FEATURE".to_owned(), "on and off".to_owned())]);
         let cancel = CancellationToken::new();
         let target = |slug: &str, cwd: &Path| ClaudeSessionTarget {
             slug: slug.into(),
@@ -1478,6 +1494,11 @@ exec /bin/sleep 30
             "{wt}"
         );
         assert!(!ordinary.contains("--permission-mode"), "{ordinary}");
+        // Launch environment is not slot-scoped: every Claude gets it.
+        for slot in ["wt-wt-source", "repo-one-other"] {
+            let env = fs::read_to_string(home.join(format!("env-{slot}"))).unwrap();
+            assert_eq!(env.trim_end(), "on and off", "{slot}");
+        }
     }
 
     #[cfg(unix)]

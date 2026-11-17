@@ -111,6 +111,15 @@ impl HarnessService {
         self.rebuild_claude_messenger()
     }
 
+    /// Set environment on each `claude` created in any slot.
+    pub fn with_claude_launch_env(
+        mut self,
+        env: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.claude_sessions = self.claude_sessions.with_launch_env(env);
+        self.rebuild_claude_messenger()
+    }
+
     /// The messenger cold-starts through its own manager copy, so it must
     /// see every launch setting applied to `claude_sessions`.
     fn rebuild_claude_messenger(mut self) -> Self {

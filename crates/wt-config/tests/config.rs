@@ -269,6 +269,44 @@ fn wt_session_claude_args_are_appended_flags_that_leave_identity_to_wt() {
 }
 
 #[test]
+fn claude_env_sets_features_but_never_the_account() {
+    let root = tempfile::tempdir().unwrap();
+    let opts = options(root.path(), root.path(), &[]);
+    let base = minimal_config(root.path());
+    let unset = Config::from_raw(toml_value(&base), &opts).unwrap();
+    assert!(unset.harness.claude_env.is_empty());
+
+    let set = format!("{base}\n[harness.claude_env]\nCLAUDE_CODE_EXPERIMENTAL_CODE_MODE = '1'\n");
+    let config = Config::from_raw(toml_value(&set), &opts).unwrap();
+    assert_eq!(
+        config
+            .harness
+            .claude_env
+            .get("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"),
+        Some(&"1".to_owned())
+    );
+
+    for invalid in [
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CONFIG_DIR",
+        "PATH",
+        "WT_AGENT",
+        "lower_case",
+    ] {
+        let raw = format!("{base}\n[harness.claude_env]\n{invalid} = 'x'\n");
+        let error = Config::from_raw(toml_value(&raw), &opts)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("harness.claude_env.{invalid}")),
+            "{invalid}: {error}"
+        );
+    }
+}
+
+#[test]
 fn defaults_are_typed_and_repository_derived() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

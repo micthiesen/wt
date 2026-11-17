@@ -526,6 +526,10 @@ pub struct HarnessConfig {
     /// Extra arguments appended to each `claude` wt creates for the `wt`
     /// special session, such as `--permission-mode`. Empty by default.
     pub wt_session_claude_args: Vec<String>,
+    /// Environment set on every interactive `claude` wt starts, in any
+    /// slot, such as Claude Code feature switches. Names that select an
+    /// account or that wt sets itself are refused at load.
+    pub claude_env: BTreeMap<String, String>,
 }
 impl Default for HarnessConfig {
     fn default() -> Self {
@@ -535,6 +539,7 @@ impl Default for HarnessConfig {
             wt_session: None,
             wt_session_claude_token_command: None,
             wt_session_claude_args: Vec::new(),
+            claude_env: BTreeMap::new(),
         }
     }
 }

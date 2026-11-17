@@ -432,7 +432,8 @@ impl AppHarness {
             ClaudeSessionManager::new(ClaudeHarness::new(claude_paths.clone()), tmux.clone())
                 .with_spawn_path(spawn_path.clone())
                 .with_launch_auth(launch_auth.clone())
-                .with_launch_args(launch_args.clone());
+                .with_launch_args(launch_args.clone())
+                .with_launch_env(context.config.harness.claude_env.clone());
         let claude_injector = ClaudeInjector::new(cache_root.clone());
         let service = HarnessService::new(
             claude_paths,
@@ -444,7 +445,8 @@ impl AppHarness {
         )
         .with_spawn_path(spawn_path)
         .with_claude_launch_auth(launch_auth)
-        .with_claude_launch_args(launch_args);
+        .with_claude_launch_args(launch_args)
+        .with_claude_launch_env(context.config.harness.claude_env.clone());
         Self {
             service,
             tmux,

@@ -34,7 +34,8 @@ carries its notes.
   published from the run's commit, so the `main` run of the same commit posts
   nothing.
 - The trigger names the workflow by its `name:`. If `Native release` is renamed,
-  update both Discord workflows in the same commit, or posts silently stop.
+  update `discord-release.yml` and `ci-rerun.yml` in the same commit, or they
+  silently stop.
 - A failed post does not affect the release. Re-run the `discord-release` run to
   retry it.
 - **Silence means no stable release was published.** A failed release run posts
@@ -47,7 +48,7 @@ longer read.
 **Actions secret** (repo Settings → Secrets → Actions):
 `DISCORD_UPDATES_WEBHOOK` (the #updates channel webhook URL).
 
-## #github: repo events and CI failures
+## #github: repo events
 
 A GitHub **repo webhook** (repo Settings → Webhooks — not an Actions secret)
 posting to the #github channel's Discord webhook URL with `/github` appended.
@@ -55,13 +56,8 @@ Registered events: `issues`, `fork`, `star` — no `push` or pull-request
 events. `issue_comment` is deliberately excluded because GitHub also uses it
 for pull-request comments. Hook id `662175381`.
 
-`.github/workflows/discord-ci-alert.yml` separately posts unsuccessful
-completions of `Native release` on `main`, including failures and timeouts.
-Cancelled runs are silent. A first attempt whose only unsuccessful jobs were
-cancelled is rerun once and watched; it posts only if that rerun fails. The alert includes the conclusion, commit, actor, and a direct
-link to the Actions run. It uses the Actions secret `DISCORD_GITHUB_WEBHOOK`,
-which is the same channel webhook URL without the native integration's
-`/github` suffix.
+CI failures are not posted to Discord; `.github/workflows/ci-rerun.yml` only
+reruns runs that failed through cancelled jobs.
 
 To re-register (e.g. after rotating the Discord webhook):
 
