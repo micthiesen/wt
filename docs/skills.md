@@ -37,7 +37,7 @@ other `@skill-id` references. See [OpenCode sessions](opencode.md).
 | `manager` skill | the fleet-coordinator playbook for the [manager session](manager.md) |
 | `start` skill | kick off work inside a prepared worktree (brief → research → build → review → test → status hand-off) |
 | `handoff` skill | move a distinct follow-up into a new worktree, write its `prompt.txt`, and start the configured primary agent |
-| `shepherd` skill | the fleet sweep behind `/shepherd`: drive every row toward mergeable on a loop, stopping short of the merge |
+| `shepherd` skill | the fleet sweep behind `/shepherd`: drive every row toward mergeable on a loop and arm the merge for each ready row |
 | `babysit` skill | the single-worktree counterpart behind `/babysit`: see your own branch through the review bot's findings and its follow-up reviews, then merge it — the one place an agent lands a PR, and only on the human's explicit invocation |
 | `triage` skill | turn a pasted task batch into prioritized, ready-to-work worktrees |
 

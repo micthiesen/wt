@@ -59,7 +59,7 @@ pub static UNITS: &[Unit] = &[
     Unit {
         kind: UnitKind::Skill,
         name: "shepherd",
-        summary: "drive the whole fleet toward mergeable, stopping short of merge",
+        summary: "drive the whole fleet toward merged, arming each ready PR",
         source: include_str!("../../../skills/shepherd/SKILL.md"),
         vars: NO_VARS,
     },

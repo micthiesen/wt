@@ -1,7 +1,8 @@
 ---
 name: shepherd
 description: >-
-  Sweeps the wt fleet toward mergeable on a loop, stopping short of the merge.
+  Sweeps the wt fleet toward merged on a loop and arms the merge for each PR
+  that is ready.
   Use for /shepherd, or when the human asks the manager for a loop or cron that
   keeps worktrees moving.
 targets:
@@ -11,11 +12,18 @@ user_invocable: true
 
 # Shepherd
 
-Each pass reads the whole fleet and does the small things that move rows
-toward mergeable. The fleet decays between merges in ways no single worktree
+Each pass reads the whole fleet, does the small things that move rows toward
+mergeable, and merges what is ready. The fleet decays between merges in ways no single worktree
 sees, above all PRs that silently went conflicted.
 
-- **Never merge**, unless the human handed you merging for the assigned set.
+- **Merging is the point.** Invoking `/shepherd` hands you merging for its
+  set (the named set, or the fleet). Arm `wt merge <slug>` for a row that is
+  `ready` with no gate, its PR not draft, no failing check and no unresolved
+  thread; pending checks are fine, since GitHub merges once they pass. Skip
+  `--risk high` rows unless the human named them, and say which you skipped.
+  Never `gh pr merge`.
+- After each landing, re-read the rows that overlap it: a sibling that went
+  `DIRTY` gets a rebase nudge in the same pass.
 - **Implement nothing.** Every fix goes to the owning worktree through
   `wt agent send <slug> "<message>"`; you only read the repository, from the
   main clone. Driving your own branch through review is `babysit`.
@@ -83,6 +91,7 @@ verdict says.
 | a check failed | Read its name and shape (below) before acting; never nudge on check status alone. |
 | unresolved review threads, or unticked boxes in the review bot's summary | Nudge for all four: fix, reply on the thread, resolve it, tick the box. |
 | draft, status `ready`, not busy, not stale, note without open questions | `gh pr ready <n>`: a finished draft gets no review until flipped. Otherwise wait a pass. |
+| `ready`, no gate, not draft, no failing check, no unresolved thread, risk not `high` | `wt merge <slug>`. Armed is final: don't watch it or re-arm. |
 | `working`/`review`, idle session, stale status | Nudge with a concrete question ("status says review since yesterday; what blocks ready?"). |
 | `ready` or `dropped` holding a dev slot while idle | Reclaim it: promote any waiter (`wt dev queue <slug> --first`), then ask the holder to stop its own server if its remaining work doesn't need it. |
 | `todo` | Gated: leave it. Ungated: apply the start policy. |
