@@ -239,7 +239,10 @@ fn concurrent_opens_serialize_schema_initialization_and_registration() {
             let db_path = db_path.clone();
             thread::spawn(move || {
                 barrier.wait();
-                for _ in 0..100 {
+                // The schema race happens on the first open. More rounds only
+                // add contention, and SQLite's busy wait is not fair: on a
+                // loaded runner one opener can starve past its 3s timeout.
+                for _ in 0..10 {
                     drop(Store::open(&db_path, identity("shared", "/repos/shared")).unwrap());
                 }
             })
