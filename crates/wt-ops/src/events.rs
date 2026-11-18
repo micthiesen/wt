@@ -616,6 +616,36 @@ pub async fn secret_is_configured(context: &AppContext) -> bool {
     resolve_secret(&context.config).await.is_ok()
 }
 
+/// The running daemon as the board shows it: its version, and whether it
+/// runs this process's build, without which its snapshot is not used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonSummary {
+    NotRunning,
+    Running { version: String, current: bool },
+}
+
+/// `None` when `[github.events]` is not configured.
+pub async fn daemon_summary(config: &Config) -> Option<DaemonSummary> {
+    config.github.events.as_ref()?;
+    let state = wt_events::read_state(&events_directory(config))
+        .await
+        .ok()
+        .flatten();
+    Some(match state {
+        Some(state) if daemon_alive(&state) => DaemonSummary::Running {
+            version: state
+                .writer_version
+                .clone()
+                .filter(|_| {
+                    state.writer_sha.is_some() && state.writer_version_sha == state.writer_sha
+                })
+                .unwrap_or_else(|| "unknown".into()),
+            current: state.writer_sha.as_deref() == Some(wt_app_core::build_info::build_id()),
+        },
+        _ => DaemonSummary::NotRunning,
+    })
+}
+
 pub async fn status(context: &AppContext) -> Result<()> {
     let events = context.config.github.events.as_ref();
     let dir = events_directory(&context.config);
@@ -819,12 +849,35 @@ async fn owns_agent(context: &AppContext, plist: &Path) -> Result<bool> {
         Ok(value) => value,
         Err(_) => return Ok(false),
     };
-    let env = parsed
+    let (global, repo) = config_environment(context);
+    Ok(agent_matches(
+        &parsed,
+        &global,
+        &repo,
+        &events_directory(&context.config),
+        &context.cwd,
+    ))
+}
+
+/// Whether a parsed launch agent plist runs the daemon for this configuration.
+///
+/// An empty `WT_REPO_CONFIG` means the daemon discovers its repository config
+/// itself, which lands on the same file whenever the events directory (keyed
+/// by repository identity) matches. Comparing it literally made every session
+/// wt launches, which pins the selector, treat a shell-installed agent as
+/// another configuration's and leave it on a stale build.
+fn agent_matches(
+    parsed: &serde_json::Value,
+    expected_global: &str,
+    expected_repo: &str,
+    expected_dir: &Path,
+    cwd: &Path,
+) -> bool {
+    let Some(env) = parsed
         .get("EnvironmentVariables")
-        .and_then(serde_json::Value::as_object);
-    let expected = config_environment(context);
-    let Some(env) = env else {
-        return Ok(false);
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
     };
     let repo = env
         .get("WT_REPO_CONFIG")
@@ -844,27 +897,17 @@ async fn owns_agent(context: &AppContext, plist: &Path) -> Result<bool> {
                 .and_then(serde_json::Value::as_str)
                 .map(|p| format!("{p}/.config/wt/config.toml"))
         });
-    let expected_dir = events_directory(&context.config);
-    Ok(canonical_optional(repo, &context.cwd) == expected.1
-        && global.is_some_and(|path| canonical_optional(&path, &context.cwd) == expected.0)
+    let log = |name: &str| expected_dir.join(name).to_string_lossy().into_owned();
+    (repo.is_empty() || canonical_optional(repo, cwd) == expected_repo)
+        && global.is_some_and(|path| canonical_optional(&path, cwd) == expected_global)
         && parsed
             .get("StandardOutPath")
             .and_then(serde_json::Value::as_str)
-            == Some(
-                expected_dir
-                    .join("daemon.out.log")
-                    .to_string_lossy()
-                    .as_ref(),
-            )
+            == Some(log("daemon.out.log").as_str())
         && parsed
             .get("StandardErrorPath")
             .and_then(serde_json::Value::as_str)
-            == Some(
-                expected_dir
-                    .join("daemon.err.log")
-                    .to_string_lossy()
-                    .as_ref(),
-            ))
+            == Some(log("daemon.err.log").as_str())
 }
 
 fn plist_contents(context: &AppContext) -> Result<String> {
@@ -934,11 +977,12 @@ fn config_environment(context: &AppContext) -> (String, String) {
     let global = std::env::var_os("WT_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| xdg.join("wt/config.toml"));
-    let repo = std::env::var_os("WT_REPO_CONFIG").map(PathBuf::from);
+    // The loaded selection, not the variable: a discovered config has no
+    // variable but still decides which repository the daemon serves.
+    let repo = context.config.repository_config.as_deref();
     (
         canonical_path(&global, &context.cwd),
-        repo.as_deref()
-            .map_or(String::new(), |path| canonical_path(path, &context.cwd)),
+        repo.map_or(String::new(), |path| canonical_path(path, &context.cwd)),
     )
 }
 
@@ -1073,6 +1117,65 @@ pub fn repository_identity(config: &wt_config::Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shell_installed_agent_still_belongs_to_a_session_that_pins_the_repo_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let events = cwd.join("cache/events");
+        let repo_config = cwd.join("repo/.wt.toml");
+        std::fs::create_dir_all(repo_config.parent().unwrap()).unwrap();
+        std::fs::write(&repo_config, "").unwrap();
+        let global = canonical_path(&cwd.join("config.toml"), cwd);
+        let repo = canonical_path(&repo_config, cwd);
+        let plist = |repo_env: &str, events: &Path| {
+            serde_json::json!({
+                "EnvironmentVariables": {
+                    "WT_CONFIG": cwd.join("config.toml"),
+                    "WT_REPO_CONFIG": repo_env,
+                },
+                "StandardOutPath": events.join("daemon.out.log"),
+                "StandardErrorPath": events.join("daemon.err.log"),
+            })
+        };
+        // Installed from a shell, the daemon discovers the same repo config.
+        assert!(agent_matches(
+            &plist("", &events),
+            &global,
+            &repo,
+            &events,
+            cwd
+        ));
+        assert!(agent_matches(
+            &plist(&repo_config.to_string_lossy(), &events),
+            &global,
+            &repo,
+            &events,
+            cwd
+        ));
+        // A different repository config or events directory is someone else's.
+        assert!(!agent_matches(
+            &plist(&cwd.join("other/.wt.toml").to_string_lossy(), &events),
+            &global,
+            &repo,
+            &events,
+            cwd
+        ));
+        assert!(!agent_matches(
+            &plist("", &cwd.join("other/events")),
+            &global,
+            &repo,
+            &events,
+            cwd
+        ));
+        assert!(!agent_matches(
+            &plist("", &events),
+            "/elsewhere.toml",
+            &repo,
+            &events,
+            cwd
+        ));
+    }
 
     #[tokio::test]
     async fn a_reload_targets_the_installed_build_not_the_running_one() {

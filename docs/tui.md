@@ -254,7 +254,7 @@ opens the main clone as it does on the board.
 | `Ctrl+J` / `Ctrl+K` | Scroll details |
 | `Ctrl+E` / `Ctrl+Y` | Scroll output |
 | `r` / `Ctrl+R` | Refresh / ask for confirmation, then clear derived caches and refresh |
-| `?` | Open searchable help |
+| `?` | Open searchable help; its title shows the running wt version and, with `[github.events]`, the events daemon's (`stale build` when it runs another build, so its snapshot is unused) |
 | `Esc` | Return the bottom pane to its default feed |
 | `q` / `Ctrl+C` | Quit |
 

@@ -1,6 +1,7 @@
-//! A quiet "newer wt release" notice for the title bar. Read-only: it never
-//! stamps the install state, so the startup prompt keeps its own daily
-//! cadence, and it never downloads anything.
+//! A quiet "newer wt release" notice for the title bar, and the running wt and
+//! events daemon versions for the help title. Read-only: it never stamps the
+//! install state, so the startup prompt keeps its own daily cadence, and it
+//! never downloads anything.
 
 use std::{sync::Arc, time::Duration};
 
@@ -16,6 +17,8 @@ use wt_app_core::context::AppContext;
 const FIRST_CHECK: Duration = Duration::from_secs(60);
 const CHECK_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+/// The daemon restarts on `wt update`; a stale version shows for at most this.
+const DAEMON_EVERY: Duration = Duration::from_secs(15);
 
 /// `None` when this build is current, the check is disabled, or it failed;
 /// a failed check shows nothing rather than a stale or alarming notice.
@@ -24,6 +27,7 @@ pub type UpdateNotice = Option<String>;
 pub fn overlay(
     scope: &TaskScope,
     checks_enabled: bool,
+    events: Option<Arc<wt_config::Config>>,
     board: SourceHandle<Board>,
 ) -> SourceHandle<Board> {
     let (notice, publisher) = leaf_channel(
@@ -69,12 +73,40 @@ pub fn overlay(
             }
         }
     });
+    let (versions, versions_publisher) = leaf_channel(
+        scope,
+        SourceSpec {
+            name: "versions",
+            domain: Domain::Perf,
+            persistence: Persistence::Never("live daemon state"),
+            policy: Default::default(),
+        },
+    );
+    versions_publisher.publish_live(versions_line(None), Stamp::now());
+    let cancellation = scope.token();
+    scope.spawn(async move {
+        let Some(config) = events else {
+            cancellation.cancelled().await;
+            drop(versions_publisher);
+            return;
+        };
+        loop {
+            let summary = wt_ops::events::daemon_summary(&config).await;
+            versions_publisher.publish_live(versions_line(summary.as_ref()), Stamp::now());
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = tokio::time::sleep(DAEMON_EVERY) => {}
+            }
+        }
+    });
     let (output, mut board_publisher) = derived_channel(scope, "update-board");
     let cancellation = scope.token();
     let notice_view = notice.view();
+    let versions_view = versions.view();
     scope.spawn(async move {
         let mut boards = board.subscribe();
         let mut notices = notice_view.subscribe();
+        let mut lines = versions_view.subscribe();
         boards.mark_changed();
         notices.mark_changed();
         loop {
@@ -88,15 +120,19 @@ pub fn overlay(
                 }
                 changed = boards.changed() => if changed.is_err() { break; },
                 changed = notices.changed() => if changed.is_err() { break; },
+                changed = lines.changed() => if changed.is_err() { break; },
             }
             let base = boards.borrow_and_update().clone();
             let latest = notices.borrow_and_update().clone();
+            let line = lines.borrow_and_update().clone();
             let data = base.data().map(|board| {
                 let mut board = board.as_ref().clone();
                 board.update_notice = latest.data().and_then(|notice| (**notice).clone());
+                board.versions = line.data().map(|line| (**line).clone()).unwrap_or_default();
                 Arc::new(board)
             });
-            board_publisher.publish_if_changed(base.with_data(data).with_input(&latest));
+            board_publisher
+                .publish_if_changed(base.with_data(data).with_input(&latest).with_input(&line));
         }
     });
     output
@@ -127,6 +163,26 @@ async fn check() -> anyhow::Result<UpdateNotice> {
         &current,
         wt_app_core::build_info::build_id(),
     ))
+}
+
+/// `wt v0.1.66 · events v0.1.66`; the daemon part is absent when the
+/// integration is not configured, and marked when it runs another build.
+fn versions_line(daemon: Option<&wt_ops::events::DaemonSummary>) -> String {
+    use wt_ops::events::DaemonSummary;
+    let wt = format!("wt v{}", wt_app_core::build_info::version());
+    match daemon {
+        None => wt,
+        Some(DaemonSummary::NotRunning) => format!("{wt} · events not running"),
+        Some(DaemonSummary::Running { version, current }) => {
+            let version = if version == "unknown" {
+                version.clone()
+            } else {
+                format!("v{}", version.trim_start_matches('v'))
+            };
+            let stale = if *current { "" } else { " (stale build)" };
+            format!("{wt} · events {version}{stale}")
+        }
+    }
 }
 
 /// The running build may be older than the installed one: an update already
@@ -167,7 +223,7 @@ mod tests {
                 policy: Default::default(),
             },
         );
-        let board = overlay(&scope, false, base.view());
+        let board = overlay(&scope, false, None, base.view());
         let mut updates = board.subscribe();
         for name in ["first", "second", "third"] {
             base_publisher.publish_live(
@@ -193,6 +249,31 @@ mod tests {
             .unwrap_or_else(|_| panic!("board {name} was not forwarded"));
         }
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[test]
+    fn versions_name_the_daemon_and_flag_a_stale_build() {
+        use wt_ops::events::DaemonSummary;
+        let wt = format!("wt v{}", wt_app_core::build_info::version());
+        assert_eq!(versions_line(None), wt);
+        assert_eq!(
+            versions_line(Some(&DaemonSummary::NotRunning)),
+            format!("{wt} · events not running")
+        );
+        assert_eq!(
+            versions_line(Some(&DaemonSummary::Running {
+                version: "0.1.64".into(),
+                current: false,
+            })),
+            format!("{wt} · events v0.1.64 (stale build)")
+        );
+        assert_eq!(
+            versions_line(Some(&DaemonSummary::Running {
+                version: "v0.1.66".into(),
+                current: true,
+            })),
+            format!("{wt} · events v0.1.66")
+        );
     }
 
     #[test]

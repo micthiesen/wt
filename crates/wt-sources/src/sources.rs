@@ -141,6 +141,12 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     let board = crate::update_source::overlay(
         scope,
         crate::update_source::enabled(context),
+        context
+            .config
+            .github
+            .events
+            .is_some()
+            .then(|| context.config.clone()),
         automations.board,
     );
     let perf = crate::perf_source::start(scope, context, board);

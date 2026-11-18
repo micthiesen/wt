@@ -2516,7 +2516,12 @@ fn help(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
             hint("? / esc / q", "close"),
         ]
     };
-    let modal = Modal::new("help · keys and glyphs", hints);
+    let title = if model.board.versions.is_empty() {
+        "help · keys and glyphs".to_owned()
+    } else {
+        format!("help · {}", model.board.versions)
+    };
+    let modal = Modal::new(title, hints);
     let outer = modal.place(area, MAX_FRAME_WIDTH as usize, 0, true);
     let body = modal.draw(frame, area, outer);
     let width = body.width as usize;

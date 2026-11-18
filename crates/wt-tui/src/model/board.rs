@@ -56,6 +56,10 @@ pub struct Board {
     /// A newer wt release ("v0.1.40 available", "restart for v0.1.40").
     #[serde(default)]
     pub update_notice: Option<String>,
+    /// Running wt and events daemon versions, shown in the help title
+    /// ("wt v0.1.66 · events v0.1.66").
+    #[serde(default)]
+    pub versions: String,
     /// Provenance and observation stamps of each remote host's domains, keyed
     /// by `BoardRow::host`. The local host's come with the snapshot itself.
     #[serde(default)]
