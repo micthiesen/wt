@@ -234,8 +234,9 @@ enum Command {
     /// Arm merge-when-ready or cancel the PR's actual merge state.
     ///
     /// Chooses the merge queue or classic auto-merge from the PR's base
-    /// branch, so pending checks are fine. Armed is final: GitHub merges once
-    /// requirements are met; do not watch it or merge again. Exit 75 means a
+    /// branch, so pending checks are fine. Armed is not landed: a queue can
+    /// evict the PR and GitHub can drop auto-merge, so watch until the PR is
+    /// merged, and re-arm only after fixing what disarmed it. Exit 75 means a
     /// required check has not reported yet: wait and re-run.
     Merge(commands::merge::MergeArgs),
     /// Open a worktree in the configured editor.

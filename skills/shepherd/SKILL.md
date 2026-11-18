@@ -22,6 +22,9 @@ sees, above all PRs that silently went conflicted.
   thread; pending checks are fine, since GitHub merges once they pass. Skip
   `--risk high` rows unless the human named them, and say which you skipped.
   Never `gh pr merge`.
+- **Armed is not merged.** Queues evict PRs often, and GitHub drops classic
+  auto-merge on a conflict, silently. Every row you armed stays on your watch
+  until its PR is `MERGED`; see *Evictions*.
 - After each landing, re-read the rows that overlap it: a sibling that went
   `DIRTY` gets a rebase nudge in the same pass.
 - **Implement nothing.** Every fix goes to the owning worktree through
@@ -55,7 +58,7 @@ queue order, starting held work), and one-shot resources.
   - **Stop predicate** (default): three consecutive passes with zero dispatched
     actions, zero non-clean PRs and zero idle stale rows. For an assigned set:
     every target PR merged with its owed closure done, or only a human block
-    left.
+    left. An armed PR that has not merged is neither, so it keeps the loop on.
 - On stopping, clear the timer, report what changed and what waits on the
   human, and say plainly that the loop is off.
 - A repeated alert with nothing changed is not an action: record the
@@ -91,10 +94,24 @@ verdict says.
 | a check failed | Read its name and shape (below) before acting; never nudge on check status alone. |
 | unresolved review threads, or unticked boxes in the review bot's summary | Nudge for all four: fix, reply on the thread, resolve it, tick the box. |
 | draft, status `ready`, not busy, not stale, note without open questions | `gh pr ready <n>`: a finished draft gets no review until flipped. Otherwise wait a pass. |
-| `ready`, no gate, not draft, no failing check, no unresolved thread, risk not `high` | `wt merge <slug>`. Armed is final: don't watch it or re-arm. |
+| `ready`, no gate, not draft, no failing check, no unresolved thread, risk not `high` | `wt merge <slug>`, then keep watching it every pass until merged. |
+| armed (`merge_queue` entry or `pr.auto_merge`), not merged | Nothing to do; re-check next pass. |
+| you armed it, open, now neither armed nor queued, or queue `UNMERGEABLE` | Evicted: see *Evictions*. |
 | `working`/`review`, idle session, stale status | Nudge with a concrete question ("status says review since yesterday; what blocks ready?"). |
 | `ready` or `dropped` holding a dev slot while idle | Reclaim it: promote any waiter (`wt dev queue <slug> --first`), then ask the holder to stop its own server if its remaining work doesn't need it. |
 | `todo` | Gated: leave it. Ungated: apply the start policy. |
+
+## Evictions
+
+Read arming from `wt fleet --json`: `.merge_queue` (null when not queued)
+and `.pr.auto_merge`. A PR you armed that is open with neither was evicted or
+disarmed. Find the cause before acting: the failed queue run (`gh pr checks`
+and its log), a conflict with something that landed ahead of it, or a new
+requirement. A code cause goes to the owner as a nudge naming the failure;
+when the owner reports it fixed and the row meets the merge row above again,
+`wt merge <slug>` again. A flaky queue run with no code cause may be re-armed
+once without a push; a second failure is a real one. Never re-arm unchanged
+in a loop. Report each eviction and its cause in the end-of-loop summary.
 
 ## Blocked with green checks
 

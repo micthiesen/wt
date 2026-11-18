@@ -49,6 +49,8 @@ human sees.
   is yours to fix), `.pr.merge_state`, `.pr.draft`,
   `.pr.unresolved_threads` (all), `.pr.unresolved_human_threads`.
 - `.work.blockedOn`, `.work.verifyAfterMerge`, `.base` (your parent when stacked).
+- Armed: `.merge_queue` (null when not queued, else its `state`) and
+  `.pr.auto_merge` (classic auto-merge). `.pr.state` is `MERGED` once it lands.
 
 | state | do |
 |---|---|
@@ -58,6 +60,8 @@ human sees.
 | bot `unresolved` | address the findings |
 | `clean` + `stale` | wait for the review of the current head |
 | `clean`, not stale, checks not failing, no threads | merge (see *Merging*) |
+| armed (queued or `auto_merge`), not merged | wait; it is not done yet |
+| was armed, now neither, or queue `UNMERGEABLE` | evicted: see *Until it lands* |
 | `checks: fail` | read the failure first; see *Red review check* |
 | `mergeable: conflicting` | rebase onto the base and resolve; `wt restack` if stacked |
 | open human threads | reply and resolve them |
@@ -126,12 +130,27 @@ wt merge
 ```
 
 `wt merge` arms GitHub's merge-when-ready, choosing the merge queue or classic
-auto-merge from the PR's base branch, so checks still running are fine. Armed
-is finished: do not watch the queue or merge again. Use `wt merge`, never
+auto-merge from the PR's base branch, so checks still running are fine. Use `wt merge`, never
 `gh pr merge`: `--auto` fails on queue bases with a misleading "Auto merge is
 not allowed" error, and a queue sets its own merge method. Exit 75 means a
 required check has not reported yet: wait and re-run, never escalate.
 `wt merge --cancel` disarms and dequeues.
+
+## Until it lands
+
+Armed is not merged. Queues evict PRs often: a queue run fails, an entry
+ahead conflicts, the base moves. GitHub also drops classic auto-merge on a
+conflict. Nothing tells you, so keep the loop running after `wt merge` until
+`.pr.state` is `MERGED`.
+
+When the PR is open and not draft but has no `.merge_queue` entry and
+`.pr.auto_merge` is false, or its queue entry reads `UNMERGEABLE`, it was
+evicted. Find out why before acting: the failed queue run
+(`gh pr checks`, then its log), a conflict, or a new requirement. Fix it
+through the normal loop (findings, push, review), then `wt merge` again.
+Never re-arm unchanged after a real failure; it fails the same way. A flaky
+queue run with no code cause may be re-armed once; a second failure is a
+real one.
 
 ## After it lands
 
@@ -140,9 +159,9 @@ required check has not reported yet: wait and re-run, never escalate.
   promotion), run the steps, then `wt status verified -m "<what you checked,
   where>"`.
 - Do not remove the worktree; merge cleanup archives it.
-- Stop when merged with verification done, blocked on a human, or a pass finds
-  nothing to do or wait for. Never keep polling a clean current-head review;
-  merge it.
+- Stop only when `.pr.state` is `MERGED` and verification is done, or when
+  blocked on a human. An armed PR is still something to wait for. Never keep
+  polling a clean current-head review; merge it.
 
 ## Next PR from this worktree
 

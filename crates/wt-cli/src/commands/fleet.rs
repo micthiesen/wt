@@ -20,7 +20,7 @@ pub struct FleetArgs {
     /// Print one object per worktree: kind (live, merged, removed), slug,
     /// branch, path, base, section, work (state, risk, note, blockedOn,
     /// verifyAfterMerge), edges, dirty, session, merge_queue, and pr (number,
-    /// draft, checks, mergeable, merge_state, review_bot {state, unresolved,
+    /// state, draft, checks, auto_merge, mergeable, merge_state, review_bot {state, unresolved,
     /// stale}, unresolved_threads, unresolved_human_threads). pr is null with
     /// pr_note set when GitHub is unreachable.
     #[arg(long)]
@@ -226,6 +226,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             "number":pr.number,"url":pr.url,"title":pr.title,"state":pr.state,"isDraft":pr.is_draft,
             "draft":pr.is_draft,
             "checks":pr.checks,"failedChecks":pr.failed_checks,
+            "auto_merge":pr.auto_merge.is_some(),
             "mergeStateStatus":merge_field(pr.merge_state_status.as_deref(), &pr.state),
             "merge_state":merge_field(pr.merge_state_status.as_deref(), &pr.state),
             "mergeable":merge_field(pr.mergeable.as_deref(), &pr.state),
