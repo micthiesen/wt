@@ -1,5 +1,39 @@
 # Performance notes
 
+### Claude Code startup freezes from an overloaded fseventsd (2026-11-20)
+
+Report: a new F12 Claude session draws, then ignores typing for seconds at a
+time before settling. Reproduced outside wt in a private tmux server with wt's
+launch environment (Claude Code 2.1.329, cozee-dev checkout): UI at 0.8 s, then
+the first keystroke echoed 4.0 s late and another 3.1 s late; Claude's own
+`--debug` log recorded `[event-loop-stall] blocked for 3953ms` and `3165ms`
+with 6 ms of CPU, and `[fs.watch probe] verdict: silent`. A second run never
+echoed a key in 14 s. `sample` of that process showed the main thread in
+`_os_unfair_lock_lock_slow` for all 1,756 samples while its CFThreadLoop
+thread sat in `FSEventStreamStart -> register_with_server -> f2d_register_rpc`.
+`fseventsd` (pid 394, up 34 days) was at 106 to 111% CPU with a 64 GB
+footprint in `top` (2.5 GB RSS). A bare Node `fs.watch(dir, {recursive: true})`
+followed by `close()` took 19.1 s, 16.3 s and 2.7 s. Load was 10 on 12 cores.
+
+This is the October FSEvents registration signature, now hitting Claude Code
+instead of wt (wt polls on macOS); any FSEvents client blocks the same way.
+
+The load on the daemon was wt's own. The TUI (v0.1.66) replaced the 679 KB
+`automations.json` about 80 times a second with identical content: the file's
+inode changed on every half-second `stat`, and two copies taken 2 s apart
+were equal. Each evaluation pass called `reset_breaker` for every rule and
+row pair whose condition was false (13 rules, 10 rows), and
+`AutomationLedger::mutate` wrote, fsynced and renamed the whole file whether
+or not anything changed. The fix skips the write when the ledger is unchanged
+and takes the ledger lock only for pairs that have a breaker record. No other
+file under the cache root changed more than once a second
+(`tmux-session.conf`, 1.7 KB, changed in 6 of 10 one-second samples).
+
+A daemon already bloated needs a reboot or `sudo killall fseventsd` (launchd
+restarts it; running watchers may need a restart). Fast checks next time:
+`ps -axo pcpu,rss,etime,command | grep '[f]seventsd'`, the Node one-liner, and
+a loop of `stat -f %i` on the cache root's JSON files to find a rewriter.
+
 ### Configured Linux workload budgets (2026-10-19)
 
 The `alex/cpu-memory-limits` implementation adds optional shared and per-job

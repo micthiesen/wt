@@ -394,7 +394,27 @@ impl AutomationEngine {
             return Ok(());
         }
 
-        for (rule_id, target) in evaluate_breaker_resets(input.rules, input.rows, input.context) {
+        let resets = evaluate_breaker_resets(input.rules, input.rows, input.context);
+        // Nearly every pair has no breaker record. Only an existing one is
+        // worth taking the ledger lock for; a record another process adds
+        // after this read is reset on the next pass.
+        let breakers = if resets.is_empty() {
+            None
+        } else {
+            Some(
+                self.ledger
+                    .snapshot()
+                    .await
+                    .context("read automation ledger")?,
+            )
+        };
+        for (rule_id, target) in resets {
+            if !breakers
+                .as_ref()
+                .is_some_and(|ledger| ledger.has_breaker(&rule_id, &target))
+            {
+                continue;
+            }
             self.ledger
                 .reset_breaker(&rule_id, &target, &self.cancellation)
                 .await

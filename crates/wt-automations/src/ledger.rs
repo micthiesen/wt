@@ -202,6 +202,11 @@ impl LedgerSnapshot {
         number(self.last_dispatch.get(&pair_key(rule_id, slug)))
     }
 
+    /// Whether any breaker record exists for the pair, tripped or not.
+    pub fn has_breaker(&self, rule_id: &str, slug: &str) -> bool {
+        self.breaker.contains_key(&pair_key(rule_id, slug))
+    }
+
     pub fn breaker_state(&self, rule_id: &str, slug: &str, now_ms: i64) -> BreakerState {
         let Some(entry) = self.breaker.get(&pair_key(rule_id, slug)) else {
             return BreakerState {
@@ -836,10 +841,17 @@ impl AutomationLedger {
         let _lock =
             FileLock::acquire(&self.lock_dir, &self.lock_key, operation, cancellation).await?;
         let mut root = self.read_root().await?;
+        let stored = root.clone();
         prune(&mut root, now_ms());
         let result = mutate(&mut root);
         prune(&mut root, now_ms());
-        self.write_root(&root).await?;
+        // Most transitions an evaluation pass asks for change nothing. Each
+        // rewrite is a whole-file fsync and rename that every filesystem
+        // watcher on the machine then has to process, so an unchanged
+        // ledger stays untouched.
+        if root != stored {
+            self.write_root(&root).await?;
+        }
         Ok(result)
     }
 
@@ -1421,6 +1433,43 @@ mod tests {
                 .count,
             0
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transitions_that_change_nothing_leave_the_file_untouched() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(&path);
+        let cancel = CancellationToken::new();
+        let now = now_ms();
+        let keys = vec!["k".to_owned()];
+        assert!(
+            ledger
+                .mark_skipped(&keys, "r", "s", now, &cancel)
+                .await
+                .unwrap()
+        );
+        // Every write replaces the file, so its inode identifies a write.
+        let written = std::fs::metadata(&path).unwrap().ino();
+
+        assert!(!ledger.reset_breaker("r", "s", &cancel).await.unwrap());
+        assert!(
+            !ledger
+                .mark_skipped(&keys, "r", "s", now + 1, &cancel)
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), written);
+
+        ledger
+            .bump_breaker("r", "s", now + 2, &cancel)
+            .await
+            .unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), written);
+        assert!(ledger.snapshot().await.unwrap().has_breaker("r", "s"));
     }
 
     #[tokio::test]
