@@ -180,6 +180,7 @@ pub fn status_trigger_state(trigger: AutomationTrigger) -> Option<WorkState> {
         AutomationTrigger::StatusNeedsHuman => Some(WorkState::NeedsHuman),
         AutomationTrigger::StatusNeedsTesting => Some(WorkState::NeedsTesting),
         AutomationTrigger::StatusReady => Some(WorkState::Ready),
+        AutomationTrigger::StatusVerified => Some(WorkState::Verified),
         _ => None,
     }
 }

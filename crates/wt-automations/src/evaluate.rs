@@ -252,7 +252,8 @@ fn evaluate_row(
         AutomationTrigger::WtMerged => evaluate_merged(rule, row, context),
         AutomationTrigger::StatusNeedsHuman
         | AutomationTrigger::StatusNeedsTesting
-        | AutomationTrigger::StatusReady => {
+        | AutomationTrigger::StatusReady
+        | AutomationTrigger::StatusVerified => {
             let wanted = status_trigger_state(trigger)?;
             let work = row.work.as_ref()?;
             if work.state != wanted || (wanted == WorkState::Ready && status_is_gated(work)) {
@@ -270,12 +271,25 @@ fn evaluate_row(
             {
                 return None;
             }
-            Some(single(
+            let mut fire = single(
                 rule,
                 row,
                 format!("{}:work:{}:{}", rule.id, slug, work.at),
                 &format!("{}{}", work.state.as_str(), status_suffix(work)),
-            ))
+            );
+            // A verified worktree is finished and usually removed within
+            // moments. A run that leaves the repository needs nothing from
+            // the checkout, so it must neither wait for the session to go
+            // idle nor be dropped when the row disappears.
+            if wanted == WorkState::Verified
+                && action_traits(rule, context)
+                    .is_some_and(|traits| traits.shell && traits.external)
+            {
+                fire.quiesce_slugs.clear();
+                fire.frozen_vars =
+                    Some(context.row_vars.get(&row.slug).cloned().unwrap_or_default());
+            }
+            Some(fire)
         }
         AutomationTrigger::StatusVerificationDue => {
             let work = row.work.as_ref()?;
@@ -1069,6 +1083,44 @@ mod tests {
         work.blocked_on = Some("approval".into());
         row.work = Some(work);
         assert!(evaluate(&[ready], &[row], &context).is_empty());
+    }
+
+    #[test]
+    fn verified_fires_once_per_assertion_and_an_external_run_outlives_the_row() {
+        let mut row = row();
+        row.work = Some(WorkStatusRecord::new(
+            WorkState::Verified,
+            "2026-10-01T00:00:00Z",
+        ));
+        let mut context = AutomationEvalContext::default();
+        context.row_vars.insert(
+            row.slug.clone(),
+            BTreeMap::from([("issue_id".into(), "WK-1".into())]),
+        );
+        context.actions.insert(
+            "external-update".into(),
+            crate::types::ActionTraits {
+                shell: true,
+                external: true,
+                ..Default::default()
+            },
+        );
+        let rules = [
+            rule("done", AutomationTrigger::StatusVerified, "external-update"),
+            rule("brief", AutomationTrigger::StatusVerified, "manager-brief"),
+            rule("ready", AutomationTrigger::StatusReady, "external-update"),
+        ];
+        let fires = evaluate(&rules, std::slice::from_ref(&row), &context);
+        assert_eq!(fires.len(), 2, "a verified row is not ready");
+        assert_eq!(
+            fires[0].fire_keys,
+            [format!("done:work:{}:2026-10-01T00:00:00Z", row.slug)]
+        );
+        assert!(fires[0].quiesce_slugs.is_empty());
+        assert_eq!(fires[0].frozen_vars.as_ref().unwrap()["issue_id"], "WK-1");
+        // A run into the worktree's session still needs the worktree.
+        assert_eq!(fires[1].quiesce_slugs, [row.slug.clone()]);
+        assert!(fires[1].frozen_vars.is_none());
     }
 
     #[test]

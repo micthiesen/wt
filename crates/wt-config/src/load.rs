@@ -1462,7 +1462,7 @@ fn parse_automations(
     result
 }
 
-const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verification_due, status.verification_overdue, branch.advanced, mcp.event";
+const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verified, status.verification_due, status.verification_overdue, branch.advanced, mcp.event";
 
 fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
     let value = match value {
@@ -1482,6 +1482,7 @@ fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
         "status.needs_human" => AutomationTrigger::StatusNeedsHuman,
         "status.needs_testing" => AutomationTrigger::StatusNeedsTesting,
         "status.ready" => AutomationTrigger::StatusReady,
+        "status.verified" => AutomationTrigger::StatusVerified,
         "status.verification_due" => AutomationTrigger::StatusVerificationDue,
         "status.verification_overdue" => AutomationTrigger::StatusVerificationOverdue,
         "branch.advanced" => AutomationTrigger::BranchAdvanced,
@@ -1501,6 +1502,7 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::StatusNeedsHuman => "status.needs_human",
         AutomationTrigger::StatusNeedsTesting => "status.needs_testing",
         AutomationTrigger::StatusReady => "status.ready",
+        AutomationTrigger::StatusVerified => "status.verified",
         AutomationTrigger::StatusVerificationDue => "status.verification_due",
         AutomationTrigger::StatusVerificationOverdue => "status.verification_overdue",
         AutomationTrigger::BranchAdvanced => "branch.advanced",
@@ -1513,6 +1515,7 @@ fn default_settle(on: AutomationTrigger) -> f64 {
         | AutomationTrigger::StatusNeedsHuman
         | AutomationTrigger::StatusNeedsTesting
         | AutomationTrigger::StatusReady
+        | AutomationTrigger::StatusVerified
         | AutomationTrigger::StatusVerificationOverdue
         | AutomationTrigger::McpEvent => 0.0,
         // Deploys lag merges; a run that starts once the deploy has likely

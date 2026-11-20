@@ -362,6 +362,8 @@ pub enum AutomationTrigger {
     StatusNeedsTesting,
     #[serde(rename = "status.ready")]
     StatusReady,
+    #[serde(rename = "status.verified")]
+    StatusVerified,
     #[serde(rename = "status.verification_due")]
     StatusVerificationDue,
     #[serde(rename = "status.verification_overdue")]
