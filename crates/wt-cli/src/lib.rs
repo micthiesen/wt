@@ -199,7 +199,7 @@ enum Command {
     #[command(name = "_destroy", hide = true)]
     Destroy(wt_ops::commands::_destroy::DestroyWorkerArgs),
     /// Create a worktree from an issue, branch or slug.
-    New(wt_ops::commands::new::NewArgs),
+    New(commands::new::NewCommandArgs),
     /// Keep a worktree whose PR landed and start its next PR on a fresh branch.
     Next(commands::next::NextArgs),
     /// Remove a worktree after checking for work that would be lost.
@@ -554,7 +554,7 @@ async fn dispatch_command(
         Command::Hold(args) => wt_ops::commands::hold::run(context, args).await,
         Command::Automations(args) => commands::automations::run(context, args).await,
         Command::Destroy(args) => wt_ops::commands::_destroy::run_worker(context, args).await,
-        Command::New(args) => wt_ops::commands::new::run(context, args).await,
+        Command::New(args) => commands::new::run(context, args).await,
         Command::Next(args) => commands::next::run(context, args).await,
         Command::Remove(args) => wt_ops::commands::remove::run(context, args).await,
         Command::Cleanup(args) => commands::cleanup::run(context, args).await,

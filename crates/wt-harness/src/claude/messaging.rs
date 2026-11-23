@@ -171,12 +171,9 @@ impl ClaudeMessenger {
                     .is_some_and(|s| s.status == RegistryStatus::Idle);
                 match outcome {
                     ClaudeInjectOutcome::Submitted { .. } => {
-                        let delivered = if is_harness_command(&text) {
-                            None
-                        } else {
-                            self.confirm(target, &text, since_ms, idle_at_submit, cancel)
-                                .await
-                        };
+                        let delivered = self
+                            .confirm(target, &text, since_ms, idle_at_submit, cancel)
+                            .await;
                         return Ok(ClaudeMessageOutcome::Sent {
                             transport: ClaudeMessageTransport::Inspector,
                             cold_started,
@@ -440,12 +437,9 @@ impl ClaudeMessenger {
                 });
             }
         }
-        let delivered = if is_harness_command(text) {
-            None
-        } else {
-            self.confirm(target, text, since_ms, idle_at_submit, cancel)
-                .await
-        };
+        let delivered = self
+            .confirm(target, text, since_ms, idle_at_submit, cancel)
+            .await;
         Ok(TerminalOutcome::Sent { delivered, resent })
     }
 
@@ -493,7 +487,13 @@ impl ClaudeMessenger {
                 return Some(true);
             }
             if tokio::time::Instant::now() >= deadline {
-                return if idle { Some(false) } else { None };
+                // Not every command leaves a transcript record, so a missing
+                // one proves nothing.
+                return if idle && !is_harness_command(text) {
+                    Some(false)
+                } else {
+                    None
+                };
             }
             tokio::select! { biased; _ = cancel.cancelled() => return None, _ = tokio::time::sleep(CONFIRM_POLL) => {} }
         }
@@ -568,6 +568,12 @@ fn transcript_has_prompt(
     if needle.is_empty() {
         return false;
     }
+    // Claude records a slash command as a tagged user turn, not as its text.
+    let command = text
+        .split_whitespace()
+        .next()
+        .filter(|token| token.starts_with('/') && is_harness_command(text))
+        .map(|token| format!("<command-name>{token}</command-name>"));
     body.lines()
         .skip(usize::from(start > 0))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -580,8 +586,13 @@ fn transcript_has_prompt(
             {
                 return false;
             }
-            received_prompt(&entry)
-                .is_some_and(|found| normalize_for_match(&found).contains(&needle))
+            received_prompt(&entry).is_some_and(|found| {
+                let found = normalize_for_match(&found);
+                found.contains(&needle)
+                    || command
+                        .as_ref()
+                        .is_some_and(|command| found.contains(command))
+            })
         })
 }
 
@@ -715,6 +726,34 @@ mod tests {
             None,
             "[a] removed note",
             since
+        ));
+    }
+
+    #[test]
+    fn a_slash_command_is_confirmed_by_its_tagged_user_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = super::super::ClaudePaths::new(home.path(), home.path().join("cache"));
+        let target = ClaudeSessionTarget {
+            slug: "task".into(),
+            cwd: home.path().join("repo"),
+            managed_name: Some("task".into()),
+        };
+        let since = parse_timestamp_ms("2026-11-23T17:10:00.000Z").unwrap();
+        transcript(
+            home.path(),
+            &target,
+            &[
+                serde_json::json!({"type": "user", "timestamp": "2026-11-23T17:10:11.903Z",
+                "message": {"role": "user", "content":
+                    "<command-message>start</command-message>\n<command-name>/start</command-name>"}}),
+            ],
+        );
+
+        assert!(transcript_has_prompt(
+            &paths, &target, None, "/start", since
+        ));
+        assert!(!transcript_has_prompt(
+            &paths, &target, None, "/babysit", since
         ));
     }
 

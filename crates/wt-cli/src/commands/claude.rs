@@ -217,27 +217,113 @@ async fn selftest(
         );
         return Ok(if wanted.is_some() { 1 } else { 0 });
     }
-    let mut failures = 0;
+    let total = entries.len();
+    let (mut broken, mut uninspectable) = (0, 0);
     for (_, tmux_name) in entries {
-        match app.claude_selftest(tmux_name, context).await {
-            ClaudeSelftestOutcome::Ready {
-                found_input,
-                found_caret,
-            } => println!(
-                "✓ {tmux_name} prompt + input{}",
-                if found_caret {
-                    " + caret"
-                } else if found_input {
-                    " (no caret restore)"
-                } else {
-                    ""
-                }
-            ),
-            ClaudeSelftestOutcome::Failed { kind, reason } => {
-                failures += 1;
-                println!("✗ {tmux_name} {kind:?}: {reason}");
+        let (verdict, line) = selftest_line(&app.claude_selftest(tmux_name, context).await);
+        match verdict {
+            SelftestVerdict::Reachable => println!("✓ {tmux_name}: {line}"),
+            SelftestVerdict::Uninspectable => {
+                uninspectable += 1;
+                println!("– {tmux_name}: {line}");
+            }
+            SelftestVerdict::Broken => {
+                broken += 1;
+                println!("✗ {tmux_name}: {line}");
             }
         }
     }
-    Ok(i32::from(failures > 0))
+    if broken + uninspectable > 0 {
+        println!(
+            "{} of {total} session(s) take messages by terminal typing instead of prompt delivery; messages still arrive, but a half-typed draft in that session can be disturbed",
+            broken + uninspectable
+        );
+    }
+    // A session wt cannot inspect is not a fault unless it is the one asked about.
+    Ok(i32::from(
+        broken > 0 || (wanted.is_some() && uninspectable > 0),
+    ))
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SelftestVerdict {
+    Reachable,
+    Uninspectable,
+    Broken,
+}
+
+/// One line per session saying what prompt delivery can do there and, when it
+/// cannot, the single action that restores it.
+fn selftest_line(outcome: &ClaudeSelftestOutcome) -> (SelftestVerdict, String) {
+    use wt_harness::ClaudeInjectFailureKind as Kind;
+    match outcome {
+        ClaudeSelftestOutcome::Ready {
+            found_input,
+            found_caret,
+        } => (
+            SelftestVerdict::Reachable,
+            match (found_input, found_caret) {
+                (true, true) => "prompt delivery works; a typed draft and its caret are kept".into(),
+                (true, false) => {
+                    "prompt delivery works; a typed draft is kept but its caret moves".into()
+                }
+                (false, _) => {
+                    "prompt delivery works, but a typed draft is lost when a message arrives"
+                        .into()
+                }
+            },
+        ),
+        ClaudeSelftestOutcome::Failed { kind, reason } => match kind {
+            Kind::Absent => (
+                SelftestVerdict::Uninspectable,
+                "no inspector socket; start the session from wt (without WT_INSPECT=off) to get prompt delivery".into(),
+            ),
+            Kind::Stale => (
+                SelftestVerdict::Uninspectable,
+                format!("its inspector socket is dead; restart the session from wt ({reason})"),
+            ),
+            Kind::NotReady => (
+                SelftestVerdict::Broken,
+                format!(
+                    "wt cannot find the prompt in this Claude Code version ({reason}); update wt, or report it if wt is current"
+                ),
+            ),
+            Kind::Blocked | Kind::SubmittedUnknown | Kind::Failed => (
+                SelftestVerdict::Broken,
+                format!("the inspector call failed ({reason}); rerun, then restart the session from wt if it repeats"),
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wt_harness::ClaudeInjectFailureKind as Kind;
+
+    #[test]
+    fn selftest_separates_sessions_it_cannot_inspect_from_broken_delivery() {
+        let failed = |kind| ClaudeSelftestOutcome::Failed {
+            kind,
+            reason: "why".into(),
+        };
+        assert_eq!(
+            selftest_line(&failed(Kind::Absent)).0,
+            SelftestVerdict::Uninspectable
+        );
+        assert_eq!(
+            selftest_line(&failed(Kind::Stale)).0,
+            SelftestVerdict::Uninspectable
+        );
+        let (verdict, line) = selftest_line(&failed(Kind::NotReady));
+        assert_eq!(verdict, SelftestVerdict::Broken);
+        assert!(line.contains("update wt"));
+        // Delivery submits without the input fiber; only the draft is at risk.
+        let (verdict, line) = selftest_line(&ClaudeSelftestOutcome::Ready {
+            found_input: false,
+            found_caret: false,
+        });
+        assert_eq!(verdict, SelftestVerdict::Reachable);
+        assert!(line.contains("draft is lost"));
+    }
 }

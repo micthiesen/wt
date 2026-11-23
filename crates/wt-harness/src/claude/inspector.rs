@@ -41,10 +41,20 @@ pub enum InspectorError {
     Remote { method: String, detail: String },
 }
 
+/// Listeners whose bound `this` leads to Claude's React root, tried in order.
+/// The terminal-resize listener belongs to the Ink instance on every build
+/// seen so far; the stdin reader was Claude's app component until Claude Code
+/// 2.1.330 moved it into a plain class with no React fiber.
+const APP_ANCHORS: [&str; 2] = [
+    "process.stdout.listeners('resize')[0]",
+    "process.stdin.listeners('readable')[0]",
+];
+
 pub struct InspectorClient {
     socket: WebSocketStream<UnixStream>,
     next_id: u64,
     call_timeout: Duration,
+    anchor: usize,
 }
 
 pub fn inspector_socket_path(cache_dir: &Path, tmux_name: &str) -> PathBuf {
@@ -82,6 +92,7 @@ impl InspectorClient {
             socket,
             next_id: 1,
             call_timeout: Duration::from_secs(12),
+            anchor: 0,
         })
     }
 
@@ -134,8 +145,14 @@ impl InspectorClient {
         Ok(response)
     }
 
-    /// Return the Inspector objectId for Claude's Ink root App, using the
-    /// stable bound-this relationship from its stdin readable listener.
+    /// Switch to the next anchor after the current one led nowhere. A probe
+    /// that then succeeds leaves the working anchor selected for the submit.
+    pub fn try_next_anchor(&mut self) {
+        self.anchor = (self.anchor + 1) % APP_ANCHORS.len();
+    }
+
+    /// Return the Inspector objectId of the object that owns Claude's React
+    /// root, using the bound-this relationship of the selected anchor listener.
     pub async fn app_instance_object_id(
         &mut self,
         cancellation: &CancellationToken,
@@ -144,7 +161,7 @@ impl InspectorClient {
             .call(
                 "Runtime.evaluate",
                 json!({
-                    "expression": "process.stdin.listeners('readable')[0]",
+                    "expression": APP_ANCHORS[self.anchor],
                     "objectGroup": "wt-inject"
                 }),
                 cancellation,
@@ -155,7 +172,7 @@ impl InspectorClient {
             .and_then(Value::as_str)
             .ok_or_else(|| InspectorError::Remote {
                 method: "Runtime.evaluate".into(),
-                detail: "no stdin readable listener".into(),
+                detail: "anchor listener not found".into(),
             })?;
         let props = self
             .call(
@@ -183,7 +200,7 @@ impl InspectorClient {
             .map(str::to_owned)
             .ok_or_else(|| InspectorError::Remote {
                 method: "Runtime.getProperties".into(),
-                detail: "stdin listener is not a bound method".into(),
+                detail: "anchor listener is not a bound method".into(),
             })
     }
 

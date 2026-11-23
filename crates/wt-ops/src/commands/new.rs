@@ -12,7 +12,7 @@ use wt_tui::CreationTitle;
 use crate::commands::resolve::run_git;
 use wt_app_core::context::AppContext;
 
-const USAGE: &str = "usage: wt new <id [title…]|url|branch|slug> [--slug s] [--gh n] [--attach] [--any] [--base ref] [--open|--no-open] [--no-install]";
+const USAGE: &str = "usage: wt new <id [title…]|url|branch|slug> [--slug s] [--gh n] [--attach] [--any] [--base ref] [--open|--no-open] [--no-install] [--section name] [--brief file|-] [-m note] [--start]";
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct NewArgs {
@@ -46,18 +46,31 @@ pub struct NewArgs {
     pub no_install: bool,
 }
 
+/// A worktree this invocation created (not one that already existed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Created {
+    pub slug: String,
+    pub path: String,
+}
+
 pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
+    Ok(run_created(ctx, args).await?.0)
+}
+
+/// `run`, also naming the worktree when this call created it, so a caller can
+/// keep acting on it.
+pub async fn run_created(ctx: &AppContext, args: &NewArgs) -> Result<(i32, Option<Created>)> {
     if args.positionals.is_empty() {
         eprintln!("{USAGE}");
-        return Ok(2);
+        return Ok((2, None));
     }
     if args.any && !args.attach {
         eprintln!("--any only applies with --attach");
-        return Ok(2);
+        return Ok((2, None));
     }
     if args.gh == Some(0) {
         eprintln!("--gh requires a positive issue number");
-        return Ok(2);
+        return Ok((2, None));
     }
     let raw = args.positionals.join(" ").trim().to_owned();
     let Parsed { branch, title } = match parse_branch(ctx, &raw, args, true).await {
@@ -65,7 +78,7 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
         Err(message) => {
             log_failure(&raw, &message);
             eprintln!("{message}");
-            return Ok(1);
+            return Ok((1, None));
         }
     };
     let rows = ctx.repository.inventory(&ctx.cancellation).await?;
@@ -84,7 +97,7 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
         if should_open(args) {
             open_editor(ctx, Path::new(&existing.target.path)).await?;
         }
-        return Ok(0);
+        return Ok((0, None));
     }
     let service = LifecycleService::new(
         ServiceConfig::from_config(&ctx.config),
@@ -108,7 +121,7 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
         Err(error) => {
             log_failure(&branch, &error.to_string());
             eprintln!("{error}");
-            return Ok(1);
+            return Ok((1, None));
         }
     };
     if let Some(number) = args.gh {
@@ -138,7 +151,13 @@ pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
     if should_open(args) {
         open_editor(ctx, Path::new(&created.target.path)).await?;
     }
-    Ok(0)
+    Ok((
+        0,
+        Some(Created {
+            slug: created.target.slug().to_owned(),
+            path: created.target.path.to_string(),
+        }),
+    ))
 }
 
 /// CLI creations (often run by agents) otherwise report failures only on

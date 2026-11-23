@@ -1,5 +1,7 @@
 function(msg, probeOnly){
-    let root = this._reactInternals || this._reactInternalFiber;
+    // Either Claude's Ink app component or, since Claude 2.1.330 moved the stdin
+    // reader out of React, the Ink instance that owns the fiber root.
+    let root = this._reactInternals || this._reactInternalFiber || (this.container && this.container.current);
     if (!root) return JSON.stringify({ok:false, err:"no react root on app instance"});
     while (root.return) root = root.return;
     // 1) the prompt fiber: onSubmit + a prompt-only semantic prop set. Claude 2.1.260

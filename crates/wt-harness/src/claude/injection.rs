@@ -199,18 +199,12 @@ impl ClaudeInjector {
         }
         match self.run_routine(&mut client, "", true, cancellation).await {
             Ok(PageResult::Probe {
-                found_input: true,
+                found_input,
                 found_caret,
             }) => ClaudeSelftestOutcome::Ready {
-                found_input: true,
+                found_input,
                 found_caret,
             },
-            Ok(PageResult::Probe {
-                found_input: false, ..
-            }) => selftest_failed(
-                ClaudeInjectFailureKind::NotReady,
-                "prompt input not found (draft would be clobbered)",
-            ),
             Ok(PageResult::Failed(reason)) => selftest_failed(
                 if is_locate_failure(&reason) {
                     ClaudeInjectFailureKind::NotReady
@@ -240,6 +234,9 @@ impl ClaudeInjector {
                 Ok(id) => id,
                 Err(error) if is_locate_failure(&error.to_string()) => {
                     last = error.to_string();
+                    if probe {
+                        client.try_next_anchor();
+                    }
                     if attempt + 1 < self.locate_retries.max(1) {
                         tokio::select! { biased; _ = cancellation.cancelled() => return Err(InspectorError::Cancelled { method: "locate".into() }), _ = tokio::time::sleep(LOCATE_RETRY_GAP) => {} }
                         continue;
@@ -274,8 +271,15 @@ impl ClaudeInjector {
                 PageResult::Failed(reason)
                     if is_locate_failure(&reason) && attempt + 1 < self.locate_retries.max(1) =>
                 {
+                    if probe && is_anchor_failure(&reason) {
+                        client.try_next_anchor();
+                    }
                     last = reason;
                     tokio::select! { biased; _ = cancellation.cancelled() => return Err(InspectorError::Cancelled { method: "locate".into() }), _ = tokio::time::sleep(LOCATE_RETRY_GAP) => {} }
+                }
+                PageResult::Failed(reason) if probe && is_anchor_failure(&reason) => {
+                    client.try_next_anchor();
+                    return Ok(PageResult::Failed(reason));
                 }
                 other => return Ok(other),
             }
@@ -313,6 +317,12 @@ fn is_locate_failure(reason: &str) -> bool {
     ["not found", "listener", "bound method", "no react root"]
         .iter()
         .any(|needle| lower.contains(needle))
+}
+
+/// Whether the anchor itself led nowhere (as opposed to a prompt that has not
+/// mounted yet), so another anchor is worth trying.
+fn is_anchor_failure(reason: &str) -> bool {
+    reason.to_ascii_lowercase().contains("no react root")
 }
 
 fn inspector_exception(value: &Value) -> Option<String> {
@@ -385,6 +395,81 @@ mod tests {
         assert!(!is_locate_failure(
             "onSubmit threw: no stdin readable listener"
         ));
+    }
+
+    #[tokio::test]
+    async fn a_rootless_anchor_falls_back_and_the_submit_uses_the_one_that_probed() {
+        let tmp = tempdir().unwrap();
+        let socket = tmp.path().join("insp/demo.sock");
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let mut anchor = String::new();
+            let mut submitted_on = None;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                let params = &request["params"];
+                let result = match request["method"].as_str().unwrap() {
+                    "Runtime.evaluate" => {
+                        anchor = if params["expression"].as_str().unwrap().contains("stdout") {
+                            "first".into()
+                        } else {
+                            "second".into()
+                        };
+                        json!({"result":{"objectId":"listener"}})
+                    }
+                    "Runtime.getProperties" => {
+                        json!({"internalProperties":[{"name":"boundThis","value":{"objectId":anchor}}]})
+                    }
+                    "Runtime.callFunctionOn" => {
+                        let target = params["objectId"].as_str().unwrap();
+                        let probe = params["arguments"][1]["value"] == true;
+                        let value = if target == "first" {
+                            r#"{"ok":false,"err":"no react root on app instance"}"#
+                        } else if probe {
+                            r#"{"ok":true,"foundPrompt":true,"foundInput":true,"foundCaret":true}"#
+                        } else {
+                            submitted_on = Some(target.to_owned());
+                            r#"{"ok":true,"submitted":true,"draftLen":0}"#
+                        };
+                        json!({"result":{"value":value}})
+                    }
+                    _ => json!({}),
+                };
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
+            submitted_on
+        });
+        let injector = ClaudeInjector::new(tmp.path()).with_timings(
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            2,
+        );
+        let cancel = CancellationToken::new();
+        let outcome = injector
+            .deliver(
+                "demo",
+                "do one thing",
+                Duration::from_secs(1),
+                &cancel,
+                || None,
+            )
+            .await;
+        assert_eq!(
+            outcome,
+            ClaudeInjectOutcome::Submitted {
+                draft_preserved: false
+            }
+        );
+        assert_eq!(server.await.unwrap().as_deref(), Some("second"));
     }
 
     #[tokio::test]

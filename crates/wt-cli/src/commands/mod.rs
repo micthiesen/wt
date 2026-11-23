@@ -16,6 +16,7 @@ pub mod init;
 pub mod install;
 pub mod list;
 pub mod merge;
+pub mod new;
 pub mod next;
 pub mod open;
 pub mod remote;

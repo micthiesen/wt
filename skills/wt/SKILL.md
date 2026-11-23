@@ -21,6 +21,7 @@ flag. Invoke `wt` by name so session shims apply.
 wt ls [--json]                         # rows with PR, status, issue links
 wt new <ID> [title words…] [--base <branch>] [--gh <n>]
 wt new <ID> --attach                   # check out the id's existing branch
+wt new <ID> --slug <s> --brief <file> --section <name> -m <note> --start   # launch a task in one step
 wt agent start <slug>                  # start a worktree's agent with the start skill
 wt agent send <slug|main|wt> <text…>   # the manager: `wt manager send`
 wt section mv <slug>… <section>        # section is LAST; `-` is the inbox

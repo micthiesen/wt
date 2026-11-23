@@ -418,8 +418,14 @@ fn print_delivery(
             fallback,
         }) => {
             println!(
-                "sent to {} via Claude {:?} (cold_started={cold_started}, delivered={delivered:?}, resent={resent})",
-                route.target.slug, transport
+                "{}",
+                claude_sent_line(
+                    &route.target.slug,
+                    transport,
+                    cold_started,
+                    delivered,
+                    resent
+                )
             );
             if let Some((level, advice)) = claude_fallback_advice(
                 &context.config.paths.cache_root,
@@ -511,6 +517,39 @@ fn print_delivery(
     }
 }
 
+fn claude_sent_line(
+    slug: &str,
+    transport: wt_harness::ClaudeMessageTransport,
+    cold_started: bool,
+    delivered: Option<bool>,
+    resent: bool,
+) -> String {
+    let transport = match transport {
+        wt_harness::ClaudeMessageTransport::Inspector => "its prompt",
+        wt_harness::ClaudeMessageTransport::Terminal => "its terminal",
+    };
+    let receipt = match delivered {
+        Some(true) => "delivered: confirmed in its transcript",
+        Some(false) => {
+            "not confirmed: the idle session recorded nothing within 8s; check it before resending"
+        }
+        None => "submitted: the session has not recorded it yet",
+    };
+    let mut notes = Vec::new();
+    if cold_started {
+        notes.push("started the session");
+    }
+    if resent {
+        notes.push("pasted twice before the terminal showed it");
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    };
+    format!("sent to {slug} through {transport}{notes}; {receipt}")
+}
+
 fn claude_fallback_advice(
     cache_root: &std::path::Path,
     fallback: Option<ClaudeInjectFailureKind>,
@@ -529,7 +568,7 @@ fn claude_fallback_advice(
             return Some((
                 "warning",
                 format!(
-                    "stale {} harness shim(s) in {}; these can interfere with managed harness launches and may explain the missing Claude inspector socket. Remove them, start a new wt-managed session, then run `wt claude selftest`",
+                    "stale {} harness shim(s) in {}; these can interfere with managed harness launches and may explain the missing Claude inspector socket. Remove them and start a new wt-managed session",
                     stale.join(", "),
                     cache_root.join("shims").display()
                 ),
@@ -539,15 +578,15 @@ fn claude_fallback_advice(
     let (level, advice) = match kind {
         ClaudeInjectFailureKind::Absent => (
             "info",
-            "this Claude session has no inspector socket; start it from wt and run `wt claude selftest` if the problem persists".into(),
+            "this Claude session has no inspector socket, so the message was typed into its terminal; a session started from wt has one".into(),
         ),
         ClaudeInjectFailureKind::Stale => (
             "info",
-            "this session's inspector socket is stale; restart the session from wt, then run `wt claude selftest`".into(),
+            "this session's inspector socket is dead, so the message was typed into its terminal; restart the session from wt to restore prompt delivery".into(),
         ),
         ClaudeInjectFailureKind::NotReady => (
-            "warning",
-            "Claude's prompt was not reachable; run `wt claude selftest` to check whether its injector anchors changed".into(),
+            "info",
+            "wt could not find Claude's prompt through the inspector, so the message was typed into its terminal. If `wt claude selftest` reports this session broken, this Claude Code version needs a newer wt".into(),
         ),
         ClaudeInjectFailureKind::Blocked => (
             "info",
@@ -559,7 +598,7 @@ fn claude_fallback_advice(
         ),
         ClaudeInjectFailureKind::Failed => (
             "warning",
-            "inspector delivery failed; run `wt claude selftest` if this repeats".into(),
+            "the inspector call failed, so the message was typed into its terminal; restart the session from wt if this repeats".into(),
         ),
     };
     Some((level, advice))
@@ -601,6 +640,23 @@ mod tests {
     }
 
     #[test]
+    fn a_sent_line_states_the_receipt_in_words() {
+        use wt_harness::ClaudeMessageTransport::{Inspector, Terminal};
+        assert_eq!(
+            claude_sent_line("task", Inspector, false, Some(true), false),
+            "sent to task through its prompt; delivered: confirmed in its transcript"
+        );
+        let unconfirmed = claude_sent_line("task", Terminal, true, None, true);
+        assert!(
+            unconfirmed.starts_with(
+                "sent to task through its terminal (started the session, pasted twice"
+            )
+        );
+        assert!(unconfirmed.ends_with("submitted: the session has not recorded it yet"));
+        assert!(!unconfirmed.contains("None"));
+    }
+
+    #[test]
     fn fallback_advice_distinguishes_intentional_disable_and_stale_shims() {
         let cache = tempfile::tempdir().unwrap();
         let disabled =
@@ -617,7 +673,6 @@ mod tests {
                 .unwrap();
         assert_eq!(advice.0, "warning");
         assert!(advice.1.contains(&shim_dir.display().to_string()));
-        assert!(advice.1.contains("wt claude selftest"));
 
         let intentional =
             claude_fallback_advice(cache.path(), Some(ClaudeInjectFailureKind::Absent), true)

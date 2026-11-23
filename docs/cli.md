@@ -91,6 +91,15 @@ The input also sets the title (see [Worktree titles](tui.md#worktree-titles)): t
 - `--open` / `--no-open` — open in the configured editor after creation (default: open when interactive).
 - `--no-install` — skip the package-install step. Ignored under the `rift` backend, which copies packages via its clone.
 
+Launch options turn creation into a complete task launch. They apply only to a worktree this call created, in this order, so the agent starts last and finds everything in place:
+
+- `--brief <file|->` — write the file (or stdin) as the new worktree's `prompt.txt`. It is read before anything is created; a missing or empty brief creates nothing.
+- `--section <name>` — put the new worktree, and only it, in this section (created if new; `-` is the inbox).
+- `-m, --note <note>` — queue it as `todo` with this note.
+- `--start` — start its agent, as `wt agent start <slug>` does.
+
+If a step fails, the worktree stays, the command exits 1 and prints the commands that finish the launch. If the worktree already existed, nothing is applied and the command exits 1 rather than overwrite a brief or start a second turn. Launches of different worktrees are safe to run in parallel (each creation holds only its own slug's lock; the shared fetch is serialized), which is the way to start a wave: run one `wt new … --start` per task concurrently.
+
 If the branch already has a worktree, prints its path instead of erroring. A dirty main clone never blocks creation: the `rift` backend's CoW clone copies the main clone's uncommitted changes, and the post-clone branch switch discards them in the copy (`--discard-changes` — the main clone itself is never touched). Like `git worktree add --no-track`, the switch creates the branch with no upstream, so a first `git push` cannot target the trunk. Any create failure surfaces its reason on the CLI and the TUI attention feed instead of a row silently vanishing.
 
 Creation also sets `branch.<name>.gh-merge-base` to the branch's real merge target (its fork base; the trunk for plain worktrees, the parent for stacked ones). `gh pr create` consults that config **before** the repository's default branch, so a bare `gh pr create` opens against the right base even in repos whose GitHub default branch isn't the integration branch — without it, agents were opening PRs against the default (the harness's own context hints them there), burning CI and review passes on a 100-file diff of other people's code. `wt doctor` checks the config against the recorded base to catch worktrees created before this or left stale by a reparent.
@@ -643,7 +652,7 @@ Claude.
 |---|---|
 | `send <target> [text...]` | deprecated alias for `wt agent send`; resolves the target's active harness and does not force Claude |
 | `ls [--json]` | list slugs with a live Claude tmux session. `--json` adds `session_id`, `pid`, `cwd`, `socket_path`, `transport`, `tmux_session`, `status`, `waiting_for`, `busy`, and `last_activity` |
-| `selftest [<slug>]` | check that prompt injection still works against live sessions (one line each; nonzero if any fails). This is what tells you a Claude Code update moved the injector's structural anchors; `wt doctor` only points you at it when it finds stale harness shims |
+| `selftest [<slug>]` | check prompt delivery against live sessions with the same probe a send runs first, one line each: `✓` delivery works (and whether a typed draft survives), `–` wt cannot inspect the session (no socket, or a dead one; the line says how to restore it), `✗` delivery is broken, which is what a Claude Code update that moved the injector's anchors looks like. Messages to `–` and `✗` sessions still arrive by terminal typing. Exits nonzero only for `✗`, or for `–` on a session you named |
 | `stop <slug>` | stop the target Claude session without typing into its pane (`kill` remains an alias) |
 
 ---

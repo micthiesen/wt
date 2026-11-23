@@ -70,15 +70,18 @@ worktrees, stacking) and get an explicit go.
    several sessions or worktrees will coordinate on, and design-worthy tasks.
    Small self-contained fixes need none. Reference each as `GH: #N` in the
    brief and record it with `wt issue <slug> --gh <n>`.
-4. **Write `prompt.txt`** in each new worktree's root (never for your own
-   session), never committed. If an issue holds the spec, the brief just
-   points to it. Otherwise it carries what `/start` would have to
-   rediscover: the pasted task text, bundled parts and order, `GH: #N`
-   references, code to reuse, "verify the current state first" warnings,
-   overlaps and in-flight dependencies. End it with:
+4. **Write each brief** to a scratch file (never for your own session). If
+   an issue holds the spec, the brief just points to it. Otherwise it carries
+   what `/start` would have to rediscover: the pasted task text, bundled
+   parts and order, `GH: #N` references, code to reuse, "verify the current
+   state first" warnings, overlaps and in-flight dependencies. End it with:
    `(You can delete this prompt.txt after reading it.)`
-   Then seed the row: `wt status <slug> todo -m "<one-line goal>"`.
-5. **Start every worktree** with `wt agent start <slug>`, without asking.
+5. **Launch every worktree** without asking, by adding the launch options to
+   the step 2 command: `--brief <file> --section "<wave name>" -m "<one-line
+   goal>" --start`. That installs the brief as `prompt.txt`, files the row,
+   seeds it `todo` and starts its agent. Run the batch's commands
+   concurrently; they do not conflict. If one prints commands that finish its
+   launch, run them.
 6. **Report** a table (tasks, branch, path), which worktrees are independent
    or stacked, and that the sessions were started.
 
