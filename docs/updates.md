@@ -27,6 +27,12 @@ started them. A long-lived session, such as the manager, keeps calling that
 older wt until it is restarted. To reach the new version from such a session,
 call the stable launcher by its path (`~/.local/bin/wt`).
 
+A pinned wt that is no longer the installed build says so on stderr, naming
+the installed release and the launcher path, at most once an hour per tmux
+pane. The board, wt's hidden worker commands and `--json` invocations stay
+silent, so no machine-read output gains a line. Only builds that carry the
+notice print it: a session started by v0.1.69 or older stays quiet.
+
 `wt install` installs a verified release and can create the `~/.local/bin/wt`
 launcher link. `scripts/install.sh` is the bootstrap installer for machines
 without an existing wt executable. `wt rollback [<release-or-sha>]` activates a

@@ -5,6 +5,7 @@
 //! rebuilds only that shim (docs/ci.md).
 
 mod commands;
+mod stale_build;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -268,6 +269,11 @@ pub fn main(info: BuildInfo) {
         );
         return;
     }
+    stale_build::warn(
+        &std::env::args_os().collect::<Vec<_>>(),
+        wt_app_core::build_info::version(),
+        wt_app_core::build_info::build_id(),
+    );
     // Recovery and informational commands never load repository configuration.
     if matches!(cli.command, Some(Command::Version)) {
         println!("wt {}", wt_app_core::build_info::native_version());
