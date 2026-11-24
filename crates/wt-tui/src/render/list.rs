@@ -180,7 +180,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
         if model.reviews_folded {
             let item = positions.get(&VisualItem::ReviewHeader).copied();
             bottom.push(folded_header(
-                "Review Requests",
+                "Review requests",
                 board.review_requests.len(),
                 &FoldSummary::default(),
                 item == model.selected && item.is_some(),
@@ -188,7 +188,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
                 item,
             ));
         } else {
-            bottom.push(divider("Review Requests", width));
+            bottom.push(divider("Review requests", width));
             for (index, review) in board.review_requests.iter().enumerate() {
                 let item = positions.get(&VisualItem::ReviewRequest(index)).copied();
                 bottom.push(review_row(
@@ -342,11 +342,11 @@ impl RowContext<'_> {
         ));
         if remote {
             spans.push(Span::styled(
-                format!("{} ", glyphs::REMOTE),
+                format!("{} ", badges::REMOTE_HOST.glyph),
                 style(if row.archived {
                     theme::FG_DIM
                 } else {
-                    theme::REMOTE
+                    badges::REMOTE_HOST.color
                 }),
             ));
         }
@@ -417,20 +417,38 @@ fn blank() -> ListLine {
     }
 }
 
-/// `── Label ──────`: a quiet rule with a dim label.
-fn divider(label: &str, width: usize) -> ListLine {
+/// `── Label ──────`: a quiet rule with a dim label, or under the cursor
+/// the selection fill with a bright bold label.
+fn rule(label: &str, width: usize, selected: bool) -> Line<'static> {
     // One cell of right margin past the leading space, like the TS rule,
     // which stops short of the scrollbar gutter.
     let inner = width.saturating_sub(3);
     let label = truncate_end(&format!(" {label} "), inner.saturating_sub(4));
     let trail = inner.saturating_sub(2 + label.width());
+    let fill = |style: Style| {
+        if selected {
+            style.bg(theme::SELECTED_BG)
+        } else {
+            style
+        }
+    };
+    let dashes = fill(theme::fg(theme::BORDER_DIM));
+    let label_style = if selected {
+        theme::bold(theme::FG_BRIGHT)
+    } else {
+        theme::dim()
+    };
+    Line::from(vec![
+        Span::styled(" ", fill(Style::new())),
+        Span::styled("──", dashes),
+        Span::styled(label, fill(label_style)),
+        Span::styled("─".repeat(trail), dashes),
+    ])
+}
+
+fn divider(label: &str, width: usize) -> ListLine {
     ListLine {
-        line: Line::from(vec![
-            Span::raw(" "),
-            Span::styled("──", theme::fg(theme::BORDER_DIM)),
-            Span::styled(label, theme::dim()),
-            Span::styled("─".repeat(trail), theme::fg(theme::BORDER_DIM)),
-        ]),
+        line: rule(label, width, false),
         item: None,
     }
 }
@@ -438,22 +456,10 @@ fn divider(label: &str, width: usize) -> ListLine {
 /// A named section with no rows: its rule alone, which is also its one
 /// cursor stop, so it can be renamed, deleted, moved, or filled.
 fn empty_section(label: &str, selected: bool, width: usize, item: Option<usize>) -> ListLine {
-    let mut line = divider(label, width);
-    line.item = item;
-    if selected {
-        for (index, span) in line.line.spans.iter_mut().enumerate() {
-            span.style = span.style.bg(theme::SELECTED_BG);
-            // The label is the third span of a rule.
-            if index == 2 {
-                span.style = span
-                    .style
-                    .fg(theme::FG_BRIGHT)
-                    .remove_modifier(Modifier::DIM)
-                    .add_modifier(Modifier::BOLD);
-            }
-        }
+    ListLine {
+        line: rule(label, width, selected),
+        item,
     }
-    line
 }
 
 /// A folded group collapsed to one stop: a `[×NN]` count chip, the label,
@@ -619,6 +625,25 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(text(&lines[0]).contains("── Later ─"));
         assert_eq!(lines[0].item, Some(0));
+        assert!(
+            lines[0]
+                .line
+                .spans
+                .iter()
+                .all(|span| span.style.bg.is_none())
+        );
+        let selected = empty_section("Later", true, 60, Some(0));
+        assert_eq!(text(&selected), text(&lines[0]));
+        for span in &selected.line.spans {
+            assert_eq!(span.style.bg, Some(theme::SELECTED_BG), "{span:?}");
+            let label = span.content.contains("Later");
+            assert_eq!(
+                span.style.fg == Some(theme::FG_BRIGHT)
+                    && span.style.add_modifier.contains(Modifier::BOLD),
+                label,
+                "{span:?}"
+            );
+        }
         // A derived group without rows (the Inbox) is not drawn.
         let inbox = BoardSection {
             key: "\0inbox".into(),
@@ -885,7 +910,7 @@ mod tests {
         assert!(position("Active task") < position("Running task"));
         assert!(position("Running task") < position("Failed task"));
         assert!(position("Failed task") < position("Archived"));
-        assert!(!text[position("Failed task")].contains("Removal failed"));
+        assert!(!text[position("Failed task")].contains("removal failed"));
         assert!(text[position("Failed task")].contains(crate::glyphs::CONFLICT));
         assert!(text[position("Running task")].contains(crate::glyphs::TRASH));
         let cursor_items: Vec<_> = lines.iter().filter_map(|line| line.item).collect();

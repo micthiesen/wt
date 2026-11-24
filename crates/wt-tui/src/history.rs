@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Margin, Rect},
     style::{Color, Modifier},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 use unicode_width::UnicodeWidthStr;
 use wt_core::WorkState;
@@ -15,7 +15,10 @@ use crate::{
     LandingKind,
     badges::{self, Badge},
     glyphs,
-    render::text::truncate_end,
+    render::{
+        details::wrap_spans,
+        text::{truncate_end, wrap},
+    },
     theme,
 };
 
@@ -190,11 +193,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
         crate::render::status::HISTORY,
         model,
     );
-    let inner = block.inner(details);
+    let inner = block.inner(details).inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
     frame.render_widget(block, details);
     let lines = rows
         .get(model.history.selected)
-        .map(record_lines)
+        .map(|row| record_lines(row, inner.width as usize))
         .unwrap_or_else(|| {
             vec![
                 Line::default(),
@@ -207,13 +213,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
             ]
         });
     frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((model.history.scroll, 0)),
-        inner.inner(Margin {
-            horizontal: 1,
-            vertical: 0,
-        }),
+        Paragraph::new(lines).scroll((model.history.scroll, 0)),
+        inner,
     );
 }
 
@@ -295,28 +296,6 @@ fn pr_badge(row: &crate::RemovedHistoryRow) -> Option<Badge> {
     }
 }
 
-fn issue_badge(status: &str) -> Badge {
-    let status = status.to_ascii_lowercase();
-    let badge = |glyph, color| Badge { glyph, color };
-    if ["done", "complete", "closed", "merged", "released"]
-        .iter()
-        .any(|word| status.contains(word))
-    {
-        badge(glyphs::TASK_COMPLETE, theme::OK)
-    } else if ["cancel", "duplicate", "won't", "wont"]
-        .iter()
-        .any(|word| status.contains(word))
-    {
-        badge(glyphs::TASK_CANCELLED, theme::FG_DIM)
-    } else if status.contains("review") {
-        badge(glyphs::HALF_CIRCLE, theme::INFO)
-    } else if status.contains("progress") || status.contains("started") {
-        badge(glyphs::DOT_CIRCLE, theme::ACCENT)
-    } else {
-        badge(glyphs::DOT_OUTLINE, theme::FG_DIM)
-    }
-}
-
 fn visible_row_count(
     rows: &[crate::RemovedHistoryRow],
     offset: usize,
@@ -349,7 +328,7 @@ fn history_row(row: &crate::RemovedHistoryRow, selected: bool, width: usize) -> 
     if row.automations_paused {
         right.push((format!("{} ", glyphs::PAUSE), theme::WARN));
     }
-    if let Some(issue) = row.issue_status.as_deref().map(issue_badge) {
+    if let Some(issue) = row.issue_status.as_deref().map(badges::issue_status_badge) {
         right.push((format!("{} ", issue.glyph), issue.color));
     }
     if let Some(pr) = pr_badge(row) {
@@ -371,8 +350,8 @@ fn history_row(row: &crate::RemovedHistoryRow, selected: bool, width: usize) -> 
     ];
     if remote {
         spans.push(Span::styled(
-            format!("{} ", glyphs::REMOTE),
-            style(theme::INFO),
+            format!("{} ", badges::REMOTE_HOST.glyph),
+            style(badges::REMOTE_HOST.color),
         ));
     }
     let mut title = style(if selected {
@@ -437,89 +416,122 @@ fn history_lines(
 /// The removal record: title, branch, when and where, then the captured
 /// `Label: value` facts as an aligned key column with the work state in
 /// its own color, free-form notes in mid gray, and the keys that apply.
-fn record_lines(row: &crate::RemovedHistoryRow) -> Vec<Line<'static>> {
+/// Every line is wrapped here, values inside their own column, so a long
+/// value never continues under the keys and reads as a new row.
+fn record_lines(row: &crate::RemovedHistoryRow, width: usize) -> Vec<Line<'static>> {
     const KEY: usize = 10;
-    let label = |text: &str| Span::styled(format!("{text:<KEY$}"), theme::dim());
+    const MARKER: usize = 3;
+    let value_width = width.saturating_sub(KEY).max(1);
+    let keyed = |name: &str, index: usize| {
+        Span::styled(
+            format!("{:<KEY$}", if index == 0 { name } else { "" }),
+            theme::dim(),
+        )
+    };
+    let field = |lines: &mut Vec<Line<'static>>, name: &str, value: &str, color: Color| {
+        for (index, text) in wrap(value, value_width).into_iter().enumerate() {
+            lines.push(Line::from(vec![
+                keyed(name, index),
+                Span::styled(text, theme::fg(color)),
+            ]));
+        }
+    };
+    let spans_field = |lines: &mut Vec<Line<'static>>, name: &str, value: Vec<Span<'static>>| {
+        for (index, mut line) in wrap_spans(value, value_width).into_iter().enumerate() {
+            line.spans.insert(0, keyed(name, index));
+            lines.push(line);
+        }
+    };
     let marker = status_badge(row);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{}  ", marker.glyph), theme::fg(marker.color)),
-            Span::styled(row.title.clone(), theme::bold(theme::FG_BRIGHT)),
-        ]),
-        Line::from(vec![
-            Span::raw("   "),
-            Span::styled(row.branch.clone(), theme::fg(theme::ACCENT_ALT)),
-        ]),
-        Line::default(),
-    ];
+    let mut lines = Vec::new();
+    for (index, text) in wrap(&row.title, width.saturating_sub(MARKER))
+        .into_iter()
+        .enumerate()
+    {
+        let lead = if index == 0 {
+            Span::styled(format!("{}  ", marker.glyph), theme::fg(marker.color))
+        } else {
+            Span::raw(" ".repeat(MARKER))
+        };
+        lines.push(Line::from(vec![
+            lead,
+            Span::styled(text, theme::bold(theme::FG_BRIGHT)),
+        ]));
+    }
+    for text in wrap(&row.branch, width.saturating_sub(MARKER)) {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(MARKER)),
+            Span::styled(text, theme::fg(theme::ACCENT_ALT)),
+        ]));
+    }
+    lines.push(Line::default());
     let when = row.day_label.as_deref().unwrap_or(&row.removed_at);
-    let mut removed = vec![
-        label("removed"),
-        Span::styled(when.to_owned(), theme::fg(theme::FG)),
-    ];
+    let mut removed = vec![Span::styled(when.to_owned(), theme::fg(theme::FG))];
     if let Some(age) = &row.age {
         removed.push(Span::styled(format!(" · {age} ago"), theme::dim()));
     }
-    lines.push(Line::from(removed));
+    spans_field(&mut lines, "removed", removed);
     if let Some(host) = &row.host {
-        lines.push(Line::from(vec![
-            label("host"),
-            Span::styled(format!("{} ", glyphs::REMOTE), theme::fg(theme::INFO)),
-            Span::styled(host.clone(), theme::fg(theme::FG)),
-        ]));
+        spans_field(
+            &mut lines,
+            "host",
+            vec![
+                Span::styled(
+                    format!("{} ", badges::REMOTE_HOST.glyph),
+                    theme::fg(badges::REMOTE_HOST.color),
+                ),
+                Span::styled(host.clone(), theme::fg(theme::FG)),
+            ],
+        );
     }
     if row.slug != row.title {
-        lines.push(Line::from(vec![
-            label("slug"),
-            Span::styled(row.slug.clone(), theme::fg(theme::FG)),
-        ]));
+        field(&mut lines, "slug", &row.slug, theme::FG);
     }
     if row.automations_paused {
-        lines.push(Line::from(vec![
-            label("automate"),
-            Span::styled(format!("{} paused", glyphs::PAUSE), theme::fg(theme::WARN)),
-        ]));
+        field(
+            &mut lines,
+            "automate",
+            &format!("{} paused", glyphs::PAUSE),
+            theme::WARN,
+        );
     }
     if let Some(state) = &row.work_state {
         let parsed = work_state(state);
-        lines.push(Line::from(vec![
-            label("work"),
-            Span::styled(
-                format!(
-                    "{}  {state}",
-                    parsed.map_or(glyphs::DOT_OUTLINE, badges::work_state_glyph)
-                ),
-                theme::fg(parsed.map_or(theme::FG, badges::work_state_color)),
+        field(
+            &mut lines,
+            "work",
+            &format!(
+                "{}  {state}",
+                parsed.map_or(glyphs::DOT_OUTLINE, badges::work_state_glyph)
             ),
-        ]));
+            parsed.map_or(theme::FG, badges::work_state_color),
+        );
     }
     if let Some(what) = &row.blocked_on {
-        lines.push(Line::from(vec![
-            label("blocked"),
-            Span::styled(what.clone(), theme::fg(theme::WARN)),
-        ]));
+        field(&mut lines, "blocked", what, theme::WARN);
     }
     if let Some(steps) = &row.verify_steps {
-        lines.push(Line::from(vec![
-            label("verify"),
-            if row.verify_owed {
-                Span::styled(format!("still owed: {steps}"), theme::fg(theme::WARN))
-            } else {
-                Span::styled(steps.clone(), theme::fg(theme::FG))
-            },
-        ]));
+        if row.verify_owed {
+            field(
+                &mut lines,
+                "verify",
+                &format!("still owed: {steps}"),
+                theme::WARN,
+            );
+        } else {
+            field(&mut lines, "verify", steps, theme::FG);
+        }
     }
     if let Some(landed) = row.landed_on {
-        lines.push(Line::from(vec![
-            label("landed"),
-            Span::styled(
-                match landed {
-                    crate::LandingKind::Production => "production",
-                    crate::LandingKind::Base => "base",
-                },
-                theme::fg(theme::OK),
-            ),
-        ]));
+        field(
+            &mut lines,
+            "landed",
+            match landed {
+                crate::LandingKind::Production => "production",
+                crate::LandingKind::Base => "base",
+            },
+            theme::OK,
+        );
     }
     for (name, value) in [
         ("issue", &row.issue_status),
@@ -527,18 +539,12 @@ fn record_lines(row: &crate::RemovedHistoryRow) -> Vec<Line<'static>> {
         ("pr", &row.pr_state),
     ] {
         if let Some(value) = value {
-            lines.push(Line::from(vec![
-                label(name),
-                Span::styled(value.clone(), theme::fg(theme::FG)),
-            ]));
+            field(&mut lines, name, value, theme::FG);
         }
     }
     // Notes and anything else the host prepared read as prose.
     for detail in &row.details {
-        lines.push(Line::from(vec![
-            Span::raw(" ".repeat(KEY)),
-            Span::styled(detail.clone(), theme::fg(theme::FG_MID)),
-        ]));
+        field(&mut lines, "", detail, theme::FG_MID);
     }
     lines.push(Line::default());
     let mut keys = vec![("⏎", "restore")];
@@ -557,7 +563,7 @@ fn record_lines(row: &crate::RemovedHistoryRow) -> Vec<Line<'static>> {
         spans.push(Span::styled(key, theme::bold(theme::ACCENT)));
         spans.push(Span::styled(format!(" {action}"), theme::dim()));
     }
-    lines.push(Line::from(spans));
+    lines.extend(wrap_spans(spans, width));
     lines
 }
 
@@ -604,12 +610,55 @@ mod tests {
         assert!(text(&lines[4]).contains("yesterday"));
         assert_eq!(lines[5].spans[1].content, format!("{}  ", glyphs::TRASH));
 
-        let record = record_lines(&rows[0]);
+        let record = record_lines(&rows[0], 60);
         let work = record
             .iter()
             .find(|line| text(line).contains("ready"))
             .unwrap();
         assert_eq!(work.spans[1].style.fg, Some(theme::OK));
+    }
+
+    #[test]
+    fn long_record_values_wrap_inside_the_value_column() {
+        let row = RemovedHistoryRow {
+            title: "A removed worktree with a title long enough to wrap".into(),
+            branch: "feature/long".into(),
+            host: Some("builder".into()),
+            blocked_on: Some("the staging deploy of the payments service".into()),
+            verify_steps: Some("open the dashboard, load the report, compare totals".into()),
+            verify_owed: true,
+            details: vec!["a note that runs well past the width of the pane".into()],
+            ..Default::default()
+        };
+        let lines = record_lines(&row, 30);
+        let text = |line: &Line<'_>| -> String {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let texts: Vec<String> = lines.iter().map(text).collect();
+        for line in &texts {
+            assert!(line.width() <= 30, "{line:?} overflows the pane");
+        }
+        let after = |key: &str| {
+            let at = texts.iter().position(|line| line.starts_with(key)).unwrap();
+            &texts[at + 1]
+        };
+        for key in ["blocked", "verify"] {
+            let next = after(key);
+            assert!(
+                next.starts_with(&" ".repeat(10)) && !next.trim().is_empty(),
+                "{key} continues under the keys: {next:?}"
+            );
+        }
+        assert!(texts[1].starts_with("   ") && !texts[1].contains("feature/long"));
+        assert!(texts.iter().any(|line| line.ends_with("pane")));
+        let host = lines
+            .iter()
+            .find(|line| text(line).starts_with("host"))
+            .unwrap();
+        assert_eq!(host.spans[1].style.fg, Some(theme::REMOTE));
     }
 
     #[test]

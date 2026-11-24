@@ -94,7 +94,7 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
                 verify_in: record.verify_in,
             }))),
         },
-        title: format!("status for {}", row.slug),
+        title: format!("Status for {}", row.slug),
         options,
         selected,
     })

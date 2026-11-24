@@ -143,7 +143,7 @@ fn stale_special_session_completion_cannot_erase_pending_creation_feedback() {
     };
     model.begin_action(2, &action);
     let generation = model.ui_generation;
-    model.toast = Some(("Working…".into(), ToastTone::Info));
+    model.toast = Some(("working…".into(), ToastTone::Info));
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::F(12)), 20),
         InputResult::Draw
@@ -151,7 +151,7 @@ fn stale_special_session_completion_cannot_erase_pending_creation_feedback() {
     let feedback = model.toast.clone();
     assert_eq!(
         feedback.as_ref().unwrap().0,
-        "Worktree is still being created"
+        "worktree is still being created"
     );
     let (ready, mut suspended) = tokio::sync::oneshot::channel();
     let (_resume, resumed) = tokio::sync::oneshot::channel();
@@ -186,11 +186,11 @@ fn navigating_away_from_a_pending_connection_explains_cancellation() {
         panic!("session action")
     };
     model.begin_action(7, &action);
-    model.toast = Some(("Working…".into(), ToastTone::Info));
+    model.toast = Some(("working…".into(), ToastTone::Info));
     model.input(KeyEvent::from(KeyCode::Down), 20);
     assert_eq!(
         model.toast.as_ref().unwrap().0,
-        "Session connection cancelled"
+        "session connection cancelled"
     );
     model.reply(UiReply {
         operation_id: Some(7),
@@ -199,7 +199,7 @@ fn navigating_away_from_a_pending_connection_explains_cancellation() {
     });
     assert_eq!(
         model.toast.as_ref().unwrap().0,
-        "Session connection cancelled"
+        "session connection cancelled"
     );
 }
 
@@ -498,7 +498,7 @@ fn pending_palette_cancellation_keys_discard_early_chord_immediately() {
         assert!(model.pending_request.is_none());
         assert_eq!(
             model.toast,
-            Some(("Menu cancelled".into(), ToastTone::Info))
+            Some(("menu cancelled".into(), ToastTone::Info))
         );
         model.reply(UiReply {
             operation_id: Some(42),

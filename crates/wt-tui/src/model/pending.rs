@@ -158,7 +158,7 @@ impl Model {
         }
         self.reproject(tokio::time::Instant::now());
         let name = section.as_deref().unwrap_or("Inbox");
-        Some(self.notify(format!("Moves to {name} once it is created")))
+        Some(self.notify(format!("moves to {name} once it is created")))
     }
 
     /// Whether a move chosen for `key` while it was being created has yet

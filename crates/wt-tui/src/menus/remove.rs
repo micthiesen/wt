@@ -11,14 +11,14 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
         };
     };
     if row.is_main || row.pending_creation || row.key.starts_with('\0') {
-        return Menu::Local(LocalMenu::Notice("This checkout cannot be removed.".into()));
+        return Menu::Local(LocalMenu::Notice("this checkout cannot be removed".into()));
     }
     if row
         .removal
         .as_ref()
         .is_some_and(|removal| removal.error.is_none())
     {
-        return Menu::Local(LocalMenu::Notice("Removal is already in progress.".into()));
+        return Menu::Local(LocalMenu::Notice(crate::model::REMOVAL_IN_PROGRESS.into()));
     }
     if let Some(removal) = row.removal.as_ref()
         && removal.checkout_absent

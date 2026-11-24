@@ -16,7 +16,7 @@ pub(crate) const TYPEAHEAD_LIMIT: usize = 16;
 /// into a menu the user never saw.
 pub(crate) const TYPEAHEAD_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Session entry on a checkout whose removal was accepted.
-pub(crate) const REMOVAL_IN_PROGRESS: &str = "Removal is already in progress";
+pub(crate) const REMOVAL_IN_PROGRESS: &str = "removal is already in progress";
 
 impl Model {
     /// Keys for the activity pane's feeds. They never touch a row, so the
@@ -121,7 +121,7 @@ impl Model {
                 });
                 self.pending_request = None;
                 self.ui_generation = self.ui_generation.wrapping_add(1);
-                return self.notify("Menu cancelled");
+                return self.notify("menu cancelled");
             }
             // Keys typed before the menu opens belong to that menu, never to
             // the board underneath it. They replay in order when it opens.
@@ -153,7 +153,7 @@ impl Model {
             }
             if *inner == request.action {
                 self.pending_request = None;
-                return self.notify("Menu cancelled");
+                return self.notify("menu cancelled");
             }
         }
         if matches!(result, InputResult::Unchanged) {
@@ -162,9 +162,9 @@ impl Model {
             let cancelled = self.pending_request.take();
             let cancelled_feedback = cancelled.as_ref().and_then(|request| {
                 if request.preparation {
-                    Some("Menu cancelled")
+                    Some("menu cancelled")
                 } else if request.action.is_terminal_handoff() {
-                    Some("Session connection cancelled")
+                    Some("session connection cancelled")
                 } else {
                     None
                 }
@@ -538,7 +538,7 @@ impl Model {
             KeyCode::Char('d') if control => self.jump_section(true),
             KeyCode::Char('J' | 'K') if !control => {
                 if self.selected_row().is_some_and(|row| row.pending_creation) {
-                    return self.notify("Still being created; press l to move it to a section");
+                    return self.notify("still being created; press l to move it to a section");
                 }
                 let Some(section) = self.selected_section().map(|section| section.key.clone())
                 else {
@@ -692,7 +692,7 @@ impl Model {
             }
             KeyCode::Char('N') | KeyCode::Char('n') if !control && shift => {
                 if self.selected_row().is_some_and(|row| row.pending_creation) {
-                    return self.notify("Worktree is still being created");
+                    return self.notify("worktree is still being created");
                 }
                 let initial = self
                     .actionable_row()
@@ -866,7 +866,7 @@ impl Model {
 
     pub(super) fn row_action(&mut self, build: impl FnOnce(String) -> UiAction) -> InputResult {
         if self.selected_row().is_some_and(|row| row.pending_creation) {
-            return self.notify("Worktree is still being created");
+            return self.notify("worktree is still being created");
         }
         match self.actionable_row() {
             Some(row) => InputResult::Action(build(row.key.clone())),
@@ -960,7 +960,7 @@ impl Model {
             .take()
             .is_some_and(|request| request.preparation)
         {
-            self.notify("Menu cancelled");
+            self.notify("menu cancelled");
         }
     }
 

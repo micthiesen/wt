@@ -145,7 +145,7 @@ pub(crate) fn status_verb(row: &BoardRow) -> (Badge, String) {
         .as_ref()
         .is_some_and(|removal| removal.error.is_some())
     {
-        return (badge(glyphs::TRASH, theme::ERR), "Removal failed".into());
+        return (badge(glyphs::CONFLICT, theme::ERR), "removal failed".into());
     }
     if let Some(busy) = &row.busy {
         let text = match &busy.age {
@@ -322,15 +322,27 @@ pub(crate) fn session_state_color(harness: &str, state: &str) -> Color {
     }
 }
 
-pub(crate) fn session_state_dot(state: &str) -> &'static str {
-    match state {
-        "working" => "●",
-        "asking" => "?",
-        "polling" => "↻",
-        "waiting" => "○",
-        "abandoned" => "✕",
-        "idle" => "·",
-        _ => "◌",
+/// The SSH-host glyph in its one hue. Callers dim it on archived rows.
+pub(crate) const REMOTE_HOST: Badge = badge(glyphs::REMOTE, theme::REMOTE);
+
+/// Tracker status glyph. Configured status styles are not part of the
+/// prepared board, so this keys on the common workflow words and falls back
+/// to a dim outline.
+pub(crate) fn issue_status_badge(status: &str) -> Badge {
+    let status = status.to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|word| status.contains(word));
+    if has(&["cancel", "duplicate", "won't", "wont"]) {
+        badge(glyphs::TASK_CANCELLED, theme::FG_DIM)
+    } else if has(&["done", "complete", "closed", "merged", "released"]) {
+        badge(glyphs::TASK_COMPLETE, theme::OK)
+    } else if has(&["review"]) {
+        badge(glyphs::HALF_CIRCLE, theme::INFO)
+    } else if has(&["progress", "started"]) {
+        badge(glyphs::DOT_CIRCLE, theme::WARN)
+    } else if has(&["block"]) {
+        badge(glyphs::SLASH, theme::ERR)
+    } else {
+        badge(glyphs::DOT_OUTLINE, theme::FG_DIM)
     }
 }
 
@@ -572,6 +584,42 @@ pub(crate) fn cluster_spans(
 mod tests {
     use super::*;
     use crate::{GitPresentation, MergeQueueView, ReviewBotView};
+
+    #[test]
+    fn a_failed_removal_wears_one_glyph_in_the_list_and_the_git_line() {
+        let failed = BoardRow {
+            removal: Some(crate::RemovalView {
+                error: Some("denied".into()),
+                ..Default::default()
+            }),
+            ..row()
+        };
+        let (verb, text) = status_verb(&failed);
+        assert_eq!(Some(verb), loud_status_badge(&failed));
+        assert_eq!(text, "removal failed");
+    }
+
+    #[test]
+    fn tracker_statuses_map_to_one_badge_per_meaning() {
+        let glyph_color = |status: &str| {
+            let badge = issue_status_badge(status);
+            (badge.glyph, badge.color)
+        };
+        for status in ["Done", "Released", "Merged", "Closed"] {
+            assert_eq!(glyph_color(status), (glyphs::TASK_COMPLETE, theme::OK));
+        }
+        for status in ["Cancelled", "Duplicate", "Won't do"] {
+            assert_eq!(glyph_color(status), (glyphs::TASK_CANCELLED, theme::FG_DIM));
+        }
+        assert_eq!(glyph_color("In Review"), (glyphs::HALF_CIRCLE, theme::INFO));
+        assert_eq!(
+            glyph_color("In Progress"),
+            (glyphs::DOT_CIRCLE, theme::WARN)
+        );
+        assert_eq!(glyph_color("Blocked"), (glyphs::SLASH, theme::ERR));
+        assert_eq!(glyph_color("Backlog"), (glyphs::DOT_OUTLINE, theme::FG_DIM));
+        assert_eq!(glyph_color(""), (glyphs::DOT_OUTLINE, theme::FG_DIM));
+    }
 
     fn row() -> BoardRow {
         BoardRow {

@@ -259,14 +259,14 @@ impl Model {
                 && completed_request.is_some()
             {
                 if reply.failed {
-                    "Command failed; see attention".into()
+                    "command failed; see attention".into()
                 } else if completed_request
                     .as_ref()
                     .is_some_and(|request| request.preparation)
                 {
-                    "Request finished without opening a menu".into()
+                    "request finished without opening a menu".into()
                 } else {
-                    "Done".into()
+                    "done".into()
                 }
             } else {
                 reply.message
@@ -414,13 +414,7 @@ impl Model {
     pub(super) fn append_typeahead_notice(&mut self, notice: &str) {
         let text = match self.toast.take() {
             Some((text, _)) if !text.trim().is_empty() => format!("{text}; {notice}"),
-            _ => {
-                let mut chars = notice.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().chain(chars).collect())
-                    .unwrap_or_default()
-            }
+            _ => notice.to_owned(),
         };
         self.toast = Some((text, ToastTone::Notice));
     }

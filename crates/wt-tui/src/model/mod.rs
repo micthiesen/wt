@@ -35,6 +35,7 @@ pub use board::{
     ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView,
     TerminalSlotView, TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
+pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{
     ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,
 };

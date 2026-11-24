@@ -14,7 +14,7 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
     };
     let row = &board.rows[index];
     if row.archived {
-        return LocalMenu::Notice("Restore the archived row before moving it to a section".into());
+        return LocalMenu::Notice("restore the archived row before moving it to a section".into());
     }
     let current = current_section(board, index);
     // The Inbox (only when the row is in a section), every other section in
@@ -264,7 +264,7 @@ mod tests {
         };
         assert_eq!(
             text,
-            "Restore the archived row before moving it to a section"
+            "restore the archived row before moving it to a section"
         );
     }
 }

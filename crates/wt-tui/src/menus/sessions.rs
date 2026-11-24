@@ -104,9 +104,9 @@ pub fn session_picker(
         action: PickerAction::Sessions { choices },
         title: match (&key, target) {
             (Some(key), SessionTarget::Harness) => {
-                format!("sessions · {}", wt_core::worktree_ledger_label(key))
+                format!("Sessions · {}", wt_core::worktree_ledger_label(key))
             }
-            _ => "sessions".into(),
+            _ => "Sessions".into(),
         },
         options,
         selected: 0,
@@ -415,7 +415,7 @@ mod tests {
         assert_eq!(options[3].chord, Some('x'));
         assert_eq!(
             title,
-            &format!("sessions · {}", wt_core::worktree_ledger_label("one"))
+            &format!("Sessions · {}", wt_core::worktree_ledger_label("one"))
         );
         assert_eq!(
             warm.as_deref(),
@@ -478,7 +478,7 @@ mod tests {
         let UiModal::Picker { title, .. } = &modal else {
             panic!()
         };
-        assert_eq!(title, "sessions");
+        assert_eq!(title, "Sessions");
         assert!(values(&modal).contains(&"session:codex:m".to_owned()));
         assert_eq!(
             warm.as_deref(),

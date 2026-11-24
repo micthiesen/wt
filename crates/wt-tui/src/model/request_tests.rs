@@ -31,7 +31,7 @@ fn request_remove(model: &mut Model, id: u64) -> u64 {
         }),
     };
     model.begin_action(id, &action);
-    model.toast = Some(("Loading menu… Esc cancels".into(), ToastTone::Info));
+    model.toast = Some(("loading menu… Esc cancels".into(), ToastTone::Info));
     model.ui_generation
 }
 
@@ -217,18 +217,18 @@ fn all_foreground_requests_keep_feedback_until_their_own_reply() {
     let mut model = Model::default();
     model.apply(board(&["one"]));
     model.begin_action(8, &UiAction::OpenEditor { key: "one".into() });
-    model.toast = Some(("Working…".into(), ToastTone::Info));
+    model.toast = Some(("working…".into(), ToastTone::Info));
     model.reply(UiReply {
         operation_id: Some(9),
         ..UiReply::failure("unrelated failure")
     });
     model.expire_toast();
-    assert_eq!(model.toast.as_ref().unwrap().0, "Working…");
+    assert_eq!(model.toast.as_ref().unwrap().0, "working…");
     model.reply(UiReply {
         operation_id: Some(8),
         ..Default::default()
     });
-    assert_eq!(model.toast.as_ref().unwrap().0, "Done");
+    assert_eq!(model.toast.as_ref().unwrap().0, "done");
 }
 
 #[test]

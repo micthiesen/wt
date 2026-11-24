@@ -172,7 +172,7 @@ fn build(model: &Model, width: usize) -> Vec<Line<'static>> {
         if model.board.review_requests.is_empty() {
             "No worktree selected."
         } else {
-            "Requested reviews · Tab to fold or expand"
+            "Review requests · Tab to fold or expand"
         },
         theme::dim(),
     )]
@@ -209,7 +209,7 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
             lines.extend(
                 wrap(detail, width)
                     .into_iter()
-                    .map(|line| Line::styled(line, theme::dim())),
+                    .map(|line| Line::styled(line, theme::fg(theme::FG_MID))),
             );
         }
     }
@@ -243,7 +243,7 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
         lines.extend(
             wrap(summary.trim(), width)
                 .into_iter()
-                .map(|line| Line::styled(line, theme::dim())),
+                .map(|line| Line::styled(line, theme::fg(theme::FG_MID))),
         );
     }
 
@@ -431,7 +431,8 @@ fn issue_value(row: &BoardRow) -> Spans {
             None => vec![Span::styled("—", theme::dim())],
         };
     };
-    let (glyph, color) = issue_status_badge(row.issue_status.as_deref());
+    let badges::Badge { glyph, color } =
+        badges::issue_status_badge(row.issue_status.as_deref().unwrap_or_default());
     let mut spans = vec![Span::styled(format!("{glyph}  #{id}"), theme::fg(color))];
     if let Some(number) = github {
         spans.push(Span::styled(" ← ", theme::dim()));
@@ -442,28 +443,6 @@ fn issue_value(row: &BoardRow) -> Spans {
         spans.push(Span::styled(status.to_owned(), theme::fg(color)));
     }
     spans
-}
-
-/// Tracker status glyph. Configured status styles are not part of the
-/// prepared board, so this keys on the common workflow words and falls back
-/// to a dim outline.
-fn issue_status_badge(status: Option<&str>) -> (&'static str, ratatui::style::Color) {
-    let Some(status) = status.map(str::to_ascii_lowercase) else {
-        return (glyphs::DOT_OUTLINE, theme::FG_DIM);
-    };
-    if status.contains("cancel") || status.contains("duplicate") {
-        (glyphs::TASK_CANCELLED, theme::FG_DIM)
-    } else if status.contains("done") || status.contains("complete") || status.contains("closed") {
-        (glyphs::TASK_COMPLETE, theme::OK)
-    } else if status.contains("review") {
-        (glyphs::HALF_CIRCLE, theme::INFO)
-    } else if status.contains("progress") || status.contains("started") {
-        (glyphs::DOT_CIRCLE, theme::WARN)
-    } else if status.contains("block") {
-        (glyphs::SLASH, theme::ERR)
-    } else {
-        (glyphs::DOT_OUTLINE, theme::FG_DIM)
-    }
 }
 
 /// Display text of the guide link in its own row; [`guide_link`] finds it
@@ -861,6 +840,26 @@ fn sync_group(open: &str, close: &str, counts: Option<(u32, u32)>) -> Spans {
     spans
 }
 
+/// Cells a block's glyph slot takes; its wrapped header and its file list
+/// both start past it.
+const HANG: usize = 3;
+
+/// `glyph  text`, wrapped so continuation lines start under the text.
+fn hanging_header(badge: badges::Badge, text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap(text, width.saturating_sub(HANG))
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let line = if index == 0 {
+                format!("{}  {line}", badge.glyph)
+            } else {
+                format!("{:HANG$}{line}", "")
+            };
+            Line::styled(line, theme::fg(badge.color))
+        })
+        .collect()
+}
+
 /// The rebase lifecycle as a block: restacking, mid-rebase, or a branch
 /// that will not rebase cleanly onto its base (with the clashing files).
 fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Line<'static>> {
@@ -868,11 +867,15 @@ fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Lin
     let Some(badge) = badges::rebase_badge(row, session_state) else {
         return Vec::new();
     };
-    let header = |text: String| fit_line(glyph_text(badge.glyph, &text, badge.color), width);
+    let header = |text: String| hanging_header(badge, &text, width);
     let files = |files: &[String], lines: &mut Vec<Line<'static>>| {
         for file in files.iter().take(MAX_CONFLICT_FILES) {
             lines.push(Line::styled(
-                truncate_end(&format!("   {file}"), width),
+                format!(
+                    "{:HANG$}{}",
+                    "",
+                    truncate_start(file, width.saturating_sub(HANG))
+                ),
                 theme::dim(),
             ));
         }
@@ -889,19 +892,11 @@ fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Lin
         } else {
             busy.label.as_str()
         };
-        return vec![header(format!("Restacking ({phase})"))];
+        return header(format!("Restacking ({phase})"));
     }
     if row.git.rebasing || !row.git.conflict_files.is_empty() {
-        let mut lines = wrap(
-            &format!(
-                "{}  Mid-rebase: resolve and continue in this worktree (/restack)",
-                badge.glyph
-            ),
-            width,
-        )
-        .into_iter()
-        .map(|line| Line::styled(line, theme::fg(badge.color)))
-        .collect();
+        let mut lines =
+            header("Mid-rebase: resolve and continue in this worktree (/restack)".into());
         files(&row.git.conflict_files, &mut lines);
         return lines;
     }
@@ -915,10 +910,10 @@ fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Lin
     };
     let conflicts = row.git.base_conflicts.as_deref().unwrap_or_default();
     let count = conflicts.len();
-    let mut lines = vec![header(format!(
+    let mut lines = header(format!(
         "{head} · {count} conflicting file{}",
         if count == 1 { "" } else { "s" }
-    ))];
+    ));
     files(conflicts, &mut lines);
     lines
 }
@@ -1555,11 +1550,27 @@ fn section_summary(
     fact(rollup.upstream_behind, "behind upstream", theme::FG_DIM);
     fact(rollup.rebasing, "rebasing", theme::WARN);
     fact(rollup.conflicted, "conflicted", theme::ERR);
-    fact(rollup.stale_statuses, "stale status", theme::WARN);
+    fact(
+        rollup.stale_statuses,
+        if rollup.stale_statuses == 1 {
+            "stale status"
+        } else {
+            "stale statuses"
+        },
+        theme::WARN,
+    );
     fact(rollup.verification_owed, "verify owed", theme::WARN);
     fact(rollup.verification_overdue, "verify overdue", theme::ERR);
     fact(rollup.paused_automations, "paused", theme::WARN);
-    fact(rollup.needs_attention, "need attention", theme::WARN);
+    fact(
+        rollup.needs_attention,
+        if rollup.needs_attention == 1 {
+            "needs attention"
+        } else {
+            "need attention"
+        },
+        theme::WARN,
+    );
     if !facts.is_empty() {
         let mut spans = Vec::new();
         for (index, (text, color)) in facts.into_iter().enumerate() {
@@ -1666,7 +1677,7 @@ fn fit_line(spans: Spans, width: usize) -> Line<'static> {
 }
 
 /// Wrap a styled line at span boundaries and spaces.
-fn wrap_spans(spans: Spans, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_spans(spans: Spans, width: usize) -> Vec<Line<'static>> {
     if spans_width(&spans) <= width {
         return vec![Line::from(spans)];
     }
@@ -1985,6 +1996,87 @@ mod tests {
         assert!(find(&lines, "src/login.rs").contains("   src/login.rs"));
         assert!(find(&lines, "@reviewer").contains("@reviewer · 3h ago"));
         find(&lines, "+2 unresolved threads");
+    }
+
+    #[test]
+    fn conflict_files_keep_their_name_and_headers_wrap_past_the_glyph() {
+        let mut clashing = row();
+        clashing.git.base_conflicts = Some(vec![
+            "crates/app/src/features/authentication/login_form.rs".into(),
+        ]);
+        let policy = DisplayPolicy::default();
+        let text = |lines: Vec<Line<'static>>| -> Vec<String> {
+            lines.iter().map(ToString::to_string).collect()
+        };
+        let block = text(rebase_block(&clashing, &policy, 30));
+        assert!(block.iter().all(|line| line.width() <= 30), "{block:?}");
+        let file = block.last().unwrap();
+        assert!(
+            file.starts_with("   …") && file.ends_with("login_form.rs"),
+            "{file}"
+        );
+        // The count is the tail of the header: wrapped, never cut.
+        assert!(block.len() > 2, "{block:?}");
+        assert!(block[0].starts_with(&format!("{}  Won't", glyphs::CONFLICT)));
+        let header = &block[..block.len() - 1];
+        assert!(header.join(" ").contains("1 conflicting file"), "{block:?}");
+        for line in &header[1..] {
+            assert!(
+                line.starts_with("   ") && !line.starts_with("    "),
+                "{line:?}"
+            );
+        }
+
+        let mut rebasing = row();
+        rebasing.git.base_conflicts = None;
+        rebasing.git.rebasing = true;
+        rebasing.git.conflict_files = vec!["src/a.rs".into()];
+        let block = text(rebase_block(&rebasing, &policy, 30));
+        assert!(block[0].contains("  Mid-rebase:"), "{block:?}");
+        assert!(block[1].starts_with("   ") && !block[1].starts_with("    "));
+        assert_eq!(block.last().unwrap(), "   src/a.rs");
+    }
+
+    #[test]
+    fn prose_blocks_are_body_gray_not_metadata_gray() {
+        let mut prose = row();
+        prose.details = vec!["A leftover detail line.".into()];
+        prose.sessions = vec![SessionView {
+            summary: Some("Session summary prose.".into()),
+            ..Default::default()
+        }];
+        let model = Model {
+            board: Arc::new(Board {
+                rows: vec![prose],
+                ..Default::default()
+            }),
+            ..Model::default()
+        };
+        let lines = row_lines(&model.board.rows[0], &model, 60);
+        for needle in ["A leftover detail line.", "Session summary prose."] {
+            let line = lines
+                .iter()
+                .find(|line| line.to_string() == needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(line.style.fg, Some(theme::FG_MID), "{needle}");
+        }
+    }
+
+    #[test]
+    fn section_facts_agree_in_number() {
+        let member = |flagged: bool| BoardRow {
+            needs_attention: flagged,
+            work: Some(WorkPresentation {
+                effective_state: Some(WorkState::Working),
+                stale: Some(flagged),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let one = section_screen(vec![member(true), member(false)], "manual").join("\n");
+        assert!(one.contains("1 stale status · 1 needs attention"), "{one}");
+        let two = section_screen(vec![member(true), member(true)], "manual").join("\n");
+        assert!(two.contains("2 stale statuses · 2 need attention"), "{two}");
     }
 
     #[test]

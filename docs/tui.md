@@ -115,10 +115,11 @@ keeps the row in place with a dim gray, struck-through name while safety
 checks run. When the worker accepts removal, the row moves to **Removing**, directly
 above **Archived**, and file cleanup continues in the background. Active
 removals reject duplicate requests, and session entry on that row (F10, F11,
-F12, Shift+F12, `;` and their pickers) says **Removal is already in progress**
+F12, Shift+F12, `;` and their pickers) says **removal is already in progress**
 instead of queuing behind the teardown. Failed rows stay in Removing with an
-alert marker in place of the trash marker, and the details and attention panels
-say **Removal failed** with the error.
+alert marker in place of the trash marker; the details git line wears the same
+marker and reads `removal failed`, and the details and attention panels show
+the error.
 Press `d` to inspect the failure and review a retry; the host repeats all
 safety checks. If checkout identity is missing, the menu permits inspection
 only. When the failed record's checkout is no longer in Git inventory, `d`
@@ -249,7 +250,7 @@ opens the main clone as it does on the board.
 | `g` / `G`, `Home` / `End` | First / last visible item |
 | `PgUp` / `PgDn` | Move half a page |
 | `Space` | Next row needing you: saved work states plus failing checks, changes requested, unresolved threads, and failed actions; toasts when nothing needs you |
-| `Tab` | Fold / unfold the section; unfolding lands on its first row. Requested reviews fold too |
+| `Tab` | Fold / unfold the section; unfolding lands on its first row. Review requests fold too |
 | `Ctrl+D` / `Ctrl+U` | Next / previous section |
 | `Ctrl+J` / `Ctrl+K` | Scroll details |
 | `Ctrl+E` / `Ctrl+Y` | Scroll output |
@@ -431,7 +432,7 @@ data and the toast says what changed.
 Menus that need host-only data (removal hazards, an unprefetched palette,
 action arguments, reviewers, failed checks, fleet cleanup, retained or remote
 terminals) show
-`Loading menu… Esc cancels`. Keys typed meanwhile belong to that menu, never to
+`loading menu… Esc cancels`. Keys typed meanwhile belong to that menu, never to
 the board: they replay in order once it opens, so a fast `; d` or `! m` acts
 inside the menu. Escape, `q`, Ctrl+C, or the menu's own key cancels it; for
 a text prompt (an action's argument or extra instructions, a new worktree on

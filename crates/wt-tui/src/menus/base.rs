@@ -82,7 +82,7 @@ pub(super) fn menu(board: &Board, key: &str) -> Menu {
             key: key.to_owned(),
             seen: Some(Seen(recorded.map(str::to_owned))),
         },
-        title: format!("fork base for {}", row.slug),
+        title: format!("Fork base for {}", row.slug),
         options,
         selected,
     }))

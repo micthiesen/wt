@@ -1313,7 +1313,7 @@ fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
             InputResult::Draw,
             "{code:?} {modifiers:?}"
         );
-        assert_eq!(toast(&model), Some("Removal is already in progress"));
+        assert_eq!(toast(&model), Some("removal is already in progress"));
     }
     // A picker opened before the removal was accepted cannot commit entry.
     model.reply(UiReply {
@@ -1335,7 +1335,7 @@ fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
     });
     model.toast = None;
     assert_eq!(ch(&mut model, 'x'), InputResult::Draw);
-    assert_eq!(toast(&model), Some("Removal is already in progress"));
+    assert_eq!(toast(&model), Some("removal is already in progress"));
     // Unrelated rows still enter immediately.
     ch(&mut model, 'j');
     assert_eq!(model.selected_row().unwrap().key, "two");

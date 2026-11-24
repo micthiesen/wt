@@ -9,8 +9,7 @@ pub(super) fn hard_refresh() -> LocalMenu {
     LocalMenu::modal(UiModal::Confirm {
         title: "Clear derived caches?".into(),
         lines: vec![
-            "Refetch current data and regenerate automatic titles. Saved worktree state and running work are preserved."
-                .into(),
+            "Refetch current data. Saved worktree state and running work are preserved.".into(),
         ],
         action: ConfirmAction::HardRefresh,
         cancel_key: None,

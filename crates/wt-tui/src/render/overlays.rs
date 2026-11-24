@@ -455,9 +455,9 @@ fn picker(
                 .any(|choice| choice.mode == SessionMode::Resume) =>
         {
             extra.extend([
-                hint("c / x / o / p", "new …"),
+                hint("c / o / p", "new …"),
                 hint("d", "close"),
-                hint("x", "kill"),
+                hint("x", "kill (on a new row: Codex)"),
             ]);
         }
         _ => {}
@@ -780,7 +780,7 @@ fn reviewers(frame: &mut Frame<'_>, area: Rect, picker: &ReviewerPrompt) {
 fn yank(frame: &mut Frame<'_>, model: &Model, area: Rect, selected: usize) {
     let choices = model.yank_choices();
     let modal = Modal::new(
-        "yank · pick what to copy",
+        "Yank · pick what to copy",
         vec![
             hint("j/k", "move"),
             hint("letter", "direct"),
@@ -1204,18 +1204,70 @@ pub(crate) fn automation_line_count(board: &crate::Board) -> usize {
     automation_lines(board, 0).len()
 }
 
+/// Widest a rule or target column grows before its names are cut.
+const AUTOMATION_NAME_CELLS: usize = 24;
+
+/// One block's entries as aligned columns: rule, target, then the block's
+/// own cells. Each column is as wide as its widest cell in the block, so
+/// states and ages line up under each other; the last cell runs free.
+fn automation_table(rows: Vec<(String, String, Vec<Span<'static>>)>) -> Vec<Line<'static>> {
+    let name = |text: &str| truncate_end(text, AUTOMATION_NAME_CELLS);
+    let rows: Vec<(String, String, Vec<Span<'static>>)> = rows
+        .into_iter()
+        .map(|(rule, target, cells)| (name(&rule), name(&target), cells))
+        .collect();
+    let rule_width = rows.iter().map(|row| row.0.width()).max().unwrap_or(0);
+    let target_width = rows.iter().map(|row| row.1.width()).max().unwrap_or(0);
+    let mut widths: Vec<usize> = Vec::new();
+    for (_, _, cells) in &rows {
+        for (index, cell) in cells.iter().enumerate() {
+            let cells = cell.content.width();
+            match widths.get_mut(index) {
+                Some(width) => *width = (*width).max(cells),
+                None => widths.push(cells),
+            }
+        }
+    }
+    rows.into_iter()
+        .map(|(rule, target, cells)| {
+            let last = cells
+                .iter()
+                .rposition(|cell| !cell.content.is_empty())
+                .map_or(0, |index| index + 1);
+            let target = if last == 0 {
+                target
+            } else {
+                fit(&target, target_width)
+            };
+            let mut spans = vec![
+                Span::styled(
+                    format!("  {}", fit(&rule, rule_width)),
+                    theme::fg(theme::ACCENT),
+                ),
+                Span::styled(format!(" → {target}"), theme::fg(theme::FG)),
+            ];
+            for (index, cell) in cells.into_iter().take(last).enumerate() {
+                let text = if index + 1 == last {
+                    cell.content.into_owned()
+                } else {
+                    fit(&cell.content, widths[index])
+                };
+                spans.push(Span::styled(format!("  {text}"), cell.style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn automation_lines(board: &crate::Board, now: u64) -> Vec<Line<'static>> {
     let view = &board.automations_view;
-    let ago = |at: i64| super::text::age(u64::try_from(at).unwrap_or(0), now);
-    let heading = |text: &str| Line::styled(text.to_owned(), theme::bold(theme::FG));
-    let entry = |rule: &str, target: &str, tail: Vec<Span<'static>>| {
-        let mut spans = vec![
-            Span::styled(format!("  {rule}"), theme::fg(theme::ACCENT)),
-            Span::styled(format!(" → {target}"), theme::fg(theme::FG)),
-        ];
-        spans.extend(tail);
-        Line::from(spans)
+    let ago = |at: i64| {
+        format!(
+            "{} ago",
+            super::text::age(u64::try_from(at).unwrap_or(0), now)
+        )
     };
+    let heading = |text: &str| Line::styled(text.to_owned(), theme::bold(theme::FG));
     let mut lines = Vec::new();
     let state = if board.automations_paused {
         Span::styled("paused · A resumes", theme::fg(theme::WARN))
@@ -1233,61 +1285,77 @@ fn automation_lines(board: &crate::Board, now: u64) -> Vec<Line<'static>> {
     if view.running.is_empty() {
         lines.push(Line::styled("  nothing", theme::dim()));
     }
-    for fire in &view.running {
-        let mut tail = vec![Span::styled(format!("  {}", fire.detail), theme::dim())];
-        if let Some(since) = fire.since_ms {
-            tail.insert(
-                0,
-                Span::styled(format!("  {} ago", ago(since)), theme::fg(theme::FG_MID)),
-            );
-        }
-        lines.push(entry(&fire.rule, &fire.target, tail));
-    }
+    // A block where no entry has an age has no age column at all.
+    let timed = view.running.iter().any(|fire| fire.since_ms.is_some());
+    lines.extend(automation_table(
+        view.running
+            .iter()
+            .map(|fire| {
+                let mut cells = Vec::new();
+                if timed {
+                    cells.push(Span::styled(
+                        fire.since_ms.map(ago).unwrap_or_default(),
+                        theme::fg(theme::FG_MID),
+                    ));
+                }
+                cells.push(Span::styled(fire.detail.clone(), theme::dim()));
+                (fire.rule.clone(), fire.target.clone(), cells)
+            })
+            .collect(),
+    ));
     lines.push(Line::default());
     lines.push(heading(&format!("Queued ({})", view.queued.len())));
     if view.queued.is_empty() {
         lines.push(Line::styled("  nothing", theme::dim()));
     }
-    for fire in &view.queued {
-        let remaining = fire.settle_at_ms.saturating_sub(now as i64);
-        let when = if now > 0 && remaining > 0 {
-            format!(
-                "  runs in {}",
-                super::text::age(now, now + remaining as u64)
-            )
-        } else {
-            format!("  waiting for {}", fire.waiting_for)
-        };
-        lines.push(entry(
-            &fire.rule,
-            &fire.target,
-            vec![
-                Span::styled(when, theme::fg(theme::WARN)),
-                Span::styled(format!("  {}", fire.detail), theme::dim()),
-            ],
-        ));
-    }
+    lines.extend(automation_table(
+        view.queued
+            .iter()
+            .map(|fire| {
+                let remaining = fire.settle_at_ms.saturating_sub(now as i64);
+                let when = if now > 0 && remaining > 0 {
+                    format!("runs in {}", super::text::age(now, now + remaining as u64))
+                } else {
+                    format!("waiting for {}", fire.waiting_for)
+                };
+                (
+                    fire.rule.clone(),
+                    fire.target.clone(),
+                    vec![
+                        Span::styled(when, theme::fg(theme::WARN)),
+                        Span::styled(fire.detail.clone(), theme::dim()),
+                    ],
+                )
+            })
+            .collect(),
+    ));
     lines.push(Line::default());
     lines.push(heading(&format!("Recent ({})", view.recent.len())));
     if view.recent.is_empty() {
         lines.push(Line::styled("  nothing recorded", theme::dim()));
     }
-    for record in &view.recent {
-        let color = match record.state.as_str() {
-            "delivered" => theme::OK,
-            "ambiguous" => theme::WARN,
-            "skipped" | "cancelled" => theme::FG_DIM,
-            _ => theme::FG_MID,
-        };
-        let mut tail = vec![
-            Span::styled(format!("  {}", record.state), theme::fg(color)),
-            Span::styled(format!("  {} ago", ago(record.at_ms)), theme::dim()),
-        ];
-        if let Some(reason) = &record.reason {
-            tail.push(Span::styled(format!("  {reason}"), theme::dim()));
-        }
-        lines.push(entry(&record.rule, &record.target, tail));
-    }
+    lines.extend(automation_table(
+        view.recent
+            .iter()
+            .map(|record| {
+                let color = match record.state.as_str() {
+                    "delivered" => theme::OK,
+                    "ambiguous" => theme::WARN,
+                    "skipped" | "cancelled" => theme::FG_DIM,
+                    _ => theme::FG_MID,
+                };
+                (
+                    record.rule.clone(),
+                    record.target.clone(),
+                    vec![
+                        Span::styled(record.state.clone(), theme::fg(color)),
+                        Span::styled(ago(record.at_ms), theme::dim()),
+                        Span::styled(record.reason.clone().unwrap_or_default(), theme::dim()),
+                    ],
+                )
+            })
+            .collect(),
+    ));
     lines
 }
 
@@ -1380,11 +1448,11 @@ const PERF_BAR_MIN_WIDTH: usize = PERF_LABEL_W + PERF_BAR_W + 18;
 fn perf(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let title = match &model.board.perf_view {
         Some(view) => format!(
-            "perf · {} downstream of wt · sampled {}",
+            "Perf · {} downstream of wt · sampled {}",
             perf_count(view.downstream_count, "process"),
             view.sampled_at
         ),
-        None => "perf · wt and everything downstream".to_owned(),
+        None => "Perf · wt and everything downstream".to_owned(),
     };
     // Same status wording as every pane; a modal title is plain text.
     let title = super::status::chip(
@@ -2239,14 +2307,7 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
             "action running",
             "!",
         ),
-        glyph_item(
-            Badge {
-                glyph: glyphs::REMOTE,
-                color: theme::INFO,
-            },
-            "hosted on an SSH remote",
-            "remote",
-        ),
+        glyph_item(badges::REMOTE_HOST, "hosted on an SSH remote", "remote"),
     ]);
     for (harness, label) in [
         ("claude", "Claude session live"),
@@ -2274,8 +2335,9 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
         ("unknown", "unknown"),
     ]
     .into_iter()
+    // What the list draws: the harness glyph, in the state's color.
     .map(|(state, label)| HelpItem::Glyph {
-        glyph: badges::session_state_dot(state).to_owned(),
+        glyph: badges::harness_glyph(primary).to_owned(),
         color: badges::session_state_color(primary, state),
         label,
         search: "ai session state",
@@ -2517,9 +2579,9 @@ fn help(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         ]
     };
     let title = if model.board.versions.is_empty() {
-        "help · keys and glyphs".to_owned()
+        "Help · keys and glyphs".to_owned()
     } else {
-        format!("help · {}", model.board.versions)
+        format!("Help · {}", model.board.versions)
     };
     let modal = Modal::new(title, hints);
     let outer = modal.place(area, MAX_FRAME_WIDTH as usize, 0, true);
@@ -3033,7 +3095,7 @@ mod tests {
         };
         let buffer = draw(&mut model, 200, 50);
         let text = rows(&buffer).join("\n");
-        assert!(text.contains("help · keys and glyphs"));
+        assert!(text.contains("Help · keys and glyphs"));
         let (x, y) = find(&buffer, " navigation").unwrap();
         assert_eq!(buffer[(x + 1, y)].bg, theme::SELECTED_BG, "heading bar");
         assert!(model.help_max_scroll > 0);
@@ -3044,6 +3106,30 @@ mod tests {
         assert!(text.contains("AI session states"), "{text}");
         assert!(text.contains(glyphs::CHECK_FAIL));
         assert_eq!(model.help_scroll, model.help_max_scroll);
+    }
+
+    #[test]
+    fn the_session_legend_shows_the_harness_glyph_in_each_state_color() {
+        let blocks = legend_blocks(&DisplayPolicy::default(), "codex");
+        let block = blocks
+            .iter()
+            .find(|block| block.title == "AI session states")
+            .unwrap();
+        assert_eq!(block.items.len(), 7);
+        for item in &block.items {
+            let HelpItem::Glyph {
+                glyph,
+                color,
+                label,
+                ..
+            } = item
+            else {
+                panic!("session legend rows are glyph rows");
+            };
+            assert_eq!(glyph, badges::harness_glyph("codex"));
+            let state = label.split(' ').next().unwrap();
+            assert_eq!(*color, badges::session_state_color("codex", state));
+        }
     }
 
     #[test]
@@ -3391,7 +3477,7 @@ mod tests {
         let buffer = draw(&mut model, 120, 80);
         let text = rows(&buffer).join("\n");
         assert!(
-            text.contains("perf · 3 processes downstream of wt · sampled 14:03:22"),
+            text.contains("Perf · 3 processes downstream of wt · sampled 14:03:22"),
             "{text}"
         );
         let (x, y) = find(&buffer, "wt is most of the load").unwrap();
@@ -3498,6 +3584,49 @@ mod tests {
         );
         let (x, y) = find(&buffer, "delivered").unwrap();
         assert_eq!(buffer[(x, y)].fg, theme::OK);
+    }
+
+    #[test]
+    fn automation_entries_align_their_columns_within_a_block() {
+        let record = |rule: &str, target: &str, state: &str, reason: Option<&str>| {
+            crate::AutomationRecordView {
+                rule: rule.into(),
+                target: target.into(),
+                state: state.into(),
+                at_ms: 0,
+                reason: reason.map(Into::into),
+            }
+        };
+        let board = crate::Board {
+            automations_view: crate::AutomationsView {
+                enabled: true,
+                recent: vec![
+                    record("ping", "one", "delivered", None),
+                    record(
+                        "a-rule-name-well-past-the-column-cap",
+                        "a-long-worktree-slug",
+                        "skipped",
+                        Some("paused"),
+                    ),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines: Vec<String> = automation_lines(&board, 3_600_000)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let short = lines.iter().find(|line| line.contains("ping")).unwrap();
+        let long = lines.iter().find(|line| line.contains("skipped")).unwrap();
+        let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].width();
+        assert!(long.contains("a-rule-name-well-past-t… → "), "{long}");
+        assert_eq!(column(short, "→"), column(long, "→"));
+        assert_eq!(column(short, "delivered"), column(long, "skipped"));
+        assert_eq!(column(short, "1h ago"), column(long, "1h ago"));
+        assert!(short.ends_with("1h ago"), "no padding past the last cell");
+        assert!(long.ends_with("1h ago  paused"), "{long}");
+        assert_eq!(lines.len(), automation_line_count(&board));
     }
 
     #[test]

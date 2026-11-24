@@ -319,7 +319,7 @@ async fn run_inner<'a>(
                     .is_err()
                 {
                     model.toast = Some((
-                        "Actions are busy; selection not copied".into(),
+                        "actions are busy; selection not copied".into(),
                         ToastTone::Failed,
                     ));
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
@@ -381,7 +381,7 @@ async fn run_inner<'a>(
                             InputResult::Quit => break,
                             InputResult::Refresh => {
                                 source.refresh();
-                                model.toast = Some(("Refreshing…".into(), ToastTone::Info));
+                                model.toast = Some(("refreshing…".into(), ToastTone::Info));
                                 toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
                                 dirty = true;
                                 input_at = Some(received);
@@ -399,10 +399,10 @@ async fn run_inner<'a>(
                                         if let Some(request) = &mut model.pending_request {
                                             request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
                                         }
-                                        model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "Loading menu… Esc cancels" } else { "Working…" }.into(), ToastTone::Info));
+                                        model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "loading menu… Esc cancels" } else { "working…" }.into(), ToastTone::Info));
                                     },
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { model.request_not_sent(); model.toast = Some(("Actions are busy; try again when one finishes".into(), ToastTone::Failed)) },
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { model.request_not_sent(); model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed)) },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { model.request_not_sent(); model.toast = Some(("actions are busy; try again when one finishes".into(), ToastTone::Failed)) },
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { model.request_not_sent(); model.toast = Some(("action worker stopped; restart wt".into(), ToastTone::Failed)) },
                                 }
                                 dirty = true;
                                 toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
@@ -466,7 +466,7 @@ async fn run_inner<'a>(
                 } else {
                     controller_open = false;
                     model.pending_request = None;
-                    model.toast = Some(("Action worker stopped; restart wt".into(), ToastTone::Failed));
+                    model.toast = Some(("action worker stopped; restart wt".into(), ToastTone::Failed));
                     dirty = true;
                 }
             }
@@ -750,7 +750,7 @@ fn send_follow_up(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate:
     if requests.try_send(request).is_err() {
         model.request_not_sent();
         model.toast = Some((
-            "Action queue is busy; retry the action".into(),
+            "action queue is busy; retry the action".into(),
             ToastTone::Failed,
         ));
         return;
@@ -764,9 +764,9 @@ fn send_follow_up(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate:
         .as_ref()
         .is_some_and(|request| request.preparation);
     let text = if preparing {
-        "Loading menu… Esc cancels"
+        "loading menu… Esc cancels"
     } else {
-        "Working…"
+        "working…"
     };
     model.toast = Some((text.into(), ToastTone::Info));
 }
