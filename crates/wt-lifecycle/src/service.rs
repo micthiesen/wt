@@ -167,6 +167,26 @@ pub struct RemoveResult {
     pub warnings: Vec<String>,
 }
 
+/// A checkout that a finished removal moved aside and has not deleted yet.
+/// The removal itself is complete: nothing still refers to this directory.
+/// Dropping it undeleted leaves the directory to
+/// [`LifecycleService::sweep_abandoned_quarantines`].
+#[derive(Debug)]
+pub struct QuarantinedCheckout {
+    original: PathBuf,
+    quarantine: PathBuf,
+    /// Advisory lock on the directory itself, taken before the rename and
+    /// held until this process drops it or exits. It is how the sweep tells
+    /// a quarantine whose deletion is still coming from an abandoned one.
+    _owner: Option<std::fs::File>,
+}
+
+impl QuarantinedCheckout {
+    pub fn path(&self) -> &Path {
+        &self.quarantine
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CleanupCandidate {
     pub target: WorktreeTarget,
@@ -833,8 +853,10 @@ impl LifecycleService {
         options: RemoveOptions,
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
-        self.remove_inner(target, options, false, None, cancellation)
-            .await
+        let removed = self
+            .remove_inner(target, options, false, None, cancellation)
+            .await;
+        self.delete_inline(removed, cancellation).await
     }
 
     pub async fn removal_revision(
@@ -894,8 +916,118 @@ impl LifecycleService {
         expected: &RemovalRevision,
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
+        let removed = self
+            .remove_inner(target, options, false, Some(expected), cancellation)
+            .await;
+        self.delete_inline(removed, cancellation).await
+    }
+
+    /// Like `remove_with_revision`, but returns as soon as the worktree is
+    /// removed and its slug is free. A returned checkout still holds the
+    /// files; the caller reports the removal first and then passes it to
+    /// `delete_quarantined`.
+    pub async fn remove_with_revision_deferred(
+        &self,
+        target: &WorktreeTarget,
+        options: RemoveOptions,
+        expected: &RemovalRevision,
+        cancellation: &CancellationToken,
+    ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
         self.remove_inner(target, options, false, Some(expected), cancellation)
             .await
+    }
+
+    /// Delete the files of a removal that already finished. A failure is a
+    /// warning naming the directory, never a failed removal.
+    pub async fn delete_quarantined(
+        &self,
+        checkout: QuarantinedCheckout,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let source = self
+            .delete_quarantine_directory(&checkout.original, &checkout.quarantine, cancellation)
+            .await
+            .err()?;
+        Some(format!(
+            "{} was removed, but deleting the directory it was moved to failed; delete {} manually: {source}",
+            checkout.original.display(),
+            checkout.quarantine.display()
+        ))
+    }
+
+    /// Delete quarantined checkouts no live process is going to delete: a
+    /// worker died after moving one aside, or its deletion failed. Runs off
+    /// the removal's critical path; each returned string is one that is
+    /// still there.
+    pub async fn sweep_abandoned_quarantines(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let Ok(root) = fs::canonicalize(&self.config.worktree_root).await else {
+            return warnings;
+        };
+        let Ok(mut entries) = fs::read_dir(&root).await else {
+            return warnings;
+        };
+        let mut candidates = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if GitRepository::is_removal_quarantine(&entry.file_name()) {
+                candidates.push(entry.path());
+            }
+        }
+        for quarantine in candidates {
+            if cancellation.is_cancelled() {
+                break;
+            }
+            // The claim refuses symlinks and non-directories, and fails while
+            // the process that moved this checkout aside is still alive. A
+            // child forked by any thread also holds the lock until it execs,
+            // so one refusal is not proof of a live owner; a real owner
+            // outlasts the retries.
+            let mut owner = None;
+            for attempt in 0..SWEEP_CLAIM_ATTEMPTS {
+                match claim_directory(&quarantine) {
+                    Ok(Some(claimed)) => {
+                        owner = Some(claimed);
+                        break;
+                    }
+                    Ok(None) if attempt + 1 < SWEEP_CLAIM_ATTEMPTS => {
+                        tokio::time::sleep(SWEEP_CLAIM_RETRY).await;
+                    }
+                    _ => break,
+                }
+            }
+            let Some(_owner) = owner else {
+                continue;
+            };
+            tracing::info!(target: "wt::removal", quarantine = %quarantine.display(),
+                "deleting a quarantined checkout left by an earlier removal");
+            if let Err(source) = self
+                .delete_quarantine_directory(&quarantine, &quarantine, cancellation)
+                .await
+            {
+                warnings.push(format!(
+                    "could not delete the removed checkout left at {}; delete it manually: {source}",
+                    quarantine.display()
+                ));
+            }
+        }
+        warnings
+    }
+
+    async fn delete_inline(
+        &self,
+        removed: Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError>,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoveResult, LifecycleError> {
+        let (mut result, quarantined) = removed?;
+        if let Some(checkout) = quarantined {
+            result
+                .warnings
+                .extend(self.delete_quarantined(checkout, cancellation).await);
+        }
+        Ok(result)
     }
 
     /// Remove only candidates already established as landed by the caller.
@@ -914,8 +1046,8 @@ impl LifecycleService {
                 ))));
                 continue;
             }
-            results.push(
-                self.remove_inner(
+            let removed = self
+                .remove_inner(
                     &candidate.target,
                     RemoveOptions {
                         force: false,
@@ -928,8 +1060,8 @@ impl LifecycleService {
                     None,
                     cancellation,
                 )
-                .await,
-            );
+                .await;
+            results.push(self.delete_inline(removed, cancellation).await);
         }
         results
     }
@@ -941,7 +1073,7 @@ impl LifecycleService {
         cleanup: bool,
         expected_revision: Option<&RemovalRevision>,
         cancellation: &CancellationToken,
-    ) -> Result<RemoveResult, LifecycleError> {
+    ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
         let total = RemovalPhase::new(Path::new(&target.path), "total");
         let result = self
             .remove_locked(target, options, cleanup, expected_revision, cancellation)
@@ -957,7 +1089,7 @@ impl LifecycleService {
         cleanup: bool,
         expected_revision: Option<&RemovalRevision>,
         cancellation: &CancellationToken,
-    ) -> Result<RemoveResult, LifecycleError> {
+    ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
         let slug = target.slug();
         let trace = Path::new(&target.path);
         let lock = timed(
@@ -1016,7 +1148,8 @@ impl LifecycleService {
                     &lock,
                     cancellation,
                 )
-                .await;
+                .await
+                .map(|result| (result, None));
         }
         if let Some(expected) = expected_revision {
             timed(
@@ -1196,6 +1329,25 @@ impl LifecycleService {
         } else {
             None
         };
+        // Only a caller's witness may stand in for Git's own dirty check, so
+        // only then is the checkout moved aside instead of unlinked by Git.
+        // Its identity is pinned before the final witness: the directory
+        // moved aside is the one that witness verified.
+        let witnessed_identity =
+            if backend == BackendKind::GitWorktree && expected_revision.is_some() {
+                fs::symlink_metadata(&path)
+                    .await
+                    .ok()
+                    .filter(std::fs::Metadata::is_dir)
+                    .map(|metadata| directory_identity(&metadata))
+            } else {
+                None
+            };
+        // Git's own refusals are applied before the final witness, so that
+        // nothing but the rename stands between that witness and the move.
+        let movable = self
+            .movable_linked_worktree(&row, &path, witnessed_identity, force)
+            .await?;
         if let Some(expected) = verified_revision.as_ref() {
             timed(
                 trace,
@@ -1209,17 +1361,48 @@ impl LifecycleService {
             )
             .await?;
         }
-        // Status reads above may have started an fsmonitor daemon; it writes
-        // cookies under the Git dir and makes a concurrent `rm` fail.
-        self.stop_fsmonitor(&row, &path, cancellation).await;
+        let mut quarantined = None;
+        if let Some(identity) = movable {
+            quarantined = self
+                .quarantine_linked_worktree(&path, identity, cancellation)
+                .await?;
+        }
         match backend {
             BackendKind::GitWorktree => {
-                timed(
-                    trace,
-                    "git-worktree-remove",
-                    self.remove_git_worktree(&path, &main, force, cancellation),
-                )
-                .await?;
+                if let Some(moved) = quarantined.as_ref() {
+                    // The rename was the commit point. The daemon is stopped
+                    // through the moved checkout while its `.git` pointer
+                    // still resolves; the pointer then goes, so nothing left
+                    // running in the old files can reach the administration
+                    // directory a recreated slug will reuse.
+                    self.stop_fsmonitor(&row, moved.path(), &CancellationToken::new())
+                        .await;
+                    if let Err(error) = fs::remove_file(moved.path().join(".git")).await {
+                        tracing::warn!(target: "wt::removal", path = %moved.path().display(), %error,
+                            "could not detach the moved checkout from its Git directory");
+                    }
+                    // With the checkout gone Git only drops this worktree's
+                    // own registration, which `git worktree prune` would do
+                    // for every missing checkout in the repository. A failure
+                    // here is settled by the registration check below.
+                    let _ = timed(
+                        trace,
+                        "git-worktree-remove",
+                        self.remove_git_worktree(&path, &main, false, &CancellationToken::new()),
+                    )
+                    .await;
+                } else {
+                    // Status reads above may have started an fsmonitor
+                    // daemon; it writes cookies under the Git dir and makes
+                    // a concurrent `rm` fail.
+                    self.stop_fsmonitor(&row, &path, cancellation).await;
+                    timed(
+                        trace,
+                        "git-worktree-remove",
+                        self.remove_git_worktree(&path, &main, force, cancellation),
+                    )
+                    .await?;
+                }
                 // Git can exit 0 with the checkout gone and its metadata still
                 // registered; that row would stay on the board as live.
                 if let Err(error) = self
@@ -1240,9 +1423,83 @@ impl LifecycleService {
         }
         // The checkout removal is the irreversible commit point. Finish branch
         // cleanup and durable bookkeeping even if cancellation arrives now.
-        Ok(self
+        let result = self
             .finish_removal(&row, &main, backend, &options, destroyed_stage, warnings)
-            .await)
+            .await;
+        Ok((result, quarantined))
+    }
+
+    /// Whether a witnessed linked worktree may be moved aside instead of
+    /// unlinked by Git. `Ok(None)` leaves the removal to `git worktree
+    /// remove`. The rename would bypass Git's refusals, so they are applied
+    /// here.
+    async fn movable_linked_worktree(
+        &self,
+        row: &WorktreeRecord,
+        path: &Path,
+        witnessed: Option<DirectoryIdentity>,
+        force: bool,
+    ) -> Result<Option<DirectoryIdentity>, LifecycleError> {
+        let Some(identity) = witnessed else {
+            return Ok(None);
+        };
+        let Some(admin) = linked_admin_dir(path).await else {
+            return Ok(None);
+        };
+        match fs::try_exists(admin.join("locked")).await {
+            Ok(false) if !row.locked => {}
+            Ok(_) => {
+                return Err(LifecycleError::Refused(format!(
+                    "{} is locked in Git; run `git worktree unlock` on it before removing",
+                    row.target.slug()
+                )));
+            }
+            Err(_) => return Ok(None),
+        }
+        // Unforced, Git refuses a worktree with submodules; let it decide.
+        if !force {
+            for marker in [path.join(".gitmodules"), admin.join("modules")] {
+                if !matches!(fs::symlink_metadata(&marker).await,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound)
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(identity))
+    }
+
+    /// Move a witnessed linked worktree aside so that deleting its files
+    /// happens after the removal, outside the slug lock. `Ok(None)` leaves
+    /// the removal to `git worktree remove`; nothing was changed.
+    async fn quarantine_linked_worktree(
+        &self,
+        path: &Path,
+        identity: DirectoryIdentity,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<QuarantinedCheckout>, LifecycleError> {
+        if cancellation.is_cancelled() {
+            return Err(LifecycleError::Cancelled);
+        }
+        match timed(
+            path,
+            "quarantine-rename",
+            quarantine_checkout(path, identity, true),
+        )
+        .await
+        {
+            Ok(quarantined) => Ok(Some(quarantined)),
+            // The checkout could not be moved (another filesystem,
+            // permissions): Git still removes it in place, with its own checks.
+            Err(LifecycleError::Io {
+                operation, source, ..
+            }) => {
+                tracing::warn!(target: "wt::removal", path = %path.display(), operation, %source,
+                    "could not move the checkout aside; removing it in place with Git");
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Branch cleanup and durable bookkeeping after the checkout is gone.
@@ -2436,21 +2693,38 @@ impl LifecycleService {
             return Err(LifecycleError::Cancelled);
         }
         let identity = identity.expect("checkout metadata was read");
-        let quarantine = timed(
+        let quarantined = timed(
             path,
             "quarantine-rename",
-            quarantine_checkout(path, identity),
+            quarantine_checkout(path, identity, false),
         )
         .await?;
-        tracing::info!(target: "wt::removal", path = %path.display(), quarantine = %quarantine.display(),
+        tracing::info!(target: "wt::removal", path = %path.display(), quarantine = %quarantined.quarantine.display(),
             "retired independent clone moved aside for deletion");
-        let phase = RemovalPhase::new(path, "quarantine-delete");
+        let warning = self.delete_quarantined(quarantined, cancellation).await;
+        if warning.is_none() {
+            tracing::info!(target: "wt::lifecycle", path = %path.display(),
+                "retired independent clone removed; Rift registry unchanged");
+        }
+        Ok(warning)
+    }
+
+    /// Delete a directory already moved aside. Retries only `Directory not
+    /// empty`, which means some process created entries after `rm` listed a
+    /// directory.
+    async fn delete_quarantine_directory(
+        &self,
+        trace: &Path,
+        quarantine: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ProcessError> {
+        let phase = RemovalPhase::new(trace, "quarantine-delete");
         for attempt in 1..=QUARANTINE_DELETE_ATTEMPTS {
             let mut spec = quarantine_cleanup(
                 &OsString::from("rm"),
                 vec!["-rf".into(), "--".into(), quarantine.as_os_str().to_owned()],
             );
-            spec.cwd = Some(root.clone());
+            spec.cwd = quarantine.parent().map(Path::to_path_buf);
             // Once recursive deletion starts, retain ownership until the process
             // exits. Cancelling halfway cannot restore an independent object store.
             let result = self
@@ -2461,9 +2735,7 @@ impl LifecycleService {
             let source = match result {
                 Ok(()) => {
                     phase.finish("success");
-                    tracing::info!(target: "wt::lifecycle", path = %path.display(), attempts = attempt,
-                        "retired independent clone removed; Rift registry unchanged");
-                    return Ok(None);
+                    return Ok(());
                 }
                 Err(source) => source,
             };
@@ -2477,11 +2749,7 @@ impl LifecycleService {
                 not_empty && attempt < QUARANTINE_DELETE_ATTEMPTS && !cancellation.is_cancelled();
             if !retry {
                 phase.finish("error");
-                return Ok(Some(format!(
-                    "{} was removed, but deleting the directory it was moved to failed; delete {} manually: {source}",
-                    path.display(),
-                    quarantine.display()
-                )));
+                return Err(source);
             }
             tracing::warn!(target: "wt::removal", quarantine = %quarantine.display(), attempt,
                 "entries appeared during quarantine deletion; retrying");
@@ -2813,15 +3081,29 @@ impl LifecycleService {
                     "revalidate published removal base",
                 )
                 .await?;
-            let still_published = advertised.status.success()
-                && advertised.stdout_text().lines().any(|line| {
-                    line.split_once('\t')
-                        .is_some_and(|(oid, name)| oid == tip && name == reference)
-                });
-            if !still_published {
-                return Err(LifecycleError::Refused(
-                    "published base changed or is unavailable after removal planning; review current landing evidence before removing".into(),
-                ));
+            let output = advertised.stdout_text();
+            let advertised_tip = output.lines().find_map(|line| {
+                line.split_once('\t')
+                    .filter(|(_, name)| name == reference)
+                    .map(|(oid, _)| oid)
+            });
+            let branch = reference.trim_start_matches("refs/heads/");
+            let refusal = match advertised_tip {
+                Some(oid) if advertised.status.success() && oid == tip => None,
+                Some(_) if advertised.status.success() => Some(format!(
+                    "published base changed: origin's {branch} moved after this removal was planned, so its landing evidence is out of date; nothing was removed; retry the removal to plan it against the current {branch}"
+                )),
+                // `ls-remote --exit-code` exits 2 when origin answered
+                // without the ref.
+                _ if advertised.status.code() == Some(2) => Some(format!(
+                    "published base is gone: origin no longer has {branch}, which this removal was planned against; nothing was removed; retry the removal to plan it again"
+                )),
+                _ => Some(format!(
+                    "published base is unavailable: origin could not be read to recheck {branch} for this removal; nothing was removed; retry once origin is reachable"
+                )),
+            };
+            if let Some(refusal) = refusal {
+                return Err(LifecycleError::Refused(refusal));
             }
         }
         let hazards = self
@@ -3944,6 +4226,59 @@ fn directory_identity(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
     }
 }
 
+const SWEEP_CLAIM_ATTEMPTS: u32 = 10;
+const SWEEP_CLAIM_RETRY: Duration = Duration::from_millis(50);
+
+/// Take the exclusive advisory lock on a directory itself. `Ok(None)` means
+/// a live process holds it. Symlinks and non-directories are errors.
+#[cfg(unix)]
+fn claim_directory(path: &Path) -> io::Result<Option<std::fs::File>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(directory));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn claim_directory(_path: &Path) -> io::Result<Option<std::fs::File>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory locks are unavailable",
+    ))
+}
+
+/// Git's administration directory for a linked worktree, read from its
+/// `.git` file. `None` for anything that is not plainly one.
+async fn linked_admin_dir(path: &Path) -> Option<PathBuf> {
+    let pointer = path.join(".git");
+    if !fs::symlink_metadata(&pointer).await.ok()?.is_file() {
+        return None;
+    }
+    let contents = fs::read_to_string(&pointer).await.ok()?;
+    let admin = path.join(
+        contents
+            .strip_prefix("gitdir: ")?
+            .trim_end_matches(['\r', '\n']),
+    );
+    fs::metadata(&admin)
+        .await
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map(|_| admin)
+}
+
 /// Move a verified checkout to a fresh `.wt-removing-*` sibling in the same
 /// directory, so the rename is atomic and stays on one filesystem. Nothing is
 /// deleted here. If the moved directory is not the one that was verified, it
@@ -3951,7 +4286,8 @@ fn directory_identity(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
 async fn quarantine_checkout(
     path: &Path,
     expected: DirectoryIdentity,
-) -> Result<PathBuf, LifecycleError> {
+    require_claim: bool,
+) -> Result<QuarantinedCheckout, LifecycleError> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(LifecycleError::Invalid(format!(
             "checkout has no parent directory: {}",
@@ -3998,6 +4334,47 @@ async fn quarantine_checkout(
             path.display()
         )));
     }
+    // Claimed before the rename, so a directory under the quarantine name is
+    // never seen unowned while this process lives.
+    let owner = match claim_directory(path) {
+        Ok(Some(owner)) => {
+            let claimed = owner.metadata().map_err(|source| LifecycleError::Io {
+                operation: "revalidate claimed checkout before quarantine",
+                path: path.to_owned(),
+                source,
+            })?;
+            if directory_identity(&claimed) != expected {
+                return Err(LifecycleError::Refused(format!(
+                    "checkout identity changed before removal: {}",
+                    path.display()
+                )));
+            }
+            Some(owner)
+        }
+        // A retired clone has no in-place removal to fall back to, so it
+        // moves unowned rather than fail on a filesystem without these locks.
+        Ok(None) | Err(_) if !require_claim => None,
+        Ok(None) => {
+            return Err(LifecycleError::Io {
+                operation: "claim checkout for removal (nothing was deleted)",
+                path: path.to_owned(),
+                source: io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another process holds a lock on the directory",
+                ),
+            });
+        }
+        // No advisory locks here: the directory moves unowned and no sweep
+        // can claim it either.
+        Err(error) if error.kind() == io::ErrorKind::Unsupported => None,
+        Err(source) => {
+            return Err(LifecycleError::Io {
+                operation: "claim checkout for removal (nothing was deleted)",
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
     fs::rename(path, &quarantine)
         .await
         .map_err(|source| LifecycleError::Io {
@@ -4010,16 +4387,34 @@ async fn quarantine_checkout(
         .as_ref()
         .is_ok_and(|metadata| directory_identity(metadata) == expected && metadata.is_dir())
     {
-        return Ok(quarantine);
+        return Ok(QuarantinedCheckout {
+            original: path.to_owned(),
+            quarantine,
+            _owner: owner,
+        });
     }
     // Something replaced the checkout between the check and the rename.
     // Put it back untouched and refuse; nothing was deleted.
     if let Err(error) = fs::rename(&quarantine, path).await {
         tracing::error!(target: "wt::removal", %error, quarantine = %quarantine.display(),
             "could not restore an unexpected directory moved aside for removal");
+        // It was never verified, so it must not keep a name the sweep
+        // deletes.
+        let unexpected = quarantine.with_file_name(format!(
+            ".wt-unexpected-{}",
+            quarantine
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .trim_start_matches('.')
+        ));
+        let left_at = match fs::rename(&quarantine, &unexpected).await {
+            Ok(()) => unexpected,
+            Err(_) => quarantine,
+        };
         return Err(LifecycleError::Refused(format!(
             "checkout identity changed during removal; the unexpected directory is at {}",
-            quarantine.display()
+            left_at.display()
         )));
     }
     Err(LifecycleError::Refused(format!(
@@ -6070,7 +6465,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            quarantine_checkout(&path, verified).await,
+            quarantine_checkout(&path, verified, false).await,
             Err(LifecycleError::Refused(ref message)) if message.contains("identity changed")
         ));
         assert_eq!(
@@ -6092,9 +6487,9 @@ mod tests {
             .await
             .unwrap();
         assert!(inventory.iter().any(|row| row.target.slug() == "aside"));
-        let quarantine = quarantine_checkout(&clone, identity).await.unwrap();
+        let quarantine = quarantine_checkout(&clone, identity, false).await.unwrap();
         assert!(!clone.exists());
-        assert!(quarantine.join(".git/HEAD").exists());
+        assert!(quarantine.path().join(".git/HEAD").exists());
         let inventory = service
             .repository
             .inventory(&CancellationToken::new())
@@ -6952,5 +7347,414 @@ mod tests {
         assert!(timed_out.unhashed);
         assert_eq!(timed_out, snapshot(few, None));
         assert_ne!(timed_out.metadata, hashed.metadata);
+    }
+
+    async fn linked(service: &LifecycleService, branch: &str) -> WorktreeTarget {
+        service
+            .create(
+                branch,
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .target
+    }
+
+    async fn registered(service: &LifecycleService, slug: &str) -> bool {
+        service
+            .repository
+            .inventory(&CancellationToken::new())
+            .await
+            .unwrap()
+            .iter()
+            .any(|row| row.target.slug() == slug)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn witnessed_removal_frees_the_slug_before_its_files_are_deleted() {
+        let (_scratch, service, _runner, main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        fs::write(main.join(".git/info/exclude"), "node_modules\n")
+            .await
+            .unwrap();
+        let target = linked(&service, "michael/ENG-31-fast").await;
+        let path = PathBuf::from(&target.path);
+        fs::create_dir_all(path.join("node_modules/pkg"))
+            .await
+            .unwrap();
+        fs::write(path.join("node_modules/pkg/index.js"), "x")
+            .await
+            .unwrap();
+        // Another registration whose checkout is missing is not this
+        // removal's to prune.
+        let missing = linked(&service, "michael/ENG-32-missing").await;
+        std::fs::remove_dir_all(&missing.path).unwrap();
+        let revision = service
+            .removal_revision(&target, false, &cancellation)
+            .await
+            .unwrap();
+        let (result, quarantined) = service
+            .remove_with_revision_deferred(
+                &target,
+                RemoveOptions::default(),
+                &revision,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(result.removed);
+        assert_eq!(result.warnings, Vec::<String>::new());
+        let quarantined = quarantined.expect("the checkout is moved aside, not deleted yet");
+        assert!(!path.exists());
+        assert!(
+            quarantined
+                .path()
+                .join("node_modules/pkg/index.js")
+                .exists()
+        );
+        assert!(!registered(&service, target.slug()).await);
+        assert!(registered(&service, missing.slug()).await);
+        assert!(
+            FileLock::try_acquire(&service.config.lock_dir, target.slug(), "probe")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let removed = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        assert!(removed.iter().any(|entry| entry.slug == target.slug()));
+        // The slug is usable again while the old files still exist.
+        let again = linked(&service, "michael/ENG-31-fast").await;
+        assert_eq!(again.path, target.path);
+        assert_eq!(
+            service.delete_quarantined(quarantined, &cancellation).await,
+            None
+        );
+        assert!(quarantines(&root).is_empty(), "{:?}", quarantines(&root));
+        assert!(path.join("tracked.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_checkout_dirtied_after_planning_is_refused_before_it_is_moved_aside() {
+        let (_scratch, service, _runner, _main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let target = linked(&service, "michael/ENG-33-dirty-late").await;
+        let path = PathBuf::from(&target.path);
+        let revision = service
+            .removal_revision(&target, false, &cancellation)
+            .await
+            .unwrap();
+        fs::write(path.join("tracked.txt"), "edited after the plan\n")
+            .await
+            .unwrap();
+        let result = service
+            .remove_with_revision_deferred(
+                &target,
+                RemoveOptions::default(),
+                &revision,
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(LifecycleError::Refused(message)) if message.contains("changed")),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("tracked.txt")).await.unwrap(),
+            "edited after the plan\n"
+        );
+        assert!(quarantines(&root).is_empty());
+        assert!(registered(&service, target.slug()).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_locked_worktree_is_refused_not_moved_aside() {
+        let (_scratch, service, runner, main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let target = linked(&service, "michael/ENG-34-locked").await;
+        let revision = service
+            .removal_revision(&target, false, &cancellation)
+            .await
+            .unwrap();
+        run(&runner, &main, &["worktree", "lock", &target.path]).await;
+        for force in [false, true] {
+            let result = service
+                .remove_with_revision_deferred(
+                    &target,
+                    RemoveOptions {
+                        force,
+                        ..RemoveOptions::default()
+                    },
+                    &revision,
+                    &cancellation,
+                )
+                .await;
+            assert!(
+                matches!(&result, Err(LifecycleError::Refused(message)) if message.contains("locked in Git")),
+                "{result:?}"
+            );
+            assert!(Path::new(&target.path).join("tracked.txt").exists());
+            assert!(quarantines(&root).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_checkout_that_cannot_be_moved_aside_is_removed_in_place_by_git() {
+        let (_scratch, service, _runner, _main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let target = linked(&service, "michael/ENG-35-unmovable").await;
+        let path = PathBuf::from(&target.path);
+        let revision = service
+            .removal_revision(&target, false, &cancellation)
+            .await
+            .unwrap();
+        // Quarantine fails at its claim, before anything is renamed.
+        let _held = claim_directory(&path).unwrap().unwrap();
+        let (result, quarantined) = service
+            .remove_with_revision_deferred(
+                &target,
+                RemoveOptions::default(),
+                &revision,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(result.removed);
+        assert!(quarantined.is_none());
+        assert!(!path.exists());
+        assert!(quarantines(&root).is_empty());
+        assert!(!registered(&service, target.slug()).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_quarantine_left_by_a_dead_worker_is_swept_and_its_removal_converges() {
+        let (_scratch, service, _runner, _main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let dead = linked(&service, "michael/ENG-36-dead").await;
+        let live = linked(&service, "michael/ENG-37-live").await;
+        let identity = |path: &str| directory_identity(&std::fs::symlink_metadata(path).unwrap());
+        // A worker that died right after the rename: nothing owns the
+        // directory and Git still registers the checkout.
+        drop(
+            quarantine_checkout(Path::new(&dead.path), identity(&dead.path), true)
+                .await
+                .unwrap(),
+        );
+        let owned = quarantine_checkout(Path::new(&live.path), identity(&live.path), true)
+            .await
+            .unwrap();
+        let stray = root.join(format!(
+            "{}not-a-directory",
+            GitRepository::REMOVAL_QUARANTINE_PREFIX
+        ));
+        fs::write(&stray, "").await.unwrap();
+        assert_eq!(quarantines(&root).len(), 3);
+
+        assert_eq!(
+            service.sweep_abandoned_quarantines(&cancellation).await,
+            Vec::<String>::new()
+        );
+        let names = |paths: Vec<PathBuf>| {
+            let mut names = paths
+                .iter()
+                .map(|path| path.file_name().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            names(quarantines(&root)),
+            names(vec![owned.path().to_path_buf(), stray.clone()])
+        );
+        assert!(owned.path().join("tracked.txt").exists());
+
+        let revision = service
+            .removal_revision(&dead, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(revision.digest, MISSING_CHECKOUT_DIGEST);
+        let result = service
+            .remove_with_revision(&dead, RemoveOptions::default(), &revision, &cancellation)
+            .await
+            .unwrap();
+        assert!(result.removed);
+        assert!(!registered(&service, dead.slug()).await);
+
+        drop(owned);
+        service.sweep_abandoned_quarantines(&cancellation).await;
+        assert_eq!(quarantines(&root), vec![stray]);
+    }
+
+    fn finished_phases(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["fields"]["message"] == "removal phase finished")
+            .filter_map(|event| event["fields"]["phase"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_witnessed_removal_moves_the_checkout_aside() {
+        let (_scratch, service, _runner, _main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let unwitnessed = linked(&service, "michael/ENG-38-unwitnessed").await;
+        let witnessed = linked(&service, "michael/ENG-39-witnessed").await;
+        let revision = service
+            .removal_revision(&witnessed, false, &cancellation)
+            .await
+            .unwrap();
+        let capture = || {
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let file = log.reopen().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_ansi(false)
+                .with_writer(move || file.try_clone().unwrap())
+                .finish();
+            (tracing::subscriber::set_default(subscriber), log)
+        };
+
+        let (guard, log) = capture();
+        let result = service
+            .remove(&unwitnessed, RemoveOptions::default(), &cancellation)
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(result.removed);
+        let phases = finished_phases(log.path());
+        assert!(phases.iter().any(|phase| phase == "git-worktree-remove"));
+        assert!(
+            !phases.iter().any(|phase| phase.starts_with("quarantine-")),
+            "{phases:?}"
+        );
+
+        let (guard, log) = capture();
+        let result = service
+            .remove_with_revision(
+                &witnessed,
+                RemoveOptions::default(),
+                &revision,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(result.removed);
+        let phases = finished_phases(log.path());
+        let position = |name: &str| phases.iter().position(|phase| phase == name);
+        assert!(
+            position("quarantine-rename") < position("total")
+                && position("total") < position("quarantine-delete")
+                && position("quarantine-rename").is_some(),
+            "{phases:?}"
+        );
+        assert!(!Path::new(&witnessed.path).exists());
+        assert!(quarantines(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_moved_or_unreadable_published_base_says_what_happened_and_removes_nothing() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let origin = scratch.path().join("origin.git");
+        run(
+            &runner,
+            scratch.path(),
+            &[
+                "clone",
+                "--bare",
+                main.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        )
+        .await;
+        run(
+            &runner,
+            &main,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        let planned_tip = rev(&runner, &main, "refs/heads/main").await;
+        let target = linked(&service, "michael/ENG-40-base").await;
+        let mut revision = service
+            .removal_revision(&target, true, &cancellation)
+            .await
+            .unwrap();
+        let options = || RemoveOptions {
+            landed: true,
+            ..RemoveOptions::default()
+        };
+        let refusal = |result: Result<RemoveResult, LifecycleError>| match result {
+            Err(LifecycleError::Refused(message)) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        fs::write(main.join("tracked.txt"), "trunk moved\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["commit", "-am", "advance trunk"]).await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        revision.published_base = Some(Box::new(("refs/heads/main".into(), planned_tip.clone())));
+        let moved = refusal(
+            service
+                .remove_with_revision(&target, options(), &revision, &cancellation)
+                .await,
+        );
+        assert!(
+            moved.starts_with("published base changed: origin's main moved")
+                && moved.contains("nothing was removed")
+                && moved.contains("retry"),
+            "{moved}"
+        );
+
+        revision.published_base = Some(Box::new(("refs/heads/absent".into(), planned_tip.clone())));
+        let gone = refusal(
+            service
+                .remove_with_revision(&target, options(), &revision, &cancellation)
+                .await,
+        );
+        assert!(
+            gone.contains("origin no longer has absent") && gone.contains("nothing was removed"),
+            "{gone}"
+        );
+
+        run(
+            &runner,
+            &main,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                scratch.path().join("unreachable.git").to_str().unwrap(),
+            ],
+        )
+        .await;
+        revision.published_base = Some(Box::new(("refs/heads/main".into(), planned_tip)));
+        let unavailable = refusal(
+            service
+                .remove_with_revision(&target, options(), &revision, &cancellation)
+                .await,
+        );
+        assert!(
+            unavailable.starts_with("published base is unavailable")
+                && unavailable.contains("nothing was removed"),
+            "{unavailable}"
+        );
+        assert!(Path::new(&target.path).join("tracked.txt").exists());
     }
 }

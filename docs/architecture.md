@@ -657,6 +657,24 @@ attention feed. Cleanup does not force-remove dirty or unpushed work, and a
 landed branch with an outstanding verification gate remains protected. Missing
 GitHub or inventory facts are unknown, never proof that removal is safe.
 
+Deleting a checkout's files is not part of removing it. A linked worktree
+removed with a removal-revision witness is renamed to a `.wt-removing-*`
+sibling right after the final witness check under the slug lock; that rename
+is the commit point. Git then drops only that worktree's registration, the
+branch and records are settled, the lock is released and success is reported.
+The files are deleted afterwards: by the `_destroy` worker once it has
+published its result, or by foreground `wt rm` after it prints the removal.
+The witness stands in for Git's own dirty check, so every removal without a
+caller witness still runs `git worktree remove` in place, as does one whose
+checkout cannot be moved aside or holds submodules. A Git-locked worktree is
+refused. The mover holds an advisory lock on the quarantined directory itself
+for as long as it lives; a later removal's worker sweeps quarantines nobody
+holds, which covers a worker that died before deleting. A worker that died
+between the rename and Git's bookkeeping leaves a registration with a missing
+checkout, which the ordinary missing-checkout removal finishes. Phase timings
+are logged under `wt::removal` (`quarantine-rename`, `git-worktree-remove`,
+`quarantine-delete`).
+
 Stacks are inferred from each worktree's recorded fork base. Preserve its
 `baseSha`: it anchors squash-safe replay. A trunk fork base means the worktree
 has no stack parent. “Landed” requires commits beyond that recorded base plus

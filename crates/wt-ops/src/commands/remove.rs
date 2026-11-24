@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use wt_lifecycle::RemoveOptions;
 
-use crate::{commands::resolve::resolve_named_worktree, lifecycle_ops};
+use crate::{commands::resolve::resolve_exact_worktree, lifecycle_ops};
 use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
@@ -40,7 +40,7 @@ pub struct RemoveArgs {
 
 pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
     let record = if let Some(slug) = &args.slug {
-        match resolve_named_worktree(ctx, slug).await {
+        match resolve_exact_worktree(ctx, slug).await {
             Ok(record) => record,
             Err(error) => {
                 eprintln!("{error}");
@@ -133,7 +133,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
     let service = lifecycle_ops::service(ctx)?;
     let dev_port = crate::host_cleanup::stored_dev_port(ctx, record.target.slug()).await;
     let result = service
-        .remove_with_revision(
+        .remove_with_revision_deferred(
             &record.target,
             RemoveOptions {
                 force: args.force,
@@ -147,7 +147,7 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
         )
         .await;
     match result {
-        Ok(result) => {
+        Ok((result, quarantined)) => {
             println!("✓ removed {}", record.target.slug());
             if result.removed {
                 for warning in
@@ -163,6 +163,20 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
                 println!("✓ deleted branch {}", record.target.branch);
             }
             for warning in result.warnings {
+                eprintln!("warning: {warning}");
+            }
+            // The worktree is already removed and reported; only its files
+            // remain, and an interrupted delete is swept by a later removal.
+            if let Some(checkout) = quarantined {
+                println!("  deleting its files (safe to interrupt; a later removal finishes it)");
+                if let Some(warning) = service
+                    .delete_quarantined(checkout, &ctx.cancellation)
+                    .await
+                {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            for warning in service.sweep_abandoned_quarantines(&ctx.cancellation).await {
                 eprintln!("warning: {warning}");
             }
             Ok(0)

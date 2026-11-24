@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use wt_core::worktree_target_key;
-use wt_lifecycle::{RemovalRevision, RemoveOptions};
+use wt_lifecycle::{QuarantinedCheckout, RemovalRevision, RemoveOptions};
 use wt_platform::process::CommandSpec;
 use wt_vcs::WorktreeRecord;
 
@@ -403,7 +403,7 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
 
     let result = execute_job(ctx, &job).await;
     match result {
-        Ok(()) => {
+        Ok(quarantined) => {
             job["state"] = json!("succeeded");
             job["error"] = Value::Null;
             job["completedAt"] = json!(now_string());
@@ -416,6 +416,7 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
                 event_text = "Worktree removed",
                 "background removal completed"
             );
+            delete_after_success(ctx, &job, quarantined).await;
             Ok(0)
         }
         Err(error) => {
@@ -521,7 +522,42 @@ async fn reconcile_removal(ctx: &AppContext, key: &str, removal: &Value) -> Resu
     publish_removal_result(ctx, &job).await
 }
 
-async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
+/// Delete the removed checkout's files only now that the job has recorded
+/// and published success: nothing waits on this, and a worker that dies
+/// here leaves a quarantine for the next worker's sweep.
+async fn delete_after_success(
+    ctx: &AppContext,
+    job: &Value,
+    quarantined: Option<QuarantinedCheckout>,
+) {
+    let service = match crate::lifecycle_ops::service(ctx) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!("warning: cannot delete removed checkout files: {error:#}");
+            return;
+        }
+    };
+    if let Some(checkout) = quarantined
+        && let Some(warning) = service
+            .delete_quarantined(checkout, &ctx.cancellation)
+            .await
+    {
+        eprintln!("warning: {warning}");
+        tracing::warn!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = job["target"]["key"].as_str().unwrap_or("wt"),
+            event_text = %format!("Removal warning: {warning}"),
+            "background removal left a warning"
+        );
+    }
+    for warning in service.sweep_abandoned_quarantines(&ctx.cancellation).await {
+        eprintln!("warning: {warning}");
+        tracing::warn!(target: "wt::removal", %warning, "abandoned removal quarantine remains");
+    }
+}
+
+async fn execute_job(ctx: &AppContext, job: &Value) -> Result<Option<QuarantinedCheckout>> {
     let target = &job["target"];
     let key = target["key"].as_str().context("job missing target key")?;
     let path = target["path"].as_str().context("job missing target path")?;
@@ -553,8 +589,8 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
     let options = &job["options"];
     let dev_port = crate::host_cleanup::stored_dev_port(ctx, row.target.slug()).await;
     let service = crate::lifecycle_ops::service(ctx)?;
-    let removed = service
-        .remove_with_revision(
+    let (removed, quarantined) = service
+        .remove_with_revision_deferred(
             &row.target,
             RemoveOptions {
                 force: options["force"].as_bool().unwrap_or(false),
@@ -592,7 +628,7 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<()> {
             eprintln!("warning: {warning}");
         }
     }
-    Ok(())
+    Ok(quarantined)
 }
 
 fn job_dir(ctx: &AppContext) -> PathBuf {
