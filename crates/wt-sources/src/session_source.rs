@@ -486,9 +486,6 @@ fn spawn_discoveries(
             };
 
             let targets = app.targets(&worktrees);
-            if force_refresh {
-                pending.extend(live_discovery_requests(&inv));
-            }
             let known_slugs = targets
                 .iter()
                 .map(|target| target.slug.clone())
@@ -498,23 +495,12 @@ fn spawn_discoveries(
             if inv_changed || git_changed {
                 prior_inventory = Some((*inv).clone());
                 prior_targets = Some(targets.clone());
+            }
+            let refresh_live = force_refresh || inv_changed || git_changed;
+            if refresh_live {
                 pending.extend(live_discovery_requests(&inv));
             }
-            // A worktree literally named `one-codex` owns that tmux
-            // name as its Claude primary. Do not give it to `one` merely
-            // because the suffix resembles another harness's slot.
-            for name in inv.all.keys().filter(|name| known_slugs.contains(*name)) {
-                pending.insert((name.clone(), HarnessId::Claude));
-                if let Some(slug) = name.strip_suffix("-codex") {
-                    pending.remove(&(slug.to_owned(), HarnessId::Codex));
-                }
-                if let Some(slug) = name.strip_suffix("-pi") {
-                    pending.remove(&(slug.to_owned(), HarnessId::Pi));
-                }
-                if let Some(slug) = name.strip_suffix("-opencode") {
-                    pending.remove(&(slug.to_owned(), HarnessId::Opencode));
-                }
-            }
+            claim_slug_named_sessions(&mut pending, &inv, &known_slugs, refresh_live);
             let mut liveness_changed = false;
             for entry in &mut data {
                 let is_live = is_session_live(&inv, entry.key.harness, &entry.session);
@@ -649,6 +635,37 @@ fn spawn_discovery(
     });
 }
 
+/// A worktree literally named `one-codex` owns that tmux name as its Claude
+/// primary. Do not give it to `one` merely because the suffix resembles
+/// another harness's slot. The primary is queued only with the other live
+/// sessions: queueing it on every pass would rediscover every live Claude
+/// primary each time a single session asked for a refresh.
+fn claim_slug_named_sessions(
+    pending: &mut BTreeSet<(String, HarnessId)>,
+    inventory: &SessionInventory,
+    known_slugs: &BTreeSet<String>,
+    refresh_live: bool,
+) {
+    for name in inventory
+        .all
+        .keys()
+        .filter(|name| known_slugs.contains(*name))
+    {
+        if refresh_live {
+            pending.insert((name.clone(), HarnessId::Claude));
+        }
+        if let Some(slug) = name.strip_suffix("-codex") {
+            pending.remove(&(slug.to_owned(), HarnessId::Codex));
+        }
+        if let Some(slug) = name.strip_suffix("-pi") {
+            pending.remove(&(slug.to_owned(), HarnessId::Pi));
+        }
+        if let Some(slug) = name.strip_suffix("-opencode") {
+            pending.remove(&(slug.to_owned(), HarnessId::Opencode));
+        }
+    }
+}
+
 fn live_discovery_requests(inventory: &SessionInventory) -> BTreeSet<(String, HarnessId)> {
     let mut requests = BTreeSet::new();
     for entry in &inventory.kinds.claude {
@@ -770,6 +787,37 @@ mod tests {
         let live_inventory =
             SourceSnapshot::test_live(Some(sessions), SourceState::Ready, Domain::Sessions);
         assert!(confirm_discovery_inputs(&git, &inventory, &live_git, &live_inventory).is_some());
+    }
+
+    #[test]
+    fn one_requested_slug_does_not_requeue_every_live_claude_primary() {
+        let inventory = classify_sessions(vec![
+            session("busy", None),
+            session("quiet", None),
+            session("one-codex", None),
+        ]);
+        let known_slugs = ["busy", "quiet", "one", "one-codex"]
+            .map(str::to_owned)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let requested = BTreeSet::from([("busy".to_owned(), HarnessId::Claude)]);
+
+        let mut pending = requested.clone();
+        claim_slug_named_sessions(&mut pending, &inventory, &known_slugs, false);
+        assert_eq!(pending, requested);
+
+        // A full refresh still gives the slot to the worktree that is
+        // literally named like another harness's session.
+        let mut pending = live_discovery_requests(&inventory);
+        assert!(pending.contains(&("one".to_owned(), HarnessId::Codex)));
+        claim_slug_named_sessions(&mut pending, &inventory, &known_slugs, true);
+        assert_eq!(
+            pending,
+            ["busy", "quiet", "one-codex"]
+                .map(|slug| (slug.to_owned(), HarnessId::Claude))
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]

@@ -402,6 +402,7 @@ pub fn start(
         let mut usage_error = None;
         let mut last_published_error = None;
 
+        let mut undelivered_discoveries = std::collections::BTreeSet::new();
         loop {
             let active = active_from_sources(
                 &app,
@@ -482,8 +483,17 @@ pub fn start(
                 (changed, discovery_changed, errors)
             };
             codex_watch.sync(cursors.codex_output.watched_paths().map(Path::to_path_buf)).await;
-            for (slug, harness) in discovery_changed {
-                commands.discover(slug, harness);
+            // A request the full queue refused is asked again next pass;
+            // otherwise a slug's last change before it went idle would wait
+            // for the discovery backstop.
+            let requests = std::mem::take(&mut undelivered_discoveries)
+                .into_iter()
+                .chain(discovery_changed)
+                .collect::<std::collections::BTreeSet<_>>();
+            for (slug, harness) in requests {
+                if !commands.discover(slug.clone(), harness) {
+                    undelivered_discoveries.insert((slug, harness));
+                }
             }
             snapshot.primary =
                 Some(wt_app_core::harness::read_primary(&primary_path, primary_fallback).await.as_str().to_owned());
@@ -721,24 +731,17 @@ async fn poll_active(
     let fallback_tails = tails.clone();
     let claude_cancel = cancel.clone();
     let read = tokio::task::spawn_blocking(move || {
-        let (changed, errors) =
+        let (changed, moved, errors) =
             poll_claude(&claude_active, &mut cursors, &mut tails, &claude_cancel);
-        (cursors, tails, changed, errors)
+        (cursors, tails, changed, moved, errors)
     })
     .await;
     match read {
-        Ok((cursors, tails, updated, read_errors)) => {
+        Ok((cursors, tails, updated, moved, read_errors)) => {
             *claude_cursors = cursors;
             snapshot.tails = tails;
-            changed |= updated;
-            if updated {
-                discovery_changed.extend(
-                    active
-                        .iter()
-                        .filter(|entry| entry.key.harness == HarnessId::Claude)
-                        .map(|entry| (entry.key.slug.clone(), HarnessId::Claude)),
-                );
-            }
+            changed |= !updated.is_empty();
+            discovery_changed.extend(claude_rediscoveries(moved));
             errors.extend(read_errors);
         }
         Err(error) => {
@@ -1024,13 +1027,25 @@ fn apply_output_update(
     true
 }
 
+/// Discovery re-reads every transcript of a slug, so only the slugs whose own
+/// tail moved are asked for; the discovery backstop covers the rest.
+fn claude_rediscoveries(updated: BTreeSet<SessionKey>) -> BTreeSet<(String, HarnessId)> {
+    updated
+        .into_iter()
+        .map(|key| (key.slug, HarnessId::Claude))
+        .collect()
+}
+
+/// Advances each active tail and returns the sessions whose displayed tail
+/// changed, then those whose transcript moved at all.
 fn poll_claude(
     active: &[(SessionKey, PathBuf)],
     claude_cursors: &mut BTreeMap<SessionKey, ClaudeTailCursor>,
     tails: &mut Vec<SessionTailSnapshot>,
     cancel: &CancellationToken,
-) -> (bool, Vec<String>) {
-    let mut changed = false;
+) -> (BTreeSet<SessionKey>, BTreeSet<SessionKey>, Vec<String>) {
+    let mut changed = BTreeSet::new();
+    let mut moved = BTreeSet::new();
     let mut errors = Vec::new();
     for (key, path) in active {
         if cancel.is_cancelled() {
@@ -1041,6 +1056,9 @@ fn poll_claude(
             .or_insert_with(|| ClaudeTailCursor::new(path.clone()));
         match cursor.read_delta(path) {
             Ok(read) => {
+                if read.reset || read.grew {
+                    moved.insert(key.clone());
+                }
                 if read.reset {
                     if let Some(tail) = tails.iter_mut().find(|tail| tail.key == *key) {
                         tail.lines.clear();
@@ -1051,7 +1069,7 @@ fn poll_claude(
                         });
                         tails.sort_by(|left, right| left.key.cmp(&right.key));
                     }
-                    changed = true;
+                    changed.insert(key.clone());
                 }
                 let delta = read.delta;
                 if !delta.append.is_empty() || !delta.patch.is_empty() {
@@ -1083,7 +1101,7 @@ fn poll_claude(
                         });
                         tails.sort_by(|a, b| a.key.cmp(&b.key));
                     }
-                    changed = true;
+                    changed.insert(key.clone());
                 }
             }
             Err(error) => {
@@ -1091,7 +1109,7 @@ fn poll_claude(
             }
         }
     }
-    (changed, errors)
+    (changed, moved, errors)
 }
 
 fn event_slug_for_text(active: &[ActiveSession], harness: HarnessId, text: &str) -> String {
@@ -1300,6 +1318,7 @@ impl ClaudeTailCursor {
                 return Ok(ClaudeTailRead {
                     delta: Default::default(),
                     reset,
+                    grew: false,
                 });
             }
             Err(error) => return Err(error),
@@ -1346,13 +1365,21 @@ impl ClaudeTailCursor {
                 self.drop_first_fragment = true;
             }
         }
-        Ok(ClaudeTailRead { delta, reset })
+        Ok(ClaudeTailRead {
+            delta,
+            reset,
+            grew: count > 0,
+        })
     }
 }
 
 struct ClaudeTailRead {
     delta: wt_harness::ActivityDelta,
     reset: bool,
+    /// Bytes were read, whether or not they produced a displayed line. A
+    /// title or last-prompt row shows nowhere in the tail but changes what
+    /// discovery reports.
+    grew: bool,
 }
 
 #[cfg(test)]
@@ -1612,21 +1639,86 @@ mod tests {
         let mut cursors = BTreeMap::new();
         let mut tails = Vec::new();
         let cancel = CancellationToken::new();
-        let (changed, errors) = poll_claude(
+        let (changed, _, errors) = poll_claude(
             &[(key.clone(), path.clone())],
             &mut cursors,
             &mut tails,
             &cancel,
         );
-        assert!(changed);
+        assert_eq!(changed, BTreeSet::from([key.clone()]));
         assert!(errors.is_empty());
         assert_eq!(tails[0].lines.len(), 1);
         assert!(tails[0].lines[0].text.contains("old prompt"));
 
         std::fs::write(&path, "").unwrap();
-        let (changed, errors) = poll_claude(&[(key, path)], &mut cursors, &mut tails, &cancel);
-        assert!(changed);
+        let (changed, _, errors) =
+            poll_claude(&[(key.clone(), path)], &mut cursors, &mut tails, &cancel);
+        assert_eq!(changed, BTreeSet::from([key]));
         assert!(errors.is_empty());
         assert!(tails[0].lines.is_empty());
+    }
+
+    #[test]
+    fn only_the_slug_whose_claude_tail_changed_is_rediscovered() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let row = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "user", "timestamp": "2026-01-01T00:00:00Z",
+                    "message": { "content": text }
+                })
+            )
+        };
+        let active = ["busy", "quiet"].map(|slug| {
+            let path = temp.path().join(format!("{slug}.jsonl"));
+            std::fs::write(&path, row("seed")).unwrap();
+            (
+                SessionKey {
+                    slug: slug.into(),
+                    harness: HarnessId::Claude,
+                    session_id: format!("{slug}-id"),
+                },
+                path,
+            )
+        });
+        let mut cursors = BTreeMap::new();
+        let mut tails = Vec::new();
+        let cancel = CancellationToken::new();
+        let (seeded, _, _) = poll_claude(&active, &mut cursors, &mut tails, &cancel);
+        assert_eq!(seeded.len(), 2);
+        let (idle, still, _) = poll_claude(&active, &mut cursors, &mut tails, &cancel);
+        assert!(idle.is_empty() && still.is_empty());
+
+        write!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active[0].1)
+                .unwrap(),
+            "{}",
+            row("more work")
+        )
+        .unwrap();
+        let (_, moved, errors) = poll_claude(&active, &mut cursors, &mut tails, &cancel);
+        assert!(errors.is_empty());
+        assert_eq!(
+            claude_rediscoveries(moved),
+            BTreeSet::from([("busy".to_owned(), HarnessId::Claude)])
+        );
+        // A row that draws nothing in the tail still moves the transcript:
+        // a new title must reach discovery without waiting for the backstop.
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active[1].1)
+                .unwrap(),
+            "{}",
+            serde_json::json!({ "type": "ai-title", "aiTitle": "Renamed" })
+        )
+        .unwrap();
+        let (shown, moved, _) = poll_claude(&active, &mut cursors, &mut tails, &cancel);
+        assert!(shown.is_empty());
+        assert_eq!(moved.len(), 1);
     }
 }
