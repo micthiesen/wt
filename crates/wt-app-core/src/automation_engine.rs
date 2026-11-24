@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use wt_automations::{
     AutomationEvalContext, AutomationFire, AutomationIntent, AutomationLedger, AutomationRow,
     CancellableFiresInput, DispatchClaim, DispatchClaimResult, DispatchKind, DispatchPolicy,
-    DispatchRequest, QueueIntentsInput, cancellable_fires, evaluate, evaluate_breaker_resets,
-    fire_identity, queue_intents,
+    DispatchRequest, LOCAL_SIGHTING_WINDOW_MS, QueueIntentsInput, cancellable_fires, evaluate,
+    evaluate_breaker_resets, fire_identity, queue_intents,
 };
 use wt_config::{AutomationBusyPolicy, AutomationDef};
 
@@ -439,10 +439,11 @@ impl AutomationEngine {
             .await
             .context("read automation ledger")?;
         self.recent = ledger.recent(RECENT_HISTORY);
-        let handled = candidates
-            .into_iter()
-            .filter(|key| ledger.has_handled(key, input.now_ms))
-            .collect::<BTreeSet<_>>();
+        let handled = QueueIntentsInput::handled_keys(
+            &candidates,
+            |key| ledger.has_handled(key, input.now_ms),
+            |key| ledger.recorded_within(key, input.now_ms, LOCAL_SIGHTING_WINDOW_MS),
+        );
         let executing = self.active.keys().cloned().collect::<BTreeSet<_>>();
         let deferred = self.deferrals.keys().cloned().collect::<BTreeSet<_>>();
         let intents = queue_intents(QueueIntentsInput {
@@ -731,17 +732,27 @@ impl AutomationEngine {
             .snapshot()
             .await
             .context("read automation ledger")?;
+        let paused = input.globally_paused || !input.enabled;
+        // While paused the cancellable set also holds what the rules produce
+        // now; a key the ledger already has is not cancelled over.
+        let evaluated = if paused {
+            evaluate(input.rules, input.rows, input.context)
+        } else {
+            Vec::new()
+        };
         let keys = pending
             .iter()
+            .chain(&evaluated)
             .flat_map(|fire| fire.fire_keys.iter())
             .cloned()
             .collect::<BTreeSet<_>>();
-        let handled = keys
-            .into_iter()
-            .filter(|key| snapshot.has_handled(key, input.now_ms))
-            .collect::<BTreeSet<_>>();
+        let handled = QueueIntentsInput::handled_keys(
+            &keys,
+            |key| snapshot.has_handled(key, input.now_ms),
+            |key| snapshot.recorded_within(key, input.now_ms, LOCAL_SIGHTING_WINDOW_MS),
+        );
         let fires = cancellable_fires(CancellableFiresInput {
-            paused: input.globally_paused || !input.enabled,
+            paused,
             state_ready: input.state_ready,
             rules: input.rules,
             rows: input.rows,
@@ -1553,6 +1564,91 @@ mod tests {
         assert!(after.claims.is_empty());
         assert_eq!(engine.pending_count(), 0);
         assert!(ledger.deferred().await.unwrap().is_empty());
+    }
+
+    /// A landing first seen on trunk alone and then through its merged PR is
+    /// one landing: its rule ran once, and an issue a human reopened in
+    /// between must not be closed a second time.
+    #[tokio::test]
+    async fn landing_handled_without_its_pr_does_not_run_again_once_the_pr_is_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [AutomationDef {
+            id: "delete-branch-on-merge".into(),
+            on: AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            settle_seconds: 0.0,
+            ..AutomationDef::default()
+        }];
+        let local = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        let merged_pr = |number| {
+            [AutomationRow {
+                pr: Some(wt_automations::AutomationPr {
+                    number,
+                    state: "MERGED".into(),
+                    ..Default::default()
+                }),
+                ..local[0].clone()
+            }]
+        };
+        let context = AutomationEvalContext {
+            github_fresh: true,
+            ..AutomationEvalContext::default()
+        };
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let pass = |rows, at| {
+            input(
+                &rules,
+                rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+        let delivered = AutomationOutcome::Delivered {
+            slot: DeliverySlot::None,
+        };
+
+        let first = engine.tick(pass(&local, start)).await.unwrap();
+        let claim = first.claims.first().unwrap().clone();
+        assert!(
+            claim
+                .fire()
+                .fire_keys
+                .contains(&"delete-branch-on-merge:merged:worktree:local".to_owned()),
+            "{:?}",
+            claim.fire().fire_keys
+        );
+        engine
+            .finish(&claim, delivered.clone(), start + 1)
+            .await
+            .unwrap();
+
+        let with_pr = merged_pr(7);
+        let second = engine.tick(pass(&with_pr, start + 2)).await.unwrap();
+        assert!(second.claims.is_empty(), "the same landing ran twice");
+        assert_eq!(engine.pending_count(), 0);
+        assert!(
+            !ledger
+                .snapshot()
+                .await
+                .unwrap()
+                .has_handled("delete-branch-on-merge:merged:worktree:7", start + 2)
+        );
+        // Pausing does not record the PR sighting as a cancelled fire either.
+        let mut paused = pass(&with_pr, start + 3);
+        paused.globally_paused = true;
+        assert_eq!(engine.cancel_pending(paused).await.unwrap(), 0);
     }
 
     /// Quitting between two claims of one pass must not strand the first:

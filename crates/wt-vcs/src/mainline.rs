@@ -49,11 +49,13 @@ pub fn branch_reflog_args(branch: &str) -> Vec<String> {
 
 /// Whether the branch itself produced `head`: an update that wrote it was a
 /// commit, a rebase or a cherry-pick. A fast-forward, reset, pull or branch
-/// creation only moved the branch to a commit made elsewhere.
+/// creation only moved the branch to a commit made elsewhere, and so did a
+/// rebase that replayed nothing.
 pub fn committed_on_branch(reflog: &str, head: &str) -> bool {
     reflog.lines().any(|line| {
         line.split_once(' ').is_some_and(|(sha, subject)| {
             sha == head
+                && !rebase_replayed_nothing(sha, subject)
                 && ["commit", "rebase", "cherry-pick", "revert", "am"]
                     .iter()
                     .any(|kind| {
@@ -63,6 +65,20 @@ pub fn committed_on_branch(reflog: &str, head: &str) -> bool {
                     })
         })
     })
+}
+
+/// A rebase that finished on the very commit it rebased onto: the branch had
+/// nothing to replay (it was empty, or all of it was already upstream), so
+/// the rebase only moved it to a base commit. Git writes the target as
+/// `onto <sha>`, abbreviated or full depending on how it was named.
+fn rebase_replayed_nothing(sha: &str, subject: &str) -> bool {
+    if !subject.starts_with("rebase") {
+        return false;
+    }
+    subject
+        .rsplit_once(" onto ")
+        .map(|(_, onto)| onto.trim())
+        .is_some_and(|onto| !onto.is_empty() && (sha.starts_with(onto) || onto.starts_with(sha)))
 }
 
 /// Landing by containment: `head` is in the base and is either off the
@@ -87,11 +103,46 @@ mod tests {
             "h4"
         ));
         assert!(committed_on_branch("h5 commit (amend): fix\n", "h5"));
+        assert!(committed_on_branch(
+            "h6 rebase (finish): returning to refs/heads/x\n",
+            "h6"
+        ));
         // A snapshot the branch fast-forwarded to is not landed work; its own
         // fast-forwarded commit and a merged-in commit are.
         assert!(!contained_head_landed("", reflog, "h3"));
         assert!(contained_head_landed("", reflog, "h2"));
         assert!(contained_head_landed("m b h9\n", "", "h9"));
+    }
+
+    /// An empty branch rebased onto trunk sits on a trunk commit it never
+    /// made; calling that landed let cleanup and branch deletion act on a
+    /// worktree whose agent had not committed yet.
+    #[test]
+    fn a_rebase_that_replayed_nothing_is_a_move_not_own_work() {
+        let onto = "affe40e1359e0c8f6a1d2b3c4d5e6f708192a3b4";
+        let full = format!(
+            "{onto} rebase (finish): refs/heads/feature onto {onto}\n{onto} branch: Created from origin/main\n"
+        );
+        assert!(!committed_on_branch(&full, onto));
+        assert!(!contained_head_landed("", &full, onto));
+        let abbreviated = format!("{onto} rebase (finish): refs/heads/feature onto affe40e135\n");
+        assert!(!committed_on_branch(&abbreviated, onto));
+        let short_head = "affe40e135 rebase (finish): refs/heads/feature onto affe40e1359e0c8f\n";
+        assert!(!committed_on_branch(short_head, "affe40e135"));
+
+        // Replayed commits end on a new hash, which is the branch's own.
+        let real = format!(
+            "b00c1e5d7f9a1b3c5d7e9f0a2b4c6d8e0f1a3b5c rebase (finish): refs/heads/feature onto {onto}\n"
+        );
+        assert!(committed_on_branch(
+            &real,
+            "b00c1e5d7f9a1b3c5d7e9f0a2b4c6d8e0f1a3b5c"
+        ));
+        // A later commit on that same base commit is still own work.
+        let then_committed = format!("c0ffee commit: work\n{full}");
+        assert!(committed_on_branch(&then_committed, "c0ffee"));
+        // Merged in rather than fast-forwarded: off the base's own line.
+        assert!(contained_head_landed("m b h9\n", &full, "h9"));
     }
 
     #[test]

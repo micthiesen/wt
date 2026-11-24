@@ -13,7 +13,10 @@ pub use ledger::{
     AutomationLedger, BREAKER_LIMIT, BreakerState, DispatchClaim, DispatchClaimResult,
     DispatchKind, DispatchPolicy, DispatchRequest, LedgerError, LedgerRecord, LedgerSnapshot,
 };
-pub use queue::{CancellableFiresInput, QueueIntentsInput, cancellable_fires, queue_intents};
+pub use queue::{
+    CancellableFiresInput, LOCAL_SIGHTING_WINDOW_MS, QueueIntentsInput, cancellable_fires,
+    queue_intents,
+};
 pub use types::{
     ActionAudience, ActionTraits, AutomationConflict, AutomationEvalContext, AutomationFire,
     AutomationIntent, AutomationPr, AutomationRow, AutomationStack, BranchRange, BranchTip,

@@ -33,6 +33,40 @@ pub struct QueueIntentsInput<'a> {
     pub deferred: &'a BTreeSet<String>,
 }
 
+impl QueueIntentsInput<'_> {
+    /// The `handled` set for these fire keys: each key the ledger has, plus
+    /// the PR-less sighting of a landing key when that sighting is recent.
+    /// The alias is never among a PR-numbered fire's own keys, and without it
+    /// a landing handled through trunk alone runs again once its PR is seen
+    /// merged, moments later. It is honoured only while recent because the
+    /// landed key lasts as long as the worktree: an old PR-less sighting
+    /// says nothing about a pull request opened and merged afterwards.
+    pub fn handled_keys<'k>(
+        keys: impl IntoIterator<Item = &'k String>,
+        is_handled: impl Fn(&str) -> bool,
+        recently_recorded: impl Fn(&str) -> bool,
+    ) -> BTreeSet<String> {
+        keys.into_iter()
+            .flat_map(|key| {
+                let alias = local_sighting(key).filter(|alias| recently_recorded(alias));
+                [Some(key.clone()), alias]
+            })
+            .flatten()
+            .filter(|key| is_handled(key))
+            .collect()
+    }
+}
+
+/// How long a PR-less sighting may stand in for the same landing's PR. The
+/// merged PR shows up at the next GitHub read, minutes at most.
+pub const LOCAL_SIGHTING_WINDOW_MS: i64 = 60 * 60 * 1000;
+
+/// The key the same landing has when no PR is known for it.
+fn local_sighting(key: &str) -> Option<String> {
+    let (stem, tail) = key.rsplit_once(':')?;
+    (stem.contains(":merged:") && tail != "local").then(|| format!("{stem}:local"))
+}
+
 /// Reconstruct exact cancellable fires while paused. The queue itself is
 /// ephemeral, but cancellation writes these keys to the durable ledger before
 /// the caller removes its pending intents.
@@ -307,6 +341,18 @@ mod tests {
         );
         // Other keys stay independent.
         assert_eq!(open_keys(&fire(&["a", "b"]), &set(&["a"])), ["b"]);
+
+        // The set the engine builds from a ledger holding the PR-less
+        // sighting carries it, though the PR-numbered fire never names it.
+        let ledger = set(&["r:merged:s:local", landed]);
+        let keys = fire(&["r:merged:s:7", landed]);
+        let handled = QueueIntentsInput::handled_keys(&keys, |key| ledger.contains(key), |_| true);
+        assert_eq!(handled, ledger);
+        assert!(open_keys(&keys, &handled).is_empty());
+        // An old PR-less sighting is not this pull request's landing: the
+        // landed key outlives it, so the PR merged later still runs.
+        let handled = QueueIntentsInput::handled_keys(&keys, |key| ledger.contains(key), |_| false);
+        assert_eq!(open_keys(&keys, &handled), ["r:merged:s:7"]);
     }
 
     #[test]

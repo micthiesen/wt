@@ -32,8 +32,59 @@ pub fn chunk_branches(branches: &[String], size: usize) -> Vec<Vec<String>> {
     branches.chunks(size).map(<[String]>::to_vec).collect()
 }
 
+/// The longest failure message reported: it reaches the log, the board and
+/// the events state file.
+const MAX_FAILURE_MESSAGE_CHARS: usize = 500;
+
+/// The `errors` of a GitHub JSON reply as `TYPE: message` lines, or `None`
+/// when `stdout` is not such a reply. A failed GraphQL read still carries its
+/// partial `data`: PR titles, comments and review text, which is neither
+/// evidence of the failure's class nor fit for an error message.
+fn response_errors(stdout: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let errors = value.get("errors")?.as_array()?;
+    // A REST reply names the failure beside its `errors`.
+    let mut lines: Vec<String> = value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(|message| message.trim().to_owned())
+        .filter(|message| !message.is_empty())
+        .into_iter()
+        .collect();
+    for error in errors {
+        let text = |key: &str| error.get(key).and_then(Value::as_str).map(str::trim);
+        let line = match (
+            text("type").or_else(|| text("code")),
+            text("message").or_else(|| error.as_str().map(str::trim)),
+        ) {
+            (Some(kind), Some(message)) => format!("{kind}: {message}"),
+            (Some(only), None) | (None, Some(only)) => only.to_owned(),
+            (None, None) => continue,
+        };
+        // One alias per branch fails the same way; say it once.
+        if !line.is_empty() && !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push("GitHub returned errors without a message".into());
+    }
+    // The reported text is capped, and a rate limit is recognised from it.
+    lines.sort_by_key(|line| !is_rate_limit(&line.to_lowercase()));
+    Some(lines.join("; "))
+}
+
+fn capped(message: &str) -> String {
+    match message.char_indices().nth(MAX_FAILURE_MESSAGE_CHARS) {
+        Some((end, _)) => format!("{}...", &message[..end]),
+        None => message.to_owned(),
+    }
+}
+
 /// Failure classes known to clear without changing a user's settings.
 pub fn is_transient_failure(stderr: &str, stdout: &str, timed_out: bool) -> bool {
+    let errors = response_errors(stdout);
+    let stdout = errors.as_deref().unwrap_or(stdout);
     let text = format!("{stderr}\n{stdout}").to_lowercase();
     if [
         "rate limit",
@@ -292,6 +343,7 @@ pub fn missing_workflow_scope(error: &str) -> bool {
 pub(crate) fn output_failure(output: &ProcessOutput) -> (String, bool) {
     let stderr = output.stderr_text();
     let stdout = output.stdout_text();
+    let stdout = response_errors(&stdout).unwrap_or(stdout);
     let transient = is_transient_failure(&stderr, &stdout, false);
     let combined = format!("{stderr}\n{stdout}");
     let special = combined.lines().find(|line| {
@@ -308,11 +360,12 @@ pub(crate) fn output_failure(output: &ProcessOutput) -> (String, bool) {
         }
     });
     (
-        body.lines()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("gh exited nonzero")
-            .trim()
-            .to_owned(),
+        capped(
+            body.lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("gh exited nonzero")
+                .trim(),
+        ),
         transient,
     )
 }
@@ -366,5 +419,79 @@ mod tests {
             "refusing to allow an OAuth App to create or update workflow without workflow scope"
         ));
         assert!(!missing_workflow_scope("rate limit exceeded"));
+    }
+
+    fn failed(stdout: &str, stderr: &str) -> ProcessOutput {
+        use std::os::unix::process::ExitStatusExt;
+        ProcessOutput {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            elapsed: std::time::Duration::ZERO,
+        }
+    }
+
+    /// A GraphQL `INTERNAL` error arrives with the partial `data` of the
+    /// aliases that did resolve. A review comment in it mentioning
+    /// "authentication" must not make the server error permanent, and none
+    /// of it belongs in the message.
+    #[test]
+    fn a_json_error_reply_is_judged_and_reported_by_its_errors_alone() {
+        let internal = json!({
+            "type": "INTERNAL",
+            "path": ["repository", "b3"],
+            "message": "Something went wrong while executing your query. Please include `ABCD:1234` when reporting this issue."
+        });
+        let body = json!({
+            "data": {"repository": {"b0": {"nodes": [{
+                "title": "Fix authentication for the rate limit banner",
+                "comments": {"nodes": [{"body": "secret review text. ".repeat(4000)}]}
+            }]}}},
+            "errors": [internal.clone(), internal],
+        })
+        .to_string();
+        assert!(body.len() > 77_000);
+        assert!(is_transient_failure("", &body, false));
+        let (message, transient) = output_failure(&failed(&body, ""));
+        assert!(transient);
+        assert_eq!(
+            message,
+            "INTERNAL: Something went wrong while executing your query. Please include `ABCD:1234` when reporting this issue."
+        );
+        assert!(!is_rate_limit(&message));
+
+        // The errors themselves still decide: these never retry on their own.
+        let rate = json!({
+            "data": {"note": "internal server error"},
+            "errors": [{"type": "RATE_LIMITED", "message": "API quota exhausted for installation."}],
+        })
+        .to_string();
+        assert!(!is_transient_failure("", &rate, false));
+        let (message, transient) = output_failure(&failed(&rate, ""));
+        assert!(!transient);
+        assert!(is_rate_limit(&message), "{message}");
+        let auth = json!({"errors": [{"message": "Bad credentials: authentication required"}]})
+            .to_string();
+        assert!(!is_transient_failure("HTTP 502", &auth, false));
+
+        // Text that is not an error reply is read as before.
+        assert!(is_transient_failure("", "HTTP 502 Bad Gateway", false));
+        assert!(!is_transient_failure("", "authentication failed", false));
+    }
+
+    #[test]
+    fn a_reported_failure_is_capped_on_a_character_boundary() {
+        let long = "é".repeat(2_000);
+        let (message, _) = output_failure(&failed("", &long));
+        assert_eq!(
+            message,
+            format!("{}...", "é".repeat(MAX_FAILURE_MESSAGE_CHARS))
+        );
+        let errors = json!({"errors": [{"message": long}]}).to_string();
+        let (message, _) = output_failure(&failed(&errors, ""));
+        assert_eq!(message.chars().count(), MAX_FAILURE_MESSAGE_CHARS + 3);
+        assert_eq!(output_failure(&failed("", "gh: short")).0, "gh: short");
     }
 }

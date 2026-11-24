@@ -452,6 +452,12 @@ async fn delete_branch(ctx: &AppContext, fire: &AutomationFire) -> Result<Builti
                 message: format!("deleted remote branch {branch}"),
             })
         }
+        LeasedDelete::AlreadyGone => {
+            tracing::info!(rule = %fire.rule.id, branch, "remote branch was already deleted");
+            Ok(BuiltinExecution::Completed {
+                message: format!("remote branch {branch} was already gone"),
+            })
+        }
         LeasedDelete::Refused(error) | LeasedDelete::Unreachable(error) => {
             tracing::warn!(rule = %fire.rule.id, branch, %error, "automation delete branch declined");
             attention(
@@ -564,8 +570,11 @@ async fn stacked_worktrees(ctx: &AppContext, branch: &str, own_slug: &str) -> Re
 #[derive(Debug, PartialEq, Eq)]
 enum LeasedDelete {
     Deleted,
+    /// The remote has no such branch: something else deleted it first
+    /// (GitHub's own delete-on-merge, a person, another wt).
+    AlreadyGone,
     /// The remote refused: its tip is not `expected` (commits were pushed
-    /// after the merge, or it is already gone).
+    /// after the merge).
     Refused(String),
     /// The push never got a per-ref answer from the remote (credentials,
     /// network, hooks), so nothing about the remote tip is known.
@@ -608,6 +617,29 @@ async fn delete_remote_branch_at(
         .map(str::trim)
         .find(|line| line.starts_with('!'))
     {
+        // A lease on a branch that no longer exists is rejected like one on
+        // a moved tip, and only the remote can tell the two apart.
+        let mut probe = CommandSpec::new("git")
+            .args([
+                "ls-remote".to_owned(),
+                "--exit-code".to_owned(),
+                "origin".to_owned(),
+                reference.clone(),
+            ])
+            .cwd(repository);
+        probe.env = vec![
+            ("GIT_TERMINAL_PROMPT".into(), Some("0".into())),
+            ("LC_ALL".into(), Some("C".into())),
+        ];
+        // Exit 2 is ls-remote's "no matching ref"; any other outcome,
+        // including a probe that could not run, leaves the remote unknown,
+        // so the refusal stands.
+        if let Ok(probed) = processes.run(probe, cancellation).await
+            && probed.status.code() == Some(2)
+            && probed.stdout_text().trim().is_empty()
+        {
+            return Ok(LeasedDelete::AlreadyGone);
+        }
         return Ok(LeasedDelete::Refused(wt_core::sanitize_terminal_text(line)));
     }
     let stderr = output.stderr_text();
@@ -782,11 +814,11 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, LeasedDelete::Deleted);
         assert_eq!(git(&remote, &["for-each-ref", "refs/heads/feature"]), "");
-        // Already gone: refused, not an error.
+        // Already gone is the wanted end state, not a refusal to warn about.
         let gone = delete_remote_branch_at(&processes, &clone, "feature", &later, &cancel)
             .await
             .unwrap();
-        assert!(matches!(gone, LeasedDelete::Refused(_)), "{gone:?}");
+        assert_eq!(gone, LeasedDelete::AlreadyGone);
 
         // An unreachable origin is not a refusal: the caller may fall back to
         // the GitHub API, which repeats the head check.

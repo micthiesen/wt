@@ -1,21 +1,28 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
 use serde_json::{Map, Value, json};
 use thiserror::Error;
-use tokio::{fs, io::AsyncWriteExt, sync::OnceCell};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::OnceCell,
+};
 use tokio_util::sync::CancellationToken;
 use wt_platform::lock::{FileLock, LockError};
 
 const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const BREAKER_LIMIT: u64 = 2;
+/// Coarsest file timestamp wt can meet (FAT stores two-second mtimes).
+const STAMP_SETTLE_SECS: i64 = 2;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Error)]
@@ -42,6 +49,43 @@ pub struct AutomationLedger {
     /// drops. Engines in other processes share the ledger; this is how one
     /// starting tells a claim still in flight from one whose owner died.
     owner: Arc<OnceCell<ClaimOwner>>,
+    local: Arc<LocalState>,
+}
+
+/// Process-local helpers shared by a handle's clones; never authoritative.
+#[derive(Debug, Default)]
+struct LocalState {
+    view: Mutex<Option<(FileStamp, Arc<LedgerView>)>>,
+    swept_temporaries: AtomicBool,
+}
+
+/// Identity of one ledger file. Every write renames a fresh file into place,
+/// so a write by any process changes the inode even when the length and a
+/// coarse mtime do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            len: metadata.len(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+        }
+    }
+
+    /// A freed inode can be handed to a later write. While the mtime is too
+    /// recent for the filesystem to tell two such writes apart, the stamp
+    /// proves nothing and the file is read.
+    fn settled(&self) -> bool {
+        (now_ms() / 1000).saturating_sub(self.mtime.0) >= STAMP_SETTLE_SECS
+    }
 }
 
 struct ClaimOwner {
@@ -108,9 +152,30 @@ impl DispatchClaim {
 /// One coherent, read-only ledger view for a whole evaluator pass.
 #[derive(Clone, Debug, Default)]
 pub struct LedgerSnapshot {
-    fired: BTreeMap<String, Value>,
-    last_dispatch: BTreeMap<String, Value>,
-    breaker: BTreeMap<String, Value>,
+    view: Arc<LedgerView>,
+}
+
+#[derive(Debug, Default)]
+struct LedgerView {
+    fired: Map<String, Value>,
+    last_dispatch: Map<String, Value>,
+    breaker: Map<String, Value>,
+    deferred: Map<String, Value>,
+}
+
+impl LedgerView {
+    fn from_root(mut root: Value) -> Self {
+        let mut take = |field: &str| match root.get_mut(field).map(Value::take) {
+            Some(Value::Object(map)) => map,
+            _ => Map::new(),
+        };
+        Self {
+            fired: take("fired"),
+            last_dispatch: take("lastDispatch"),
+            breaker: take("breaker"),
+            deferred: take("deferred"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -155,6 +220,7 @@ impl LedgerSnapshot {
     /// The newest recorded fires first, for display.
     pub fn recent(&self, limit: usize) -> Vec<LedgerRecord> {
         let mut records = self
+            .view
             .fired
             .iter()
             .filter_map(|(key, entry)| {
@@ -185,7 +251,7 @@ impl LedgerSnapshot {
     }
 
     pub fn has_handled(&self, key: &str, now_ms: i64) -> bool {
-        let Some(entry) = self.fired.get(key) else {
+        let Some(entry) = self.view.fired.get(key) else {
             return false;
         };
         // Unknown or malformed persisted entries are claims until they can be
@@ -198,17 +264,27 @@ impl LedgerSnapshot {
         number(entry.get("at")).is_none_or(|at| now_ms.saturating_sub(at) <= RETENTION_MS)
     }
 
+    /// Whether `key` was recorded no longer than `window_ms` ago. An entry
+    /// without a readable time is not recent.
+    pub fn recorded_within(&self, key: &str, now_ms: i64, window_ms: i64) -> bool {
+        self.view
+            .fired
+            .get(key)
+            .and_then(|entry| number(entry.get("at")))
+            .is_some_and(|at| now_ms.saturating_sub(at) <= window_ms)
+    }
+
     pub fn last_dispatch(&self, rule_id: &str, slug: &str) -> Option<i64> {
-        number(self.last_dispatch.get(&pair_key(rule_id, slug)))
+        number(self.view.last_dispatch.get(&pair_key(rule_id, slug)))
     }
 
     /// Whether any breaker record exists for the pair, tripped or not.
     pub fn has_breaker(&self, rule_id: &str, slug: &str) -> bool {
-        self.breaker.contains_key(&pair_key(rule_id, slug))
+        self.view.breaker.contains_key(&pair_key(rule_id, slug))
     }
 
     pub fn breaker_state(&self, rule_id: &str, slug: &str, now_ms: i64) -> BreakerState {
-        let Some(entry) = self.breaker.get(&pair_key(rule_id, slug)) else {
+        let Some(entry) = self.view.breaker.get(&pair_key(rule_id, slug)) else {
             return BreakerState {
                 count: 0,
                 tripped_at: None,
@@ -242,6 +318,7 @@ impl AutomationLedger {
             lock_dir,
             lock_key,
             owner: Arc::default(),
+            local: Arc::default(),
         }
     }
 
@@ -574,12 +651,12 @@ impl AutomationLedger {
 
     /// Deferred fires recorded by any process, by identity.
     pub async fn deferred(&self) -> Result<BTreeMap<String, Value>, LedgerError> {
-        let root = self.read_root().await?;
-        Ok(root
-            .get("deferred")
-            .and_then(Value::as_object)
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default())
+        let view = self.view().await?;
+        Ok(view
+            .deferred
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
     }
 
     pub async fn mark_skipped(
@@ -725,24 +802,41 @@ impl AutomationLedger {
     }
 
     pub async fn snapshot(&self) -> Result<LedgerSnapshot, LedgerError> {
-        let root = self.read_root().await?;
         Ok(LedgerSnapshot {
-            fired: root
-                .get("fired")
-                .and_then(Value::as_object)
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .unwrap_or_default(),
-            last_dispatch: root
-                .get("lastDispatch")
-                .and_then(Value::as_object)
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .unwrap_or_default(),
-            breaker: root
-                .get("breaker")
-                .and_then(Value::as_object)
-                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                .unwrap_or_default(),
+            view: self.view().await?,
         })
+    }
+
+    /// The file's current contents, parsed once per file identity. An
+    /// evaluator pass asks several times a second and the ledger rarely
+    /// changes; the file on disk stays the authority for every answer.
+    async fn view(&self) -> Result<Arc<LedgerView>, LedgerError> {
+        if let Ok(metadata) = fs::metadata(&self.path).await {
+            let current = FileStamp::of(&metadata);
+            if current.settled()
+                && let Ok(cached) = self.local.view.lock()
+                && let Some((stamp, view)) = cached.as_ref()
+                && *stamp == current
+            {
+                return Ok(Arc::clone(view));
+            }
+        }
+        let (root, stamp) = self.read_root_stamped().await?;
+        let view = Arc::new(LedgerView::from_root(root));
+        self.remember(stamp, &view);
+        Ok(view)
+    }
+
+    /// Keep a view only when its file was already settled as it was read.
+    /// A file read while still fresh could be replaced, and its inode reused
+    /// by a same-length write in the same timestamp tick, without the stamp
+    /// ever changing; a settled one cannot.
+    fn remember(&self, stamp: Option<FileStamp>, view: &Arc<LedgerView>) {
+        if let Ok(mut cached) = self.local.view.lock() {
+            *cached = stamp
+                .filter(FileStamp::settled)
+                .map(|stamp| (stamp, Arc::clone(view)));
+        }
     }
 
     pub async fn bump_breaker(
@@ -840,6 +934,9 @@ impl AutomationLedger {
     ) -> Result<T, LedgerError> {
         let _lock =
             FileLock::acquire(&self.lock_dir, &self.lock_key, operation, cancellation).await?;
+        if !self.local.swept_temporaries.swap(true, Ordering::Relaxed) {
+            self.remove_abandoned_temporaries().await;
+        }
         let mut root = self.read_root().await?;
         let stored = root.clone();
         prune(&mut root, now_ms());
@@ -851,13 +948,64 @@ impl AutomationLedger {
         // ledger stays untouched.
         if root != stored {
             self.write_root(&root).await?;
+            if let Ok(mut cached) = self.local.view.lock() {
+                *cached = None;
+            }
         }
         Ok(result)
     }
 
+    /// A writer killed between creating its temporary file and renaming it
+    /// leaves a full ledger copy behind. Every writer holds the ledger lock
+    /// for the whole life of its temporary file, so under that lock any
+    /// temporary file present belongs to a writer that is gone.
+    async fn remove_abandoned_temporaries(&self) {
+        let prefix = self.path.with_extension("json.tmp-");
+        let (Some(parent), Some(prefix)) = (
+            self.path.parent(),
+            prefix.file_name().and_then(|name| name.to_str()),
+        ) else {
+            return;
+        };
+        let Ok(mut entries) = fs::read_dir(parent).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let numbered = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(prefix))
+                .and_then(|suffix| suffix.split_once('-'))
+                .is_some_and(|(pid, counter)| {
+                    [pid, counter].iter().all(|part| {
+                        !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                });
+            if numbered {
+                let _ = fs::remove_file(entry.path()).await;
+            }
+        }
+    }
+
     async fn read_root(&self) -> Result<Value, LedgerError> {
-        match fs::read(&self.path).await {
-            Ok(bytes) => {
+        Ok(self.read_root_stamped().await?.0)
+    }
+
+    /// The parsed file with the identity of the file those bytes came from;
+    /// no identity when there is no file.
+    async fn read_root_stamped(&self) -> Result<(Value, Option<FileStamp>), LedgerError> {
+        let opened = match fs::File::open(&self.path).await {
+            Ok(mut file) => {
+                // Stamp the open file, not the path: a rename landing during
+                // the read must not label these bytes as the newer file.
+                let stamp = file.metadata().await.ok().map(|m| FileStamp::of(&m));
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.map(|_| (bytes, stamp))
+            }
+            Err(error) => Err(error),
+        };
+        match opened {
+            Ok((bytes, stamp)) => {
                 let value: Value =
                     serde_json::from_slice(&bytes).map_err(|error| LedgerError::Invalid {
                         path: self.path.clone(),
@@ -877,16 +1025,18 @@ impl AutomationLedger {
                         });
                     }
                 }
-                Ok(value)
+                Ok((value, stamp))
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Ok(json!({"version":1,"fired":{},"breaker":{},"lastDispatch":{}}))
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((
+                json!({"version":1,"fired":{},"breaker":{},"lastDispatch":{}}),
+                None,
+            )),
             Err(source) => Err(io_error("read", &self.path, source)),
         }
     }
 
-    async fn write_root(&self, value: &Value) -> Result<(), LedgerError> {
+    /// Returns the identity of the file now in place.
+    async fn write_root(&self, value: &Value) -> Result<Option<FileStamp>, LedgerError> {
         let parent = self.path.parent().unwrap_or(Path::new("."));
         fs::create_dir_all(parent)
             .await
@@ -913,10 +1063,13 @@ impl AutomationLedger {
             file.sync_all()
                 .await
                 .map_err(|source| io_error("sync temporary", &temp, source))?;
+            // Rename keeps the inode, length and mtime read here.
+            let stamp = file.metadata().await.ok().map(|m| FileStamp::of(&m));
             drop(file);
             fs::rename(&temp, &self.path)
                 .await
-                .map_err(|source| io_error("replace", &self.path, source))
+                .map_err(|source| io_error("replace", &self.path, source))?;
+            Ok(stamp)
         }
         .await;
         if written.is_err() {
@@ -1632,5 +1785,137 @@ mod tests {
                 .unwrap(),
             DispatchClaimResult::CoolingDown { until_ms } if until_ms == i64::MAX
         ));
+    }
+
+    fn set_mtime(path: &Path, at: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    fn long_ago() -> std::time::SystemTime {
+        std::time::SystemTime::now() - std::time::Duration::from_secs(600)
+    }
+
+    #[tokio::test]
+    async fn unchanged_ledger_is_parsed_once_and_own_writes_show_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(&path);
+        let cancel = CancellationToken::new();
+        let now = now_ms();
+        ledger.cancel(&["one".into()], now, &cancel).await.unwrap();
+
+        // Too fresh for the stamp to prove anything: read every time.
+        let fresh = ledger.snapshot().await.unwrap();
+        assert!(!Arc::ptr_eq(
+            &fresh.view,
+            &ledger.snapshot().await.unwrap().view
+        ));
+
+        set_mtime(&path, long_ago());
+        let first = ledger.snapshot().await.unwrap();
+        let again = ledger.clone().snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(&first.view, &again.view));
+        assert!(again.has_handled("one", now));
+
+        ledger.cancel(&["two".into()], now, &cancel).await.unwrap();
+        let after = ledger.snapshot().await.unwrap();
+        assert!(after.has_handled("two", now));
+        assert!(!first.has_handled("two", now));
+    }
+
+    #[tokio::test]
+    async fn another_writers_change_is_seen_on_the_next_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let reader = AutomationLedger::new(&path);
+        let writer = AutomationLedger::new(&path);
+        let cancel = CancellationToken::new();
+        let now = now_ms();
+        writer.cancel(&["one".into()], now, &cancel).await.unwrap();
+        set_mtime(&path, long_ago());
+        assert!(reader.snapshot().await.unwrap().has_handled("one", now));
+        assert!(!reader.snapshot().await.unwrap().has_handled("two", now));
+
+        writer.cancel(&["two".into()], now, &cancel).await.unwrap();
+        assert!(reader.snapshot().await.unwrap().has_handled("two", now));
+        assert!(reader.deferred().await.unwrap().is_empty());
+
+        let claim = writer
+            .claim_dispatch(
+                &["three".into()],
+                "rule",
+                "slug",
+                DispatchKind::HeadlessAction,
+                now,
+                &cancel,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        writer
+            .release_deferred(&claim, "later", json!({"queuedAtMs": now}), &cancel)
+            .await
+            .unwrap();
+        assert!(reader.deferred().await.unwrap().contains_key("later"));
+    }
+
+    #[tokio::test]
+    async fn replacement_with_the_same_length_and_mtime_is_still_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let reader = AutomationLedger::new(&path);
+        let writer = AutomationLedger::new(&path);
+        let now = now_ms();
+        let root = |key: &str| json!({"version":1,"fired":{key:{"state":"cancelled","at":now,"ruleId":"","slug":""}}});
+        let at = long_ago();
+        writer.write_root(&root("aaa")).await.unwrap();
+        set_mtime(&path, at);
+        let before = std::fs::metadata(&path).unwrap();
+        let cached = reader.snapshot().await.unwrap();
+        assert!(Arc::ptr_eq(
+            &cached.view,
+            &reader.snapshot().await.unwrap().view
+        ));
+
+        writer.write_root(&root("bbb")).await.unwrap();
+        set_mtime(&path, at);
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+
+        let seen = reader.snapshot().await.unwrap();
+        assert!(seen.has_handled("bbb", now));
+        assert!(!seen.has_handled("aaa", now));
+    }
+
+    #[tokio::test]
+    async fn first_write_removes_temporaries_a_dead_writer_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let abandoned = dir.path().join("automations.json.tmp-4194304-7");
+        let unrelated = [
+            dir.path().join("automations.json.tmp-notes"),
+            dir.path().join("automations.json.tmp-12-"),
+            dir.path().join("harness.json.tmp-12-0"),
+        ];
+        for file in unrelated.iter().chain([&abandoned]) {
+            std::fs::write(file, b"{}").unwrap();
+        }
+        let ledger = AutomationLedger::new(&path);
+        let cancel = CancellationToken::new();
+        ledger.snapshot().await.unwrap();
+        assert!(abandoned.exists());
+        ledger
+            .cancel(&["one".into()], now_ms(), &cancel)
+            .await
+            .unwrap();
+        assert!(!abandoned.exists());
+        assert!(unrelated.iter().all(|file| file.exists()));
+        assert!(path.exists());
     }
 }

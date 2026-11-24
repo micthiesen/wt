@@ -311,6 +311,11 @@ fn decode_hex(text: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
+/// The most branches a `status` payload names.
+const STATUS_BRANCH_LIMIT: usize = 10;
+
+/// The branches an event concerns: `None` when that is unknown (it may
+/// concern any), empty when it concerns none.
 pub(super) fn extract_event_branches(
     event: &str,
     payload: &Value,
@@ -318,11 +323,62 @@ pub(super) fn extract_event_branches(
 ) -> Option<Vec<String>> {
     let unscoped = || None;
     match event {
-        "pull_request"
-        | "pull_request_review"
-        | "pull_request_review_thread"
-        | "status"
-        | "merge_group" => unscoped(),
+        "pull_request" | "pull_request_review" | "pull_request_review_thread" => {
+            // Entering or leaving the merge queue moves every queued PR's
+            // position, a local one's included.
+            if matches!(
+                payload.get("action").and_then(Value::as_str),
+                Some("enqueued" | "dequeued")
+            ) {
+                return unscoped();
+            }
+            let head = branch_at(payload, &["pull_request", "head", "ref"]);
+            let base = branch_at(payload, &["pull_request", "base", "ref"]);
+            let (Some(head), Some(base)) = (head, base) else {
+                return unscoped();
+            };
+            if head.is_empty() || base.is_empty() {
+                return unscoped();
+            }
+            // A PR stacked on a local branch concerns that branch. Nearly
+            // every PR targets the trunk, so the trunk itself scopes nothing.
+            let retargeted_from = payload
+                .pointer("/changes/base/ref/from")
+                .and_then(Value::as_str);
+            Some(
+                std::iter::once(head)
+                    .chain(
+                        [Some(base), retargeted_from]
+                            .into_iter()
+                            .flatten()
+                            .filter(|branch| *branch != base_branch),
+                    )
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        }
+        "status" => {
+            let Some(branches) = payload.get("branches").and_then(Value::as_array) else {
+                return unscoped();
+            };
+            let names: Option<Vec<String>> = branches
+                .iter()
+                .map(|branch| branch_at(branch, &["name"]).map(str::to_owned))
+                .collect();
+            match names {
+                // GitHub lists at most ten branches containing the commit, so
+                // a full list may omit a local one.
+                Some(names)
+                    if !names.is_empty()
+                        && names.len() < STATUS_BRANCH_LIMIT
+                        && names.iter().all(|name| name != base_branch) =>
+                {
+                    Some(names)
+                }
+                _ => unscoped(),
+            }
+        }
+        "merge_group" => unscoped(),
         "check_suite" => branch_at(payload, &["check_suite", "head_branch"])
             .map(|v| vec![v.to_owned()])
             .or_else(unscoped),
@@ -455,7 +511,7 @@ async fn scheduler(
     // What the next refresh fetches origin for; `None` skips the fetch. The
     // first refresh, and a coalesced overflow whose events are unknown,
     // always fetch.
-    let mut origin_trigger: Option<String> = Some("startup".into());
+    let mut origin_trigger: Option<(String, Option<String>)> = Some(("startup".into(), None));
     loop {
         let sleep = async {
             match pending_deadline {
@@ -486,18 +542,20 @@ async fn scheduler(
                     cached_inventory_at = Some(now);
                 }
                 let candidates = extract_event_branches(&event.name, &event.payload, &config.base_branch);
-                let relevant = match candidates {
-                    Some(names) if names.is_empty() => false,
-                    None => true,
+                let (relevant, matched) = match candidates {
+                    Some(names) if names.is_empty() => (false, None),
+                    None => (true, None),
+                    Some(_) if !(local_known && remote_known) => (true, None),
                     Some(names) => {
-                        let all: BTreeSet<_> = local_branches.union(&remote_branches).cloned().collect();
-                        let complete = local_known && remote_known;
-                        !complete || names.iter().any(|branch| all.contains(branch))
+                        let matched = names.into_iter().find(|branch| {
+                            local_branches.contains(branch) || remote_branches.contains(branch)
+                        });
+                        (matched.is_some(), matched)
                     }
                 };
                 if relevant {
                     if changes_refs(&event.name, &event.payload) {
-                        origin_trigger.get_or_insert_with(|| event.name.clone());
+                        origin_trigger.get_or_insert_with(|| (event.name.clone(), matched));
                     }
                     {
                         let mut state = durable.state.lock().await;
@@ -514,7 +572,7 @@ async fn scheduler(
                 }
             }
             _ = coalesced_rx.recv() => {
-                origin_trigger.get_or_insert_with(|| "coalesced overflow".into());
+                origin_trigger.get_or_insert_with(|| ("coalesced overflow".into(), None));
                 let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let last_ms = last_fetch_start.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
                 let pending_ms = pending_deadline.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
@@ -531,6 +589,10 @@ async fn scheduler(
                 };
                 let local = match branch_refresh.await {
                     Ok(branches) => { local_known = true; branches },
+                    Err(e) if cancel.is_cancelled() => {
+                        debug!(error = %e, "inventory read interrupted by shutdown");
+                        break;
+                    }
                     Err(e) => {
                         local_known = false;
                         failures = failures.saturating_add(1);
@@ -568,17 +630,18 @@ async fn scheduler(
                     fetch_branches.extend(remote_branches.iter().cloned());
                 }
                 cached_inventory_at = Some(now);
-                if let Some(trigger) = origin_trigger.take() {
+                if let Some((trigger, branch)) = origin_trigger.take() {
+                    let branch_name = branch.as_deref().unwrap_or("");
                     let origin_started = Instant::now();
                     let result = source.fetch_origin(&cancel).await;
                     let elapsed_ms = origin_started.elapsed().as_millis() as u64;
                     match result {
                         // The fetch itself logs its trigger and duration at info.
-                        Ok(()) => debug!(%trigger, elapsed_ms, "fetched origin before GitHub refresh"),
+                        Ok(()) => debug!(event = %trigger, branch = branch_name, elapsed_ms, "fetched origin before GitHub refresh"),
                         Err(e) => {
-                            warn!(%trigger, elapsed_ms, error = %e, "git fetch origin failed before GitHub refresh");
+                            warn!(event = %trigger, branch = branch_name, elapsed_ms, error = %e, "git fetch origin failed before GitHub refresh");
                             // Keep the request so the next refresh retries it.
-                            origin_trigger.get_or_insert(trigger);
+                            origin_trigger.get_or_insert((trigger, branch));
                         }
                     }
                 }
@@ -611,6 +674,11 @@ async fn scheduler(
                 };
                 match failure {
                     None => (failures, fetch_interval_ms) = (0, config.min_fetch_interval_ms),
+                    // A read cut short by shutdown says nothing about GitHub.
+                    Some(message) if cancel.is_cancelled() => {
+                        debug!(error = %message, "GitHub refresh interrupted by shutdown");
+                        break;
+                    }
                     Some(message) => {
                         failures = failures.saturating_add(1);
                         fetch_interval_ms = backoff_interval_ms(config.min_fetch_interval_ms, failures, rate_limited(&message));
@@ -732,6 +800,9 @@ mod tests {
 
     #[derive(Default)]
     struct MockSource {
+        /// The GitHub read waits for cancellation and then fails, as a
+        /// request in flight at shutdown does.
+        hang_until_cancelled: AtomicBool,
         fail: AtomicBool,
         fetches: AtomicUsize,
         origin_fetches: AtomicUsize,
@@ -772,11 +843,16 @@ mod tests {
         fn fetch_github<'a>(
             &'a self,
             branches: Vec<String>,
-            _: &'a CancellationToken,
+            cancel: &'a CancellationToken,
         ) -> EventFuture<'a, Result<EventGithubData, String>> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             let fail = self.fail.load(Ordering::SeqCst);
+            let hang = self.hang_until_cancelled.load(Ordering::SeqCst);
             Box::pin(async move {
+                if hang {
+                    cancel.cancelled().await;
+                    return Err("transient GitHub failure: GitHub request cancelled".into());
+                }
                 if fail {
                     return Err("fixture failure".into());
                 }
@@ -881,6 +957,85 @@ mod tests {
                 "main"
             ),
             Some(vec!["topic".into()])
+        );
+    }
+
+    #[test]
+    fn pull_request_events_are_scoped_to_their_head_and_base() {
+        let pr = |head: &str, base: &str| json!({"action":"synchronize","pull_request":{"head":{"ref":head},"base":{"ref":base}}});
+        for event in [
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_thread",
+        ] {
+            // Someone else's PR into the trunk names only its own head.
+            assert_eq!(
+                extract_event_branches(event, &pr("theirs", "main"), "main"),
+                Some(vec!["theirs".into()]),
+                "{event}"
+            );
+            // A PR stacked on another branch concerns that branch too.
+            assert_eq!(
+                extract_event_branches(event, &pr("child", "feature-x"), "main"),
+                Some(vec!["child".into(), "feature-x".into()]),
+                "{event}"
+            );
+            for partial in [
+                json!({"pull_request":{"head":{"ref":"theirs"}}}),
+                json!({"pull_request":{"base":{"ref":"main"}}}),
+                json!({"pull_request":{"head":{"ref":""},"base":{"ref":"main"}}}),
+                json!({"pull_request":{"head":{"ref":7},"base":{"ref":"main"}}}),
+            ] {
+                assert_eq!(
+                    extract_event_branches(event, &partial, "main"),
+                    None,
+                    "{event} {partial}"
+                );
+            }
+        }
+        // Retargeted off a local branch: its old base lost a child.
+        let mut retargeted = pr("child", "main");
+        retargeted["changes"] = json!({"base":{"ref":{"from":"feature-x"}}});
+        assert_eq!(
+            extract_event_branches("pull_request", &retargeted, "main"),
+            Some(vec!["child".into(), "feature-x".into()])
+        );
+        for action in ["enqueued", "dequeued"] {
+            let mut queued = pr("theirs", "main");
+            queued["action"] = json!(action);
+            assert_eq!(
+                extract_event_branches("pull_request", &queued, "main"),
+                None
+            );
+        }
+        assert_eq!(
+            extract_event_branches("merge_group", &json!({}), "main"),
+            None
+        );
+    }
+
+    #[test]
+    fn status_events_are_scoped_to_the_branches_they_name() {
+        let status = |names: &[&str]| json!({"branches": names.iter().map(|name| json!({"name": name})).collect::<Vec<_>>()});
+        assert_eq!(
+            extract_event_branches("status", &status(&["theirs", "other"]), "main"),
+            Some(vec!["theirs".into(), "other".into()])
+        );
+        assert_eq!(extract_event_branches("status", &json!({}), "main"), None);
+        assert_eq!(extract_event_branches("status", &status(&[]), "main"), None);
+        assert_eq!(
+            extract_event_branches("status", &status(&["theirs", "main"]), "main"),
+            None
+        );
+        assert_eq!(
+            extract_event_branches("status", &json!({"branches":[{"name":"a"},{}]}), "main"),
+            None
+        );
+        let full: Vec<String> = (0..STATUS_BRANCH_LIMIT).map(|n| format!("b{n}")).collect();
+        let full: Vec<&str> = full.iter().map(String::as_str).collect();
+        assert_eq!(
+            extract_event_branches("status", &status(&full), "main"),
+            None
         );
     }
 
@@ -1131,6 +1286,75 @@ mod tests {
         assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
         cancel.cancel();
         daemon.shutdown().await;
+    }
+
+    /// A PR nobody here has a branch for costs neither an origin fetch nor a
+    /// GitHub read; one whose head or base is a local branch still does.
+    #[tokio::test]
+    async fn only_pull_requests_touching_a_known_branch_schedule_a_refresh() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        wait_for_fetches(&source, 1).await;
+        let pr = |head: &str, base: &str| {
+            json!({"action":"synchronize","pull_request":{"head":{"ref":head},"base":{"ref":base}}})
+                .to_string()
+                .into_bytes()
+        };
+
+        let foreign = pr("theirs", "main");
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request", &foreign).await,
+            200
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
+
+        let local_head = pr("feature-x", "main");
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request", &local_head).await,
+            200
+        );
+        wait_for_fetches(&source, 2).await;
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
+
+        let local_base = pr("theirs", "feature-x");
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request", &local_base).await,
+            200
+        );
+        wait_for_fetches(&source, 3).await;
+
+        let no_refs = br#"{"action":"synchronize","pull_request":{}}"#;
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request", no_refs).await,
+            200
+        );
+        wait_for_fetches(&source, 4).await;
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// Restarting the daemon cancels the read in flight. That is not a
+    /// GitHub failure, and must not be left behind as the daemon's last error.
+    #[tokio::test]
+    async fn a_refresh_cancelled_by_shutdown_records_no_error() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        source.hang_until_cancelled.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        wait_for_fetches(&source, 1).await;
+        cancel.cancel();
+        daemon.shutdown().await;
+        let state = read_state(dir.path()).await.unwrap().unwrap();
+        assert_eq!(state.last_error, None);
     }
 
     /// No webhook follows the startup refresh, so only the daemon's own
