@@ -210,6 +210,9 @@ async fn restack(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecu
             &mut |_| {},
         )
         .await;
+    if let Ok(outcome) = &outcome {
+        crate::restack_action::record_outcome(ctx, &branch, None, outcome).await;
+    }
     match outcome {
         Err(wt_stack::StackError::Busy) => Ok(BuiltinExecution::Failed {
             message: "restack became busy after pre-clean; run `wt restack` once it is free".into(),

@@ -38,12 +38,12 @@ pub use menus::{LocalMenu, Menu, new_worktree_prompt, session_menu_key};
 pub use model::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
     AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
-    GitPresentation, GuideView, HostChoice, Interaction, LandingKind, LiveSlotView, LogView,
-    MergeQueueView, Model, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
-    PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
-    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
-    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WorkPresentation,
-    WorkRiskCount, WorkStateCount,
+    GitPresentation, GuideView, HostChoice, Interaction, LandingKind, LiveSlotView, LocalStamp,
+    LogView, MergeQueueView, Model, PerfGroupView, PerfProcessView, PerfTone, PerfView,
+    PrCommentView, PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView,
+    RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
+    SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem,
+    WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub use mutations::{
     AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,

@@ -107,6 +107,14 @@ pub enum AutomationOutcome {
     },
 }
 
+/// A fire the engine ended as a terminal skip, and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedFire {
+    pub slug: String,
+    pub rule: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ClaimedFire {
     id: String,
@@ -192,6 +200,8 @@ pub struct AutomationEngine {
     recent: Vec<wt_automations::LedgerRecord>,
     /// Deferred fires by identity, while their intent is queued or running.
     deferrals: BTreeMap<String, Deferral>,
+    /// Fires ended as skipped since the last [`AutomationEngine::take_skipped`].
+    skipped: Vec<SkippedFire>,
     /// Quit arriving right after this many claims of one pass: timing alone
     /// cannot place a cancellation between two claims on every platform.
     #[cfg(test)]
@@ -209,8 +219,26 @@ impl AutomationEngine {
             unmet: BTreeSet::new(),
             recent: Vec::new(),
             deferrals: BTreeMap::new(),
+            skipped: Vec::new(),
             #[cfg(test)]
             quit_after_claims: None,
+        }
+    }
+
+    /// Fires the engine ended without dispatching since the last call, for
+    /// the caller to record in each worktree's history.
+    pub fn take_skipped(&mut self) -> Vec<SkippedFire> {
+        std::mem::take(&mut self.skipped)
+    }
+
+    fn note_skipped(&mut self, fire: &AutomationFire, reason: &str) {
+        // Bounded even if no caller drains it.
+        if self.skipped.len() < 256 {
+            self.skipped.push(SkippedFire {
+                slug: fire.slug.clone(),
+                rule: fire.rule.id.clone(),
+                reason: reason.to_owned(),
+            });
         }
     }
 
@@ -552,6 +580,7 @@ impl AutomationEngine {
                     )
                     .await
                     .context("persist terminal unmet automation requirement")?;
+                self.note_skipped(&fire, "its requirements are no longer met");
                 self.intents.remove(&id);
                 continue;
             }
@@ -581,6 +610,7 @@ impl AutomationEngine {
                     )
                     .await
                     .context("persist breaker-suppressed automation")?;
+                self.note_skipped(&fire, "it fired too often for this worktree");
                 self.intents.remove(&id);
                 continue;
             }
@@ -622,6 +652,7 @@ impl AutomationEngine {
                         )
                         .await
                         .context("persist busy-skipped automation")?;
+                    self.note_skipped(&fire, &reason);
                     self.intents.remove(&id);
                     tracing::info!(rule = %rule.id, %reason, "automation skipped while target busy");
                 } else {
@@ -671,6 +702,7 @@ impl AutomationEngine {
                         )
                         .await
                         .context("persist breaker-suppressed automation")?;
+                    self.note_skipped(&fire, "it fired too often for this worktree");
                     self.intents.remove(&id);
                 }
                 DispatchClaimResult::Claimed(claim) => {
@@ -1254,6 +1286,55 @@ mod tests {
             waiting_for,
             [None, Some("session busy on worktree".to_owned())]
         );
+    }
+
+    /// A fire dropped for good is reported once, for its worktree's history.
+    #[tokio::test]
+    async fn a_fire_skipped_while_its_target_is_busy_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let rules = [AutomationDef {
+            busy: AutomationBusyPolicy::Skip,
+            ..rule("custom-action", 0.0)
+        }];
+        let rows = [row()];
+        let context = AutomationEvalContext::default();
+        let activity = RuntimeActivity::default();
+        let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+        let busy = BTreeMap::from([(
+            "worktree".to_owned(),
+            WorktreeQuiescence {
+                session_busy: true,
+                ..WorktreeQuiescence::default()
+            },
+        )]);
+        let start = now_ms();
+        for step in 0..2 {
+            let tick = engine
+                .tick(input(
+                    &rules,
+                    &rows,
+                    &context,
+                    &requirements,
+                    &busy,
+                    &activity,
+                    start + step,
+                ))
+                .await
+                .unwrap();
+            assert!(tick.claims.is_empty());
+        }
+        assert!(engine.queued().is_empty(), "a skipped fire does not wait");
+        assert_eq!(
+            engine.take_skipped(),
+            [SkippedFire {
+                slug: "worktree".into(),
+                rule: "test".into(),
+                reason: "session busy on worktree".into(),
+            }]
+        );
+        assert!(engine.take_skipped().is_empty());
     }
 
     #[tokio::test]

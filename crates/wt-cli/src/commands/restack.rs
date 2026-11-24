@@ -84,7 +84,7 @@ pub async fn run(ctx: &AppContext, args: &RestackArgs) -> Result<i32> {
         },
     };
     let mut event = |event| print_event(event);
-    match service
+    let outcome = service
         .restack(
             &branch,
             RestackOptions {
@@ -93,8 +93,9 @@ pub async fn run(ctx: &AppContext, args: &RestackArgs) -> Result<i32> {
             &ctx.cancellation,
             &mut event,
         )
-        .await?
-    {
+        .await?;
+    wt_ops::restack_action::record_outcome(ctx, &branch, args.onto.as_deref(), &outcome).await;
+    match outcome {
         RestackOutcome::Complete { replayed, total } => {
             println!("✓ restacked {branch} ({replayed}/{total} worktree(s) replayed)");
             Ok(0)

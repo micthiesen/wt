@@ -350,6 +350,9 @@ enum Command {
     Edge(commands::edge::EdgeArgs),
     /// Show or record the worktree's change guide (`[guides] enabled`).
     Guide(commands::guide::GuideArgs),
+    /// Show a worktree's recorded history: statuses, PR, checks, reviews,
+    /// messages and automation fires, newest first.
+    History(commands::history::HistoryArgs),
     /// Show or set the worktree's title.
     ///
     /// Titles rank user > agent > issue > fallback; a lower source never
@@ -696,6 +699,7 @@ async fn dispatch_command(
         Command::Section(args) => wt_ops::commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,
         Command::Guide(args) => commands::guide::run(context, args).await,
+        Command::History(args) => commands::history::run(context, args).await,
         Command::Title(args) => commands::title::run(context, args).await,
         Command::Merge(args) => commands::merge::run(context, args).await,
         Command::Open(args) => commands::open::run(context, args).await,

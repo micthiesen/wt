@@ -35,6 +35,62 @@ pub use session_commands::{
 };
 use session_commands::{session_name, slot_name};
 
+/// How a delivered message reads in the target worktree's history.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MessageRecord<'a> {
+    /// The sending worktree's slug, `manager`, `wt` for a prompt wt sent
+    /// itself (an automation, a restack handoff), or `None` for the person.
+    pub from: Option<&'a str>,
+    /// Shown instead of the message's own first line.
+    pub text: Option<&'a str>,
+}
+
+async fn record_message(
+    route: &AgentRoute,
+    text: &str,
+    record: MessageRecord<'_>,
+    outcome: &Result<HarnessMessageOutcome>,
+    context: &AppContext,
+) {
+    if route.target.kind != AgentTargetKind::Worktree || route.target.remote {
+        return;
+    }
+    let event = wt_core::WorktreeEventKind::Message {
+        from: record
+            .from
+            .map(str::trim)
+            .filter(|from| !from.is_empty())
+            .map(str::to_owned),
+        text: wt_core::event_text(record.text.unwrap_or(text)),
+        delivered: message_delivered(outcome),
+    };
+    crate::worktree_history::record(context, &route.target.slug, event).await;
+}
+
+/// `Some(true)` when the harness proved arrival, `Some(false)` when it is
+/// known not to have arrived, `None` when it was submitted without proof.
+fn message_delivered(outcome: &Result<HarnessMessageOutcome>) -> Option<bool> {
+    use wt_harness::{ClaudeMessageOutcome, CodexMessageOutcome};
+    match outcome {
+        Err(_) => Some(false),
+        Ok(HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent { delivered, .. }))
+        | Ok(HarnessMessageOutcome::Codex(CodexMessageOutcome::Terminal { delivered, .. })) => {
+            *delivered
+        }
+        Ok(HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
+            maybe_submitted, ..
+        })) => (!maybe_submitted).then_some(false),
+        Ok(HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::Queued(_) | CodexMessageOutcome::CliQueued { .. },
+        )) => Some(true),
+        Ok(HarnessMessageOutcome::Codex(CodexMessageOutcome::Ambiguous { .. })) => None,
+        Ok(HarnessMessageOutcome::Codex(
+            CodexMessageOutcome::NeedsTerminalFallback { .. } | CodexMessageOutcome::Failed { .. },
+        )) => Some(false),
+        Ok(HarnessMessageOutcome::OpenCode(_) | HarnessMessageOutcome::Pi(_)) => None,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {
     pub slug: String,
@@ -712,6 +768,39 @@ impl AppHarness {
 
     /// `steer` delivers into a running Codex turn instead of queueing.
     pub async fn send_with(
+        &self,
+        route: &AgentRoute,
+        text: &str,
+        sender: Option<&str>,
+        steer: bool,
+        context: &AppContext,
+    ) -> Result<HarnessMessageOutcome> {
+        let record = MessageRecord {
+            from: sender,
+            text: None,
+        };
+        self.send_recorded(route, text, sender, steer, record, context)
+            .await
+    }
+
+    /// Deliver a message and record it in the target worktree's history.
+    /// Every send passes through here, so the history has one writer.
+    /// Special sessions (the manager, the main checkout) have no row.
+    pub async fn send_recorded(
+        &self,
+        route: &AgentRoute,
+        text: &str,
+        sender: Option<&str>,
+        steer: bool,
+        record: MessageRecord<'_>,
+        context: &AppContext,
+    ) -> Result<HarnessMessageOutcome> {
+        let outcome = self.deliver(route, text, sender, steer, context).await;
+        record_message(route, text, record, &outcome, context).await;
+        outcome
+    }
+
+    async fn deliver(
         &self,
         route: &AgentRoute,
         text: &str,
@@ -1663,6 +1752,161 @@ mod tests {
             );
         }
         assert!(!fixture.ctx.home.join(".codex/config.toml").exists());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_send_is_recorded_in_the_worktree_history_and_never_for_a_special_session() {
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        let mut app = AppHarness::new(&fixture.ctx);
+        app.codex_config = fixture.ctx.home.join("selected-codex/config.toml");
+        let route = |slug: &str, kind, cwd: PathBuf| AgentRoute {
+            target: AgentTarget {
+                kind,
+                ..special_target(slug, cwd, None)
+            },
+            choice: HarnessChoice {
+                selected: Some(HarnessId::Codex),
+                source: SelectionSource::Primary,
+                live: Some(Vec::new()),
+            },
+        };
+        let worktree = route("one", AgentTargetKind::Worktree, fixture.ctx.cwd.clone());
+        let manager = route(
+            "manager",
+            AgentTargetKind::Special,
+            fixture.ctx.config.paths.main_clone.clone(),
+        );
+        // Empty text fails at the adapter boundary without starting an agent.
+        let record = MessageRecord {
+            from: Some("two"),
+            text: Some("start"),
+        };
+        app.send_recorded(&worktree, "", Some("two"), false, record, &fixture.ctx)
+            .await
+            .unwrap_err();
+        app.send(&manager, "", Some("two"), &fixture.ctx)
+            .await
+            .unwrap_err();
+        let (one, special) = fixture
+            .ctx
+            .database
+            .call(|store| {
+                Ok((
+                    store.read_worktree_events("one", 80)?,
+                    store.read_worktree_events("manager", 80)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            one.into_iter().map(|event| event.event).collect::<Vec<_>>(),
+            [wt_core::WorktreeEventKind::Message {
+                from: Some("two".into()),
+                text: "start".into(),
+                delivered: Some(false),
+            }]
+        );
+        assert!(special.is_empty());
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn each_delivery_outcome_is_recorded_as_what_is_known_about_arrival() {
+        use wt_harness::{ClaudeMessageOutcome, CodexMessageOutcome, PiSendOutcome};
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        let route = AgentRoute {
+            target: AgentTarget {
+                kind: AgentTargetKind::Worktree,
+                ..special_target("one", fixture.ctx.cwd.clone(), None)
+            },
+            choice: HarnessChoice {
+                selected: Some(HarnessId::Codex),
+                source: SelectionSource::Primary,
+                live: Some(Vec::new()),
+            },
+        };
+        let outcomes: [(Result<HarnessMessageOutcome>, Option<bool>); 5] = [
+            // Codex owns the message: it arrived.
+            (
+                Ok(HarnessMessageOutcome::Codex(
+                    CodexMessageOutcome::CliQueued {
+                        thread_id: "thread".into(),
+                    },
+                )),
+                Some(true),
+            ),
+            // Submitted to a harness that gives no receipt.
+            (
+                Ok(HarnessMessageOutcome::Pi(PiSendOutcome {
+                    cold_started: false,
+                })),
+                None,
+            ),
+            (
+                Ok(HarnessMessageOutcome::Codex(
+                    CodexMessageOutcome::Ambiguous {
+                        reason: "reply lost".into(),
+                    },
+                )),
+                None,
+            ),
+            (
+                Ok(HarnessMessageOutcome::Claude(
+                    ClaudeMessageOutcome::Failed {
+                        reason: "pane closed".into(),
+                        maybe_submitted: true,
+                    },
+                )),
+                None,
+            ),
+            (
+                Ok(HarnessMessageOutcome::Claude(
+                    ClaudeMessageOutcome::Failed {
+                        reason: "no session".into(),
+                        maybe_submitted: false,
+                    },
+                )),
+                Some(false),
+            ),
+        ];
+        let expected: Vec<_> = outcomes.iter().map(|(_, delivered)| *delivered).collect();
+        for (outcome, _) in &outcomes {
+            let record = MessageRecord {
+                from: Some("manager"),
+                text: None,
+            };
+            record_message(
+                &route,
+                "please rebase\nand more",
+                record,
+                outcome,
+                &fixture.ctx,
+            )
+            .await;
+        }
+        let recorded = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_worktree_events("one", 80)?))
+            .await
+            .unwrap();
+        let delivered: Vec<_> = recorded
+            .iter()
+            .map(|event| match &event.event {
+                wt_core::WorktreeEventKind::Message {
+                    from,
+                    text,
+                    delivered,
+                } => {
+                    assert_eq!(from.as_deref(), Some("manager"));
+                    assert_eq!(text, "please rebase");
+                    *delivered
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(delivered, expected);
         fixture.close().await.unwrap();
     }
 

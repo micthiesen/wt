@@ -238,9 +238,48 @@ against a bounded local GitHub-merge and production-history scan while history
 is open. A landing only moves forward: once a removal is proven in
 production its record keeps that (`landedOn`), so a later refresh or restart
 never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
-verification, landing, and notes. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `p` opens the PR, `i` opens
+verification, landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
+
+### Row history
+
+`H` opens the selected row's history as a modal. Its header is the row's
+marker, title and slug, then one summary line built from the events, such as
+`created 3d ago · ready for 2h · 4 review rounds · 2 automations`, showing
+only the parts the events support. Below a rule the timeline reads newest
+first under day headings. Each event is one line: a time, the glyph and
+color the board uses for the same fact (a status wears its work-status dot, a
+gated status the warn circle-slash, failing checks the red check glyph), a
+headline in that color, dim metadata (who, PR number, rule, check names,
+delivery state), then a status note or a quoted message in body gray. Long
+lines are cut with an ellipsis, never wrapped.
+
+A status line says only what is new. `by <who>` names whoever asserted it
+unless that was the row's own agent, and is left out when no one was
+recorded. A gate and an owed post-merge check are carried by every later
+status, so `blocked on <gate>` and `verify in <stage>` appear only on the
+status where they first appear or change, compared with the status before
+it; a status that drops the gate says `gate cleared` once. A gated status
+keeps its warn circle-slash on every line.
+
+Runs of noise fold into one line carrying the latest time: three or more
+status changes back and forth between the same two states (`ready ↔ review
+×4`), review rounds in a row from one reviewer (`review: 2 findings` with
+the round count), and the same automation outcome repeated within ten
+minutes (`×3`). Only neighbouring events fold, so a line never hides
+something that happened in between. A status that sets or clears a gate or
+an owed check is never folded.
+
+The modal is drawn from the board on every frame. While it is open, new
+events appear at the top; a reader who has scrolled down stays on the line
+they were reading. In a terminal too short to keep the header pinned, the
+header scrolls with the timeline. A row with no events says that recording
+starts from now. Times are local clock times under `Today`, `Yesterday`
+and dated headings when the board carries prepared local labels for every
+event shown; otherwise each line shows its age under elapsed-day headings
+(`Past 24 hours`, `2 days ago`). The `removal record` pane of `h` shows the
+same summary and timeline for a removed row that has recorded events.
 
 ## Keymap
 
@@ -305,6 +344,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `J` / `K` | Reorder the selected row, stack, or folded or empty section; the cursor follows the row across sections, including into an empty one on screen, never into a hidden group |
 | `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
+| `H` | Open the selected row's history: a timeline of how it got here. `j`/`k`, arrows, page keys and `g`/`G` scroll; `H`, `Esc` or `q` closes |
 | `h` | Open removed-worktree history |
 
 ### Worktree titles

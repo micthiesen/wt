@@ -141,6 +141,38 @@ pub async fn start(
     }
 }
 
+/// Record a finished restack in a worktree's history: a replay on the branch
+/// it was asked for, or the stop on the branch that conflicted. A refusal and
+/// a stack that was already up to date moved nothing and are not events.
+/// Every caller of `StackService::restack` reports here.
+pub async fn record_outcome(
+    context: &AppContext,
+    requested: &str,
+    onto: Option<&str>,
+    outcome: &RestackOutcome,
+) {
+    let (branch, ok) = match outcome {
+        RestackOutcome::Complete { replayed, .. } if *replayed > 0 => (requested, true),
+        RestackOutcome::Conflict { branch, .. } => (branch.as_str(), false),
+        _ => return,
+    };
+    let Ok(rows) = context.repository.inventory(&context.cancellation).await else {
+        return;
+    };
+    let Some(row) = rows.iter().find(|row| {
+        !row.is_main
+            && row.target.branch == branch
+            && matches!(row.target.location(), wt_core::WorktreeLocation::Local)
+    }) else {
+        return;
+    };
+    let event = wt_core::WorktreeEventKind::Restack {
+        ok,
+        onto: onto.map(str::to_owned),
+    };
+    wt_app_core::worktree_history::record(context, row.target.slug(), event).await;
+}
+
 /// Entry used by the hidden durable worker command. This deliberately handles
 /// handoff in the worker process rather than the transient TUI controller.
 pub async fn worker(context: &AppContext, branch: &str) -> Result<i32> {
@@ -149,15 +181,16 @@ pub async fn worker(context: &AppContext, branch: &str) -> Result<i32> {
         StackEvent::Log(message) => println!("{message}"),
         StackEvent::Attention(message) => eprintln!("attention: {message}"),
     };
-    match service
+    let outcome = service
         .restack(
             branch,
             RestackOptions::default(),
             &context.cancellation,
             &mut event,
         )
-        .await?
-    {
+        .await?;
+    record_outcome(context, branch, None, &outcome).await;
+    match outcome {
         RestackOutcome::Complete { replayed, total } => {
             println!("restacked {branch} ({replayed}/{total} worktrees)");
             Ok(0)
@@ -233,8 +266,12 @@ async fn handoff_conflict(
         .selected
         .context("could not inspect the wt tmux session registry")?;
     let text = conflict_handoff_text(selected, detail, backup_ref);
+    let record = wt_app_core::harness::MessageRecord {
+        from: Some("wt"),
+        text: None,
+    };
     let outcome = harness
-        .send(route, &text, None, context)
+        .send_recorded(route, &text, None, false, record, context)
         .await
         .context("send /restack conflict handoff")?;
     classify_handoff(outcome)

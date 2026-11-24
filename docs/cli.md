@@ -396,6 +396,10 @@ It is a **skip hint, never authority**. Absent, stale, or unrecognised all mean 
 
 Record or show the worktree's change guide; requires `[guides] enabled` (see [configuration.md](configuration.md#guides--change-guides)). A lone URL argument records it for the current worktree, stamped with its HEAD, so the details pane can say whether the guide still describes the branch. Only one `http(s)` URL is accepted. Bare `wt guide` prints the guide and `current` or `outdated`; `--json` prints `{enabled, slug, head, guide: {url, sha, at}, current}`. `--clear` forgets it. With guides off, recording or clearing exits 2 and writes nothing, so an agent that runs it in a repo without guides changes nothing.
 
+### `wt history [<slug>] [--json] [--limit <n>]`
+
+Print a worktree's recorded history: status changes, pull request state, checks, reviews, merge queue, conflicts, landings, messages sent to its agent, automation fires and restacks. With no slug it reads the worktree of the current directory, then `WT_AGENT`. The text form is newest first, one event per line, with the local time and a plain-words summary. `--json` prints an array of `{at_ms, event}`, oldest first, where `event` is tagged by `kind`; a kind written by a newer build reads as `{"kind": "unknown"}`. `--limit` keeps the newest N events (default 100, at most 500). The command only reads. A name that matches no live worktree is taken as the slug of a removed one, whose last history is kept for 90 days, so this is how to answer "why is this row still here" or "what happened to that branch". [worktree-history.md](worktree-history.md) lists the events and what records each.
+
 ### `wt title [<title…>] [-w <slug>]`
 
 Show or set the worktree's title (default: the current worktree). Bare `wt title` prints the title and its source. Setting one records source `agent`; people rename with the TUI's `t`. A lower source never replaces a higher one, so an agent can retitle as often as the outcome changes but never over a person's title; a refused write exits 1 and names the title it kept. See [Worktree titles](tui.md#worktree-titles).

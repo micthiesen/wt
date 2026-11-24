@@ -32,3 +32,4 @@ pub mod sources;
 pub mod titles;
 pub mod update_source;
 pub mod work_presentation;
+pub mod worktree_history;

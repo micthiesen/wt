@@ -64,5 +64,10 @@ pub(crate) const CODEX: &str = "\u{F4AC}";
 pub(crate) const OPENCODE: &str = "\u{F018D}";
 pub(crate) const PI: &str = "π";
 
+// History timeline (`H`): facts the board has no slot for.
+pub(crate) const BRANCH: &str = "\u{F418}"; // worktree created
+pub(crate) const AUTOMATION: &str = "\u{F085}"; // cogs: an automation rule fired
+pub(crate) const SEND: &str = "\u{F1D8}"; // paper plane: a message to the agent
+
 /// Pause marker for automation state. Plain Unicode, renders everywhere.
 pub(crate) const PAUSE: &str = "⏸";

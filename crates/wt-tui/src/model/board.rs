@@ -73,6 +73,11 @@ pub struct Board {
     /// Only the newest events of a row are carried; a row with none is absent.
     #[serde(default)]
     pub row_history: std::collections::BTreeMap<String, Vec<wt_core::WorktreeEvent>>,
+    /// Controller-local day and clock labels for `row_history` timestamps,
+    /// prepared off the render thread like `local_times`. A history whose
+    /// timestamps are not all labelled is shown with relative ages instead.
+    #[serde(default)]
+    pub history_times: std::collections::BTreeMap<u64, LocalStamp>,
     /// Manually ordered section names (`sectionsOrder`), for the section menu.
     #[serde(default)]
     pub section_order: Vec<String>,
@@ -227,6 +232,17 @@ pub struct LogView {
     pub id: String,
     pub title: String,
     pub lines: Vec<String>,
+}
+
+/// One timestamp in the controller's timezone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LocalStamp {
+    /// The day heading it falls under: `today`, `yesterday`, or a date
+    /// such as `Mon 23 Nov`.
+    pub day: String,
+    /// The clock time, `14:32`.
+    pub clock: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

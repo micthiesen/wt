@@ -14,7 +14,9 @@ const UNORDERED: u64 = 0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Stamp {
     epoch: u64,
-    offset_ms: u64,
+    /// Signed: a moment before the clock's origin still orders correctly.
+    /// Only paused test clocks produce one.
+    offset_ms: i64,
 }
 
 struct ProcessClock {
@@ -49,7 +51,11 @@ impl Stamp {
         let clock = clock();
         Self {
             epoch: clock.epoch,
-            offset_ms: instant.saturating_duration_since(clock.origin).as_millis() as u64,
+            offset_ms: if instant >= clock.origin {
+                instant.duration_since(clock.origin).as_millis() as i64
+            } else {
+                -(clock.origin.duration_since(instant).as_millis() as i64)
+            },
         }
     }
 
@@ -89,8 +95,14 @@ impl Stamp {
     /// The local instant for a stamp from this process, if it is one.
     pub fn local_instant(&self) -> Option<Instant> {
         let clock = clock();
-        (self.epoch == clock.epoch && self.is_ordered())
-            .then(|| clock.origin + std::time::Duration::from_millis(self.offset_ms))
+        (self.epoch == clock.epoch && self.is_ordered()).then(|| {
+            let span = std::time::Duration::from_millis(self.offset_ms.unsigned_abs());
+            if self.offset_ms >= 0 {
+                clock.origin + span
+            } else {
+                clock.origin.checked_sub(span).unwrap_or(clock.origin)
+            }
+        })
     }
 }
 

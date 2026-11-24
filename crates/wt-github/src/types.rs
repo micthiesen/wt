@@ -147,6 +147,12 @@ pub struct PullRequest {
 pub struct GithubData {
     pub prs: BTreeMap<String, PullRequest>,
     pub merge_queue: BTreeMap<String, MergeQueueEntry>,
+    /// Whether `merge_queue` holds every entry of the queue. The read takes
+    /// one page, so a branch missing from a full page may still be queued.
+    /// False for data that does not say (an events-daemon snapshot, a cache
+    /// written before this field).
+    #[serde(default)]
+    pub merge_queue_complete: bool,
     /// Branches explicitly included in the read that produced this snapshot.
     /// An absent PR proves anything only for a covered branch.
     #[serde(default)]

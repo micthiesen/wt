@@ -107,6 +107,21 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         github.view(),
         context.config.branch.base.clone(),
     );
+    let row_history = crate::worktree_history::start(
+        scope,
+        context,
+        local_sources.git.clone(),
+        local_sources.metadata.clone(),
+    );
+    // The observer wants rows with their Git facts and nothing optimistic.
+    crate::worktree_history::observe(
+        scope,
+        context,
+        board.clone(),
+        github.clone(),
+        local_sources.metadata.clone(),
+        row_history.view(),
+    );
     let board = crate::titles::overlay(scope, board);
     let board = crate::session_board::overlay(
         scope,
@@ -149,6 +164,8 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
             .then(|| context.config.clone()),
         automations.board,
     );
+    // Attached last: every later stage would copy each row's events again.
+    let board = crate::worktree_history::overlay(scope, board, row_history.view());
     let perf = crate::perf_source::start(scope, context, board);
     let hard_refresh = crate::hard_refresh::HardRefreshCommands::new(
         perf.board.clone(),
@@ -362,7 +379,12 @@ mod tests {
     ];
 
     /// Sources that read durable SQLite; it is authoritative and never cached.
-    const SQLITE_READERS: &[&str] = &["metadata", "review-dismissals", "removed-history"];
+    const SQLITE_READERS: &[&str] = &[
+        "metadata",
+        "review-dismissals",
+        "removed-history",
+        "row-history",
+    ];
 
     #[tokio::test]
     async fn every_source_declares_and_is_covered() {

@@ -3351,6 +3351,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "tracing",
+ "wt-core",
 ]
 
 [[package]]

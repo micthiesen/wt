@@ -539,8 +539,12 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             };
             let slug = record.target.slug().to_owned();
             let db_slug = slug.clone();
+            let by = std::env::var("WT_AGENT")
+                .ok()
+                .map(|by| by.trim().to_owned())
+                .filter(|by| !by.is_empty());
             ctx.database
-                .call(move |s| Ok(s.set_slug_work_status(&db_slug, None)?))
+                .call(move |s| Ok(s.clear_slug_work_status(&db_slug, by.as_deref())?))
                 .await?;
             println!("✓ {slug} status cleared");
             Ok(0)

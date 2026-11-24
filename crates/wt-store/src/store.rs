@@ -202,10 +202,20 @@ impl Store {
         &mut self,
         mutate: impl FnOnce(&mut WtState) -> Result<(R, bool), StoreError>,
     ) -> Result<R, StoreError> {
+        self.mutate_wt_state_logged(|state, _| mutate(state))
+    }
+
+    /// [`Store::mutate_wt_state`] for a mutation that also records history.
+    /// Events appended through the log share the mutation's transaction.
+    pub(crate) fn mutate_wt_state_logged<R>(
+        &mut self,
+        mutate: impl FnOnce(&mut WtState, &crate::events::EventLog<'_>) -> Result<(R, bool), StoreError>,
+    ) -> Result<R, StoreError> {
         let id = self.identity.id.clone();
         let db = self.writable_db()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = mutate_wt_state_tx(&tx, &id, mutate)?;
+        let log = crate::events::EventLog::new(&tx, &id);
+        let result = mutate_wt_state_tx(&tx, &id, |state| mutate(state, &log))?;
         tx.commit()?;
         Ok(result)
     }
@@ -471,7 +481,11 @@ impl Store {
         }
     }
 
-    fn writable_db(&mut self) -> Result<&mut Connection, StoreError> {
+    pub(crate) fn connection(&self) -> Option<&Connection> {
+        self.db.as_ref()
+    }
+
+    pub(crate) fn writable_db(&mut self) -> Result<&mut Connection, StoreError> {
         if self.read_only {
             return Err(StoreError::ReadOnly);
         }
@@ -550,6 +564,24 @@ fn initialize_schema(db: &mut Connection) -> Result<(), StoreError> {
         )?;
         tx.execute(
             "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
+            [now_ms()],
+        )?;
+    }
+    // Version 2 only adds a table. Builds that know version 1 alone check
+    // for `version >= 1` and never read the new table, so they keep opening
+    // and writing a migrated database.
+    let events: bool = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = 2",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !events {
+        tx.execute_batch(crate::events::EVENTS_SCHEMA)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
             [now_ms()],
         )?;
     }
@@ -703,7 +735,7 @@ fn replace_archived_keys_tx(
     Ok(())
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

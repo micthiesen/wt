@@ -34,3 +34,4 @@ pub mod test_support;
 pub mod watcher;
 pub mod watcher_cleanup;
 pub mod workload;
+pub mod worktree_history;

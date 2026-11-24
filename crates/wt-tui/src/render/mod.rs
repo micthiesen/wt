@@ -7,6 +7,7 @@ mod overlays;
 pub(crate) use overlays::automation_line_count;
 pub(crate) mod status;
 pub(crate) mod text;
+pub(crate) mod timeline;
 
 use ratatui::{
     Frame,

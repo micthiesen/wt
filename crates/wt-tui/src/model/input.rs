@@ -450,6 +450,16 @@ impl Model {
                 self.history.active = true;
                 InputResult::Action(UiAction::SetHistoryActive { active: true })
             }
+            KeyCode::Char('H') if !control => {
+                let Some(row) = self.selected_row() else {
+                    return self.notify("select a worktree first");
+                };
+                self.interaction = Interaction::Timeline(super::TimelinePrompt {
+                    key: row.key.clone(),
+                    ..Default::default()
+                });
+                InputResult::Draw
+            }
             KeyCode::Char('R') if !control => self.row_action(|key| UiAction::Restack { key }),
             KeyCode::Char('e' | 'E') if !control => {
                 let ship = key.code == KeyCode::Char('E');

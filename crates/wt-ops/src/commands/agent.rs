@@ -96,7 +96,16 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
                 }
                 bail!("unknown agent target: {target}; run `wt agent ls` to see available targets");
             };
-            send_route(context, &app, route, &mut text, hold.as_deref(), *steer).await
+            send_route(
+                context,
+                &app,
+                route,
+                &mut text,
+                hold.as_deref(),
+                *steer,
+                None,
+            )
+            .await
         }
         AgentCommand::Start { target, model } => {
             let Some(route) = AppHarness::target_for(target, &routes) else {
@@ -141,7 +150,8 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
             };
             let prompt = wt_app_core::skills::start_prompt(context, harness).await?;
             let mut body = prompt;
-            send_route(context, &app, route, &mut body, None, false).await
+            // The start prompt is a whole skill; its history line says what it is.
+            send_route(context, &app, route, &mut body, None, false, Some("start")).await
         }
     }
 }
@@ -193,7 +203,7 @@ pub async fn send_to(
         );
     }
     let mut body = text.trim().to_owned();
-    send_route(context, &app, route, &mut body, hold, false).await
+    send_route(context, &app, route, &mut body, hold, false, None).await
 }
 
 async fn send_route(
@@ -203,6 +213,7 @@ async fn send_route(
     body: &mut String,
     hold: Option<&str>,
     steer: bool,
+    history_text: Option<&str>,
 ) -> Result<i32> {
     if steer && route.choice.selected != Some(wt_harness::HarnessId::Codex) {
         bail!("--steer applies to Codex sessions; nothing was sent");
@@ -224,8 +235,12 @@ async fn send_route(
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
+    let record = wt_app_core::harness::MessageRecord {
+        from: sender.as_deref(),
+        text: history_text,
+    };
     let outcome = app
-        .send_with(route, body, sender.as_deref(), steer, context)
+        .send_recorded(route, body, sender.as_deref(), steer, record, context)
         .await?;
     log_claude_delivery(&route.target.slug, &outcome);
     if let Some(notice) = app.claude_auth_restart_notice(route, context).await {

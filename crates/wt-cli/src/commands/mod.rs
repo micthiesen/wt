@@ -12,6 +12,7 @@ pub mod edge;
 pub mod events;
 pub mod fleet;
 pub mod guide;
+pub mod history;
 pub mod init;
 pub mod install;
 pub mod list;

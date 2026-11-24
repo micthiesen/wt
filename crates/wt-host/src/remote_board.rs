@@ -334,6 +334,18 @@ fn compose(
                     }
                     board.removed_history.rows.push(row);
                 }
+                // A row's history comes from the host that owns the row,
+                // under that row's own key. The same slug on another host
+                // is another worktree.
+                for (key, events) in &remote.row_history {
+                    let mut events = events.clone();
+                    for event in &mut events {
+                        wt_app_core::worktree_history::sanitize(&mut event.event);
+                    }
+                    board
+                        .row_history
+                        .insert(wt_core::remote_worktree_ledger_key(&host, key), events);
+                }
                 board
                     .activity
                     .extend(remote.activity.iter().cloned().map(|mut line| {
@@ -532,6 +544,63 @@ mod tests {
             .find(|section| section.key == "Review")
             .unwrap();
         assert_eq!(review.rows.len(), 2);
+        fixture.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_remote_rows_history_stays_with_that_hosts_row() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let endpoint = wt_config::RemoteConfig {
+            host: "builder".into(),
+            ..Default::default()
+        };
+        let row = wt_tui::BoardRow {
+            key: "one".into(),
+            slug: "one".into(),
+            branch: "feature/one".into(),
+            ..Default::default()
+        };
+        let message = |text: &str| wt_core::WorktreeEvent {
+            at_ms: 1,
+            event: wt_core::WorktreeEventKind::Message {
+                from: None,
+                text: text.into(),
+                delivered: None,
+            },
+        };
+        let board = |text: &str| Board {
+            rows: vec![row.clone()],
+            row_history: [("one".to_owned(), vec![message(text)])].into(),
+            ..Default::default()
+        };
+        let source = host(HostSnapshot {
+            board: Some(board("from the \u{1b}[31mbuilder")),
+            state: HostState::Ready,
+            domains: Default::default(),
+            layout: Default::default(),
+        });
+        let result = compose(
+            &mut FailureClock::default(),
+            &fixture.ctx.config,
+            ready(board("local")),
+            ready((serde_json::json!({"slugs": {}}), Default::default())),
+            &[(&endpoint, source, None)],
+        );
+        let composed = result.data().cloned().unwrap();
+        let remote_key = wt_core::remote_worktree_ledger_key(&endpoint.key(), "one");
+        assert_eq!(composed.row_history.len(), 2);
+        assert_eq!(composed.row_history["one"], [message("local")]);
+        let remote = &composed.row_history[&remote_key];
+        assert!(
+            matches!(
+                &remote[0].event,
+                wt_core::WorktreeEventKind::Message { text, .. }
+                    if text.contains("builder") && !text.contains('\u{1b}')
+            ),
+            "{remote:?}"
+        );
+        assert!(composed.rows.iter().any(|row| row.key == remote_key));
         fixture.close().await.unwrap();
     }
     #[tokio::test]

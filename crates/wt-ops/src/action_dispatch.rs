@@ -209,8 +209,12 @@ pub async fn dispatch_automation(
             } else {
                 prompt
             };
+            let record = wt_app_core::harness::MessageRecord {
+                from: Some("wt"),
+                text: None,
+            };
             match AppHarness::new(context)
-                .send(&route, &text, None, context)
+                .send_recorded(&route, &text, None, false, record, context)
                 .await
             {
                 Ok(outcome) => match outcome {

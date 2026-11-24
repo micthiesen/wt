@@ -68,6 +68,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         } => log(frame, area, title, lines, scroll),
         Interaction::Confirm(confirm) => confirmation(frame, area, confirm),
         Interaction::Automations { scroll } => automations(frame, area, &model.board, scroll),
+        Interaction::Timeline(view) => super::timeline::modal(frame, area, &model.board, view),
         Interaction::Picker(picker) => {
             let summary = session_summary(&model.board, picker);
             self::picker(frame, area, picker, &primary, summary.as_deref())
@@ -78,20 +79,20 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
 
 // ── Frame ───────────────────────────────────────────────────────────────
 
-type Hint = (String, String);
+pub(super) type Hint = (String, String);
 
-fn hint(key: impl Into<String>, label: impl Into<String>) -> Hint {
+pub(super) fn hint(key: impl Into<String>, label: impl Into<String>) -> Hint {
     (key.into(), label.into())
 }
 
-struct Modal {
+pub(super) struct Modal {
     title: String,
-    border: Color,
+    pub(super) border: Color,
     hints: Vec<Hint>,
 }
 
 impl Modal {
-    fn new(title: impl Into<String>, hints: Vec<Hint>) -> Self {
+    pub(super) fn new(title: impl Into<String>, hints: Vec<Hint>) -> Self {
         Self {
             title: title.into(),
             border: theme::ACCENT,
@@ -128,7 +129,13 @@ impl Modal {
 
     /// The frame for `body_rows` of content that would like
     /// `content_width` cells. `fill` takes the full available height.
-    fn place(&self, area: Rect, content_width: usize, body_rows: usize, fill: bool) -> Rect {
+    pub(super) fn place(
+        &self,
+        area: Rect,
+        content_width: usize,
+        body_rows: usize,
+        fill: bool,
+    ) -> Rect {
         // Narrow terminals give the modal the width inside the pane borders,
         // so no sliver of list text shows beside it.
         let narrow = area.width < NARROW_WIDTH;
@@ -170,7 +177,7 @@ impl Modal {
     }
 
     /// Paint the frame and hints; returns the body rectangle.
-    fn draw(&self, frame: &mut Frame<'_>, area: Rect, outer: Rect) -> Rect {
+    pub(super) fn draw(&self, frame: &mut Frame<'_>, area: Rect, outer: Rect) -> Rect {
         // A one-cell gutter of board background on each side, so text
         // behind the modal never sits flush against its border.
         // The gutter never covers the pane borders at the screen edges.
@@ -262,7 +269,7 @@ fn help_heading(line: &str) -> String {
 
 /// A thumb on the frame's right border when `total` rows overflow the
 /// `visible` rows of the content area (which excludes the hint rows).
-fn scrollbar(
+pub(super) fn scrollbar(
     frame: &mut Frame<'_>,
     outer: Rect,
     border: Color,
@@ -292,7 +299,7 @@ fn scrollbar(
 
 /// Fit spans into exactly `width` cells: the overflowing span is cut with
 /// an ellipsis and the rest of the row is padded.
-fn fit_spans(spans: Vec<Span<'static>>, width: usize, pad: Style) -> Vec<Span<'static>> {
+pub(super) fn fit_spans(spans: Vec<Span<'static>>, width: usize, pad: Style) -> Vec<Span<'static>> {
     let mut out = Vec::with_capacity(spans.len() + 1);
     let mut used = 0;
     for span in spans {
@@ -2309,6 +2316,39 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
         ),
         glyph_item(badges::REMOTE_HOST, "hosted on an SSH remote", "remote"),
     ]);
+    // Facts only the history timeline draws; the rest of its glyphs are the
+    // board's own, listed above.
+    let history_items = [
+        (
+            wt_core::WorktreeEventKind::Created { base: None },
+            "worktree created",
+        ),
+        (
+            wt_core::WorktreeEventKind::Automation {
+                rule: String::new(),
+                outcome: wt_core::AutomationOutcomeKind::Delivered,
+                reason: None,
+            },
+            "automation fired (green delivered, yellow unconfirmed, red failed, dim skipped)",
+        ),
+        (
+            wt_core::WorktreeEventKind::Message {
+                from: None,
+                text: String::new(),
+                delivered: Some(true),
+            },
+            "message to the agent (yellow unconfirmed, red not delivered)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(event, label)| {
+        Some(glyph_item(
+            badges::event_badge(&event, policy)?,
+            label,
+            "history timeline",
+        ))
+    })
+    .collect();
     for (harness, label) in [
         ("claude", "Claude session live"),
         ("codex", "Codex session live"),
@@ -2364,6 +2404,11 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
             title: "row badges".into(),
             grid: false,
             items: row_items,
+        },
+        HelpBlock {
+            title: "history (H)".into(),
+            grid: false,
+            items: history_items,
         },
         HelpBlock {
             title: "AI session states".into(),

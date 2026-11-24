@@ -9,6 +9,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Number, Value, json};
 
+use wt_core::WorktreeEventKind;
+
 use crate::{
     GuideRecord, MergeEdge, RemovedWorktree, ReviewRequestDismissal, Store, StoreError,
     TitleSource, TitleWrite, WorkStatusRecord, WorkStatusWrite, WtState,
@@ -1210,10 +1212,36 @@ impl Store {
         slug: &str,
         record: Option<&WorkStatusRecord>,
     ) -> Result<bool, StoreError> {
-        self.mutate_wt_state(|state| {
+        self.mutate_wt_state_logged(|state, log| {
             let previous = stored_work_status(state, slug);
             let changed = write_work_status(state, slug, previous.as_ref(), record)?;
+            if changed {
+                log.best_effort(|log| {
+                    log_incarnation(log, state, slug)?;
+                    log_status(log, slug, previous.as_ref(), record, None)
+                });
+            }
             Ok((changed, changed))
+        })
+    }
+
+    /// Clear a worktree's status, recording who cleared it (`None` for the
+    /// person). Returns whether a status was stored.
+    pub fn clear_slug_work_status(
+        &mut self,
+        slug: &str,
+        by: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state_logged(|state, log| {
+            let previous = stored_work_status(state, slug);
+            let changed = write_work_status(state, slug, previous.as_ref(), None)?;
+            if changed {
+                log.best_effort(|log| {
+                    log_incarnation(log, state, slug)?;
+                    log_status(log, slug, previous.as_ref(), None, by)
+                });
+            }
+            Ok((previous.is_some(), changed))
         })
     }
 
@@ -1228,13 +1256,19 @@ impl Store {
         slug: &str,
         update: impl FnOnce(Option<&WorkStatusRecord>) -> Result<Option<WorkStatusRecord>, E>,
     ) -> Result<Result<WorkStatusWrite, E>, StoreError> {
-        self.mutate_wt_state(|state| {
+        self.mutate_wt_state_logged(|state, log| {
             let previous = stored_work_status(state, slug);
             let record = match update(previous.as_ref()) {
                 Ok(record) => record,
                 Err(refusal) => return Ok((Err(refusal), false)),
             };
             let changed = write_work_status(state, slug, previous.as_ref(), record.as_ref())?;
+            if changed {
+                log.best_effort(|log| {
+                    log_incarnation(log, state, slug)?;
+                    log_status(log, slug, previous.as_ref(), record.as_ref(), None)
+                });
+            }
             Ok((
                 Ok(WorkStatusWrite {
                     previous,
@@ -1603,13 +1637,35 @@ impl Store {
     }
 
     pub fn record_slug_created(&mut self, slug: &str, at: &str) -> Result<bool, StoreError> {
-        self.mutate_wt_state(|state| {
+        let began = parse_timestamp_ms(at).unwrap_or_else(crate::store::now_ms);
+        self.record_slug_created_since(slug, at, began)
+    }
+
+    /// Record a finished creation that began at `began_ms`. The history's
+    /// `created` event is dated then, not now: the row is in the Git
+    /// inventory while its checkout is still being prepared, and a status
+    /// write, an automation fire or an observation made in that window
+    /// belongs to this incarnation, after its creation.
+    pub fn record_slug_created_since(
+        &mut self,
+        slug: &str,
+        at: &str,
+        began_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state_logged(|state, log| {
             let mut entry = slug_entry(state, slug);
             if entry.get("createdAt").and_then(Value::as_str).is_some() {
                 return Ok((false, false));
             }
             entry.insert("createdAt".to_owned(), json!(at));
+            let base = entry
+                .get("baseBranch")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            log.best_effort(|log| {
+                log.append_created(slug, began_ms.min(crate::store::now_ms()), base, at)
+            });
             Ok((true, true))
         })
     }
@@ -1622,7 +1678,7 @@ impl Store {
         if incoming.is_empty() {
             return Ok(());
         }
-        self.mutate_wt_state(|state| {
+        self.mutate_wt_state_logged(|state, log| {
             let current_slugs = state
                 .get("slugs")
                 .and_then(Value::as_object)
@@ -1714,6 +1770,18 @@ impl Store {
                         next.remove("githubIssue");
                     }
                 }
+                // A removal can be recorded again while it is confirmed;
+                // it is one event.
+                log.best_effort(|log| {
+                    log_incarnation(log, state, &incoming.slug)?;
+                    if log.removed(&incoming.slug)? {
+                        return Ok(());
+                    }
+                    let landed =
+                        serde_json::from_value::<RemovedWorktree>(Value::Object(next.clone()))
+                            .is_ok_and(|entry| is_merged_removal(&entry));
+                    log.append(&incoming.slug, &WorktreeEventKind::Removed { landed })
+                });
                 by_slug.insert(incoming.slug.clone(), Value::Object(next));
             }
             let cutoff = now_ms.saturating_sub(REMOVED_MAX_AGE_MS);
@@ -1768,7 +1836,7 @@ impl Store {
         outcome: &WorkStatusRecord,
     ) -> Result<RemovedSettle, StoreError> {
         let value = serde_json::to_value(outcome)?;
-        self.mutate_wt_state(|state| {
+        self.mutate_wt_state_logged(|state, log| {
             let removed = array_mut(state, "removed");
             let Some(entry) = removed
                 .iter_mut()
@@ -1780,6 +1848,15 @@ impl Store {
             if !verification_owed_at_removal(&parsed) {
                 return Ok((RemovedSettle::NotOwed, false));
             }
+            log.best_effort(|log| {
+                // The slug may name a new worktree by now. The outcome is
+                // about the removed one, so it is recorded only while that
+                // is still the slug's last incarnation.
+                if log.lifecycle(slug)?.is_some_and(|latest| !latest.removed) {
+                    return Ok(());
+                }
+                log_status(log, slug, parsed.work.as_ref(), Some(outcome), None)
+            });
             let previous = parsed.work.and_then(|work| work.verify_after_merge);
             entry["work"] = value;
             Ok((
@@ -2257,6 +2334,138 @@ fn stored_work_status(state: &WtState, slug: &str) -> Option<WorkStatusRecord> {
         .and_then(|slugs| slugs.get(slug))
         .and_then(|slug| slug.get("work"))
         .and_then(|value| serde_json::from_value::<WorkStatusRecord>(value.clone()).ok())
+}
+
+/// Open the slug's current incarnation in the log when its creation is not
+/// there: the worktree predates the log, or a pinned older build created it.
+/// Without this its events would continue the previous incarnation's
+/// history. `createdAt` is the recorded creation time, not a guess.
+fn log_incarnation(
+    log: &crate::events::EventLog<'_>,
+    state: &WtState,
+    slug: &str,
+) -> Result<(), StoreError> {
+    let Some(entry) = state.get("slugs").and_then(|slugs| slugs.get(slug)) else {
+        return Ok(());
+    };
+    let Some(created_at) = entry.get("createdAt").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(created) = parse_timestamp_ms(created_at) else {
+        return Ok(());
+    };
+    // A creation past the retention age would be pruned by the very append
+    // it precedes.
+    if created < crate::store::now_ms().saturating_sub(crate::WORKTREE_EVENT_MAX_AGE_MS) {
+        return Ok(());
+    }
+    match log.lifecycle(slug)? {
+        // This incarnation's creation is recorded. Its event is dated when
+        // creation began, so it is matched by the `createdAt` it was written
+        // for and not by time.
+        Some(latest) if !latest.removed && latest.created_at.as_deref() == Some(created_at) => {
+            return Ok(());
+        }
+        // This incarnation's own removal, recorded a second time.
+        Some(latest) if latest.removed && latest.at_ms >= created => return Ok(()),
+        _ => {}
+    }
+    // At the cap the backdated event would be the oldest and the first one
+    // pruned, on every write.
+    if log.full(slug)? {
+        return Ok(());
+    }
+    let base = entry
+        .get("baseBranch")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    log.append_created(slug, created, base, created_at)
+}
+
+/// The history event for `record` following a status in state `from`. `None`
+/// when a newer build wrote a state this one cannot name. Status writes and
+/// the observer that catches statuses written by older builds both build
+/// their event here, so they describe one status the same way.
+pub fn work_status_event(
+    from: Option<wt_core::WorkState>,
+    record: &WorkStatusRecord,
+) -> Option<WorktreeEventKind> {
+    let mut event = WorktreeEventKind::Status {
+        from,
+        to: work_state(record)?,
+        by: author(record.by.as_deref()),
+        risk: record
+            .risk
+            .as_ref()
+            .and_then(|risk| serde_json::from_value(json!(risk)).ok()),
+        note: record
+            .note
+            .as_deref()
+            .map(wt_core::event_text)
+            .filter(|note| !note.is_empty()),
+        blocked_on: record.blocked_on.clone(),
+        verify_in: owed_stage(record),
+    };
+    crate::bound_worktree_event(&mut event);
+    Some(event)
+}
+
+fn work_state(record: &WorkStatusRecord) -> Option<wt_core::WorkState> {
+    serde_json::from_value(json!(record.state)).ok()
+}
+
+/// Where the record's post-merge check is owed, if it owes one.
+fn owed_stage(record: &WorkStatusRecord) -> Option<String> {
+    record
+        .verify_after_merge
+        .as_deref()
+        .is_some_and(|steps| !steps.trim().is_empty())
+        // Records from before the stage existed were due on the base landing.
+        .then(|| record.verify_in.clone().unwrap_or_else(|| "staging".into()))
+}
+
+/// The person is recorded as no author.
+fn author(by: Option<&str>) -> Option<String> {
+    by.map(str::trim)
+        .filter(|by| !by.is_empty() && *by != "human")
+        .map(str::to_owned)
+}
+
+/// Record a status write that changed the claim's state, risk, merge gate or
+/// post-merge check. A change to the note alone is a re-assertion, not an
+/// event. `cleared_by` names who cleared a status, which has no record.
+fn log_status(
+    log: &crate::events::EventLog<'_>,
+    slug: &str,
+    previous: Option<&WorkStatusRecord>,
+    record: Option<&WorkStatusRecord>,
+    cleared_by: Option<&str>,
+) -> Result<(), StoreError> {
+    let from = previous.and_then(work_state);
+    let Some(record) = record else {
+        if previous.is_some() {
+            log.append(
+                slug,
+                &WorktreeEventKind::StatusCleared {
+                    from,
+                    by: author(cleared_by),
+                },
+            )?;
+        }
+        return Ok(());
+    };
+    if previous.is_some_and(|previous| {
+        previous.state == record.state
+            && previous.risk == record.risk
+            && previous.blocked_on == record.blocked_on
+            && owed_stage(previous) == owed_stage(record)
+    }) {
+        return Ok(());
+    }
+    match work_status_event(from, record) {
+        Some(event) => log.append(slug, &event),
+        None => Ok(()),
+    }
 }
 
 /// Returns whether the stored status changed.

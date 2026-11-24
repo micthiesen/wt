@@ -47,6 +47,19 @@ pub struct ReviewerPrompt {
     pub selected: usize,
 }
 
+/// The open history modal (`H`). `key` names the row; its lines are rebuilt
+/// from the board on every draw.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TimelinePrompt {
+    pub key: String,
+    pub scroll: usize,
+    /// How far the last draw could scroll; bounds the scroll keys.
+    pub(crate) max_scroll: usize,
+    /// The first entry the last draw showed, its distance below the top
+    /// line, and the scroll it was drawn at.
+    pub(crate) anchor: Option<(u64, usize, usize)>,
+}
+
 #[derive(Default)]
 pub enum Interaction {
     #[default]
@@ -64,6 +77,7 @@ pub enum Interaction {
         scroll: usize,
     },
     Reviewers(ReviewerPrompt),
+    Timeline(TimelinePrompt),
 }
 
 impl Model {
@@ -143,6 +157,21 @@ impl Model {
                 }
                 let maximum = crate::render::automation_line_count(&self.board).saturating_sub(1);
                 let moved = overlay_scroll(key, scroll, maximum, height);
+                self.interaction = interaction;
+                if moved {
+                    InputResult::Draw
+                } else {
+                    InputResult::Unchanged
+                }
+            }
+            Interaction::Timeline(view) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | 'H'))
+                    || (control && key.code == KeyCode::Char('c'))
+                {
+                    return InputResult::Draw;
+                }
+                let maximum = view.max_scroll;
+                let moved = overlay_scroll(key, &mut view.scroll, maximum, height);
                 self.interaction = interaction;
                 if moved {
                     InputResult::Draw

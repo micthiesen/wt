@@ -15,7 +15,10 @@ use ratatui::{
     text::Span,
 };
 use unicode_width::UnicodeWidthStr;
-use wt_core::{WorkRisk, WorkState};
+use wt_core::{
+    AutomationOutcomeKind, ChecksChange, LandedOn, PrChange, QueueChange, ReviewChange, WorkRisk,
+    WorkState, WorktreeEventKind,
+};
 
 use crate::{
     BoardRow, CheckState, DisplayPolicy, LandingKind, PrPresentation, ReviewState, SessionView,
@@ -375,11 +378,15 @@ pub(crate) fn check_badge(checks: CheckState) -> Option<Badge> {
     }
 }
 
-/// Changes-requested is amber, not alarm red: "needs another pass".
 pub(crate) fn review_badge(review: ReviewState, policy: &DisplayPolicy) -> Option<Badge> {
     if !policy.reviewers {
         return None;
     }
+    review_state_badge(review)
+}
+
+/// Changes-requested is amber, not alarm red: "needs another pass".
+fn review_state_badge(review: ReviewState) -> Option<Badge> {
     match review {
         ReviewState::Approved => Some(badge(glyphs::THUMBS_UP, theme::OK)),
         ReviewState::ChangesRequested => Some(badge(glyphs::LIGHTBULB, theme::WARN)),
@@ -459,6 +466,96 @@ pub(crate) fn rebase_badge(row: &BoardRow, session_state: Option<&str>) -> Optio
         return Some(badge(glyphs::CONFLICT, theme::ERR));
     }
     None
+}
+
+/// A status as it was asserted: the dot the list drew for it at the time. A
+/// gated assertion wears the warn circle-slash of a blocked row.
+pub(crate) fn asserted_status_badge(state: WorkState, gated: bool) -> Badge {
+    work_status_badge(Some(&WorkPresentation {
+        effective_state: Some(state),
+        blocked: gated,
+        ..Default::default()
+    }))
+}
+
+/// The same hues the automations overlay gives a recorded fire.
+pub(crate) fn automation_outcome_color(outcome: AutomationOutcomeKind) -> Color {
+    match outcome {
+        AutomationOutcomeKind::Delivered => theme::OK,
+        AutomationOutcomeKind::Unconfirmed => theme::WARN,
+        AutomationOutcomeKind::Skipped => theme::FG_DIM,
+        AutomationOutcomeKind::Failed => theme::ERR,
+    }
+}
+
+/// The glyph a recorded history event wears: whatever the board draws for
+/// the same fact, built through the board's own helpers so the two cannot
+/// drift. `None` for a kind this build does not know.
+pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> Option<Badge> {
+    use WorktreeEventKind as Event;
+    let pr = |state: &str, draft: bool| {
+        pr_state_badge(&PrPresentation {
+            state: Some(state.into()),
+            draft,
+            ..Default::default()
+        })
+    };
+    Some(match event {
+        Event::Created { .. } => badge(glyphs::BRANCH, theme::ACCENT_ALT),
+        Event::Status { to, blocked_on, .. } => asserted_status_badge(*to, blocked_on.is_some()),
+        Event::StatusCleared { .. } => work_status_badge(None),
+        Event::Pr { change, .. } => match change {
+            PrChange::Opened | PrChange::ReadyForReview | PrChange::Reopened => pr("OPEN", false),
+            PrChange::OpenedDraft | PrChange::BackToDraft => pr("OPEN", true),
+            PrChange::Closed => pr("CLOSED", false),
+            PrChange::Merged => pr("MERGED", false),
+        },
+        Event::Checks { state, .. } => check_badge(match state {
+            ChecksChange::Failing => CheckState::Fail,
+            ChecksChange::Passing => CheckState::Pass,
+        })?,
+        Event::Review { change, .. } => match change {
+            ReviewChange::Findings { .. } => badge(review_bot_glyph(policy), theme::INFO),
+            ReviewChange::Clean => badge(review_bot_glyph(policy), theme::OK),
+            ReviewChange::ChangesRequested => review_state_badge(ReviewState::ChangesRequested)?,
+            ReviewChange::Approved => review_state_badge(ReviewState::Approved)?,
+        },
+        Event::MergeQueue { change } => badge(
+            glyphs::MERGE_QUEUE,
+            match change {
+                QueueChange::Queued => merge_queue_state("QUEUED").1,
+                QueueChange::Left => theme::FG_DIM,
+            },
+        ),
+        Event::Conflict { resolved: false } => badge(glyphs::CONFLICT, theme::ERR),
+        Event::Conflict { resolved: true } => badge(glyphs::RESTACK, theme::OK),
+        Event::Landed { on } => badge(
+            match on {
+                LandedOn::Base => glyphs::MERGE,
+                LandedOn::Production => glyphs::PRODUCTION,
+            },
+            theme::OK,
+        ),
+        Event::Automation { outcome, .. } => {
+            badge(glyphs::AUTOMATION, automation_outcome_color(*outcome))
+        }
+        Event::Message { delivered, .. } => badge(
+            glyphs::SEND,
+            match delivered {
+                Some(true) => theme::ACCENT,
+                None => theme::WARN,
+                Some(false) => theme::ERR,
+            },
+        ),
+        Event::Restack { ok: true, .. } => busy_badge("restack"),
+        Event::Restack { ok: false, .. } => badge(glyphs::RESTACK, theme::ERR),
+        // A removal that discarded unlanded work is the one worth noticing.
+        Event::Removed { landed } => badge(
+            glyphs::TRASH,
+            if *landed { theme::FG_DIM } else { theme::WARN },
+        ),
+        Event::Unknown => return None,
+    })
 }
 
 fn shows(policy: &DisplayPolicy, slot: &str) -> bool {
@@ -863,6 +960,118 @@ mod tests {
             rebase_badge(&conflicted, Some("idle")),
             Some(badge(glyphs::CONFLICT, theme::ERR))
         );
+    }
+
+    #[test]
+    fn history_events_wear_the_boards_badge_for_the_same_fact() {
+        use wt_core::WorktreeEventKind as Event;
+        let policy = DisplayPolicy::default();
+        let event = |event: Event| event_badge(&event, &policy);
+        for state in [WorkState::Ready, WorkState::Review, WorkState::Dropped] {
+            assert_eq!(
+                asserted_status_badge(state, false),
+                work_status_badge(Some(&work(state)))
+            );
+        }
+        let gated = WorkPresentation {
+            blocked: true,
+            ..work(WorkState::Ready)
+        };
+        assert_eq!(
+            asserted_status_badge(WorkState::Ready, true),
+            work_status_badge(Some(&gated))
+        );
+        assert_eq!(
+            event(Event::StatusCleared {
+                from: None,
+                by: None
+            }),
+            Some(work_status_badge(None))
+        );
+        let checks = |state| Event::Checks {
+            state,
+            failed: Vec::new(),
+        };
+        assert_eq!(
+            event(checks(ChecksChange::Failing)),
+            check_badge(CheckState::Fail)
+        );
+        assert_eq!(
+            event(checks(ChecksChange::Passing)),
+            check_badge(CheckState::Pass)
+        );
+        let pr = |state: &str, draft: bool| {
+            Some(pr_state_badge(&PrPresentation {
+                state: Some(state.into()),
+                draft,
+                ..Default::default()
+            }))
+        };
+        for (change, expected) in [
+            (PrChange::Opened, pr("OPEN", false)),
+            (PrChange::OpenedDraft, pr("OPEN", true)),
+            (PrChange::Merged, pr("MERGED", false)),
+            (PrChange::Closed, pr("CLOSED", false)),
+        ] {
+            assert_eq!(event(Event::Pr { number: 1, change }), expected);
+        }
+        let reviewers = DisplayPolicy {
+            reviewers: true,
+            ..Default::default()
+        };
+        let review = |change| Event::Review {
+            reviewer: None,
+            change,
+        };
+        assert_eq!(
+            event(review(ReviewChange::Approved)),
+            review_badge(ReviewState::Approved, &reviewers)
+        );
+        assert_eq!(
+            event(review(ReviewChange::ChangesRequested)),
+            review_badge(ReviewState::ChangesRequested, &reviewers)
+        );
+        let bot = |state: &str| {
+            review_bot_badge(
+                &PrPresentation {
+                    state: Some("OPEN".into()),
+                    review_bot: Some(ReviewBotView {
+                        state: state.into(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &policy,
+            )
+        };
+        assert_eq!(
+            event(review(ReviewChange::Findings { count: 2 })),
+            bot("unresolved")
+        );
+        assert_eq!(event(review(ReviewChange::Clean)), bot("clean"));
+        let mut conflicted = row();
+        conflicted.git.base_conflicts = Some(vec!["a.rs".into()]);
+        assert_eq!(
+            event(Event::Conflict { resolved: false }),
+            rebase_badge(&conflicted, None)
+        );
+        let mut landed = row();
+        landed.git.landed_on = Some(LandingKind::Base);
+        assert_eq!(
+            event(Event::Landed { on: LandedOn::Base }),
+            loud_status_badge(&landed)
+        );
+        assert_eq!(
+            event(Event::Landed {
+                on: LandedOn::Production
+            }),
+            Some(badge(glyphs::PRODUCTION, theme::OK))
+        );
+        assert_eq!(
+            event(Event::Removed { landed: true }).map(|badge| badge.glyph),
+            Some(glyphs::TRASH)
+        );
+        assert_eq!(event(Event::Unknown), None);
     }
 
     #[test]

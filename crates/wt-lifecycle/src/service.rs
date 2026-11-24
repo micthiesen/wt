@@ -731,6 +731,10 @@ impl LifecycleService {
         progress: &mut CreateProgress,
         cancellation: &CancellationToken,
     ) -> Result<WorktreeTarget, LifecycleError> {
+        // The row is on the board while its checkout is prepared and its
+        // install runs; history made in that window belongs to this
+        // worktree, so its creation is dated from here.
+        let began = now_ms();
         let prior = self.reset_slug_state(slug, cancellation).await?;
         // The slug alone does not identify a branch: only the removal record
         // proves the previous state belonged to this one.
@@ -836,7 +840,11 @@ impl LifecycleService {
         let created_at = now_iso();
         self.mutate_store(cancellation, {
             let slug = slug.to_owned();
-            move |store| store.record_slug_created(&slug, &created_at).map(|_| ())
+            move |store| {
+                store
+                    .record_slug_created_since(&slug, &created_at, began)
+                    .map(|_| ())
+            }
         })
         .await?;
         Ok(local_worktree_target(
@@ -5091,6 +5099,62 @@ mod tests {
         assert_eq!(collision("other"), Some("other-dev".into()));
         assert_eq!(collision("fix-codex-notes"), None);
         assert_eq!(collision("-dev"), None);
+    }
+
+    #[tokio::test]
+    async fn history_dates_a_creation_from_its_start_so_install_time_events_follow_it() {
+        let (_scratch, mut service, _runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        service.config.install_command = Some("sleep 0.4".into());
+        let before = now_ms();
+        service
+            .create(
+                "michael/slow-install",
+                CreateOptions {
+                    base: Some("refs/heads/main".into()),
+                    fetch_origin: false,
+                    run_install: true,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        // Something recorded while the install ran, such as a status the
+        // new agent asserted.
+        let during = u64::try_from(now_ms() - 200).unwrap();
+        let (events, created_at) = service
+            .mutate_store(&cancellation, move |store| {
+                store.append_worktree_event(
+                    "slow-install",
+                    during,
+                    &wt_core::WorktreeEventKind::Conflict { resolved: false },
+                )?;
+                Ok((
+                    store.read_worktree_events("slow-install", 80)?,
+                    store.read_wt_state()?["slugs"]["slow-install"]["createdAt"]
+                        .as_str()
+                        .map(str::to_owned),
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(created_at.is_some(), "creation finished");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events[0].event,
+            wt_core::WorktreeEventKind::Created {
+                base: Some("main".into())
+            }
+        );
+        let created = i64::try_from(events[0].at_ms).unwrap();
+        assert!(
+            created >= before && created <= now_ms() - 400,
+            "dated when creation began, before the install: {created} vs {before}"
+        );
+        assert_eq!(
+            events[1].event,
+            wt_core::WorktreeEventKind::Conflict { resolved: false }
+        );
     }
 
     #[tokio::test]

@@ -29,15 +29,17 @@ pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION, REMOVING_SECTION};
 pub use board::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
     AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
-    GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LogView, MergeQueueView,
-    PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
-    PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot,
-    ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView,
-    TerminalSlotView, TitleSource, UsageItem, WorkPresentation, WorkRiskCount, WorkStateCount,
+    GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LocalStamp, LogView,
+    MergeQueueView, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
+    PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
+    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
+    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WorkPresentation,
+    WorkRiskCount, WorkStateCount,
 };
 pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{
-    ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TitlePrompt,
+    ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TimelinePrompt,
+    TitlePrompt,
 };
 pub(crate) use interaction::{digit_rows, overlay_scroll};
 pub(crate) use selection::VisualItem;

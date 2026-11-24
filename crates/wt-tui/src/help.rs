@@ -26,6 +26,7 @@ pub(crate) const LINES: &[&str] = &[
     "  y on folded        Copy section name (n), slugs (s), branches (b), list (l)",
     "  t                  Rename the worktree title",
     "  V                  Show / hide this row's post-merge verify steps",
+    "  H                  History: how the row got here (H / Esc / q closes)",
     "  a                  Archive / restore",
     "  d                  Remove worktree (confirmation)",
     "",

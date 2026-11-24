@@ -194,13 +194,14 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     match completed {
                         Some(Ok((id, (claim, outcome, error))) ) => {
                             active_dispatches.remove(&id);
-                            if let Some(error) = error { latest_error = Some(error); }
+                            if let Some(error) = &error { latest_error = Some(error.clone()); }
                             let advanced_tip = claim.fire().branch_range.as_ref().map(|range| (range.branch.clone(), range.to.clone()));
                             let delivered_event = claim.fire().mcp_event.as_ref().map(|event| (event.rule.clone(), event.event_id.clone()));
                             let started = !matches!(
                                 outcome,
                                 AutomationOutcome::NotStarted | AutomationOutcome::Deferred { .. }
                             );
+                            let finished = fire_event(claim.fire(), &outcome, error.as_deref());
                             match engine.finish_with_cancellation(
                                 &claim, outcome, now_ms(), &accepted_context.cancellation,
                             ).await {
@@ -215,6 +216,9 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                 Err(error) => {
                                     latest_error = Some(format!("automation ledger finish: {error:#}"));
                                 }
+                            }
+                            if let Some(event) = finished {
+                                wt_app_core::worktree_history::record(&context, &claim.fire().slug, event).await;
                             }
                             // The ledger already holds the fire's key, so a
                             // failed drop only leaves an event that cannot
@@ -419,6 +423,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     continue;
                 }
             };
+            record_skipped(&context, engine.take_skipped()).await;
             for claim in tick.claims {
                 let context = accepted_context.clone();
                 let github = fresh_github.clone();
@@ -478,6 +483,62 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         commands,
         drain: AutomationDrain::new(drain_token, task),
     }
+}
+
+/// Record the fires the engine ended without running. A fleet fire has no
+/// worktree.
+async fn record_skipped(
+    context: &AppContext,
+    skipped: Vec<wt_app_core::automation_engine::SkippedFire>,
+) {
+    for skipped in skipped {
+        if skipped.slug == wt_automations::FLEET_SLUG {
+            continue;
+        }
+        let event = wt_core::WorktreeEventKind::Automation {
+            rule: skipped.rule,
+            outcome: wt_core::AutomationOutcomeKind::Skipped,
+            reason: Some(wt_core::event_text(&skipped.reason)),
+        };
+        wt_app_core::worktree_history::record(context, &skipped.slug, event).await;
+    }
+}
+
+/// How a finished fire reads in its worktree's history. A fire that will run
+/// again (not started, deferred) is still pending and is not an event, and a
+/// fleet fire has no worktree.
+fn fire_event(
+    fire: &wt_automations::AutomationFire,
+    outcome: &AutomationOutcome,
+    error: Option<&str>,
+) -> Option<wt_core::WorktreeEventKind> {
+    use wt_core::AutomationOutcomeKind;
+    if fire.slug == wt_automations::FLEET_SLUG {
+        return None;
+    }
+    let (outcome, reason) = match (outcome, error) {
+        (AutomationOutcome::NotStarted | AutomationOutcome::Deferred { .. }, _) => return None,
+        // A built-in that ran and reported failure is delivered to the
+        // ledger, so it is not replayed; here it reads as what it was.
+        (AutomationOutcome::Delivered { .. }, Some(error)) => {
+            (AutomationOutcomeKind::Failed, Some(error))
+        }
+        (AutomationOutcome::Delivered { .. }, None) => (AutomationOutcomeKind::Delivered, None),
+        (AutomationOutcome::Ambiguous { reason, .. }, _) => {
+            (AutomationOutcomeKind::Unconfirmed, Some(reason.as_str()))
+        }
+    };
+    Some(wt_core::WorktreeEventKind::Automation {
+        rule: fire.rule.id.clone(),
+        outcome,
+        reason: reason
+            .map(|reason| {
+                // A built-in's failure text leads with its own rule id.
+                let prefix = format!("{}: ", fire.rule.id);
+                wt_core::event_text(reason.strip_prefix(prefix.as_str()).unwrap_or(reason))
+            })
+            .filter(|reason| !reason.is_empty()),
+    })
 }
 
 /// A dispatch task that panicked or was aborted may have delivered first.
@@ -1021,6 +1082,131 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use wt_runtime::SourceSnapshot;
+
+    fn fire(slug: &str) -> wt_automations::AutomationFire {
+        wt_automations::AutomationFire {
+            rule: wt_config::AutomationDef {
+                id: "nudge".into(),
+                ..Default::default()
+            },
+            slug: slug.into(),
+            quiesce_slugs: Vec::new(),
+            fire_keys: vec!["key".into()],
+            stack_id: None,
+            close_issue: None,
+            delete_branch: None,
+            delete_branch_pr: None,
+            branch_range: None,
+            frozen_vars: None,
+            frozen_pr: None,
+            mcp_event: None,
+            detail: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_and_skipped_fires_are_recorded_and_pending_ones_are_not() {
+        use wt_app_core::automation_engine::{DeliverySlot, SkippedFire};
+        use wt_core::{AutomationOutcomeKind, WorktreeEventKind};
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let delivered = AutomationOutcome::Delivered {
+            slot: DeliverySlot::None,
+        };
+        let outcomes = [
+            (delivered.clone(), None),
+            // A built-in that ran and reported failure.
+            (delivered.clone(), Some("nudge: push was rejected")),
+            (
+                AutomationOutcome::Ambiguous {
+                    reason: "reply lost".into(),
+                    slot: DeliverySlot::Session,
+                },
+                None,
+            ),
+            // Both run again later, so neither is an event yet.
+            (AutomationOutcome::NotStarted, None),
+            (
+                AutomationOutcome::Deferred {
+                    reason: "waiting".into(),
+                    frozen: Default::default(),
+                },
+                None,
+            ),
+        ];
+        for (outcome, error) in &outcomes {
+            if let Some(event) = fire_event(&fire("one"), outcome, *error) {
+                wt_app_core::worktree_history::record(&fixture.ctx, "one", event).await;
+            }
+        }
+        assert_eq!(
+            fire_event(&fire(wt_automations::FLEET_SLUG), &delivered, None),
+            None,
+            "a fleet fire belongs to no worktree"
+        );
+        record_skipped(
+            &fixture.ctx,
+            vec![
+                SkippedFire {
+                    slug: "one".into(),
+                    rule: "nudge".into(),
+                    reason: "session busy on one".into(),
+                },
+                SkippedFire {
+                    slug: wt_automations::FLEET_SLUG.into(),
+                    rule: "nudge".into(),
+                    reason: "busy".into(),
+                },
+            ],
+        )
+        .await;
+        let recorded: Vec<_> = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_worktree_events("one", 80)?))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|event| match event.event {
+                WorktreeEventKind::Automation {
+                    rule,
+                    outcome,
+                    reason,
+                } => {
+                    assert_eq!(rule, "nudge");
+                    (outcome, reason)
+                }
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (AutomationOutcomeKind::Delivered, None),
+                (
+                    AutomationOutcomeKind::Failed,
+                    Some("push was rejected".to_owned())
+                ),
+                (
+                    AutomationOutcomeKind::Unconfirmed,
+                    Some("reply lost".to_owned())
+                ),
+                (
+                    AutomationOutcomeKind::Skipped,
+                    Some("session busy on one".to_owned())
+                ),
+            ]
+        );
+        let fleet = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_worktree_events(wt_automations::FLEET_SLUG, 80)?))
+            .await
+            .unwrap();
+        assert!(fleet.is_empty());
+        fixture.close().await.unwrap();
+    }
 
     #[cfg(unix)]
     #[tokio::test]

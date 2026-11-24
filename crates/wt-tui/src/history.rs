@@ -200,7 +200,11 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, list: Rect, detai
     frame.render_widget(block, details);
     let lines = rows
         .get(model.history.selected)
-        .map(|row| record_lines(row, inner.width as usize))
+        .map(|row| {
+            let width = inner.width as usize;
+            let history = crate::render::timeline::record_block(&model.board, &row.key, width);
+            record_lines(row, history, width)
+        })
         .unwrap_or_else(|| {
             vec![
                 Line::default(),
@@ -415,10 +419,15 @@ fn history_lines(
 
 /// The removal record: title, branch, when and where, then the captured
 /// `Label: value` facts as an aligned key column with the work state in
-/// its own color, free-form notes in mid gray, and the keys that apply.
+/// its own color, free-form notes in mid gray, the row's recorded
+/// `history` when it has one, and the keys that apply.
 /// Every line is wrapped here, values inside their own column, so a long
 /// value never continues under the keys and reads as a new row.
-fn record_lines(row: &crate::RemovedHistoryRow, width: usize) -> Vec<Line<'static>> {
+fn record_lines(
+    row: &crate::RemovedHistoryRow,
+    history: Vec<Line<'static>>,
+    width: usize,
+) -> Vec<Line<'static>> {
     const KEY: usize = 10;
     const MARKER: usize = 3;
     let value_width = width.saturating_sub(KEY).max(1);
@@ -546,6 +555,10 @@ fn record_lines(row: &crate::RemovedHistoryRow, width: usize) -> Vec<Line<'stati
     for detail in &row.details {
         field(&mut lines, "", detail, theme::FG_MID);
     }
+    if !history.is_empty() {
+        lines.push(Line::default());
+        lines.extend(history);
+    }
     lines.push(Line::default());
     let mut keys = vec![("⏎", "restore")];
     if row.pr_url.is_some() {
@@ -610,7 +623,7 @@ mod tests {
         assert!(text(&lines[4]).contains("yesterday"));
         assert_eq!(lines[5].spans[1].content, format!("{}  ", glyphs::TRASH));
 
-        let record = record_lines(&rows[0], 60);
+        let record = record_lines(&rows[0], Vec::new(), 60);
         let work = record
             .iter()
             .find(|line| text(line).contains("ready"))
@@ -630,7 +643,7 @@ mod tests {
             details: vec!["a note that runs well past the width of the pane".into()],
             ..Default::default()
         };
-        let lines = record_lines(&row, 30);
+        let lines = record_lines(&row, Vec::new(), 30);
         let text = |line: &Line<'_>| -> String {
             line.spans
                 .iter()

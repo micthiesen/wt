@@ -141,6 +141,17 @@ inventory changes, even while the pane is closed. Opening history displays
 those prepared rows immediately and enriches tracker and landing facts in the
 background. Closing history cancels external enrichment but retains its rows.
 
+Each worktree's own history is a separate durable event log
+([worktree-history.md](worktree-history.md)). The `row-history` leaf reads the
+newest events of every live local row and every listed removed row from
+SQLite in one query whenever the
+metadata leaf refreshes, and publishes them as `Board::row_history`. The same
+module runs the observer that records pull request, check, review, merge
+queue, conflict and landing changes: it takes only confirmed GitHub and Git
+facts, and decides what is new from the log itself inside the appending
+transaction, so restarts and a second host on one database record a fact
+once. Remote rows carry the history their own host published.
+
 The activity source backfills a bounded tail from the seven rolling native
 JSON logs and manager reports. Attention transitions are written to that same
 log with their event timestamp, so both feeds can recover them after restart
@@ -629,7 +640,8 @@ are not moved. Separate service daemons require their own resource policy.
 
 `wt-store` is the authority for repository-scoped status, sections, issue
 overrides, fork bases, archives, removed-worktree history, automation pause
-state, and other user-authored records. SQLite schema migrations and the
+state, and other user-authored records. It also holds each worktree's event
+log, which is a record and never an input to a safety decision. SQLite schema migrations and the
 versioned worktree-state payload migrations are distinct compatibility
 boundaries. `wt state migrate` imports legacy records; it does not run as an
 implicit cache clear.

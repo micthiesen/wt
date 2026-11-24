@@ -234,6 +234,7 @@ impl GithubClient {
             for mut chunk in chunks.drain(..) {
                 data.prs.append(&mut chunk.prs);
                 data.merge_queue.append(&mut chunk.merge_queue);
+                data.merge_queue_complete |= chunk.merge_queue_complete;
             }
             data.covered_branches = branches.iter().cloned().collect();
             Ok::<GithubData, GithubError>(data)
@@ -1332,9 +1333,10 @@ fn build_query(
     // (open, or the latest merged) first however recently older ones changed.
     let aliases = (0..branches.len()).map(|i| format!("wt_{i}: pullRequests(first:2,headRefName:$b{i},orderBy:{{field:CREATED_AT,direction:DESC}}) {{ nodes {{ ...PrFields }} }}")).collect::<Vec<_>>().join("\n");
     let merge_queue = if with_queue {
-        "mergeQueue(branch:$mergeQueueBranch) { entries(first:50) { nodes { enqueuedAt estimatedTimeToMerge position state pullRequest { headRefName } } } }"
+        "mergeQueue(branch:$mergeQueueBranch) { entries(first:MERGE_QUEUE_PAGE) { nodes { enqueuedAt estimatedTimeToMerge position state pullRequest { headRefName } } } }"
+            .replace("MERGE_QUEUE_PAGE", &MERGE_QUEUE_PAGE.to_string())
     } else {
-        ""
+        String::new()
     };
     let merge_var = if with_queue {
         ", $mergeQueueBranch: String!"
@@ -1438,6 +1440,10 @@ comments(last:COMMENT_FETCH_LIMIT) { nodes { author { login __typename } body cr
 reviews(last:10) { nodes { author { login __typename } body state createdAt } }
 }"#;
 
+/// Merge queue entries one read asks for. The query does not paginate, so a
+/// full page may not be the whole queue.
+const MERGE_QUEUE_PAGE: usize = 50;
+
 fn parse_chunk(
     bytes: &[u8],
     branches: &[String],
@@ -1511,11 +1517,15 @@ fn parse_chunk(
             data.prs.insert(pr.head_ref_name.clone(), pr);
         }
     }
+    // A base branch with no merge queue answers `mergeQueue: null`: nothing
+    // is queued, and that is the whole answer.
+    data.merge_queue_complete = with_queue && repo.get("mergeQueue").is_some_and(Value::is_null);
     if with_queue
         && let Some(nodes) = repo
             .pointer("/mergeQueue/entries/nodes")
             .and_then(Value::as_array)
     {
+        data.merge_queue_complete = nodes.len() < MERGE_QUEUE_PAGE;
         for item in nodes {
             let Some(head) = str_at(item, "/pullRequest/headRefName") else {
                 continue;
@@ -2364,6 +2374,48 @@ else:
             crate::count_unticked_review_boxes("- [ ] one\n~~~\n- [ ] ignored\n~~~\n  - [ ] two"),
             2
         );
+    }
+
+    #[test]
+    fn a_full_page_of_queue_entries_is_not_the_whole_queue() {
+        let chunk = |entries: usize, with_queue: bool| {
+            let nodes: Vec<_> = (0..entries)
+                .map(|n| {
+                    serde_json::json!({
+                        "state": "QUEUED", "position": n, "enqueuedAt": "2026-10-09T00:00:00Z",
+                        "pullRequest": {"headRefName": format!("feature/{n}")}
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({"data": {"repository": {
+                "wt_0": {"nodes": []},
+                "mergeQueue": {"entries": {"nodes": nodes}}
+            }}});
+            parse_chunk(
+                body.to_string().as_bytes(),
+                &["feature/a".into()],
+                with_queue,
+                &options(),
+            )
+            .unwrap()
+        };
+        let short = chunk(MERGE_QUEUE_PAGE - 1, true);
+        assert_eq!(short.merge_queue.len(), MERGE_QUEUE_PAGE - 1);
+        assert!(short.merge_queue_complete);
+        assert!(!chunk(MERGE_QUEUE_PAGE, true).merge_queue_complete);
+        // A chunk that did not ask for the queue says nothing about it.
+        assert!(!chunk(0, false).merge_queue_complete);
+        // A base branch without a merge queue has nothing queued.
+        let none = parse_chunk(
+            br#"{"data":{"repository":{"wt_0":{"nodes":[]},"mergeQueue":null}}}"#,
+            &["feature/a".into()],
+            true,
+            &options(),
+        )
+        .unwrap();
+        assert!(none.merge_queue_complete);
+        let (query, _) = build_query(&["feature/a".into()], true, "owner", "repo", "main", 30);
+        assert!(query.contains(&format!("entries(first:{MERGE_QUEUE_PAGE})")));
     }
 
     #[test]
