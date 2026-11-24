@@ -69,6 +69,10 @@ pub struct Board {
     /// presented board, the user's own pending requests.
     #[serde(default, rename = "pending")]
     pub pending_views: Vec<wt_runtime::PendingView>,
+    /// Each row's recorded history, oldest first, keyed by `BoardRow::key`.
+    /// Only the newest events of a row are carried; a row with none is absent.
+    #[serde(default)]
+    pub row_history: std::collections::BTreeMap<String, Vec<wt_core::WorktreeEvent>>,
     /// Manually ordered section names (`sectionsOrder`), for the section menu.
     #[serde(default)]
     pub section_order: Vec<String>,

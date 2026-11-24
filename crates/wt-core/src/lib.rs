@@ -9,6 +9,7 @@ mod stage;
 mod time;
 pub use time::parse_iso_millis;
 mod work_status;
+mod worktree_event;
 mod worktree_ref;
 mod worktree_target;
 
@@ -19,5 +20,6 @@ pub use merge_edges::*;
 pub use stack_layout::*;
 pub use stage::stage_name;
 pub use work_status::*;
+pub use worktree_event::*;
 pub use worktree_ref::*;
 pub use worktree_target::*;
