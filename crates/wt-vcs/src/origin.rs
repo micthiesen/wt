@@ -4,7 +4,7 @@ use std::{
     collections::BTreeSet,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::{StreamExt, stream};
@@ -26,6 +26,32 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Waiting for admission only: a started fast-forward always finishes.
 const FAST_FORWARD_ADMISSION: Duration = Duration::from_secs(60);
 const GIT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+/// Beside the fetch lock: when the last successful `git fetch` started, in
+/// wall-clock nanoseconds. Read and written only while holding that lock.
+const FETCH_STAMP: &str = "fetch-origin.stamp";
+
+/// Wall clock, because the stamp is compared across processes. `None` (a
+/// clock before the epoch) disables both stamping and skipping.
+fn wall_clock_nanos() -> Option<u128> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_nanos())
+}
+
+/// Whether a fetch some process already completed began at or after
+/// `requested`, so it saw everything this caller could be asking for. A
+/// stamp from the future (a clock that stepped back) proves nothing.
+async fn stamped_fetch_covers(stamp: &Path, requested: Option<u128>) -> bool {
+    let (Some(requested), Some(now)) = (requested, wall_clock_nanos()) else {
+        return false;
+    };
+    tokio::fs::read_to_string(stamp)
+        .await
+        .ok()
+        .and_then(|text| text.trim().parse::<u128>().ok())
+        .is_some_and(|started| started >= requested && started <= now)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct FetchOriginOptions {
@@ -233,6 +259,19 @@ impl GitRepository {
         options: FetchOriginOptions,
         cancellation: &CancellationToken,
     ) -> Result<FetchOriginReport, RepositoryError> {
+        // Noted before queueing for the lock: a wave of processes then shares
+        // the one fetch that starts after they all asked.
+        let requested = wall_clock_nanos();
+        self.fetch_origin_requested_at(options, requested, cancellation)
+            .await
+    }
+
+    async fn fetch_origin_requested_at(
+        &self,
+        options: FetchOriginOptions,
+        requested: Option<u128>,
+        cancellation: &CancellationToken,
+    ) -> Result<FetchOriginReport, RepositoryError> {
         let lock_dir = self.repository_lock_dir().await;
         let _lock = FileLock::acquire(&lock_dir, "fetch-origin", "fetch origin", cancellation)
             .await
@@ -250,13 +289,21 @@ impl GitRepository {
         let before_main_head = self
             .rev_parse(&self.origin_config().main_clone, "HEAD", cancellation)
             .await?;
-        self.run_git_args(
-            &self.origin_config().main_clone,
-            ["fetch", "origin", "--prune"].map(Into::into).to_vec(),
-            cancellation,
-            "fetch origin",
-        )
-        .await?;
+        let stamp = lock_dir.join(FETCH_STAMP);
+        if !stamped_fetch_covers(&stamp, requested).await {
+            let started = wall_clock_nanos();
+            self.run_git_args(
+                &self.origin_config().main_clone,
+                ["fetch", "origin", "--prune"].map(Into::into).to_vec(),
+                cancellation,
+                "fetch origin",
+            )
+            .await?;
+            // An unwritten stamp only costs the next waiter its own fetch.
+            if let Some(started) = started {
+                let _ = tokio::fs::write(&stamp, started.to_string()).await;
+            }
+        }
 
         let checked_out = self
             .run_git_optional(
@@ -1282,6 +1329,107 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("checked out elsewhere"))
         );
+    }
+
+    async fn push_late_commit(runner: &ProcessRunner, seed: &Path) -> String {
+        let pushed = commit_file(runner, seed, "late.txt", "late\n", "late").await;
+        git(runner, seed, &["push", "origin", "main"]).await;
+        pushed
+    }
+
+    async fn fetch_stamp(main: &Path) -> PathBuf {
+        let (_, common_dir) = super::super::repository::git_metadata_paths(main).await;
+        common_dir
+            .unwrap()
+            .join("wt-locks")
+            .join(super::FETCH_STAMP)
+    }
+
+    #[tokio::test]
+    async fn a_waiter_skips_the_fetch_that_started_after_its_request() {
+        let (_root, runner, seed, main, worktrees) = fixture().await;
+        let cancel = CancellationToken::new();
+        let requested = super::wall_clock_nanos();
+        // Another process's fetch, begun while this request waited for the lock.
+        repository(&main, &worktrees)
+            .fetch_origin(FetchOriginOptions::default(), &cancel)
+            .await
+            .unwrap();
+        let fetched = git(&runner, &main, &["rev-parse", "origin/main"]).await;
+        let pushed = push_late_commit(&runner, &seed).await;
+
+        repository(&main, &worktrees)
+            .fetch_origin_requested_at(FetchOriginOptions::default(), requested, &cancel)
+            .await
+            .unwrap();
+
+        assert_ne!(fetched, pushed);
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            fetched,
+            "a covered request must not fetch again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_newer_than_the_stamp_or_a_future_stamp_fetches() {
+        let (_root, runner, seed, main, worktrees) = fixture().await;
+        let cancel = CancellationToken::new();
+        let repository = repository(&main, &worktrees);
+        repository
+            .fetch_origin(FetchOriginOptions::default(), &cancel)
+            .await
+            .unwrap();
+        let stamp = fetch_stamp(&main).await;
+        let first = std::fs::read_to_string(&stamp).unwrap();
+        let pushed = push_late_commit(&runner, &seed).await;
+
+        repository
+            .fetch_origin(FetchOriginOptions::default(), &cancel)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            pushed
+        );
+        let second = std::fs::read_to_string(&stamp).unwrap();
+        assert!(second.parse::<u128>().unwrap() > first.parse::<u128>().unwrap());
+
+        let future = super::wall_clock_nanos().unwrap() + 3_600_000_000_000;
+        std::fs::write(&stamp, future.to_string()).unwrap();
+        let later = commit_file(&runner, &seed, "later.txt", "later\n", "later").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        repository
+            .fetch_origin_requested_at(FetchOriginOptions::default(), second.parse().ok(), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            later,
+            "a stamp from the future must not stand in for a fetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_leaves_no_stamp() {
+        let (root, runner, _seed, main, worktrees) = fixture().await;
+        let missing = root.path().join("missing.git");
+        git(
+            &runner,
+            &main,
+            &["remote", "set-url", "origin", missing.to_str().unwrap()],
+        )
+        .await;
+
+        assert!(
+            repository(&main, &worktrees)
+                .fetch_origin(FetchOriginOptions::default(), &CancellationToken::new())
+                .await
+                .is_err()
+        );
+
+        assert!(!fetch_stamp(&main).await.exists());
     }
 
     #[tokio::test]

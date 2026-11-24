@@ -8,7 +8,7 @@ The native evaluator is deliberately I/O-free. Its caller supplies one source sn
 
 ## Level-triggered, ledger-deduped
 
-Rules are **level conditions, not edge events**. On every evaluation pass the engine re-derives "does this trigger hold for this worktree right now?" from the same row state the TUI renders. Firing once-per-instance comes from a persistent ledger of *fire keys* (`~/.cache/wt/automations.json`), not from watching transitions — so a TUI restart can't replay a fire, and a missed edge can't lose one.
+Rules are **level conditions, not edge events**. On every evaluation pass the engine re-derives "does this trigger hold for this worktree right now?" from the same row state the TUI renders. Firing once-per-instance comes from a persistent ledger of *fire keys* (`automations.json` in the repository's cache root), not from watching transitions — so a TUI restart can't replay a fire, and a missed edge can't lose one.
 
 Fire keys embed the PR's head SHA where relevant: a new push produces a new key (the same failure on new code fires again), while re-evaluating the same failed state does nothing.
 

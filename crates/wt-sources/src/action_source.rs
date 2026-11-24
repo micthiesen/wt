@@ -56,7 +56,7 @@ const TAIL_DELTA_BYTES: usize = 32 * 1024;
 
 /// Action id of the dependency install that creation starts. The board marks
 /// a row initializing while a run with this id is running.
-pub const CREATE_INSTALL_ACTION_ID: &str = "builtin:create-install";
+pub use wt_ops::commands::new::CREATE_INSTALL_ACTION_ID;
 
 /// Spacing of follow-up tracker reads while an expectation is unconfirmed.
 const CONFIRM_POLL: Duration = Duration::from_secs(5);

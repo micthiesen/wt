@@ -111,7 +111,7 @@ pub struct ClaudeSessionManager {
     start_timeout: Duration,
     spawn_path: Option<String>,
     launch_auth: Option<ClaudeLaunchAuth>,
-    launch_args: Option<ClaudeLaunchArgs>,
+    launch_args: Vec<ClaudeLaunchArgs>,
     launch_env: Vec<(String, String)>,
 }
 
@@ -125,7 +125,7 @@ impl ClaudeSessionManager {
             start_timeout: START_TIMEOUT,
             spawn_path: None,
             launch_auth: None,
-            launch_args: None,
+            launch_args: Vec::new(),
             launch_env: Vec::new(),
         }
     }
@@ -149,7 +149,13 @@ impl ClaudeSessionManager {
 
     /// Append `args` to each `claude` this manager creates in their slot.
     pub fn with_launch_args(mut self, args: Option<ClaudeLaunchArgs>) -> Self {
-        self.launch_args = args;
+        self.launch_args = args.into_iter().collect();
+        self
+    }
+
+    /// Also append `args` in their slot, after any already set.
+    pub fn with_more_launch_args(mut self, args: ClaudeLaunchArgs) -> Self {
+        self.launch_args.push(args);
         self
     }
 
@@ -686,9 +692,9 @@ impl ClaudeSessionManager {
         }
         command.push(spawn.program.to_string_lossy().into_owned());
         command.extend(spawn.args);
-        if let Some(extra) = self
+        for extra in self
             .launch_args
-            .as_ref()
+            .iter()
             .filter(|extra| extra.applies_to(target))
         {
             command.extend(extra.args.iter().cloned());
@@ -1472,6 +1478,11 @@ exec /bin/sleep 30
             &wt_source,
             vec!["--permission-mode".into(), "accept edits".into()],
         )))
+        .with_more_launch_args(ClaudeLaunchArgs::new(
+            "repo-one",
+            &other,
+            vec!["--model".into(), "fable".into()],
+        ))
         .with_launch_env([("WT_QA_FEATURE".to_owned(), "on and off".to_owned())]);
         let cancel = CancellationToken::new();
         let target = |slug: &str, cwd: &Path| ClaudeSessionTarget {
@@ -1494,6 +1505,9 @@ exec /bin/sleep 30
             "{wt}"
         );
         assert!(!ordinary.contains("--permission-mode"), "{ordinary}");
+        // A second set of arguments reaches only its own slot too.
+        assert!(ordinary.trim_end().ends_with("--model fable"), "{ordinary}");
+        assert!(!wt.contains("--model"), "{wt}");
         // Launch environment is not slot-scoped: every Claude gets it.
         for slot in ["wt-wt-source", "repo-one-other"] {
             let env = fs::read_to_string(home.join(format!("env-{slot}"))).unwrap();

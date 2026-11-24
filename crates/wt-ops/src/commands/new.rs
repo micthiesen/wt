@@ -12,7 +12,22 @@ use wt_tui::CreationTitle;
 use crate::commands::resolve::run_git;
 use wt_app_core::context::AppContext;
 
-const USAGE: &str = "usage: wt new <id [title…]|url|branch|slug> [--slug s] [--gh n] [--attach] [--any] [--base ref] [--open|--no-open] [--no-install] [--section name] [--brief file|-] [-m note] [--start]";
+const USAGE: &str = "usage: wt new <id [title…]|url|branch|slug> [--slug s] [--gh n] [--attach] [--any] [--base ref] [--open|--no-open] [--no-install] [--section name] [--brief file|-] [-m note] [--start] [--wait-install]";
+
+/// Action id of the dependency install a creation leaves running. The board
+/// shows a row as installing while a run with this id is live.
+pub const CREATE_INSTALL_ACTION_ID: &str = "builtin:create-install";
+
+/// When a new worktree's dependencies are installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InstallTiming {
+    /// Before creation returns, so the caller finds them present.
+    #[default]
+    Inline,
+    /// Left to the caller, which owes `Created::deferred_install` to
+    /// `start_install`.
+    Deferred,
+}
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct NewArgs {
@@ -51,15 +66,21 @@ pub struct NewArgs {
 pub struct Created {
     pub slug: String,
     pub path: String,
+    /// The dependency install this creation skipped and its caller owes.
+    pub deferred_install: Option<wt_core::WorktreeTarget>,
 }
 
 pub async fn run(ctx: &AppContext, args: &NewArgs) -> Result<i32> {
-    Ok(run_created(ctx, args).await?.0)
+    Ok(run_created(ctx, args, InstallTiming::Inline).await?.0)
 }
 
 /// `run`, also naming the worktree when this call created it, so a caller can
 /// keep acting on it.
-pub async fn run_created(ctx: &AppContext, args: &NewArgs) -> Result<(i32, Option<Created>)> {
+pub async fn run_created(
+    ctx: &AppContext,
+    args: &NewArgs,
+    install: InstallTiming,
+) -> Result<(i32, Option<Created>)> {
     if args.positionals.is_empty() {
         eprintln!("{USAGE}");
         return Ok((2, None));
@@ -111,7 +132,7 @@ pub async fn run_created(ctx: &AppContext, args: &NewArgs) -> Result<(i32, Optio
             CreateOptions {
                 base: args.base.clone(),
                 fetch_origin: true,
-                run_install: !args.no_install,
+                run_install: !args.no_install && install == InstallTiming::Inline,
             },
             &ctx.cancellation,
         )
@@ -124,8 +145,14 @@ pub async fn run_created(ctx: &AppContext, args: &NewArgs) -> Result<(i32, Optio
             return Ok((1, None));
         }
     };
+    // A step failing from here on must not cost a deferred install its
+    // start: the caller only learns of it through the returned `Created`.
+    let deferred = install == InstallTiming::Deferred;
     if let Some(number) = args.gh {
-        set_github_issue(ctx, created.target.slug(), number).await?;
+        match set_github_issue(ctx, created.target.slug(), number).await {
+            Err(error) if deferred => eprintln!("warning: could not record #{number}: {error:#}"),
+            result => result?,
+        }
     }
     // The CLI is the agents' path; people title worktrees in the TUI.
     let issue_title = lookup.finish().await;
@@ -149,15 +176,100 @@ pub async fn run_created(ctx: &AppContext, args: &NewArgs) -> Result<(i32, Optio
         println!("  stage: {}", created.target.stage);
     }
     if should_open(args) {
-        open_editor(ctx, Path::new(&created.target.path)).await?;
+        match open_editor(ctx, Path::new(&created.target.path)).await {
+            Err(error) if deferred => eprintln!("warning: could not open the editor: {error:#}"),
+            result => result?,
+        }
     }
+    // A rift clone brings its packages with it; the inline path skips it too.
+    let deferred_install = (install == InstallTiming::Deferred
+        && !args.no_install
+        && !tokio::fs::try_exists(Path::new(&created.target.path).join(".rift"))
+            .await
+            .unwrap_or(false))
+    .then(|| created.target.clone());
     Ok((
         0,
         Some(Created {
             slug: created.target.slug().to_owned(),
             path: created.target.path.to_string(),
+            deferred_install,
         }),
     ))
+}
+
+/// The background action that installs `target`'s dependencies, or `None`
+/// when the checkout has nothing to install.
+async fn install_request(
+    ctx: &AppContext,
+    target: &wt_core::WorktreeTarget,
+) -> Result<Option<wt_actions::ActionRequest>> {
+    let config = ServiceConfig::from_config(&ctx.config);
+    let policy = wt_platform::install::InstallPolicy {
+        command: config.install_command,
+        shell: config.shell,
+    };
+    let Some(plan) = policy.resolve(Path::new(&target.path), false).await? else {
+        return Ok(None);
+    };
+    let mut command = vec![plan.spec.program.to_string_lossy().into_owned()];
+    command.extend(
+        plan.spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned()),
+    );
+    let mut config_selectors = std::collections::BTreeMap::new();
+    if let Some(path) = &ctx.config.repository_config {
+        config_selectors.insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
+    }
+    Ok(Some(wt_actions::ActionRequest {
+        action_key: wt_core::worktree_target_key(target),
+        slug: target.slug().to_owned(),
+        worktree_ref: Some(wt_core::WorktreeRef::Local {
+            slug: target.slug().to_owned(),
+        }),
+        action_id: CREATE_INSTALL_ACTION_ID.into(),
+        action_name: "Install dependencies".into(),
+        arg_history: None,
+        prompt: plan.label,
+        kind: wt_actions::ActionRunKind::Shell,
+        command,
+        cwd: Path::new(&target.path).to_path_buf(),
+        affects: vec![wt_config::EffectTag::Git],
+        issue_status: None,
+        external: false,
+        auto_fire_keys: Vec::new(),
+        config_selectors,
+    }))
+}
+
+/// A dependency install running as a durable background action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedInstall {
+    /// The command, as the action's prompt shows it.
+    pub label: String,
+    pub log: std::path::PathBuf,
+}
+
+/// Install a created worktree's dependencies in a background action that
+/// outlives this process, as the TUI's creation does. `None` when the
+/// checkout has nothing to install.
+pub async fn start_install(
+    ctx: &AppContext,
+    target: &wt_core::WorktreeTarget,
+) -> Result<Option<StartedInstall>> {
+    let Some(request) = install_request(ctx, target).await? else {
+        return Ok(None);
+    };
+    let label = request.prompt.clone();
+    let started = wt_app_core::actions::service(ctx)?
+        .start(request, &ctx.cancellation)
+        .await?;
+    Ok(Some(StartedInstall {
+        label,
+        log: started.run_dir.join("stream.log"),
+    }))
 }
 
 /// CLI creations (often run by agents) otherwise report failures only on
@@ -467,7 +579,8 @@ async fn open_editor(ctx: &AppContext, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CreationTitle, IssueTitleLookup, NewArgs, TitleSource, parse_branch, record_title, slugify,
+        CREATE_INSTALL_ACTION_ID, CreationTitle, InstallTiming, IssueTitleLookup, NewArgs,
+        TitleSource, install_request, parse_branch, record_title, run_created, slugify,
     };
     use clap::{Args as _, Command, FromArgMatches};
 
@@ -633,6 +746,136 @@ mod tests {
         );
         fixture.close().await.unwrap();
         fresh.close().await.unwrap();
+    }
+
+    fn git(main: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(main)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    /// Creation fetches `origin`, which the bare command fixture lacks.
+    fn add_origin(fixture: &wt_app_core::test_support::CommandFixture) {
+        let main = &fixture.ctx.config.paths.main_clone;
+        let origin = fixture._root.path().join("origin.git");
+        git(main, &["clone", "--bare", ".", origin.to_str().unwrap()]);
+        git(main, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    }
+
+    /// A fixture whose main clone has a lockfile and whose install command
+    /// leaves a marker in the checkout it runs in.
+    async fn installing_fixture() -> wt_app_core::test_support::CommandFixture {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        std::fs::write(main.join("bun.lock"), "").unwrap();
+        git(&main, &["add", "bun.lock"]);
+        git(&main, &["commit", "-m", "lockfile"]);
+        add_origin(&fixture);
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .lifecycle
+            .install_command = Some("touch installed.marker".into());
+        fixture
+    }
+
+    fn new_args(branch: &str) -> NewArgs {
+        NewArgs {
+            positionals: vec![branch.into()],
+            no_open: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deferred_install_returns_before_installing_and_names_the_action_it_owes() {
+        let fixture = installing_fixture().await;
+
+        let (code, created) = run_created(
+            &fixture.ctx,
+            &new_args("feature/deferred"),
+            InstallTiming::Deferred,
+        )
+        .await
+        .unwrap();
+        let created = created.unwrap();
+        assert_eq!(code, 0);
+        let path = std::path::Path::new(&created.path);
+        assert!(path.join("bun.lock").exists());
+        assert!(
+            !path.join("installed.marker").exists(),
+            "creation must not wait for the install"
+        );
+        let target = created.deferred_install.expect("the install is owed");
+        let request = install_request(&fixture.ctx, &target)
+            .await
+            .unwrap()
+            .expect("a lockfile means an install");
+        // The board marks a row as installing by this id and key.
+        assert_eq!(request.action_id, CREATE_INSTALL_ACTION_ID);
+        assert_eq!(request.action_key, wt_core::worktree_target_key(&target));
+        assert_eq!(request.cwd, path);
+        assert_eq!(
+            request.command.last().map(String::as_str),
+            Some("touch installed.marker")
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_inline_or_skipped_install_owes_nothing() {
+        let fixture = installing_fixture().await;
+
+        let (_, inline) = run_created(
+            &fixture.ctx,
+            &new_args("feature/inline"),
+            InstallTiming::Inline,
+        )
+        .await
+        .unwrap();
+        let inline = inline.unwrap();
+        assert!(
+            std::path::Path::new(&inline.path)
+                .join("installed.marker")
+                .exists()
+        );
+        assert_eq!(inline.deferred_install, None);
+
+        let skipped = NewArgs {
+            no_install: true,
+            ..new_args("feature/skipped")
+        };
+        let (_, skipped) = run_created(&fixture.ctx, &skipped, InstallTiming::Deferred)
+            .await
+            .unwrap();
+        assert_eq!(skipped.unwrap().deferred_install, None);
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_checkout_without_a_lockfile_has_no_install_to_start() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        add_origin(&fixture);
+        let (_, created) = run_created(
+            &fixture.ctx,
+            &new_args("feature/plain"),
+            InstallTiming::Deferred,
+        )
+        .await
+        .unwrap();
+        let target = created.unwrap().deferred_install.unwrap();
+        assert!(
+            install_request(&fixture.ctx, &target)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        fixture.close().await.unwrap();
     }
 
     #[test]

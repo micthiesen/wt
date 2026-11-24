@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Args;
 use regex::Regex;
 use std::{
+    io::IsTerminal,
     path::{Path, PathBuf},
     process::Stdio,
     time::SystemTime,
@@ -10,13 +11,27 @@ use wt_app_core::context::AppContext;
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct LogsArgs {
-    /// Tail this worktree's destroy log, including retained removed worktrees.
+    /// Show this worktree's latest destroy log, including retained removed
+    /// worktrees (default: the newest destroy log of any worktree).
     pub slug: Option<String>,
+    /// Print the last 200 lines and exit instead of following the log. This
+    /// is the default when stdout is not a terminal.
+    #[arg(long)]
+    pub no_follow: bool,
+}
+
+/// The last `count` lines of `text`, as `tail -n` prints them.
+fn last_lines(text: &str, count: usize) -> &str {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    match body.rmatch_indices('\n').nth(count.saturating_sub(1)) {
+        Some((index, _)) => &text[index + 1..],
+        None => text,
+    }
 }
 
 pub async fn run(context: &AppContext, args: &LogsArgs) -> Result<i32> {
     let Some(path) = latest(context, args.slug.as_deref()).await? else {
-        println!(
+        eprintln!(
             "No destroy logs{}.\nSession routing: wt agent ls; application logs: {}",
             args.slug
                 .as_ref()
@@ -27,6 +42,15 @@ pub async fn run(context: &AppContext, args: &LogsArgs) -> Result<i32> {
         return Ok(1);
     };
     eprintln!("→ {}", path.display());
+    // Following never ends on its own, which holds a pipe or an agent's tool
+    // call open until something kills it.
+    if args.no_follow || !std::io::stdout().is_terminal() {
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        print!("{}", last_lines(&String::from_utf8_lossy(&bytes), 200));
+        return Ok(0);
+    }
     // This is an intentionally long-lived streaming child. Capturing it with
     // ProcessRunner would buffer an unbounded log rather than stream to the user.
     let mut command = tokio::process::Command::new("tail");
@@ -170,6 +194,37 @@ mod tests {
             Some(retained)
         );
         assert_eq!(latest(&fixture.ctx, Some("missing")).await.unwrap(), None);
+        // Printing without following ends by itself; a follow would hang here.
+        let printed = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run(
+                &fixture.ctx,
+                &LogsArgs {
+                    slug: Some("removed".into()),
+                    no_follow: true,
+                },
+            ),
+        )
+        .await
+        .expect("--no-follow must not follow the log");
+        assert_eq!(printed.unwrap(), 0);
+        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc\n");
+        assert_eq!(last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(last_lines("a\nb\n", 5), "a\nb\n");
+        assert_eq!(last_lines("only", 1), "only");
+        assert_eq!(last_lines("", 3), "");
+        assert_eq!(
+            run(
+                &fixture.ctx,
+                &LogsArgs {
+                    slug: Some("missing".into()),
+                    no_follow: true,
+                },
+            )
+            .await
+            .unwrap(),
+            1
+        );
         fixture.close().await.unwrap();
     }
 }

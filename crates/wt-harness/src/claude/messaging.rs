@@ -47,6 +47,8 @@ pub enum ClaudeMessageOutcome {
         delivered: Option<bool>,
         resent: bool,
         fallback: Option<ClaudeInjectFailureKind>,
+        /// Why the prompt route was not used, when `fallback` is set.
+        fallback_reason: Option<String>,
     },
     Failed {
         reason: String,
@@ -180,6 +182,7 @@ impl ClaudeMessenger {
                             delivered,
                             resent: false,
                             fallback: None,
+                            fallback_reason: None,
                         });
                     }
                     ClaudeInjectOutcome::Failed {
@@ -193,6 +196,7 @@ impl ClaudeMessenger {
                                 delivered: Some(true),
                                 resent: false,
                                 fallback: None,
+                                fallback_reason: None,
                             });
                         }
                         return Ok(ClaudeMessageOutcome::Failed {
@@ -214,6 +218,7 @@ impl ClaudeMessenger {
                                     delivered,
                                     resent,
                                     fallback: Some(kind),
+                                    fallback_reason: Some(reason),
                                 }
                             }
                             TerminalOutcome::Failed {
@@ -249,6 +254,7 @@ impl ClaudeMessenger {
                 delivered,
                 resent,
                 fallback: Some(ClaudeInjectFailureKind::Failed),
+                fallback_reason: Some("WT_INSPECT=off disables prompt delivery".into()),
             }),
             TerminalOutcome::Failed {
                 reason,

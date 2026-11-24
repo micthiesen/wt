@@ -22,6 +22,7 @@ use wt_vcs::{GitRepository, RepositoryConfig, StageConfig};
 struct Cli {
     #[arg(long = "_boot-probe", hide = true)]
     boot_probe: bool,
+    /// Print version
     #[arg(short = 'v', action = clap::ArgAction::Version)]
     _version: Option<bool>,
     #[command(subcommand)]
@@ -87,6 +88,129 @@ mod cli_tests {
         assert_eq!(error_chain(&plain), "outer: inner");
     }
 
+    /// Visible arguments and subcommands that still have no help text, as
+    /// `wt <path> <arg>`. Agents are told to read `--help` before guessing a
+    /// flag, so a new entry here needs a doc comment instead.
+    const UNDOCUMENTED: &[&str] = &[
+        "wt controller serve",
+        "wt controller status",
+        "wt controller exec",
+        "wt controller exec <service>",
+        "wt stages <json>",
+        "wt stages <clean>",
+        "wt stages <yes>",
+        "wt state migrate",
+        "wt state migrate <from>",
+        "wt state migrate <keep_legacy>",
+        "wt doctor <target>",
+        "wt doctor <all>",
+        "wt doctor <json>",
+        "wt perf <json>",
+        "wt dev start <slug>",
+        "wt dev start <wait>",
+        "wt dev start <timeout>",
+        "wt dev start <rebuild>",
+        "wt dev reset <slug>",
+        "wt dev reset <wait>",
+        "wt dev reset <timeout>",
+        "wt dev stop <slug>",
+        "wt dev status <slug>",
+        "wt dev status <all>",
+        "wt dev status <json>",
+        "wt dev queue <slug>",
+        "wt dev queue <first>",
+        "wt dev queue <normal>",
+        "wt dev queue <json>",
+        "wt dev logs <slug>",
+        "wt remote <args>",
+        "wt skills sync <units>",
+        "wt skills sync <yes>",
+        "wt skills sync <force>",
+        "wt skills diff <unit>",
+        "wt skills reset <answers>",
+        "wt skills reset <declines>",
+        "wt claude send <target>",
+        "wt claude send <text>",
+        "wt claude ls <json>",
+        "wt claude selftest <slug>",
+        "wt claude stop <target>",
+        "wt manager send",
+        "wt manager send <hold>",
+        "wt manager send <text>",
+        "wt manager report",
+        "wt manager report <ok>",
+        "wt manager report <warn>",
+        "wt manager report <err>",
+        "wt manager report <info>",
+        "wt manager report <text>",
+        "wt hold release",
+        "wt hold release <resource>",
+        "wt hold release <event_at>",
+        "wt hold release <owner>",
+        "wt hold release <reason>",
+        "wt hold status",
+        "wt hold status <resource>",
+        "wt init <directory>",
+        "wt init <primary>",
+        "wt archive <target>",
+        "wt restore <target>",
+        "wt section <json>",
+        "wt section list",
+        "wt section list <json>",
+        "wt section rename",
+        "wt section rename <old>",
+        "wt section rename <new>",
+        "wt section rm",
+        "wt section rm <name>",
+        "wt guide <clear>",
+        "wt guide <json>",
+    ];
+
+    #[test]
+    fn every_visible_argument_and_subcommand_has_help() {
+        use clap::CommandFactory;
+        fn walk(command: &clap::Command, path: &str, missing: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                if !arg.is_hide_set() && arg.get_help().is_none() {
+                    missing.push(format!("{path} <{}>", arg.get_id()));
+                }
+            }
+            for sub in command.get_subcommands() {
+                // The generated `help` subtree repeats every subcommand.
+                if sub.is_hide_set() || sub.get_name() == "help" {
+                    continue;
+                }
+                let path = format!("{path} {}", sub.get_name());
+                if sub.get_about().is_none() {
+                    missing.push(path.clone());
+                }
+                walk(sub, &path, missing);
+            }
+        }
+        let mut command = Cli::command();
+        command.build();
+        let mut missing = Vec::new();
+        walk(&command, "wt", &mut missing);
+        let unexpected = missing
+            .iter()
+            .filter(|entry| !UNDOCUMENTED.contains(&entry.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            unexpected.is_empty(),
+            "no --help text for:\n{}",
+            unexpected.join("\n")
+        );
+        let documented = UNDOCUMENTED
+            .iter()
+            .filter(|entry| !missing.iter().any(|found| found == *entry))
+            .collect::<Vec<_>>();
+        assert!(
+            documented.is_empty(),
+            "now documented; remove from UNDOCUMENTED: {documented:?}"
+        );
+    }
+
     #[test]
     fn version_and_help_parse_without_repository_configuration() {
         for args in [vec!["wt"], vec!["wt", "status"], vec!["wt", "merge", "one"]] {
@@ -145,7 +269,7 @@ enum Command {
     Issue(wt_ops::commands::issue::IssueArgs),
     /// Diagnose repository and coding-agent session health.
     Doctor(commands::doctor::DoctorArgs),
-    /// Show a compact fleet report.
+    /// Show a compact fleet report, for every worktree or the ones named.
     Fleet(commands::fleet::FleetArgs),
     /// Inspect wt process resource usage and machine load.
     Perf(wt_ops::commands::perf::PerfArgs),
@@ -229,8 +353,8 @@ enum Command {
     /// Show or set the worktree's title.
     ///
     /// Titles rank user > agent > issue > fallback; a lower source never
-    /// replaces a higher one. An agent may replace an issue or fallback title
-    /// once, with the outcome its PR will have; a person's rename is final.
+    /// replaces a higher one. An agent may replace any title but a person's,
+    /// as often as the outcome changes; a person's rename is final.
     Title(commands::title::TitleArgs),
     /// Arm merge-when-ready or cancel the PR's actual merge state.
     ///
@@ -242,7 +366,7 @@ enum Command {
     Merge(commands::merge::MergeArgs),
     /// Open a worktree in the configured editor.
     Open(commands::open::OpenArgs),
-    /// Follow the latest retained destroy log.
+    /// Show the latest retained destroy log, following it on a terminal.
     Logs(wt_ops::commands::logs::LogsArgs),
     /// Print the running native version.
     Version,

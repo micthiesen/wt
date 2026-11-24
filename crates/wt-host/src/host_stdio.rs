@@ -36,7 +36,9 @@ impl Pipe {
         if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(AsyncFd::new(File::from(owned))?))
+        // SAFETY: the `File` owns the duplicated descriptor and the `AsyncFd`
+        // owns the `File`, so it stays open and unchanged for that lifetime.
+        Ok(Self(unsafe { AsyncFd::register(File::from(owned)) }?))
     }
 }
 

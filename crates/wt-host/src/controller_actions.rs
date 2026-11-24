@@ -852,50 +852,9 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
 }
 
 async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Result<()> {
-    let config = wt_lifecycle::ServiceConfig::from_config(&ctx.config);
-    let policy = wt_platform::install::InstallPolicy {
-        command: config.install_command,
-        shell: config.shell,
-    };
-    let Some(plan) = policy.resolve(Path::new(&target.path), false).await? else {
-        return Ok(());
-    };
-    let mut command = vec![plan.spec.program.to_string_lossy().into_owned()];
-    command.extend(
-        plan.spec
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned()),
-    );
-    let mut config_selectors = std::collections::BTreeMap::new();
-    if let Some(path) = &ctx.config.repository_config {
-        config_selectors.insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
-    }
-    wt_app_core::actions::service(ctx)?
-        .start(
-            wt_actions::ActionRequest {
-                action_key: wt_core::worktree_target_key(target),
-                slug: target.slug().to_owned(),
-                worktree_ref: Some(wt_core::WorktreeRef::Local {
-                    slug: target.slug().to_owned(),
-                }),
-                action_id: wt_sources::action_source::CREATE_INSTALL_ACTION_ID.into(),
-                action_name: "Install dependencies".into(),
-                arg_history: None,
-                prompt: plan.label,
-                kind: wt_actions::ActionRunKind::Shell,
-                command,
-                cwd: Path::new(&target.path).to_path_buf(),
-                affects: vec![wt_config::EffectTag::Git],
-                issue_status: None,
-                external: false,
-                auto_fire_keys: Vec::new(),
-                config_selectors,
-            },
-            &ctx.cancellation,
-        )
-        .await?;
-    Ok(())
+    wt_ops::commands::new::start_install(ctx, target)
+        .await
+        .map(|_| ())
 }
 
 async fn set_status(

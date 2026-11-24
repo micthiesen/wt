@@ -23,6 +23,7 @@ wt new <ID> [title words…] [--base <branch>] [--gh <n>]
 wt new <ID> --attach                   # check out the id's existing branch
 wt new <ID> --slug <s> --brief <file> --section <name> -m <note> --start   # launch a task in one step
 wt agent start <slug>                  # start a worktree's agent with the start skill
+                                       # --model fable|opus (here or with wt new --start): only when the user names a model
 wt agent send <slug|main|wt> <text…>   # the manager: `wt manager send`
 wt section mv <slug>… <section>        # section is LAST; `-` is the inbox
 wt edge <from> before|enables|conflicts <to> [--blocks] [-m why]
@@ -33,6 +34,7 @@ wt next [branch] --title <outcome> [--issue <ID>|none] [--gh <n>|none]
 wt issue [slug] [--gh <n> | --clear-gh | --read]
 wt title [title…] [-w slug]          # show, or set any but a person's title
 wt rm [slug] [--keep-branch]           # deletes the branch by default
+wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it; checkout untouched
 ```
 
 ## Rules

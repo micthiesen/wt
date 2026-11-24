@@ -16,7 +16,11 @@ pub async fn read_line(message: &str, cancel: &CancellationToken) -> Result<Opti
         use std::io::Read;
         use tokio::io::unix::AsyncFd;
         let file = open_terminal(libc::STDIN_FILENO)?;
-        let file = AsyncFd::new(file).context("register interactive terminal")?;
+        // SAFETY: `file` owns its descriptor, and the `AsyncFd` owns `file`
+        // until it is dropped, so the descriptor stays open and unchanged.
+        let file = unsafe { AsyncFd::register(file) }
+            .map_err(std::io::Error::from)
+            .context("register interactive terminal")?;
         let mut input = Vec::new();
         loop {
             let mut ready = tokio::select! {
@@ -145,8 +149,11 @@ mod tests {
         let mut master = unsafe { std::fs::File::from_raw_fd(master) };
         let slave = unsafe { std::fs::File::from_raw_fd(slave) };
         let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
-        let terminal =
-            tokio::io::unix::AsyncFd::new(open_terminal(slave.as_raw_fd()).unwrap()).unwrap();
+        // SAFETY: the opened terminal is owned by the `AsyncFd` for its life.
+        let terminal = unsafe {
+            tokio::io::unix::AsyncFd::register(open_terminal(slave.as_raw_fd()).unwrap())
+        }
+        .unwrap();
         assert_eq!(
             unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) },
             flags

@@ -33,7 +33,7 @@ Each pass: read your row, do the one thing it calls for, wait minutes (not
 seconds), repeat. Re-read every pass; the bot, CI and the base all move.
 
 ```bash
-wt fleet --json | jq '.[] | select(.slug == env.WT_AGENT)'
+wt fleet "$WT_AGENT" --json | jq '.[0]'   # one row; the output is still an array
 ```
 
 Read review state from this row, not from `gh` or the bot's comments.

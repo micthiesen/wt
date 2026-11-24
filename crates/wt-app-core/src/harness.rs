@@ -462,6 +462,19 @@ impl AppHarness {
         }
     }
 
+    /// Start `target`'s Claude session on `model` if this harness is what
+    /// creates it. A session already running keeps the model it has.
+    pub fn with_claude_model(mut self, target: &AgentTarget, model: &str) -> Self {
+        let args = wt_harness::ClaudeLaunchArgs::new(
+            target.slug.clone(),
+            &target.cwd,
+            vec!["--model".into(), model.to_owned()],
+        );
+        self.claude_sessions = self.claude_sessions.with_more_launch_args(args.clone());
+        self.service = self.service.with_more_claude_launch_args(args);
+        self
+    }
+
     pub async fn session_inventory(&self, context: &AppContext) -> Result<Vec<SessionInfo>> {
         self.tmux
             .list_sessions(&context.cancellation)

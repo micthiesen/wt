@@ -122,6 +122,12 @@ impl HarnessService {
 
     /// The messenger cold-starts through its own manager copy, so it must
     /// see every launch setting applied to `claude_sessions`.
+    /// Also append arguments to each `claude` created in one exact slot.
+    pub fn with_more_claude_launch_args(mut self, args: ClaudeLaunchArgs) -> Self {
+        self.claude_sessions = self.claude_sessions.with_more_launch_args(args);
+        self.rebuild_claude_messenger()
+    }
+
     fn rebuild_claude_messenger(mut self) -> Self {
         self.claude_messenger = ClaudeMessenger::new(
             self.claude_sessions.clone(),

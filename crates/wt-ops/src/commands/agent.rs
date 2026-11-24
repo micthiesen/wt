@@ -28,18 +28,28 @@ pub struct AgentArgs {
 pub enum AgentCommand {
     /// List addressable targets and selected/live harnesses.
     Ls {
+        /// Print machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Send text to the active harness, or the configured primary if none is live.
+    ///
+    /// TARGET is a worktree slug or branch, or a special session: `manager`,
+    /// `main`, `wt` (with `paths.wt_source`) or `dotfiles`; `wt agent ls`
+    /// lists the ones available. With no TEXT the message is read from stdin
+    /// (up to 1 MiB), or prompted for on a terminal.
     Send {
+        /// Worktree slug or branch, or `manager`, `main`, `wt`, `dotfiles`.
         target: String,
+        /// Attach this maintenance hold's ID, so the receiver can check it
+        /// with `wt hold check`.
         #[arg(long)]
         hold: Option<String>,
         /// Codex only: deliver into the agent's running turn instead of
         /// queueing behind it.
         #[arg(long)]
         steer: bool,
+        /// The message, joined with spaces; omit to read it from stdin.
         #[arg(trailing_var_arg = true)]
         text: Vec<String>,
     },
@@ -47,6 +57,11 @@ pub enum AgentCommand {
     Start {
         /// Worktree slug or branch.
         target: String,
+        /// Start the Claude Code session on this model family, such as
+        /// `fable` or `opus` (its latest version). Only for a session that
+        /// is not running yet, and only when a specific model was asked for.
+        #[arg(long, value_name = "NAME")]
+        model: Option<String>,
     },
 }
 
@@ -83,7 +98,7 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
             };
             send_route(context, &app, route, &mut text, hold.as_deref(), *steer).await
         }
-        AgentCommand::Start { target } => {
+        AgentCommand::Start { target, model } => {
             let Some(route) = AppHarness::target_for(target, &routes) else {
                 if target == "wt" && context.config.paths.wt_source.is_none() {
                     bail!("{}", unavailable_source_message());
@@ -100,11 +115,48 @@ pub async fn run(context: &AppContext, args: &AgentArgs) -> Result<i32> {
                 .choice
                 .selected
                 .context("harness selection is unavailable")?;
+            let app = match model {
+                Some(model) => {
+                    let model = claude_model_alias(model)?;
+                    if harness != wt_harness::HarnessId::Claude {
+                        bail!(
+                            "--model applies to Claude Code only; {} would start another harness",
+                            route.target.slug
+                        );
+                    }
+                    if route
+                        .choice
+                        .live
+                        .as_ref()
+                        .is_some_and(|live| live.contains(&wt_harness::HarnessId::Claude))
+                    {
+                        bail!(
+                            "{} already has a running Claude session, which keeps the model it started with; --model applies only when wt starts the session",
+                            route.target.slug
+                        );
+                    }
+                    app.with_claude_model(&route.target, &model)
+                }
+                None => app,
+            };
             let prompt = wt_app_core::skills::start_prompt(context, harness).await?;
             let mut body = prompt;
             send_route(context, &app, route, &mut body, None, false).await
         }
     }
+}
+
+/// A model family name as Claude Code's `--model` takes it. Only a bare
+/// family is accepted, so a session always gets that family's latest
+/// version and never a pinned one.
+pub fn claude_model_alias(name: &str) -> Result<String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() || name.len() > 24 || !name.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        bail!(
+            "--model takes a model family name such as fable or opus, not a version or a full model id"
+        );
+    }
+    Ok(name)
 }
 
 pub async fn send_to(
@@ -175,10 +227,73 @@ async fn send_route(
     let outcome = app
         .send_with(route, body, sender.as_deref(), steer, context)
         .await?;
+    log_claude_delivery(&route.target.slug, &outcome);
     if let Some(notice) = app.claude_auth_restart_notice(route, context).await {
         eprintln!("note: {notice}");
     }
     print_delivery(context, route, outcome)
+}
+
+fn inspector_disabled() -> bool {
+    std::env::var("WT_INSPECT").is_ok_and(|value| value.eq_ignore_ascii_case("off"))
+}
+
+/// What the app log records about a Claude send: the fallback that replaced
+/// prompt delivery, and whether the transcript confirmed arrival. A disabled
+/// inspector is a choice, not a fallback.
+fn claude_delivery_record(
+    outcome: &ClaudeMessageOutcome,
+    inspector_disabled: bool,
+) -> (Option<(ClaudeInjectFailureKind, String)>, bool) {
+    match outcome {
+        ClaudeMessageOutcome::Sent {
+            delivered,
+            fallback,
+            fallback_reason,
+            ..
+        } => (
+            fallback.filter(|_| !inspector_disabled).map(|kind| {
+                (
+                    kind,
+                    fallback_reason
+                        .clone()
+                        .unwrap_or_else(|| "no reason reported".into()),
+                )
+            }),
+            *delivered != Some(true),
+        ),
+        ClaudeMessageOutcome::Failed { .. } => (None, false),
+    }
+}
+
+/// Write a Claude send's fallback, failure or missing receipt to the app
+/// log. The sender sees these only on its own terminal, so a Claude Code
+/// release that breaks prompt delivery otherwise leaves no trace across the
+/// fleet.
+pub fn log_claude_delivery(slug: &str, outcome: &HarnessMessageOutcome) {
+    let HarnessMessageOutcome::Claude(outcome) = outcome else {
+        return;
+    };
+    if let ClaudeMessageOutcome::Failed {
+        reason,
+        maybe_submitted,
+    } = outcome
+    {
+        tracing::warn!(slug, maybe_submitted, reason, "Claude delivery failed");
+        return;
+    }
+    let (fallback, unconfirmed) = claude_delivery_record(outcome, inspector_disabled());
+    if let Some((kind, reason)) = fallback {
+        tracing::warn!(
+            slug,
+            fallback = ?kind,
+            reason,
+            "Claude send fell back from the prompt route to the terminal"
+        );
+    }
+    if unconfirmed {
+        tracing::info!(slug, "Claude delivery was not confirmed in the transcript");
+    }
 }
 
 fn list(routes: &[AgentRoute], json: bool) -> Result<i32> {
@@ -321,7 +436,11 @@ async fn read_nonblocking(
         file,
         original_flags: flags,
     };
-    let async_fd = AsyncFd::new(owned).context("register message stdin")?;
+    // SAFETY: `owned` holds the open file and always reports its descriptor,
+    // and the `AsyncFd` owns it until it is dropped.
+    let async_fd = unsafe { AsyncFd::register(owned) }
+        .map_err(io::Error::from)
+        .context("register message stdin")?;
     let mut output = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -416,6 +535,7 @@ fn print_delivery(
             delivered,
             resent,
             fallback,
+            fallback_reason: _,
         }) => {
             println!(
                 "{}",
@@ -430,7 +550,7 @@ fn print_delivery(
             if let Some((level, advice)) = claude_fallback_advice(
                 &context.config.paths.cache_root,
                 fallback,
-                std::env::var("WT_INSPECT").is_ok_and(|value| value.eq_ignore_ascii_case("off")),
+                inspector_disabled(),
             ) {
                 println!("{level}: {advice}");
             }
@@ -608,6 +728,21 @@ fn claude_fallback_advice(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_model_is_named_by_family_never_by_version() {
+        assert_eq!(claude_model_alias("fable").unwrap(), "fable");
+        assert_eq!(claude_model_alias(" Opus ").unwrap(), "opus");
+        for refused in [
+            "",
+            "claude-fable-5-2",
+            "opus4",
+            "fable --dangerously",
+            "opus[1m]",
+        ] {
+            assert!(claude_model_alias(refused).is_err(), "{refused:?}");
+        }
+    }
+
     #[tokio::test]
     async fn stdin_is_bounded_and_text_arguments_preserve_spaces() {
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -654,6 +789,48 @@ mod tests {
         );
         assert!(unconfirmed.ends_with("submitted: the session has not recorded it yet"));
         assert!(!unconfirmed.contains("None"));
+    }
+
+    #[test]
+    fn the_log_records_a_fallback_with_its_reason_and_an_unconfirmed_send() {
+        use wt_harness::ClaudeMessageTransport::{Inspector, Terminal};
+        let sent = |transport, delivered, fallback: Option<ClaudeInjectFailureKind>| {
+            ClaudeMessageOutcome::Sent {
+                transport,
+                cold_started: false,
+                delivered,
+                resent: false,
+                fallback,
+                fallback_reason: fallback.map(|_| "prompt element not found".to_owned()),
+            }
+        };
+        let fell_back = sent(
+            Terminal,
+            Some(true),
+            Some(ClaudeInjectFailureKind::NotReady),
+        );
+        assert_eq!(
+            claude_delivery_record(&fell_back, false),
+            (
+                Some((
+                    ClaudeInjectFailureKind::NotReady,
+                    "prompt element not found".to_owned()
+                )),
+                false
+            )
+        );
+        // Terminal delivery chosen with WT_INSPECT=off is not a fallback.
+        assert_eq!(claude_delivery_record(&fell_back, true), (None, false));
+        assert_eq!(
+            claude_delivery_record(&sent(Inspector, Some(true), None), false),
+            (None, false)
+        );
+        for receipt in [None, Some(false)] {
+            assert_eq!(
+                claude_delivery_record(&sent(Inspector, receipt, None), false),
+                (None, true)
+            );
+        }
     }
 
     #[test]

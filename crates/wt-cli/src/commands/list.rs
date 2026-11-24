@@ -23,6 +23,8 @@ use wt_ops::{
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct ListArgs {
+    /// Print a machine-readable array of live rows and recently removed ones,
+    /// without PR data.
     #[arg(long)]
     pub json: bool,
     /// Include confirmed inventory from every configured host; fail if any host is unavailable.
@@ -41,16 +43,27 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
         .map(|snapshot| snapshot.worktree.target.slug().to_owned())
         .collect::<BTreeSet<_>>();
     let now = now_ms();
-    let (state, removed) = ctx
-        .database
-        .call(move |store| {
+    // The PR column is the only network read of the table; it overlaps the
+    // local reads instead of following them.
+    let wants_prs = !args.json && !live.is_empty();
+    let (stored, locks, prs) = tokio::join!(
+        ctx.database.call(move |store| {
             Ok((
                 store.read_wt_state()?,
                 store.recently_removed_worktrees(&live_slugs, now)?,
             ))
-        })
-        .await?;
-    let locks = collect_operation_locks(ctx, &live).await?;
+        }),
+        collect_operation_locks(ctx, &live),
+        async {
+            if wants_prs {
+                Some(pull_requests(ctx, &live).await)
+            } else {
+                None
+            }
+        },
+    );
+    let (state, removed) = stored?;
+    let locks = locks?;
     if args.json {
         let remote_url = run_git(
             ctx,
@@ -126,21 +139,13 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
         }
         return Ok(0);
     }
-    let branches = live
-        .iter()
-        .map(|snapshot| snapshot.worktree.target.branch.clone())
-        .collect::<Vec<_>>();
-    let github = GithubClient::new(
-        ctx.processes.clone(),
-        ctx.config.paths.main_clone.clone(),
-        GithubOptions::from_config(&ctx.config, true),
-    );
-    let prs = match github.fetch_worktrees(&branches, &ctx.cancellation).await {
-        Ok(data) => Some(data.prs),
-        Err(error) => {
+    let prs = match prs {
+        Some(Ok(prs)) => Some(prs),
+        Some(Err(error)) => {
             eprintln!("PR data unavailable: {error}");
             None
         }
+        None => None,
     };
     let with_stage = ctx.config.sst.is_some();
     if with_stage {
@@ -200,6 +205,30 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
         println!("\nrecently merged: {}", merged.join(", "));
     }
     Ok(0)
+}
+
+/// PRs for the table's display-only PR column: the events daemon's snapshot
+/// while it is fresh and covers every branch, else one batched GitHub read.
+async fn pull_requests(
+    ctx: &AppContext,
+    live: &[&WorktreeSnapshot],
+) -> Result<BTreeMap<String, PullRequest>, wt_github::GithubError> {
+    let branches = live
+        .iter()
+        .map(|snapshot| snapshot.worktree.target.branch.clone())
+        .collect::<Vec<_>>();
+    if let Some(read) = wt_sources::github_events_source::load(ctx, &branches).await {
+        return Ok(read.data.prs);
+    }
+    let github = GithubClient::new(
+        ctx.processes.clone(),
+        ctx.config.paths.main_clone.clone(),
+        GithubOptions::from_config(&ctx.config, true),
+    );
+    Ok(github
+        .fetch_worktrees(&branches, &ctx.cancellation)
+        .await?
+        .prs)
 }
 
 async fn collect_push_facts(

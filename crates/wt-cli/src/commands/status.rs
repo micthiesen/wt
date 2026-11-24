@@ -15,6 +15,7 @@ use wt_core::{
 };
 use wt_platform::process::CommandSpec;
 use wt_store::WorkStatusRecord as StoredWorkStatusRecord;
+use wt_vcs::WorktreeRecord;
 
 use wt_app_core::{context::AppContext, database::Database};
 use wt_ops::commands::resolve::resolve_worktree;
@@ -75,7 +76,8 @@ pub struct StatusArgs {
     /// Print the fleet overview of every worktree's status.
     #[arg(long)]
     pub all: bool,
-    /// Print machine-readable JSON (with `--all` or a show).
+    /// Print machine-readable JSON: an array with `--all`, one object of the
+    /// same shape when showing a single worktree.
     #[arg(long)]
     pub json: bool,
 }
@@ -92,7 +94,10 @@ enum Action {
     All {
         json: bool,
     },
-    Show(Option<String>),
+    Show {
+        target: Option<String>,
+        json: bool,
+    },
     Clear(Option<String>),
     Examine {
         target: Option<String>,
@@ -118,7 +123,85 @@ enum Action {
     Error(String),
 }
 
+/// Whether `token` is spelled exactly like one of this command's flags.
+fn is_status_flag(token: &str) -> bool {
+    let command = StatusArgs::augment_args(clap::Command::new("status"));
+    matches!(token, "-h" | "--help")
+        || command.get_arguments().any(|arg| {
+            arg.get_long()
+                .is_some_and(|long| token.strip_prefix("--") == Some(long))
+                || arg.get_short().is_some_and(|short| {
+                    token
+                        .strip_prefix('-')
+                        .is_some_and(|rest| rest.chars().eq([short]))
+                })
+        })
+}
+
+/// These flags accept values that start with a hyphen, so a flag written
+/// without its value takes the next flag as the value and pushes that flag's
+/// own value into the positionals, where it fails as an unknown state.
+fn swallowed_flag(args: &StatusArgs) -> Option<String> {
+    let valued = [
+        (
+            "--verify-in-staging",
+            &args.verify_in_staging,
+            "steps",
+            "--verify-in-staging \"1. ...\" -m \"<note>\"",
+        ),
+        (
+            "--verify-in-production",
+            &args.verify_in_production,
+            "steps",
+            "--verify-in-production \"1. ...\" -m \"<note>\"",
+        ),
+        (
+            "--blocked-on",
+            &args.blocked_on,
+            "gate",
+            "--blocked-on \"<gate>\" -m \"<note>\"",
+        ),
+        (
+            "--examined",
+            &args.examined,
+            "verdict",
+            "--examined \"<verdict>\"",
+        ),
+        (
+            "--note-only",
+            &args.note_only,
+            "note",
+            "--note-only \"<note>\"",
+        ),
+        ("-m", &args.note, "note", "-m \"<note>\""),
+    ];
+    valued.into_iter().find_map(|(flag, value, what, usage)| {
+        let value = value.as_deref()?.trim();
+        is_status_flag(value).then(|| {
+            format!("{flag} needs its {what} as the next argument, not `{value}`: {usage}")
+        })
+    })
+}
+
 fn parse_status_args(args: &StatusArgs) -> Action {
+    if let Some(message) = swallowed_flag(args) {
+        return Action::Error(message);
+    }
+    let action = parse_status_action(args);
+    if args.json
+        && !matches!(
+            action,
+            Action::All { .. } | Action::Show { .. } | Action::Error(_)
+        )
+    {
+        return Action::Error(
+            "--json only prints: use it with --all or when showing one worktree's status".into(),
+        );
+    }
+    action
+}
+
+fn parse_status_action(args: &StatusArgs) -> Action {
     let positions = &args.positionals;
     let fail = |s: &str| Action::Error(s.into());
     let sanitize = |value: &str| {
@@ -247,9 +330,6 @@ fn parse_status_args(args: &StatusArgs) -> Action {
         }
         return Action::All { json: args.json };
     }
-    if args.json {
-        return fail("--json requires --all");
-    }
     if args.clear {
         if note.is_some()
             || risk.is_some()
@@ -269,7 +349,9 @@ fn parse_status_args(args: &StatusArgs) -> Action {
     let (target, state) = match positions.as_slice() {
         [] => (None, None),
         [one] if resolve_work_state(one).is_some() => (None, Some(one.as_str())),
-        [one] if is_ambiguous_state(one) => return fail("ambiguous status prefix"),
+        [one] if is_ambiguous_state(one) => {
+            return Action::Error(format!("ambiguous status prefix: `{one}`"));
+        }
         [one] => (Some(one.clone()), None),
         [target, state] => (Some(target.clone()), Some(state.as_str())),
         _ => return fail("too many arguments"),
@@ -292,10 +374,13 @@ fn parse_status_args(args: &StatusArgs) -> Action {
         if note.is_some() {
             return fail("-m needs a state; to amend a note use --note-only");
         }
-        return Action::Show(target);
+        return Action::Show {
+            target,
+            json: args.json,
+        };
     };
     let Some(state) = resolve_work_state(raw_state) else {
-        return fail("unknown or ambiguous status state");
+        return Action::Error(format!("unknown or ambiguous status state: `{raw_state}`"));
     };
     if risk.is_some() && state != WorkState::Ready {
         return fail("--risk only applies to ready");
@@ -347,38 +432,11 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
     match action {
         Action::All { json: wants_json } => {
             let now = now_ms();
-            let mut entries = Vec::with_capacity(worktrees.len());
-            for w in &worktrees {
-                let slug = w.target.slug();
-                let record = state.get("slugs").and_then(|s| s.get(slug));
-                let work = record
-                    .and_then(|r| r.get("work"))
-                    .and_then(parse_work_status);
-                let head = w.head_sha.clone();
-                let examined = record.and_then(|r| r.get("examined"));
-                let base_branch = record
-                    .and_then(|r| r.get("baseBranch"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(&ctx.config.branch.base);
-                let base_sha = base_tip_sha(ctx, base_branch).await?;
-                let examined_current = match (
-                    examined.and_then(|e| e.get("sha")).and_then(Value::as_str),
-                    head.as_deref(),
-                    examined
-                        .and_then(|e| e.get("baseSha"))
-                        .and_then(Value::as_str),
-                    base_sha.as_deref(),
-                ) {
-                    (None, _, _, _) | (_, None, _, _) => None,
-                    (Some(_), Some(_), None, _) => Some(false),
-                    (Some(_), Some(_), Some(_), None) => None,
-                    (Some(sha), Some(head), Some(old_base), Some(base)) => {
-                        Some(sha == head && old_base == base)
-                    }
-                };
-                entries.push(json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}));
-            }
             if wants_json {
+                let mut entries = Vec::with_capacity(worktrees.len());
+                for w in &worktrees {
+                    entries.push(live_json(ctx, &state, w).await?);
+                }
                 let live = worktrees
                     .iter()
                     .map(|w| w.target.slug().to_owned())
@@ -405,22 +463,49 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             }
             Ok(0)
         }
-        Action::Show(target) => {
+        Action::Show {
+            target,
+            json: wants_json,
+        } => {
+            let outside = |error: &anyhow::Error| {
+                target.is_none() && error.to_string().starts_with("not inside")
+            };
             let record = match resolve_worktree(ctx, target.as_deref()).await {
                 Ok(record) if !record.is_main => record,
+                // JSON has no vocabulary to fall back to: a reader would
+                // parse the text as a status.
+                Ok(_) if wants_json => {
+                    eprintln!("--json shows one worktree: pass a slug or run inside a worktree");
+                    return Ok(1);
+                }
+                Err(error) if wants_json && outside(&error) => {
+                    eprintln!("--json shows one worktree: pass a slug or run inside a worktree");
+                    return Ok(1);
+                }
                 Ok(_) => {
                     println!("{VOCAB}");
                     return Ok(0);
                 }
-                Err(error) if target.is_none() && error.to_string().starts_with("not inside") => {
+                Err(error) if outside(&error) => {
                     println!("{VOCAB}");
                     return Ok(0);
+                }
+                Err(error) if wants_json => {
+                    eprintln!("{error}");
+                    return Ok(1);
                 }
                 Err(error) => {
                     eprintln!("{error}\n{VOCAB}");
                     return Ok(1);
                 }
             };
+            if wants_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&live_json(ctx, &state, &record).await?)?
+                );
+                return Ok(0);
+            }
             let work = state
                 .get("slugs")
                 .and_then(|s| s.get(record.target.slug()))
@@ -572,13 +657,22 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             })
             .await?
             .map_err(anyhow::Error::msg)?;
-            let previous_note = previous.and_then(|previous| previous.note);
+            let (previous_note, previous_gate) = previous
+                .map(|previous| (previous.note, previous.blocked_on))
+                .unwrap_or_default();
             println!(
                 "✓ {} {}{}",
                 record.target.slug(),
                 work_state_name(work_state),
                 if wrote { "" } else { " (already asserted)" }
             );
+            if let Some(line) = cleared_gate_line(
+                previous_gate.as_deref(),
+                next.blocked_on.as_deref(),
+                work_state,
+            ) {
+                println!("{line}");
+            }
             report_replaced_note(previous_note.as_deref(), next.note.as_deref(), append);
             if let Some(note) = &next.note {
                 println!("  note: {note}");
@@ -844,6 +938,21 @@ fn merge_note(
     }
 }
 
+/// A new assertion replaces the whole record, so one made without
+/// `--blocked-on` drops a merge gate the previous record carried.
+fn cleared_gate_line(
+    previous: Option<&str>,
+    current: Option<&str>,
+    state: WorkState,
+) -> Option<String> {
+    let gate = previous.filter(|_| current.is_none())?;
+    Some(if matches!(state, WorkState::Ready | WorkState::Todo) {
+        format!("  gate cleared (was: {gate}); re-add with --blocked-on if it still holds")
+    } else {
+        format!("  gate cleared (was: {gate})")
+    })
+}
+
 fn report_replaced_note(previous: Option<&str>, current: Option<&str>, append: bool) {
     if !append && previous.is_some() && previous != current {
         println!(
@@ -1031,6 +1140,40 @@ async fn base_tip_sha(ctx: &AppContext, branch: &str) -> Result<Option<String>> 
     rev_parse(ctx, &ctx.config.paths.main_clone, branch).await
 }
 
+/// One live worktree's entry of `wt status --all --json`.
+async fn live_json(ctx: &AppContext, state: &Value, w: &WorktreeRecord) -> Result<Value> {
+    let slug = w.target.slug();
+    let record = state.get("slugs").and_then(|s| s.get(slug));
+    let work = record
+        .and_then(|r| r.get("work"))
+        .and_then(parse_work_status);
+    let head = w.head_sha.clone();
+    let examined = record.and_then(|r| r.get("examined"));
+    let base_branch = record
+        .and_then(|r| r.get("baseBranch"))
+        .and_then(Value::as_str)
+        .unwrap_or(&ctx.config.branch.base);
+    let base_sha = base_tip_sha(ctx, base_branch).await?;
+    let examined_current = match (
+        examined.and_then(|e| e.get("sha")).and_then(Value::as_str),
+        head.as_deref(),
+        examined
+            .and_then(|e| e.get("baseSha"))
+            .and_then(Value::as_str),
+        base_sha.as_deref(),
+    ) {
+        (None, _, _, _) | (_, None, _, _) => None,
+        (Some(_), Some(_), None, _) => Some(false),
+        (Some(_), Some(_), Some(_), None) => None,
+        (Some(sha), Some(head), Some(old_base), Some(base)) => {
+            Some(sha == head && old_base == base)
+        }
+    };
+    Ok(
+        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
+    )
+}
+
 fn removed_json(entry: wt_store::RemovedWorktree) -> Value {
     let work_state = entry.work.as_ref().map(|work| work.state.as_str());
     let verification_owed = wt_store::verification_owed_at_removal(&entry);
@@ -1183,6 +1326,144 @@ mod tests {
             "STEPS: 1. check prod"
         );
         fixture.close().await.unwrap();
+    }
+
+    fn parsed(argv: &[&str]) -> Action {
+        #[derive(clap::Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: StatusArgs,
+        }
+        use clap::Parser;
+        parse_status_args(
+            &Harness::try_parse_from(std::iter::once("status").chain(argv.iter().copied()))
+                .unwrap()
+                .args,
+        )
+    }
+
+    #[test]
+    fn a_flag_swallowed_as_another_flags_value_is_named() {
+        let Action::Error(message) = parsed(&[
+            "ready",
+            "--risk",
+            "low",
+            "--verify-in-staging",
+            "-m",
+            "note",
+        ]) else {
+            panic!("a value flag given another flag as its value must be refused");
+        };
+        assert!(
+            message.starts_with("--verify-in-staging needs its steps as the next argument"),
+            "{message}"
+        );
+        assert!(message.contains("`-m`"), "{message}");
+        for (flag, what) in [
+            ("--blocked-on", "gate"),
+            ("--verify-in-production", "steps"),
+            ("--examined", "verdict"),
+            ("--note-only", "note"),
+        ] {
+            let Action::Error(message) = parsed(&[flag, "--json"]) else {
+                panic!("{flag} took a flag as its value");
+            };
+            assert!(
+                message.starts_with(&format!("{flag} needs its {what}")),
+                "{message}"
+            );
+        }
+        // Hyphenated prose is still a value.
+        assert!(matches!(
+            parsed(&["todo", "--blocked-on", "-m is not a gate, this is"]),
+            Action::Set { .. }
+        ));
+        assert!(matches!(
+            parsed(&["ready", "--risk", "low", "--verify-in-staging", "- check"]),
+            Action::Set { .. }
+        ));
+        let Action::Error(message) = parsed(&["one", "bogus"]) else {
+            panic!("an unknown state must be refused");
+        };
+        assert!(message.contains("`bogus`"), "{message}");
+    }
+
+    #[test]
+    fn json_applies_to_reads_only() {
+        assert_eq!(
+            parsed(&["one", "--json"]),
+            Action::Show {
+                target: Some("one".into()),
+                json: true
+            }
+        );
+        assert_eq!(parsed(&["--all", "--json"]), Action::All { json: true });
+        for write in [
+            &["working", "--json"][..],
+            &["--clear", "--json"],
+            &["--unblock", "--json"],
+            &["--examined", "fine", "--json"],
+        ] {
+            assert!(matches!(parsed(write), Action::Error(_)), "{write:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn one_row_json_has_the_shape_of_an_all_entry() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let gated = StatusArgs {
+            positionals: vec!["one".into(), "todo".into()],
+            blocked_on: Some("release train lands".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &gated).await.unwrap(), 0);
+        let show = StatusArgs {
+            positionals: vec!["one".into()],
+            json: true,
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &show).await.unwrap(), 0);
+        let records = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let one = records.iter().find(|w| w.target.slug() == "one").unwrap();
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        let entry = live_json(&fixture.ctx, &state, one).await.unwrap();
+        assert_eq!(entry["slug"], "one");
+        assert_eq!(entry["state"], "todo");
+        assert_eq!(entry["blocked_on"], "release train lands");
+        assert_eq!(entry["kind"], "live");
+        let missing = StatusArgs {
+            positionals: vec!["absent".into()],
+            json: true,
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &missing).await.unwrap(), 1);
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_dropped_gate_is_reported_and_a_kept_one_is_not() {
+        assert_eq!(
+            cleared_gate_line(Some("mobile release"), None, WorkState::Ready).as_deref(),
+            Some(
+                "  gate cleared (was: mobile release); re-add with --blocked-on if it still holds"
+            )
+        );
+        // --blocked-on does not apply to working, so the hint would mislead.
+        assert_eq!(
+            cleared_gate_line(Some("mobile release"), None, WorkState::Working).as_deref(),
+            Some("  gate cleared (was: mobile release)")
+        );
+        assert_eq!(
+            cleared_gate_line(Some("old"), Some("new"), WorkState::Ready),
+            None
+        );
+        assert_eq!(cleared_gate_line(None, None, WorkState::Ready), None);
     }
 
     #[test]

@@ -30,18 +30,13 @@ pub struct EdgeArgs {
     #[arg(value_name = "TO")]
     pub to: Option<String>,
     /// Mark the edge as a hard dependency (unsafe to violate).
-    #[arg(long, global = true, conflicts_with = "prefer")]
+    #[arg(long, conflicts_with = "prefer")]
     pub blocks: bool,
     /// Mark the edge as a preference (the default; safe to violate).
-    #[arg(long, global = true, conflicts_with = "blocks")]
+    #[arg(long, conflicts_with = "blocks")]
     pub prefer: bool,
     /// Why the edge exists.
-    #[arg(
-        short = 'm',
-        long = "message",
-        global = true,
-        allow_hyphen_values = true
-    )]
+    #[arg(short = 'm', long = "message", allow_hyphen_values = true)]
     pub message: Option<String>,
     /// Print machine-readable JSON.
     #[arg(long, global = true)]
@@ -406,6 +401,30 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn assertion_flags_are_refused_where_they_would_do_nothing() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: EdgeArgs,
+        }
+        let asserted =
+            Harness::try_parse_from(["edge", "one", "before", "two", "--blocks", "-m", "why"])
+                .unwrap()
+                .args;
+        assert!(asserted.blocks);
+        assert_eq!(asserted.message.as_deref(), Some("why"));
+        for ignored in [
+            &["edge", "prune", "--blocks"][..],
+            &["edge", "prune", "--prefer"],
+            &["edge", "rm", "one", "two", "-m", "why"],
+        ] {
+            assert!(Harness::try_parse_from(ignored).is_err(), "{ignored:?}");
+        }
+        assert!(Harness::try_parse_from(["edge", "rm", "one", "two"]).is_ok());
+    }
+
     #[test]
     fn edge_kind_prefix_must_be_unique() {
         assert_eq!(parse_kind("b"), Some(MergeEdgeKind::Before));

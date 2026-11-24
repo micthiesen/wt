@@ -5,7 +5,7 @@ use clap::Args;
 use wt_app_core::context::AppContext;
 use wt_ops::commands::{
     agent::{AgentArgs, AgentCommand},
-    new::{Created, NewArgs},
+    new::{Created, InstallTiming, NewArgs},
     section::{SectionArgs, SectionCommand},
 };
 
@@ -35,24 +35,47 @@ pub struct LaunchArgs {
     #[arg(short = 'm', long = "note", allow_hyphen_values = true)]
     pub note: Option<String>,
     /// Start the worktree's agent on the brief once everything else is set.
+    /// Dependencies then install in the background.
     #[arg(long)]
     pub start: bool,
+    /// With --start, finish the dependency install before anything else.
+    #[arg(long, requires = "start")]
+    pub wait_install: bool,
+    /// With --start, start the Claude Code session on this model family,
+    /// such as `fable` or `opus`. Only when a specific model was asked for.
+    #[arg(long, value_name = "NAME", requires = "start")]
+    pub model: Option<String>,
 }
 
 impl LaunchArgs {
     fn any(&self) -> bool {
         self.section.is_some() || self.brief.is_some() || self.note.is_some() || self.start
     }
+
+    /// Only a launch that starts an agent defers the install: a script that
+    /// creates a worktree and returns relies on finding dependencies present.
+    fn install_timing(&self) -> InstallTiming {
+        if self.start && !self.wait_install {
+            InstallTiming::Deferred
+        } else {
+            InstallTiming::Inline
+        }
+    }
 }
 
 pub async fn run(ctx: &AppContext, args: &NewCommandArgs) -> Result<i32> {
     let launch = &args.launch;
+    // Refuse a bad model name, and read the brief, before anything exists.
+    if let Some(model) = &launch.model {
+        wt_ops::commands::agent::claude_model_alias(model)?;
+    }
     // Read the brief first: a missing file must not leave a worktree behind.
     let brief = match &launch.brief {
         Some(source) => Some(read_brief(source).await?),
         None => None,
     };
-    let (code, created) = wt_ops::commands::new::run_created(ctx, &args.new).await?;
+    let (code, created) =
+        wt_ops::commands::new::run_created(ctx, &args.new, launch.install_timing()).await?;
     let Some(created) = created else {
         if code == 0 && launch.any() {
             eprintln!(
@@ -62,18 +85,28 @@ pub async fn run(ctx: &AppContext, args: &NewCommandArgs) -> Result<i32> {
         }
         return Ok(code);
     };
+    let mut owed_install = created.deferred_install.as_ref();
     for (index, step) in steps(launch).iter().enumerate() {
         let done = match step {
             Step::Brief => write_brief(&created, brief.as_deref().unwrap_or_default()).await,
             Step::Section(name) => section(ctx, &created, name).await,
             Step::Todo(note) => todo(ctx, &created, note).await,
-            Step::Start => start(ctx, &created).await,
+            Step::Start(model) => {
+                if let Some(target) = owed_install.take() {
+                    background_install(ctx, target).await;
+                }
+                start(ctx, &created, *model).await
+            }
         };
         let failure = match done {
             Ok(0) => continue,
             Ok(code) => format!("exit {code}"),
             Err(error) => format!("{error:#}"),
         };
+        // A launch that stops early still owes the worktree its dependencies.
+        if let Some(target) = owed_install.take() {
+            background_install(ctx, target).await;
+        }
         eprintln!(
             "{} failed for {}: {failure}\nThe worktree was created. Finish with:",
             step.label(),
@@ -92,7 +125,7 @@ enum Step<'a> {
     Brief,
     Section(&'a str),
     Todo(&'a str),
-    Start,
+    Start(Option<&'a str>),
 }
 
 /// The agent starts last, so it finds its brief, section and status in place.
@@ -108,7 +141,7 @@ fn steps(launch: &LaunchArgs) -> Vec<Step<'_>> {
         steps.push(Step::Todo(note));
     }
     if launch.start {
-        steps.push(Step::Start);
+        steps.push(Step::Start(launch.model.as_deref()));
     }
     steps
 }
@@ -119,7 +152,7 @@ impl Step<'_> {
             Step::Brief => "writing the brief",
             Step::Section(_) => "moving to the section",
             Step::Todo(_) => "setting todo",
-            Step::Start => "starting the agent",
+            Step::Start(_) => "starting the agent",
         }
     }
 
@@ -130,7 +163,10 @@ impl Step<'_> {
                 format!("wt section mv --only -- {} {name:?}", created.slug)
             }
             Step::Todo(note) => format!("wt status {} todo -m {note:?}", created.slug),
-            Step::Start => format!("wt agent start {}", created.slug),
+            Step::Start(None) => format!("wt agent start {}", created.slug),
+            Step::Start(Some(model)) => {
+                format!("wt agent start {} --model {model}", created.slug)
+            }
         }
     }
 }
@@ -201,12 +237,30 @@ async fn todo(ctx: &AppContext, created: &Created, note: &str) -> Result<i32> {
     .await
 }
 
-async fn start(ctx: &AppContext, created: &Created) -> Result<i32> {
+/// A failure to start costs only the install, which the agent or the user can
+/// run, so it is reported and the launch goes on.
+async fn background_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) {
+    match wt_ops::commands::new::start_install(ctx, target).await {
+        Ok(Some(install)) => println!(
+            "  install: {} continues in the background; watch it with: tail -f {}",
+            wt_core::sanitize_terminal_text(&install.label),
+            install.log.display()
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "the dependency install did not start ({error:#}); run it in {}",
+            target.path
+        ),
+    }
+}
+
+async fn start(ctx: &AppContext, created: &Created, model: Option<&str>) -> Result<i32> {
     wt_ops::commands::agent::run(
         ctx,
         &AgentArgs {
             command: AgentCommand::Start {
                 target: created.slug.clone(),
+                model: model.map(str::to_owned),
             },
         },
     )
@@ -247,10 +301,36 @@ mod tests {
                 Step::Brief,
                 Step::Section("Wave"),
                 Step::Todo("ship it"),
-                Step::Start
+                Step::Start(None)
             ]
         );
+        assert_eq!(
+            steps(&parse(&["ENG-1", "--start", "--model", "fable"]).launch),
+            [Step::Start(Some("fable"))]
+        );
         assert!(steps(&parse(&["ENG-1"]).launch).is_empty());
+    }
+
+    #[test]
+    fn only_a_launch_that_starts_an_agent_defers_the_install() {
+        let timing = |args: &[&str]| parse(args).launch.install_timing();
+        assert_eq!(timing(&["ENG-1"]), InstallTiming::Inline);
+        assert_eq!(
+            timing(&["ENG-1", "--brief", "-", "--section", "Wave"]),
+            InstallTiming::Inline
+        );
+        assert_eq!(timing(&["ENG-1", "--start"]), InstallTiming::Deferred);
+        assert_eq!(
+            timing(&["ENG-1", "--start", "--wait-install"]),
+            InstallTiming::Inline
+        );
+        let command = NewCommandArgs::augment_args(Command::new("new"));
+        assert!(
+            command
+                .try_get_matches_from(["new", "ENG-1", "--wait-install"])
+                .is_err(),
+            "--wait-install without --start changes nothing, so it is refused"
+        );
     }
 
     #[test]
@@ -258,12 +338,20 @@ mod tests {
         let created = Created {
             slug: "eng-1-fix".into(),
             path: "/wt/eng-1-fix".into(),
+            deferred_install: None,
         };
         assert_eq!(
             Step::Section("Wave one").manual(&created),
             "wt section mv --only -- eng-1-fix \"Wave one\""
         );
-        assert_eq!(Step::Start.manual(&created), "wt agent start eng-1-fix");
+        assert_eq!(
+            Step::Start(None).manual(&created),
+            "wt agent start eng-1-fix"
+        );
+        assert_eq!(
+            Step::Start(Some("fable")).manual(&created),
+            "wt agent start eng-1-fix --model fable"
+        );
     }
 
     #[tokio::test]

@@ -77,7 +77,9 @@ queues it as `todo`, and starts its agent:
   Inbox, written `-`). If sections can't be read, omit it and say so in the
   report.
 - `--start` picks the configured harness and sends that harness's form of
-  `start`; never address a harness yourself.
+  `start`; never address a harness yourself. The dependency install then
+  runs in the background, so the agent starts at once. Add `--model <name>`
+  (`fable`, `opus`) only when the user asked for a specific model.
 - Never use raw `git worktree add`. Take the new slug, branch, and path from
   the output.
 - Several follow-ups: run one `wt new … --start` per task concurrently; they
