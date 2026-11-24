@@ -233,7 +233,7 @@ impl Model {
 
     /// Cursor stops in render order. An expanded section is a divider, not a
     /// stop; a folded section collapses to one selectable header, and an empty
-    /// named section is one stop, its "empty" line; an empty derived group
+    /// named section is one stop, its rule; an empty derived group
     /// (`BoardSection::drawn`) is not drawn at all. Requested reviews
     /// sit between the active board and the archived block.
     pub(crate) fn rebuild_items(&mut self) {
@@ -262,7 +262,7 @@ impl Model {
                 .filter(|&row| row < self.board.rows.len())
                 .collect();
             if rows.is_empty() {
-                // An empty named section is one stop: its "empty" line.
+                // An empty named section is one stop: its rule.
                 if section.drawn() {
                     items.push(VisualItem::Section(index));
                 }

@@ -224,8 +224,8 @@ impl RowContext<'_> {
         }
         if rows.is_empty() {
             let item = positions.get(&VisualItem::Section(index)).copied();
-            lines.push(divider(&section.title, self.width));
             lines.push(empty_section(
+                &section.title,
                 item.is_some() && item == self.model.selected,
                 self.width,
                 item,
@@ -409,18 +409,25 @@ fn divider(label: &str, width: usize) -> ListLine {
     }
 }
 
-/// The one cursor stop of a named section with no rows, so it can be
-/// renamed, deleted, or filled.
-fn empty_section(selected: bool, width: usize, item: Option<usize>) -> ListLine {
-    let mut style = theme::dim().add_modifier(Modifier::ITALIC);
+/// A named section with no rows: its rule alone, which is also its one
+/// cursor stop, so it can be renamed, deleted, moved, or filled.
+fn empty_section(label: &str, selected: bool, width: usize, item: Option<usize>) -> ListLine {
+    let mut line = divider(label, width);
+    line.item = item;
     if selected {
-        style = style.bg(theme::SELECTED_BG);
+        for (index, span) in line.line.spans.iter_mut().enumerate() {
+            span.style = span.style.bg(theme::SELECTED_BG);
+            // The label is the third span of a rule.
+            if index == 2 {
+                span.style = span
+                    .style
+                    .fg(theme::FG_BRIGHT)
+                    .remove_modifier(Modifier::DIM)
+                    .add_modifier(Modifier::BOLD);
+            }
+        }
     }
-    let text = fit("   empty", width.saturating_sub(1));
-    ListLine {
-        line: Line::from(vec![Span::styled(text, style), Span::raw(" ")]),
-        item,
-    }
+    line
 }
 
 /// A folded group collapsed to one stop: a `[×NN]` count chip, the label,
@@ -575,7 +582,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_named_section_draws_with_a_selectable_empty_line() {
+    fn an_empty_named_section_is_one_selectable_rule() {
         let model = Model::default();
         let context = RowContext {
             model: &model,
@@ -598,10 +605,9 @@ mod tests {
         };
         let mut lines = Vec::new();
         context.section(&mut lines, 0, &named, &positions, false);
-        assert_eq!(lines.len(), 2);
-        assert!(text(&lines[0]).contains("Later"));
-        assert!(text(&lines[1]).contains("empty"));
-        assert_eq!(lines[1].item, Some(0));
+        assert_eq!(lines.len(), 1);
+        assert!(text(&lines[0]).contains("── Later ─"));
+        assert_eq!(lines[0].item, Some(0));
         // A derived group without rows (the Inbox) is not drawn.
         let inbox = BoardSection {
             key: "\0inbox".into(),

@@ -45,8 +45,8 @@ answer drives the glyph and `c`, and `c` never offers a row whose status is
 working or needs-human.
 
 Sections are explicit: one lasts from creation (`l n`) until you delete it with
-`D`, and stays on screen when its last worktree leaves, drawn as its rule over
-a dim `empty` line. That line is the section's cursor stop, so an empty section
+`D`, and stays on screen when its last worktree leaves, drawn as its rule
+alone. That rule is the section's cursor stop, so an empty section
 can be renamed, deleted, moved with `J`/`K`, or filled (`n` creates into it).
 Deleting a section that still has worktrees asks first and moves them to the
 Inbox. The Inbox and the archive appear only when they have rows.
