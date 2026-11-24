@@ -1078,23 +1078,27 @@ mod tests {
 
     #[test]
     fn folded_section_summary_exposes_states_risk_and_blocker_notes() {
-        let rollup = crate::SectionRollup {
-            states: vec![crate::WorkStateCount {
-                state: Some(wt_core::WorkState::NeedsHuman),
-                count: 2,
-            }],
-            risks: vec![crate::WorkRiskCount {
-                risk: wt_core::WorkRisk::High,
-                count: 1,
-            }],
-            blocked_notes: vec!["api: waiting for review".into()],
+        let row = crate::BoardRow {
+            slug: "api".into(),
+            work: Some(crate::WorkPresentation {
+                effective_state: Some(wt_core::WorkState::NeedsHuman),
+                record: Some(wt_core::WorkStatusRecord {
+                    risk: Some(wt_core::WorkRisk::High),
+                    blocked_on: Some("waiting for review".into()),
+                    ..wt_core::WorkStatusRecord::new(
+                        wt_core::WorkState::NeedsHuman,
+                        "2026-10-09T00:00:00Z",
+                    )
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let section = crate::BoardSection {
-            rollup,
+            rows: vec![0],
             ..Default::default()
         };
-        let details = details::section_rollup_lines(&section)
+        let details = details::section_rollup_lines(&section, &[&row])
             .into_iter()
             .map(|line| {
                 line.spans

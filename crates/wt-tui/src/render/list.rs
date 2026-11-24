@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::text::{fit, truncate_end};
 use crate::{
-    BoardRow, BoardSection, Model, ReviewRequestRow, SectionRollup, badges,
+    BoardRow, BoardSection, Model, ReviewRequestRow, badges,
     cleanup::{CleanupMark, CleanupPreview},
     glyphs,
     model::{ARCHIVED_SECTION, REMOVING_SECTION, VisualItem},
@@ -29,6 +29,31 @@ const MIN_LABEL_CELLS: usize = 24;
 const REF_ARROW: &str = " → ";
 /// The deepest rail drawn; a pathological chain cannot eat the title.
 const MAX_GUTTER: usize = 3;
+
+/// What a folded header says about its hidden rows: their own markers,
+/// counted, plus the two alarms that live in a row's badge cluster.
+#[derive(Default)]
+struct FoldSummary {
+    markers: Vec<(badges::Badge, usize)>,
+    conflicted: usize,
+    failing_checks: usize,
+}
+
+impl FoldSummary {
+    fn of(rows: &[&BoardRow], policy: &crate::DisplayPolicy) -> Self {
+        Self {
+            markers: badges::marker_tally(rows, policy),
+            conflicted: rows
+                .iter()
+                .filter(|row| !row.git.conflict_files.is_empty())
+                .count(),
+            failing_checks: rows
+                .iter()
+                .filter(|row| row.pr.as_ref().map(|pr| pr.checks) == Some(crate::CheckState::Fail))
+                .count(),
+        }
+    }
+}
 
 /// One drawn line and the cursor stop it represents, if any.
 struct ListLine {
@@ -157,7 +182,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
             bottom.push(folded_header(
                 "Review Requests",
                 board.review_requests.len(),
-                None,
+                &FoldSummary::default(),
                 item == model.selected && item.is_some(),
                 width,
                 item,
@@ -234,10 +259,11 @@ impl RowContext<'_> {
         }
         if section.folded {
             let item = positions.get(&VisualItem::Section(index)).copied();
+            let members: Vec<&BoardRow> = rows.iter().map(|(_, row)| *row).collect();
             let mut header = folded_header(
                 &section.title,
                 rows.len(),
-                Some(&section.rollup),
+                &FoldSummary::of(&members, &self.model.board.display),
                 item.is_some() && item == self.model.selected,
                 self.width,
                 item,
@@ -431,12 +457,12 @@ fn empty_section(label: &str, selected: bool, width: usize, item: Option<usize>)
 }
 
 /// A folded group collapsed to one stop: a `[×NN]` count chip, the label,
-/// and on the right a compact rollup of the hidden rows' work states, so
-/// folding a section never hides that something inside needs attention.
+/// and on the right the hidden rows' markers, counted, so folding a section
+/// never hides that something inside needs attention.
 fn folded_header(
     label: &str,
     count: usize,
-    rollup: Option<&SectionRollup>,
+    fold: &FoldSummary,
     selected: bool,
     width: usize,
     item: Option<usize>,
@@ -452,38 +478,23 @@ fn folded_header(
         Modifier::empty()
     };
     let chip = format!("[×{count:02}] ");
-    let mut states: Vec<Span<'static>> = Vec::new();
+    let mut states: Vec<Span<'static>> = fold
+        .markers
+        .iter()
+        .map(|(badge, count)| Span::styled(format!("{} {count} ", badge.glyph), style(badge.color)))
+        .collect();
     let mut alarms: Vec<Span<'static>> = Vec::new();
-    if let Some(rollup) = rollup {
-        for entry in super::details::ranked_states(&rollup.states).filter(|entry| {
-            entry
-                .state
-                .is_some_and(|state| state != wt_core::WorkState::Todo)
-        }) {
-            let state = entry.state.expect("filtered to asserted states");
-            states.push(Span::styled(
-                format!("{} {} ", badges::work_state_glyph(state), entry.count),
-                style(badges::work_state_color(state)),
-            ));
-        }
-        if rollup.verification_overdue > 0 {
-            alarms.push(Span::styled(
-                format!("{} {} ", glyphs::DOT, rollup.verification_overdue),
-                style(theme::ERR),
-            ));
-        }
-        if rollup.conflicted > 0 {
-            alarms.push(Span::styled(
-                format!("{} {} ", glyphs::CONFLICT, rollup.conflicted),
-                style(theme::ERR),
-            ));
-        }
-        if rollup.failing_checks > 0 {
-            alarms.push(Span::styled(
-                format!("{} {} ", glyphs::CHECK_FAIL, rollup.failing_checks),
-                style(theme::ERR),
-            ));
-        }
+    if fold.conflicted > 0 {
+        alarms.push(Span::styled(
+            format!("{} {} ", glyphs::CONFLICT, fold.conflicted),
+            style(theme::ERR),
+        ));
+    }
+    if fold.failing_checks > 0 {
+        alarms.push(Span::styled(
+            format!("{} {} ", glyphs::CHECK_FAIL, fold.failing_checks),
+            style(theme::ERR),
+        ));
     }
     // The name wins over the counts: the least urgent state counts go first
     // when the name would otherwise be cut; alarms always stay.
@@ -734,7 +745,6 @@ mod tests {
                         title: "Archived".into(),
                         rows: vec![1],
                         folded: true,
-                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -984,25 +994,35 @@ mod tests {
         assert_eq!(cells, 38);
     }
 
+    fn state_row(state: wt_core::WorkState) -> BoardRow {
+        BoardRow {
+            work: Some(crate::WorkPresentation {
+                effective_state: Some(state),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn fold_of(rows: &[BoardRow], policy: &crate::DisplayPolicy) -> FoldSummary {
+        FoldSummary::of(&rows.iter().collect::<Vec<_>>(), policy)
+    }
+
     #[test]
     fn a_narrow_folded_header_drops_counts_before_its_name() {
-        let rollup = SectionRollup {
-            states: [
-                wt_core::WorkState::Ready,
-                wt_core::WorkState::NeedsHuman,
-                wt_core::WorkState::Working,
-                wt_core::WorkState::Review,
-            ]
-            .into_iter()
-            .map(|state| crate::WorkStateCount {
-                state: Some(state),
-                count: 1,
-            })
-            .collect(),
-            failing_checks: 1,
+        let mut rows = [
+            wt_core::WorkState::Ready,
+            wt_core::WorkState::NeedsHuman,
+            wt_core::WorkState::Working,
+            wt_core::WorkState::Review,
+        ]
+        .map(state_row);
+        rows[0].pr = Some(crate::PrPresentation {
+            checks: crate::CheckState::Fail,
             ..Default::default()
-        };
-        let line = folded_header("Statuses", 8, Some(&rollup), false, 30, None);
+        });
+        let fold = fold_of(&rows, &Default::default());
+        let line = folded_header("Statuses", 8, &fold, false, 30, None);
         let text: String = line
             .line
             .spans
@@ -1017,23 +1037,16 @@ mod tests {
     }
 
     #[test]
-    fn folded_header_rollup_reads_most_urgent_first() {
-        let rollup = SectionRollup {
-            states: [
-                wt_core::WorkState::Working,
-                wt_core::WorkState::NeedsTesting,
-                wt_core::WorkState::NeedsHuman,
-                wt_core::WorkState::Ready,
-            ]
-            .into_iter()
-            .map(|state| crate::WorkStateCount {
-                state: Some(state),
-                count: 1,
-            })
-            .collect(),
-            ..Default::default()
-        };
-        let line = folded_header("Batch", 4, Some(&rollup), false, 60, None);
+    fn folded_header_reads_most_urgent_first() {
+        let rows = [
+            wt_core::WorkState::Working,
+            wt_core::WorkState::NeedsTesting,
+            wt_core::WorkState::NeedsHuman,
+            wt_core::WorkState::Ready,
+        ]
+        .map(state_row);
+        let fold = fold_of(&rows, &Default::default());
+        let line = folded_header("Batch", 4, &fold, false, 60, None);
         let colors = line
             .line
             .spans
@@ -1049,5 +1062,63 @@ mod tests {
         ]
         .map(|state| Some(badges::work_state_color(state)));
         assert_eq!(colors, expected);
+    }
+
+    /// The folded header may only show what its rows show: every counted
+    /// glyph is some member's marker, and every member with a coloured
+    /// marker is counted once.
+    #[test]
+    fn a_folded_header_counts_exactly_the_markers_its_rows_wear() {
+        let mut rows = Vec::new();
+        for state in wt_core::WORK_STATES {
+            for variant in 0..7 {
+                let mut row = state_row(state);
+                let work = row.work.as_mut().unwrap();
+                match variant {
+                    1 => work.blocked = true,
+                    2 => work.stale = Some(true),
+                    3 => {
+                        work.verification_owed = true;
+                        work.verification_overdue = true;
+                    }
+                    4 => row.git.landed_on = Some(crate::LandingKind::Base),
+                    5 => row.git.landed_on = Some(crate::LandingKind::Production),
+                    6 => row.archived = true,
+                    _ => {}
+                }
+                rows.push(row);
+            }
+        }
+        rows.push(BoardRow::default());
+        for production in [false, true] {
+            let policy = crate::DisplayPolicy {
+                production,
+                ..Default::default()
+            };
+            let fold = fold_of(&rows, &policy);
+            let drawn: Vec<_> = rows
+                .iter()
+                .map(|row| badges::marker(row, &policy))
+                .filter(|badge| badge.color != theme::FG_DIM)
+                .collect();
+            assert_eq!(
+                fold.markers.iter().map(|entry| entry.1).sum::<usize>(),
+                drawn.len()
+            );
+            for (badge, count) in &fold.markers {
+                assert_eq!(
+                    drawn.iter().filter(|marker| *marker == badge).count(),
+                    *count,
+                    "{badge:?}"
+                );
+            }
+            let line = folded_header("All", rows.len(), &fold, false, 400, None);
+            for (badge, count) in &fold.markers {
+                assert!(line.line.spans.iter().any(|span| {
+                    span.content == format!("{} {count} ", badge.glyph)
+                        && span.style.fg == Some(badge.color)
+                }));
+            }
+        }
     }
 }

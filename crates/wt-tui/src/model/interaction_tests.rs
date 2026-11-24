@@ -52,7 +52,6 @@ fn section(key: &str, rows: Vec<usize>, folded: bool) -> BoardSection {
         title: key.into(),
         folded,
         rows,
-        ..Default::default()
     }
 }
 

@@ -1470,8 +1470,11 @@ fn member_risk(row: &BoardRow) -> Option<wt_core::WorkRisk> {
 
 /// Rollup lines for tests that read them without a pane width.
 #[cfg(test)]
-pub(crate) fn section_rollup_lines(section: &BoardSection) -> Vec<Line<'static>> {
-    let (mut lines, blocked) = section_summary(section, &[], 200);
+pub(crate) fn section_rollup_lines(
+    section: &BoardSection,
+    members: &[&BoardRow],
+) -> Vec<Line<'static>> {
+    let (mut lines, blocked) = section_summary(section, members, 200);
     lines.extend(blocked);
     lines
 }
@@ -1485,7 +1488,7 @@ fn section_summary(
     members: &[&BoardRow],
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-    let rollup = &section.rollup;
+    let rollup = &crate::SectionRollup::of(members);
     let count = section.rows.len();
     let mut states = vec![Span::styled(
         format!("{count} worktree{}", if count == 1 { "" } else { "s" }),
@@ -1612,7 +1615,7 @@ fn section_summary(
     (lines, blocked)
 }
 
-/// The prepared rollup's states, most urgent first by the shared section
+/// The rollup's states, most urgent first by the shared section
 /// rank (ready, needs-human, needs-testing, review, working, unset, todo,
 /// then the terminal states), so the pane and the folded list header agree.
 pub(crate) fn ranked_states(
@@ -2066,32 +2069,16 @@ mod tests {
 
     fn section_screen(rows: Vec<BoardRow>, key: &str) -> Vec<String> {
         let count = rows.len();
-        let mut board = Board {
+        let board = Board {
             rows,
             sections: vec![BoardSection {
                 key: key.into(),
                 title: "To Merge".into(),
                 folded: true,
                 rows: (0..count).collect(),
-                ..Default::default()
             }],
             ..Default::default()
         };
-        board.sections[0].rollup.states = vec![
-            crate::WorkStateCount {
-                state: Some(WorkState::Working),
-                count: 1,
-            },
-            crate::WorkStateCount {
-                state: Some(WorkState::NeedsHuman),
-                count: 1,
-            },
-            crate::WorkStateCount {
-                state: Some(WorkState::Ready),
-                count: 1,
-            },
-        ];
-        board.sections[0].rollup.blocked_notes = vec!["gated: release approval".into()];
         let mut model = Model {
             board: Arc::new(board),
             ..Model::default()
@@ -2148,7 +2135,19 @@ mod tests {
             effective_state: Some(WorkState::NeedsHuman),
             ..Default::default()
         });
-        let lines = section_screen(vec![row(), asking], "manual");
+        let mut gated = row();
+        gated.slug = "gated".into();
+        gated
+            .work
+            .as_mut()
+            .unwrap()
+            .record
+            .as_mut()
+            .unwrap()
+            .blocked_on = Some("release approval".into());
+        let mut working = row();
+        working.work.as_mut().unwrap().effective_state = Some(WorkState::Working);
+        let lines = section_screen(vec![gated, asking, working], "manual");
         let you = lines
             .iter()
             .position(|line| line.contains("blocked on you"))
@@ -2161,7 +2160,7 @@ mod tests {
         assert!(lines[you + 2].contains("    Need the staging API key from ops"));
         find(&lines, "blocked on");
         find(&lines, "gated: release approval");
-        let rollup = find(&lines, "2 worktrees");
+        let rollup = find(&lines, "3 worktrees");
         let ready = rollup.find("ready").unwrap();
         let human = rollup.find("needs-human").unwrap();
         let working = rollup.find("working").unwrap();

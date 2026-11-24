@@ -416,7 +416,6 @@ fn compose(
             .then_with(|| a.key.cmp(&b.key))
     });
     wt_sources::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
-    wt_sources::board_layout::refresh_rollups(&mut board);
     wt_app_core::feeds::bound_feeds(&mut board);
     snapshot.derive(Some(Arc::new(board)))
 }
@@ -533,22 +532,6 @@ mod tests {
             .find(|section| section.key == "Review")
             .unwrap();
         assert_eq!(review.rows.len(), 2);
-        assert!(
-            review.rollup.states.iter().any(|state| {
-                state.state == Some(wt_core::WorkState::Ready) && state.count == 1
-            })
-        );
-        assert!(review.rollup.states.iter().any(|state| {
-            state.state == Some(wt_core::WorkState::NeedsHuman) && state.count == 1
-        }));
-        assert_eq!(review.rollup.risks[0].risk, wt_core::WorkRisk::High);
-        assert!(
-            review
-                .rollup
-                .blocked_notes
-                .iter()
-                .any(|note| note == "one: waiting for review")
-        );
         fixture.close().await.unwrap();
     }
     #[tokio::test]

@@ -98,7 +98,6 @@ fn compose(
         }
         row.detail_groups = detail_groups(row, config);
     }
-    crate::board_layout::refresh_rollups(&mut board);
     source.with_data(Some(Arc::new(board))).with_input(&github)
 }
 
@@ -500,7 +499,6 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use wt_core::{WorkRisk, WorkState, WorkStatusRecord};
-    use wt_tui::BoardSection;
     use wt_tui::GitPresentation;
 
     fn config(rows: &[&str]) -> Config {
@@ -784,104 +782,5 @@ mod tests {
         assert_eq!(work.record, None);
         assert_eq!(work.effective_state, Some(WorkState::NeedsHuman));
         assert!(work.derived);
-    }
-
-    #[test]
-    fn folded_rollups_include_state_risk_mechanical_counts_and_blocker_notes() {
-        let mut board = Board {
-            rows: vec![
-                BoardRow {
-                    slug: "ready-row".into(),
-                    needs_attention: true,
-                    work: Some(WorkPresentation {
-                        effective_state: Some(WorkState::Ready),
-                        stale: Some(true),
-                        verification_owed: true,
-                        verification_overdue: true,
-                        record: Some(WorkStatusRecord {
-                            state: WorkState::Ready,
-                            risk: Some(WorkRisk::High),
-                            blocked_on: Some("release approval".into()),
-                            at: "2026-10-09T00:00:00Z".into(),
-                            ..WorkStatusRecord::new(WorkState::Ready, "2026-10-09T00:00:00Z")
-                        }),
-                        ..Default::default()
-                    }),
-                    git: GitPresentation {
-                        tracked_changes: Some(1),
-                        untracked_files: Some(0),
-                        ahead: Some(2),
-                        behind: Some(1),
-                        rebasing: true,
-                        conflict_files: vec!["Cargo.toml".into()],
-                        ..Default::default()
-                    },
-                    pr: Some(wt_tui::PrPresentation {
-                        state: Some("OPEN".into()),
-                        draft: true,
-                        checks: wt_tui::CheckState::Fail,
-                        merge_queue: Some(wt_tui::MergeQueueView {
-                            position: 4,
-                            state: "AWAITING_CHECKS".into(),
-                        }),
-                        ..Default::default()
-                    }),
-                    automations_paused: true,
-                    ..Default::default()
-                },
-                BoardRow {
-                    slug: "unknown-row".into(),
-                    ..Default::default()
-                },
-            ],
-            sections: vec![BoardSection {
-                rows: vec![0, 1],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        crate::board_layout::refresh_rollups(&mut board);
-        let summary = &board.sections[0].rollup;
-        assert_eq!(
-            summary
-                .states
-                .iter()
-                .find(|entry| entry.state == Some(WorkState::Ready))
-                .unwrap()
-                .count,
-            1
-        );
-        assert_eq!(
-            summary
-                .states
-                .iter()
-                .find(|entry| entry.state.is_none())
-                .unwrap()
-                .count,
-            1
-        );
-        assert_eq!(
-            summary.risks,
-            [wt_tui::WorkRiskCount {
-                risk: WorkRisk::High,
-                count: 1
-            }]
-        );
-        assert_eq!(summary.blocked_notes, ["ready-row: release approval"]);
-        assert_eq!(summary.stale_statuses, 1);
-        assert_eq!(summary.verification_owed, 1);
-        assert_eq!(summary.verification_overdue, 1);
-        assert_eq!(summary.dirty_worktrees, Some(1));
-        assert_eq!(summary.unknown_git, 1);
-        assert_eq!(summary.upstream_ahead, 1);
-        assert_eq!(summary.upstream_behind, 1);
-        assert_eq!(summary.rebasing, 1);
-        assert_eq!(summary.conflicted, 1);
-        assert_eq!(summary.open_prs, 1);
-        assert_eq!(summary.draft_prs, 1);
-        assert_eq!(summary.queued_prs, 1);
-        assert_eq!(summary.failing_checks, 1);
-        assert_eq!(summary.paused_automations, 1);
-        assert_eq!(summary.needs_attention, 1);
     }
 }

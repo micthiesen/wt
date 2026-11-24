@@ -53,9 +53,9 @@ Inbox. The Inbox and the archive appear only when they have rows.
 
 Sections fold with `Tab`. Only folded and empty sections are cursor stops; an
 expanded section is just its rows. A folded header reads `[×NN] Name` with a
-right-aligned count per work state, most urgent first (ready, needs-human,
-needs-testing, review, working), plus overdue verifications, conflicts, and
-failing checks. Selecting it shows the full rollup and blocker notes in the
+right-aligned count of each marker its rows wear, most urgent first, so it
+shows exactly the glyphs you would see expanded (dim markers such as todo,
+finished and archived are left out), plus conflicts and failing checks. Selecting it shows the full rollup and blocker notes in the
 details pane. `[ui].sort = "status"` orders rows by work status; manual section
 placement remains separate. Within a section, rows without a manual order sort
 first, and a stack sorts as one unit under its root's identity.

@@ -300,8 +300,6 @@ pub struct BoardSection {
     pub folded: bool,
     /// Indices into the prepared board's rows, already sorted by the source.
     pub rows: Vec<usize>,
-    #[serde(default)]
-    pub rollup: SectionRollup,
 }
 
 impl Board {
@@ -354,6 +352,145 @@ pub struct SectionRollup {
     pub failing_checks: usize,
     pub paused_automations: usize,
     pub needs_attention: usize,
+}
+
+impl SectionRollup {
+    /// Summarize the rows a section draws. Computed where it is drawn, from
+    /// the rows on screen, so a summary can never describe an older board
+    /// than its members.
+    pub fn of(rows: &[&BoardRow]) -> Self {
+        let mut states = Vec::new();
+        for state in wt_core::WORK_STATES {
+            let count = rows
+                .iter()
+                .filter(|row| {
+                    row.work.as_ref().and_then(|work| work.effective_state) == Some(state)
+                })
+                .count();
+            if count > 0 {
+                states.push(WorkStateCount {
+                    state: Some(state),
+                    count,
+                });
+            }
+        }
+        let unset = rows
+            .iter()
+            .filter(|row| {
+                row.work
+                    .as_ref()
+                    .and_then(|work| work.effective_state)
+                    .is_none()
+            })
+            .count();
+        if unset > 0 {
+            states.push(WorkStateCount {
+                state: None,
+                count: unset,
+            });
+        }
+        let risks = [
+            wt_core::WorkRisk::High,
+            wt_core::WorkRisk::Medium,
+            wt_core::WorkRisk::Low,
+        ]
+        .into_iter()
+        .filter_map(|risk| {
+            let count = rows
+                .iter()
+                .filter(|row| {
+                    row.work.as_ref().is_some_and(|work| {
+                        work.record.as_ref().and_then(|record| record.risk) == Some(risk)
+                    })
+                })
+                .count();
+            (count > 0).then_some(WorkRiskCount { risk, count })
+        })
+        .collect();
+        let unknown_git = rows
+            .iter()
+            .filter(|row| row.git.tracked_changes.is_none() || row.git.untracked_files.is_none())
+            .count();
+        let dirty_worktrees = rows
+            .iter()
+            .filter(|row| {
+                row.git.tracked_changes.unwrap_or_default() > 0
+                    || row.git.untracked_files.unwrap_or_default() > 0
+            })
+            .count();
+        let blocked_notes = rows
+            .iter()
+            .filter_map(|row| {
+                row.work
+                    .as_ref()
+                    .and_then(|work| work.record.as_ref())
+                    .and_then(|record| record.blocked_on.as_deref())
+                    .map(|note| format!("{}: {}", row.slug, note))
+            })
+            .collect();
+        SectionRollup {
+            states,
+            risks,
+            blocked_notes,
+            stale_statuses: rows
+                .iter()
+                .filter(|row| {
+                    row.work
+                        .as_ref()
+                        .is_some_and(|work| work.stale == Some(true))
+                })
+                .count(),
+            verification_owed: rows
+                .iter()
+                .filter(|row| row.work.as_ref().is_some_and(|work| work.verification_owed))
+                .count(),
+            verification_overdue: rows
+                .iter()
+                .filter(|row| {
+                    row.work
+                        .as_ref()
+                        .is_some_and(|work| work.verification_overdue)
+                })
+                .count(),
+            dirty_worktrees: Some(dirty_worktrees),
+            unknown_git,
+            upstream_ahead: rows
+                .iter()
+                .filter(|row| row.git.ahead.is_some_and(|count| count > 0))
+                .count(),
+            upstream_behind: rows
+                .iter()
+                .filter(|row| row.git.behind.is_some_and(|count| count > 0))
+                .count(),
+            rebasing: rows.iter().filter(|row| row.git.rebasing).count(),
+            conflicted: rows
+                .iter()
+                .filter(|row| !row.git.conflict_files.is_empty())
+                .count(),
+            open_prs: rows
+                .iter()
+                .filter(|row| row.pr.as_ref().and_then(|pr| pr.state.as_deref()) == Some("OPEN"))
+                .count(),
+            draft_prs: rows
+                .iter()
+                .filter(|row| {
+                    row.pr
+                        .as_ref()
+                        .is_some_and(|pr| pr.state.as_deref() == Some("OPEN") && pr.draft)
+                })
+                .count(),
+            queued_prs: rows
+                .iter()
+                .filter(|row| row.pr.as_ref().is_some_and(|pr| pr.merge_queue.is_some()))
+                .count(),
+            failing_checks: rows
+                .iter()
+                .filter(|row| row.pr.as_ref().map(|pr| pr.checks) == Some(CheckState::Fail))
+                .count(),
+            paused_automations: rows.iter().filter(|row| row.automations_paused).count(),
+            needs_attention: rows.iter().filter(|row| row.needs_attention).count(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -791,4 +928,109 @@ pub struct BoardRow {
     pub live_sessions: Vec<LiveSlotView>,
     #[serde(default)]
     pub logs: Vec<LogView>,
+}
+
+#[cfg(test)]
+mod rollup_tests {
+    use wt_core::{WorkRisk, WorkState, WorkStatusRecord};
+
+    use super::*;
+
+    #[test]
+    fn folded_rollups_include_state_risk_mechanical_counts_and_blocker_notes() {
+        let board = Board {
+            rows: vec![
+                BoardRow {
+                    slug: "ready-row".into(),
+                    needs_attention: true,
+                    work: Some(WorkPresentation {
+                        effective_state: Some(WorkState::Ready),
+                        stale: Some(true),
+                        verification_owed: true,
+                        verification_overdue: true,
+                        record: Some(WorkStatusRecord {
+                            state: WorkState::Ready,
+                            risk: Some(WorkRisk::High),
+                            blocked_on: Some("release approval".into()),
+                            at: "2026-10-09T00:00:00Z".into(),
+                            ..WorkStatusRecord::new(WorkState::Ready, "2026-10-09T00:00:00Z")
+                        }),
+                        ..Default::default()
+                    }),
+                    git: GitPresentation {
+                        tracked_changes: Some(1),
+                        untracked_files: Some(0),
+                        ahead: Some(2),
+                        behind: Some(1),
+                        rebasing: true,
+                        conflict_files: vec!["Cargo.toml".into()],
+                        ..Default::default()
+                    },
+                    pr: Some(PrPresentation {
+                        state: Some("OPEN".into()),
+                        draft: true,
+                        checks: CheckState::Fail,
+                        merge_queue: Some(MergeQueueView {
+                            position: 4,
+                            state: "AWAITING_CHECKS".into(),
+                        }),
+                        ..Default::default()
+                    }),
+                    automations_paused: true,
+                    ..Default::default()
+                },
+                BoardRow {
+                    slug: "unknown-row".into(),
+                    ..Default::default()
+                },
+            ],
+            sections: vec![BoardSection {
+                rows: vec![0, 1],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let summary = SectionRollup::of(&board.rows.iter().collect::<Vec<_>>());
+        assert_eq!(
+            summary
+                .states
+                .iter()
+                .find(|entry| entry.state == Some(WorkState::Ready))
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            summary
+                .states
+                .iter()
+                .find(|entry| entry.state.is_none())
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            summary.risks,
+            [WorkRiskCount {
+                risk: WorkRisk::High,
+                count: 1
+            }]
+        );
+        assert_eq!(summary.blocked_notes, ["ready-row: release approval"]);
+        assert_eq!(summary.stale_statuses, 1);
+        assert_eq!(summary.verification_owed, 1);
+        assert_eq!(summary.verification_overdue, 1);
+        assert_eq!(summary.dirty_worktrees, Some(1));
+        assert_eq!(summary.unknown_git, 1);
+        assert_eq!(summary.upstream_ahead, 1);
+        assert_eq!(summary.upstream_behind, 1);
+        assert_eq!(summary.rebasing, 1);
+        assert_eq!(summary.conflicted, 1);
+        assert_eq!(summary.open_prs, 1);
+        assert_eq!(summary.draft_prs, 1);
+        assert_eq!(summary.queued_prs, 1);
+        assert_eq!(summary.failing_checks, 1);
+        assert_eq!(summary.paused_automations, 1);
+        assert_eq!(summary.needs_attention, 1);
+    }
 }

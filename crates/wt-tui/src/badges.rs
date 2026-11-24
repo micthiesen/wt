@@ -208,6 +208,35 @@ pub(crate) fn marker(row: &BoardRow, policy: &DisplayPolicy) -> Badge {
     }
 }
 
+/// The markers a folded section's rows wear, counted, most urgent first.
+/// Each entry is exactly what `marker` draws for those rows, so a folded
+/// header cannot show a glyph its expanded section would not. Dim markers
+/// (queued, finished, unasserted, archived) are left out: quiet rows stay
+/// quiet when folded.
+pub(crate) fn marker_tally(rows: &[&BoardRow], policy: &DisplayPolicy) -> Vec<(Badge, usize)> {
+    let mut tally: Vec<(Badge, u8, usize)> = Vec::new();
+    for row in rows {
+        let badge = marker(row, policy);
+        if badge.color == theme::FG_DIM {
+            continue;
+        }
+        let rank =
+            wt_core::work_state_rank(row.work.as_ref().and_then(|work| work.effective_state));
+        match tally.iter_mut().find(|entry| entry.0 == badge) {
+            Some(entry) => {
+                entry.1 = entry.1.min(rank);
+                entry.2 += 1;
+            }
+            None => tally.push((badge, rank, 1)),
+        }
+    }
+    tally.sort_by_key(|entry| entry.1);
+    tally
+        .into_iter()
+        .map(|(badge, _, count)| (badge, count))
+        .collect()
+}
+
 /// The session F12 would attach to: the first live one, preferring the
 /// primary harness.
 pub(crate) fn active_session<'a>(

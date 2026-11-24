@@ -237,7 +237,6 @@ fn grouped(keys: &[&str], folded: bool) -> SourceSnapshot<Board> {
         title: "Batch".into(),
         folded,
         rows: (0..keys.len()).collect(),
-        ..Default::default()
     }];
     state
 }
@@ -732,7 +731,6 @@ fn moved_row_keeps_cursor_in_original_section_and_restore_follows_row() {
         title: "Archived".into(),
         rows: vec![0],
         folded: false,
-        ..Default::default()
     });
     model.apply(moved);
     assert_eq!(model.selected_row().unwrap().key, "two");
@@ -2447,7 +2445,6 @@ fn creation_uses_inbox_and_a_folded_section_header_without_guessing_an_anchor() 
             title: "Group".into(),
             rows: vec![0],
             folded: true,
-            ..Default::default()
         }];
         model.apply(source);
         model.input(KeyEvent::from(KeyCode::Char('n')), 20);
