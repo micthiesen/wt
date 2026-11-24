@@ -560,7 +560,7 @@ def main():
             os.write(master, b"h")
             wait_for(lambda data: b"removed (" in data)
             os.write(master, b"P")
-            wait_for(lambda data: "perf ·".encode() in data)
+            wait_for(lambda data: "Perf ·".encode() in data)
             os.write(master, b"P")
             # Closing the overlay repaints only the cells it covered; the
             # history pane under it is unchanged, so any frame is the signal.
@@ -662,7 +662,7 @@ def main():
             os.write(master, b"\x1b[24~")
             # Differential rendering reuses cells from preceding frames.
             # Assert the visible screen, never a complete phrase in raw bytes.
-            wait_for(lambda _: screen.contains("Worktree is still being created"))
+            wait_for(lambda _: screen.contains("worktree is still being created"))
             # A preference write is independent of checkout creation. Require
             # the durable value, not merely its optimistic header, while the
             # creation inventory read is still held.
