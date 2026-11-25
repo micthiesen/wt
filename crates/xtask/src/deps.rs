@@ -87,7 +87,10 @@ pub fn check(root: &Path) -> Result<()> {
             })
             .collect();
 
-        let allowed_foundation = if name == "wt-config" {
+        // wt-core is pure domain types with no workspace dependencies, so
+        // the other foundation crates may share its vocabulary: configuration
+        // values, and the events wt-store records in its own transactions.
+        let allowed_foundation = if matches!(name, "wt-config" | "wt-store") {
             &["wt-core"][..]
         } else {
             &[][..]
