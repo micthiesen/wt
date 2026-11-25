@@ -331,7 +331,7 @@ impl WatchCondition {
     }
 
     /// The condition in words, with a time relative to today: `17:00`,
-    /// `tomorrow 09:00`, `Nov 26 17:00`, `#3806 in production`, `PR checks
+    /// `09:00 tomorrow`, `Nov 26 17:00`, `#3806 in production`, `PR checks
     /// green for 1h`.
     pub fn describe(&self, clock: LocalClock) -> String {
         self.describe_in(Local {
@@ -520,11 +520,57 @@ impl Watch {
     /// The conditions in words for text that is kept, with times in the
     /// setter's local time and relative to the day the watch was set.
     pub fn summary(&self) -> String {
+        self.summary_on(self.created_at_ms)
+    }
+
+    /// [`Self::summary`] for text about what the watch did once it was met,
+    /// with times relative to that day.
+    pub fn summary_met(&self) -> String {
+        self.summary_on(self.met_at_ms.unwrap_or(self.created_at_ms))
+    }
+
+    fn summary_on(&self, day_ms: i64) -> String {
         let local = Local {
             utc_offset_minutes: self.utc_offset_minutes,
-            now_ms: Some(self.created_at_ms),
+            now_ms: Some(day_ms),
         };
         self.join(|cond| cond.describe_in(local))
+    }
+
+    /// Whether the watch waits for one instant and nothing else, which
+    /// reads "at 17:00" where anything else reads "when merged".
+    pub fn timed(&self) -> bool {
+        matches!(self.when.as_slice(), [only] if matches!(only.cond, Condition::At { .. }))
+    }
+
+    /// [`Self::summary`] led by its connective: `at 17:00`, `when merged`.
+    pub fn when_summary(&self) -> String {
+        self.connected(self.summary())
+    }
+
+    /// [`Self::describe`] led by its connective.
+    pub fn when_described(&self, clock: LocalClock) -> String {
+        self.connected(self.describe(clock))
+    }
+
+    fn connected(&self, conditions: String) -> String {
+        if self.timed() {
+            format!("at {conditions}")
+        } else {
+            format!("when {conditions}")
+        }
+    }
+
+    /// What removing the owner's worktree would lose: a wake still owed to
+    /// its session, as a removal hazard. A watch that only tells the person
+    /// outlives the worktree and is none.
+    pub fn wake_hazard(&self, clock: LocalClock) -> Option<String> {
+        let prompt = self.then.wake.as_deref().filter(|_| !self.owner_gone)?;
+        Some(format!(
+            "{WAKE_HAZARD}: {} ({})",
+            headline(prompt),
+            self.describe(clock)
+        ))
     }
 
     fn join(&self, describe: impl Fn(&WatchCondition) -> String) -> String {
@@ -597,7 +643,7 @@ pub struct GrammarError {
 }
 
 const GRAMMAR: &str = "A condition is one of:
-  17:00 | 5pm | 5:30pm | 3h | 90m | 2d | \"tomorrow 09:00\" | 2026-11-25T17:00    a local time
+  17:00 | 5pm | 5:30pm | 3h | 90m | 2d | \"tomorrow 09:00\" | 2030-01-15T09:00    a local time
   merged | staging | production | ready | green | verified | closed    this worktree
   pr:3806 | pr:3806:merged|staging|production|closed    a pull request
   wt:<slug>:merged|staging|production|ready|green|verified|closed|gone    another worktree
@@ -657,7 +703,7 @@ fn absolute_ms(text: &str) -> Option<i64> {
     digits(text.strip_prefix("at:")?)
 }
 
-const TIME_FORMS: &str = "a time is a clock time (17:00, 5pm, 5:30pm), a time from now (3h, 90m, 2d), \"tomorrow 09:00\" as one quoted argument, or a date and time (2026-11-25T17:00)";
+const TIME_FORMS: &str = "a time is a clock time (17:00, 5pm, 5:30pm), a time from now (3h, 90m, 2d), \"tomorrow 09:00\" as one quoted argument, or a date and time (2030-01-15T09:00)";
 
 /// Whether text that is no condition was probably meant as a time, so its
 /// refusal should say how a time is written.
@@ -738,7 +784,7 @@ fn parse_time(text: &str, clock: LocalClock) -> Result<Option<i64>, String> {
             && rest.starts_with(' ')
         {
             let of_day = clock_of_day(rest.trim())?.ok_or_else(|| {
-                format!("after `{word}` comes a clock time: \"{word} 09:00\"; any other day is a date and time, 2026-11-25T17:00")
+                format!("after `{word}` comes a clock time: \"{word} 09:00\"; any other day is a date and time, 2030-01-15T09:00")
             })?;
             return Ok(Some(midnight + day + of_day - offset_ms));
         }
@@ -759,7 +805,7 @@ fn parse_time(text: &str, clock: LocalClock) -> Result<Option<i64>, String> {
     if !dated {
         return Ok(None);
     }
-    let shape = "a date and time looks like 2026-11-25T17:00";
+    let shape = "a date and time looks like 2030-01-15T09:00";
     let mut clock_parts = text.get(11..).ok_or(shape)?.split(':');
     let (Some(hour), Some(minute), second, None) = (
         clock_parts.next(),
@@ -1015,7 +1061,7 @@ impl Local {
         )
     }
 
-    /// `17:00` on the reference day, `tomorrow 09:00`, else `Nov 26 17:00`,
+    /// `17:00` on the reference day, `09:00 tomorrow`, else `Nov 26 17:00`,
     /// with the year when it is another one. Never seconds: this is read,
     /// not typed back.
     fn describe(self, at_ms: i64) -> String {
@@ -1028,10 +1074,67 @@ impl Local {
         );
         match self.now_ms {
             Some(now_ms) if day(at_ms) == day(now_ms) => clock,
-            Some(now_ms) if day(at_ms) == day(now_ms) + 1 => format!("tomorrow {clock}"),
+            Some(now_ms) if day(at_ms) == day(now_ms) + 1 => format!("{clock} tomorrow"),
             Some(now_ms) if civil_from_days(day(now_ms)).0 == year => dated,
             _ => format!("{dated}, {year}"),
         }
+    }
+}
+
+/// How every [`Watch::wake_hazard`] starts.
+pub const WAKE_HAZARD: &str = "pending wake-up";
+
+/// Whether kept text names one instant as [`Watch::summary`] writes it:
+/// `17:00`, `09:00 tomorrow`, `Nov 26 17:00`, `Jan 2 09:00, 2027`, and
+/// `tomorrow 09:00` as earlier builds wrote it. History keeps a watch's
+/// words, not its conditions, and still reads "at" for a time.
+pub fn is_time_phrase(text: &str) -> bool {
+    let clock = |text: &str| {
+        let bytes = text.as_bytes();
+        bytes.len() == 5
+            && bytes[2] == b':'
+            && [0, 1, 3, 4].iter().all(|at| bytes[*at].is_ascii_digit())
+    };
+    let dated = |text: &str| {
+        let mut words = text.splitn(3, ' ');
+        let (month, day, time) = (words.next(), words.next(), words.next());
+        month.is_some_and(|month| MONTHS.contains(&month))
+            && day.is_some_and(|day| !day.is_empty() && day.bytes().all(|b| b.is_ascii_digit()))
+            && time.is_some_and(|time| match time.split_once(", ") {
+                Some((time, year)) => {
+                    clock(time) && year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit())
+                }
+                None => clock(time),
+            })
+    };
+    clock(text)
+        || text.strip_suffix(" tomorrow").is_some_and(clock)
+        || text.strip_prefix("tomorrow ").is_some_and(clock)
+        || dated(text)
+}
+
+/// Kept words for what a watch waits for, led by their connective:
+/// `at 17:00` for a time, `when merged` for anything else.
+pub fn when_phrase(what: &str) -> String {
+    if is_time_phrase(what) {
+        format!("at {what}")
+    } else {
+        format!("when {what}")
+    }
+}
+
+/// The first line with anything on it of a prompt or a notification text,
+/// cut to 80 cells.
+pub fn headline(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() > 80 {
+        format!("{}…", line.chars().take(79).collect::<String>())
+    } else {
+        line.to_owned()
     }
 }
 

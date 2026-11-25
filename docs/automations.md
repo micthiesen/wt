@@ -112,7 +112,13 @@ the trigger or the run.
   eligible row; a notify-only watch outlives a landed worktree. Waking is a
   prompt: it comes after the same watch has cleared its gate, waits for the
   session to be idle, and defers on the 30 s then 5 min backoff when the
-  session cannot be reached.
+  session cannot be reached. A wake sent without proof it arrived is not
+  replayed: its history line reads `wake sent, delivery not confirmed` and
+  the attention feed names the worktree and the note once. A wake's prompt
+  is recorded by its watch, not as a separate message event. While a wake is
+  pending its worktree is not cleaned up: it is a removal hazard
+  (`pending wake-up: <note> (<conditions>)`) for `builtin:clean`, `wt clean`
+  and the `c` sweep.
 - **Exempt from the breaker and from cancellation.** A global pause, a
   paused worktree and `Ctrl+Shift+A` hold watch fires and never consume their
   keys: the watch delivers when the pause ends. Evaluation continues while

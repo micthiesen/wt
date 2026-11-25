@@ -21,7 +21,7 @@ use wt_core::{
 use wt_ops::commands::resolve::resolve_worktree;
 use wt_store::{NewWatch, WatchRefusal, WatchSelector};
 
-const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, 5pm, 3h, \"tomorrow 09:00\", 2026-11-25T17:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request (pr:3806, pr:3806:production), another worktree (wt:<slug>:merged, wt:<slug>:gone; <slug>:merged also reads), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
+const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, 5pm, 3h, \"tomorrow 09:00\", 2030-01-15T09:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request (pr:3806, pr:3806:production), another worktree (wt:<slug>:merged, wt:<slug>:gone; <slug>:merged also reads), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
 
 #[derive(Debug, Clone, Args)]
 pub struct WakeArgs {
@@ -376,15 +376,7 @@ pub(crate) async fn set(
 
 async fn report_set(ctx: &AppContext, set: &SetWatch, does: &str, read: &ReadConditions) {
     let watch = &set.watch;
-    if set.already {
-        println!(
-            "already set: watch {}: {does} when {}",
-            watch.id,
-            watch.summary()
-        );
-    } else {
-        println!("✓ watch {}: {does} when {}", watch.id, watch.summary());
-    }
+    println!("{}", set_text(watch, does, set.already));
     read.print();
     println!("  cancel: wt watch cancel {}", watch.id);
     if !super::automations::engine_running(ctx).await {
@@ -392,6 +384,16 @@ async fn report_set(ctx: &AppContext, set: &SetWatch, does: &str, read: &ReadCon
             "  nothing is evaluating watches right now: they are checked while the wt TUI is open for this repository"
         );
     }
+}
+
+/// `✓ watch abc234: wakes one at 01:01 tomorrow`.
+fn set_text(watch: &Watch, does: &str, already: bool) -> String {
+    format!(
+        "{} watch {}: {does} {}",
+        if already { "already set:" } else { "✓" },
+        watch.id,
+        watch.when_summary()
+    )
 }
 
 fn clean(text: &str) -> Option<String> {
@@ -590,7 +592,21 @@ fn listing_text(watch: &Watch, clock: LocalClock, evaluating: bool) -> String {
             WatchAction::Wake => format!("\n  then: wake the session: {}", headline(text)),
         });
     }
-    if let Some(error) = &watch.last_error {
+    // Said once: beside the condition it is about, or here.
+    let beside_a_condition = |error: &String| {
+        watch.when.iter().any(|cond| {
+            let state = shown(watch, cond, clock.now_ms, evaluating);
+            matches!(state, Shown::Unknown(_))
+                && state
+                    .reason()
+                    .is_some_and(|reason| error == reason || error.ends_with(reason))
+        })
+    };
+    if let Some(error) = watch
+        .last_error
+        .as_ref()
+        .filter(|error| !beside_a_condition(error))
+    {
         out.push_str(&format!("\n  problem: {error}"));
     }
     out
@@ -872,6 +888,53 @@ mod tests {
         assert_eq!(row[0]["then"]["wake"], "Run the smoke test.\nThen report.");
         assert_eq!(row[0]["met_at"], Value::Null);
         assert_eq!(watches_json(&[watch], "two", clock), json!([]));
+    }
+
+    #[test]
+    fn a_problem_shown_beside_its_condition_is_not_said_twice() {
+        let mut watch = stored(&["check:secret=KEY", "merged"]);
+        watch.then.unblock = None;
+        watch.last_error = Some("check secret exited 3: vault sealed".into());
+        let clock = LocalClock {
+            now_ms: NOON + 60_000,
+            utc_offset_minutes: 60,
+        };
+        let listed = listing_text(&watch, clock, true);
+        assert!(
+            listed.contains("unknown  check secret=KEY (exited 3: vault sealed)"),
+            "{listed}"
+        );
+        assert!(!listed.contains("problem:"), "{listed}");
+        // No engine runs, so no condition carries it: it gets its own line.
+        let idle = listing_text(&watch, clock, false);
+        assert!(
+            idle.ends_with("\n  problem: check secret exited 3: vault sealed"),
+            "{idle}"
+        );
+        // A problem about none of the conditions.
+        watch.last_error = Some("#9 was closed without merging; still waiting".into());
+        assert!(
+            listing_text(&watch, clock, true)
+                .ends_with("\n  problem: #9 was closed without merging; still waiting")
+        );
+    }
+
+    #[test]
+    fn setting_a_watch_says_at_for_a_time_and_when_for_an_event() {
+        // Noon UTC is 13:00 here, so 01:01 is tomorrow's.
+        let timed = stored(&["01:01"]);
+        assert_eq!(
+            set_text(&timed, "wakes wake-demo", false),
+            "✓ watch aaaaaa: wakes wake-demo at 01:01 tomorrow"
+        );
+        assert_eq!(
+            set_text(&stored(&["check:flag=go"]), "wakes one", true),
+            "already set: watch aaaaaa: wakes one when check flag=go"
+        );
+        assert_eq!(
+            set_text(&stored(&["merged", "17:00"]), "tells you", false),
+            "✓ watch aaaaaa: tells you when merged and 17:00"
+        );
     }
 
     #[tokio::test]

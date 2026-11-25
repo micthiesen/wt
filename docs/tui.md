@@ -67,7 +67,7 @@ The work-status block follows when a status is saved: state,
 risk, age, and commits since the status, then the gate and the note behind a
 rail in the state's color. `OPS`, `REVERT`, `IF WRONG`, and `UNTESTED` note
 fields align under a hanging indent; a phased `OPS BEFORE MERGE`-style label
-sits on its own line above its step. A post-merge obligation shows its stage
+sits on its own line above its step, which is indented two cells under it. A post-merge obligation shows its stage
 (`verify in staging` / `verify in production`) and step count with a two-line
 preview; `V` expands or collapses the steps, and they start expanded once the
 check is due. A production check on a branch that has only reached base reads
@@ -274,15 +274,17 @@ Once wt has cleared the gate, what that watch still owes (its wake) moves to
 a line of its own until it is delivered.
 
 Every other watch is one line below the status block, wrapped like it on a
-narrow pane: `wakes 17:00 (in 2h10m) · Run the smoke test` for a wake at a
-time, `wakes when ○ PR checks green · ...` for one on a condition, and `tells
-you when ○ merged` for a notification. A wake's prompt or a notification's
+narrow pane with the continuation under the words after the bell:
+`wakes at 17:00 (in 2h10m) · Run the smoke test` for a wake at a time,
+`wakes when ○ PR checks green · ...` for one on a condition, and `tells you
+when ○ merged` for a notification. A gate that waits only for a time reads
+`clears at 17:00`. A wake's prompt or a notification's
 text follows, cut to its first line that says anything; `by <who>` names a
 setter that is neither the row's own agent nor you; `delivering` marks one
 whose conditions held. A long condition wraps with the line rather than being
 cut. The pane lists six watches per row and counts the rest as
 `+N more (wt watch)`.
-Times are in this machine's clock (`tomorrow 09:00`, `Mon 30 Nov 09:00`), and
+Times are in this machine's clock (`09:00 tomorrow`, `Mon 30 Nov 09:00`), and
 the countdown is refreshed at least every 30 seconds while anything waits.
 
 `W` opens **Notify me when `<slug>` is…** from the board on screen: `r`
@@ -336,21 +338,30 @@ minutes (`×3`). Only neighbouring events fold, so a line never hides
 something that happened in between. A status that sets or clears a gate or
 an owed check is never folded.
 
-A watch wears the bell on every line. `waiting  for <what> · then clears the
-gate and wakes the session` (teal) is when it was set, with `by <who>` unless
-that was the row's own agent or you. `held  <what>` is when every condition
-held, and what wt then did follows in green: `gate cleared by wt  when
-<what>`, `told you  when <what>`, `session woken  when <what>`. `stopped
+A watch reads as at most two lines, both wearing the bell: when it was set,
+and what wt did. Set (teal) says what it will do, with `at` for a time and
+`when` for anything else: `will wake the session  at 23:08`, `will tell you
+when merged`, `gate clears  when #3806 in production · then wakes the
+session`, with `by <who>` unless that was the row's own agent or you. What wt
+did (green) follows: `woke the session  at 23:08`, `told you  merged`,
+`cleared the gate and woke the session  check flag=go held`. That one line
+stands for everything recorded about the firing: the conditions holding, each
+action taken within a minute of the one before, and the status change that is
+wt clearing the gate, so no separate `gate cleared` status line appears. A
+wake whose delivery nothing confirmed reads `wake sent, delivery not
+confirmed` in yellow, and the attention feed says so once; it is not sent
+again. `held  <what>` appears alone only while the conditions hold and nothing
+has been done yet (automations paused, a busy session), and an action
+delivered more than a minute after another keeps its own line. When the
+conditions already held within ten seconds of the watch being set, its set
+line folds in too and the line ends `as soon as it was set`. `stopped
 waiting  for <what>` (dim) is a cancel, and `gave up waiting  for <what> ·
-<why>` (yellow) is a watch wt dropped. When wt acts within a minute of the
-conditions holding, the `held` line folds into the first action; when the
-conditions already held within ten seconds of the watch being set, its
-`waiting` line folds in too and the action ends `as soon as it was set`. A
-second action of the same watch (the wake after the gate) keeps its line.
-`wt history` says the same in sentences: `waiting for <what>, then wt tells
-you`, `held: <what>`, `gate cleared: <what>`, `told you: <what>`,
-`session woken: <what>`, `stopped waiting for <what>`, `gave up waiting for
-<what>: <why>`.
+<why>` (yellow) is a watch wt dropped.
+`wt history` says the same in sentences: `will wake the session at 23:08`,
+`gate clears when <what>, then wakes the session (set by manager)`, `woke the
+session: check flag=go held`, `told you: merged`, `cleared the gate: <what>`,
+`held: <what>`, `stopped waiting for <what>`, `gave up waiting for <what>:
+<why>`.
 
 The modal is drawn from the board on every frame. While it is open, new
 events appear at the top; a reader who has scrolled down stays on the line

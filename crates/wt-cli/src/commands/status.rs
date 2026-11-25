@@ -911,17 +911,7 @@ async fn gate_watch(
                     watch.id
                 );
             }
-            Ok(Ok(Some(format!(
-                "{}{} (watch {}{})",
-                watch.summary(),
-                if watch.then.wake.is_some() {
-                    ", and then wakes this session"
-                } else {
-                    ""
-                },
-                watch.id,
-                if set.already { ", already set" } else { "" }
-            ))))
+            Ok(Ok(Some(clears_text(&watch, set.already))))
         }
         // The status is written; only its self-clearing is missing.
         Err(message) => {
@@ -929,6 +919,23 @@ async fn gate_watch(
             Ok(Err(1))
         }
     }
+}
+
+/// What clears a gate by itself, to follow "wt clears the gate": `at 17:00
+/// (watch abc234)`, `when #3806 in production, and then wakes this session
+/// (watch abc234)`.
+fn clears_text(watch: &wt_core::watch::Watch, already: bool) -> String {
+    format!(
+        "{}{} (watch {}{})",
+        watch.when_summary(),
+        if watch.then.wake.is_some() {
+            ", and then wakes this session"
+        } else {
+            ""
+        },
+        watch.id,
+        if already { ", already set" } else { "" }
+    )
 }
 
 struct StatusWrite {
@@ -955,9 +962,9 @@ fn report_cancelled_watches(cancelled: &[wt_core::watch::Watch]) {
             })
             .unwrap_or_default();
         println!(
-            "  cancelled watch {}, which cleared the old gate when {}{wake}",
+            "  cancelled watch {}, which cleared the old gate {}{wake}",
             watch.id,
-            watch.summary()
+            watch.when_summary()
         );
     }
 }
@@ -1188,7 +1195,7 @@ fn print_guidance(
     // Not a hint: it is the one line that says the gate will clear itself.
     if let (Some(gate), Some(clears)) = (blocked_on, clears) {
         println!(
-            "wt clears the gate \"{gate}\" when {clears}; `wt status --unblock` clears it by hand."
+            "wt clears the gate \"{gate}\" {clears}; `wt status --unblock` clears it by hand."
         );
     }
     if hints_off() {
@@ -1957,6 +1964,24 @@ mod tests {
         assert_eq!(set[0].then.unblock.as_deref(), Some("#7 ships"));
         assert_eq!(set[0].then.wake.as_deref(), Some("run the smoke test"));
         assert_eq!(set[0].when.len(), 2);
+        let id = &set[0].id;
+        assert!(
+            clears_text(&set[0], false).starts_with("when #7 in production and "),
+            "{}",
+            clears_text(&set[0], false)
+        );
+        assert!(clears_text(&set[0], true).ends_with(&format!(
+            ", and then wakes this session (watch {id}, already set)"
+        )));
+        // A gate that waits only for a time clears "at" it.
+        let mut timed = set[0].clone();
+        timed.when.remove(0);
+        timed.then.wake = None;
+        let said = clears_text(&timed, false);
+        assert!(
+            said.starts_with("at ") && said.ends_with(&format!(" (watch {id})")),
+            "{said}"
+        );
 
         // The row's JSON carries it.
         let state = read_state(&fixture.ctx.database).await.unwrap();

@@ -211,7 +211,7 @@ pub async fn dispatch_automation(
             } else {
                 DeliverySlot::Session
             };
-            match deliver_prompt(context, route_slug, cwd, branch, managed, &text).await {
+            match deliver_prompt(context, route_slug, cwd, branch, managed, &text, true).await {
                 PromptDelivery::Delivered => AutomationOutcome::Delivered { slot },
                 PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous { reason, slot },
                 PromptDelivery::Unreachable(_) => AutomationOutcome::NotStarted,
@@ -231,7 +231,8 @@ enum PromptDelivery {
 
 /// Send a prompt from wt to the session a route names. Shared by action
 /// prompts and watch wake-ups, so both resume sessions, respect harness
-/// slots and treat a lost reply the same way.
+/// slots and treat a lost reply the same way. `recorded` adds the message
+/// to the worktree's history; a wake-up is recorded by its watch instead.
 async fn deliver_prompt(
     context: &AppContext,
     slug: String,
@@ -239,6 +240,7 @@ async fn deliver_prompt(
     branch: Option<String>,
     managed: Option<String>,
     text: &str,
+    recorded: bool,
 ) -> PromptDelivery {
     let route = match delivery_route(context, slug, cwd, branch, managed).await {
         Ok(route) => route,
@@ -247,14 +249,19 @@ async fn deliver_prompt(
     if route.target.remote || route.choice.source == SelectionSource::RemoteUnavailable {
         return PromptDelivery::Unreachable("its session is on another host".into());
     }
-    let record = wt_app_core::harness::MessageRecord {
-        from: Some("wt"),
-        text: None,
+    let harness = AppHarness::new(context);
+    let sent = if recorded {
+        let record = wt_app_core::harness::MessageRecord {
+            from: Some("wt"),
+            text: None,
+        };
+        harness
+            .send_recorded(&route, text, None, false, record, context)
+            .await
+    } else {
+        harness.send_unrecorded(&route, text, context).await
     };
-    match AppHarness::new(context)
-        .send_recorded(&route, text, None, false, record, context)
-        .await
-    {
+    match sent {
         Ok(outcome) => match outcome {
             HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
                 delivered: Some(true),
@@ -338,6 +345,7 @@ pub async fn wake_session(
         Some(row.target.branch.clone()),
         None,
         prompt,
+        false,
     )
     .await;
     match delivery {

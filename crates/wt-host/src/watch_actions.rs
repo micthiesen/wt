@@ -77,7 +77,7 @@ async fn add(ctx: &AppContext, slug: String, state: &str, seen: Option<String>) 
         .call(move |store| Ok(store.add_watch_seen(new, clock.now_ms, seen.as_deref())?))
         .await?;
     match added {
-        Ok(watch) => Ok(format!("{slug}: wt tells you when {}", watch.summary())),
+        Ok(watch) => Ok(format!("{slug}: wt tells you {}", watch.when_summary())),
         Err(WatchRefusal::OwnerChanged) => Err(stale(
             "the worktree was removed or created again since the menu opened",
         )),

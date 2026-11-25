@@ -280,7 +280,7 @@ fn what_cannot_be_meant_is_refused_with_the_reason() {
     assert_eq!(problem("2026-11-24T11:59"), "that time has already passed");
     assert_eq!(problem("at:5"), "that time has already passed");
     assert!(problem("2026-02-30T10:00").contains("does not exist"));
-    assert!(problem("2026-11-25").contains("2026-11-25T17:00"));
+    assert!(problem("2026-11-25").contains("2030-01-15T09:00"));
     assert!(problem("25:00").contains("00:00 to 23:59"));
     assert!(problem("+3w").contains("+90m"));
     assert_eq!(problem("today 09:00"), "that time has already passed");
@@ -420,7 +420,7 @@ fn conditions_read_in_words() {
         ("release:production", "next production release"),
         ("release:production+24h", "1d after next production release"),
         ("17:00", "17:00"),
-        ("09:00", "tomorrow 09:00"),
+        ("09:00", "09:00 tomorrow"),
         ("2026-11-30T09:00:30", "Nov 30 09:00"),
         ("2027-01-02T09:00", "Jan 2 09:00, 2027"),
         ("green+1h", "PR checks green for 1h"),
@@ -441,10 +441,66 @@ fn conditions_read_in_words() {
     // Kept text reads from the day the watch was set, in its setter's time.
     both.utc_offset_minutes = 60;
     assert_eq!(both.summary(), "#3806 in production and 18:00");
-    assert_eq!(watch(&["09:00"]).summary(), "tomorrow 09:00");
+    assert_eq!(watch(&["09:00"]).summary(), "09:00 tomorrow");
     assert_eq!(watch(&["2026-11-26T17:00:05"]).summary(), "Nov 26 17:00");
     // What is typed back keeps the whole instant.
     assert_eq!(cond("2026-11-26T17:00:05").to_arg(0), "2026-11-26 17:00:05");
+}
+
+#[test]
+fn a_time_reads_at_and_anything_else_reads_when() {
+    for (conditions, kept) in [
+        (&["17:00"][..], "at 17:00"),
+        (&["09:00"], "at 09:00 tomorrow"),
+        (&["2026-11-30T09:00"], "at Nov 30 09:00"),
+        (&["2027-01-02T09:00"], "at Jan 2 09:00, 2027"),
+        (&["merged"], "when merged"),
+        (&["check:flag=go"], "when check flag=go"),
+        (
+            &["#3806:production", "17:00"],
+            "when #3806 in production and 17:00",
+        ),
+        (&["17:00", "18:00"], "when 17:00 and 18:00"),
+    ] {
+        let watch = watch(conditions);
+        assert_eq!(watch.when_summary(), kept);
+        assert_eq!(watch.when_described(UTC), kept);
+        // History keeps only the words, and reads them the same way.
+        assert_eq!(when_phrase(&watch.summary()), kept);
+    }
+    // As earlier builds wrote the day.
+    assert_eq!(when_phrase("tomorrow 09:00"), "at tomorrow 09:00");
+    for words in ["1h after merged", "May flowers", "Nov 30", "17:00 sharp"] {
+        assert!(!is_time_phrase(words), "{words}");
+    }
+}
+
+#[test]
+fn what_a_met_watch_did_reads_from_the_day_it_was_met() {
+    let mut early = watch(&["09:00"]);
+    assert_eq!(early.summary_met(), "09:00 tomorrow");
+    early.met_at_ms = Some(NOON + 21 * HOUR_MS);
+    assert_eq!(early.summary_met(), "09:00");
+    assert_eq!(early.summary(), "09:00 tomorrow");
+}
+
+#[test]
+fn only_a_wake_still_owed_to_a_live_worktree_is_a_removal_hazard() {
+    let mut watch = watch(&["#3806:production", "09:00"]);
+    assert_eq!(watch.wake_hazard(UTC), None);
+    watch.then.wake = Some("\nRun the smoke test.\nThen report.".into());
+    assert_eq!(
+        watch.wake_hazard(UTC).as_deref(),
+        Some("pending wake-up: Run the smoke test. (#3806 in production and 09:00 tomorrow)")
+    );
+    // A gate that wakes afterwards counts; the gate alone does not.
+    watch.then.unblock = Some("the release".into());
+    assert!(watch.wake_hazard(UTC).is_some());
+    watch.then.wake = None;
+    assert_eq!(watch.wake_hazard(UTC), None);
+    watch.then.wake = Some("Report.".into());
+    watch.owner_gone = true;
+    assert_eq!(watch.wake_hazard(UTC), None);
 }
 
 #[test]

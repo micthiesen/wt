@@ -60,8 +60,8 @@ The checkout is shared with other agents, the human, and hot-reloading servers.
 - Conditions (all must hold): a time (`17:00`, `5pm`, `3h`); this worktree
   (`merged`, `staging`, `production`, `green`); `pr:3806:production`;
   `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a time
-  take a delay (`release:production+24h`). `wt watch` lists them and
-  `wt watch cancel <id>` cancels one. A wake dies with its worktree.
+  take a delay (`release:production+24h`). `wt watch` lists them;
+  `wt watch cancel <id>` cancels. A pending wake holds off cleanup.
 
 ### Completion status
 

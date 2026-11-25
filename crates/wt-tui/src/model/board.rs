@@ -275,6 +275,12 @@ impl WatchView {
         self.actions.contains(&action)
     }
 
+    /// Whether it waits for one instant and nothing else: that reads "at
+    /// 17:00" where anything else reads "when merged".
+    pub fn timed(&self) -> bool {
+        matches!(self.conditions.as_slice(), [only] if only.at_ms.is_some())
+    }
+
     /// A watch that only tells the person, set by the person: what the
     /// notify menu offers to cancel.
     pub fn is_human_notify(&self) -> bool {

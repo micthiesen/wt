@@ -103,6 +103,7 @@ pub fn bound_worktree_event(event: &mut WorktreeEventKind) {
             then,
             change: _,
             id: _,
+            unconfirmed: _,
         } => {
             line(what);
             some(by);

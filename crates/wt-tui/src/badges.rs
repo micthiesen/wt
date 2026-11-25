@@ -488,6 +488,15 @@ pub(crate) fn automation_outcome_color(outcome: AutomationOutcomeKind) -> Color 
     }
 }
 
+/// What wt did about a met watch. A wake nothing proved delivered asks for
+/// a look at the session.
+pub(crate) fn watch_fired_badge(unconfirmed: bool) -> Badge {
+    badge(
+        glyphs::WATCH,
+        if unconfirmed { theme::WARN } else { theme::OK },
+    )
+}
+
 /// The glyph a recorded history event wears: whatever the board draws for
 /// the same fact, built through the board's own helpers so the two cannot
 /// drift. `None` for a kind this build does not know.
@@ -554,6 +563,11 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
             glyphs::TRASH,
             if *landed { theme::FG_DIM } else { theme::WARN },
         ),
+        Event::Watch {
+            change: wt_core::WatchChange::Woken,
+            unconfirmed: true,
+            ..
+        } => watch_fired_badge(true),
         Event::Watch { change, .. } => badge(
             glyphs::WATCH,
             match change {
@@ -1205,7 +1219,7 @@ mod tests {
             event(Event::Removed { landed: true }).map(|badge| badge.glyph),
             Some(glyphs::TRASH)
         );
-        let watch = |change| {
+        let watch_event = |change, unconfirmed| {
             event(Event::Watch {
                 id: None,
                 change,
@@ -1213,8 +1227,18 @@ mod tests {
                 by: None,
                 reason: None,
                 then: Vec::new(),
+                unconfirmed,
             })
         };
+        let watch = |change| watch_event(change, false);
+        assert_eq!(
+            watch_event(wt_core::WatchChange::Woken, true),
+            Some(badge(glyphs::WATCH, theme::WARN))
+        );
+        assert_eq!(
+            watch(wt_core::WatchChange::Woken),
+            Some(watch_fired_badge(false))
+        );
         assert_eq!(
             watch(wt_core::WatchChange::Set),
             watch_badge(&[waiting(WatchTruth::NotYet, false)])

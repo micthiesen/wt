@@ -81,8 +81,9 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   mean deployed only where the repository has a deploy probe, otherwise
   landed on that stage's branch. `--slug <slug>` sets one for another
   worktree. The wt TUI evaluates watches, so nothing fires while it is
-  closed; the commands say when it is. A wake is dropped when its worktree
-  is removed; a notification about a landed worktree is kept.
+  closed; the commands say when it is. A pending wake keeps its worktree
+  from cleanup until it is delivered or cancelled; a notification about a
+  landed worktree outlives it.
 - **Another PR in the same worktree.** After its PR merged, run
   `wt next --title "<outcome>"` there instead of a new worktree or a hand
   reset, then push as below. `--issue <ID>` alone takes the tracker's title.

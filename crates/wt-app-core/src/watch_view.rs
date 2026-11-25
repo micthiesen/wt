@@ -82,20 +82,7 @@ pub fn shown(watch: &Watch, cond: &WatchCondition, now_ms: i64, idle: Option<&st
     }
 }
 
-/// The first line with anything on it of a prompt or a notification text,
-/// cut to 80 cells.
-pub fn headline(text: &str) -> String {
-    let line = text
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
-    if line.chars().count() > 80 {
-        format!("{}…", line.chars().take(79).collect::<String>())
-    } else {
-        line.to_owned()
-    }
-}
+pub use wt_core::watch::headline;
 
 #[cfg(test)]
 mod tests {

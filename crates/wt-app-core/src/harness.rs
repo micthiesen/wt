@@ -800,6 +800,17 @@ impl AppHarness {
         outcome
     }
 
+    /// Send a prompt from wt whose sender writes its own history: a watch's
+    /// wake-up is one line there, not a message beside it.
+    pub async fn send_unrecorded(
+        &self,
+        route: &AgentRoute,
+        text: &str,
+        context: &AppContext,
+    ) -> Result<HarnessMessageOutcome> {
+        self.deliver(route, text, None, false, context).await
+    }
+
     async fn deliver(
         &self,
         route: &AgentRoute,

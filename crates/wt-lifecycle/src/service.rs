@@ -1640,12 +1640,13 @@ impl LifecycleService {
             ));
         }
         if !options.force
-            && hazards
-                .iter()
-                .any(|hazard| hazard == OWED_VERIFICATION_HAZARD)
+            && let Some(owed) = hazards.iter().find(|hazard| {
+                *hazard == OWED_VERIFICATION_HAZARD
+                    || hazard.starts_with(wt_core::watch::WAKE_HAZARD)
+            })
         {
             return Err(LifecycleError::Refused(format!(
-                "{}: {OWED_VERIFICATION_HAZARD}; explicit force is required",
+                "{}: {owed}; explicit force is required",
                 row.target.slug()
             )));
         }
@@ -3261,13 +3262,12 @@ impl LifecycleService {
         row: &WorktreeRecord,
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>, LifecycleError> {
-        let state = self
-            .read_slug_state(row.target.slug(), cancellation)
-            .await?;
+        let (state, wakes) = self.read_owed(row.target.slug(), cancellation).await?;
         let mut hazards = vec![MISSING_CHECKOUT_HAZARD.to_owned()];
         if owes_verification(state.as_ref()) {
             hazards.push(OWED_VERIFICATION_HAZARD.to_owned());
         }
+        hazards.extend(wakes);
         Ok(hazards)
     }
 
@@ -3288,10 +3288,13 @@ impl LifecycleService {
             hazards.push(IN_PROGRESS_HAZARD.to_owned());
         }
         let slug = row.target.slug().to_owned();
-        let state = self.read_slug_state(&slug, cancellation).await?;
+        let (state, wakes) = self.read_owed(&slug, cancellation).await?;
         if owes_verification(state.as_ref()) {
             hazards.push(OWED_VERIFICATION_HAZARD.to_owned());
         }
+        // A wake is a promise its session made to come back. It dies with
+        // the worktree, so cleanup leaves the worktree until it is kept.
+        hazards.extend(wakes);
         // Landing evidence covers what was pushed and merged. Commits beyond
         // the branch's own origin ref exist only here, landed or not, so a
         // planning-time `landed` claim never authorizes discarding them.
@@ -3566,11 +3569,22 @@ impl LifecycleService {
             .ok())
     }
 
+    #[cfg(test)]
     async fn read_slug_state(
         &self,
         slug: &str,
         cancellation: &CancellationToken,
     ) -> Result<Option<Value>, LifecycleError> {
+        Ok(self.read_owed(slug, cancellation).await?.0)
+    }
+
+    /// What the store holds that removing `slug` would drop: its entry, and
+    /// a hazard for each wake still owed to its session.
+    async fn read_owed(
+        &self,
+        slug: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(Option<Value>, Vec<String>), LifecycleError> {
         let path = self.config.state.path.clone();
         let identity = self.config.state.identity.clone();
         let slug = slug.to_owned();
@@ -3579,7 +3593,24 @@ impl LifecycleService {
         }
         tokio::task::spawn_blocking(move || {
             let mut store = Store::open_read_only(path, identity)?;
-            store.read_slug_state(&slug)
+            let state = store.read_slug_state(&slug)?;
+            let created_at = state
+                .as_ref()
+                .and_then(|state| state.get("createdAt"))
+                .and_then(Value::as_str);
+            let now_ms = now_ms();
+            let wakes = store
+                .list_watches(Some(&slug))?
+                .iter()
+                .filter(|watch| watch.owned_by(created_at))
+                .filter_map(|watch| {
+                    watch.wake_hazard(wt_core::watch::LocalClock {
+                        now_ms,
+                        utc_offset_minutes: watch.utc_offset_minutes,
+                    })
+                })
+                .collect();
+            Ok::<_, StoreError>((state, wakes))
         })
         .await
         .map_err(|error| LifecycleError::Join(error.to_string()))?
@@ -7238,6 +7269,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(base_of("onlocal").await, "main");
+    }
+
+    #[tokio::test]
+    async fn a_pending_wake_keeps_its_worktree_until_removal_is_forced() {
+        let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let mut targets = Vec::new();
+        for branch in ["michael/later", "michael/lost"] {
+            let created = service
+                .create(
+                    branch,
+                    CreateOptions {
+                        base: Some("refs/heads/main".into()),
+                        fetch_origin: false,
+                        run_install: false,
+                    },
+                    &cancellation,
+                )
+                .await
+                .unwrap();
+            targets.push(created.target);
+        }
+        let watch = |slug: &'static str, then: wt_core::watch::WatchActions| {
+            service.mutate_store(&cancellation, move |store| {
+                let clock = wt_core::watch::LocalClock {
+                    now_ms: 0,
+                    utc_offset_minutes: 0,
+                };
+                let new = wt_store::NewWatch {
+                    slug: slug.into(),
+                    by: slug.into(),
+                    utc_offset_minutes: 0,
+                    when: vec![wt_core::watch::parse("production", clock).unwrap()],
+                    then,
+                };
+                store.add_watch(new, now_ms()).map(|added| added.unwrap())
+            })
+        };
+        let wakes = |hazards: &[String]| -> Vec<String> {
+            hazards
+                .iter()
+                .filter(|hazard| hazard.starts_with(wt_core::watch::WAKE_HAZARD))
+                .cloned()
+                .collect()
+        };
+        let later = &targets[0];
+        // Telling the person outlives the worktree, so it holds nothing back.
+        watch(
+            "later",
+            wt_core::watch::WatchActions {
+                notify: Some(String::new()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for landed in [false, true] {
+            let hazards = service
+                .removal_hazards(later, landed, &cancellation)
+                .await
+                .unwrap();
+            assert_eq!(wakes(&hazards), [] as [String; 0]);
+        }
+        watch(
+            "later",
+            wt_core::watch::WatchActions {
+                wake: Some("Run the smoke test.\nThen report.".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let hazard = "pending wake-up: Run the smoke test. (in production)";
+        for landed in [false, true] {
+            let hazards = service
+                .removal_hazards(later, landed, &cancellation)
+                .await
+                .unwrap();
+            assert_eq!(wakes(&hazards), [hazard]);
+            let kept = service
+                .remove(
+                    later,
+                    RemoveOptions {
+                        landed,
+                        ..RemoveOptions::default()
+                    },
+                    &cancellation,
+                )
+                .await;
+            assert!(
+                matches!(&kept, Err(LifecycleError::Refused(message)) if message.contains(hazard)),
+                "{kept:?}"
+            );
+        }
+        let forced = RemoveOptions {
+            force: true,
+            ..RemoveOptions::default()
+        };
+        let removed = service.remove(later, forced, &cancellation).await.unwrap();
+        assert!(removed.removed);
+
+        // A checkout that is already gone still owes its session the wake.
+        let lost = &targets[1];
+        watch(
+            "lost",
+            wt_core::watch::WatchActions {
+                wake: Some("Report.".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        fs::remove_dir_all(&lost.path).await.unwrap();
+        let revision = service
+            .removal_revision(lost, false, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            revision.hazards,
+            [
+                MISSING_CHECKOUT_HAZARD,
+                "pending wake-up: Report. (in production)"
+            ]
+        );
+        let unforced = service
+            .remove_with_revision(lost, RemoveOptions::default(), &revision, &cancellation)
+            .await;
+        assert!(
+            matches!(&unforced, Err(LifecycleError::Refused(message)) if message.contains("pending wake-up: Report.")),
+            "{unforced:?}"
+        );
     }
 
     #[tokio::test]

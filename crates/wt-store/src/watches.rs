@@ -359,6 +359,21 @@ impl Store {
     /// a watch that owes nothing more is deleted. Returns whether the action
     /// was still owed, so a second call changes nothing.
     pub fn complete_action(&mut self, id: &str, action: WatchAction) -> Result<bool, StoreError> {
+        self.finish_action(id, action, false)
+    }
+
+    /// [`Self::complete_action`] for a wake that was sent without proof it
+    /// reached the session. It is not sent again, and its history says so.
+    pub fn complete_unconfirmed_wake(&mut self, id: &str) -> Result<bool, StoreError> {
+        self.finish_action(id, WatchAction::Wake, true)
+    }
+
+    fn finish_action(
+        &mut self,
+        id: &str,
+        action: WatchAction,
+        unconfirmed: bool,
+    ) -> Result<bool, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
             let Some(index) = entries(state)
                 .iter()
@@ -388,7 +403,7 @@ impl Store {
                 WatchAction::Notify => WatchChange::Notified,
                 WatchAction::Wake => WatchChange::Woken,
             };
-            log.best_effort(|log| record(log, &watch, change, None, None));
+            log.best_effort(|log| record_event(log, &watch, change, None, None, unconfirmed));
             Ok((true, true))
         })
     }
@@ -659,6 +674,17 @@ fn record(
     by: Option<&str>,
     reason: Option<&str>,
 ) -> Result<(), StoreError> {
+    record_event(log, watch, change, by, reason, false)
+}
+
+fn record_event(
+    log: &EventLog<'_>,
+    watch: &Watch,
+    change: WatchChange,
+    by: Option<&str>,
+    reason: Option<&str>,
+    unconfirmed: bool,
+) -> Result<(), StoreError> {
     // The slug may name a new worktree by now; an outlived owner's watch is
     // not part of that one's history.
     if watch.owner_gone
@@ -673,7 +699,13 @@ fn record(
         &WorktreeEventKind::Watch {
             id: Some(watch.id.clone()),
             change,
-            what: watch.summary(),
+            // What it did is read on the day it did it: a wake set
+            // yesterday for "09:00 tomorrow" woke the session at 09:00.
+            what: if change == WatchChange::Held || change.is_action() {
+                watch.summary_met()
+            } else {
+                watch.summary()
+            },
             by: by
                 .map(str::trim)
                 .filter(|by| !by.is_empty() && *by != "human")
@@ -688,6 +720,7 @@ fn record(
             } else {
                 Vec::new()
             },
+            unconfirmed,
         },
     )
 }

@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::Args;
 use wt_core::{
-    AutomationOutcomeKind, ChecksChange, LandedOn, PrChange, QueueChange, ReviewChange,
-    WatchChange, WorktreeEvent, WorktreeEventKind,
+    AutomationOutcomeKind, ChecksChange, HistoryLine, LandedOn, PrChange, QueueChange,
+    ReviewChange, WatchChange, WorktreeEvent, WorktreeEventKind,
 };
 
 use wt_app_core::context::AppContext;
@@ -74,17 +74,29 @@ async fn target(ctx: &AppContext, requested: Option<&str>) -> Result<String> {
     }
 }
 
-/// Newest first, one event per line, with the local time it was recorded.
+/// Newest first, one line per event with the local time it was recorded;
+/// what wt did about a met watch is one line.
 fn text(events: &[WorktreeEvent]) -> Vec<String> {
-    events
+    wt_core::fold_watch_history(events)
         .iter()
         .rev()
-        .filter_map(|event| {
-            Some(format!(
-                "{}  {}",
-                stamp(event.at_ms),
-                describe(&event.event)?
-            ))
+        .filter_map(|line| {
+            let (at_ms, said) = match line {
+                HistoryLine::Event(event) => (event.at_ms, describe(&event.event)?),
+                HistoryLine::Fired(fired) => {
+                    let did =
+                        wt_core::watch_fired_words(&fired.done, fired.unconfirmed, fired.what)
+                            .sentence();
+                    let said = if fired.just_set {
+                        format!("{did} (as soon as it was set)")
+                    } else {
+                        did
+                    };
+                    (fired.at_ms, said)
+                }
+                HistoryLine::Folded(_) => return None,
+            };
+            Some(format!("{}  {said}", stamp(at_ms)))
         })
         .collect()
 }
@@ -234,22 +246,23 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
             by: who,
             reason,
             then,
+            unconfirmed,
             id: _,
         } => match change {
             WatchChange::Set => {
-                let then = wt_core::watch_then_phrase(then)
-                    .map(|then| format!(", then wt {then}"))
-                    .unwrap_or_default();
                 let set_by = who
                     .as_ref()
                     .map(|who| format!(" (set by {who})"))
                     .unwrap_or_default();
-                format!("waiting for {what}{then}{set_by}")
+                format!(
+                    "{}{set_by}",
+                    wt_core::watch_set_words(then, what).sentence()
+                )
             }
             WatchChange::Held => format!("held: {what}"),
-            WatchChange::ClearedGate => format!("gate cleared: {what}"),
-            WatchChange::Woken => format!("session woken: {what}"),
-            WatchChange::Notified => format!("told you: {what}"),
+            WatchChange::ClearedGate | WatchChange::Woken | WatchChange::Notified => {
+                wt_core::watch_fired_words(&[*change], *unconfirmed, what).sentence()
+            }
             WatchChange::Cancelled => format!("stopped waiting for {what}{}", by(who)),
             WatchChange::Dropped => match reason {
                 Some(reason) => format!("gave up waiting for {what}: {reason}"),
@@ -327,57 +340,110 @@ mod tests {
     }
 
     #[test]
-    fn a_watch_reads_as_what_was_waited_for_and_what_wt_did() {
-        let watch = |change, by: Option<&str>, reason: Option<&str>, then: &[&str]| {
-            describe(&WorktreeEventKind::Watch {
-                id: None,
+    fn a_watch_reads_as_when_it_was_set_and_what_wt_did() {
+        let event = |change, what: &str, by: Option<&str>, reason: Option<&str>, then: &[&str]| {
+            WorktreeEventKind::Watch {
+                id: Some("aaaaaa".into()),
                 change,
-                what: "#3806 in production".into(),
+                what: what.into(),
                 by: by.map(str::to_owned),
                 reason: reason.map(str::to_owned),
                 then: then.iter().map(|action| (*action).to_owned()).collect(),
-            })
-            .unwrap()
+                unconfirmed: false,
+            }
         };
-        assert_eq!(
-            watch(
-                WatchChange::Set,
-                Some("manager"),
-                None,
-                &["unblock", "wake"]
+        let said = |events: &[WorktreeEvent]| -> Vec<String> {
+            text(events)
+                .into_iter()
+                .rev()
+                .map(|line| line.split_once("  ").unwrap().1.to_owned())
+                .collect()
+        };
+        let at = |at_ms: u64, event| WorktreeEvent { at_ms, event };
+        let hour = 3_600_000;
+        // A wake at a time as earlier builds recorded it: four events.
+        let wake = [
+            at(0, event(WatchChange::Set, "23:08", None, None, &["wake"])),
+            at(hour, event(WatchChange::Held, "23:08", None, None, &[])),
+            at(
+                hour + 1,
+                WorktreeEventKind::Message {
+                    from: Some("wt".into()),
+                    text: "[wt] What you were waiting for has happened: 23:08.".into(),
+                    delivered: Some(false),
+                },
             ),
-            "waiting for #3806 in production, then wt clears the gate and wakes the session (set by manager)"
+            at(
+                hour + 2,
+                event(WatchChange::Woken, "23:08", None, None, &[]),
+            ),
+        ];
+        assert_eq!(
+            said(&wake),
+            [
+                "will wake the session at 23:08",
+                "wake sent, delivery not confirmed at 23:08",
+            ]
         );
         assert_eq!(
-            watch(WatchChange::Set, None, None, &[]),
+            said(&wake[..2]),
+            ["will wake the session at 23:08", "held: 23:08"]
+        );
+        // A gate set by the manager that clears and wakes.
+        let what = "#3806 in production";
+        let gate = [
+            at(
+                0,
+                event(
+                    WatchChange::Set,
+                    what,
+                    Some("manager"),
+                    None,
+                    &["unblock", "wake"],
+                ),
+            ),
+            at(hour, event(WatchChange::Held, what, None, None, &[])),
+            at(
+                hour + 1,
+                event(WatchChange::ClearedGate, what, None, None, &[]),
+            ),
+            at(hour + 2, event(WatchChange::Woken, what, None, None, &[])),
+        ];
+        assert_eq!(
+            said(&gate),
+            [
+                "gate clears when #3806 in production, then wakes the session (set by manager)",
+                "cleared the gate and woke the session: #3806 in production",
+            ]
+        );
+        let told = [
+            at(
+                0,
+                event(WatchChange::Set, "merged", None, None, &["notify"]),
+            ),
+            at(1_000, event(WatchChange::Held, "merged", None, None, &[])),
+            at(
+                2_000,
+                event(WatchChange::Notified, "merged", None, None, &[]),
+            ),
+        ];
+        assert_eq!(said(&told), ["told you: merged (as soon as it was set)"]);
+
+        let one = |change, by, reason| describe(&event(change, what, by, reason, &[])).unwrap();
+        assert_eq!(
+            one(WatchChange::Set, None, None),
             "waiting for #3806 in production"
         );
-        for (change, expected) in [
-            (WatchChange::Held, "held: #3806 in production"),
-            (
-                WatchChange::ClearedGate,
-                "gate cleared: #3806 in production",
-            ),
-            (WatchChange::Woken, "session woken: #3806 in production"),
-            (WatchChange::Notified, "told you: #3806 in production"),
-            (
-                WatchChange::Cancelled,
-                "stopped waiting for #3806 in production",
-            ),
-        ] {
-            assert_eq!(watch(change, None, None, &[]), expected);
-        }
         assert_eq!(
-            watch(WatchChange::Cancelled, Some("one"), None, &[]),
+            one(WatchChange::Cancelled, None, None),
+            "stopped waiting for #3806 in production"
+        );
+        assert_eq!(
+            one(WatchChange::Cancelled, Some("one"), None),
             "stopped waiting for #3806 in production by one"
         );
         assert_eq!(
-            watch(
-                WatchChange::Dropped,
-                None,
-                Some("its worktree is gone"),
-                &[]
-            ),
+            one(WatchChange::Dropped, None, Some("its worktree is gone")),
             "gave up waiting for #3806 in production: its worktree is gone"
         );
     }

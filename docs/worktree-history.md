@@ -29,6 +29,7 @@ six failing names and counts the rest in a final `+N more` entry.
 | `removed` | the removal is recorded, with whether the branch had landed | the store's removal write |
 | `message` | a message is sent to the worktree's agent | `AppHarness::send_recorded` |
 | `automation` | a fire finishes or is skipped for good | the automation source |
+| `watch` | a watch is set, holds, clears its gate, tells the person, wakes the session, is cancelled or is dropped | the store's watch writes |
 | `restack` | a restack replays the branch or stops on a conflict | `restack_action::record_outcome` |
 | `pr`, `checks`, `review`, `merge_queue`, `conflict`, `landed` | the fact is observed to change | the host's observer |
 | `status`, `status_cleared` (again) | a status was written by a build without the log | the host's observer |
@@ -45,6 +46,12 @@ for a person. `delivered` is `true` when the harness proved arrival, `false`
 when the send failed, and absent when it was submitted without proof. Messages
 to special sessions (the manager, the main checkout) are not recorded: they
 have no row. `wt agent start` records the text `start`, not the skill prompt.
+
+A watch's wake-up prompt is not a `message` event: the `watch` event with
+`change: "woken"` is its record, and carries `unconfirmed: true` when the
+prompt was sent without proof it arrived. The timeline and `wt history` read
+a watch's events as two lines, when it was set and what wt did; `--json`
+prints every event as stored.
 
 An automation fire that will run again (not started, deferred, still queued)
 is not an event. `delivered` means it ran, `failed` that a built-in ran and

@@ -111,7 +111,7 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
                 }
                 .value(),
             ),
-            label: when,
+            label: format!("{} {when}", if watch.timed() { "at" } else { "when" }),
             chord: None,
             note: None,
             verify_after_merge: None,
@@ -351,11 +351,14 @@ mod tests {
     #[test]
     fn the_persons_own_watches_are_offered_for_cancelling_by_id() {
         let mut waiting = row();
+        let mut timed = notify("ccc444", "human", "at:1795539600000", "17:00");
+        timed.conditions[0].at_ms = Some(1_795_539_600_000);
         waiting.watches = vec![
             notify("aaa222", "human", "merged", "merged"),
             // An agent's watch is not the person's to cancel here.
             notify("bbb333", "one", "ready", "ready"),
-            notify("ccc444", "human", "at:1795539600000", "17:00 today"),
+            timed,
+            notify("eee666", "human", "check:flag=go", "check flag=go"),
             // Stored after the menu's own request, not yet read back.
             notify("", "human", "green", "checks green"),
             WatchView {
@@ -381,8 +384,13 @@ mod tests {
                 choice("on staging", None, Some("(same as merged here)")),
                 choice("in production", Some("add:production"), None),
                 choice(
-                    "17:00 today",
+                    "at 17:00",
                     Some("cancel:ccc444"),
+                    Some("set · pick to cancel")
+                ),
+                choice(
+                    "when check flag=go",
+                    Some("cancel:eee666"),
                     Some("set · pick to cancel")
                 ),
             ]

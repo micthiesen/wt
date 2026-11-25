@@ -1118,6 +1118,7 @@ fn condition_spans(cond: &WatchConditionView, times: &Times, marked: bool) -> Sp
         .and_then(|at_ms| times.get(&at_ms))
         .map(|stamp| match stamp.day.as_str() {
             "today" => stamp.clock.clone(),
+            day @ ("tomorrow" | "yesterday") => format!("{} {day}", stamp.clock),
             day => format!("{day} {}", stamp.clock),
         })
         .unwrap_or_else(|| cond.text.clone());
@@ -1201,8 +1202,13 @@ fn watch_tail(watch: &WatchView, own: &str, used: usize, width: usize) -> Spans 
 /// Under `blocked on`: what clears the gate without anyone, and whether
 /// each part already holds.
 fn gate_watch_lines(watch: &WatchView, times: &Times, width: usize) -> Vec<Line<'static>> {
-    let mut spans = vec![Span::styled("clears when ", theme::dim())];
-    spans.extend(conditions_spans(watch, times, true));
+    // A lone time carries no mark.
+    let timed = watch.timed();
+    let mut spans = vec![Span::styled(
+        if timed { "clears at " } else { "clears when " },
+        theme::dim(),
+    )];
+    spans.extend(conditions_spans(watch, times, !timed));
     if watch.does(WatchActionKind::Wake) {
         spans.push(Span::styled(", then wakes the session", theme::dim()));
     }
@@ -1213,7 +1219,7 @@ fn gate_watch_lines(watch: &WatchView, times: &Times, width: usize) -> Vec<Line<
 }
 
 /// One line per watch the gate line does not already show: a wake
-/// (`wakes 17:00 (in 2h10m) · run the smoke test`) or a notification
+/// (`wakes at 17:00 (in 2h10m) · run the smoke test`) or a notification
 /// (`tells you when ○ merged`).
 fn watch_lines(
     row: &BoardRow,
@@ -1244,20 +1250,17 @@ fn watch_lines(
             (false, true, false) => "tells you",
             (false, false, false) => "waits",
         };
-        let mut spans = vec![
-            Span::styled(format!("{}  ", badge.glyph), theme::fg(badge.color)),
-            Span::styled(verb, theme::fg(badge.color)),
-        ];
-        // "wakes 17:00" reads without "when", and a time carries no mark.
-        let timed = matches!(watch.conditions.as_slice(), [only] if only.at_ms.is_some());
+        let bell = Span::styled(format!("{}  ", badge.glyph), theme::fg(badge.color));
+        let mut spans = vec![Span::styled(verb, theme::fg(badge.color))];
+        let timed = watch.timed();
         spans.push(Span::styled(
-            if timed { " " } else { " when " },
+            if timed { " at " } else { " when " },
             theme::dim(),
         ));
         spans.extend(conditions_spans(watch, times, !timed));
-        let used = spans_width(&spans);
+        let used = bell.content.width() + spans_width(&spans);
         spans.extend(watch_tail(watch, &row.slug, used, width));
-        lines.extend(wrap_spans(spans, width));
+        lines.extend(wrap_hanging(bell, spans, width));
     }
     if listed.len() > WATCH_LINES_MAX {
         lines.push(Line::styled(
@@ -1296,7 +1299,8 @@ fn note_lines(note: &str, color: ratatui::style::Color, width: usize) -> Vec<Lin
     for (label, body) in sections {
         let own_line = label.is_some_and(|label| label.width() > INLINE_NOTE_LABEL_WIDTH);
         let indent = match label {
-            Some(_) if own_line => gutter.max(2),
+            // Under its own label, not out at the inline labels' gutter.
+            Some(_) if own_line => 2,
             Some(_) => gutter,
             None => 0,
         };
@@ -1908,6 +1912,21 @@ fn fit_line(spans: Spans, width: usize) -> Line<'static> {
     Line::from(out)
 }
 
+/// `lead` then `spans`, wrapped so that later lines start under the text
+/// after the lead.
+fn wrap_hanging(lead: Span<'static>, spans: Spans, width: usize) -> Vec<Line<'static>> {
+    let indent = lead.content.width();
+    let mut lead = Some(lead);
+    wrap_spans(spans, width.saturating_sub(indent).max(1))
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![lead.take().unwrap_or_else(|| Span::raw(" ".repeat(indent)))];
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// Wrap a styled line at span boundaries and spaces.
 pub(crate) fn wrap_spans(spans: Spans, width: usize) -> Vec<Line<'static>> {
     if spans_width(&spans) <= width {
@@ -2361,7 +2380,7 @@ mod tests {
             [
                 "│ Ships it.",
                 "│ OPS AFTER MERGE",
-                "│         backfill",
+                "│   backfill",
                 "│ REVERT  safe"
             ]
         );
@@ -2683,7 +2702,7 @@ mod tests {
         // The controller's clock for the instant; without one, the host's.
         for (times, when) in [
             (stamp("today"), "18:00"),
-            (stamp("tomorrow"), "tomorrow 18:00"),
+            (stamp("tomorrow"), "18:00 tomorrow"),
             (Times::new(), "17:00"),
         ] {
             let lines = watch_lines(&waiting, false, &times, 200);
@@ -2691,7 +2710,7 @@ mod tests {
                 plain(&lines),
                 [
                     format!(
-                        "{bell}  wakes {when} (in 2h10m) · Run the smoke test against staging · by manager"
+                        "{bell}  wakes at {when} (in 2h10m) · Run the smoke test against staging · by manager"
                     ),
                     format!("{bell}  tells you when ○ merged"),
                 ]
@@ -2710,7 +2729,7 @@ mod tests {
         assert_eq!(
             plain(&lines),
             [
-                format!("{bell}  wakes 18:00 · Run the smoke test against staging · delivering"),
+                format!("{bell}  wakes at 18:00 · Run the smoke test against staging · delivering"),
                 format!("{bell}  tells you when ? merged (no current data for this worktree)"),
             ]
         );
@@ -2732,6 +2751,17 @@ mod tests {
         let narrow = watch_lines(&waiting, false, &Times::new(), 30);
         assert!(narrow.len() > 2);
         assert!(narrow.iter().all(|line| line.width() <= 30), "{narrow:?}");
+        // What wraps continues under the words, not under the bell.
+        let narrow = plain(&narrow);
+        let hang = " ".repeat(bell.width() + 2);
+        assert!(
+            narrow[0].starts_with(&format!("{bell}  wakes at")),
+            "{narrow:?}"
+        );
+        assert!(
+            narrow[1].starts_with(&hang) && !narrow[1][hang.len()..].starts_with(' '),
+            "{narrow:?}"
+        );
     }
 
     #[test]
