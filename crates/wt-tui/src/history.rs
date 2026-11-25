@@ -127,6 +127,13 @@ impl Model {
         let Some(row) = self.board.removed_history.rows.get(self.history.selected) else {
             return InputResult::Unchanged;
         };
+        if key.code == KeyCode::Char('H') {
+            self.interaction = crate::model::Interaction::Timeline(crate::model::TimelinePrompt {
+                key: row.key.clone(),
+                ..Default::default()
+            });
+            return InputResult::Draw;
+        }
         let action = match key.code {
             KeyCode::Enter => UiAction::PrepareRestoreRemoved {
                 key: row.key.clone(),
@@ -707,6 +714,22 @@ mod tests {
                 seen: Some(crate::Seen(false)),
             })
         );
+        // H opens the removed row's timeline over the history view, and
+        // closing it leaves the view open.
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('H')), 20),
+            InputResult::Draw
+        );
+        assert!(matches!(
+            &model.interaction,
+            crate::model::Interaction::Timeline(view) if view.key == "@remote/builder/same"
+        ));
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Esc), 20),
+            InputResult::Draw
+        );
+        assert!(matches!(model.interaction, crate::model::Interaction::None));
+        assert!(model.history.active);
         assert_eq!(
             model.history_input(KeyEvent::from(KeyCode::Esc), 20),
             InputResult::Action(UiAction::SetHistoryActive { active: false })

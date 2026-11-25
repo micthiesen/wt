@@ -386,6 +386,19 @@ async fn report_set(ctx: &AppContext, set: &SetWatch, does: &str, read: &ReadCon
     }
 }
 
+/// A wake for this worktree's own deploy is usually a check of the deployed
+/// change, which the board can only show as owed when it is a status.
+fn deployed_check_hint(when: &[WatchCondition]) -> Option<String> {
+    let stage = when.iter().find_map(|cond| match cond.cond {
+        Condition::Own(RowState::Staging) => Some("staging"),
+        Condition::Own(RowState::Production) => Some("production"),
+        _ => None,
+    })?;
+    Some(format!(
+        "to check the deployed change, use `wt status ready --verify-in-{stage}` instead: the row then shows the check as owed and returns as needs-testing; a wake shows only a bell"
+    ))
+}
+
 /// `✓ watch abc234: wakes one at 01:01 tomorrow`.
 fn set_text(watch: &Watch, does: &str, already: bool) -> String {
     format!(
@@ -450,13 +463,16 @@ async fn set_and_report(
         }
     };
     let clock = clock();
-    let read = match read_conditions(ctx, conditions, clock).await {
+    let mut read = match read_conditions(ctx, conditions, clock).await {
         Ok(read) => read,
         Err(message) => {
             eprintln!("{message}");
             return Ok(2);
         }
     };
+    if then.wake.is_some() {
+        read.notes.extend(deployed_check_hint(&read.when));
+    }
     let does = if then.wake.is_some() {
         format!("wakes {slug}")
     } else {

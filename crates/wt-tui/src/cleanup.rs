@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use ratatui::style::Color;
 
-use crate::{Board, BoardRow, CleanupTarget, ConfirmAction, UiModal, theme};
+use crate::{Board, BoardRow, CleanupTarget, ConfirmAction, UiModal, WatchActionKind, theme};
 
 /// Title of the overlay shown when nothing can be cleaned.
 pub(crate) const LOG_TITLE: &str = "Clean worktrees";
@@ -13,6 +13,7 @@ const CHECKOUT_UNAVAILABLE: &str = "checkout is unavailable";
 const OPERATION_IN_PROGRESS: &str = "operation in progress";
 const GIT_UNAVAILABLE: &str = "Git state is unavailable";
 const CHANGES_LOADING: &str = "checkout changes are still loading";
+const PENDING_WAKE: &str = "its session has a pending wake-up";
 
 /// What the open cleanup menu decided for a row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -193,6 +194,14 @@ pub(crate) fn checkout_hold_reason(row: &BoardRow, landing_required: bool) -> Op
         Some("work is still in progress")
     } else if row.work.as_ref().is_some_and(|work| work.verification_owed) {
         Some("post-merge verification still owed")
+    } else if landing_required
+        && row
+            .watches
+            .iter()
+            .any(|watch| watch.does(WatchActionKind::Wake))
+    {
+        // The host refuses this removal; say so before it is offered.
+        Some(PENDING_WAKE)
     } else if row.git.rebasing || !row.git.conflict_files.is_empty() {
         Some("rebase or merge is in progress")
     } else if row.git.tracked_changes.is_none() || row.git.untracked_files.is_none() {
@@ -255,6 +264,22 @@ mod tests {
         assert_eq!(mark(&down), Some(CleanupMark::Unknown));
         assert_eq!(mark(&fresh), Some(CleanupMark::Unknown));
         assert_eq!(mark(&temporary), None);
+    }
+
+    #[test]
+    fn a_pending_wake_keeps_a_landed_row_and_a_notification_does_not() {
+        let watch = |action| crate::WatchView {
+            id: "abc234".into(),
+            actions: vec![action],
+            ..Default::default()
+        };
+        let mut waking = landed("waking");
+        waking.watches = vec![watch(WatchActionKind::Wake)];
+        assert_eq!(keep_reason(&waking), Some(PENDING_WAKE));
+        assert_eq!(checkout_hold_reason(&waking, false), None);
+        let mut telling = landed("telling");
+        telling.watches = vec![watch(WatchActionKind::Notify)];
+        assert_eq!(keep_reason(&telling), None);
     }
 
     #[test]

@@ -96,8 +96,9 @@ The ready note is about 400 characters of fragments:
   ships with the change, such as a checked-in migration the normal deploy
   applies; a step the merge and deploy flow already performs is not an op.
 - An `OPS BEFORE MERGE` step still undone means the branch must not merge:
-  pair it with `--blocked-on`. A later op is one you come back for: a check
-  takes `--verify-in-<stage>`, any other a `wt wake` (`staging`, `production`).
+  pair it with `--blocked-on`. A later op is one you come back for. A check of
+  the deployed change is always `--verify-in-<stage>`, which shows it as owed;
+  a `wt wake` (`staging`, `production`) is for any other step, never a check.
 - `--blocked-on "<gate>"` only when merging now would make things worse until
   an external prerequisite happens, never only in the note. A manual deploy or
   follow-up that leaves the status quo unchanged is not a gate; it goes in an

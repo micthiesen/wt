@@ -82,7 +82,7 @@ pub(crate) const LINES: &[&str] = &[
     "  Ctrl+N             New worktree on a chosen host",
     "  Tab (in n prompt)  Cycle the new worktree's host; n remembers it",
     "  c                  Clean landed worktrees (all hosts)",
-    "  h                  Removed-worktree history",
+    "  h                  Removed-worktree history (H there: a removed row's timeline)",
     "  r / Ctrl+R         Refresh / clear derived caches (confirmation)",
     "  , / . / /          wt source / main / dotfiles session",
     "  < / > / \\          Slot palette: g continue, m compact, z editor, c custom",

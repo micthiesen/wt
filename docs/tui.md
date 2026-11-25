@@ -244,7 +244,7 @@ against a bounded local GitHub-merge and production-history scan while history
 is open. A landing only moves forward: once a removal is proven in
 production its record keeps that (`landedOn`), so a later refresh or restart
 never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
-verification, landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `p` opens the PR, `i` opens
+verification, landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `H` opens the row's history modal as on the board, `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
@@ -311,7 +311,8 @@ configured. Pausing holds deliveries; conditions keep being evaluated.
 
 ### Row history
 
-`H` opens the selected row's history as a modal. Its header is the row's
+`H` opens the selected row's history as a modal, for an archived row and, in
+the `h` view, a removed one too. Its header is the row's
 marker, title and slug, then one summary line built from the events, such as
 `created 3d ago · ready for 2h · 4 review rounds · 2 automations`, showing
 only the parts the events support. Below a rule the timeline reads newest
@@ -421,7 +422,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `Ctrl+N` | Create on a chosen host; toasts when `[remote]` is not configured. Managed hosts that owe a sign-in say so |
 | `o` | Open the selected worktree in the configured editor |
 | `d` | Remove the selected worktree after confirmation |
-| `c` | Open cleanup review from background results, including archived rows |
+| `c` | Open cleanup review from background results, including archived rows. A landed row whose session has a pending wake-up is kept |
 | `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
 | `t` | Rename the worktree. A rename is final: no agent or tracker title replaces it, until `wt next` starts new work there |
 | `#` | Set or clear the worktree's issue identity |
@@ -438,7 +439,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
 | `H` | Open the selected row's history: a timeline of how it got here. `j`/`k`, arrows, page keys and `g`/`G` scroll; `H`, `Esc` or `q` closes |
-| `h` | Open removed-worktree history |
+| `h` | Open removed-worktree history; `H` there opens the selected removed row's timeline |
 
 ### Worktree titles
 
