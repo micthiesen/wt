@@ -3,8 +3,9 @@ name: wt
 description: >-
   Drives the `wt` worktree CLI: create, list, remove and message worktrees and
   their agents, arm auto-merge, stacked PRs, restacks, sections and merge
-  edges. Use when the user mentions wt, a worktree, stacking, restacking or
-  auto-merge.
+  edges, and wait for a time, merge, deploy or release. Use when the user
+  mentions wt, a worktree, stacking, restacking, auto-merge or being told or
+  woken when something happens.
 targets:
   - '*'
 ---
@@ -30,6 +31,11 @@ wt edge <from> before|enables|conflicts <to> [--blocks] [-m why]
 wt restack [<branch>]
 wt restack prune-backups [--days <n>]   # delete old backup/restack-* branches
 wt merge [slug] [--cancel]             # arm merge-when-ready
+wt status ready --risk <r> --blocked-on "<why>" --until <cond>… [--then "<prompt>"]   # a gate that clears itself
+wt wake <cond>… -m "<what to do then>" # wake this session then; end the turn
+wt notify <cond>… [-m "<text>"]        # tell the person then
+wt watch [--all]                       # what is waiting; cancel <id>…, check <cond>…
+wt history [slug]                      # what happened to a row, removed ones too
 wt next [branch] --title <outcome> [--issue <ID>|none] [--gh <n>|none]
 wt issue [slug] [--gh <n> | --clear-gh | --read]
 wt title [title…] [-w slug]          # show, or set any but a person's title
@@ -60,6 +66,23 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
 - **Merging.** Use `wt merge`, never `gh pr merge --auto`: only `wt merge`
   enqueues on a merge-queue base, and gh's error there looks like a
   permission problem that isn't one.
+- **Waiting.** Never sleep, poll or set a harness timer for something wt can
+  observe: `wt wake` it and end the turn, `wt notify` it when the person
+  asked to be told, `--until` it when it is a merge gate. Conditions are one
+  argument each and all must hold: a time (`17:00`, `5pm`, `3h`,
+  `"tomorrow 09:00"`); this worktree (`merged`, `staging`, `production`,
+  `ready`, `green`, `verified`, `closed`); a pull request (`pr:3806`,
+  `pr:3806:production`); another worktree (`wt:<slug>:merged`,
+  `wt:<slug>:gone`); the next release (`release:production`); a configured
+  probe (`check:<id>=<arg>`). All but a time take a delay that must hold
+  unbroken: `green+1h`, `release:production+24h`. Write `pr:3806`, never
+  `#3806`: the shell reads `#` as a comment. `wt watch check <cond>…` says
+  what a condition means here before you set it; `staging` and `production`
+  mean deployed only where the repository has a deploy probe, otherwise
+  landed on that stage's branch. `--slug <slug>` sets one for another
+  worktree. The wt TUI evaluates watches, so nothing fires while it is
+  closed; the commands say when it is. A wake is dropped when its worktree
+  is removed; a notification about a landed worktree is kept.
 - **Another PR in the same worktree.** After its PR merged, run
   `wt next --title "<outcome>"` there instead of a new worktree or a hand
   reset, then push as below. `--issue <ID>` alone takes the tracker's title.
@@ -80,8 +103,8 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
 
 ## Index
 
-- Status and coordination: `status`, `fleet`, `manager`, `hold`, `edge`,
-  `guide`, `automations`
+- Status and coordination: `status`, `wake`, `notify`, `watch`, `history`,
+  `fleet`, `manager`, `hold`, `edge`, `guide`, `automations`
 - Worktrees: `new`, `next`, `restack`, `merge`, `ls`, `rm`, `clean`,
   `archive`, `restore`, `open`, `doctor`, `logs`, `base`, `issue`, `section`
 - Agents and servers: `agent`, `dev`, `perf`, `claude`, `codex`, `remote`,

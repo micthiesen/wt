@@ -118,12 +118,20 @@ it expires on its own:
 | you changed or learned a row's state | `wt status <slug> <state> -m "<note>"` |
 | deliberately not started, because X | `wt status <slug> todo --blocked-on "X"` |
 | finished but must not merge yet | `wt status <slug> ready --risk <r> --blocked-on "X"` |
+| the gate waits on something wt can observe | add `--until <condition>` (`pr:3806:production`, `wt:<slug>:merged`, `release:production`), or `wt status <slug> --until <condition>` on a gate already set; it clears itself |
+| a worker must act when something happens | `wt wake --slug <slug> <condition> -m "<what to do then>"` |
+| the human asked to be told | `wt notify --slug <slug> <condition> [-m "<text>"]` |
 | looked, nothing to do | `wt status <slug> --examined "<verdict>"` (void once the branch moves) |
 | A merges before B | `wt edge A before B [--blocks] -m "<why>"` |
 | the human decided what ships together or is held | `wt section mv <slug>… <section>` |
 
 Record what the human decided; don't regroup sections on your own initiative.
-A section name like "Held: X" can't say what unholds it; a gate can.
+A section name like "Held: X" can't say what unholds it; a gate can, and
+with `--until` it clears without you. Never hold a "check back when X" in
+your head or on a timer: a wake or a notification outlives a compaction. A
+watch belongs to a worktree, so you cannot wake yourself: wake the owner or
+notify the human. Conditions and their meaning: `wt wake --help`,
+`wt watch check <condition>`.
 
 ## Shared maintenance and holds
 
@@ -157,8 +165,9 @@ evidence; label theories, and verify a destructive remedy before proposing it.
   `.work.verifyAfterMerge` on a landed live row, `verification_owed` on a
   merged one): the worktree is kept alive for a post-merge check, so it is not
   a cleanup candidate. `.work.verifyIn` says where it runs; a `production`
-  check waits for the promotion and needs nothing before then. The owning session runs the check and asserts
-  `verified`; nudge it once. A red, overdue one gets a digest line, not a second
+  check waits for the promotion, and a row reading `awaiting <stage> deploy`
+  waits for the deploy; both need nothing before then. The owning session runs the check and asserts
+  `verified`; nudge it once it is due. A red, overdue one gets a digest line, not a second
   reminder.
 - **Removing a worktree:** if `wt guide <slug> --json` shows a recorded
   guide, retire it first the way your instructions say.
@@ -176,6 +185,11 @@ evidence; label theories, and verify a destructive remedy before proposing it.
 - a recurring action on a row condition (a timer or cron request) → propose an
   `[[automations]]` rule first (wt's docs/automations.md; `wt automations`
   shows what runs); a timer only for what it can't express
+- a one-off "when X, do Y" or "tell me when X" → `wt wake --slug` /
+  `wt notify --slug`, never a timer
+- what every worktree waits for → `wt watch --all`; `wt watch cancel <id>`
+  cancels anyone's
+- why a row is in its state, removed rows included → `wt history <slug>`
 - a loop that keeps the fleet moving → the `shepherd` skill
 - addressable targets and harnesses → `wt agent ls`
 - recent history → grep `' ATTN '` in `~/.cache/wt/logs/app/wt-YYYY-MM-DD.log`

@@ -29,8 +29,18 @@ Before any command that writes, including `wt status`:
 
 ## The loop
 
-Each pass: read your row, do the one thing it calls for, wait minutes (not
-seconds), repeat. Re-read every pass; the bot, CI and the base all move.
+Each pass: read your row, do the one thing it calls for, wait, repeat.
+Re-read every pass; the bot, CI and the base all move.
+
+To wait, say what brings you back and end the turn; never sleep or poll:
+
+```bash
+wt wake 10m -m "babysit: next pass"        # a review or check still running
+wt wake green -m "babysit: next pass"      # only the checks are pending
+```
+
+If wt answers that nothing is evaluating watches (the wt TUI is closed), wait
+in the session instead, minutes not seconds.
 
 ```bash
 wt fleet "$WT_AGENT" --json | jq '.[0]'   # one row; the output is still an array
@@ -133,15 +143,22 @@ wt merge
 auto-merge from the PR's base branch, so checks still running are fine. Use `wt merge`, never
 `gh pr merge`: `--auto` fails on queue bases with a misleading "Auto merge is
 not allowed" error, and a queue sets its own merge method. Exit 75 means a
-required check has not reported yet: wait and re-run, never escalate.
+required check has not reported yet: wait a pass and re-run, never escalate.
 `wt merge --cancel` disarms and dequeues.
 
 ## Until it lands
 
 Armed is not merged. Queues evict PRs often: a queue run fails, an entry
 ahead conflicts, the base moves. GitHub also drops classic auto-merge on a
-conflict. Nothing tells you, so keep the loop running after `wt merge` until
-`.pr.state` is `MERGED`.
+conflict. GitHub tells nobody, so after `wt merge` set both and end the turn:
+
+```bash
+wt wake merged -m "babysit: landed; do After it lands"
+wt wake 1h -m "babysit: not merged yet? read the row for an eviction"
+```
+
+A repository with a `pr.merge_dropped` automation prompts you sooner. Each
+time you are woken unmerged, read the row and set the time wake again.
 
 When the PR is open and not draft but has no `.merge_queue` entry and
 `.pr.auto_merge` is false, or its queue entry reads `UNMERGEABLE`, it was
@@ -154,14 +171,18 @@ real one.
 
 ## After it lands
 
-- `verifyAfterMerge` set: `verifyIn` names the environment. Confirm its
-  deploy carrying the change is live (a `production` check waits for the
-  promotion), run the steps, then `wt status verified -m "<what you checked,
+- `verifyAfterMerge` set: `verifyIn` names the environment. Come back when
+  the change is there, `wt wake staging -m "run the owed check"` or
+  `wt wake production -m …`, not by polling. Then confirm its deploy carries
+  the change, run the steps, and `wt status verified -m "<what you checked,
   where>"`.
+- A later-phase op in your note (`OPS AFTER MERGE`, `OPS AFTER RELEASE`)
+  gets the same wake.
 - Do not remove the worktree; merge cleanup archives it.
-- Stop only when `.pr.state` is `MERGED` and verification is done, or when
-  blocked on a human. An armed PR is still something to wait for. Never keep
-  polling a clean current-head review; merge it.
+- You are done only when `.pr.state` is `MERGED` and verification is done,
+  or when blocked on a human. An armed PR is still something to wait for:
+  never end a turn there without a wake set (`wt watch`). Never keep waiting
+  on a clean current-head review; merge it.
 
 ## Next PR from this worktree
 

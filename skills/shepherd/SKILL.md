@@ -41,6 +41,14 @@ A recurring action on a simple row condition belongs in wt's rule engine,
 it re-derives conditions every pass, keeps a once-only ledger, waits out a
 settle window, trips a per-rule circuit breaker, and paces dispatches. If the
 request is really a few row conditions, propose automations instead.
+`pr.merge_dropped` (a merge wt armed is no longer armed) and
+`status.verification_due` (an owed post-merge check has come due) are such
+conditions: with rules that prompt the owner, neither needs a sweep.
+
+A one-off wait is not a loop either. "Do Y when X" for one row is
+`wt wake --slug <slug> <condition> -m "<Y>"`, "tell me when X" is
+`wt notify --slug <slug> <condition>`, and a gate wt can observe takes
+`--until` (below). `wt watch --all` lists them.
 
 Sweep only for what the engine can't express: composed messages (a static
 prompt telling the owner to compute its own conflict list is cheaper and
@@ -60,7 +68,9 @@ queue order, starting held work), and one-shot resources.
     every target PR merged with its owed closure done, or only a human block
     left. An armed PR that has not merged is neither, so it keeps the loop on.
 - On stopping, clear the timer, report what changed and what waits on the
-  human, and say plainly that the loop is off.
+  human, and say plainly that the loop is off. For what waits on an event
+  (a deploy, a release, another PR), leave a `wt wake --slug` for its owner
+  or a `wt notify --slug` rather than keeping the loop on.
 - A repeated alert with nothing changed is not an action: record the
   `--examined` verdict silently, with no new ask or nudge.
 
@@ -99,6 +109,7 @@ verdict says.
 | you armed it, open, now neither armed nor queued, or queue `UNMERGEABLE` | Evicted: see *Evictions*. |
 | `working`/`review`, idle session, stale status | Nudge with a concrete question ("status says review since yesterday; what blocks ready?"). |
 | `ready` or `dropped` holding a dev slot while idle | Reclaim it: promote any waiter (`wt dev queue <slug> --first`), then ask the holder to stop its own server if its remaining work doesn't need it. |
+| gated (`blockedOn`) on something wt can observe, with no watch in `wt watch --slug <slug>` | `wt status <slug> --until <condition>` (`pr:3806:production`, `wt:<slug>:merged`, `release:production`): the gate clears itself and a later pass merges the row. Leave a gate on a person's decision. |
 | `todo` | Gated: leave it. Ungated: apply the start policy. |
 
 ## Evictions

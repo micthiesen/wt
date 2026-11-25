@@ -31,14 +31,14 @@ other `@skill-id` references. See [OpenCode sessions](opencode.md).
 
 | unit | what it is |
 |---|---|
-| `instructions` | a managed block spliced into each tool's **global instructions file** (`~/.claude/CLAUDE.md` unless [Claude reads AGENTS.md](#claude-code-and-the-agents-mod), `~/.codex/AGENTS.md`, `$PI_CODING_AGENT_DIR/AGENTS.md`, `~/.config/opencode/AGENTS.md`): the always-on ownership rules for agents working in wt worktrees (work status, decision ownership and the `needs-human` refusal test, manual testing, the dev server) |
-| `wt` skill | orientation: subcommands, conventions, the stacked-PR model, gotchas |
+| `instructions` | a managed block spliced into each tool's **global instructions file** (`~/.claude/CLAUDE.md` unless [Claude reads AGENTS.md](#claude-code-and-the-agents-mod), `~/.codex/AGENTS.md`, `$PI_CODING_AGENT_DIR/AGENTS.md`, `~/.config/opencode/AGENTS.md`): the always-on ownership rules for agents working in wt worktrees (work status, decision ownership and the `needs-human` refusal test, manual testing, the dev server, waiting through `wt wake` / `wt notify` / `--until` instead of sleeping or polling) |
+| `wt` skill | orientation: subcommands, conventions, the stacked-PR model, the watch condition forms, gotchas |
 | `restack` skill | the conflict-resolution playbook behind `/restack` |
 | `manager` skill | the fleet-coordinator playbook for the [manager session](manager.md) |
 | `start` skill | kick off work inside a prepared worktree (brief → research → build → review → test → status hand-off) |
 | `handoff` skill | move a distinct follow-up into a new worktree, write its `prompt.txt`, and start the configured primary agent |
-| `shepherd` skill | the fleet sweep behind `/shepherd`: drive every row toward mergeable on a loop, arm the merge for each ready row, and keep watching until it lands, re-arming after an eviction |
-| `babysit` skill | the single-worktree counterpart behind `/babysit`: see your own branch through the review bot's findings and its follow-up reviews, then merge it — the one place an agent lands a PR, and only on the human's explicit invocation |
+| `shepherd` skill | the fleet sweep behind `/shepherd`: drive every row toward mergeable on a loop, arm the merge for each ready row, and keep watching until it lands, re-arming after an eviction. One-off waits go to `wt wake --slug` / `wt notify --slug`, and an observable gate gets `--until`, rather than staying in the loop |
+| `babysit` skill | the single-worktree counterpart behind `/babysit`: see your own branch through the review bot's findings and its follow-up reviews, then merge it — the one place an agent lands a PR, and only on the human's explicit invocation. It waits by setting a wake and ending the turn (the next pass, the landing, the deploy an owed check needs), falling back to waiting in the session only when no TUI is evaluating watches |
 | `triage` skill | turn a pasted task batch into prioritized, ready-to-work worktrees |
 
 The instructions block exists because skills only load when invoked — the
@@ -49,6 +49,11 @@ The block and manager/shepherd playbooks restrict coordination to new actionable
 cross-owner facts. Transient holds require a current `wt hold check` result;
 acknowledgments do not renew them. Maintenance pauses only affected operations,
 while independent work continues and unavailable checks remain recorded as owed.
+
+The waiting rules are in the block for the same reason: the moment an agent
+is about to sleep, poll or schedule its own timer is not a moment at which it
+loads a skill. The block carries the rule and the condition forms; the `wt`
+skill carries what the forms mean and their limits.
 
 It's also the only layer that can *correct* a repo. A shared repo's own
 `CLAUDE.md`/`AGENTS.md` is written for the contributors who don't use wt, so it

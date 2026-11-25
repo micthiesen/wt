@@ -1,7 +1,6 @@
 ## wt worktrees: status and testing ownership
 
-In a wt-managed worktree you own the task's status, its testing, and its dev
-server.
+In a wt-managed worktree you own the task's status, testing, and dev server.
 
 - Assert each transition with `wt status <state> [-m note]` (bare `wt status`
   lists the states): `working` when work begins, `review` when review begins.
@@ -15,8 +14,7 @@ server.
   doing independent work meanwhile.
 - Decide reversible repository changes yourself. External messages, published
   artifacts, closed issues, and hosted writes need authorization.
-- An escalation note is about 300 characters and answerable without other
-  context:
+- An escalation note is about 300 characters and needs no other context:
 
       ASK:       <the question, one sentence>
       RECOMMEND: <the default action, one sentence>
@@ -45,14 +43,25 @@ server.
 
 ### Shared checkout safety
 
-The checkout is shared with subagents, reviewers, other sessions, the human,
-and hot-reloading servers.
+The checkout is shared with other agents, the human, and hot-reloading servers.
 
 - Test a hypothesis against a copy, never with `git stash`, `checkout`,
   `restore`, or `reset`.
 - Announce any necessary change to shared tree state and restore it before
   finishing.
 - Put scratch files in the harness scratch area, never in the checkout.
+
+### Waiting
+
+- When all that remains is waiting for a time or an event wt can observe, run
+  `wt wake <condition>... -m "<what to do then>"` and end the turn. Never
+  sleep, poll, or set a harness timer: those die with the session.
+- "Tell me when X" is `wt notify <condition>...`; do not stay open for it.
+- Conditions (all must hold): a time (`17:00`, `5pm`, `3h`); this worktree
+  (`merged`, `staging`, `production`, `green`); `pr:3806:production`;
+  `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a time
+  take a delay (`release:production+24h`). `wt watch` lists them and
+  `wt watch cancel <id>` cancels one. A wake dies with its worktree.
 
 ### Completion status
 
@@ -87,12 +96,14 @@ The ready note is about 400 characters of fragments:
   ships with the change, such as a checked-in migration the normal deploy
   applies; a step the merge and deploy flow already performs is not an op.
 - An `OPS BEFORE MERGE` step still undone means the branch must not merge:
-  pair it with `--blocked-on`. A later op is one you come back for; when it is
-  a check, pair it with the matching `--verify-in-<stage>`.
+  pair it with `--blocked-on`. A later op is one you come back for: a check
+  takes `--verify-in-<stage>`, any other a `wt wake` (`staging`, `production`).
 - `--blocked-on "<gate>"` only when merging now would make things worse until
   an external prerequisite happens, never only in the note. A manual deploy or
   follow-up that leaves the status quo unchanged is not a gate; it goes in an
-  `OPS AFTER` line. `wt status --unblock` clears a satisfied gate.
+  `OPS AFTER` line. Add `--until <condition>` when wt can observe the
+  prerequisite, so the gate clears itself, and `--then "<prompt>"` to act
+  then. Only a person's decision stays a bare gate (`wt status --unblock`).
 - `--verify-in-staging` or `--verify-in-production` as soon as you know a
   specific check can only run once deployed there. It does not block merging;
   when the change reaches that stage the row returns as `needs-testing`.
@@ -125,5 +136,4 @@ The ready note is about 400 characters of fragments:
   `wt edge <from> <before|conflicts|enables> <to> [-m why]` (`--blocks` for a
   hard dependency). Edges expire when either branch moves; reassert them after
   a material change. A missing edge is not evidence of safety.
-- Invoke tools by name through PATH, including in scripts, so wt's shims
-  apply.
+- Invoke tools by name through PATH, even in scripts, so wt's shims apply.
