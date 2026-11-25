@@ -374,6 +374,42 @@ impl GithubClient {
         parse_live_pr(&out.stdout).map(Some)
     }
 
+    /// How each named pull request ended, in one request. A number the
+    /// repository does not have is left out; any other failure fails the
+    /// whole read, so a missing entry never stands for "not merged".
+    pub async fn fetch_pull_request_outcomes(
+        &self,
+        numbers: &[u64],
+        cancellation: &CancellationToken,
+    ) -> Result<std::collections::BTreeMap<u64, PrOutcome>, GithubError> {
+        if numbers.is_empty() {
+            return Ok(Default::default());
+        }
+        let repo = self.repository(cancellation).await?;
+        let out = self
+            .run(
+                [
+                    "api".to_owned(),
+                    "graphql".to_owned(),
+                    "-f".to_owned(),
+                    format!("query={}", pr_outcomes_query(numbers)),
+                    "-f".to_owned(),
+                    format!("owner={}", repo.owner),
+                    "-f".to_owned(),
+                    format!("name={}", repo.name),
+                ],
+                cancellation,
+            )
+            .await?;
+        // gh exits non-zero when the reply carries errors, and still prints
+        // the reply: an unknown number must not fail the other PRs.
+        match parse_pr_outcomes(&out.stdout, numbers) {
+            Ok(outcomes) => Ok(outcomes),
+            Err(_) if !out.status.success() => Err(classify_output(&out)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Numbers of the open PRs whose BASE is `branch`. Deleting a branch by
     /// push or API makes GitHub close these (`base_ref_deleted`) rather than
     /// retarget them, and such a PR cannot be reopened. A failed request is
@@ -1287,6 +1323,75 @@ fn proves_no_pull_request(output: &ProcessOutput) -> bool {
         || text.contains(
             "none of the git remotes configured for this repository point to a known github host",
         )
+}
+
+fn pr_outcomes_query(numbers: &[u64]) -> String {
+    let fields = numbers
+        .iter()
+        .map(|number| {
+            format!("p{number}: pullRequest(number: {number}) {{ state mergeCommit {{ oid }} }}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}"
+    )
+}
+
+fn parse_pr_outcomes(
+    bytes: &[u8],
+    numbers: &[u64],
+) -> Result<std::collections::BTreeMap<u64, PrOutcome>, GithubError> {
+    let body: Value = serde_json::from_slice(bytes)
+        .map_err(|e| GithubError::Protocol(format!("invalid pull request JSON: {e}")))?;
+    for error in body
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let missing = error.get("type").and_then(Value::as_str) == Some("NOT_FOUND")
+            && error
+                .pointer("/path/1")
+                .and_then(Value::as_str)
+                .is_some_and(|alias| alias.starts_with('p'));
+        if !missing {
+            return Err(GithubError::Protocol(format!(
+                "GitHub returned errors for the pull request read: {}",
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error")
+            )));
+        }
+    }
+    let repository = body
+        .pointer("/data/repository")
+        .and_then(Value::as_object)
+        .ok_or_else(|| GithubError::Protocol("GitHub omitted the repository".into()))?;
+    let mut outcomes = std::collections::BTreeMap::new();
+    for number in numbers {
+        let Some(node) = repository
+            .get(&format!("p{number}"))
+            .filter(|node| !node.is_null())
+        else {
+            continue;
+        };
+        let state = node.get("state").and_then(Value::as_str).ok_or_else(|| {
+            GithubError::Protocol(format!("GitHub omitted the state of #{number}"))
+        })?;
+        outcomes.insert(
+            *number,
+            PrOutcome {
+                state: state.to_owned(),
+                merge_commit_oid: node
+                    .pointer("/mergeCommit/oid")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
+        );
+    }
+    Ok(outcomes)
 }
 
 fn parse_live_pr(bytes: &[u8]) -> Result<LivePrInfo, GithubError> {
@@ -2912,5 +3017,38 @@ esac
             br#"{"data":{"node":{"mergeQueueEntry":null,"autoMergeRequest":null}},"errors":[{"message":"partial result"}]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn pull_request_outcomes_skip_unknown_numbers_and_fail_closed_otherwise() {
+        assert_eq!(
+            pr_outcomes_query(&[7, 12]),
+            "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { p7: pullRequest(number: 7) { state mergeCommit { oid } } p12: pullRequest(number: 12) { state mergeCommit { oid } } } }"
+        );
+        let reply = serde_json::json!({
+            "data": {"repository": {
+                "p7": {"state": "MERGED", "mergeCommit": {"oid": "abc"}},
+                "p12": {"state": "OPEN", "mergeCommit": null},
+                "p99": null,
+            }},
+            "errors": [{"type": "NOT_FOUND", "path": ["repository", "p99"], "message": "no such PR"}],
+        });
+        let outcomes = parse_pr_outcomes(reply.to_string().as_bytes(), &[7, 12, 99]).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[&7].merge_commit_oid.as_deref(), Some("abc"));
+        assert_eq!(
+            (
+                outcomes[&12].state.as_str(),
+                &outcomes[&12].merge_commit_oid
+            ),
+            ("OPEN", &None)
+        );
+        for broken in [
+            serde_json::json!({"data": {"repository": {"p7": null}}, "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]}),
+            serde_json::json!({"data": null}),
+            serde_json::json!({"data": {"repository": {"p7": {"mergeCommit": null}}}}),
+        ] {
+            assert!(parse_pr_outcomes(broken.to_string().as_bytes(), &[7]).is_err());
+        }
     }
 }

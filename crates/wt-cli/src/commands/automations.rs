@@ -39,12 +39,17 @@ struct Queued {
 
 pub async fn run(ctx: &AppContext, args: &AutomationsArgs) -> Result<i32> {
     let path = queue_report_path(&ctx.config);
-    if ctx.config.automations.is_empty() {
-        println!("no automations are configured");
-        return Ok(0);
-    }
     let raw = match tokio::fs::read_to_string(&path).await {
         Ok(raw) => raw,
+        // Watches run with no rule configured, so only a repository whose
+        // engine never ran has nothing to say.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && ctx.config.automations.is_empty() =>
+        {
+            println!("no automations are configured");
+            return Ok(0);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             println!(
                 "automations have not run for this repository yet: they are evaluated by the wt TUI's host while it is open"
@@ -105,6 +110,18 @@ pub async fn run(ctx: &AppContext, args: &AutomationsArgs) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Whether an engine is evaluating this repository now: its report names a
+/// live process and is recent.
+pub(crate) async fn engine_running(ctx: &AppContext) -> bool {
+    let Ok(raw) = tokio::fs::read_to_string(queue_report_path(&ctx.config)).await else {
+        return false;
+    };
+    serde_json::from_str::<Report>(&raw).is_ok_and(|report| {
+        wt_ops::events::pid_alive(report.pid)
+            && now_ms().saturating_sub(report.updated_at_ms) <= STALE_AFTER_MS
+    })
 }
 
 fn now_ms() -> i64 {

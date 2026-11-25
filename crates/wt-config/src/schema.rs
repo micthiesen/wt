@@ -372,6 +372,10 @@ pub enum AutomationTrigger {
     BranchAdvanced,
     #[serde(rename = "stage.deployed")]
     StageDeployed,
+    /// A watch's conditions hold. The trigger of wt's own implicit rule;
+    /// configuration cannot name it.
+    #[serde(rename = "watch.met")]
+    WatchMet,
     #[serde(rename = "mcp.event")]
     McpEvent,
 }
@@ -510,6 +514,45 @@ impl Default for EnvironmentConfig {
             timeout_seconds: 20,
         }
     }
+}
+
+/// A probe a watch can wait on as `check:<id>` or `check:<id>=<arg>`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CheckConfig {
+    pub id: String,
+    pub description: String,
+    /// Argv, run in the main clone with no shell. `{{arg}}`, `{{slug}}`,
+    /// `{{branch}}` and `{{main_clone}}` are replaced inside each argument.
+    /// Exit 0 holds, exit 1 does not yet, anything else is an error.
+    pub run: Vec<String>,
+    pub every_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+impl CheckConfig {
+    pub const MIN_EVERY_SECONDS: u64 = 30;
+}
+
+impl Default for CheckConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            description: String::new(),
+            run: Vec::new(),
+            every_seconds: 300,
+            timeout_seconds: 30,
+        }
+    }
+}
+
+/// How a watch tells the person, besides the desktop banner.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotifyConfig {
+    /// Argv, run in the main clone with no shell. `{{title}}` and
+    /// `{{body}}` are replaced inside each argument.
+    pub command: Option<Vec<String>>,
 }
 
 /// Deploy probes by stage. A stage without one is taken to run whatever its
@@ -689,6 +732,10 @@ pub struct Config {
     pub branch: BranchConfig,
     /// Deploy probes: `[environments.staging]` and `[environments.production]`.
     pub environments: EnvironmentsConfig,
+    /// `[[checks]]`: probes a watch can wait on.
+    pub checks: Vec<CheckConfig>,
+    /// `[notify]`: an extra command for watch notifications.
+    pub notify: NotifyConfig,
     pub stage: StageConfig,
     pub lifecycle: LifecycleConfig,
     pub backend: BackendConfig,

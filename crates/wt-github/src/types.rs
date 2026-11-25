@@ -142,6 +142,14 @@ pub struct PullRequest {
     pub closed_at: Option<String>,
 }
 
+/// How a pull request named by number ended, or that it is still open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrOutcome {
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    pub state: String,
+    pub merge_commit_oid: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GithubData {

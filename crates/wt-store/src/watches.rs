@@ -22,6 +22,12 @@ use crate::{RemovedWorktree, Store, StoreError, WtState, events::EventLog};
 const KEY: &str = "watches";
 const ID_ALPHABET: &[u8; 32] = b"abcdefghjkmnopqrstuvwxyz23456789";
 const ID_LENGTH: usize = 6;
+const CLEARED_GATE: &str = "clearedGate";
+
+/// The gate text a watch has already cleared, for the wake that follows.
+pub fn cleared_gate(watch: &Watch) -> Option<&str> {
+    watch.extra.get(CLEARED_GATE)?.as_str()
+}
 
 /// A watch to set. The store assigns its id and its owner's incarnation.
 #[derive(Clone, Debug, PartialEq)]
@@ -264,8 +270,14 @@ impl Store {
             let Some(mut watch) = read(&entries(state)[index]) else {
                 return Ok((false, false));
             };
-            if watch.then.take(action).is_none() {
+            let Some(text) = watch.then.take(action) else {
                 return Ok((false, false));
+            };
+            // The wake that follows tells the session its gate is gone.
+            if action == WatchAction::Unblock {
+                watch
+                    .extra
+                    .insert(CLEARED_GATE.to_owned(), Value::String(text));
             }
             if watch.then.is_empty() {
                 entries_mut(state).remove(index);
@@ -278,6 +290,38 @@ impl Store {
                 WatchAction::Wake => WatchChange::Woken,
             };
             log.best_effort(|log| record(log, &watch, change, None, None));
+            Ok((true, true))
+        })
+    }
+
+    /// Give up one action of a watch that can no longer happen (the gate it
+    /// was to clear reads something else now). The rest of the watch stays.
+    /// Returns whether the action was still owed.
+    pub fn abandon_action(
+        &mut self,
+        id: &str,
+        action: WatchAction,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state_logged(|state, log| {
+            let Some(index) = entries(state)
+                .iter()
+                .position(|entry| text(entry, "id") == Some(id))
+            else {
+                return Ok((false, false));
+            };
+            let Some(mut watch) = read(&entries(state)[index]) else {
+                return Ok((false, false));
+            };
+            if watch.then.take(action).is_none() {
+                return Ok((false, false));
+            }
+            if watch.then.is_empty() {
+                entries_mut(state).remove(index);
+            } else {
+                entries_mut(state)[index] = serde_json::to_value(&watch)?;
+            }
+            log.best_effort(|log| record(log, &watch, WatchChange::Dropped, None, Some(reason)));
             Ok((true, true))
         })
     }

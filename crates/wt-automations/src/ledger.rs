@@ -264,6 +264,15 @@ impl LedgerSnapshot {
         number(entry.get("at")).is_none_or(|at| now_ms.saturating_sub(at) <= RETENTION_MS)
     }
 
+    /// Whether `key`'s fire has ended, however it ended. A dispatch still in
+    /// flight, here or in another process, has not: it may yet be released.
+    pub fn settled(&self, key: &str) -> bool {
+        self.view
+            .fired
+            .get(key)
+            .is_some_and(|entry| entry.get("state").and_then(Value::as_str) != Some("dispatched"))
+    }
+
     /// Whether `key` was recorded no longer than `window_ms` ago. An entry
     /// without a readable time is not recent.
     pub fn recorded_within(&self, key: &str, now_ms: i64, window_ms: i64) -> bool {

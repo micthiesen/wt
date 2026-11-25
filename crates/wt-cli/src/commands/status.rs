@@ -20,7 +20,7 @@ use wt_vcs::WorktreeRecord;
 use wt_app_core::{context::AppContext, database::Database};
 use wt_ops::commands::resolve::resolve_worktree;
 
-const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo; --verify-in-staging / --verify-in-production record a check owed once the change deploys there.";
+const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo, and --until <condition> clears the gate by itself once the condition holds (e.g. --until '#3806:production'; see `wt watch check`); --verify-in-staging / --verify-in-production record a check owed once the change deploys there.";
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StatusArgs {
@@ -67,6 +67,16 @@ pub struct StatusArgs {
     /// Clear the `--blocked-on` gate, keeping state, risk and note.
     #[arg(long)]
     pub unblock: bool,
+    /// When the `--blocked-on` gate clears by itself: a condition as
+    /// `wt wake` reads it ('#3806:production', release:production+24h,
+    /// 17:00, check:<id>). Repeat it; all must hold. Needs a gate, given
+    /// here or already set.
+    #[arg(long, value_name = "CONDITION")]
+    pub until: Vec<String>,
+    /// With `--until`: also wake the session with this prompt once the
+    /// gate has cleared.
+    #[arg(long, allow_hyphen_values = true, value_name = "PROMPT")]
+    pub then: Option<String>,
     /// Add to the existing note instead of replacing it (with `-m` or `--note-only`).
     #[arg(long)]
     pub append: bool,
@@ -173,6 +183,12 @@ fn swallowed_flag(args: &StatusArgs) -> Option<String> {
             "note",
             "--note-only \"<note>\"",
         ),
+        (
+            "--then",
+            &args.then,
+            "prompt",
+            "--until <condition> --then \"<prompt>\"",
+        ),
         ("-m", &args.note, "note", "-m \"<note>\""),
     ];
     valued.into_iter().find_map(|(flag, value, what, usage)| {
@@ -187,6 +203,9 @@ fn parse_status_args(args: &StatusArgs) -> Action {
     if let Some(message) = swallowed_flag(args) {
         return Action::Error(message);
     }
+    if let Some(message) = until_misuse(args) {
+        return Action::Error(message.into());
+    }
     let action = parse_status_action(args);
     if args.json
         && !matches!(
@@ -199,6 +218,32 @@ fn parse_status_args(args: &StatusArgs) -> Action {
         );
     }
     action
+}
+
+/// `--until` belongs to a gate and `--then` to `--until`.
+fn until_misuse(args: &StatusArgs) -> Option<&'static str> {
+    if args.until.is_empty() {
+        return args
+            .then
+            .is_some()
+            .then_some("--then says what to do once --until holds; add --until <condition>");
+    }
+    if args.unblock {
+        return Some("--until clears the gate later and --unblock clears it now; pick one");
+    }
+    if args.clear || args.all || args.examined.is_some() || args.note_only.is_some() {
+        return Some(
+            "--until says when a --blocked-on gate clears; it goes with a state or with --blocked-on",
+        );
+    }
+    if args
+        .then
+        .as_deref()
+        .is_some_and(|then| sanitize_work_note(then).is_empty())
+    {
+        return Some("--then requires a non-empty prompt");
+    }
+    None
 }
 
 fn parse_status_action(args: &StatusArgs) -> Action {
@@ -357,7 +402,12 @@ fn parse_status_action(args: &StatusArgs) -> Action {
         _ => return fail("too many arguments"),
     };
     let Some(raw_state) = state else {
-        if gate.is_some() || args.unblock || verify.is_some() || risk.is_some() {
+        if gate.is_some()
+            || args.unblock
+            || verify.is_some()
+            || risk.is_some()
+            || !args.until.is_empty()
+        {
             return Action::Amend {
                 target,
                 note,
@@ -390,6 +440,11 @@ fn parse_status_action(args: &StatusArgs) -> Action {
     }
     if gate.is_some() && !matches!(state, WorkState::Ready | WorkState::Todo) {
         return fail("--blocked-on applies only to ready and todo");
+    }
+    if !args.until.is_empty() && gate.is_none() {
+        return fail(
+            "--until says when a gate clears; a new assertion has none: add --blocked-on \"<why>\"",
+        );
     }
     if state == WorkState::Ready && risk.is_none() {
         return fail("ready requires --risk low|medium|high");
@@ -429,6 +484,21 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
     let records = ctx.repository.inventory(&ctx.cancellation).await?;
     let worktrees = records.iter().filter(|w| !w.is_main).collect::<Vec<_>>();
     let state = read_state(&ctx.database).await?;
+    // Read before anything is written: a condition that cannot be read
+    // must not leave a gate behind that nothing clears.
+    let clock = super::watch::clock();
+    let until = if args.until.is_empty() {
+        None
+    } else {
+        match super::watch::read_conditions(ctx, &args.until, clock).await {
+            Ok(read) => Some(read),
+            Err(message) => {
+                eprintln!("{message}");
+                return Ok(2);
+            }
+        }
+    };
+    let then = args.then.as_deref().map(sanitize_work_note);
     match action {
         Action::All { json: wants_json } => {
             let now = now_ms();
@@ -682,7 +752,16 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 println!("  note: {note}");
             }
             note_budget_hint(work_state, next.note.as_deref());
-            print_guidance(work_state, next.blocked_on.as_deref(), next.verification());
+            let clears = match gate_watch(ctx, &slug, &next, until, then, clock).await? {
+                Ok(clears) => clears,
+                Err(code) => return Ok(code),
+            };
+            print_guidance(
+                work_state,
+                next.blocked_on.as_deref(),
+                next.verification(),
+                clears.as_deref(),
+            );
             Ok(0)
         }
         Action::Amend {
@@ -705,9 +784,18 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
+            let needs_gate = until.is_some();
             let write = update_status(&ctx.database, &slug, {
                 let slug = slug.clone();
-                move |previous| amend_record(&slug, previous, note, risk, blocked, verify, append)
+                move |previous| {
+                    let next = amend_record(&slug, previous, note, risk, blocked, verify, append)?;
+                    if needs_gate && next.blocked_on.is_none() {
+                        return Err(format!(
+                            "{slug} has no gate for --until to clear: add --blocked-on \"<why>\""
+                        ));
+                    }
+                    Ok(next)
+                }
             })
             .await?;
             let StatusWrite {
@@ -745,14 +833,71 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             }
             report_replaced_note(previous_note.as_deref(), next.note.as_deref(), append);
             note_budget_hint(next.state, next.note.as_deref());
-            if old_gate != next.blocked_on
+            let clears = match gate_watch(ctx, &slug, &next, until, then, clock).await? {
+                Ok(clears) => clears,
+                Err(code) => return Ok(code),
+            };
+            if clears.is_some()
+                || old_gate != next.blocked_on
                 || old_verify != (next.verify_after_merge.clone(), next.verify_in)
             {
-                print_guidance(next.state, next.blocked_on.as_deref(), next.verification());
+                print_guidance(
+                    next.state,
+                    next.blocked_on.as_deref(),
+                    next.verification(),
+                    clears.as_deref(),
+                );
             }
             Ok(0)
         }
         Action::Error(_) => unreachable!(),
+    }
+}
+
+/// Set the watch that clears the gate just written. Returns what will clear
+/// it, in words, or the exit code after saying why no watch was set.
+async fn gate_watch(
+    ctx: &AppContext,
+    slug: &str,
+    written: &WorkStatusRecord,
+    until: Option<super::watch::ReadConditions>,
+    then: Option<String>,
+    clock: wt_core::watch::LocalClock,
+) -> Result<Result<Option<String>, i32>> {
+    let Some(until) = until else {
+        return Ok(Ok(None));
+    };
+    let Some(gate) = written.blocked_on.clone() else {
+        eprintln!("the status has no gate, so --until set nothing");
+        return Ok(Err(1));
+    };
+    let actions = wt_core::watch::WatchActions {
+        unblock: Some(gate),
+        wake: then,
+        ..Default::default()
+    };
+    let wakes = actions.wake.is_some();
+    match super::watch::set(ctx, slug, until.when, actions, clock).await? {
+        Ok(watch) => {
+            for note in &until.notes {
+                println!("  note: {note}");
+            }
+            Ok(Ok(Some(format!(
+                "{}{} (watch {})",
+                watch.summary(),
+                if wakes {
+                    ", and then wakes this session"
+                } else {
+                    ""
+                },
+                watch.id
+            ))))
+        }
+        // The status is written; only its self-clearing is missing.
+        Err(message) => {
+            eprintln!("the gate is set but will not clear by itself: {message}");
+            Ok(Err(1))
+        }
     }
 }
 
@@ -978,7 +1123,18 @@ fn hints_off() -> bool {
     std::env::var("WT_NO_HINTS").is_ok_and(|value| value == "1")
 }
 
-fn print_guidance(state: WorkState, blocked_on: Option<&str>, verify: Option<(VerifyStage, &str)>) {
+fn print_guidance(
+    state: WorkState,
+    blocked_on: Option<&str>,
+    verify: Option<(VerifyStage, &str)>,
+    clears: Option<&str>,
+) {
+    // Not a hint: it is the one line that says the gate will clear itself.
+    if let (Some(gate), Some(clears)) = (blocked_on, clears) {
+        println!(
+            "wt clears the gate \"{gate}\" when {clears}; `wt status --unblock` clears it by hand."
+        );
+    }
     if hints_off() {
         return;
     }
@@ -995,6 +1151,9 @@ fn print_guidance(state: WorkState, blocked_on: Option<&str>, verify: Option<(Ve
             "first confirm the {} deploy carrying this change finished; then use `wt status verified -m <what you checked and where>`.",
             stage.as_str()
         );
+    }
+    if blocked_on.is_some() && clears.is_some() {
+        return;
     }
     if let Some(gate) = blocked_on {
         if state == WorkState::Todo {
@@ -1174,7 +1333,7 @@ async fn live_json(ctx: &AppContext, state: &Value, w: &WorktreeRecord) -> Resul
         }
     };
     Ok(
-        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
+        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, super::watch::clock()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
     )
 }
 
@@ -1587,6 +1746,145 @@ mod tests {
                 .unwrap(),
             1
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn until_needs_a_gate_and_then_needs_until() {
+        let base = || StatusArgs {
+            until: vec!["merged".into()],
+            ..Default::default()
+        };
+        let error = |args: StatusArgs| match parse_status_args(&args) {
+            Action::Error(message) => message,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        // On its own it amends: the gate may already be on the record.
+        assert!(matches!(
+            parse_status_args(&base()),
+            Action::Amend { blocked: None, .. }
+        ));
+        assert!(matches!(
+            parse_status_args(&StatusArgs {
+                positionals: vec!["ready".into()],
+                risk: Some("low".into()),
+                blocked_on: Some("the release".into()),
+                then: Some("verify it".into()),
+                ..base()
+            }),
+            Action::Set {
+                blocked: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            error(StatusArgs {
+                positionals: vec!["ready".into()],
+                risk: Some("low".into()),
+                ..base()
+            })
+            .contains("add --blocked-on")
+        );
+        assert!(
+            error(StatusArgs {
+                then: Some("verify it".into()),
+                ..Default::default()
+            })
+            .contains("add --until")
+        );
+        assert!(
+            error(StatusArgs {
+                unblock: true,
+                ..base()
+            })
+            .contains("pick one")
+        );
+        assert!(
+            error(StatusArgs {
+                then: Some("--until".into()),
+                ..base()
+            })
+            .contains("--then needs its prompt")
+        );
+        for args in [
+            StatusArgs {
+                clear: true,
+                ..base()
+            },
+            StatusArgs {
+                all: true,
+                ..base()
+            },
+        ] {
+            assert!(error(args).contains("--until says when"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gate_set_with_until_gets_the_watch_that_clears_it() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let watches = || async {
+            fixture
+                .ctx
+                .database
+                .call(|store| Ok(store.list_watches(Some("one"))?))
+                .await
+                .unwrap()
+        };
+        // No gate on the record yet: nothing is written at all.
+        let bare = StatusArgs {
+            until: vec!["merged".into()],
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &bare).await.unwrap(), 2);
+        // A condition that cannot be read refuses before the status is written.
+        let unreadable = StatusArgs {
+            positionals: vec!["ready".into()],
+            risk: Some("low".into()),
+            blocked_on: Some("#7 ships".into()),
+            until: vec!["whenever".into()],
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &unreadable).await.unwrap(), 2);
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        assert!(state["slugs"]["one"].get("work").is_none());
+
+        let gated = StatusArgs {
+            until: vec!["#7:production".into(), "+1h".into()],
+            then: Some("run the smoke test".into()),
+            ..unreadable.clone()
+        };
+        assert_eq!(run(&fixture.ctx, &gated).await.unwrap(), 0);
+        let set = watches().await;
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].then.unblock.as_deref(), Some("#7 ships"));
+        assert_eq!(set[0].then.wake.as_deref(), Some("run the smoke test"));
+        assert_eq!(set[0].when.len(), 2);
+
+        // The row's JSON carries it.
+        let state = read_state(&fixture.ctx.database).await.unwrap();
+        let record = resolve_worktree(&fixture.ctx, Some("one")).await.unwrap();
+        let row = live_json(&fixture.ctx, &state, &record).await.unwrap();
+        assert_eq!(row["watches"][0]["id"], set[0].id.as_str());
+        assert_eq!(row["watches"][0]["when"][0]["arg"], "#7:production");
+        assert_eq!(row["watches"][0]["then"]["unblock"], "#7 ships");
+
+        // --until on the existing gate replaces the watch that clears it.
+        assert_eq!(run(&fixture.ctx, &bare).await.unwrap(), 0);
+        let replaced = watches().await;
+        assert_eq!(replaced.len(), 1);
+        assert_ne!(replaced[0].id, set[0].id);
+        assert_eq!(replaced[0].then.unblock.as_deref(), Some("#7 ships"));
+        assert_eq!(replaced[0].then.wake, None);
+
+        // Clearing the gate by hand leaves nothing to clear it later.
+        let unblock = StatusArgs {
+            unblock: true,
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &unblock).await.unwrap(), 0);
+        assert_eq!(watches().await, []);
         fixture.close().await.unwrap();
     }
 }

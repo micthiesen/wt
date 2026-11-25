@@ -19,4 +19,6 @@ pub mod origin;
 pub mod remote;
 pub mod restack_action;
 pub mod updates;
+pub mod watch_actions;
+pub mod watch_probe;
 pub mod worktree_facts;

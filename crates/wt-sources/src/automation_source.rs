@@ -103,8 +103,9 @@ impl AutomationDrain {
 }
 
 pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) -> AutomationHandle {
-    if ctx.config.automations.is_empty() || std::env::var("WT_AUTOMATIONS").as_deref() == Ok("off")
-    {
+    // Watches run under an implicit rule, so the engine runs with no
+    // `[[automations]]` at all.
+    if std::env::var("WT_AUTOMATIONS").as_deref() == Ok("off") {
         return passthrough(scope, sources.board);
     }
     let (cancel_tx, mut cancel_rx) = mpsc::channel(1);
@@ -171,6 +172,15 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut active_dispatches = HashMap::new();
         let mut reported = Vec::new();
         let mut queue_report = QueueReport::default();
+        let mut externals = crate::watch_facts::Externals::default();
+        // What was last written for which metadata revision: the snapshot
+        // lags its own writes, and the same finding is not written twice.
+        let mut applied_stamps: Option<(u64, Vec<wt_core::watch::WatchStamps>)> = None;
+        let mut orphans_settled_at: Option<u64> = None;
+        let mut settled_watches = BTreeSet::new();
+        // Landing commits outlive the rows they were read from: a watch
+        // follows its commit once its worktree is removed.
+        let mut known_landings = std::collections::BTreeMap::<String, String>::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -260,6 +270,9 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     }
                     continue;
                 }
+                arrived = externals.arrived(), if externals.busy() => {
+                    if let Some(arrived) = arrived { externals.absorb(arrived); }
+                }
                 _ = ticker.tick() => {},
             }
             let git = git_rx.borrow_and_update().clone();
@@ -278,7 +291,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let lanes_ready = *git.state() == SourceState::Ready
                 && *metadata.state() == SourceState::Ready;
             let metadata_key = metadata_facts_key(confirmed_metadata.as_deref());
-            let production = production_tip.current(&context).await;
+            let watches_await_production = confirmed_metadata.as_deref().is_some_and(|(state, _)| {
+                wt_ops::lifecycle_ops::watch_wants(state).values().any(|wants| wants.production)
+            });
+            let production = production_tip.current(&context, watches_await_production).await;
             let deployed = deploys_rx.borrow_and_update().data().map(|deploys| {
                 (deploys.staging.oid.clone(), deploys.production.oid.clone())
             });
@@ -336,6 +352,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                 }
                             }
                             lifecycle_errors = next.errors;
+                            known_landings.extend(next.landing_commits);
                             lifecycle_cache = next.rows;
                             lifecycle_cache_key = Some(lifecycle_key);
                         }
@@ -424,6 +441,46 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             }
             facts.context.now_ms = now_ms();
             facts.context.github_fresh = fresh_github.is_some();
+            facts.context.watches.clear();
+            if let Some((state, _)) = confirmed_metadata.as_deref() {
+                let watches = wt_store::stored_watches(state);
+                let now = facts.context.now_ms;
+                let revision = metadata.revision();
+                // Reads start here and arrive through the select above;
+                // this pass uses what has arrived so far.
+                externals.request(&context, &wt_core::watch::needs(&watches), &facts.watch_prs, &facts.branches);
+                let known = crate::watch_facts::facts(&watches, &facts.watch_rows, facts.state_ready, &facts.watch_prs, &externals);
+                let stamps = crate::watch_facts::stamps(&watches, &known, now);
+                if !stamps.is_empty() && applied_stamps.as_ref() != Some(&(revision, stamps.clone())) {
+                    let write = stamps.clone();
+                    match context.database.call(move |store| Ok(store.apply_evaluation(&write)?)).await {
+                        Ok(_) => applied_stamps = Some((revision, stamps)),
+                        Err(error) => latest_error = Some(format!("cannot record what a watch saw: {error:#}")),
+                    }
+                }
+                // Only an inventory this process read says a worktree is gone.
+                let inventory_read_at = confirmed_git
+                    .as_ref()
+                    .filter(|_| facts.state_ready)
+                    .and_then(|git| git.age())
+                    .map(|age| now.saturating_sub(i64::try_from(age.as_millis()).unwrap_or(i64::MAX)));
+                let live = crate::watch_facts::live_owners(&facts.watch_rows, &watches, inventory_read_at.unwrap_or(i64::MIN));
+                if inventory_read_at.is_some()
+                    && orphans_settled_at != Some(revision)
+                    && crate::watch_facts::has_orphans(&watches, &live)
+                {
+                    orphans_settled_at = Some(revision);
+                    let (owners, landings) = (live.clone(), known_landings.clone());
+                    match context.database.call(move |store| Ok(store.drop_orphans(&owners, &landings, now)?)).await {
+                        Ok(dropped) => for watch in dropped {
+                            tracing::info!(watch = %watch.id, slug = %watch.slug, "dropped a watch whose worktree is gone");
+                        },
+                        Err(error) => latest_error = Some(format!("cannot settle watches of removed worktrees: {error:#}")),
+                    }
+                }
+                known_landings.retain(|slug, _| watches.iter().any(|watch| watch.slug == *slug));
+                facts.context.watches = crate::watch_facts::deliverable(&watches, &live, now);
+            }
             let pass = pass_input(&context, facts, facts.context.now_ms);
             let tick = match engine.tick(pass).await {
                 Ok(tick) => tick,
@@ -434,6 +491,15 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 }
             };
             record_skipped(&context, engine.take_skipped()).await;
+            if settled_watches.len() > 512 { settled_watches.clear(); }
+            for (id, action) in tick.settled_watches {
+                if !settled_watches.insert((id.clone(), action)) { continue; }
+                let done = id.clone();
+                if let Err(error) = context.database.call(move |store| Ok(store.complete_action(&done, action)?)).await {
+                    settled_watches.remove(&(id, action));
+                    latest_error = Some(format!("cannot record a finished watch action: {error:#}"));
+                }
+            }
             for claim in tick.claims {
                 let context = accepted_context.clone();
                 let github = fresh_github.clone();
@@ -523,7 +589,8 @@ fn fire_event(
     error: Option<&str>,
 ) -> Option<wt_core::WorktreeEventKind> {
     use wt_core::AutomationOutcomeKind;
-    if fire.slug == wt_automations::FLEET_SLUG {
+    // A watch's history is written with the watch itself.
+    if fire.slug == wt_automations::FLEET_SLUG || fire.watch.is_some() {
         return None;
     }
     let (outcome, reason) = match (outcome, error) {
@@ -597,7 +664,9 @@ async fn dispatch_claim(
     board: Option<Board>,
 ) -> (ClaimedFire, AutomationOutcome, Option<String>) {
     let fire = claim.fire().clone();
-    let (outcome, error) = if fire.rule.run.starts_with("builtin:") {
+    let (outcome, error) = if fire.watch.is_some() {
+        wt_ops::watch_actions::dispatch(&context, &fire).await
+    } else if fire.rule.run.starts_with("builtin:") {
         match wt_ops::automation_builtins::execute(&context, &fire).await {
             wt_ops::automation_builtins::BuiltinExecution::Retry { reason } => {
                 tracing::info!(rule = %fire.rule.id, %reason, "automation will retry");
@@ -906,19 +975,20 @@ struct ProductionTip {
 impl ProductionTip {
     const INTERVAL: Duration = Duration::from_secs(30);
 
-    async fn current(&mut self, ctx: &AppContext) -> Option<String> {
+    async fn current(&mut self, ctx: &AppContext, watches_await: bool) -> Option<String> {
         let branch = &ctx.config.branch;
         let production = branch
             .production
             .as_deref()
             .filter(|_| branch.separate_production())?;
-        let watched = ctx.config.automations.iter().any(|rule| {
-            matches!(
-                rule.on,
-                wt_config::AutomationTrigger::StatusVerificationDue
-                    | wt_config::AutomationTrigger::StatusVerificationOverdue
-            )
-        });
+        let watched = watches_await
+            || ctx.config.automations.iter().any(|rule| {
+                matches!(
+                    rule.on,
+                    wt_config::AutomationTrigger::StatusVerificationDue
+                        | wt_config::AutomationTrigger::StatusVerificationOverdue
+                )
+            });
         if !watched || self.checked.is_some_and(|at| at.elapsed() < Self::INTERVAL) {
             return self.tip.clone();
         }
@@ -1037,6 +1107,7 @@ fn metadata_facts_key(metadata: Option<&crate::local_source::Metadata>) -> serde
             (rule.clone(), serde_json::json!({"subscription": entry["subscription"], "pending": ids}))
         }).collect::<serde_json::Map<_, _>>()),
         "removedPauses": removed_pauses,
+        "watches": crate::watch_facts::identity(state),
     })
 }
 
@@ -1059,7 +1130,7 @@ fn lifecycle_metadata_key(metadata: Option<&crate::local_source::Metadata>) -> s
         .flatten()
         .map(|(key, removal)| (key.clone(), removal["path"].clone()))
         .collect::<serde_json::Map<_, _>>();
-    serde_json::json!({"slugs": slugs, "removals": removals})
+    serde_json::json!({"slugs": slugs, "removals": removals, "watches": crate::watch_facts::identity(state)})
 }
 
 /// A failed session lane keeps its last data as live, so it confirms nothing
@@ -1110,6 +1181,7 @@ mod tests {
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: String::new(),
         }
     }

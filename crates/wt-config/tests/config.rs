@@ -104,6 +104,7 @@ fn snapshot(config: &Config) -> serde_json::Value {
                 wt_config::AutomationTrigger::BranchAdvanced => "branch.advanced",
                 wt_config::AutomationTrigger::StageDeployed => "stage.deployed",
                 wt_config::AutomationTrigger::McpEvent => "mcp.event",
+                wt_config::AutomationTrigger::WatchMet => "watch.met",
             },
             "run": automation.run, "busy": if automation.busy == wt_config::AutomationBusyPolicy::Skip { "skip" } else { "queue" },
             "cooldownMinutes": automation.cooldown_minutes.map(number), "afterDays": number(automation.after_days),
@@ -809,6 +810,97 @@ fn mcp_event_rules_name_a_server_an_event_and_a_prompt_action() {
         "{error}"
     );
     assert!(error.contains("automations[3]"), "{error}");
+}
+
+#[test]
+fn checks_and_notify_are_argv_and_the_watch_trigger_is_reserved() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let load = |extra: &str| {
+        let mut text = minimal_config(root.path());
+        text.push_str(extra);
+        Config::from_raw(toml_value(&text), &options(root.path(), &home, &[]))
+    };
+    let config = load("").unwrap();
+    assert!(config.checks.is_empty());
+    assert_eq!(config.notify.command, None);
+
+    let config = load(
+        "\n[[checks]]\nid = 'secret'\ndescription = 'a secret is set'\nrun = ['vault', 'has', '{{arg}}']\n\
+         [[checks]]\nid = 'flag.on'\nrun = ['flag']\nevery_seconds = 30\ntimeout_seconds = 5\n\
+         [notify]\ncommand = ['push', '{{title}}', '{{body}}']\n",
+    )
+    .unwrap();
+    assert_eq!(config.checks[0].id, "secret");
+    assert_eq!(config.checks[0].description, "a secret is set");
+    assert_eq!(config.checks[0].run, ["vault", "has", "{{arg}}"]);
+    assert_eq!(
+        (
+            config.checks[0].every_seconds,
+            config.checks[0].timeout_seconds
+        ),
+        (300, 30)
+    );
+    assert_eq!(
+        (
+            config.checks[1].every_seconds,
+            config.checks[1].timeout_seconds
+        ),
+        (30, 5)
+    );
+    assert_eq!(
+        config.notify.command.as_deref().unwrap(),
+        ["push", "{{title}}", "{{body}}"]
+    );
+
+    for (extra, expected) in [
+        (
+            "\n[checks]\nid = 'x'\n",
+            "checks must be an array of [[checks]] tables",
+        ),
+        ("\n[[checks]]\nrun = ['x']\n", "checks[0].id is required"),
+        (
+            "\n[[checks]]\nid = 'a=b'\nrun = ['x']\n",
+            "checks[0].id is required and may hold only",
+        ),
+        (
+            "\n[[checks]]\nid = 'a'\nrun = ['x']\n[[checks]]\nid = 'a'\nrun = ['y']\n",
+            "checks[1].id \"a\" is duplicated",
+        ),
+        (
+            "\n[[checks]]\nid = 'a'\nrun = []\n",
+            "checks[0].run must be an array of nonempty strings",
+        ),
+        (
+            "\n[[checks]]\nid = 'a'\nrun = 'vault has x'\n",
+            "checks[0]: ",
+        ),
+        (
+            "\n[[checks]]\nid = 'a'\nrun = ['x']\nevery_seconds = 29\n",
+            "checks[0].every_seconds must be at least 30",
+        ),
+        (
+            "\n[[checks]]\nid = 'a'\nrun = ['x']\ntimeout_seconds = 0\n",
+            "checks[0].timeout_seconds must be a positive integer",
+        ),
+        (
+            "\n[notify]\ncommand = []\n",
+            "notify.command must be an array of nonempty strings",
+        ),
+        ("\n[notify]\ncommand = 'push it'\n", "notify: "),
+        (
+            "\n[[automations]]\nid = 'w'\non = 'watch.met'\nrun = 'builtin:notify'\n",
+            "automations[0].on \"watch.met\" is wt's own trigger for watches",
+        ),
+        (
+            "\n[[automations]]\nid = 'w'\non = 'status.ready'\nrun = 'builtin:watch'\n",
+            "automations[0].run \"builtin:watch\" is neither",
+        ),
+    ] {
+        let error = load(extra).unwrap_err().to_string();
+        assert!(error.contains(expected), "{extra}: {error}");
+    }
 }
 
 #[test]

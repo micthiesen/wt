@@ -81,6 +81,50 @@ run    = "answer-guide"
 - **It never echoes its audience.** The server is responsible for leaving out what the subscriber itself wrote (artifacts.boo leaves out every agent's comments and answers), so a session's own reply does not wake it again. Because of that, and because each event is a distinct occurrence, the per-worktree breaker does not apply; `cooldown_minutes` still does.
 - **Credentials.** `token_command` prints the bearer token, typically from the macOS Keychain. Its output is never logged, stored or shown in an error, and it is fetched again once when the server answers 401. wt has no credential store of its own and cannot borrow a harness's or gateway's MCP login, so the token is one the server issues for headless clients (an artifacts.boo agent token from the workspace's settings).
 
+## Watches
+
+A [watch](cli.md#wt-wake-condition--m-prompt---slug-slug) is a worktree waiting
+for conditions and owing up to three actions once they all hold: clear its
+merge gate (`wt status --until`), tell the person (`wt notify`), wake its
+session (`wt wake`, `--then`). Watches are not a second scheduler. They run
+through this engine under one implicit rule, id `wt.watch`, trigger
+`watch.met`, run `builtin:watch`, settle 0. The rule always exists, so the
+engine runs with no `[[automations]]` at all, and configuration cannot declare
+the trigger or the run.
+
+- **Evaluation.** Each pass judges every pending watch against the same
+  confirmed rows the rules see, plus facts the board does not carry: pull
+  requests outside the fleet (one batched GitHub read, at most once a
+  minute, never again for a PR seen merged), whether a commit reached a
+  stage, each stage's current release, and [`[[checks]]`](configuration.md#checks-probes-a-watch-can-wait-on)
+  probes. Those reads run beside the loop and only while a pending watch
+  needs them; a fact that has not arrived or whose read failed is unknown,
+  and unknown never holds. A watch is met once, durably, and never un-met.
+- **One fire per action**, keyed `wt.watch:<id>:unblock`, `:notify`, `:wake`,
+  so several watches on one worktree never replace each other in the queue
+  and a retry never repeats an action that already ran. The ledger is the
+  record: when an action's fire has ended it is removed from the watch, and a
+  watch that owes nothing is deleted. A crash between the two is healed on
+  the next pass.
+- **What waits for what.** Clearing the gate and telling the person need
+  nothing from the session, so they run while it is busy and need no
+  eligible row; a notify-only watch outlives a landed worktree. Waking is a
+  prompt: it comes after the same watch has cleared its gate, waits for the
+  session to be idle, and defers on the 30 s then 5 min backoff when the
+  session cannot be reached.
+- **Exempt from the breaker and from cancellation.** A global pause, a
+  paused worktree and `Ctrl+Shift+A` hold watch fires and never consume their
+  keys: the watch delivers when the pause ends. Evaluation continues while
+  paused. `WT_AUTOMATIONS=off` disables watches with everything else.
+- **Remote worktrees.** A watch on a worktree hosted by a
+  [managed worker](remote.md) is stored and evaluated by that worker's
+  engine while the controller is connected. A notification raised there
+  shows on the worker, not on the person's desktop; set `[notify] command`
+  there if it must reach them.
+
+In the queue (`Q`, `wt automations`) a watch fire shows as rule `watch` with
+the action and what held as its detail.
+
 ## Built-in runs
 
 `run` names either an `[[actions]]` id or a built-in flow:
@@ -196,7 +240,7 @@ ledger's 30-day retention). New trigger instances can still queue normally.
 This does not pause rules, change cooldowns or breakers, stop running actions,
 or recall prompts already handed to a harness's native queue. Unlike clearing,
 pausing drops pending intents without consuming their keys, so they can return
-when resumed.
+when resumed. [Watch](#watches) fires are held by both and consumed by neither.
 
 Clearing also works while globally paused, without resuming or dispatching
 anything. It reconstructs currently eligible, unseen trigger instances from

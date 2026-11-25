@@ -256,6 +256,59 @@ three intervals is reported in the attention feed, once per distinct error
 clone nor on origin). The probe runs on each host that loads this
 configuration, with that host's credentials.
 
+## `[[checks]]`: probes a watch can wait on
+
+A [watch](cli.md#wt-wake-condition--m-prompt---slug-slug) can wait on anything a
+command can answer: a secret being set, a feature flag, a migration having
+run. Each `[[checks]]` entry names such a command; a watch refers to it as
+`check:<id>` or `check:<id>=<arg>`.
+
+```toml
+[[checks]]
+id = "secret"
+description = "a secret is present in the production vault"
+run = ["./scripts/has-secret", "production", "{{arg}}"]
+every_seconds = 300
+```
+
+```sh
+wt status ready --risk low --blocked-on "needs STRIPE_KEY in production" --until check:secret=STRIPE_KEY
+```
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `id` | **yes** | — | The name in `check:<id>`. Letters, digits, `-`, `_` and `.`; unique. |
+| `description` | no | *(none)* | What the check answers, shown by `wt watch check`. |
+| `run` | **yes** | — | Argv, run in the main clone with no shell. Exit `0` means it holds, `1` means not yet; any other exit, or a timeout, is an error that `wt watch` shows while the watch keeps waiting. |
+| `every_seconds` | no | `300` | How often it runs while a pending watch needs it. Minimum `30`. |
+| `timeout_seconds` | no | `30` | A run still going after this long is stopped and counts as an error. |
+
+`{{arg}}` (the text after `=`, empty without one), `{{slug}}` and `{{branch}}`
+(the worktree the watch belongs to) and `{{main_clone}}` are replaced inside
+each argument. A value never splits into further arguments and is never read
+by a shell, so an argument written by an agent cannot run anything the
+command itself does not. A check runs only while a pending watch waits on
+it, at most two at a time, on each host that evaluates that watch, with that
+host's credentials. A watch naming an id that is not configured is refused
+when it is set.
+
+## `[notify]`: an extra notification command
+
+`wt notify` and other watch notifications raise a desktop banner on the host
+whose TUI evaluates them. `[notify] command` sends the same title and body
+somewhere else as well, for a banner nobody is at the desk to see.
+
+```toml
+[notify]
+command = ["./scripts/push-to-phone", "{{title}}", "{{body}}"]
+```
+
+`command` is argv, run in the main clone with no shell, with `{{title}}`
+(`wt · <slug>`) and `{{body}}` replaced inside each argument. A non-zero exit
+is reported; the notification counts as delivered when either the banner or
+the command succeeded, and is tried again later when neither did. It applies
+to watches only: `builtin:notify` rules keep raising the banner alone.
+
 ## `[remote]` and `[[remotes]]` — optional SSH worktree hosts
 
 Configure one or more machines whose clone, config, and worktree root remain

@@ -1,14 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wt_config::{AutomationDef, AutomationTrigger};
-use wt_core::WorkState;
+use wt_core::{WorkState, watch::WatchAction};
 
 use crate::types::{
     ActionAudience, AutomationEvalContext, AutomationFire, AutomationRow, BranchRange, FrozenPr,
-    GuideOwner, McpEvent, status_is_gated, status_suffix, status_trigger_state,
+    GuideOwner, McpEvent, WatchFire, status_is_gated, status_suffix, status_trigger_state,
 };
 
 pub const FLEET_SLUG: &str = "_fleet";
+pub const WATCH_RULE_ID: &str = "wt.watch";
+pub const WATCH_RUN: &str = "builtin:watch";
+
+/// The rule every watch fire runs under. It exists without configuration,
+/// and configuration cannot declare it.
+pub fn watch_rule() -> AutomationDef {
+    AutomationDef {
+        id: WATCH_RULE_ID.into(),
+        on: AutomationTrigger::WatchMet,
+        run: WATCH_RUN.into(),
+        busy: wt_config::AutomationBusyPolicy::Queue,
+        settle_seconds: 0.0,
+        ..AutomationDef::default()
+    }
+}
 
 /// Evaluate level conditions from one consistent source snapshot. Callers
 /// supply freshness, durable pause state, local time, and lifecycle safety
@@ -35,6 +50,8 @@ pub fn evaluate(
                 }
             }
             AutomationTrigger::McpEvent => fires.extend(evaluate_mcp(rule, rows, context)),
+            // Watch fires come from the watches themselves, below.
+            AutomationTrigger::WatchMet => {}
             trigger => {
                 for row in rows {
                     if eligible(row, context)
@@ -44,6 +61,71 @@ pub fn evaluate(
                     }
                 }
             }
+        }
+    }
+    fires.extend(evaluate_watches(rows, context));
+    fires
+}
+
+/// One fire per action a met watch still owes. Clearing a gate and telling
+/// the person need nothing from the worktree, so they neither wait for it
+/// nor need its row. Waking the session waits for the gate to be cleared
+/// first, and for the session like any prompt. A paused worktree holds all
+/// three: nothing is consumed.
+fn evaluate_watches(
+    rows: &[AutomationRow],
+    context: &AutomationEvalContext,
+) -> Vec<AutomationFire> {
+    let mut fires = Vec::new();
+    for watch in &context.watches {
+        if context.pauses.slugs.contains(&watch.slug) {
+            continue;
+        }
+        let owes_unblock = watch
+            .actions
+            .iter()
+            .any(|(action, _)| *action == WatchAction::Unblock);
+        for (action, text) in &watch.actions {
+            let wake = *action == WatchAction::Wake;
+            if wake
+                && (owes_unblock
+                    || !rows
+                        .iter()
+                        .any(|row| row.slug == watch.slug && !row.archived))
+            {
+                continue;
+            }
+            fires.push(AutomationFire {
+                rule: watch_rule(),
+                slug: watch.slug.clone(),
+                quiesce_slugs: if wake {
+                    vec![watch.slug.clone()]
+                } else {
+                    Vec::new()
+                },
+                fire_keys: vec![wt_core::watch::action_key(&watch.id, *action)],
+                stack_id: None,
+                close_issue: None,
+                delete_branch: None,
+                delete_branch_pr: None,
+                branch_range: None,
+                frozen_vars: None,
+                frozen_pr: None,
+                mcp_event: None,
+                watch: Some(WatchFire {
+                    id: watch.id.clone(),
+                    action: *action,
+                    by: watch.by.clone(),
+                    held: watch.held.clone(),
+                    text: text.clone(),
+                    cleared_gate: watch.cleared_gate.clone(),
+                }),
+                detail: wt_core::sanitize_terminal_text(&format!(
+                    "{}: {}",
+                    action.as_str(),
+                    watch.held
+                )),
+            });
         }
     }
     fires
@@ -78,6 +160,7 @@ pub fn evaluate_breaker_resets(
             AutomationTrigger::BranchAdvanced
                 | AutomationTrigger::StageDeployed
                 | AutomationTrigger::McpEvent
+                | AutomationTrigger::WatchMet
         ) {
             // Branch movement, deploys and MCP events are each a distinct occurrence;
             // no worktree condition clears them.
@@ -146,11 +229,19 @@ pub fn evaluate_breaker_resets(
 
 pub fn fire_identity(fire: &AutomationFire) -> String {
     let target = fire.stack_id.as_deref().unwrap_or(&fire.slug);
-    match &fire.mcp_event {
+    match (&fire.mcp_event, &fire.watch) {
         // Each event is its own fire; sharing `rule|slug` would let a burst
         // for one guide replace itself in the queue, newest first.
-        Some(event) => format!("{}|{target}|{}", fire.rule.id, event.event_id),
-        None => format!("{}|{target}", fire.rule.id),
+        (Some(event), _) => format!("{}|{target}|{}", fire.rule.id, event.event_id),
+        // So is each action of each watch: several met watches on one
+        // worktree must not replace each other.
+        (None, Some(watch)) => format!(
+            "{}|{target}|{}:{}",
+            fire.rule.id,
+            watch.id,
+            watch.action.as_str()
+        ),
+        (None, None) => format!("{}|{target}", fire.rule.id),
     }
 }
 
@@ -342,7 +433,8 @@ fn evaluate_row(
         AutomationTrigger::StackParentMerged
         | AutomationTrigger::BranchAdvanced
         | AutomationTrigger::StageDeployed
-        | AutomationTrigger::McpEvent => None,
+        | AutomationTrigger::McpEvent
+        | AutomationTrigger::WatchMet => None,
     }
 }
 
@@ -418,6 +510,7 @@ fn evaluate_merged(
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: format!("{landed} — closing issue #{issue}"),
         });
     }
@@ -438,6 +531,7 @@ fn evaluate_merged(
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: format!("{landed} — deleting remote branch {}", row.branch),
         });
     }
@@ -458,6 +552,7 @@ fn evaluate_merged(
                 is_draft: pr.is_draft,
             }),
             mcp_event: None,
+            watch: None,
             detail: landed,
         });
     }
@@ -609,6 +704,7 @@ fn evaluate_stack(
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: format!("{} under {} open member(s)", parts.join(" + "), open.len()),
         });
     }
@@ -643,6 +739,7 @@ fn evaluate_branch(
         frozen_vars: None,
         frozen_pr: None,
         mcp_event: None,
+        watch: None,
         detail: format!("{branch} advanced {start}..{end}"),
     })
 }
@@ -681,6 +778,7 @@ fn evaluate_stage(rule: &AutomationDef, context: &AutomationEvalContext) -> Opti
         frozen_vars: None,
         frozen_pr: None,
         mcp_event: None,
+        watch: None,
         detail: format!("{} deployed {start}..{end}", stage.as_str()),
     })
 }
@@ -738,6 +836,7 @@ fn evaluate_mcp(
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: Some(event.clone()),
+            watch: None,
             detail: wt_core::sanitize_terminal_text(&detail),
         });
     }
@@ -922,6 +1021,7 @@ fn single(rule: &AutomationDef, row: &AutomationRow, key: String, detail: &str) 
         frozen_vars: None,
         frozen_pr: None,
         mcp_event: None,
+        watch: None,
         detail: detail.to_owned(),
     }
 }
@@ -1761,5 +1861,79 @@ mod tests {
         let mut context = context;
         context.pauses.slugs.insert("feature-1".into());
         assert!(evaluate_breaker_resets(&[local], &[row], &context).is_empty());
+    }
+
+    fn met_watch(id: &str, slug: &str, actions: &[WatchAction]) -> crate::types::MetWatch {
+        crate::types::MetWatch {
+            id: id.into(),
+            slug: slug.into(),
+            by: "manager".into(),
+            held: "#12 merged".into(),
+            actions: actions
+                .iter()
+                .map(|action| (*action, "text".to_owned()))
+                .collect(),
+            cleared_gate: None,
+        }
+    }
+
+    #[test]
+    fn a_met_watch_fires_once_per_owed_action_without_any_rule() {
+        let live = AutomationRow {
+            slug: "one".into(),
+            ..AutomationRow::default()
+        };
+        let mut context = AutomationEvalContext {
+            watches: vec![
+                met_watch("aaaaaa", "one", &WatchAction::ALL),
+                met_watch("bbbbbb", "one", &[WatchAction::Notify]),
+                // Its worktree is gone: telling the person still happens,
+                // waking a session cannot.
+                met_watch("cccccc", "gone", &[WatchAction::Notify, WatchAction::Wake]),
+            ],
+            ..AutomationEvalContext::default()
+        };
+        let fires = evaluate(&[], std::slice::from_ref(&live), &context);
+        let seen = |fires: &[AutomationFire]| {
+            fires
+                .iter()
+                .map(|fire| fire.fire_keys[0].clone())
+                .collect::<Vec<_>>()
+        };
+        // The wake waits until the same watch has cleared its gate.
+        assert_eq!(
+            seen(&fires),
+            [
+                "wt.watch:aaaaaa:unblock",
+                "wt.watch:aaaaaa:notify",
+                "wt.watch:bbbbbb:notify",
+                "wt.watch:cccccc:notify",
+            ]
+        );
+        assert!(fires.iter().all(|fire| fire.quiesce_slugs.is_empty()));
+        let identities: BTreeSet<_> = fires.iter().map(fire_identity).collect();
+        assert_eq!(identities.len(), fires.len());
+        assert_eq!(fires[0].detail, "unblock: #12 merged");
+        assert!(evaluate_breaker_resets(&[], std::slice::from_ref(&live), &context).is_empty());
+
+        context.watches[0].actions.remove(0);
+        let fires = evaluate(&[], std::slice::from_ref(&live), &context);
+        assert_eq!(fires[1].fire_keys, ["wt.watch:aaaaaa:wake"]);
+        assert_eq!(fires[1].quiesce_slugs, ["one"]);
+        let archived = AutomationRow {
+            archived: true,
+            ..live.clone()
+        };
+        assert!(
+            !seen(&evaluate(&[], &[archived], &context))
+                .contains(&"wt.watch:aaaaaa:wake".to_owned())
+        );
+
+        // A paused worktree holds everything of its watches.
+        context.pauses.slugs.insert("one".into());
+        assert_eq!(
+            seen(&evaluate(&[], &[live], &context)),
+            ["wt.watch:cccccc:notify"]
+        );
     }
 }

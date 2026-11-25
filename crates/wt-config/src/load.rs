@@ -345,6 +345,8 @@ impl Config {
         }
 
         let environments = parse_environments(&raw, &mut errors);
+        let checks = parse_checks(&raw, &mut errors);
+        let notify = parse_notify(&raw, &mut errors);
 
         let stage_raw: RawStage = section(&raw, "stage", &mut errors);
         let stage = StageConfig {
@@ -795,6 +797,8 @@ impl Config {
             resources,
             branch,
             environments,
+            checks,
+            notify,
             stage,
             lifecycle,
             backend: BackendConfig {
@@ -1265,6 +1269,87 @@ fn parse_environments(raw: &toml::Value, errors: &mut Vec<String>) -> Environmen
     environments
 }
 
+/// `[[checks]]`: probes a watch names as `check:<id>`. The id is part of a
+/// condition's text, so it cannot hold the characters that delimit one.
+fn parse_checks(raw: &toml::Value, errors: &mut Vec<String>) -> Vec<CheckConfig> {
+    let Some(value) = raw.get("checks") else {
+        return Vec::new();
+    };
+    let Some(entries) = value.as_array() else {
+        errors.push("checks must be an array of [[checks]] tables".into());
+        return Vec::new();
+    };
+    let mut checks: Vec<CheckConfig> = Vec::new();
+    for (index, value) in entries.iter().enumerate() {
+        let tag = format!("checks[{index}]");
+        if !value.is_table() {
+            errors.push(format!("{tag} must be a table"));
+            continue;
+        }
+        let check: CheckConfig = match value.clone().try_into() {
+            Ok(check) => check,
+            Err(error) => {
+                errors.push(format!("{tag}: {error}"));
+                continue;
+            }
+        };
+        if check.id.is_empty()
+            || !check
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
+            errors.push(format!("{tag}.id is required and may hold only letters, digits, '-', '_' and '.' (it is written as check:<id>)"));
+            continue;
+        }
+        if checks.iter().any(|other| other.id == check.id) {
+            errors.push(format!("{tag}.id \"{}\" is duplicated", check.id));
+            continue;
+        }
+        if check.run.is_empty() || check.run.iter().any(|arg| arg.trim().is_empty()) {
+            errors.push(format!("{tag}.run must be an array of nonempty strings (argv, not a shell command) that exits 0 when the check holds and 1 when it does not yet"));
+            continue;
+        }
+        if check.every_seconds < CheckConfig::MIN_EVERY_SECONDS {
+            errors.push(format!(
+                "{tag}.every_seconds must be at least {}",
+                CheckConfig::MIN_EVERY_SECONDS
+            ));
+            continue;
+        }
+        if check.timeout_seconds == 0 {
+            errors.push(format!("{tag}.timeout_seconds must be a positive integer"));
+            continue;
+        }
+        checks.push(check);
+    }
+    checks
+}
+
+fn parse_notify(raw: &toml::Value, errors: &mut Vec<String>) -> NotifyConfig {
+    let Some(value) = raw.get("notify") else {
+        return NotifyConfig::default();
+    };
+    if !value.is_table() {
+        errors.push("notify must be a table".into());
+        return NotifyConfig::default();
+    }
+    let notify: NotifyConfig = match value.clone().try_into() {
+        Ok(notify) => notify,
+        Err(error) => {
+            errors.push(format!("notify: {error}"));
+            return NotifyConfig::default();
+        }
+    };
+    if notify.command.as_ref().is_some_and(|command| {
+        command.is_empty() || command.iter().any(|arg| arg.trim().is_empty())
+    }) {
+        errors.push("notify.command must be an array of nonempty strings (argv, not a shell command); {{title}} and {{body}} are replaced inside each argument".into());
+        return NotifyConfig::default();
+    }
+    notify
+}
+
 fn parse_automations(
     raw: &toml::Value,
     actions: &[ActionDef],
@@ -1306,6 +1391,10 @@ fn parse_automations(
             .get("on")
             .and_then(toml::Value::as_str)
             .unwrap_or_default();
+        if raw_on == WATCH_TRIGGER {
+            errors.push(format!("{tag}.on \"{WATCH_TRIGGER}\" is wt's own trigger for watches and cannot be configured: set one with `wt wake`, `wt notify` or `wt status --blocked-on ... --until`"));
+            continue;
+        }
         if !raw_on.is_empty() && parse_trigger(raw_on).is_none() {
             let id = value
                 .get("id")
@@ -1561,6 +1650,10 @@ fn parse_automations(
 
 const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verified, status.verification_due, status.verification_overdue, branch.advanced, stage.deployed, mcp.event";
 
+/// The implicit watch rule's trigger. `parse_trigger` does not know it, so
+/// no `[[automations]]` rule can carry it.
+const WATCH_TRIGGER: &str = "watch.met";
+
 fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
     let value = match value {
         "rabbit.unresolved" => "review_bot.unresolved",
@@ -1606,6 +1699,7 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::BranchAdvanced => "branch.advanced",
         AutomationTrigger::StageDeployed => "stage.deployed",
         AutomationTrigger::McpEvent => "mcp.event",
+        AutomationTrigger::WatchMet => WATCH_TRIGGER,
     }
 }
 fn default_settle(
@@ -1620,7 +1714,8 @@ fn default_settle(
         | AutomationTrigger::StatusReady
         | AutomationTrigger::StatusVerified
         | AutomationTrigger::StatusVerificationOverdue
-        | AutomationTrigger::McpEvent => 0.0,
+        | AutomationTrigger::McpEvent
+        | AutomationTrigger::WatchMet => 0.0,
         // With a deploy probe for every stage a check can come due on, the
         // trigger itself waits for the deploy and the settle only lets the
         // new release start serving.

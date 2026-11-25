@@ -42,6 +42,13 @@ pub struct PreparedAutomationFacts {
     pub github_fresh: bool,
     /// Exact branch set covered by that GitHub read.
     pub github_covered_branches: BTreeSet<String>,
+    /// What watches may ask of each live worktree. An unknown answer is
+    /// `None`, never `false`.
+    pub watch_rows: BTreeMap<String, wt_core::watch::RowFacts>,
+    /// The fleet's own pull requests by number, from the fresh GitHub read.
+    pub watch_prs: BTreeMap<u64, wt_core::watch::PrFacts>,
+    /// Each live worktree's branch, for a check's `{{branch}}`.
+    pub branches: BTreeMap<String, String>,
 }
 
 /// GitHub evidence older than this cannot prove a merge or drive a fire.
@@ -75,6 +82,8 @@ pub struct AutomationInputs<'a> {
 #[derive(Default)]
 pub struct PreparedLifecycleFacts {
     pub rows: BTreeMap<String, LifecycleFacts>,
+    /// Landing commits of the landed rows a watch belongs to.
+    pub landing_commits: BTreeMap<String, String>,
     pub errors: BTreeMap<String, String>,
     /// A live lifecycle operation owns some evidence; retry once it settles.
     pub deferred: bool,
@@ -97,19 +106,22 @@ pub async fn lifecycle_facts(
                 | wt_config::AutomationTrigger::WtCreated
         )
     });
-    if !required {
-        return Ok(PreparedLifecycleFacts::default());
-    }
     let (Some(snapshots), Some(metadata)) = (git, metadata) else {
         return Ok(PreparedLifecycleFacts::default());
     };
     let (state, _) = &**metadata;
+    // Without such a rule, only the worktrees a pending watch depends on
+    // are worth the Git calls.
+    let watched = wt_ops::lifecycle_ops::watch_wants(state);
+    if !required && watched.is_empty() {
+        return Ok(PreparedLifecycleFacts::default());
+    }
     let mut result = PreparedLifecycleFacts::default();
     let mut rows = Vec::new();
-    for snapshot in snapshots
-        .iter()
-        .filter(|snapshot| !snapshot.worktree.is_main)
-    {
+    for snapshot in snapshots.iter().filter(|snapshot| {
+        !snapshot.worktree.is_main
+            && (required || watched.contains_key(snapshot.worktree.target.slug()))
+    }) {
         let slug = snapshot.worktree.target.slug();
         // An accepted removal owns this checkout; its files may disappear at
         // any moment. A retired target contributes no facts and no error.
@@ -165,6 +177,7 @@ pub async fn lifecycle_facts(
         result.errors.insert(slug, error);
     }
     result.rows = plans.rows;
+    result.landing_commits = plans.landing_commits;
     Ok(result)
 }
 
@@ -220,6 +233,7 @@ pub async fn prepare(
         .collect::<Vec<_>>();
     let stacks = build_stack_index(&members, &ctx.config.branch.base);
     let mut rows = Vec::with_capacity(records.len());
+    let mut watch_rows = BTreeMap::new();
     let mut quiescence = BTreeMap::new();
     let mut paused_slugs = BTreeSet::new();
     for (slug, record) in state["slugs"].as_object().into_iter().flatten() {
@@ -310,6 +324,18 @@ pub async fn prepare(
         };
         let session_busy = session_busy(input.discoveries, input.inventory, &slug);
         let action_running = action_running(input.inventory, &slug);
+        watch_rows.insert(
+            slug.clone(),
+            watch_row(WatchRowInput {
+                created_at: stored["createdAt"].as_str(),
+                work: work.as_ref(),
+                pr: github.prs.get(&branch),
+                // GitHub read this branch just now: no PR is an answer.
+                pr_read: github_fresh && github_covered_branches.contains(&branch),
+                lifecycle: input.lifecycle.get(&slug).copied(),
+                separate_production: ctx.config.branch.separate_production(),
+            }),
+        );
         let row = AutomationRow {
             slug: slug.clone(),
             branch: branch.clone(),
@@ -450,6 +476,8 @@ pub async fn prepare(
                 })
             })
             .collect(),
+        // Set on every pass from the stored watches.
+        watches: Vec::new(),
     };
     context.local_day = OffsetDateTime::now_utc().date().to_string();
     let fires = evaluate(&ctx.config.automations, &rows, &context);
@@ -488,7 +516,80 @@ pub async fn prepare(
         globally_paused,
         github_fresh,
         github_covered_branches,
+        watch_rows,
+        watch_prs: if github_fresh {
+            github
+                .prs
+                .values()
+                .map(|pr| {
+                    (
+                        pr.number,
+                        wt_ops::watch_probe::pr_facts(&pr.state, pr.merge_commit_oid.clone()),
+                    )
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        },
+        branches: records
+            .iter()
+            .filter(|record| !record.is_main)
+            .map(|record| {
+                (
+                    record.target.slug().to_owned(),
+                    record.target.branch.clone(),
+                )
+            })
+            .collect(),
     })
+}
+
+struct WatchRowInput<'a> {
+    created_at: Option<&'a str>,
+    work: Option<&'a WorkStatusRecord>,
+    pr: Option<&'a wt_github::PullRequest>,
+    pr_read: bool,
+    /// `None` when no landing evidence was gathered for the row.
+    lifecycle: Option<LifecycleFacts>,
+    separate_production: bool,
+}
+
+/// One live worktree as watches see it, from the same landing the
+/// automations use. "Yes" needs proof; "no" needs both the local evidence
+/// and a fresh GitHub read of the branch, and is otherwise unknown.
+fn watch_row(input: WatchRowInput<'_>) -> wt_core::watch::RowFacts {
+    let pr_merged = input.pr_read && input.pr.is_some_and(|pr| pr.state == "MERGED");
+    let lifecycle = input.lifecycle.unwrap_or_default();
+    let base = lifecycle.local_merged == Some(true) || pr_merged;
+    let landing = wt_core::Landing::new(base, lifecycle.in_production, input.separate_production)
+        .with_deploys(lifecycle.deploys);
+    let can_deny = input.lifecycle.is_some() && input.pr_read;
+    let answer = |holds: bool| holds.then_some(true).or(can_deny.then_some(false));
+    // Without landing evidence the deploy proof is missing too.
+    let reached = |stage| input.lifecycle.and_then(|_| answer(landing.reached(stage)));
+    wt_core::watch::RowFacts {
+        exists: true,
+        incarnation: input.created_at.map(str::to_owned),
+        merged: answer(base),
+        staging: reached(wt_core::VerifyStage::Staging),
+        production: reached(wt_core::VerifyStage::Production),
+        ready: Some(input.work.is_some_and(|work| {
+            work.state == wt_core::WorkState::Ready && !wt_automations::status_is_gated(work)
+        })),
+        green: input.pr_read.then(|| {
+            input
+                .pr
+                .is_some_and(|pr| pr.state == "OPEN" && pr.checks == wt_github::PrChecks::Pass)
+        }),
+        verified: Some(
+            input
+                .work
+                .is_some_and(|work| work.state == wt_core::WorkState::Verified),
+        ),
+        closed: input
+            .pr_read
+            .then(|| input.pr.is_some_and(|pr| pr.state == "CLOSED")),
+    }
 }
 
 fn latest_session_activity_ms(
@@ -867,6 +968,7 @@ mod tests {
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: String::new(),
         };
         for run in [
@@ -967,6 +1069,7 @@ mod tests {
             frozen_vars: Some(BTreeMap::from([("pr".into(), "3092".into())])),
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: String::new(),
         };
         let mut facts = PreparedAutomationFacts::default();
@@ -1005,6 +1108,7 @@ mod tests {
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: String::new(),
         };
         let mut actions = [wt_config::ActionDef {

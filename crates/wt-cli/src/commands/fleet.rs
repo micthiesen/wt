@@ -27,7 +27,8 @@ pub struct FleetArgs {
     pub slugs: Vec<String>,
     /// Print one object per worktree: kind (live, merged, removed), slug,
     /// branch, path, base, section, work (state, risk, note, blocked_on,
-    /// verify_after_merge, verify_in), edges, dirty, session, merge_queue, and pr (number,
+    /// verify_after_merge, verify_in), watches (id, by, when, then, met_at),
+    /// edges, dirty, session, merge_queue, and pr (number,
     /// state, draft, checks, auto_merge, mergeable, merge_state, review_bot {state, unresolved,
     /// stale}, unresolved_threads, unresolved_human_threads). pr is null with
     /// pr_note set when GitHub is unreachable.
@@ -236,6 +237,8 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         })
         .unwrap_or_default();
     let mut reports = Vec::new();
+    let watches = wt_store::stored_watches(&state);
+    let clock = super::watch::clock();
     for row in rows {
         let slug = row.worktree.target.slug().to_owned();
         let worktree_state = state
@@ -354,6 +357,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             "path":row.worktree.target.path, "head":row.worktree.head_sha,
             "base":worktree_state.and_then(|record| record.get("baseBranch")).and_then(Value::as_str).unwrap_or(&ctx.config.branch.base),
             "section":section, "work":work, "edges":edges,
+            "watches":super::watch::watches_json(&watches, &slug, clock),
             "dirty":row.status.as_ref().map(|status| status.dirty),
             "session":{"alive":alive,"busy":busy,"last_activity":last_activity}, "session_note":session_note,
             "operation":operation,"operation_note":operation_note,

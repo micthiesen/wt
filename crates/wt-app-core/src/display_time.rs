@@ -244,6 +244,29 @@ pub fn local_time_components(_timestamp_ms: u64) -> Option<(i32, u8, u8, u8, u8,
     None
 }
 
+/// How many minutes the host's local time is ahead of UTC at that instant.
+/// Like [`local_time_components`], not for an input or render thread.
+#[cfg(unix)]
+pub fn local_utc_offset_minutes(timestamp_ms: u64) -> Option<i32> {
+    let seconds = i64::try_from(timestamp_ms / 1_000).ok()?;
+    #[cfg(target_pointer_width = "64")]
+    let seconds: libc::time_t = seconds;
+    #[cfg(not(target_pointer_width = "64"))]
+    let seconds: libc::time_t = seconds.try_into().ok()?;
+    let mut broken_down = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let result = unsafe { libc::localtime_r(&seconds, broken_down.as_mut_ptr()) };
+    if result.is_null() {
+        return None;
+    }
+    let broken_down = unsafe { broken_down.assume_init() };
+    i32::try_from(broken_down.tm_gmtoff / 60).ok()
+}
+
+#[cfg(not(unix))]
+pub fn local_utc_offset_minutes(_timestamp_ms: u64) -> Option<i32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

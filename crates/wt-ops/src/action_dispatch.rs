@@ -201,90 +201,154 @@ pub async fn dispatch_automation(
             else {
                 return AutomationOutcome::NotStarted;
             };
-            let Ok(route) = delivery_route(context, route_slug, cwd, branch, managed).await else {
-                return AutomationOutcome::NotStarted;
-            };
-            if route.target.remote || route.choice.source == SelectionSource::RemoteUnavailable {
-                return AutomationOutcome::NotStarted;
-            }
             let text = if manager_prefix {
                 format!("[re: {}] {prompt}", fire.slug)
             } else {
                 prompt
             };
-            let record = wt_app_core::harness::MessageRecord {
-                from: Some("wt"),
-                text: None,
+            let slot = if target == "manager" {
+                DeliverySlot::Manager
+            } else {
+                DeliverySlot::Session
             };
-            match AppHarness::new(context)
-                .send_recorded(&route, &text, None, false, record, context)
-                .await
-            {
-                Ok(outcome) => match outcome {
-                    HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
-                        delivered: Some(true),
-                        ..
-                    })
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::Queued(_))
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::CliQueued { .. })
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::Terminal {
-                        delivered: Some(true),
-                        ..
-                    })
-                    | HarnessMessageOutcome::OpenCode(_)
-                    | HarnessMessageOutcome::Pi(_) => AutomationOutcome::Delivered {
-                        slot: if target == "manager" {
-                            DeliverySlot::Manager
-                        } else {
-                            DeliverySlot::Session
-                        },
-                    },
-                    HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
-                        delivered: Some(false),
-                        ..
-                    })
-                    | HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
-                        delivered: None,
-                        ..
-                    })
-                    | HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
-                        maybe_submitted: true,
-                        ..
-                    })
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::Terminal {
-                        delivered: None | Some(false),
-                        ..
-                    })
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::Ambiguous { .. }) => {
-                        AutomationOutcome::Ambiguous {
-                            reason: "prompt may have been submitted; do not replay automatically"
-                                .into(),
-                            slot: if target == "manager" {
-                                DeliverySlot::Manager
-                            } else {
-                                DeliverySlot::Session
-                            },
-                        }
-                    }
-                    HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
-                        maybe_submitted: false,
-                        ..
-                    })
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::Failed { .. })
-                    | HarnessMessageOutcome::Codex(CodexMessageOutcome::NeedsTerminalFallback {
-                        ..
-                    }) => AutomationOutcome::NotStarted,
-                },
-                Err(_) => AutomationOutcome::Ambiguous {
-                    reason: "harness send failed after entering the delivery path".into(),
-                    slot: if target == "manager" {
-                        DeliverySlot::Manager
-                    } else {
-                        DeliverySlot::Session
-                    },
-                },
+            match deliver_prompt(context, route_slug, cwd, branch, managed, &text).await {
+                PromptDelivery::Delivered => AutomationOutcome::Delivered { slot },
+                PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous { reason, slot },
+                PromptDelivery::Unreachable(_) => AutomationOutcome::NotStarted,
             }
         }
+    }
+}
+
+/// How sending a prompt into a session ended.
+enum PromptDelivery {
+    Delivered,
+    /// The prompt may have been submitted; it must not be sent again.
+    Ambiguous(String),
+    /// Positive evidence that nothing was sent, and why.
+    Unreachable(String),
+}
+
+/// Send a prompt from wt to the session a route names. Shared by action
+/// prompts and watch wake-ups, so both resume sessions, respect harness
+/// slots and treat a lost reply the same way.
+async fn deliver_prompt(
+    context: &AppContext,
+    slug: String,
+    cwd: PathBuf,
+    branch: Option<String>,
+    managed: Option<String>,
+    text: &str,
+) -> PromptDelivery {
+    let route = match delivery_route(context, slug, cwd, branch, managed).await {
+        Ok(route) => route,
+        Err(error) => return PromptDelivery::Unreachable(format!("{error:#}")),
+    };
+    if route.target.remote || route.choice.source == SelectionSource::RemoteUnavailable {
+        return PromptDelivery::Unreachable("its session is on another host".into());
+    }
+    let record = wt_app_core::harness::MessageRecord {
+        from: Some("wt"),
+        text: None,
+    };
+    match AppHarness::new(context)
+        .send_recorded(&route, text, None, false, record, context)
+        .await
+    {
+        Ok(outcome) => match outcome {
+            HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
+                delivered: Some(true),
+                ..
+            })
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::Queued(_))
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::CliQueued { .. })
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::Terminal {
+                delivered: Some(true),
+                ..
+            })
+            | HarnessMessageOutcome::OpenCode(_)
+            | HarnessMessageOutcome::Pi(_) => PromptDelivery::Delivered,
+            HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
+                delivered: Some(false),
+                ..
+            })
+            | HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Sent {
+                delivered: None, ..
+            })
+            | HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
+                maybe_submitted: true,
+                ..
+            })
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::Terminal {
+                delivered: None | Some(false),
+                ..
+            })
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::Ambiguous { .. }) => {
+                PromptDelivery::Ambiguous(
+                    "prompt may have been submitted; do not replay automatically".into(),
+                )
+            }
+            HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
+                maybe_submitted: false,
+                reason,
+            })
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::Failed { reason })
+            | HarnessMessageOutcome::Codex(CodexMessageOutcome::NeedsTerminalFallback { reason }) => {
+                PromptDelivery::Unreachable(reason)
+            }
+        },
+        Err(_) => {
+            PromptDelivery::Ambiguous("harness send failed after entering the delivery path".into())
+        }
+    }
+}
+
+/// Send a watch's wake-up prompt to its worktree's session. A session that
+/// cannot be reached now defers the fire to the engine's backoff: nothing was
+/// sent, and trying again on every pass would only spin.
+pub async fn wake_session(
+    context: &AppContext,
+    slug: &str,
+    prompt: &str,
+) -> wt_app_core::automation_engine::AutomationOutcome {
+    use wt_app_core::automation_engine::{AutomationOutcome, DeliverySlot};
+    let defer = |reason: String| AutomationOutcome::Deferred {
+        reason,
+        frozen: Default::default(),
+    };
+    let row = match context.repository.inventory(&context.cancellation).await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|row| !row.is_main && row.target.slug() == slug),
+        Err(error) => return defer(format!("cannot list worktrees: {error:#}")),
+    };
+    let Some(row) = row else {
+        return defer(format!("{slug} has no worktree to wake"));
+    };
+    if matches!(
+        row.target.location(),
+        wt_core::WorktreeLocation::Remote { .. }
+    ) {
+        return defer(format!("{slug} is on another host"));
+    }
+    let delivery = deliver_prompt(
+        context,
+        slug.to_owned(),
+        PathBuf::from(&row.target.path),
+        Some(row.target.branch.clone()),
+        None,
+        prompt,
+    )
+    .await;
+    match delivery {
+        PromptDelivery::Delivered => AutomationOutcome::Delivered {
+            slot: DeliverySlot::Session,
+        },
+        PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous {
+            reason,
+            slot: DeliverySlot::Session,
+        },
+        PromptDelivery::Unreachable(reason) => defer(format!("cannot reach its session: {reason}")),
     }
 }
 

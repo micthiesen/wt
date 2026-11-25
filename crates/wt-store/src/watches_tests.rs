@@ -799,3 +799,53 @@ fn an_earlier_incarnations_removal_record_says_nothing_about_a_later_watch() {
         .unwrap();
     assert_eq!(dropped.len(), 1);
 }
+
+#[test]
+fn a_cleared_gate_is_remembered_and_an_action_that_cannot_happen_is_given_up() {
+    let (_temp, mut store) = store();
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #7"))))
+        .unwrap();
+    let both = || {
+        then(|then| {
+            then.unblock = Some("after #7".into());
+            then.wake = Some("test it".into());
+        })
+    };
+    let watch = add(&mut store, "one", &["#7"], both());
+    assert_eq!(crate::cleared_gate(&watch), None);
+    store
+        .complete_action(&watch.id, WatchAction::Unblock)
+        .unwrap();
+    let left = store.list_watches(None).unwrap().remove(0);
+    assert_eq!(crate::cleared_gate(&left), Some("after #7"));
+    store.complete_action(&watch.id, WatchAction::Wake).unwrap();
+
+    // The gate was rewritten after the watch was met: the unblock is given
+    // up, the wake is still owed and says nothing of a cleared gate.
+    let watch = add(&mut store, "one", &["#7"], both());
+    assert!(
+        store
+            .abandon_action(&watch.id, WatchAction::Unblock, "the gate changed")
+            .unwrap()
+    );
+    assert!(
+        !store
+            .abandon_action(&watch.id, WatchAction::Unblock, "the gate changed")
+            .unwrap()
+    );
+    let left = store.list_watches(None).unwrap().remove(0);
+    assert_eq!(
+        left.then.remaining().collect::<Vec<_>>(),
+        [WatchAction::Wake]
+    );
+    assert_eq!(crate::cleared_gate(&left), None);
+    assert_eq!(
+        watch_events(&store, "one").last().unwrap(),
+        &(
+            WatchChange::Dropped,
+            left.summary(),
+            Some("the gate changed".to_owned())
+        )
+    );
+}

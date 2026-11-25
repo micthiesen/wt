@@ -156,6 +156,10 @@ const RECENT_HISTORY: usize = 10;
 pub struct AutomationTick {
     pub pending: usize,
     pub claims: Vec<ClaimedFire>,
+    /// Watch actions the ledger shows ended while the watch still lists
+    /// them: the process stopped between recording the fire and updating the
+    /// watch. The caller removes each from its watch.
+    pub settled_watches: Vec<(String, wt_core::watch::WatchAction)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,7 +252,7 @@ impl AutomationEngine {
             .active
             .values()
             .map(|active| RunningFire {
-                rule: active.fire.rule.id.clone(),
+                rule: shown_rule(&active.fire),
                 target: pair_target(&active.fire),
                 detail: active.fire.detail.clone(),
                 since_ms: match &active.slot {
@@ -292,7 +296,7 @@ impl AutomationEngine {
             .iter()
             .filter(|(id, _)| !self.unmet.contains(*id))
             .map(|(id, intent)| QueuedFire {
-                rule: intent.fire.rule.id.clone(),
+                rule: shown_rule(&intent.fire),
                 target: pair_target(&intent.fire),
                 detail: intent.fire.detail.clone(),
                 queued_at_ms: intent.queued_at_ms,
@@ -473,6 +477,16 @@ impl AutomationEngine {
             |key| ledger.recorded_within(key, input.now_ms, LOCAL_SIGHTING_WINDOW_MS),
         );
         let executing = self.active.keys().cloned().collect::<BTreeSet<_>>();
+        for fire in &current {
+            if let Some(watch) = &fire.watch
+                && !executing.contains(&fire_identity(fire))
+                && fire.fire_keys.iter().all(|key| ledger.settled(key))
+            {
+                report
+                    .settled_watches
+                    .push((watch.id.clone(), watch.action));
+            }
+        }
         let deferred = self.deferrals.keys().cloned().collect::<BTreeSet<_>>();
         let intents = queue_intents(QueueIntentsInput {
             existing: &existing,
@@ -490,6 +504,26 @@ impl AutomationEngine {
             .into_iter()
             .map(|intent| (fire_identity(&intent.fire), intent))
             .collect();
+        // A watch fire comes from its watch on every pass. One that no
+        // longer does (cancelled, or held by a paused worktree) starts over
+        // when it returns, so its stored deferral would only be restored at
+        // each start and never cleared.
+        let stale = existing
+            .iter()
+            .filter(|intent| intent.fire.watch.is_some())
+            .map(|intent| fire_identity(&intent.fire))
+            .filter(|id| {
+                self.deferrals.contains_key(id)
+                    && !self.intents.contains_key(id)
+                    && !self.active.contains_key(id)
+            })
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.ledger
+                .clear_deferred(&id, &self.cancellation)
+                .await
+                .context("clear a withdrawn watch fire's deferral")?;
+        }
         self.deferrals
             .retain(|id, _| self.intents.contains_key(id) || self.active.contains_key(id));
 
@@ -639,7 +673,8 @@ impl AutomationEngine {
                 continue;
             }
 
-            let quiesce_exempt = breaker_exempt;
+            // A wake is a prompt into a session and waits for it like one.
+            let quiesce_exempt = breaker_exempt && !is_wake(&fire);
             if !quiesce_exempt && let Some(reason) = quiesce_block_reason(&fire, &input) {
                 if rule.busy == AutomationBusyPolicy::Skip {
                     self.ledger
@@ -1049,6 +1084,22 @@ impl AutomationEngine {
     }
 }
 
+fn is_wake(fire: &AutomationFire) -> bool {
+    fire.watch
+        .as_ref()
+        .is_some_and(|watch| watch.action == wt_core::watch::WatchAction::Wake)
+}
+
+/// The rule name a person reads: every watch fire runs under one implicit
+/// rule whose id says nothing.
+fn shown_rule(fire: &AutomationFire) -> String {
+    if fire.watch.is_some() {
+        "watch".into()
+    } else {
+        fire.rule.id.clone()
+    }
+}
+
 fn pair_target(fire: &AutomationFire) -> String {
     fire.stack_id.clone().unwrap_or_else(|| fire.slug.clone())
 }
@@ -1073,6 +1124,8 @@ fn breaker_exempt(fire: &AutomationFire, manager_run: bool) -> bool {
         // Each event is a distinct occurrence, and the server leaves out the
         // agents' own writes, so a reply cannot wake its sender in a loop.
         || fire.rule.on == wt_config::AutomationTrigger::McpEvent
+        // A watch is met once and each of its actions is delivered once.
+        || fire.watch.is_some()
         || fire.rule.run == "builtin:notify"
         || fire.rule.run == "builtin:close-issue"
         || fire.rule.run == "builtin:delete-branch"
@@ -1969,5 +2022,407 @@ mod tests {
             .await
             .unwrap();
         assert!(next.claims.is_empty());
+    }
+
+    use wt_automations::MetWatch;
+    use wt_core::watch::{WatchAction, action_key};
+
+    fn met(id: &str, actions: &[(WatchAction, &str)]) -> MetWatch {
+        MetWatch {
+            id: id.into(),
+            slug: "worktree".into(),
+            by: "worktree".into(),
+            held: "17:00 today".into(),
+            actions: actions
+                .iter()
+                .map(|(action, text)| (*action, (*text).to_owned()))
+                .collect(),
+            cleared_gate: None,
+        }
+    }
+
+    fn watching(watches: Vec<MetWatch>) -> AutomationEvalContext {
+        AutomationEvalContext {
+            watches,
+            ..AutomationEvalContext::default()
+        }
+    }
+
+    fn busy_session() -> BTreeMap<String, WorktreeQuiescence> {
+        BTreeMap::from([(
+            "worktree".to_owned(),
+            WorktreeQuiescence {
+                session_busy: true,
+                ..WorktreeQuiescence::default()
+            },
+        )])
+    }
+
+    const DONE: AutomationOutcome = AutomationOutcome::Delivered {
+        slot: DeliverySlot::None,
+    };
+
+    /// Watches need no configured rule, and several on one worktree are
+    /// separate fires: none replaces another in the queue.
+    #[tokio::test]
+    async fn three_met_watches_on_one_worktree_each_deliver() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rows = [row()];
+        let context = watching(
+            ["aaaaaa", "bbbbbb", "cccccc"]
+                .map(|id| met(id, &[(WatchAction::Notify, "")]))
+                .to_vec(),
+        );
+        let (requirements, quiescence, activity) =
+            (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let mut delivered = Vec::new();
+        for step in 0..3 {
+            let tick = engine
+                .tick(input(
+                    &[],
+                    &rows,
+                    &context,
+                    &requirements,
+                    &quiescence,
+                    &activity,
+                    start + step,
+                ))
+                .await
+                .unwrap();
+            for claim in &tick.claims {
+                assert_eq!(claim.fire().rule.run, "builtin:watch");
+                delivered.push(claim.fire().watch.clone().unwrap().id);
+                engine.finish(claim, DONE, start + step).await.unwrap();
+            }
+        }
+        delivered.sort();
+        assert_eq!(delivered, ["aaaaaa", "bbbbbb", "cccccc"]);
+        let snapshot = ledger.snapshot().await.unwrap();
+        for id in &delivered {
+            assert!(snapshot.has_handled(&action_key(id, WatchAction::Notify), start + 3));
+        }
+        assert!(engine.queued().is_empty());
+    }
+
+    /// A pause and a cleared queue hold watch fires; neither writes their
+    /// keys, so the watch still delivers afterwards.
+    #[tokio::test]
+    async fn pausing_or_clearing_the_queue_consumes_no_watch_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rows = [row()];
+        let context = watching(vec![met(
+            "aaaaaa",
+            &[(WatchAction::Notify, ""), (WatchAction::Wake, "go")],
+        )]);
+        let (requirements, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let busy = busy_session();
+        let start = now_ms();
+        let keys =
+            [WatchAction::Notify, WatchAction::Wake].map(|action| action_key("aaaaaa", action));
+
+        let mut paused = input(&[], &rows, &context, &requirements, &busy, &activity, start);
+        paused.globally_paused = true;
+        let tick = engine.tick(paused).await.unwrap();
+        assert!(tick.claims.is_empty());
+        let snapshot = ledger.snapshot().await.unwrap();
+        assert!(keys.iter().all(|key| !snapshot.has_handled(key, start)));
+
+        // Resumed: the notification goes out although the session is busy,
+        // and the wake waits for it.
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &busy,
+                &activity,
+                start + 1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        assert_eq!(tick.claims[0].fire().fire_keys, [keys[0].clone()]);
+        engine
+            .finish(&tick.claims[0], DONE, start + 1)
+            .await
+            .unwrap();
+        let queued = engine.queued();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            (
+                queued[0].rule.as_str(),
+                queued[0].detail.as_str(),
+                queued[0].waiting_for.as_str()
+            ),
+            ("watch", "wake: 17:00 today", "session busy on worktree")
+        );
+
+        let cleared = engine
+            .cancel_pending(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &busy,
+                &activity,
+                start + 2,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared, 0);
+        assert!(
+            !ledger
+                .snapshot()
+                .await
+                .unwrap()
+                .has_handled(&keys[1], start + 2)
+        );
+
+        let idle = BTreeMap::new();
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 3,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        assert_eq!(tick.claims[0].fire().fire_keys, [keys[1].clone()]);
+        assert_eq!(tick.claims[0].fire().quiesce_slugs, ["worktree"]);
+    }
+
+    /// The process can stop after the ledger recorded a watch action and
+    /// before the watch dropped it. The next pass reports the action as
+    /// settled instead of leaving the watch met with nothing to deliver it,
+    /// and never while the delivery is still in flight.
+    #[tokio::test]
+    async fn a_watch_action_the_ledger_already_ended_is_reported_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rows = [row()];
+        let context = watching(vec![met("aaaaaa", &[(WatchAction::Notify, "")])]);
+        let (requirements, quiescence, activity) =
+            (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let pass = |now| {
+            input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                now,
+            )
+        };
+
+        let tick = engine.tick(pass(start)).await.unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        assert!(tick.settled_watches.is_empty());
+        let flying = engine.tick(pass(start + 1)).await.unwrap();
+        assert!(flying.claims.is_empty() && flying.settled_watches.is_empty());
+        engine
+            .finish(&tick.claims[0], DONE, start + 2)
+            .await
+            .unwrap();
+
+        // A new process: the ledger remembers, the watch record was never
+        // updated.
+        let mut restarted = AutomationEngine::new(ledger, CancellationToken::new());
+        let tick = restarted.tick(pass(start + 3)).await.unwrap();
+        assert!(tick.claims.is_empty());
+        assert_eq!(
+            tick.settled_watches,
+            [("aaaaaa".to_owned(), WatchAction::Notify)]
+        );
+    }
+
+    /// Clearing the gate needs nothing from the session, so it happens while
+    /// the session works. The wake comes after it and waits for the session.
+    #[tokio::test]
+    async fn a_gate_clears_while_the_session_is_busy_and_the_wake_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let rows = [row()];
+        let (requirements, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let busy = busy_session();
+        let start = now_ms();
+        let gated = watching(vec![met(
+            "aaaaaa",
+            &[
+                (WatchAction::Unblock, "the release"),
+                (WatchAction::Wake, "go"),
+            ],
+        )]);
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &gated,
+                &requirements,
+                &busy,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        let unblock = tick.claims[0].fire().watch.clone().unwrap();
+        assert_eq!(
+            (unblock.action, unblock.text.as_str()),
+            (WatchAction::Unblock, "the release")
+        );
+        assert!(tick.claims[0].fire().quiesce_slugs.is_empty());
+        engine.finish(&tick.claims[0], DONE, start).await.unwrap();
+
+        let mut cleared = met("aaaaaa", &[(WatchAction::Wake, "go")]);
+        cleared.cleared_gate = Some("the release".into());
+        let cleared = watching(vec![cleared]);
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &cleared,
+                &requirements,
+                &busy,
+                &activity,
+                start + 1,
+            ))
+            .await
+            .unwrap();
+        assert!(tick.claims.is_empty());
+        assert_eq!(engine.queued()[0].waiting_for, "session busy on worktree");
+
+        let idle = BTreeMap::new();
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &cleared,
+                &requirements,
+                &idle,
+                &activity,
+                start + 2,
+            ))
+            .await
+            .unwrap();
+        let wake = tick.claims[0].fire().watch.clone().unwrap();
+        assert_eq!(wake.action, WatchAction::Wake);
+        assert_eq!(wake.cleared_gate.as_deref(), Some("the release"));
+    }
+
+    /// A session that cannot be reached is tried again on the deferral
+    /// backoff, not on every pass, and the deferral survives a restart.
+    #[tokio::test]
+    async fn a_wake_that_cannot_reach_its_session_backs_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rows = [row()];
+        let context = watching(vec![met("aaaaaa", &[(WatchAction::Wake, "go")])]);
+        let (requirements, quiescence, activity) =
+            (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let pass = |now| {
+            input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                now,
+            )
+        };
+
+        let tick = engine.tick(pass(start)).await.unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        let unreachable = AutomationOutcome::Deferred {
+            reason: "no session can be reached".into(),
+            frozen: BTreeMap::new(),
+        };
+        engine
+            .finish(&tick.claims[0], unreachable.clone(), start)
+            .await
+            .unwrap();
+        for now in [start + 1_000, start + DEFER_RETRY_MS - 1] {
+            assert!(engine.tick(pass(now)).await.unwrap().claims.is_empty());
+        }
+        assert_eq!(
+            engine.queued()[0].waiting_for,
+            "a re-check: no session can be reached"
+        );
+        let key = action_key("aaaaaa", WatchAction::Wake);
+        assert!(!ledger.snapshot().await.unwrap().has_handled(&key, start));
+
+        let mut restarted = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert_eq!(restarted.restore_deferred(start + 2_000).await.unwrap(), 1);
+        assert!(
+            restarted
+                .tick(pass(start + 3_000))
+                .await
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        let retry = restarted
+            .tick(pass(start + 2_000 + DEFER_RETRY_MS))
+            .await
+            .unwrap();
+        assert_eq!(retry.claims.len(), 1);
+        assert_eq!(retry.claims[0].fire().watch.as_ref().unwrap().text, "go");
+
+        // Withdrawn while deferred (its watch was cancelled): the stored
+        // deferral goes too, so no later start restores it.
+        restarted
+            .finish(&retry.claims[0], unreachable, start + 40_000)
+            .await
+            .unwrap();
+        let none = watching(Vec::new());
+        restarted
+            .tick(input(
+                &[],
+                &rows,
+                &none,
+                &requirements,
+                &quiescence,
+                &activity,
+                start + 41_000,
+            ))
+            .await
+            .unwrap();
+        assert!(ledger.deferred().await.unwrap().is_empty());
+    }
+
+    /// Deferred fires written before watches existed still load, and one
+    /// carrying an action this build does not know is skipped, not run.
+    #[test]
+    fn stored_fires_load_across_builds() {
+        let context = watching(vec![met("aaaaaa", &[(WatchAction::Wake, "go")])]);
+        let fire = evaluate(&[], &[row()], &context).remove(0);
+        let mut stored = serde_json::to_value(&fire).unwrap();
+        assert_eq!(stored["watch"]["action"], "wake");
+        stored["watch"]["action"] = "teleport".into();
+        assert!(serde_json::from_value::<AutomationFire>(stored.clone()).is_err());
+        stored.as_object_mut().unwrap().remove("watch");
+        assert_eq!(
+            serde_json::from_value::<AutomationFire>(stored)
+                .unwrap()
+                .watch,
+            None
+        );
     }
 }

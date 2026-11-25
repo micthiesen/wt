@@ -100,6 +100,11 @@ pub fn cancellable_fires(input: CancellableFiresInput<'_>) -> Vec<AutomationFire
         if fire.mcp_event.is_some() {
             continue;
         }
+        // A watch is met once and its record waits in state the same way;
+        // a cancelled key would leave it met with nothing left to deliver it.
+        if fire.watch.is_some() {
+            continue;
+        }
         let id = fire_identity(&fire);
         if executing.contains(&id) {
             continue;
@@ -278,6 +283,7 @@ mod tests {
             frozen_vars: None,
             frozen_pr: None,
             mcp_event: None,
+            watch: None,
             detail: "test".into(),
         }
     }
@@ -386,5 +392,31 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    #[test]
+    fn a_watch_fire_is_never_cancellable() {
+        let mut watch = fire("wt.watch:aaaaaa:notify", "s");
+        watch.watch = Some(crate::types::WatchFire {
+            id: "aaaaaa".into(),
+            action: wt_core::watch::WatchAction::Notify,
+            by: "s".into(),
+            held: "merged".into(),
+            text: String::new(),
+            cleared_gate: None,
+        });
+        let pending = [watch, fire("a", "s")];
+        let cancellable = cancellable_fires(CancellableFiresInput {
+            paused: false,
+            state_ready: true,
+            rules: &[],
+            rows: &[],
+            context: &AutomationEvalContext::default(),
+            pending: &pending,
+            executing: &BTreeSet::new(),
+            handled: &BTreeSet::new(),
+        });
+        assert_eq!(cancellable.len(), 1);
+        assert_eq!(cancellable[0].fire_keys, ["a"]);
     }
 }

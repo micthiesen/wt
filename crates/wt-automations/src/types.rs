@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wt_config::{AutomationDef, AutomationTrigger};
-use wt_core::{WorkRisk, WorkState, WorkStatusRecord};
+use wt_core::{WorkRisk, WorkState, WorkStatusRecord, watch::WatchAction};
 
 /// Inputs are prepared by the application from current Git, GitHub and store
 /// snapshots. No source or persistence is touched by the evaluator.
@@ -108,6 +108,63 @@ pub struct GuideOwner {
     pub url: String,
 }
 
+/// A watch whose conditions held and whose owner is still the worktree it
+/// was set on (or has outlived it by design), with the actions it still owes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MetWatch {
+    pub id: String,
+    pub slug: String,
+    pub by: String,
+    /// The conditions that held, in words.
+    pub held: String,
+    /// What is still owed, in delivery order, each with its text.
+    pub actions: Vec<(WatchAction, String)>,
+    /// The gate this watch already cleared.
+    pub cleared_gate: Option<String>,
+}
+
+/// One action of a met watch, as its fire carries it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WatchFire {
+    pub id: String,
+    #[serde(with = "watch_action")]
+    pub action: WatchAction,
+    /// Who set the watch.
+    pub by: String,
+    /// The conditions that held, in words.
+    pub held: String,
+    /// The action's own text: the gate to clear, what to tell the person,
+    /// or the note for the session.
+    pub text: String,
+    /// The gate this watch cleared before waking the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_gate: Option<String>,
+}
+
+/// An action a newer build added fails to read, so the deferred fire that
+/// carries it is skipped instead of run as something else.
+mod watch_action {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+    use wt_core::watch::WatchAction;
+
+    pub fn serialize<S: Serializer>(
+        action: &WatchAction,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(action.as_str())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<WatchAction, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        WatchAction::ALL
+            .into_iter()
+            .find(|action| action.as_str() == name)
+            .ok_or_else(|| D::Error::custom(format!("unknown watch action {name:?}")))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AutomationEvalContext {
     pub github_fresh: bool,
@@ -129,6 +186,8 @@ pub struct AutomationEvalContext {
     pub mcp_events: Vec<McpEvent>,
     /// Live worktrees' recorded guides (`wt guide <url>`).
     pub guides: Vec<GuideOwner>,
+    /// Met watches with actions still owed.
+    pub watches: Vec<MetWatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -160,6 +219,10 @@ pub struct AutomationFire {
     /// The event an `mcp.event` fire delivers. A fire with no owning
     /// worktree has `slug == FLEET_SLUG` and goes to the manager.
     pub mcp_event: Option<McpEvent>,
+    /// The watch action a `watch.met` fire delivers. Absent from fires
+    /// persisted before watches existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchFire>,
     pub detail: String,
 }
 

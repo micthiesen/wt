@@ -30,6 +30,7 @@ pub mod state;
 pub mod status;
 pub mod title;
 pub mod update;
+pub mod watch;
 
 pub mod _action_worker;
 pub mod _claude_hook;

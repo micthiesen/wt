@@ -230,6 +230,22 @@ async fn restack(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecu
 
 async fn notify(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecution> {
     let title = format!("wt · {}", fire.slug);
+    if !desktop_notify(ctx, &title, &fire.detail).await? {
+        tracing::warn!(slug = %fire.slug, "automation notification skipped: desktop notifications are unsupported on this platform");
+        return Ok(BuiltinExecution::Completed {
+            message: format!(
+                "notification skipped for {}: unsupported platform",
+                fire.slug
+            ),
+        });
+    }
+    Ok(BuiltinExecution::Completed {
+        message: format!("notification sent for {}", fire.slug),
+    })
+}
+
+/// Show a desktop banner. `Ok(false)` when this platform has none.
+pub(crate) async fn desktop_notify(ctx: &AppContext, title: &str, body: &str) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
         let output = ctx
@@ -243,39 +259,33 @@ async fn notify(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecut
                     "-e",
                     "end run",
                     "--",
-                    &title,
-                    &fire.detail,
+                    title,
+                    body,
                 ]),
                 &ctx.cancellation,
             )
             .await?;
         output.checked("osascript")?;
+        Ok(true)
     }
     #[cfg(target_os = "linux")]
     {
         let output = ctx
             .processes
             .run(
-                // A detail starting with `-` must not parse as an option.
-                CommandSpec::new("notify-send").args(["--", &title, &fire.detail]),
+                // A body starting with `-` must not parse as an option.
+                CommandSpec::new("notify-send").args(["--", title, body]),
                 &ctx.cancellation,
             )
             .await?;
         output.checked("notify-send")?;
+        Ok(true)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        tracing::warn!(slug = %fire.slug, "automation notification skipped: desktop notifications are unsupported on this platform");
-        return Ok(BuiltinExecution::Completed {
-            message: format!(
-                "notification skipped for {}: unsupported platform",
-                fire.slug
-            ),
-        });
+        let _ = (ctx, title, body);
+        Ok(false)
     }
-    Ok(BuiltinExecution::Completed {
-        message: format!("notification sent for {}", fire.slug),
-    })
 }
 
 async fn close_issue(ctx: &AppContext, fire: &AutomationFire) -> Result<BuiltinExecution> {

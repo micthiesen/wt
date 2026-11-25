@@ -342,6 +342,16 @@ enum Command {
     Restore(commands::restore::RestoreArgs),
     /// Show or assert a worktree's work status.
     Status(commands::status::StatusArgs),
+    /// Wake this worktree's session once conditions hold.
+    ///
+    /// The session gets a prompt saying what held, with your note. Use it
+    /// instead of sleeping or polling: `wt wake '#3806:production' -m "run
+    /// the smoke test"`, `wt wake 17:00 -m "check the nightly job"`.
+    Wake(commands::watch::WakeArgs),
+    /// Tell the person once conditions hold.
+    Notify(commands::watch::NotifyArgs),
+    /// List, cancel or check watches: what worktrees are waiting for.
+    Watch(commands::watch::WatchArgs),
     /// Show, set or clear a recorded fork base.
     Base(commands::base::BaseArgs),
     /// Organize worktrees into named sections.
@@ -695,6 +705,9 @@ async fn dispatch_command(
         Command::Archive(args) => commands::archive::run(context, args).await,
         Command::Restore(args) => commands::restore::run(context, args).await,
         Command::Status(args) => commands::status::run(context, args).await,
+        Command::Wake(args) => commands::watch::run_wake(context, args).await,
+        Command::Notify(args) => commands::watch::run_notify(context, args).await,
+        Command::Watch(args) => commands::watch::run_watch(context, args).await,
         Command::Base(args) => commands::base::run(context, args).await,
         Command::Section(args) => wt_ops::commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,

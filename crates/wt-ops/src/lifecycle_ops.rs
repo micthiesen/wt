@@ -94,6 +94,56 @@ pub struct RemovalPlans {
 pub struct AutomationLifecycleEvidence {
     pub rows: BTreeMap<String, LifecycleFacts>,
     pub row_errors: BTreeMap<String, String>,
+    /// The commit that carried each landed row's work onto the base branch,
+    /// for the rows a watch belongs to: what the watch follows once the
+    /// worktree is removed.
+    pub landing_commits: BTreeMap<String, String>,
+}
+
+/// What pending watches need known about one worktree's landing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WatchWants {
+    pub staging: bool,
+    pub production: bool,
+}
+
+impl WatchWants {
+    fn stage(self, stage: wt_core::VerifyStage) -> bool {
+        match stage {
+            wt_core::VerifyStage::Staging => self.staging,
+            wt_core::VerifyStage::Production => self.production,
+        }
+    }
+}
+
+/// The worktrees pending watches depend on, by slug: every watch's owner,
+/// and each worktree a condition names, with the stages asked about.
+pub fn watch_wants(state: &serde_json::Value) -> BTreeMap<String, WatchWants> {
+    use wt_core::watch::{Condition, RowState};
+    let mut wants: BTreeMap<String, WatchWants> = BTreeMap::new();
+    for watch in wt_store::stored_watches(state) {
+        if watch.owner_gone {
+            continue;
+        }
+        wants.entry(watch.slug.clone()).or_default();
+        if watch.is_met() {
+            continue;
+        }
+        for cond in watch.when.iter().filter(|cond| !cond.latched) {
+            let (slug, state) = match &cond.cond {
+                Condition::Own(state) => (&watch.slug, *state),
+                Condition::Worktree { slug, state } => (slug, *state),
+                _ => continue,
+            };
+            let entry = wants.entry(slug.clone()).or_default();
+            match state {
+                RowState::Staging => entry.staging = true,
+                RowState::Production => entry.production = true,
+                _ => {}
+            }
+        }
+    }
+    wants
 }
 
 pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<RemovalPlans> {
@@ -180,6 +230,7 @@ pub async fn plan_automation_facts(
     let mut published_bases = BTreeMap::new();
     let mut warning = None;
     let mut evidence = AutomationLifecycleEvidence::default();
+    let wants = watch_wants(state);
     for row in rows {
         if row.is_main {
             continue;
@@ -222,28 +273,52 @@ pub async fn plan_automation_facts(
         };
         let separate_production = ctx.config.branch.separate_production();
         let owed_stage = owed_check_stage(stored).filter(|_| landing.landed());
+        // A watch asks the same questions an owed check does, of the stages
+        // its conditions name.
+        let watched = wants.get(&slug).copied().filter(|_| landing.landed());
+        let asked = |stage| {
+            owed_stage == Some(stage) || watched.is_some_and(|watched| watched.stage(stage))
+        };
         let in_production = separate_production
-            && owed_stage == Some(wt_core::VerifyStage::Production)
+            && asked(wt_core::VerifyStage::Production)
             && reached_production(ctx, &row, github).await;
+        let probed = [
+            wt_core::VerifyStage::Staging,
+            wt_core::VerifyStage::Production,
+        ]
+        .into_iter()
+        .filter(|stage| asked(*stage) && ctx.config.environments.get(*stage).is_some())
+        .collect::<Vec<_>>();
+        let commits = if watched.is_some() || !probed.is_empty() {
+            landing_commits(ctx, &row, github).await
+        } else {
+            None
+        };
         let mut deploys = wt_core::StageDeploys::default();
-        if let Some(stage) = owed_stage
-            && ctx.config.environments.get(stage).is_some()
-        {
+        for stage in probed {
             // A deploy cannot be ahead of the Git landing it ships.
             let landed = match stage {
                 wt_core::VerifyStage::Staging => true,
                 wt_core::VerifyStage::Production => in_production || !separate_production,
             };
             let deployed = landed
-                && match landing_commits(ctx, &row, github).await {
+                && match &commits {
                     Some(commits) => {
-                        crate::deploys::landing_deployed(ctx, stage, &commits, &ctx.cancellation)
+                        crate::deploys::landing_deployed(ctx, stage, commits, &ctx.cancellation)
                             .await
                             == Some(true)
                     }
                     None => false,
                 };
             deploys.set(stage, Some(deployed));
+        }
+        // The merge commit when the PR merged at HEAD, else HEAD itself.
+        if watched.is_some()
+            && let Some(commit) = commits.as_ref().and_then(|commits| commits.last())
+        {
+            evidence
+                .landing_commits
+                .insert(slug.clone(), commit.clone());
         }
         evidence.rows.insert(
             slug,
