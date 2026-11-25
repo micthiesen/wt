@@ -582,6 +582,15 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
                 | wt_core::WatchChange::Notified => theme::OK,
             },
         ),
+        Event::Owed { change, .. } => badge(
+            glyphs::WATCH,
+            match change {
+                wt_core::OwedChange::Due => theme::WARN,
+                wt_core::OwedChange::Done => theme::OK,
+                wt_core::OwedChange::Again => WAITING,
+                wt_core::OwedChange::Dropped => theme::FG_DIM,
+            },
+        ),
         Event::Unknown => return None,
     })
 }

@@ -93,6 +93,21 @@ pub fn sanitize(event: &mut WorktreeEventKind) {
             clean_some(reason);
             then.iter_mut().for_each(clean);
         }
+        WorktreeEventKind::Owed {
+            id,
+            what,
+            evidence,
+            by,
+            stage,
+            when,
+            change: _,
+            unconfirmed: _,
+        } => {
+            clean(what);
+            [id, evidence, by, stage, when]
+                .into_iter()
+                .for_each(clean_some);
+        }
         WorktreeEventKind::Skill { name, args, by } => {
             clean(name);
             clean_some(args);

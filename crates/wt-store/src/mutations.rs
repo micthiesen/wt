@@ -1214,12 +1214,14 @@ impl Store {
         record: Option<&WorkStatusRecord>,
     ) -> Result<bool, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
+            let discharged = crate::owed::discharged_by_an_older_build(state, slug);
             let previous = stored_work_status(state, slug);
             let written = write_work_status(state, slug, previous.as_ref(), record)?;
             let changed = written.changed;
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
+                    crate::owed::log_discharged(log, slug, &discharged)?;
                     log_status(log, slug, previous.as_ref(), record, None)?;
                     crate::watches::log_cancelled(
                         log,
@@ -1266,9 +1268,13 @@ impl Store {
         update: impl FnOnce(Option<&WorkStatusRecord>) -> Result<Option<WorkStatusRecord>, E>,
     ) -> Result<Result<WorkStatusWrite, E>, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
+            let discharged = crate::owed::discharged_by_an_older_build(state, slug);
             let previous = stored_work_status(state, slug);
             let record = match update(previous.as_ref()) {
-                Ok(record) => record,
+                Ok(record) => record.map(|mut record| {
+                    record.normalize();
+                    record
+                }),
                 Err(refusal) => return Ok((Err(refusal), false)),
             };
             let written = write_work_status(state, slug, previous.as_ref(), record.as_ref())?;
@@ -1276,6 +1282,7 @@ impl Store {
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
+                    crate::owed::log_discharged(log, slug, &discharged)?;
                     log_status(log, slug, previous.as_ref(), record.as_ref(), None)?;
                     crate::watches::log_cancelled(
                         log,
@@ -1827,7 +1834,12 @@ impl Store {
                     None => {}
                 }
                 for (key, value) in &incoming.extra {
-                    next.insert(key.clone(), value.clone());
+                    // What the row owes belongs to the record in the store:
+                    // a caller's copy of it may predate a check or a step
+                    // closed there since.
+                    if !crate::owed::REMOVED_OWNED.contains(&key.as_str()) {
+                        next.insert(key.clone(), value.clone());
+                    }
                 }
                 // These values can change while a removal confirmation or
                 // detached worker is pending. Refresh them from the current
@@ -1872,6 +1884,8 @@ impl Store {
                             .is_ok_and(|entry| is_merged_removal(&entry));
                     log.append(&incoming.slug, &WorktreeEventKind::Removed { landed })
                 });
+                crate::owed::settle_removed_checks(&mut next);
+                crate::owed::move_to_removed(state, &mut next);
                 crate::watches::owner_removed(state, &next, now_ms);
                 by_slug.insert(incoming.slug.clone(), Value::Object(next));
             }
@@ -1918,44 +1932,33 @@ impl Store {
         })
     }
 
-    /// Record the outcome of a post-merge check owed by a removed row. Only
-    /// a retained row that still owes verification is written; its removal
-    /// record is otherwise left exactly as it was.
+    /// Record the outcome of a post-merge check owed by a removed row, as
+    /// builds before per-stage checks did: one outcome for the row. Only a
+    /// retained row that still owes a check is written; its removal record
+    /// is otherwise left exactly as it was.
+    ///
+    /// A verified outcome closes the earliest stage's check, and is written
+    /// as the row's status once no check remains. A dropped outcome drops
+    /// every check. Any other outcome becomes the row's status and leaves
+    /// its checks owed. Prefer [`Store::close_removed_checks`], which names
+    /// the stages and records the evidence.
     pub fn settle_removed_verification(
         &mut self,
         slug: &str,
         outcome: &WorkStatusRecord,
     ) -> Result<RemovedSettle, StoreError> {
-        let value = serde_json::to_value(outcome)?;
-        self.mutate_wt_state_logged(|state, log| {
-            let removed = array_mut(state, "removed");
-            let Some(entry) = removed
-                .iter_mut()
-                .find(|entry| entry.get("slug").and_then(Value::as_str) == Some(slug))
-            else {
-                return Ok((RemovedSettle::Missing, false));
-            };
-            let parsed: RemovedWorktree = serde_json::from_value(entry.clone())?;
-            if !verification_owed_at_removal(&parsed) {
-                return Ok((RemovedSettle::NotOwed, false));
-            }
-            log.best_effort(|log| {
-                // The slug may name a new worktree by now. The outcome is
-                // about the removed one, so it is recorded only while that
-                // is still the slug's last incarnation.
-                if log.lifecycle(slug)?.is_some_and(|latest| !latest.removed) {
-                    return Ok(());
-                }
-                log_status(log, slug, parsed.work.as_ref(), Some(outcome), None)
-            });
-            let previous = parsed.work.and_then(|work| work.verify_after_merge);
-            entry["work"] = value;
-            Ok((
-                RemovedSettle::Settled {
-                    verify_after_merge: previous,
-                },
-                true,
-            ))
+        let targets = match outcome.state.as_str() {
+            "verified" => crate::CheckTargets::Earliest,
+            "dropped" => crate::CheckTargets::All,
+            _ => crate::CheckTargets::Stages(Vec::new()),
+        };
+        let closed = self.settle_removed(slug, &targets, outcome, None)?;
+        Ok(match closed {
+            crate::RemovedChecksClosed::Missing => RemovedSettle::Missing,
+            crate::RemovedChecksClosed::NotOwed => RemovedSettle::NotOwed,
+            crate::RemovedChecksClosed::Closed { closed, .. } => RemovedSettle::Settled {
+                verify_after_merge: closed.into_iter().next().map(|(_, check)| check.steps),
+            },
         })
     }
 
@@ -2051,13 +2054,7 @@ pub enum RemovedSettle {
 /// independent of whether the branch landed; absence of a status remains
 /// unknown rather than being interpreted as an obligation.
 pub fn verification_owed_at_removal(entry: &RemovedWorktree) -> bool {
-    entry.work.as_ref().is_some_and(|work| {
-        work.verify_after_merge
-            .as_ref()
-            .is_some_and(|steps| !steps.is_empty())
-            && work.state != "verified"
-            && work.state != "dropped"
-    })
+    !entry.open_checks().is_empty()
 }
 
 /// Set a section's fold flag. Returns whether the state changed.
@@ -2179,7 +2176,7 @@ fn object_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Map<String, Value>
         .expect("object shape established")
 }
 
-fn array_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
+pub(crate) fn array_mut<'a>(state: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
     if !state.get(key).is_some_and(Value::is_array) {
         state[key] = Value::Array(Vec::new());
     }
@@ -2408,6 +2405,8 @@ fn merge_optional(
                     "blockedOn",
                     "verifyAfterMerge",
                     "verifyIn",
+                    "checks",
+                    "checksMirror",
                 ],
             );
             target.insert(key.to_owned(), value);
@@ -2419,12 +2418,16 @@ fn merge_optional(
     }
 }
 
-fn stored_work_status(state: &WtState, slug: &str) -> Option<WorkStatusRecord> {
-    state
+/// The slug's status with its checks reconciled against what an older
+/// build may have written (see [`wt_core::normalize_checks`]).
+pub(crate) fn stored_work_status(state: &WtState, slug: &str) -> Option<WorkStatusRecord> {
+    let mut record = state
         .get("slugs")
         .and_then(|slugs| slugs.get(slug))
         .and_then(|slug| slug.get("work"))
-        .and_then(|value| serde_json::from_value::<WorkStatusRecord>(value.clone()).ok())
+        .and_then(|value| serde_json::from_value::<WorkStatusRecord>(value.clone()).ok())?;
+    record.normalize();
+    Some(record)
 }
 
 /// Open the slug's current incarnation in the log when its creation is not
@@ -2505,14 +2508,11 @@ fn work_state(record: &WorkStatusRecord) -> Option<wt_core::WorkState> {
     serde_json::from_value(json!(record.state)).ok()
 }
 
-/// Where the record's post-merge check is owed, if it owes one.
+/// Where the record's first post-merge check is owed, if it has one: the
+/// one stage a status event names.
 fn owed_stage(record: &WorkStatusRecord) -> Option<String> {
-    record
-        .verify_after_merge
-        .as_deref()
-        .is_some_and(|steps| !steps.trim().is_empty())
-        // Records from before the stage existed were due on the base landing.
-        .then(|| record.verify_in.clone().unwrap_or_else(|| "staging".into()))
+    let (stage, _) = record.all_checks().iter().next()?;
+    Some(stage.as_str().to_owned())
 }
 
 /// The person is recorded as no author.
@@ -2525,7 +2525,7 @@ fn author(by: Option<&str>) -> Option<String> {
 /// Record a status write that changed the claim's state, risk, merge gate or
 /// post-merge check. A change to the note alone is a re-assertion, not an
 /// event. `cleared_by` names who cleared a status, which has no record.
-fn log_status(
+pub(crate) fn log_status(
     log: &crate::events::EventLog<'_>,
     slug: &str,
     previous: Option<&WorkStatusRecord>,
@@ -2580,13 +2580,16 @@ pub(crate) fn clear_gate(
 }
 
 #[derive(Default)]
-struct StatusWritten {
-    changed: bool,
+pub(crate) struct StatusWritten {
+    pub(crate) changed: bool,
     /// Watches that were to clear a gate this write removed or replaced.
-    cancelled_watches: Vec<wt_core::watch::Watch>,
+    pub(crate) cancelled_watches: Vec<wt_core::watch::Watch>,
 }
 
-fn write_work_status(
+/// Write `record` as the slug's status. Its checks are normalized first, so
+/// a record that sets only the fields older builds know is stored with the
+/// check they name, and what is stored always mirrors its first check.
+pub(crate) fn write_work_status(
     state: &mut WtState,
     slug: &str,
     previous: Option<&WorkStatusRecord>,
@@ -2595,6 +2598,11 @@ fn write_work_status(
     if record.is_none() && !has_slug(state, slug) {
         return Ok(StatusWritten::default());
     }
+    let normalized = record.cloned().map(|mut record| {
+        record.normalize();
+        record
+    });
+    let record = normalized.as_ref();
     if let (Some(record), Some(previous)) = (record, previous)
         && previous.same_claim(record)
     {
@@ -2616,6 +2624,8 @@ fn write_work_status(
                 "blockedOn",
                 "verifyAfterMerge",
                 "verifyIn",
+                "checks",
+                "checksMirror",
             ],
         );
         entry.insert("work".to_owned(), next_work);

@@ -144,6 +144,7 @@ rows = ["issue", "branch", "git"]
 hidden_badges = ["dirty", "session"]
 sort = "manual"
 activity_pane = "full_width"
+owed_sections = true
 
 [skills]
 startup_check = false

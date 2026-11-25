@@ -71,6 +71,7 @@ async fn add(ctx: &AppContext, slug: String, state: &str, seen: Option<String>) 
             notify: Some(String::new()),
             ..WatchActions::default()
         },
+        before_release: false,
     };
     let added = ctx
         .database
@@ -182,6 +183,7 @@ mod tests {
                             notify: Some(String::new()),
                             ..WatchActions::default()
                         },
+                        before_release: false,
                     },
                     1,
                 )?)

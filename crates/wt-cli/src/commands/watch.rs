@@ -355,6 +355,7 @@ pub(crate) async fn set(
         utc_offset_minutes: clock.utc_offset_minutes,
         when,
         then,
+        before_release: false,
     };
     let added = ctx
         .database

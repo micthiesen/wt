@@ -10,14 +10,14 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 use wt_core::{
-    WatchChange, WorktreeEventKind,
+    OwedRecord, OwnerLanding, WatchChange, WorktreeEventKind,
     watch::{
         OwnerRemoval, WATCHES_MAX, WATCHES_PER_SLUG_MAX, Watch, WatchAction, WatchActions,
         WatchCondition, WatchStamps,
     },
 };
 
-use crate::{RemovedWorktree, Store, StoreError, WtState, events::EventLog};
+use crate::{RemovedWorktree, Store, StoreError, WakeCompletion, WtState, events::EventLog};
 
 const KEY: &str = "watches";
 const ID_ALPHABET: &[u8; 32] = b"abcdefghjkmnopqrstuvwxyz23456789";
@@ -38,6 +38,10 @@ pub struct NewWatch {
     pub utc_offset_minutes: i32,
     pub when: Vec<WatchCondition>,
     pub then: WatchActions,
+    /// What the watch wakes its session for must happen before the next
+    /// production release (`wt wake --before-release`). Kept with the watch
+    /// and carried to the due step it becomes.
+    pub before_release: bool,
 }
 
 /// Why [`Store::add_watch`] wrote nothing.
@@ -107,10 +111,6 @@ pub enum WatchSelector<'a> {
         slug: &'a str,
         by: &'a str,
     },
-    /// The watch that clears `slug`'s gate.
-    Gate {
-        slug: &'a str,
-    },
 }
 
 /// The watches in a state snapshot that this build can read.
@@ -145,113 +145,17 @@ impl Store {
 
     fn add_watch_checked(
         &mut self,
-        mut new: NewWatch,
+        new: NewWatch,
         now_ms: i64,
         seen: Option<Option<&str>>,
     ) -> Result<Result<Watch, WatchRefusal>, StoreError> {
         let candidates = candidate_ids()?;
         self.mutate_wt_state_logged(|state, log| {
-            let refuse = |refusal| Ok((Err(refusal), false));
-            if new.when.is_empty() {
-                return refuse(WatchRefusal::NoConditions);
-            }
-            if new.then.is_empty() {
-                return refuse(WatchRefusal::NoActions);
-            }
-            if let Some(incarnation) = seen
-                && created_at(state, &new.slug) != incarnation
-            {
-                return refuse(WatchRefusal::OwnerChanged);
-            }
-            if new.then.unblock.is_some() && new.then.wake.is_none() {
-                new.then.wake = entries(state)
-                    .iter()
-                    .filter(|entry| pending_gate(entry, &new.slug) == new.then.unblock.as_deref())
-                    .filter_map(read)
-                    .find_map(|replaced| replaced.then.wake);
-            }
-            let incarnation = created_at(state, &new.slug);
-            let same = entries(state).iter().filter_map(read).find(|watch| {
-                watch.slug == new.slug
-                    && watch.by == new.by
-                    && !watch.owner_gone
-                    && watch.owned_by(incarnation)
-                    && watch.then == new.then
-                    && watch
-                        .when
-                        .iter()
-                        .map(|cond| (&cond.cond, cond.delay))
-                        .eq(new.when.iter().map(|cond| (&cond.cond, cond.delay)))
-            });
-            if let Some(same) = same {
-                return refuse(WatchRefusal::AlreadySet {
-                    watch: Box::new(same),
-                });
-            }
-            let current = gate(state, &new.slug);
-            if new.then.unblock.is_some() && new.then.unblock.as_deref() != current {
-                return refuse(WatchRefusal::GateChanged {
-                    current: current.map(str::to_owned),
-                });
-            }
-            let (slug, clears_gate) = (new.slug.clone(), new.then.unblock.is_some());
-            let replaces = move |entry: &Value| clears_gate && pending_gate(entry, &slug).is_some();
-            let staying = || entries(state).iter().filter(|entry| !replaces(entry));
-            if staying()
-                .filter(|entry| text(entry, "slug") == Some(new.slug.as_str()))
-                .count()
-                >= WATCHES_PER_SLUG_MAX
-            {
-                return refuse(WatchRefusal::TooManyForSlug {
-                    slug: new.slug.clone(),
-                });
-            }
-            if staying().count() >= WATCHES_MAX {
-                return refuse(WatchRefusal::TooMany);
-            }
-            let unused = |id: &&String| {
-                !entries(state)
-                    .iter()
-                    .any(|entry| text(entry, "id") == Some(id.as_str()))
-            };
-            let Some(id) = candidates.iter().find(unused) else {
-                return Err(StoreError::Io(std::io::Error::other(
-                    "could not choose an unused watch id",
-                )));
-            };
-            let watch = Watch {
-                id: id.clone(),
-                incarnation: created_at(state, &new.slug).map(str::to_owned),
-                slug: new.slug,
-                by: new.by,
-                created_at_ms: now_ms,
-                utc_offset_minutes: new.utc_offset_minutes,
-                when: new.when,
-                then: new.then,
-                met_at_ms: None,
-                last_error: None,
-                owner_gone: false,
-                extra: Map::new(),
-            };
-            let replaced = remove_where(state, &replaces);
-            entries_mut(state).push(serde_json::to_value(&watch)?);
-            log.best_effort(|log| {
-                crate::mutations::log_incarnation(log, state, &watch.slug)?;
-                for replaced in replaced.iter().filter_map(read) {
-                    record(
-                        log,
-                        &replaced,
-                        WatchChange::Cancelled,
-                        Some(&watch.by),
-                        None,
-                    )?;
-                }
-                record(log, &watch, WatchChange::Set, Some(&watch.by), None)
-            });
-            Ok((Ok(watch), true))
+            let set = insert_watch(state, log, new, now_ms, seen, &candidates)?;
+            let changed = set.is_ok();
+            Ok((set, changed))
         })
     }
-
     /// The watches this build can read: all of them, or one worktree's.
     pub fn list_watches(&mut self, slug: Option<&str>) -> Result<Vec<Watch>, StoreError> {
         let mut watches = stored_watches(&self.read_wt_state()?);
@@ -273,9 +177,6 @@ impl Store {
                 }
                 WatchSelector::SetBy { slug, by } => {
                     text(entry, "slug") == Some(slug) && text(entry, "by") == Some(by)
-                }
-                WatchSelector::Gate { slug } => {
-                    text(entry, "slug") == Some(slug) && entry["then"]["unblock"].is_string()
                 }
             });
             let changed = !removed.is_empty();
@@ -358,14 +259,41 @@ impl Store {
     /// Record that one action of a watch is done: it is no longer owed, and
     /// a watch that owes nothing more is deleted. Returns whether the action
     /// was still owed, so a second call changes nothing.
+    ///
+    /// A wake completed here closes on delivery whatever its worktree has
+    /// landed. Whoever delivers a wake uses [`Self::complete_wake`], which
+    /// keeps it owed after landing.
     pub fn complete_action(&mut self, id: &str, action: WatchAction) -> Result<bool, StoreError> {
-        self.finish_action(id, action, false)
+        Ok(self.finish_action(id, action, false, None)? != WakeCompletion::NotOwed)
     }
 
     /// [`Self::complete_action`] for a wake that was sent without proof it
     /// reached the session. It is not sent again, and its history says so.
+    /// Like [`Self::complete_action`], it closes the wake on delivery.
     pub fn complete_unconfirmed_wake(&mut self, id: &str) -> Result<bool, StoreError> {
-        self.finish_action(id, WatchAction::Wake, true)
+        Ok(self.finish_action(id, WatchAction::Wake, true, None)? != WakeCompletion::NotOwed)
+    }
+
+    /// Record that a watch's wake was delivered. Delivery is not
+    /// completion: when the worktree's own work had landed (or may have:
+    /// `landing` unknown), the wake becomes a due step that stays owed
+    /// until it is closed with [`Self::close_owed`]. The wake leaves the
+    /// watch and the step is stored in one transaction, so no crash loses
+    /// both, and a second call finds nothing owed. A wake delivered before
+    /// landing closes here, as coordination always has.
+    ///
+    /// `unconfirmed` is a wake sent without proof it reached the session;
+    /// it is not sent again and the step and its history say so. `now_ms`
+    /// is when the step came due.
+    pub fn complete_wake(
+        &mut self,
+        id: &str,
+        landing: OwnerLanding,
+        unconfirmed: bool,
+        now_ms: i64,
+    ) -> Result<WakeCompletion, StoreError> {
+        let due = landing.owes().then_some(now_ms);
+        self.finish_action(id, WatchAction::Wake, unconfirmed, due)
     }
 
     fn finish_action(
@@ -373,19 +301,24 @@ impl Store {
         id: &str,
         action: WatchAction,
         unconfirmed: bool,
-    ) -> Result<bool, StoreError> {
+        due_at_ms: Option<i64>,
+    ) -> Result<WakeCompletion, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
             let Some(index) = entries(state)
                 .iter()
                 .position(|entry| text(entry, "id") == Some(id))
             else {
-                return Ok((false, false));
+                return Ok((WakeCompletion::NotOwed, false));
             };
             let Some(mut watch) = read(&entries(state)[index]) else {
-                return Ok((false, false));
+                return Ok((WakeCompletion::NotOwed, false));
             };
+            // A watch that outlived its worktree has no row left to owe it.
+            let step = due_at_ms
+                .filter(|_| !watch.owner_gone)
+                .and_then(|due_at_ms| OwedRecord::from_wake(&watch, due_at_ms, unconfirmed));
             let Some(text) = watch.then.take(action) else {
-                return Ok((false, false));
+                return Ok((WakeCompletion::NotOwed, false));
             };
             // The wake that follows tells the session its gate is gone.
             if action == WatchAction::Unblock {
@@ -403,8 +336,13 @@ impl Store {
                 WatchAction::Notify => WatchChange::Notified,
                 WatchAction::Wake => WatchChange::Woken,
             };
-            log.best_effort(|log| record_event(log, &watch, change, None, None, unconfirmed));
-            Ok((true, true))
+            let Some(step) = step else {
+                log.best_effort(|log| record_event(log, &watch, change, None, None, unconfirmed));
+                return Ok((WakeCompletion::Closed, true));
+            };
+            let evicted = crate::owed::push_due(state, &step)?;
+            log.best_effort(|log| crate::owed::log_due(log, &step, &evicted));
+            Ok((WakeCompletion::Due(Box::new(step)), true))
         })
     }
 
@@ -470,6 +408,10 @@ impl Store {
     /// record says it landed, with its own-row conditions rewritten onto the
     /// landing commit. Every other ownerless watch is dropped, with a
     /// history event saying why. Returns the dropped watches.
+    ///
+    /// A due step whose worktree is gone moves onto that worktree's removal
+    /// record, where it can still be closed; with no such record retained
+    /// it is dropped, with a history event.
     pub fn drop_orphans(
         &mut self,
         live: &BTreeMap<String, Option<String>>,
@@ -518,7 +460,10 @@ impl Store {
             if changed {
                 *entries_mut(state) = kept;
             }
+            let (dropped_steps, steps_changed) = crate::owed::settle_orphans(state, live);
+            changed |= steps_changed;
             log.best_effort(|log| {
+                crate::owed::log_dropped(log, &dropped_steps, live)?;
                 dropped
                     .iter()
                     // The slug's history now belongs to a later worktree.
@@ -537,6 +482,118 @@ impl Store {
             Ok((dropped, changed))
         })
     }
+}
+
+/// Add a watch to `state` after every check [`Store::add_watch`] makes; the
+/// one place a watch is created. `seen` is the incarnation a menu showed,
+/// when the watch comes from one. Nothing is written when it refuses.
+pub(crate) fn insert_watch(
+    state: &mut WtState,
+    log: &EventLog<'_>,
+    mut new: NewWatch,
+    now_ms: i64,
+    seen: Option<Option<&str>>,
+    candidates: &[String],
+) -> Result<Result<Watch, WatchRefusal>, StoreError> {
+    let refuse = |refusal| Ok(Err(refusal));
+    if new.when.is_empty() {
+        return refuse(WatchRefusal::NoConditions);
+    }
+    if new.then.is_empty() {
+        return refuse(WatchRefusal::NoActions);
+    }
+    if let Some(incarnation) = seen
+        && created_at(state, &new.slug) != incarnation
+    {
+        return refuse(WatchRefusal::OwnerChanged);
+    }
+    if new.then.unblock.is_some() && new.then.wake.is_none() {
+        new.then.wake = entries(state)
+            .iter()
+            .filter(|entry| pending_gate(entry, &new.slug) == new.then.unblock.as_deref())
+            .filter_map(read)
+            .find_map(|replaced| replaced.then.wake);
+    }
+    let incarnation = created_at(state, &new.slug);
+    let same = entries(state).iter().filter_map(read).find(|watch| {
+        watch.slug == new.slug
+            && watch.by == new.by
+            && !watch.owner_gone
+            && watch.owned_by(incarnation)
+            && watch.then == new.then
+            && watch
+                .when
+                .iter()
+                .map(|cond| (&cond.cond, cond.delay))
+                .eq(new.when.iter().map(|cond| (&cond.cond, cond.delay)))
+    });
+    if let Some(same) = same {
+        return refuse(WatchRefusal::AlreadySet {
+            watch: Box::new(same),
+        });
+    }
+    let current = gate(state, &new.slug);
+    if new.then.unblock.is_some() && new.then.unblock.as_deref() != current {
+        return refuse(WatchRefusal::GateChanged {
+            current: current.map(str::to_owned),
+        });
+    }
+    let (slug, clears_gate) = (new.slug.clone(), new.then.unblock.is_some());
+    let replaces = move |entry: &Value| clears_gate && pending_gate(entry, &slug).is_some();
+    let staying = || entries(state).iter().filter(|entry| !replaces(entry));
+    if staying()
+        .filter(|entry| text(entry, "slug") == Some(new.slug.as_str()))
+        .count()
+        >= WATCHES_PER_SLUG_MAX
+    {
+        return refuse(WatchRefusal::TooManyForSlug {
+            slug: new.slug.clone(),
+        });
+    }
+    if staying().count() >= WATCHES_MAX {
+        return refuse(WatchRefusal::TooMany);
+    }
+    let unused = |id: &&String| {
+        !entries(state)
+            .iter()
+            .any(|entry| text(entry, "id") == Some(id.as_str()))
+    };
+    let Some(id) = candidates.iter().find(unused) else {
+        return Err(StoreError::Io(std::io::Error::other(
+            "could not choose an unused watch id",
+        )));
+    };
+    let mut watch = Watch {
+        id: id.clone(),
+        incarnation: created_at(state, &new.slug).map(str::to_owned),
+        slug: new.slug,
+        by: new.by,
+        created_at_ms: now_ms,
+        utc_offset_minutes: new.utc_offset_minutes,
+        when: new.when,
+        then: new.then,
+        met_at_ms: None,
+        last_error: None,
+        owner_gone: false,
+        extra: Map::new(),
+    };
+    watch.set_before_release(new.before_release);
+    let replaced = remove_where(state, &replaces);
+    entries_mut(state).push(serde_json::to_value(&watch)?);
+    log.best_effort(|log| {
+        crate::mutations::log_incarnation(log, state, &watch.slug)?;
+        for replaced in replaced.iter().filter_map(read) {
+            record(
+                log,
+                &replaced,
+                WatchChange::Cancelled,
+                Some(&watch.by),
+                None,
+            )?;
+        }
+        record(log, &watch, WatchChange::Set, Some(&watch.by), None)
+    });
+    Ok(Ok(watch))
 }
 
 /// A removal is being recorded. When its record says the branch landed, the
@@ -728,7 +785,7 @@ fn record_event(
 /// Random ids to choose an unused one from. An id is typed by people and
 /// names the watch's fires in the automation ledger after the watch is gone,
 /// so it is short but not reused in practice.
-fn candidate_ids() -> Result<Vec<String>, StoreError> {
+pub(crate) fn candidate_ids() -> Result<Vec<String>, StoreError> {
     let mut bytes = [0u8; ID_LENGTH * 8];
     getrandom::fill(&mut bytes).map_err(|error| StoreError::Io(std::io::Error::other(error)))?;
     Ok(bytes

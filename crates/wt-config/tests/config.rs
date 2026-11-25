@@ -333,6 +333,7 @@ fn defaults_are_typed_and_repository_derived() {
     );
     assert_eq!(config.ui.sort, UiSort::Status);
     assert_eq!(config.ui.activity_pane, ActivityPane::Column);
+    assert!(!config.ui.owed_sections);
     assert_eq!(
         config.ui.rows,
         ["branch", "issue", "stage", "dev", "pr", "claude", "git"]
@@ -356,6 +357,28 @@ fn defaults_are_typed_and_repository_derived() {
         config.paths.state_db,
         config.paths.cache_root.join("wt.sqlite")
     );
+}
+
+#[test]
+fn owed_sections_are_opt_in_and_must_be_a_boolean() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let load = |ui: &str| {
+        let text = format!("{}\n[ui]\n{ui}\n", minimal_config(root.path()));
+        Config::from_raw(toml_value(&text), &options(root.path(), &home, &[]))
+    };
+    assert!(!load("").unwrap().ui.owed_sections);
+    assert!(!load("owed_sections = false").unwrap().ui.owed_sections);
+    let on = load("owed_sections = true\nsort = 'manual'").unwrap();
+    assert!(on.ui.owed_sections);
+    // The option leaves every other ui default alone.
+    assert_eq!(on.ui.sort, UiSort::Manual);
+    assert_eq!(on.ui.rows, load("").unwrap().ui.rows);
+    let error = load("owed_sections = 'yes'").unwrap_err().to_string();
+    assert!(error.contains("ui"), "{error}");
+    let fixture = toml_value(include_str!("fixtures/all-options.toml"));
+    assert_eq!(fixture["ui"]["owed_sections"].as_bool(), Some(true));
 }
 
 #[test]

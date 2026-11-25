@@ -7,6 +7,7 @@
 mod events;
 mod migrations;
 mod mutations;
+mod owed;
 mod store;
 mod titles;
 mod types;
@@ -23,6 +24,9 @@ pub use mutations::{
     BaseUpdate, ClearFailedRemoval, RemovedSettle, SeenToggle, is_merged_removal,
     verification_owed_at_removal, work_status_event,
 };
+pub use owed::{
+    CheckTargets, ChecksClosed, OwedClosed, RemovedChecksClosed, WakeCompletion, stored_owed,
+};
 pub use store::{Store, StoreError};
 pub use titles::{TitleSource, TitleWrite, sentence_case, stored_title};
 pub use types::{
@@ -35,6 +39,8 @@ pub use watches::{
 
 #[cfg(test)]
 mod events_tests;
+#[cfg(test)]
+mod owed_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

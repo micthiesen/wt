@@ -380,6 +380,7 @@ mod tests {
                                 wake: Some("verify".into()),
                                 ..Default::default()
                             },
+                            before_release: false,
                         },
                         1,
                     )?)

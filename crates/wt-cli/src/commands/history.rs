@@ -275,6 +275,11 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
                 None => format!("gave up waiting for {what}"),
             },
         },
+        owed @ WorktreeEventKind::Owed { by: who, .. } => format!(
+            "{}{}",
+            wt_core::owed_sentence(owed).unwrap_or_default(),
+            by_agent(who)
+        ),
         WorktreeEventKind::Skill {
             name,
             args,

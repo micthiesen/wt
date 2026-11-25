@@ -132,6 +132,37 @@ pub enum WorktreeEventKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unconfirmed: bool,
     },
+    /// Something the worktree owes after landing came due, was done, was
+    /// put off or was given up: a step it was woken for, or a post-merge
+    /// check.
+    Owed {
+        /// A step's id, as `wt done <id>` takes it. Absent for a check,
+        /// which is named by its `stage`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        change: OwedChange,
+        /// First line of what is owed: the step's prompt or the check's
+        /// steps.
+        what: String,
+        /// What was done and seen, given when it was closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<String>,
+        /// Who closed, re-armed or dropped it: a worktree slug, `manager`,
+        /// or `None` for the person and for wt itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        /// `staging` or `production` for a check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<String>,
+        /// What it waits for, in words: the conditions that held when it
+        /// came due, or the ones it was put off to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
+        /// It came due by a wake that was sent without proof it reached the
+        /// session.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unconfirmed: bool,
+    },
     /// A skill or slash command was used in the worktree's session, as its
     /// harness reported through `wt mark`.
     Skill {
@@ -173,6 +204,67 @@ pub enum WatchChange {
     Cancelled,
     /// wt gave it up; the event's `reason` says why.
     Dropped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwedChange {
+    /// It came due and stays owed until it is closed.
+    Due,
+    /// Closed with evidence.
+    Done,
+    /// Put off: it waits again.
+    Again,
+    /// Given up without being done.
+    Dropped,
+}
+
+/// How an owed event reads in one sentence: `due: <what> (wt done <id>)`,
+/// `done: <what>: <evidence>`, `again <when>: <what>`, `dropped: <what>`.
+/// A check is named by its stage. `kind` must be the `Owed` variant;
+/// anything else reads as nothing.
+pub fn owed_sentence(kind: &WorktreeEventKind) -> Option<String> {
+    let WorktreeEventKind::Owed {
+        id,
+        change,
+        what,
+        evidence,
+        stage,
+        when,
+        unconfirmed,
+        by: _,
+    } = kind
+    else {
+        return None;
+    };
+    let what = match stage {
+        Some(stage) => format!("{stage} check: {what}"),
+        None => what.clone(),
+    };
+    Some(match change {
+        OwedChange::Due => {
+            let close = id.as_deref().or(stage.as_deref());
+            let close = close.map(|target| format!(" (wt done {target})"));
+            let unsure = if *unconfirmed {
+                "; wake sent, delivery not confirmed"
+            } else {
+                ""
+            };
+            format!("due: {what}{}{unsure}", close.unwrap_or_default())
+        }
+        OwedChange::Done => match evidence {
+            Some(evidence) => format!("done: {what}: {evidence}"),
+            None => format!("done: {what}"),
+        },
+        OwedChange::Again => match when {
+            Some(when) => format!("again {when}: {what}"),
+            None => format!("again: {what}"),
+        },
+        OwedChange::Dropped => match evidence {
+            Some(reason) => format!("dropped: {what}: {reason}"),
+            None => format!("dropped: {what}"),
+        },
+    })
 }
 
 impl WatchChange {
@@ -919,5 +1011,58 @@ mod tests {
         let cut = event_text(&long);
         assert_eq!(cut.chars().count(), EVENT_TEXT_MAX);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn owed_events_read_as_one_sentence_each() {
+        let owed = |id: Option<&str>, change, stage: Option<&str>| WorktreeEventKind::Owed {
+            id: id.map(str::to_owned),
+            change,
+            what: "confirm prod logs".into(),
+            evidence: Some("saw 200s for an hour".into()),
+            by: Some("one".into()),
+            stage: stage.map(str::to_owned),
+            when: Some("at 17:00".into()),
+            unconfirmed: false,
+        };
+        let said = |event: &WorktreeEventKind| owed_sentence(event).unwrap();
+        assert_eq!(
+            said(&owed(Some("93co6q"), OwedChange::Due, None)),
+            "due: confirm prod logs (wt done 93co6q)"
+        );
+        assert_eq!(
+            said(&owed(None, OwedChange::Due, Some("staging"))),
+            "due: staging check: confirm prod logs (wt done staging)"
+        );
+        assert_eq!(
+            said(&owed(Some("93co6q"), OwedChange::Done, None)),
+            "done: confirm prod logs: saw 200s for an hour"
+        );
+        assert_eq!(
+            said(&owed(Some("93co6q"), OwedChange::Again, None)),
+            "again at 17:00: confirm prod logs"
+        );
+        let mut dropped = owed(Some("93co6q"), OwedChange::Dropped, None);
+        if let WorktreeEventKind::Owed { evidence, .. } = &mut dropped {
+            *evidence = None;
+        }
+        assert_eq!(said(&dropped), "dropped: confirm prod logs");
+        let mut unsure = owed(Some("93co6q"), OwedChange::Due, None);
+        if let WorktreeEventKind::Owed { unconfirmed, .. } = &mut unsure {
+            *unconfirmed = true;
+        }
+        assert_eq!(
+            said(&unsure),
+            "due: confirm prod logs (wt done 93co6q); wake sent, delivery not confirmed"
+        );
+        assert_eq!(owed_sentence(&WorktreeEventKind::Unknown), None);
+        // A build that does not know the kind skips it; this one reads it back.
+        let stored = serde_json::to_value(&unsure).unwrap();
+        assert_eq!(stored["kind"], "owed");
+        assert_eq!(stored["change"], "due");
+        assert_eq!(
+            serde_json::from_value::<WorktreeEventKind>(stored).unwrap(),
+            unsure
+        );
     }
 }

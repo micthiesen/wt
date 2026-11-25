@@ -459,6 +459,10 @@ fn show_event(
             body = Some(format!("\"{text}\""));
             "message".to_owned()
         }
+        owed @ Kind::Owed { by, .. } => {
+            meta.extend(named(by));
+            wt_core::owed_sentence(owed).unwrap_or_default()
+        }
         Kind::Skill { name, args, by } => {
             meta.extend(args.clone());
             // Unlike a status, who ran it is the point: the person typing

@@ -59,6 +59,7 @@ fn new(slug: &str, conditions: &[&str], then: WatchActions) -> NewWatch {
             .map(|arg| parse(arg, clock).unwrap())
             .collect(),
         then,
+        before_release: false,
     }
 }
 
@@ -598,27 +599,6 @@ fn a_gate_watch_lives_and_dies_with_the_gate_text_it_witnessed() {
         [(met.id.as_str(), Some("go on"))]
     );
     assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
-    store
-        .set_slug_work_status("one", Some(&status(None)))
-        .unwrap();
-
-    // The explicit cancel takes the gate's watch whatever its state.
-    assert_eq!(
-        store
-            .cancel_watches(WatchSelector::Gate { slug: "one" }, Some("one"))
-            .unwrap(),
-        []
-    );
-    store
-        .set_slug_work_status("one", Some(&status(Some("g"))))
-        .unwrap();
-    let last = add(&mut store, "one", &["#9"], gate("g"));
-    assert_eq!(
-        store
-            .cancel_watches(WatchSelector::Gate { slug: "one" }, Some("one"))
-            .unwrap(),
-        [last]
-    );
     let _ = third;
 }
 

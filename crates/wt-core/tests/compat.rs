@@ -5,7 +5,19 @@ fn work_status_matches_typescript_record_fixture() {
     let fixture: Value =
         serde_json::from_str(include_str!("../../../test/compat/work-status.json")).unwrap();
     let parsed = wt_core::parse_work_status(&fixture["input"]).unwrap();
-    assert_eq!(serde_json::to_value(parsed).unwrap(), fixture["expected"]);
+    let mut written = serde_json::to_value(parsed).unwrap();
+    // Rust also writes the per-stage checks the one legacy check mirrors.
+    // The reference fixture predates them.
+    let checks = written.as_object_mut().unwrap().remove("checks");
+    assert_eq!(
+        checks,
+        Some(json!({"staging": {"steps": "deploy to staging"}}))
+    );
+    assert_eq!(
+        written.as_object_mut().unwrap().remove("checksMirror"),
+        Some(json!("staging"))
+    );
+    assert_eq!(written, fixture["expected"]);
 }
 
 #[test]

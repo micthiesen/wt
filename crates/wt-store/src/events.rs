@@ -110,6 +110,19 @@ pub fn bound_worktree_event(event: &mut WorktreeEventKind) {
             some(reason);
             then.iter_mut().for_each(line);
         }
+        WorktreeEventKind::Owed {
+            id,
+            what,
+            evidence,
+            by,
+            stage,
+            when,
+            change: _,
+            unconfirmed: _,
+        } => {
+            line(what);
+            [id, evidence, by, stage, when].into_iter().for_each(some);
+        }
         WorktreeEventKind::Skill { name, args, by } => {
             line(name);
             some(args);

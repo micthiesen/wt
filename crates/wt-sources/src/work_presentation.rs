@@ -644,6 +644,8 @@ mod tests {
             note: Some("Keep the title".into()),
             blocked_on: Some("approval".into()),
             by: None,
+            checks: Default::default(),
+            checks_mirror: None,
             extra: Default::default(),
         });
         row.git.landed_on = Some(wt_tui::LandingKind::Base);

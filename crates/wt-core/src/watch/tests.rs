@@ -485,22 +485,39 @@ fn what_a_met_watch_did_reads_from_the_day_it_was_met() {
 }
 
 #[test]
-fn only_a_wake_still_owed_to_a_live_worktree_is_a_removal_hazard() {
+fn only_a_wake_still_owed_to_a_live_worktree_wakes_its_owner() {
     let mut watch = watch(&["#3806:production", "09:00"]);
-    assert_eq!(watch.wake_hazard(UTC), None);
+    assert!(!watch.wakes_owner());
     watch.then.wake = Some("\nRun the smoke test.\nThen report.".into());
+    assert!(watch.wakes_owner());
     assert_eq!(
-        watch.wake_hazard(UTC).as_deref(),
-        Some("pending wake-up: Run the smoke test. (#3806 in production and 09:00 tomorrow)")
+        when_described(&watch.when, UTC),
+        "when #3806 in production and 09:00 tomorrow"
     );
     // A gate that wakes afterwards counts; the gate alone does not.
     watch.then.unblock = Some("the release".into());
-    assert!(watch.wake_hazard(UTC).is_some());
+    assert!(watch.wakes_owner());
     watch.then.wake = None;
-    assert_eq!(watch.wake_hazard(UTC), None);
+    assert!(!watch.wakes_owner());
     watch.then.wake = Some("Report.".into());
     watch.owner_gone = true;
-    assert_eq!(watch.wake_hazard(UTC), None);
+    assert!(!watch.wakes_owner());
+}
+
+#[test]
+fn before_release_is_kept_beside_the_keys_older_builds_know() {
+    let mut watch = watch(&["staging"]);
+    assert!(!watch.before_release());
+    watch.set_before_release(true);
+    assert_eq!(serde_json::to_value(&watch).unwrap()["beforeRelease"], true);
+    assert!(watch.before_release());
+    watch.set_before_release(false);
+    assert!(
+        serde_json::to_value(&watch)
+            .unwrap()
+            .get("beforeRelease")
+            .is_none()
+    );
 }
 
 #[test]

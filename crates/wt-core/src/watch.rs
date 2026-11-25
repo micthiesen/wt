@@ -462,6 +462,7 @@ pub struct Watch {
 // Kept beside the record's other keys rather than as fields, so a build
 // that does not know them carries them through a rewrite like any other.
 const LANDING_COMMIT: &str = "landingCommit";
+const BEFORE_RELEASE: &str = "beforeRelease";
 const EVALUATED_AT: &str = "evaluatedAtMs";
 /// How often an engine records again that it judged a watch. Every stamp
 /// rewrites the state and wakes every process that reads it, and the
@@ -493,6 +494,28 @@ impl Watch {
     /// time, then about hourly. `None` until one has.
     pub fn evaluated_at_ms(&self) -> Option<i64> {
         self.extra.get(EVALUATED_AT)?.as_i64()
+    }
+
+    /// Whether what the watch wakes its session for must happen before the
+    /// next production release (`wt wake --before-release`). Listing and
+    /// display only.
+    pub fn before_release(&self) -> bool {
+        self.extra.get(BEFORE_RELEASE).and_then(Value::as_bool) == Some(true)
+    }
+
+    pub fn set_before_release(&mut self, before_release: bool) {
+        if before_release {
+            self.extra
+                .insert(BEFORE_RELEASE.to_owned(), Value::Bool(true));
+        } else {
+            self.extra.remove(BEFORE_RELEASE);
+        }
+    }
+
+    /// Whether the watch still owes its owner's session a wake. A watch
+    /// that outlived its owner wakes nobody.
+    pub fn wakes_owner(&self) -> bool {
+        self.then.wake.is_some() && !self.owner_gone
     }
 
     /// Whether any condition is about the owner's own row reaching a stage.
@@ -559,18 +582,6 @@ impl Watch {
         } else {
             format!("when {conditions}")
         }
-    }
-
-    /// What removing the owner's worktree would lose: a wake still owed to
-    /// its session, as a removal hazard. A watch that only tells the person
-    /// outlives the worktree and is none.
-    pub fn wake_hazard(&self, clock: LocalClock) -> Option<String> {
-        let prompt = self.then.wake.as_deref().filter(|_| !self.owner_gone)?;
-        Some(format!(
-            "{WAKE_HAZARD}: {} ({})",
-            headline(prompt),
-            self.describe(clock)
-        ))
     }
 
     fn join(&self, describe: impl Fn(&WatchCondition) -> String) -> String {
@@ -1081,8 +1092,31 @@ impl Local {
     }
 }
 
-/// How every [`Watch::wake_hazard`] starts.
-pub const WAKE_HAZARD: &str = "pending wake-up";
+/// An instant in words for a reader now: `17:00`, `09:00 tomorrow`,
+/// `Nov 26 17:00`.
+pub fn describe_instant(at_ms: i64, clock: LocalClock) -> String {
+    Local {
+        utc_offset_minutes: clock.utc_offset_minutes,
+        now_ms: Some(clock.now_ms),
+    }
+    .describe(at_ms)
+}
+
+/// Conditions in words for a reader now, led by their connective:
+/// `at 17:00` for one instant, `when merged and #3806 in production` for
+/// anything else.
+pub fn when_described(when: &[WatchCondition], clock: LocalClock) -> String {
+    let words = when
+        .iter()
+        .map(|cond| cond.describe(clock))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    if matches!(when, [only] if matches!(only.cond, Condition::At { .. })) {
+        format!("at {words}")
+    } else {
+        format!("when {words}")
+    }
+}
 
 /// Whether kept text names one instant as [`Watch::summary`] writes it:
 /// `17:00`, `09:00 tomorrow`, `Nov 26 17:00`, `Jan 2 09:00, 2027`, and

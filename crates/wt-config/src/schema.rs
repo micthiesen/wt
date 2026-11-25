@@ -700,6 +700,11 @@ pub struct UiConfig {
     pub hidden_badges: BTreeSet<String>,
     pub sort: UiSort,
     pub activity_pane: ActivityPane,
+    /// Show a landed row under what it still owes (due, waiting for a
+    /// stage, waiting, done) instead of its manual section. Off by default:
+    /// sections stay exactly as they were arranged. The stored section is
+    /// never changed, so turning this off restores the layout.
+    pub owed_sections: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

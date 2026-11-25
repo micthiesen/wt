@@ -277,7 +277,6 @@ struct CreateProgress {
 struct PriorSlugState {
     entry: Option<Value>,
     base: Option<(String, Option<String>)>,
-    work: Option<wt_store::WorkStatusRecord>,
     removed: Option<RemovedWorktree>,
 }
 
@@ -744,14 +743,22 @@ impl LifecycleService {
                 .as_ref()
                 .is_some_and(|removed| removed.branch == branch);
         let prior = progress.prior_state.insert(prior);
+        // What the removed row still owed comes back with it. The removal
+        // record is where a check or a step was closed after the removal,
+        // so it says what is owed now; the slug's old status does not.
+        let mut owed_steps = Vec::new();
         if restoring {
             let base = prior.base.clone();
-            let owed = prior.work.clone().filter(|work| {
-                work.verify_after_merge
-                    .as_deref()
-                    .is_some_and(|steps| !steps.trim().is_empty())
-                    && !matches!(work.state.as_str(), "verified" | "dropped")
-            });
+            let owed = prior
+                .removed
+                .as_ref()
+                .and_then(RemovedWorktree::work_with_checks)
+                .filter(|work| !work.open_checks().is_empty());
+            owed_steps = prior
+                .removed
+                .as_ref()
+                .map(RemovedWorktree::owed)
+                .unwrap_or_default();
             self.mutate_store(cancellation, {
                 let slug = slug.to_owned();
                 move |store| restore_slug_record(store, &slug, base, owed, None)
@@ -841,9 +848,10 @@ impl LifecycleService {
         self.mutate_store(cancellation, {
             let slug = slug.to_owned();
             move |store| {
-                store
-                    .record_slug_created_since(&slug, &created_at, began)
-                    .map(|_| ())
+                store.record_slug_created_since(&slug, &created_at, began)?;
+                // Due steps belong to an incarnation, so they are attached
+                // once this one has its creation stamp.
+                store.restore_owed(&slug, &owed_steps).map(|_| ())
             }
         })
         .await?;
@@ -1640,10 +1648,9 @@ impl LifecycleService {
             ));
         }
         if !options.force
-            && let Some(owed) = hazards.iter().find(|hazard| {
-                *hazard == OWED_VERIFICATION_HAZARD
-                    || hazard.starts_with(wt_core::watch::WAKE_HAZARD)
-            })
+            && let Some(owed) = hazards
+                .iter()
+                .find(|hazard| hazard.starts_with(wt_core::OWED_HAZARD))
         {
             return Err(LifecycleError::Refused(format!(
                 "{}: {owed}; explicit force is required",
@@ -2029,10 +2036,6 @@ impl LifecycleService {
                 let prior = PriorSlugState {
                     entry: entry.clone(),
                     base: field("baseBranch").map(|branch| (branch, field("baseSha"))),
-                    work: entry
-                        .as_ref()
-                        .and_then(|entry| entry.get("work"))
-                        .and_then(|work| serde_json::from_value(work.clone()).ok()),
                     removed: store
                         .read_removed_worktrees()?
                         .into_iter()
@@ -3255,19 +3258,16 @@ impl LifecycleService {
     }
 
     /// The hazards of a registration whose checkout is gone. Nothing in the
-    /// checkout can be read, but an owed post-merge check lives in the store
-    /// and is dropped with the row all the same.
+    /// checkout can be read, but what the row owes lives in the store and
+    /// goes with the row all the same.
     async fn missing_checkout_hazards(
         &self,
         row: &WorktreeRecord,
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>, LifecycleError> {
-        let (state, wakes) = self.read_owed(row.target.slug(), cancellation).await?;
+        let (_, owed) = self.read_owed(row.target.slug(), cancellation).await?;
         let mut hazards = vec![MISSING_CHECKOUT_HAZARD.to_owned()];
-        if owes_verification(state.as_ref()) {
-            hazards.push(OWED_VERIFICATION_HAZARD.to_owned());
-        }
-        hazards.extend(wakes);
+        hazards.extend(owed);
         Ok(hazards)
     }
 
@@ -3288,13 +3288,12 @@ impl LifecycleService {
             hazards.push(IN_PROGRESS_HAZARD.to_owned());
         }
         let slug = row.target.slug().to_owned();
-        let (state, wakes) = self.read_owed(&slug, cancellation).await?;
-        if owes_verification(state.as_ref()) {
-            hazards.push(OWED_VERIFICATION_HAZARD.to_owned());
-        }
-        // A wake is a promise its session made to come back. It dies with
-        // the worktree, so cleanup leaves the worktree until it is kept.
-        hazards.extend(wakes);
+        let (state, owed) = self.read_owed(&slug, cancellation).await?;
+        // A check not yet discharged, a wake its session asked for and a
+        // step that came due are promises to come back. They leave the live
+        // row with the worktree, so cleanup leaves the worktree until they
+        // are kept.
+        hazards.extend(owed);
         // Landing evidence covers what was pushed and merged. Commits beyond
         // the branch's own origin ref exist only here, landed or not, so a
         // planning-time `landed` claim never authorizes discarding them.
@@ -3579,7 +3578,8 @@ impl LifecycleService {
     }
 
     /// What the store holds that removing `slug` would drop: its entry, and
-    /// a hazard for each wake still owed to its session.
+    /// a hazard for each thing the worktree still owes
+    /// ([`wt_core::owes_anything`]).
     async fn read_owed(
         &self,
         slug: &str,
@@ -3598,19 +3598,28 @@ impl LifecycleService {
                 .as_ref()
                 .and_then(|state| state.get("createdAt"))
                 .and_then(Value::as_str);
-            let now_ms = now_ms();
-            let wakes = store
-                .list_watches(Some(&slug))?
-                .iter()
-                .filter(|watch| watch.owned_by(created_at))
-                .filter_map(|watch| {
-                    watch.wake_hazard(wt_core::watch::LocalClock {
-                        now_ms,
-                        utc_offset_minutes: watch.utc_offset_minutes,
-                    })
-                })
-                .collect();
-            Ok::<_, StoreError>((state, wakes))
+            let record = state
+                .as_ref()
+                .and_then(|state| wt_core::parse_work_status(&state["work"]));
+            let watches =
+                wt_core::owed::row_watches(&store.list_watches(Some(&slug))?, &slug, created_at);
+            let due = wt_core::owed::row_due(&store.list_owed(Some(&slug))?, &slug, created_at);
+            // Times read in the zone of whoever set the first of them.
+            let utc_offset_minutes = watches
+                .first()
+                .map(|watch| watch.utc_offset_minutes)
+                .or_else(|| due.first().map(|step| step.utc_offset_minutes))
+                .unwrap_or(0);
+            let owed = wt_core::owed_hazards(
+                record.as_ref(),
+                &watches,
+                &due,
+                wt_core::watch::LocalClock {
+                    now_ms: now_ms(),
+                    utc_offset_minutes,
+                },
+            );
+            Ok::<_, StoreError>((state, owed))
         })
         .await
         .map_err(|error| LifecycleError::Join(error.to_string()))?
@@ -3846,20 +3855,6 @@ fn exclusion_pathspecs(paths: &[String]) -> Result<Vec<OsString>, LifecycleError
         result.push(OsString::from(format!(":(exclude,literal){path}")));
     }
     Ok(result)
-}
-
-fn owes_verification(state: Option<&Value>) -> bool {
-    state
-        .and_then(|value| value.get("work"))
-        .is_some_and(|work| {
-            work.get("verifyAfterMerge")
-                .and_then(Value::as_str)
-                .is_some_and(|steps| !steps.trim().is_empty())
-                && !matches!(
-                    work.get("state").and_then(Value::as_str),
-                    Some("verified" | "dropped")
-                )
-        })
 }
 
 fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
@@ -4469,7 +4464,6 @@ pub const IN_PROGRESS_HAZARD: &str = "a rebase, merge or cherry-pick is in progr
 /// branch could not be checked for unpushed commits.
 pub const MISSING_CHECKOUT_HAZARD: &str =
     "the checkout is already gone, so its branch was not checked for unpushed commits";
-const OWED_VERIFICATION_HAZARD: &str = "post-merge verification still owed";
 /// Removal hazard for untracked content the removal witness pins only by
 /// name and stat data: a nested repository, a socket or FIFO, or a set too
 /// large or too slow to hash.
@@ -4550,7 +4544,9 @@ mod tests {
         assert!(is_lost_work_hazard(super::IN_PROGRESS_HAZARD));
         assert!(is_lost_work_hazard(&unpushed_hazard(1)));
         assert!(is_lost_work_hazard(&unpushed_hazard(12)));
-        assert!(!is_lost_work_hazard("post-merge verification still owed"));
+        assert!(!is_lost_work_hazard(
+            "still owes: check: open the page (in staging)"
+        ));
         assert!(!is_lost_work_hazard("could not verify pushed state"));
         let branch = super::unpushed_branch_hazard(2, "team/side", "0123456789abcdef");
         assert_eq!(
@@ -5079,6 +5075,144 @@ mod tests {
         assert_eq!(after["baseBranch"], before["baseBranch"]);
         assert_eq!(after["baseSha"], before["baseSha"]);
         assert_eq!(after["work"]["verifyAfterMerge"], "verify prod");
+    }
+
+    #[tokio::test]
+    async fn restoring_brings_back_what_the_removed_row_still_owes_and_nothing_it_closed() {
+        use wt_core::VerifyStage::{Production, Staging};
+        let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let options = || CreateOptions {
+            base: Some("refs/heads/main".into()),
+            fetch_origin: false,
+            run_install: false,
+        };
+        let created = service
+            .create("michael/owing", options(), &cancellation)
+            .await
+            .unwrap();
+        let step = service
+            .mutate_store(&cancellation, |store| {
+                let owed = owed_verification().with_check(Production, "watch prod");
+                store.set_slug_work_status("owing", Some(&owed))?;
+                let clock = wt_core::watch::LocalClock {
+                    now_ms: 0,
+                    utc_offset_minutes: 0,
+                };
+                let new = wt_store::NewWatch {
+                    slug: "owing".into(),
+                    by: "owing".into(),
+                    utc_offset_minutes: 0,
+                    when: vec![wt_core::watch::parse("staging", clock).unwrap()],
+                    then: wt_core::watch::WatchActions {
+                        wake: Some("Open the follow-up PR.".into()),
+                        ..Default::default()
+                    },
+                    before_release: false,
+                };
+                let id = store.add_watch(new, now_ms())?.unwrap().id;
+                store.complete_wake(&id, wt_core::OwnerLanding::Landed, false, now_ms())?;
+                Ok(id)
+            })
+            .await
+            .unwrap();
+        // Everything it owes holds the worktree, landed or not.
+        let hazards = service
+            .removal_hazards(&created.target, true, &cancellation)
+            .await
+            .unwrap();
+        let owed: Vec<&str> = hazards
+            .iter()
+            .filter(|hazard| hazard.starts_with(wt_core::OWED_HAZARD))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(owed.len(), 3, "{hazards:?}");
+        assert!(owed[0].starts_with("still owes: Open the follow-up PR. (due since "));
+        assert_eq!(
+            owed[1..],
+            [
+                "still owes: check: verify prod (in staging)",
+                "still owes: check: watch prod (in production)",
+            ]
+        );
+        let kept = service
+            .remove(&created.target, RemoveOptions::default(), &cancellation)
+            .await;
+        assert!(
+            matches!(&kept, Err(LifecycleError::Refused(message)) if message.contains("still owes")),
+            "{kept:?}"
+        );
+        service
+            .remove(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: false,
+                    ..RemoveOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        // The removal record holds the checks and the due step, and the
+        // staging check is closed there.
+        let history = service
+            .mutate_store(&cancellation, |store| {
+                assert!(store.list_owed(None)?.is_empty());
+                let verified = wt_store::WorkStatusRecord {
+                    state: "verified".into(),
+                    ..owed_verification()
+                };
+                let closed = store.close_removed_checks(
+                    "owing",
+                    &wt_store::CheckTargets::Stages(vec![Staging]),
+                    &verified,
+                    Some("saw it"),
+                )?;
+                assert!(matches!(
+                    closed,
+                    wt_store::RemovedChecksClosed::Closed { .. }
+                ));
+                store.read_removed_worktrees()
+            })
+            .await
+            .unwrap();
+        assert_eq!(history[0].owed().len(), 1);
+        service
+            .create_from_removed(
+                "owing",
+                "michael/owing",
+                &history[0].removed_at,
+                options(),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        let after = service
+            .read_slug_state("owing", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after["work"]["checks"],
+            serde_json::json!({"production": {"steps": "watch prod"}})
+        );
+        assert_eq!(after["work"]["verifyAfterMerge"], "watch prod");
+        let (steps, removed) = service
+            .mutate_store(&cancellation, |store| {
+                Ok((
+                    store.list_owed(Some("owing"))?,
+                    store.read_removed_worktrees()?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, step);
+        // The step is the restored worktree's own.
+        assert_eq!(steps[0].incarnation.as_deref(), after["createdAt"].as_str());
+        assert!(steps[0].incarnation.is_some());
     }
 
     #[tokio::test]
@@ -6329,7 +6463,10 @@ mod tests {
         for (target, hazard) in [
             (&targets[1], "uncommitted changes"),
             (&targets[2], "unpushed commit"),
-            (&targets[3], "post-merge verification still owed"),
+            (
+                &targets[3],
+                "still owes: check: check the deployment (in staging)",
+            ),
         ] {
             let result = service
                 .remove(target, RemoveOptions::default(), &cancellation)
@@ -7303,6 +7440,7 @@ mod tests {
                     utc_offset_minutes: 0,
                     when: vec![wt_core::watch::parse("production", clock).unwrap()],
                     then,
+                    before_release: false,
                 };
                 store.add_watch(new, now_ms()).map(|added| added.unwrap())
             })
@@ -7310,7 +7448,7 @@ mod tests {
         let wakes = |hazards: &[String]| -> Vec<String> {
             hazards
                 .iter()
-                .filter(|hazard| hazard.starts_with(wt_core::watch::WAKE_HAZARD))
+                .filter(|hazard| hazard.starts_with(wt_core::OWED_HAZARD))
                 .cloned()
                 .collect()
         };
@@ -7341,7 +7479,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let hazard = "pending wake-up: Run the smoke test. (in production)";
+        let hazard = "still owes: Run the smoke test. (when in production)";
         for landed in [false, true] {
             let hazards = service
                 .removal_hazards(later, landed, &cancellation)
@@ -7390,14 +7528,14 @@ mod tests {
             revision.hazards,
             [
                 MISSING_CHECKOUT_HAZARD,
-                "pending wake-up: Report. (in production)"
+                "still owes: Report. (when in production)"
             ]
         );
         let unforced = service
             .remove_with_revision(lost, RemoveOptions::default(), &revision, &cancellation)
             .await;
         assert!(
-            matches!(&unforced, Err(LifecycleError::Refused(message)) if message.contains("pending wake-up: Report.")),
+            matches!(&unforced, Err(LifecycleError::Refused(message)) if message.contains("still owes: Report.")),
             "{unforced:?}"
         );
     }
@@ -7432,10 +7570,8 @@ mod tests {
             .removal_revision(&created.target, false, &cancellation)
             .await
             .unwrap();
-        assert_eq!(
-            revision.hazards,
-            [MISSING_CHECKOUT_HAZARD, OWED_VERIFICATION_HAZARD]
-        );
+        const OWED: &str = "still owes: check: verify prod (in staging)";
+        assert_eq!(revision.hazards, [MISSING_CHECKOUT_HAZARD, OWED]);
         let unforced = service
             .remove_with_revision(
                 &created.target,
@@ -7445,7 +7581,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&unforced, Err(LifecycleError::Refused(message)) if message.contains(OWED_VERIFICATION_HAZARD)),
+            matches!(&unforced, Err(LifecycleError::Refused(message)) if message.contains(OWED)),
             "{unforced:?}"
         );
 

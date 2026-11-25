@@ -1171,7 +1171,9 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            refused.to_string().contains("verification still owed"),
+            refused
+                .to_string()
+                .contains("still owes: check: Check the deployed result"),
             "{refused}"
         );
         ctx.database

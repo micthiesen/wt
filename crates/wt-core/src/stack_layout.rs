@@ -58,6 +58,31 @@ pub struct StackIndex {
 /// Infer stacks by following each live member's recorded fork base. `trunk`
 /// is explicit so this core transform does not depend on global configuration.
 pub fn build_stack_index(members: &[ChainMember], trunk: &str) -> StackIndex {
+    stack_index(members, trunk, &|_| false)
+}
+
+/// [`build_stack_index`] for display and for moving rows between sections,
+/// where a member whose own work has landed is no longer a parent: it is a
+/// single, and the members based on it become roots (they still name it as
+/// their parent branch, so they read as needing a restack onto trunk).
+/// Moving or grouping a landed head therefore moves only that row.
+///
+/// Display only. Stack ids, the stack pause, automations and restacks keep
+/// [`build_stack_index`]: fork-base records are not rewritten when a parent
+/// lands.
+pub fn build_display_stack_index(
+    members: &[ChainMember],
+    trunk: &str,
+    landed: impl Fn(&ChainMember) -> bool,
+) -> StackIndex {
+    stack_index(members, trunk, &landed)
+}
+
+fn stack_index(
+    members: &[ChainMember],
+    trunk: &str,
+    detached: &dyn Fn(&ChainMember) -> bool,
+) -> StackIndex {
     let mut by_branch_member = BTreeMap::<String, ChainMember>::new();
     for member in members {
         if !member.branch.is_empty() {
@@ -66,10 +91,12 @@ pub fn build_stack_index(members: &[ChainMember], trunk: &str) -> StackIndex {
     }
     let parent_of = |member: &ChainMember| -> Option<&ChainMember> {
         let base = member.base_branch.as_deref()?;
-        if base.is_empty() || base == trunk || base == member.branch {
+        if base.is_empty() || base == trunk || base == member.branch || detached(member) {
             return None;
         }
-        by_branch_member.get(base)
+        by_branch_member
+            .get(base)
+            .filter(|parent| !detached(parent))
     };
     let mut children = BTreeMap::<String, Vec<ChainMember>>::new();
     let mut roots = Vec::new();
@@ -443,5 +470,82 @@ mod tests {
             ["┌", "└"]
         );
         assert_eq!(sp(&[("a", "A", None), ("z", "Z", None)]), ["", ""]);
+    }
+
+    fn shape(index: &StackIndex) -> Vec<Vec<(String, usize, Option<String>)>> {
+        index
+            .layouts
+            .iter()
+            .map(|layout| {
+                layout
+                    .nodes
+                    .iter()
+                    .map(|node| (node.slug.clone(), node.depth, node.parent_branch.clone()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_landed_root_is_a_single_for_display_and_its_children_become_roots() {
+        let members = [
+            m("a", "A", None),
+            m("b", "B", Some("A")),
+            m("c", "C", Some("B")),
+            m("d", "D", Some("A")),
+            m("e", "E", Some("D")),
+        ];
+        let stored = build_stack_index(&members, "main");
+        let landed = |member: &ChainMember| member.slug == "a";
+        let shown = build_display_stack_index(&members, "main", landed);
+        // The landed head is in no stack; each child heads its own, and
+        // still names the branch it was forked from.
+        assert!(!shown.by_branch.contains_key("A"));
+        assert_eq!(
+            shape(&shown),
+            [
+                vec![
+                    ("b".to_owned(), 0, Some("A".to_owned())),
+                    ("c".to_owned(), 1, Some("B".to_owned()))
+                ],
+                vec![
+                    ("d".to_owned(), 0, Some("A".to_owned())),
+                    ("e".to_owned(), 1, Some("D".to_owned()))
+                ],
+            ]
+        );
+        assert_eq!(shown.layouts[0].stack_id, "B");
+        // The stored index is what it always was: one stack headed by A.
+        assert_eq!(stored, build_stack_index(&members, "main"));
+        assert_eq!(stored.layouts.len(), 1);
+        assert_eq!(stored.layouts[0].stack_id, "A");
+        assert_eq!(stored.layouts[0].nodes.len(), 5);
+        // Nothing landed: both read the same.
+        assert_eq!(
+            build_display_stack_index(&members, "main", |_| false),
+            stored
+        );
+    }
+
+    #[test]
+    fn a_landed_member_with_one_child_leaves_two_singles() {
+        let members = [m("a", "A", None), m("b", "B", Some("A"))];
+        let shown = build_display_stack_index(&members, "main", |member| member.slug == "a");
+        assert!(shown.layouts.is_empty());
+        // A member landed in the middle leaves what is above it a stack.
+        let members = [
+            m("a", "A", None),
+            m("b", "B", Some("A")),
+            m("c", "C", Some("B")),
+            m("d", "D", Some("C")),
+        ];
+        let shown = build_display_stack_index(&members, "main", |member| member.slug == "b");
+        assert_eq!(
+            shape(&shown),
+            [vec![
+                ("c".to_owned(), 0, Some("B".to_owned())),
+                ("d".to_owned(), 1, Some("C".to_owned()))
+            ]]
+        );
     }
 }
