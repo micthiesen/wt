@@ -201,7 +201,14 @@ def main() -> int:
         rows = json.loads(run([str(binary), "ls", "--json"], env=env, cwd=main_repo))
         assert any(row.get("slug") == "ENG-501-background" and row.get("kind") == "removed" for row in rows), rows
         worker_pid = int(job["workerPid"])
-        alive = subprocess.run(["ps", "-p", str(worker_pid), "-o", "command="], text=True, capture_output=True)
+        # The worker reports success before it deletes the moved checkout, so
+        # it outlives the job state briefly; a leak is one that never exits.
+        deadline = time.monotonic() + 30
+        while True:
+            alive = subprocess.run(["ps", "-p", str(worker_pid), "-o", "command="], text=True, capture_output=True)
+            if "_destroy" not in alive.stdout or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
         assert "_destroy" not in alive.stdout, f"worker leaked after success: {alive.stdout.strip()}"
 
         invalid = subprocess.run([str(binary), "_destroy", "../escape"], env=env, cwd=main_repo, text=True, capture_output=True)
