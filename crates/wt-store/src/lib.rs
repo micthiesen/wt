@@ -10,6 +10,7 @@ mod mutations;
 mod store;
 mod titles;
 mod types;
+mod watches;
 
 pub use events::{
     WORKTREE_EVENT_CHECKS_MAX, WORKTREE_EVENT_MAX_AGE_MS, WORKTREE_EVENTS_PER_SLUG,
@@ -28,8 +29,11 @@ pub use types::{
     ForeignRepositoryRow, GuideRecord, MergeEdge, RemovedWorktree, RepositoryIdentity,
     ReviewRequestDismissal, WorkStatusRecord, WorkStatusWrite, WtState,
 };
+pub use watches::{NewWatch, WatchRefusal, WatchSelector, stored_watches};
 
 #[cfg(test)]
 mod events_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod watches_tests;

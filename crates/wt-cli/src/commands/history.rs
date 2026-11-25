@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::Args;
 use wt_core::{
     AutomationOutcomeKind, ChecksChange, LandedOn, PrChange, QueueChange, ReviewChange,
-    WorktreeEvent, WorktreeEventKind,
+    WatchChange, WorktreeEvent, WorktreeEventKind,
 };
 
 use wt_app_core::context::AppContext;
@@ -228,6 +228,23 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
                 format!("restack{onto} stopped on a conflict")
             }
         }
+        WorktreeEventKind::Watch {
+            change,
+            what,
+            by: who,
+            reason,
+        } => match change {
+            WatchChange::Set => format!("waiting for {what}{}", by(who)),
+            WatchChange::Held => format!("no longer waiting: {what}"),
+            WatchChange::ClearedGate => format!("gate cleared by wt: {what}"),
+            WatchChange::Woken => format!("woken: {what}"),
+            WatchChange::Notified => format!("told you: {what}"),
+            WatchChange::Cancelled => format!("stopped waiting for {what}{}", by(who)),
+            WatchChange::Dropped => match reason {
+                Some(reason) => format!("stopped waiting for {what}: {reason}"),
+                None => format!("stopped waiting for {what}"),
+            },
+        },
         WorktreeEventKind::Removed { landed: true } => "removed after landing".into(),
         WorktreeEventKind::Removed { landed: false } => "removed".into(),
         WorktreeEventKind::Unknown => return None,

@@ -415,6 +415,26 @@ fn show_event(
             );
             "removed".to_owned()
         }
+        Kind::Watch {
+            change,
+            what,
+            by,
+            reason,
+        } => {
+            meta.push(what.clone());
+            meta.extend(named(by));
+            meta.extend(reason.clone());
+            match change {
+                wt_core::WatchChange::Set => "waiting",
+                wt_core::WatchChange::Held => "wait over",
+                wt_core::WatchChange::ClearedGate => "gate cleared by wt",
+                wt_core::WatchChange::Woken => "woken",
+                wt_core::WatchChange::Notified => "notified",
+                wt_core::WatchChange::Cancelled => "wait cancelled",
+                wt_core::WatchChange::Dropped => "wait dropped",
+            }
+            .to_owned()
+        }
         Kind::Unknown => return None,
     };
     meta.retain(|part| !part.trim().is_empty());

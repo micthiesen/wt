@@ -1,0 +1,801 @@
+use std::collections::BTreeMap;
+
+use serde_json::{Map, Value, json};
+use tempfile::{TempDir, tempdir};
+use wt_core::{
+    VerifyStage, WatchChange, WorktreeEventKind,
+    watch::{
+        Condition, LocalClock, PrFacts, PrLife, RowFacts, WATCHES_MAX, WATCHES_PER_SLUG_MAX, Watch,
+        WatchAction, WatchActions, WatchFacts, evaluate, parse,
+    },
+};
+
+use crate::{
+    NewWatch, RemovedWorktree, RepositoryIdentity, Store, WatchRefusal, WatchSelector,
+    WorkStatusRecord,
+};
+
+/// 2026-11-24 12:00:00 UTC.
+const NOON: i64 = 1_795_521_600_000;
+const CREATED: &str = "2026-11-01T00:00:00Z";
+const SHA: &str = "0123abcdef0123abcdef0123abcdef0123abcdef";
+
+fn store() -> (TempDir, Store) {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        RepositoryIdentity::new("repo", "/repo"),
+    )
+    .unwrap();
+    store.record_slug_created("one", CREATED).unwrap();
+    (temp, store)
+}
+
+fn then(set: impl FnOnce(&mut WatchActions)) -> WatchActions {
+    let mut then = WatchActions::default();
+    set(&mut then);
+    then
+}
+
+fn notify() -> WatchActions {
+    then(|then| then.notify = Some(String::new()))
+}
+
+fn wake() -> WatchActions {
+    then(|then| then.wake = Some("test it".into()))
+}
+
+fn new(slug: &str, conditions: &[&str], then: WatchActions) -> NewWatch {
+    let clock = LocalClock {
+        now_ms: NOON,
+        utc_offset_minutes: 0,
+    };
+    NewWatch {
+        slug: slug.into(),
+        by: slug.into(),
+        utc_offset_minutes: 0,
+        when: conditions
+            .iter()
+            .map(|arg| parse(arg, clock).unwrap())
+            .collect(),
+        then,
+    }
+}
+
+fn add(store: &mut Store, slug: &str, conditions: &[&str], then: WatchActions) -> Watch {
+    store
+        .add_watch(new(slug, conditions, then), NOON)
+        .unwrap()
+        .unwrap()
+}
+
+fn status(blocked_on: Option<&str>) -> WorkStatusRecord {
+    WorkStatusRecord {
+        state: "ready".into(),
+        at: "2026-11-24T12:00:00Z".into(),
+        note: None,
+        risk: None,
+        sha: None,
+        by: None,
+        blocked_on: blocked_on.map(str::to_owned),
+        verify_after_merge: None,
+        verify_in: None,
+        extra: Map::new(),
+    }
+}
+
+fn removed(slug: &str, landed: &str) -> RemovedWorktree {
+    RemovedWorktree {
+        slug: slug.into(),
+        branch: format!("feature/{slug}"),
+        removed_at: "2026-11-24T12:00:01Z".into(),
+        work: None,
+        automations_paused: None,
+        extra: [("landedOnAtRemoval".to_owned(), json!(landed))]
+            .into_iter()
+            .collect(),
+    }
+}
+
+fn watch_events(store: &Store, slug: &str) -> Vec<(WatchChange, String, Option<String>)> {
+    store
+        .read_worktree_events(slug, 500)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            WorktreeEventKind::Watch {
+                change,
+                what,
+                reason,
+                by: _,
+            } => Some((change, what, reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn changes(store: &Store, slug: &str) -> Vec<WatchChange> {
+    watch_events(store, slug)
+        .into_iter()
+        .map(|(change, ..)| change)
+        .collect()
+}
+
+fn raw(store: &Store) -> Value {
+    serde_json::from_str(&store.read_repository_state_json().unwrap().unwrap()).unwrap()
+}
+
+fn live(slugs: &[(&str, &str)]) -> BTreeMap<String, Option<String>> {
+    slugs
+        .iter()
+        .map(|(slug, created)| ((*slug).to_owned(), Some((*created).to_owned())))
+        .collect()
+}
+
+fn pr_merged(number: u64) -> WatchFacts {
+    WatchFacts {
+        prs: [(
+            number,
+            PrFacts {
+                life: Some(PrLife::Merged),
+                ..PrFacts::default()
+            },
+        )]
+        .into(),
+        ..WatchFacts::default()
+    }
+}
+
+#[test]
+fn a_watch_is_stored_with_an_id_and_its_owners_incarnation() {
+    let (_temp, mut store) = store();
+    let watch = add(
+        &mut store,
+        "one",
+        &["#3806:production", "release:staging+1h"],
+        wake(),
+    );
+    assert_eq!(watch.id.len(), 6);
+    assert!(
+        watch
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    );
+    assert_eq!(watch.incarnation.as_deref(), Some(CREATED));
+    assert_eq!((watch.created_at_ms, watch.met_at_ms), (NOON, None));
+    assert_eq!(
+        store.list_watches(None).unwrap(),
+        std::slice::from_ref(&watch)
+    );
+    assert_eq!(
+        store.list_watches(Some("one")).unwrap(),
+        std::slice::from_ref(&watch)
+    );
+    assert_eq!(store.list_watches(Some("two")).unwrap(), []);
+    assert_eq!(
+        raw(&store)["watches"][0]["when"],
+        json!([{"cond": "#3806:production"}, {"cond": "release:staging", "delayMs": 3_600_000}])
+    );
+    assert_eq!(
+        watch_events(&store, "one"),
+        [(
+            WatchChange::Set,
+            "#3806 in production and 1h after next staging release".to_owned(),
+            None
+        )]
+    );
+    // A worktree with no recorded creation still gets a watch.
+    let unrecorded = add(&mut store, "old", &["merged"], notify());
+    assert_eq!(unrecorded.incarnation, None);
+    assert_ne!(unrecorded.id, watch.id);
+}
+
+#[test]
+fn a_watch_with_nothing_to_wait_for_or_to_do_is_refused() {
+    let (_temp, mut store) = store();
+    assert_eq!(
+        store.add_watch(new("one", &[], notify()), NOON).unwrap(),
+        Err(WatchRefusal::NoConditions)
+    );
+    assert_eq!(
+        store
+            .add_watch(new("one", &["merged"], WatchActions::default()), NOON)
+            .unwrap(),
+        Err(WatchRefusal::NoActions)
+    );
+    assert!(raw(&store)["watches"].is_null());
+}
+
+#[test]
+fn watches_are_capped_per_worktree_and_per_repository() {
+    let (_temp, mut store) = store();
+    for _ in 0..WATCHES_PER_SLUG_MAX {
+        add(&mut store, "one", &["merged"], notify());
+    }
+    let refusal = store
+        .add_watch(new("one", &["merged"], notify()), NOON)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(refusal, WatchRefusal::TooManyForSlug { slug: "one".into() });
+    assert!(refusal.to_string().contains("one already has 20 watches"));
+    for slug in 1..WATCHES_MAX / WATCHES_PER_SLUG_MAX {
+        for _ in 0..WATCHES_PER_SLUG_MAX {
+            add(&mut store, &format!("slug-{slug}"), &["merged"], notify());
+        }
+    }
+    assert_eq!(
+        store
+            .add_watch(new("fresh", &["merged"], notify()), NOON)
+            .unwrap(),
+        Err(WatchRefusal::TooMany)
+    );
+    let watches = store.list_watches(None).unwrap();
+    assert_eq!(watches.len(), WATCHES_MAX);
+    let ids: std::collections::BTreeSet<_> = watches.iter().map(|watch| &watch.id).collect();
+    assert_eq!(ids.len(), WATCHES_MAX);
+    // Cancelling makes room.
+    let first = [watches[0].id.clone()];
+    assert_eq!(
+        store
+            .cancel_watches(WatchSelector::Ids(&first), None)
+            .unwrap()
+            .len(),
+        1
+    );
+    add(&mut store, "fresh", &["merged"], notify());
+}
+
+#[test]
+fn keys_and_entries_from_a_newer_build_survive_every_write() {
+    let (_temp, mut store) = store();
+    let unreadable = json!({"id": "zzzzzz", "slug": "one", "shape": "of the future"});
+    store
+        .write_repository_state_json(
+            &json!({
+                "version": 99,
+                "slugs": {"one": {"createdAt": CREATED}},
+                "watches": [
+                    {
+                        "id": "aaaaaa", "slug": "one", "incarnation": CREATED, "by": "one",
+                        "createdAtMs": NOON, "utcOffsetMinutes": 0, "futureTop": {"x": 1},
+                        "when": [{"cond": "#7", "futureCond": 2}, {"cond": "moon:full"}],
+                        "then": {"notify": "", "wake": "go", "futureAction": true}
+                    },
+                    unreadable
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+    let watch = store.list_watches(None).unwrap().remove(0);
+    assert_eq!(store.list_watches(None).unwrap().len(), 1);
+    assert_eq!(watch.when[1].cond, Condition::Unknown("moon:full".into()));
+
+    let stamps = evaluate(&watch, &pr_merged(7), NOON).stamps.unwrap();
+    assert!(store.apply_evaluation(&[stamps]).unwrap());
+    assert!(
+        store
+            .complete_action("aaaaaa", WatchAction::Notify)
+            .unwrap()
+    );
+    add(&mut store, "one", &["merged"], notify());
+    store.set_branch_tip("trunk", "new-sha").unwrap();
+
+    let state = raw(&store);
+    assert_eq!(state["version"], 99);
+    assert_eq!(state["watches"].as_array().unwrap().len(), 3);
+    let kept = &state["watches"][0];
+    assert_eq!(kept["futureTop"]["x"], 1);
+    assert_eq!(
+        kept["when"][0],
+        json!({"cond": "#7:merged", "futureCond": 2, "firstHeldAtMs": NOON})
+    );
+    assert_eq!(kept["when"][1], json!({"cond": "moon:full"}));
+    assert_eq!(kept["then"], json!({"wake": "go", "futureAction": true}));
+    assert_eq!(state["watches"][1], unreadable);
+
+    // Only an explicit cancel of its id removes what this build cannot read.
+    assert!(
+        !store
+            .complete_action("zzzzzz", WatchAction::Notify)
+            .unwrap()
+    );
+    store
+        .drop_orphans(&BTreeMap::new(), &BTreeMap::new(), NOON)
+        .unwrap();
+    assert_eq!(raw(&store)["watches"], json!([unreadable]));
+    let ids = ["zzzzzz".to_owned()];
+    assert_eq!(
+        store
+            .cancel_watches(WatchSelector::Ids(&ids), None)
+            .unwrap(),
+        []
+    );
+    assert_eq!(raw(&store)["watches"], json!([]));
+}
+
+#[test]
+fn a_build_that_predates_watches_does_not_lose_them() {
+    let (_temp, mut store) = store();
+    add(&mut store, "one", &["#7:production+1h"], wake());
+    let before = raw(&store)["watches"].clone();
+    // Writes that know nothing of watches, and a whole-state read and write
+    // back as an older build's file-based path did.
+    store.set_branch_tip("trunk", "sha").unwrap();
+    store.set_slug_dev_port("one", Some(4500)).unwrap();
+    store.reap_wt_state(&["one".to_owned()].into()).unwrap();
+    store.reap_wt_state(&Default::default()).unwrap();
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["watches"], before);
+    store
+        .write_repository_state_json(&state.to_string())
+        .unwrap();
+    store.set_branch_tip("trunk", "other").unwrap();
+    assert_eq!(raw(&store)["watches"], before);
+    assert_eq!(store.list_watches(None).unwrap().len(), 1);
+}
+
+#[test]
+fn storing_an_evaluation_twice_writes_once() {
+    let (_temp, mut store) = store();
+    let watch = add(&mut store, "one", &["#7"], notify());
+    assert!(!store.apply_evaluation(&[]).unwrap());
+    let stamps = evaluate(&watch, &pr_merged(7), NOON + 5).stamps.unwrap();
+    assert!(
+        store
+            .apply_evaluation(std::slice::from_ref(&stamps))
+            .unwrap()
+    );
+    let stored = store.list_watches(None).unwrap().remove(0);
+    assert_eq!(stored.met_at_ms, Some(NOON + 5));
+    assert_eq!(stored.when[0].first_held_at_ms, Some(NOON + 5));
+    assert!(
+        !store
+            .apply_evaluation(std::slice::from_ref(&stamps))
+            .unwrap()
+    );
+    // A met watch is never met again, at another time or by a stale pass.
+    let later = evaluate(&watch, &pr_merged(7), NOON + 9).stamps.unwrap();
+    store.apply_evaluation(&[later]).unwrap();
+    assert_eq!(
+        store.list_watches(None).unwrap()[0].met_at_ms,
+        Some(NOON + 5)
+    );
+    assert_eq!(evaluate(&stored, &pr_merged(7), NOON + 9).stamps, None);
+    assert_eq!(
+        changes(&store, "one"),
+        [WatchChange::Set, WatchChange::Held]
+    );
+
+    // Stamps for a watch that is gone write nothing.
+    store
+        .cancel_watches(WatchSelector::Ids(&[watch.id]), None)
+        .unwrap();
+    assert!(!store.apply_evaluation(&[stamps]).unwrap());
+}
+
+#[test]
+fn a_probe_error_is_written_when_it_changes_and_not_again() {
+    let (_temp, mut store) = store();
+    let watch = add(&mut store, "one", &["check:secret=FOO"], notify());
+    let key = wt_core::watch::CheckKey {
+        slug: "one".into(),
+        id: "secret".into(),
+        arg: Some("FOO".into()),
+    };
+    let failing = WatchFacts {
+        checks: [(key, Err("exit 2".to_owned()))].into(),
+        ..WatchFacts::default()
+    };
+    let stamps = evaluate(&watch, &failing, NOON).stamps.unwrap();
+    assert!(store.apply_evaluation(&[stamps]).unwrap());
+    let stored = store.list_watches(None).unwrap().remove(0);
+    assert_eq!(stored.last_error.as_deref(), Some("exit 2"));
+    assert_eq!(evaluate(&stored, &failing, NOON + 60_000).stamps, None);
+}
+
+#[test]
+fn a_finished_action_is_no_longer_owed_and_the_last_one_ends_the_watch() {
+    let (_temp, mut store) = store();
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #7"))))
+        .unwrap();
+    let watch = add(
+        &mut store,
+        "one",
+        &["#7"],
+        then(|then| {
+            then.unblock = Some("after #7".into());
+            then.notify = Some("it merged".into());
+            then.wake = Some("test it".into());
+        }),
+    );
+    assert!(!store.complete_action("nosuch", WatchAction::Wake).unwrap());
+    assert!(
+        store
+            .complete_action(&watch.id, WatchAction::Unblock)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .complete_action(&watch.id, WatchAction::Unblock)
+            .unwrap()
+    );
+    let left = store.list_watches(None).unwrap().remove(0);
+    assert_eq!(
+        left.then.remaining().collect::<Vec<_>>(),
+        [WatchAction::Notify, WatchAction::Wake]
+    );
+    assert!(store.complete_action(&watch.id, WatchAction::Wake).unwrap());
+    assert!(
+        store
+            .complete_action(&watch.id, WatchAction::Notify)
+            .unwrap()
+    );
+    assert_eq!(store.list_watches(None).unwrap(), []);
+    assert!(
+        !store
+            .complete_action(&watch.id, WatchAction::Notify)
+            .unwrap()
+    );
+    assert_eq!(
+        changes(&store, "one"),
+        [
+            WatchChange::Set,
+            WatchChange::ClearedGate,
+            WatchChange::Woken,
+            WatchChange::Notified
+        ]
+    );
+}
+
+#[test]
+fn a_gate_watch_lives_and_dies_with_the_gate_text_it_witnessed() {
+    let (_temp, mut store) = store();
+    let gate = |text: &str| {
+        then(|then| {
+            then.unblock = Some(text.into());
+            then.wake = Some("go on".into());
+        })
+    };
+    // No gate, or another gate: nothing to clear.
+    assert_eq!(
+        store
+            .add_watch(new("one", &["#7"], gate("after #7")), NOON)
+            .unwrap(),
+        Err(WatchRefusal::GateChanged { current: None })
+    );
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #7"))))
+        .unwrap();
+    assert_eq!(
+        store
+            .add_watch(new("one", &["#7"], gate("after #8")), NOON)
+            .unwrap(),
+        Err(WatchRefusal::GateChanged {
+            current: Some("after #7".into())
+        })
+    );
+    let reminder = add(&mut store, "one", &["#7"], notify());
+    let first = add(&mut store, "one", &["#7"], gate("after #7"));
+    // The gate has one watch: setting it again replaces the pending one.
+    let second = add(&mut store, "one", &["#7:production"], gate("after #7"));
+    let ids = |store: &mut Store| {
+        store
+            .list_watches(Some("one"))
+            .unwrap()
+            .into_iter()
+            .map(|watch| watch.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&mut store), [reminder.id.clone(), second.id.clone()]);
+    assert_ne!(first.id, second.id);
+
+    // Re-asserting the same gate keeps its watch.
+    let mut same = status(Some("after #7"));
+    same.note = Some("still waiting".into());
+    store.set_slug_work_status("one", Some(&same)).unwrap();
+    assert_eq!(ids(&mut store).len(), 2);
+
+    // A different gate cancels it; other watches are not the gate's.
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #9"))))
+        .unwrap();
+    assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
+
+    // Clearing the gate cancels it.
+    let third = add(&mut store, "one", &["#9"], gate("after #9"));
+    store
+        .update_slug_work_status("one", |_| Ok::<_, ()>(Some(status(None))))
+        .unwrap()
+        .unwrap();
+    assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
+
+    // Clearing the status cancels it.
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #9"))))
+        .unwrap();
+    add(&mut store, "one", &["#9"], gate("after #9"));
+    assert!(store.clear_slug_work_status("one", None).unwrap());
+    assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
+
+    // A met watch is already being delivered: its remaining actions stay
+    // for the delivery, whose own write clears the gate.
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #9"))))
+        .unwrap();
+    let met = add(&mut store, "one", &["#9"], gate("after #9"));
+    let stamps = evaluate(&met, &pr_merged(9), NOON).stamps.unwrap();
+    store.apply_evaluation(&[stamps]).unwrap();
+    store
+        .set_slug_work_status("one", Some(&status(None)))
+        .unwrap();
+    assert_eq!(ids(&mut store), [reminder.id.clone(), met.id.clone()]);
+    assert!(
+        store
+            .complete_action(&met.id, WatchAction::Unblock)
+            .unwrap()
+    );
+
+    // The explicit cancel takes the gate's watch whatever its state.
+    assert_eq!(
+        store
+            .cancel_watches(WatchSelector::Gate { slug: "one" }, Some("one"))
+            .unwrap(),
+        []
+    );
+    store
+        .set_slug_work_status("one", Some(&status(Some("g"))))
+        .unwrap();
+    let last = add(&mut store, "one", &["#9"], gate("g"));
+    assert_eq!(
+        store
+            .cancel_watches(WatchSelector::Gate { slug: "one" }, Some("one"))
+            .unwrap(),
+        [last]
+    );
+    let _ = third;
+}
+
+#[test]
+fn watches_are_cancelled_by_id_or_by_who_set_them() {
+    let (_temp, mut store) = store();
+    let mine = add(&mut store, "one", &["merged"], notify());
+    let mut human = new("one", &["green"], notify());
+    human.by = "human".into();
+    let human = store.add_watch(human, NOON).unwrap().unwrap();
+    let other = add(&mut store, "two", &["merged"], notify());
+    assert_eq!(
+        store
+            .cancel_watches(
+                WatchSelector::SetBy {
+                    slug: "one",
+                    by: "one"
+                },
+                Some("one")
+            )
+            .unwrap(),
+        [mine]
+    );
+    let ids = [human.id.clone(), other.id.clone(), "nosuch".to_owned()];
+    assert_eq!(
+        store
+            .cancel_watches(WatchSelector::Ids(&ids), None)
+            .unwrap(),
+        [human, other]
+    );
+    assert_eq!(
+        store
+            .cancel_watches(WatchSelector::Ids(&ids), None)
+            .unwrap(),
+        []
+    );
+    assert_eq!(
+        changes(&store, "one"),
+        [
+            WatchChange::Set,
+            WatchChange::Set,
+            WatchChange::Cancelled,
+            WatchChange::Cancelled
+        ]
+    );
+}
+
+#[test]
+fn a_watch_does_not_pass_to_the_next_worktree_with_its_slug() {
+    let (_temp, mut store) = store();
+    let old = add(&mut store, "one", &["merged"], wake());
+    let unrecorded = add(&mut store, "old", &["merged"], wake());
+    // The same incarnation, and a worktree whose creation was never
+    // recorded, keep their watches.
+    let same = live(&[("one", CREATED), ("old", "2026-11-20T00:00:00Z")]);
+    assert_eq!(
+        store.drop_orphans(&same, &BTreeMap::new(), NOON).unwrap(),
+        []
+    );
+    assert_eq!(store.list_watches(None).unwrap().len(), 2);
+
+    let reborn = live(&[("one", "2026-11-24T13:00:00Z")]);
+    let dropped = store.drop_orphans(&reborn, &BTreeMap::new(), NOON).unwrap();
+    assert_eq!(dropped, [old, unrecorded]);
+    assert_eq!(store.list_watches(None).unwrap(), []);
+    // The new worktree's history does not report the old one's watch.
+    assert_eq!(changes(&store, "one"), [WatchChange::Set]);
+    assert_eq!(
+        watch_events(&store, "old")[1],
+        (
+            WatchChange::Dropped,
+            "merged".to_owned(),
+            Some("its worktree was removed".to_owned())
+        )
+    );
+    assert_eq!(
+        store.drop_orphans(&reborn, &BTreeMap::new(), NOON).unwrap(),
+        []
+    );
+}
+
+#[test]
+fn removal_keeps_what_tells_the_person_about_a_landing() {
+    let (_temp, mut store) = store();
+    let tells = add(
+        &mut store,
+        "one",
+        &["merged", "production+1h", "#7"],
+        notify(),
+    );
+    let wakes = add(&mut store, "one", &["merged"], wake());
+    let stuck = add(&mut store, "one", &["green"], notify());
+
+    // Recording the landed removal holds the owner's own "merged" for good,
+    // while the row may still be on the board.
+    store
+        .record_removed_worktrees(&[removed("one", "base")], NOON + 1_000)
+        .unwrap();
+    let after_record = store.list_watches(None).unwrap();
+    assert_eq!(after_record.len(), 3);
+    for watch in &after_record[..2] {
+        assert!(watch.when[0].latched && !watch.owner_gone);
+        assert_eq!(watch.when[0].first_held_at_ms, Some(NOON + 1_000));
+    }
+    assert!(!after_record[2].when[0].latched);
+
+    // The row is gone: only the watch that tells the person goes on, on the
+    // landing commit.
+    let commits: BTreeMap<_, _> = [("one".to_owned(), SHA.to_owned())].into();
+    let dropped = store
+        .drop_orphans(&BTreeMap::new(), &commits, NOON + 2_000)
+        .unwrap();
+    assert_eq!(
+        dropped.iter().map(|watch| &watch.id).collect::<Vec<_>>(),
+        [&wakes.id, &stuck.id]
+    );
+    let kept = store.list_watches(None).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].id, tells.id);
+    assert!(kept[0].owner_gone);
+    assert_eq!(
+        kept[0].when[1].cond,
+        Condition::Commit {
+            oid: SHA.into(),
+            stage: VerifyStage::Production
+        }
+    );
+    assert_eq!(kept[0].when[2], tells.when[2]);
+    let reasons: Vec<_> = watch_events(&store, "one")
+        .into_iter()
+        .filter(|(change, ..)| *change == WatchChange::Dropped)
+        .map(|(_, what, reason)| (what, reason.unwrap()))
+        .collect();
+    assert_eq!(
+        reasons,
+        [
+            ("merged".to_owned(), "its worktree was removed".to_owned()),
+            (
+                "PR checks green".to_owned(),
+                "its worktree was removed and can no longer become green".to_owned()
+            ),
+        ]
+    );
+
+    // It survives later passes and a new worktree taking the slug, and is
+    // judged without the owner's row.
+    let reborn = live(&[("one", "2026-11-25T00:00:00Z")]);
+    assert_eq!(
+        store.drop_orphans(&reborn, &BTreeMap::new(), NOON).unwrap(),
+        []
+    );
+    let facts = WatchFacts {
+        rows: [(
+            "one".to_owned(),
+            RowFacts {
+                exists: true,
+                ..RowFacts::default()
+            },
+        )]
+        .into(),
+        commits: [((SHA.to_owned(), VerifyStage::Production), true)].into(),
+        ..pr_merged(7)
+    };
+    let at = NOON + 2 * 3_600_000;
+    store
+        .apply_evaluation(&[evaluate(&kept[0], &facts, at).stamps.unwrap()])
+        .unwrap();
+    let held = store.list_watches(None).unwrap().remove(0);
+    store
+        .apply_evaluation(&[evaluate(&held, &facts, at + 3_600_000).stamps.unwrap()])
+        .unwrap();
+    assert!(store.list_watches(None).unwrap()[0].is_met());
+    assert!(
+        store
+            .complete_action(&tells.id, WatchAction::Notify)
+            .unwrap()
+    );
+    assert_eq!(store.list_watches(None).unwrap(), []);
+}
+
+#[test]
+fn a_removal_that_did_not_land_or_has_no_landing_commit_drops_the_watch() {
+    let (_temp, mut store) = store();
+    add(&mut store, "one", &["production"], notify());
+    store.record_slug_created("two", CREATED).unwrap();
+    add(&mut store, "two", &["merged"], notify());
+    store.record_slug_created("three", CREATED).unwrap();
+    let kept = add(&mut store, "three", &["merged"], notify());
+    store
+        .record_removed_worktrees(
+            &[
+                removed("one", "base"),
+                removed("two", "unlanded"),
+                removed("three", "production"),
+            ],
+            NOON + 1_000,
+        )
+        .unwrap();
+    assert!(!store.list_watches(Some("two")).unwrap()[0].when[0].latched);
+    let dropped = store
+        .drop_orphans(&BTreeMap::new(), &BTreeMap::new(), NOON + 2_000)
+        .unwrap();
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|watch| watch.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    assert_eq!(
+        watch_events(&store, "one").last().unwrap().2.as_deref(),
+        Some("its worktree was removed and no landing commit is known")
+    );
+    assert_eq!(
+        watch_events(&store, "two").last().unwrap().2.as_deref(),
+        Some("its worktree was removed before landing")
+    );
+    // A landed "merged" needs no commit.
+    let left = store.list_watches(None).unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, kept.id);
+    assert!(left[0].owner_gone && left[0].when[0].latched);
+}
+
+#[test]
+fn an_earlier_incarnations_removal_record_says_nothing_about_a_later_watch() {
+    let (_temp, mut store) = store();
+    // Removed and landed before the watch below was set.
+    let mut earlier = removed("one", "base");
+    earlier.removed_at = "2026-11-24T11:00:00Z".into();
+    store
+        .record_removed_worktrees(&[earlier.clone()], NOON - 3_600_000)
+        .unwrap();
+    add(&mut store, "one", &["merged"], notify());
+    // The old record is written again, as a confirmation does.
+    store
+        .record_removed_worktrees(&[earlier], NOON + 1_000)
+        .unwrap();
+    assert!(!store.list_watches(None).unwrap()[0].when[0].latched);
+    let dropped = store
+        .drop_orphans(&BTreeMap::new(), &BTreeMap::new(), NOON + 2_000)
+        .unwrap();
+    assert_eq!(dropped.len(), 1);
+}

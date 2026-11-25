@@ -8,6 +8,7 @@ mod stack_layout;
 mod stage;
 mod time;
 pub use time::parse_iso_millis;
+pub mod watch;
 mod work_status;
 mod worktree_event;
 mod worktree_ref;

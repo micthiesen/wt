@@ -1782,6 +1782,7 @@ impl Store {
                             .is_ok_and(|entry| is_merged_removal(&entry));
                     log.append(&incoming.slug, &WorktreeEventKind::Removed { landed })
                 });
+                crate::watches::owner_removed(state, &next, now_ms);
                 by_slug.insert(incoming.slug.clone(), Value::Object(next));
             }
             let cutoff = now_ms.saturating_sub(REMOVED_MAX_AGE_MS);
@@ -2340,7 +2341,7 @@ fn stored_work_status(state: &WtState, slug: &str) -> Option<WorkStatusRecord> {
 /// there: the worktree predates the log, or a pinned older build created it.
 /// Without this its events would continue the previous incarnation's
 /// history. `createdAt` is the recorded creation time, not a guess.
-fn log_incarnation(
+pub(crate) fn log_incarnation(
     log: &crate::events::EventLog<'_>,
     state: &WtState,
     slug: &str,
@@ -2506,5 +2507,10 @@ fn write_work_status(
         entry.remove("work");
     }
     object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+    crate::watches::gate_written(
+        state,
+        slug,
+        record.and_then(|record| record.blocked_on.as_deref()),
+    );
     Ok(true)
 }

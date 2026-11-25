@@ -554,6 +554,17 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
             glyphs::TRASH,
             if *landed { theme::FG_DIM } else { theme::WARN },
         ),
+        Event::Watch { change, .. } => badge(
+            glyphs::AUTOMATION,
+            match change {
+                wt_core::WatchChange::Set | wt_core::WatchChange::Cancelled => theme::FG_DIM,
+                wt_core::WatchChange::Dropped => theme::WARN,
+                wt_core::WatchChange::Held
+                | wt_core::WatchChange::ClearedGate
+                | wt_core::WatchChange::Woken
+                | wt_core::WatchChange::Notified => theme::OK,
+            },
+        ),
         Event::Unknown => return None,
     })
 }

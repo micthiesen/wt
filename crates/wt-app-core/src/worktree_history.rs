@@ -79,6 +79,16 @@ pub fn sanitize(event: &mut WorktreeEventKind) {
             clean(text);
         }
         WorktreeEventKind::Restack { onto, ok: _ } => clean_some(onto),
+        WorktreeEventKind::Watch {
+            what,
+            by,
+            reason,
+            change: _,
+        } => {
+            clean(what);
+            clean_some(by);
+            clean_some(reason);
+        }
         WorktreeEventKind::Pr { .. }
         | WorktreeEventKind::MergeQueue { .. }
         | WorktreeEventKind::Conflict { .. }

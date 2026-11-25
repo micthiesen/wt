@@ -107,8 +107,39 @@ pub enum WorktreeEventKind {
         /// Whether the branch had landed when it was removed.
         landed: bool,
     },
+    /// Something the worktree waits for was set, came true, was acted on or
+    /// was given up.
+    Watch {
+        change: WatchChange,
+        /// What was waited for, in words.
+        what: String,
+        /// Who set or cancelled it: a worktree slug, `manager`, or `None`
+        /// for the person and for wt itself.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+        /// Why wt dropped it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchChange {
+    Set,
+    /// Every condition held.
+    Held,
+    /// wt cleared the merge gate.
+    ClearedGate,
+    /// The worktree's session was sent its prompt.
+    Woken,
+    /// The person was told.
+    Notified,
+    Cancelled,
+    /// wt gave it up; the event's `reason` says why.
+    Dropped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +223,40 @@ mod tests {
         let newer: WorktreeEventKind =
             serde_json::from_str(r#"{"kind":"teleported","to":"mars"}"#).unwrap();
         assert_eq!(newer, WorktreeEventKind::Unknown);
+    }
+
+    #[test]
+    fn a_watch_event_is_tagged_like_every_other_kind() {
+        let event = WorktreeEventKind::Watch {
+            change: WatchChange::ClearedGate,
+            what: "#3806 in production".into(),
+            by: None,
+            reason: None,
+        };
+        let stored = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({
+                "kind": "watch", "change": "cleared_gate", "what": "#3806 in production"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<WorktreeEventKind>(stored).unwrap(),
+            event
+        );
+        let dropped: WorktreeEventKind = serde_json::from_str(
+            r#"{"kind":"watch","change":"dropped","what":"merged","by":"one","reason":"gone"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dropped,
+            WorktreeEventKind::Watch {
+                change: WatchChange::Dropped,
+                what: "merged".into(),
+                by: Some("one".into()),
+                reason: Some("gone".into()),
+            }
+        );
     }
 
     #[test]

@@ -96,6 +96,16 @@ pub fn bound_worktree_event(event: &mut WorktreeEventKind) {
             line(text);
         }
         WorktreeEventKind::Restack { onto, ok: _ } => some(onto),
+        WorktreeEventKind::Watch {
+            what,
+            by,
+            reason,
+            change: _,
+        } => {
+            line(what);
+            some(by);
+            some(reason);
+        }
         WorktreeEventKind::Pr { .. }
         | WorktreeEventKind::MergeQueue { .. }
         | WorktreeEventKind::Conflict { .. }
