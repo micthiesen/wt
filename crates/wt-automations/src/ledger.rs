@@ -273,6 +273,16 @@ impl LedgerSnapshot {
             .is_some_and(|entry| entry.get("state").and_then(Value::as_str) != Some("dispatched"))
     }
 
+    /// Whether `key`'s fire ended with proof that it was delivered. A fire
+    /// that ended any other way (sent without proof, skipped, cancelled)
+    /// may never have reached its target.
+    pub fn delivered(&self, key: &str) -> bool {
+        self.view
+            .fired
+            .get(key)
+            .is_some_and(|entry| entry.get("state").and_then(Value::as_str) == Some("delivered"))
+    }
+
     /// Whether `key` was recorded no longer than `window_ms` ago. An entry
     /// without a readable time is not recent.
     pub fn recorded_within(&self, key: &str, now_ms: i64, window_ms: i64) -> bool {

@@ -514,12 +514,10 @@ impl Model {
                 let Some(row) = self.actionable_row() else {
                     return self.notify("select a worktree first");
                 };
-                let has_steps = row.verify_steps.is_some()
-                    || row
-                        .work
-                        .as_ref()
-                        .and_then(|work| work.record.as_ref())
-                        .is_some_and(|record| record.verify_after_merge.is_some());
+                let has_steps = row
+                    .owes
+                    .iter()
+                    .any(|item| item.kind == wt_core::OwedKind::Check);
                 if !has_steps {
                     return self.notify("no verify-after-merge steps on this row");
                 }
@@ -550,10 +548,14 @@ impl Model {
                 if self.selected_row().is_some_and(|row| row.pending_creation) {
                     return self.notify("still being created; press l to move it to a section");
                 }
-                let Some(section) = self.selected_section().map(|section| section.key.clone())
-                else {
+                let Some(section) = self.selected_section() else {
                     return self.notify("select a worktree first");
                 };
+                if section.owed_block() {
+                    // wt orders these blocks and the rows in them.
+                    return self.notify(crate::owed_block_refusal(&section.title));
+                }
+                let section = section.key.clone();
                 let row = self.actionable_row().map(|row| row.key.clone());
                 // The cursor follows a moved row, including across a section
                 // boundary (TS docs/tui.md "J / K").

@@ -554,7 +554,7 @@ impl Model {
                     // The note starts empty, as in TS: a new assertion
                     // carries a fresh note.
                     let (action, prompt, initial) = if let Some(steps) = option.verify_after_merge {
-                        let stage = option.verify_in.unwrap_or(wt_core::VerifyStage::Staging);
+                        let stage = wt_core::VerifyStage::or_default(option.verify_in);
                         (
                             TextAction::VerifyAfterMerge {
                                 key: key.clone(),
@@ -764,7 +764,7 @@ impl Model {
                     }
                     PickerAction::Status { key, seen } => {
                         if let Some(steps) = option.verify_after_merge {
-                            let stage = option.verify_in.unwrap_or(wt_core::VerifyStage::Staging);
+                            let stage = wt_core::VerifyStage::or_default(option.verify_in);
                             self.interaction = Interaction::Text(TextPrompt {
                                 action: TextAction::VerifyAfterMerge {
                                     key: key.clone(),

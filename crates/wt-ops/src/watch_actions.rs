@@ -9,11 +9,47 @@ use wt_app_core::{
     automation_engine::{AutomationOutcome, DeliverySlot},
     context::AppContext,
 };
-use wt_automations::{AutomationFire, WatchFire};
+use wt_automations::{AutomationFire, CheckFire, WatchFire};
 use wt_core::watch::WatchAction;
 use wt_platform::process::CommandSpec;
 
 const NOTIFY_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wake the session for a check that came due: wt's own delivery, used
+/// where no configured rule brings the check to the session. Nothing is
+/// recorded here: the check stays owed until it is closed.
+pub async fn dispatch_check(
+    ctx: &AppContext,
+    fire: &AutomationFire,
+) -> (AutomationOutcome, Option<String>) {
+    let Some(check) = &fire.check else {
+        return (AutomationOutcome::NotStarted, None);
+    };
+    let outcome = crate::action_dispatch::wake_session(ctx, &fire.slug, &check_prompt(check)).await;
+    if matches!(outcome, AutomationOutcome::Ambiguous { .. }) {
+        tracing::warn!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = %fire.slug,
+            event_text = %format!(
+                "The prompt for {}'s check in {} was sent but its delivery is not confirmed, and wt will not send it again. Check the session.",
+                fire.slug,
+                check.stage.as_str()
+            ),
+            "check prompt delivery not confirmed"
+        );
+    }
+    (outcome, None)
+}
+
+/// The prompt that brings a due check to its session.
+pub fn check_prompt(check: &CheckFire) -> String {
+    let stage = check.stage.as_str();
+    format!(
+        "[wt] The check this worktree owes in {stage} is due: the change is deployed there.\n{}\nTo close it: wt done {stage} -m \"<what you checked and where>\"",
+        wt_core::sanitize_terminal_lines(&check.steps)
+    )
+}
 
 /// Run one watch action. The second value is a failure to surface that does
 /// not change the outcome.
@@ -77,18 +113,18 @@ fn unconfirmed_wake_notice(slug: &str, watch: &WatchFire) -> String {
     )
 }
 
-/// The action is no longer owed. A failure here is healed by the engine's
-/// next pass, which finds the fire recorded and removes the action.
-/// `unconfirmed` is a wake sent without proof it arrived.
+/// The action is no longer owed by the watch. A wake delivered once the
+/// worktree's own work landed (or may have) stays owed as a due step. A
+/// failure here is healed by the engine's next pass, which finds the fire
+/// recorded and settles the action the same way. `unconfirmed` is a wake
+/// sent without proof it arrived.
 async fn complete(ctx: &AppContext, watch: &WatchFire, unconfirmed: bool) -> Option<String> {
-    let (id, action) = (watch.id.clone(), watch.action);
+    let (id, action, landing) = (watch.id.clone(), watch.action, watch.landing);
+    let now_ms = i64::try_from(wt_app_core::feeds::epoch_ms()).unwrap_or(i64::MAX);
     ctx.database
         .call(move |store| {
-            Ok(if unconfirmed {
-                store.complete_unconfirmed_wake(&id)?
-            } else {
-                store.complete_action(&id, action)?
-            })
+            settle(store, &id, action, landing, unconfirmed, now_ms)?;
+            Ok(())
         })
         .await
         .err()
@@ -98,6 +134,31 @@ async fn complete(ctx: &AppContext, watch: &WatchFire, unconfirmed: bool) -> Opt
                 watch.id
             )
         })
+}
+
+/// Record one ended watch action: the one write the delivery path and the
+/// engine's heal path share. The gate is written only where it still reads
+/// what the watch was set to clear.
+pub fn settle(
+    store: &mut wt_store::Store,
+    id: &str,
+    action: WatchAction,
+    landing: wt_core::OwnerLanding,
+    unconfirmed: bool,
+    now_ms: i64,
+) -> Result<(), wt_store::StoreError> {
+    match action {
+        WatchAction::Unblock => {
+            store.deliver_unblock(id)?;
+        }
+        WatchAction::Wake => {
+            store.complete_wake(id, landing, unconfirmed, now_ms)?;
+        }
+        WatchAction::Notify => {
+            store.complete_action(id, action)?;
+        }
+    }
+    Ok(())
 }
 
 /// Clear the gate only while it still reads what the watch was set to
@@ -236,6 +297,13 @@ pub fn wake_prompt(slug: &str, watch: &WatchFire, now: Option<&str>) -> String {
     }
     prompt.push('\n');
     prompt.push_str(&wt_core::sanitize_terminal_lines(&watch.text));
+    // Delivered after landing, this stays owed until it is closed.
+    if watch.landing.owes() {
+        prompt.push_str(&format!(
+            "\nTo close it: wt done {} -m \"<what you did and what you saw>\"",
+            watch.id
+        ));
+    }
     prompt
 }
 
@@ -251,6 +319,7 @@ mod tests {
             held: "#3806 in production; 17:00 today".into(),
             text: "Run the smoke test\x1b[31m and report.".into(),
             cleared_gate: cleared_gate.map(str::to_owned),
+            landing: wt_core::OwnerLanding::NotLanded,
         }
     }
 
@@ -284,6 +353,153 @@ mod tests {
             wake_prompt("one", &steps, None)
                 .ends_with("wake-up:\n1. Deploy.\n\n2. Run the smoke test.")
         );
+    }
+
+    #[test]
+    fn a_wake_that_stays_owed_ends_with_how_to_close_it() {
+        let mut owed = fire("one", None);
+        for landing in [
+            wt_core::OwnerLanding::Landed,
+            wt_core::OwnerLanding::Unknown,
+        ] {
+            owed.landing = landing;
+            assert!(
+                wake_prompt("one", &owed, None).ends_with(
+                    "Run the smoke test and report.\nTo close it: wt done aaaaaa -m \"<what you did and what you saw>\""
+                ),
+                "{landing:?}"
+            );
+        }
+        // Before landing the wake closes on delivery: nothing to close.
+        owed.landing = wt_core::OwnerLanding::NotLanded;
+        assert!(!wake_prompt("one", &owed, None).contains("wt done"));
+        assert_eq!(
+            check_prompt(&CheckFire {
+                stage: wt_core::VerifyStage::Production,
+                steps: "1. Open /health\x1b[31m\n2. Expect 200".into(),
+            }),
+            "[wt] The check this worktree owes in production is due: the change is deployed there.\n\
+             1. Open /health\n2. Expect 200\n\
+             To close it: wt done production -m \"<what you checked and where>\""
+        );
+    }
+
+    /// Delivery is not completion once the worktree's work has landed, or
+    /// may have: the wake stays as a due step. The engine's heal path
+    /// settles a wake whose delivery was never recorded the same way.
+    #[tokio::test]
+    async fn a_delivered_wake_closes_before_landing_and_stays_owed_after() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let wake = |prompt: &'static str| async move {
+            let clock = wt_core::watch::LocalClock {
+                now_ms: 0,
+                utc_offset_minutes: 0,
+            };
+            ctx.database
+                .call(move |store| {
+                    Ok(store.add_watch(
+                        wt_store::NewWatch {
+                            slug: "one".into(),
+                            by: "one".into(),
+                            utc_offset_minutes: 0,
+                            when: vec![wt_core::watch::parse("merged", clock).unwrap()],
+                            then: wt_core::watch::WatchActions {
+                                wake: Some(prompt.into()),
+                                ..Default::default()
+                            },
+                            before_release: false,
+                        },
+                        1,
+                    )?)
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        };
+        let delivered = |id: String, landing| WatchFire {
+            id,
+            landing,
+            ..fire("one", None)
+        };
+        let owed = || async {
+            ctx.database
+                .call(|store| Ok(store.list_owed(Some("one"))?))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|step| (step.what, step.unconfirmed))
+                .collect::<Vec<_>>()
+        };
+        let pending = || async {
+            ctx.database
+                .call(|store| Ok(store.list_watches(Some("one"))?))
+                .await
+                .unwrap()
+                .len()
+        };
+
+        let early = wake("rebase onto it").await;
+        let fire_early = delivered(early, wt_core::OwnerLanding::NotLanded);
+        assert_eq!(complete(ctx, &fire_early, false).await, None);
+        assert_eq!((pending().await, owed().await), (0, vec![]));
+
+        let landed = wake("confirm the logs").await;
+        let fire_landed = delivered(landed.clone(), wt_core::OwnerLanding::Landed);
+        assert_eq!(complete(ctx, &fire_landed, false).await, None);
+        // Unknown landing counts as landed, and an unproven delivery says so.
+        let unknown = wake("rerun the check").await;
+        let fire_unknown = delivered(unknown, wt_core::OwnerLanding::Unknown);
+        assert_eq!(complete(ctx, &fire_unknown, true).await, None);
+        assert_eq!(pending().await, 0);
+        assert_eq!(
+            owed().await,
+            [
+                ("confirm the logs".to_owned(), false),
+                ("rerun the check".to_owned(), true)
+            ]
+        );
+        // Settled twice (the delivery and then the heal pass): still one step.
+        assert_eq!(complete(ctx, &fire_landed, false).await, None);
+        assert_eq!(owed().await.len(), 2);
+
+        // The heal path: the ledger recorded the fire, the watch never
+        // heard. It settles through the same write, by the landing the pass
+        // evaluated.
+        let healed = wake("check the dashboard").await;
+        let lost = wake("tidy up").await;
+        ctx.database
+            .call(move |store| {
+                settle(
+                    store,
+                    &healed,
+                    WatchAction::Wake,
+                    wt_core::OwnerLanding::Landed,
+                    true,
+                    9,
+                )?;
+                settle(
+                    store,
+                    &lost,
+                    WatchAction::Wake,
+                    wt_core::OwnerLanding::NotLanded,
+                    false,
+                    9,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending().await, 0);
+        assert_eq!(
+            owed().await.last().unwrap(),
+            &("check the dashboard".to_owned(), true)
+        );
+        assert_eq!(owed().await.len(), 3);
+        fixture.close().await.unwrap();
     }
 
     #[test]
@@ -409,8 +625,10 @@ mod tests {
                 held: "merged".into(),
                 text: gate.into(),
                 cleared_gate: None,
+                landing: wt_core::OwnerLanding::NotLanded,
             }),
             detail: String::new(),
+            check: None,
         };
         let work = || async {
             ctx.database

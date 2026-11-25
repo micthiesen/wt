@@ -529,15 +529,20 @@ fn describe_status(record: &Value) -> String {
         .and_then(Value::as_str)
         .map(|value| format!(" [blocked on: {}]", truncate(value, 80)))
         .unwrap_or_default();
-    let verify = record
-        .get("verifyAfterMerge")
-        .and_then(Value::as_str)
-        .map(|value| {
-            let stage = match record.get("verifyIn").and_then(Value::as_str) {
-                Some("production") => "production",
-                _ => "staging",
-            };
-            format!(" [verify in {stage}: {}]", truncate(value, 100))
+    // One per stage the status still owes a check in.
+    let verify: String = wt_core::parse_work_status(record)
+        .map(|status| {
+            status
+                .open_checks()
+                .iter()
+                .map(|(stage, check)| {
+                    format!(
+                        " [verify in {}: {}]",
+                        stage.as_str(),
+                        truncate(&check.steps, 100)
+                    )
+                })
+                .collect()
         })
         .unwrap_or_default();
     format!("{label}{risk}{blocked}{verify}{note}")

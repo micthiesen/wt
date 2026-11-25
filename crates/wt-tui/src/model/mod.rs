@@ -30,11 +30,12 @@ pub use board::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
     AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
     GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LocalStamp, LogView,
-    MergeQueueView, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
-    PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
-    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
-    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WatchActionKind,
-    WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount, WorkStateCount,
+    MergeQueueView, OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION, OwedBlock, OwedView, PerfGroupView,
+    PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup,
+    PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
+    ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView,
+    TitleSource, UsageItem, WatchActionKind, WatchConditionView, WatchTruth, WatchView,
+    WorkPresentation, WorkRiskCount, WorkStateCount, owed_block_refusal,
 };
 pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{

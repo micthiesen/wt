@@ -105,6 +105,12 @@ pub fn cancellable_fires(input: CancellableFiresInput<'_>) -> Vec<AutomationFire
         if fire.watch.is_some() {
             continue;
         }
+        // wt's own wake for a due check is derived from the status the same
+        // way, and once its key were cancelled nothing would bring the check
+        // to its session.
+        if crate::is_check_wake(&fire) {
+            continue;
+        }
         let id = fire_identity(&fire);
         if executing.contains(&id) {
             continue;
@@ -285,6 +291,7 @@ mod tests {
             mcp_event: None,
             watch: None,
             detail: "test".into(),
+            check: None,
         }
     }
 
@@ -404,6 +411,7 @@ mod tests {
             held: "merged".into(),
             text: String::new(),
             cleared_gate: None,
+            landing: wt_core::OwnerLanding::NotLanded,
         });
         let pending = [watch, fire("a", "s")];
         let cancellable = cancellable_fires(CancellableFiresInput {

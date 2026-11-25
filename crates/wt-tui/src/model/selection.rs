@@ -61,7 +61,26 @@ impl Model {
         let previous_index = self.selected.unwrap_or_default();
         self.board = board;
         self.rebuild_items();
+        // A row wt regrouped by what it owes keeps the cursor: nobody moved
+        // it, so there is no place the user was working in to stay at.
+        let owed_block = previous_key.as_ref().and_then(|key| {
+            self.board
+                .sections
+                .iter()
+                .find(|section| {
+                    section.owed_block()
+                        && Some(&section.key) != previous_section.as_ref()
+                        && section.rows.iter().any(|&index| {
+                            self.board
+                                .rows
+                                .get(index)
+                                .is_some_and(|row| &row.key == key)
+                        })
+                })
+                .map(|section| section.key.clone())
+        });
         let left_section = previous_key.is_some()
+            && owed_block.is_none()
             && previous_section.as_deref().is_some_and(|old| {
                 old != ARCHIVED_SECTION
                     && !self.board.sections.iter().any(|section| {
@@ -97,6 +116,12 @@ impl Model {
                     .then_some(previous_key.as_deref())
                     .flatten()
                     .and_then(|key| self.row_position(key))
+            })
+            // Folded, the block's header stands for the row.
+            .or_else(|| {
+                owed_block
+                    .as_deref()
+                    .and_then(|key| self.section_position(key))
             })
             .or_else(|| {
                 previous_section.as_deref().and_then(|key| {
@@ -190,7 +215,11 @@ impl Model {
 
     pub(crate) fn creation_placement(&self) -> Option<crate::CreatePlacement> {
         let section = self.selected_section()?;
-        if section.key == super::ARCHIVED_SECTION || section.key == super::REMOVING_SECTION {
+        // Nothing is filed in a block wt derives.
+        if section.key == super::ARCHIVED_SECTION
+            || section.key == super::REMOVING_SECTION
+            || section.owed_block()
+        {
             return None;
         }
         Some(crate::CreatePlacement {
@@ -355,10 +384,11 @@ impl Model {
     /// `V` is per row: it starts open once the post-merge check is due and
     /// resets whenever the cursor lands on another row.
     pub(super) fn reset_verification(&mut self) {
-        self.show_verification = self
-            .selected_row()
-            .and_then(|row| row.work.as_ref())
-            .is_some_and(|work| work.verification_owed && !work.verification_waiting);
+        self.show_verification = self.selected_row().is_some_and(|row| {
+            row.owes
+                .iter()
+                .any(|item| item.kind == wt_core::OwedKind::Check && item.due())
+        });
     }
 
     /// Move the cursor one stop; at an edge, scroll the list to that edge

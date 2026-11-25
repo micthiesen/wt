@@ -540,6 +540,115 @@ fn filing_in_another_section_keeps_the_cursor_on_the_neighbor() {
     assert_eq!(model.selected_row().unwrap().key, "b");
 }
 
+fn owed_section(block: crate::OwedBlock, rows: Vec<usize>, folded: bool) -> BoardSection {
+    BoardSection {
+        key: block.key().into(),
+        title: block.title().into(),
+        folded,
+        rows,
+    }
+}
+
+#[test]
+fn a_row_wt_regroups_by_what_it_owes_keeps_the_cursor() {
+    use crate::OwedBlock;
+    let mut model = Model::default();
+    let mut first = board(&["a", "b", "c"]);
+    first.sections = vec![
+        section("One", vec![0, 1], false),
+        owed_section(OwedBlock::Waiting, vec![2], false),
+    ];
+    model.apply(ready(first.clone()));
+    // It lands: nobody filed it, so the cursor goes with it.
+    model.select(model.row_position("a").unwrap());
+    first.sections = vec![
+        section("One", vec![1], false),
+        owed_section(OwedBlock::Waiting, vec![0, 2], false),
+    ];
+    model.apply(ready(first.clone()));
+    assert_eq!(model.selected_row().unwrap().key, "a");
+    // What it waited for comes due: it changes block and stays selected.
+    first.sections = vec![
+        section("One", vec![1], false),
+        owed_section(OwedBlock::Due, vec![0], false),
+        owed_section(OwedBlock::Waiting, vec![2], false),
+    ];
+    model.apply(ready(first.clone()));
+    assert_eq!(model.selected_row().unwrap().key, "a");
+    assert_eq!(model.selected_section().unwrap().key, OwedBlock::Due.key());
+    // Into a folded block, its header stands for the row.
+    first.sections = vec![
+        section("One", vec![1], false),
+        owed_section(OwedBlock::Waiting, vec![2], false),
+        owed_section(OwedBlock::Done, vec![0], true),
+    ];
+    model.apply(ready(first.clone()));
+    assert!(model.selected_row().is_none());
+    assert_eq!(model.selected_section().unwrap().key, OwedBlock::Done.key());
+    // A row someone else files by hand still leaves the cursor in place.
+    model.select(model.row_position("b").unwrap());
+    first.sections = vec![
+        section("One", vec![], false),
+        section("Two", vec![1], false),
+        owed_section(OwedBlock::Waiting, vec![2], false),
+        owed_section(OwedBlock::Done, vec![0], true),
+    ];
+    model.apply(ready(first));
+    assert_ne!(model.selected_row().map(|row| row.key.as_str()), Some("b"));
+}
+
+#[test]
+fn rows_in_a_derived_block_are_not_filed_reordered_or_built_on() {
+    use crate::OwedBlock;
+    let mut model = Model::default();
+    let mut value = board(&["a", "b"]);
+    value.section_order = vec!["One".into()];
+    value.sections = vec![
+        section("One", vec![0], false),
+        owed_section(OwedBlock::Due, vec![1], false),
+    ];
+    model.apply(ready(value.clone()));
+    model.select(model.row_position("b").unwrap());
+    let refusal = "Due is derived from what landed rows owe; set [ui] owed_sections = false to file rows by hand";
+    for key in ['J', 'K'] {
+        assert_eq!(ch(&mut model, key), InputResult::Draw);
+        assert_eq!(toast(&model), Some(refusal));
+    }
+    assert!(model.pending_selection.is_none());
+    // A new worktree started from here is not filed under the block.
+    assert_eq!(model.creation_placement(), None);
+    // The move menu refuses the row, and never offers a derived block.
+    let menu = |key: &str| UiAction::PrepareSection { key: key.into() }.menu(&value);
+    let crate::Menu::Local(crate::LocalMenu::Notice(text)) = menu("b") else {
+        panic!("a derived row must not open the picker")
+    };
+    assert_eq!(text, refusal);
+    let crate::Menu::Local(crate::LocalMenu::Modal { modal, .. }) = menu("a") else {
+        panic!("a filed row opens the picker")
+    };
+    let UiModal::Picker { options, .. } = *modal else {
+        panic!("expected a picker")
+    };
+    assert!(
+        options.iter().all(|option| option.label != "Due"
+            && !option
+                .value
+                .as_deref()
+                .is_some_and(|value| value.starts_with(crate::OWED_BLOCK_PREFIX))),
+        "{options:?}"
+    );
+    // Neither can it be renamed or deleted.
+    model.apply(ready({
+        let mut folded = value.clone();
+        folded.sections[1].folded = true;
+        folded
+    }));
+    model.select(model.section_position(OwedBlock::Due.key()).unwrap());
+    assert_eq!(ch(&mut model, 'L'), InputResult::Unchanged);
+    ch(&mut model, 'D');
+    assert_eq!(toast(&model), Some("Due is not a section you can delete"));
+}
+
 #[test]
 fn tab_unfold_lands_on_the_first_row_and_rows_outside_sections_toast() {
     let mut model = Model::default();
@@ -781,7 +890,12 @@ fn review_fold_keeps_the_cursor_on_the_header() {
 #[test]
 fn verification_steps_are_per_row_and_toast_when_absent() {
     let mut value = board(&["a", "b"]);
-    value.rows[0].verify_steps = Some("check prod".into());
+    value.rows[0].owes = vec![crate::OwedView::new(
+        wt_core::OwedKind::Check,
+        wt_core::OwedState::Due,
+        "check prod",
+    )];
+    value.rows[0].owed_phase = Some(wt_core::OwedPhase::Due);
     value.rows[0].work = Some(WorkPresentation {
         record: Some(wt_core::WorkStatusRecord {
             verify_after_merge: Some("check prod".into()),
@@ -789,7 +903,6 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
             ..wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "2026-10-09T00:00:00Z")
         }),
         effective_state: Some(wt_core::WorkState::Ready),
-        verification_owed: true,
         ..Default::default()
     });
     let mut model = Model::default();

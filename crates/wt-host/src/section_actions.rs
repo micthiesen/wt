@@ -1,6 +1,6 @@
 //! Controller-side section operations; UI code only handles prepared choices.
 use anyhow::{Context, Result, bail};
-use wt_core::{ChainMember, build_stack_index};
+use wt_core::{ChainMember, StackIndex, build_display_stack_index};
 use wt_tui::{Seen, UiReply};
 
 use wt_app_core::context::AppContext;
@@ -39,6 +39,52 @@ fn check_section_witness(
     Ok(())
 }
 
+/// The stacks as the board draws them: a row whose own work has landed is a
+/// unit of its own, so it moves and reorders alone and what was stacked on
+/// it stays where it is. Fork-base records and stack ids are not involved.
+fn shown_stacks(
+    board: &wt_tui::Board,
+    trunk: &str,
+    listed: impl Fn(&wt_tui::BoardRow) -> bool,
+) -> StackIndex {
+    let members: Vec<_> = board
+        .rows
+        .iter()
+        .filter(|row| listed(row))
+        .map(|row| {
+            ChainMember::new(
+                &row.key,
+                wt_sources::board_layout::branch_key(row, &row.branch),
+                row.base_branch
+                    .as_deref()
+                    .filter(|base| *base != trunk)
+                    .map(|base| wt_sources::board_layout::branch_key(row, base)),
+            )
+        })
+        .collect();
+    let landed: std::collections::BTreeSet<&str> = board
+        .rows
+        .iter()
+        .filter(|row| row.git.landed_on.is_some())
+        .map(|row| row.key.as_str())
+        .collect();
+    build_display_stack_index(&members, trunk, |member| {
+        landed.contains(member.slug.as_str())
+    })
+}
+
+/// The derived block the board draws a row in, if any. Nothing is filed in
+/// one, so a row there has no stored placement a move could change.
+fn owed_block_of<'a>(board: &'a wt_tui::Board, key: &str) -> Option<&'a wt_tui::BoardSection> {
+    board.sections.iter().find(|section| {
+        section.owed_block()
+            && section
+                .rows
+                .iter()
+                .any(|&index| board.rows.get(index).is_some_and(|row| row.key == key))
+    })
+}
+
 pub async fn move_row(
     ctx: &AppContext,
     key: String,
@@ -52,6 +98,11 @@ pub async fn move_row(
         .iter()
         .find(|row| row.key == key)
         .context("selected worktree is no longer visible")?;
+    if let Some(block) = owed_block_of(board, &key) {
+        return Err(wt_app_core::host_errors::notice(
+            wt_tui::owed_block_refusal(&block.title),
+        ));
+    }
     let (state, archived) = ctx
         .database
         .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
@@ -70,22 +121,9 @@ pub async fn move_row(
             Ok(section::resolve_section(&state, &name).unwrap_or_else(|| name.trim().to_owned()))
         })
         .transpose()?;
-    let members: Vec<_> = board
-        .rows
-        .iter()
-        .filter(|row| !archived.contains(&row.key))
-        .map(|row| {
-            ChainMember::new(
-                &row.key,
-                wt_sources::board_layout::branch_key(row, &row.branch),
-                row.base_branch
-                    .as_deref()
-                    .filter(|base| *base != ctx.config.branch.base)
-                    .map(|base| wt_sources::board_layout::branch_key(row, base)),
-            )
-        })
-        .collect();
-    let stacks = build_stack_index(&members, &ctx.config.branch.base);
+    let stacks = shown_stacks(board, &ctx.config.branch.base, |row| {
+        !archived.contains(&row.key)
+    });
     let moving: Vec<_> = stacks
         .by_branch
         .get(&wt_sources::board_layout::branch_key(row, &row.branch))
@@ -169,11 +207,21 @@ pub async fn reorder(
         .iter()
         .position(|group| group.key == section)
         .context("section disappeared")?;
-    if key.is_none() || section.starts_with("\0stack:") {
+    if board.sections[group_index].owed_block() {
+        // wt orders these blocks and the rows in them.
+        return Err(wt_app_core::host_errors::notice(
+            wt_tui::owed_block_refusal(&board.sections[group_index].title),
+        ));
+    }
+    if key.is_none() {
         let order = board
             .sections
             .iter()
-            .filter(|group| group.key != wt_sources::board_layout::ARCHIVED && group.drawn())
+            .filter(|group| {
+                group.key != wt_sources::board_layout::ARCHIVED
+                    && !group.owed_block()
+                    && group.drawn()
+            })
             .map(|group| group.key.clone())
             .collect::<Vec<_>>();
         let current = order
@@ -203,22 +251,7 @@ pub async fn reorder(
         });
     }
     let key = key.expect("checked row key");
-    let members = board
-        .rows
-        .iter()
-        .filter(|row| !row.archived)
-        .map(|row| {
-            ChainMember::new(
-                &row.key,
-                wt_sources::board_layout::branch_key(row, &row.branch),
-                row.base_branch
-                    .as_deref()
-                    .filter(|base| *base != ctx.config.branch.base)
-                    .map(|base| wt_sources::board_layout::branch_key(row, base)),
-            )
-        })
-        .collect::<Vec<_>>();
-    let stacks = build_stack_index(&members, &ctx.config.branch.base);
+    let stacks = shown_stacks(board, &ctx.config.branch.base, |row| !row.archived);
     let section_rows = board.sections[group_index]
         .rows
         .iter()
@@ -317,9 +350,7 @@ pub async fn reorder(
         // A row only crosses into a section on screen: a named section even
         // while empty, a derived group (the Inbox) only with rows.
         .find(|group| {
-            group.key != wt_sources::board_layout::ARCHIVED
-                && !group.key.starts_with("\0stack:")
-                && group.drawn()
+            group.key != wt_sources::board_layout::ARCHIVED && !group.owed_block() && group.drawn()
         })
         .ok_or_else(|| {
             wt_app_core::host_errors::notice(if down {
@@ -513,6 +544,251 @@ mod tests {
         )
         .await
         .unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    /// The fixture's board with `two` stacked on `one`.
+    async fn stacked_board(fixture: &wt_app_core::test_support::CommandFixture) -> wt_tui::Board {
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.set_slug_base("two", Some(("feature/one", None)))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let facts = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default())
+    }
+
+    async fn sections(
+        fixture: &wt_app_core::test_support::CommandFixture,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        (
+            state["slugs"]["one"]["section"].clone(),
+            state["slugs"]["two"]["section"].clone(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_landed_head_moves_alone_and_its_unlanded_children_stay() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut board = stacked_board(&fixture).await;
+        let head = board.rows.iter().position(|row| row.key == "one").unwrap();
+        board.rows[head].git.landed_on = Some(wt_tui::LandingKind::Base);
+        move_row(
+            &fixture.ctx,
+            "one".into(),
+            Some("Shipped".into()),
+            None,
+            Some(&board),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sections(&fixture).await,
+            (serde_json::json!("Shipped"), serde_json::Value::Null)
+        );
+        // What was stacked on it is its own unit now and moves by itself.
+        move_row(
+            &fixture.ctx,
+            "two".into(),
+            Some("Next".into()),
+            None,
+            Some(&board),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sections(&fixture).await,
+            (serde_json::json!("Shipped"), serde_json::json!("Next"))
+        );
+        // Reordering one past the edge of its section takes only it along.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.move_worktrees_to_section(
+                    &["one".to_owned(), "two".to_owned()],
+                    Some("Next"),
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        wt_sources::board_layout::prepare(
+            &mut board,
+            &state,
+            &fixture.ctx.config.branch.base,
+            wt_config::UiSort::Manual,
+        );
+        let last = board
+            .sections
+            .iter()
+            .find(|section| section.key == "Next")
+            .and_then(|section| section.rows.last())
+            .map(|&index| board.rows[index].key.clone())
+            .unwrap();
+        let mut ctx = fixture.ctx.clone();
+        std::sync::Arc::make_mut(&mut ctx.config).ui.sort = wt_config::UiSort::Manual;
+        reorder(&ctx, Some(last.clone()), "Next".into(), true, Some(&board))
+            .await
+            .unwrap_err();
+        board.sections.push(wt_tui::BoardSection {
+            key: "Later".into(),
+            title: "Later".into(),
+            ..Default::default()
+        });
+        reorder(&ctx, Some(last.clone()), "Next".into(), true, Some(&board))
+            .await
+            .unwrap();
+        let (one, two) = sections(&fixture).await;
+        let (moved, stayed) = if last == "one" {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        assert_eq!(
+            (moved, stayed),
+            (serde_json::json!("Later"), serde_json::json!("Next"))
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rows_and_blocks_derived_from_what_is_owed_are_not_moved_or_reordered() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.place_slug("one", Some("Batch"), false)?;
+                store.place_slug("two", Some("Batch"), false)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut board = stacked_board(&fixture).await;
+        let head = board.rows.iter().position(|row| row.key == "one").unwrap();
+        board.rows[head].git.landed_on = Some(wt_tui::LandingKind::Base);
+        board.rows[head].owed_phase = Some(wt_core::OwedPhase::Done);
+        board.display.owed_sections = true;
+        let state = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        wt_sources::board_layout::prepare(
+            &mut board,
+            &state,
+            &fixture.ctx.config.branch.base,
+            fixture.ctx.config.ui.sort,
+        );
+        let done = wt_tui::OwedBlock::Done.key().to_owned();
+        let refused = |error: anyhow::Error| {
+            assert!(
+                error
+                    .chain()
+                    .any(|cause| cause.is::<wt_app_core::host_errors::Notice>()),
+                "{error:#}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "Done is derived from what landed rows owe; set [ui] owed_sections = false to file rows by hand"
+            );
+        };
+        // Out of the block, inside it, and the block itself.
+        refused(
+            move_row(
+                &fixture.ctx,
+                "one".into(),
+                Some("Next".into()),
+                None,
+                Some(&board),
+            )
+            .await
+            .unwrap_err(),
+        );
+        for down in [true, false] {
+            refused(
+                reorder(
+                    &fixture.ctx,
+                    Some("one".into()),
+                    done.clone(),
+                    down,
+                    Some(&board),
+                )
+                .await
+                .unwrap_err(),
+            );
+            refused(
+                reorder(&fixture.ctx, None, done.clone(), down, Some(&board))
+                    .await
+                    .unwrap_err(),
+            );
+        }
+        // Into it: a row at the bottom of the last stored section has
+        // nowhere further to go, and no section moves past a derived block.
+        let order: Vec<&str> = board
+            .sections
+            .iter()
+            .filter(|section| section.drawn())
+            .map(|section| section.key.as_str())
+            .collect();
+        assert_eq!(order, ["Batch", done.as_str()]);
+        let bottom = reorder(
+            &fixture.ctx,
+            Some("two".into()),
+            "Batch".into(),
+            true,
+            Some(&board),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bottom.to_string(), "already at bottom");
+        let bottom = reorder(&fixture.ctx, None, "Batch".into(), true, Some(&board))
+            .await
+            .unwrap_err();
+        assert_eq!(bottom.to_string(), "section already at bottom");
+        // Nothing stored changed: off again, the row is where it was filed.
+        let after = fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert_eq!(after["slugs"], state["slugs"]);
+        assert_eq!(after["sectionsOrder"], state["sectionsOrder"]);
+        assert_eq!(after["slugs"]["one"]["section"], "Batch");
         fixture.close().await.unwrap();
     }
 

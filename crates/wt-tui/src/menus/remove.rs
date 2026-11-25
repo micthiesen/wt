@@ -271,10 +271,11 @@ mod tests {
             |row| row.path_missing = true,
             |row| row.busy = Some(Default::default()),
             |row| {
-                row.work = Some(crate::WorkPresentation {
-                    verification_owed: true,
-                    ..Default::default()
-                })
+                row.owes = vec![crate::OwedView::new(
+                    wt_core::OwedKind::Check,
+                    wt_core::OwedState::Waiting,
+                    "check prod",
+                )]
             },
             |row| row.environment_live = true,
             |row| row.host = Some("builder".into()),

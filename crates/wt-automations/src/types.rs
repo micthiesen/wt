@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use wt_config::{AutomationDef, AutomationTrigger};
-use wt_core::{WorkRisk, WorkState, WorkStatusRecord, watch::WatchAction};
+use wt_core::{
+    OwnerLanding, VerifyStage, WorkRisk, WorkState, WorkStatusRecord, watch::WatchAction,
+};
 
 /// Inputs are prepared by the application from current Git, GitHub and store
 /// snapshots. No source or persistence is touched by the evaluator.
@@ -148,6 +150,24 @@ pub struct WatchFire {
     /// The gate this watch cleared before waking the session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleared_gate: Option<String>,
+    /// Whether the worktree's own work had landed when this fire was
+    /// evaluated: a wake delivered after landing stays owed as a due step.
+    /// A fire stored before this was recorded reads as unknown, which must
+    /// be closed by hand.
+    #[serde(default = "unknown_landing")]
+    pub landing: OwnerLanding,
+}
+
+fn unknown_landing() -> OwnerLanding {
+    OwnerLanding::Unknown
+}
+
+/// The owed check a fire is about: a `status.verification_due` rule's, or
+/// the implicit `wt.check` wake's.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CheckFire {
+    pub stage: VerifyStage,
+    pub steps: String,
 }
 
 /// An action a newer build added fails to read, so the deferred fire that
@@ -199,6 +219,13 @@ pub struct AutomationEvalContext {
     pub guides: Vec<GuideOwner>,
     /// Met watches with actions still owed.
     pub watches: Vec<MetWatch>,
+    /// The settle delay of wt's own wake for a due check: what a
+    /// `status.verification_due` rule gets when it sets none.
+    pub check_settle_seconds: f64,
+    /// Action id and slug pairs where the row does not meet the action's
+    /// `requires`, for the actions of `status.verification_due` rules: such
+    /// a rule does not bring that row's check to its session.
+    pub unmet_requirements: BTreeSet<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -234,6 +261,10 @@ pub struct AutomationFire {
     /// persisted before watches existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<WatchFire>,
+    /// The owed check a verification fire is about. Absent from fires
+    /// persisted before checks were owed per stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CheckFire>,
     pub detail: String,
 }
 
@@ -277,8 +308,8 @@ pub fn status_suffix(work: &WorkStatusRecord) -> String {
     if let Some(blocked) = work.blocked_on.as_deref().filter(|text| !text.is_empty()) {
         suffix.push_str(&format!(" [blocked on: {blocked}]"));
     }
-    if let Some((stage, steps)) = work.verification() {
-        suffix.push_str(&format!(" [verify in {}: {steps}]", stage.as_str()));
+    for (stage, check) in work.open_checks() {
+        suffix.push_str(&format!(" [verify in {}: {}]", stage.as_str(), check.steps));
     }
     if let Some(note) = work.note.as_deref().filter(|text| !text.is_empty()) {
         suffix.push_str(&format!(" — {note}"));

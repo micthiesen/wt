@@ -341,6 +341,7 @@ fn prepare_ledger(
                 &statuses,
                 None,
                 None,
+                context.config.branch.separate_production(),
             );
             if let Some(old) = previous
                 .rows
@@ -397,6 +398,7 @@ async fn enrich(
                 &statuses,
                 github_repo.as_deref(),
                 landed,
+                context.config.branch.separate_production(),
             )
         })
         .collect();
@@ -412,6 +414,7 @@ fn present(
     statuses: &BTreeMap<String, String>,
     github_repo: Option<&str>,
     landing_override: Option<bool>,
+    separate_production: bool,
 ) -> RemovedHistoryRow {
     let issue_override = entry.extra.get("issueId").and_then(Value::as_str);
     let issue_id = issue_identity::resolve(&entry.slug, issue_override);
@@ -457,9 +460,29 @@ fn present(
         .as_ref()
         .and_then(|id| statuses.get(id))
         .map(|status| sanitize_terminal_text(status));
-    let verify_owed = entry.work.as_ref().is_some_and(|work| {
-        work.verify_after_merge.is_some() && work.state != "verified" && work.state != "dropped"
-    });
+    // What the removal record still owes: its checks per stage and the
+    // steps that had come due. A gate left on it holds nothing.
+    let owes = {
+        let now = now_ms();
+        let clock = wt_core::watch::LocalClock {
+            now_ms: now,
+            utc_offset_minutes: u64::try_from(now)
+                .ok()
+                .and_then(wt_app_core::display_time::local_utc_offset_minutes)
+                .unwrap_or(0),
+        };
+        let record = entry.work_with_checks().and_then(|work| work.to_core());
+        let landing = wt_core::Landing::new(
+            production_landed.is_some(),
+            production_landed == Some(true),
+            separate_production,
+        );
+        wt_core::owed_items(record.as_ref(), &landing, &[], &entry.owed(), now)
+            .iter()
+            .filter(|item| item.kind != wt_core::OwedKind::Gate)
+            .map(|item| crate::watch_board::owed_view(item, &[], clock, None, false))
+            .collect()
+    };
     let day_label = removal_day_label(&entry.removed_at);
     let age = wt_core::work_age(&entry.removed_at, now_ms());
     RemovedHistoryRow {
@@ -485,12 +508,7 @@ fn present(
             .as_ref()
             .and_then(|work| work.blocked_on.as_deref())
             .map(sanitize_terminal_text),
-        verify_steps: entry.work.as_ref().and_then(|work| {
-            let steps = sanitize_terminal_text(work.verify_after_merge.as_deref()?);
-            let stage = work.verify_in.as_deref().unwrap_or("staging");
-            Some(format!("in {}: {steps}", sanitize_terminal_text(stage)))
-        }),
-        verify_owed,
+        owes,
         git_state,
         pr_state,
         issue_url,
@@ -977,7 +995,14 @@ mod tests {
     fn a_production_landing_is_kept_and_recorded_once_proven() {
         let records = vec![removed("one", "base")];
         let row = |landing| {
-            let mut row = present(None, records[0].clone(), &BTreeMap::new(), None, landing);
+            let mut row = present(
+                None,
+                records[0].clone(),
+                &BTreeMap::new(),
+                None,
+                landing,
+                false,
+            );
             row.removed_at = records[0].removed_at.clone();
             row
         };
@@ -1004,7 +1029,7 @@ mod tests {
         let mut recorded = records[0].clone();
         recorded.extra.insert(LANDED_ON.into(), json!("production"));
         assert_eq!(saved_landing(&recorded), Some(true));
-        let fresh = present(None, recorded.clone(), &BTreeMap::new(), None, None);
+        let fresh = present(None, recorded.clone(), &BTreeMap::new(), None, None, false);
         assert_eq!(fresh.landed_on, Some(wt_tui::LandingKind::Production));
         let mut again = RemovedHistorySnapshot { rows: vec![fresh] };
         assert!(keep_strongest_landing(&mut again, &previous, &[recorded]).is_empty());
@@ -1018,6 +1043,14 @@ mod tests {
         extra.insert("title".into(), json!("Saved title"));
         extra.insert("prUrl".into(), json!("https://github.com/org/repo/pull/8"));
         extra.insert("landedOnAtRemoval".into(), json!("base"));
+        extra.insert(
+            "owed".into(),
+            json!([{
+                "id": "93co6q", "slug": "eng-12-fix", "by": "eng-12-fix",
+                "what": "confirm the logs", "whenText": "in production",
+                "dueAtMs": 1_791_540_000_000_i64,
+            }]),
+        );
         let entry = RemovedWorktree {
             slug: "eng-12-fix".into(),
             branch: "m/eng-12-fix".into(),
@@ -1041,6 +1074,7 @@ mod tests {
             &statuses,
             Some("https://github.com/org/repo"),
             None,
+            false,
         );
         assert_eq!(row.key, "eng-12-fix");
         assert_eq!(row.title, "Saved title");
@@ -1056,10 +1090,31 @@ mod tests {
         assert_eq!(row.production_landed, Some(false));
         assert!(row.automations_paused);
         assert!(row.details.iter().any(|detail| detail == "saved note"));
+        // Landed on base at removal: the check is due in staging, after
+        // the step that had already come due.
+        let owes: Vec<_> = row
+            .owes
+            .iter()
+            .map(|item| (item.kind, item.state, item.stage, item.what.as_str()))
+            .collect();
         assert_eq!(
-            row.verify_steps.as_deref(),
-            Some("in staging: check production")
+            owes,
+            [
+                (
+                    wt_core::OwedKind::Check,
+                    wt_core::OwedState::Due,
+                    Some(wt_core::VerifyStage::Staging),
+                    "check production"
+                ),
+                (
+                    wt_core::OwedKind::Step,
+                    wt_core::OwedState::Due,
+                    None,
+                    "confirm the logs"
+                ),
+            ]
         );
+        assert_eq!(row.owes[1].id.as_deref(), Some("93co6q"));
     }
 
     #[test]
@@ -1081,6 +1136,7 @@ mod tests {
             &BTreeMap::new(),
             Some("https://github.com/org/repo"),
             None,
+            false,
         );
         assert_eq!(
             row.issue_url.as_deref(),

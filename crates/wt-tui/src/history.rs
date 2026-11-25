@@ -526,17 +526,20 @@ fn record_lines(
     if let Some(what) = &row.blocked_on {
         field(&mut lines, "blocked", what, theme::WARN);
     }
-    if let Some(steps) = &row.verify_steps {
-        if row.verify_owed {
-            field(
-                &mut lines,
-                "verify",
-                &format!("still owed: {steps}"),
-                theme::WARN,
-            );
-        } else {
-            field(&mut lines, "verify", steps, theme::FG);
-        }
+    for (index, item) in row.owes.iter().enumerate() {
+        // A step that came due is closed by its id: `wt done <id> --slug`.
+        let id = item
+            .id
+            .as_deref()
+            .filter(|_| item.due() && item.kind == wt_core::OwedKind::Step)
+            .map(|id| format!(" · {id}"))
+            .unwrap_or_default();
+        field(
+            &mut lines,
+            if index == 0 { "owes" } else { "" },
+            &format!("{} ({}){id}", item.headline, item.when),
+            if item.due() { theme::WARN } else { theme::FG },
+        );
     }
     if let Some(landed) = row.landed_on {
         field(
@@ -645,8 +648,15 @@ mod tests {
             branch: "feature/long".into(),
             host: Some("builder".into()),
             blocked_on: Some("the staging deploy of the payments service".into()),
-            verify_steps: Some("open the dashboard, load the report, compare totals".into()),
-            verify_owed: true,
+            owes: vec![{
+                let mut check = crate::OwedView::new(
+                    wt_core::OwedKind::Check,
+                    wt_core::OwedState::Due,
+                    "open the dashboard, load the report, compare totals",
+                );
+                check.when = "due in staging".into();
+                check
+            }],
             details: vec!["a note that runs well past the width of the pane".into()],
             ..Default::default()
         };
@@ -665,7 +675,13 @@ mod tests {
             let at = texts.iter().position(|line| line.starts_with(key)).unwrap();
             &texts[at + 1]
         };
-        for key in ["blocked", "verify"] {
+        assert!(
+            texts
+                .iter()
+                .any(|line| line.starts_with("owes") && line.contains("check: open")),
+            "{texts:?}"
+        );
+        for key in ["blocked", "owes"] {
             let next = after(key);
             assert!(
                 next.starts_with(&" ".repeat(10)) && !next.trim().is_empty(),

@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use wt_config::InstanceRole;
-use wt_core::{ChainMember, build_stack_index};
+use wt_core::{ChainMember, build_display_stack_index};
 
 use crate::commands::resolve::resolve_from_inventory;
 use wt_app_core::context::AppContext;
@@ -176,8 +176,26 @@ async fn move_members(
     };
     let records = ctx.repository.inventory(&ctx.cancellation).await?;
     let worktrees = records.iter().filter(|w| !w.is_main).collect::<Vec<_>>();
+    let archived = ctx
+        .database
+        .call(|store| Ok(store.read_archived_keys()?))
+        .await?;
+    // The stacks as the board draws them, so a move here and one in the TUI
+    // take the same rows along: an archived row is in no stack, and a row
+    // whose own work has landed is a unit of its own.
+    let landed = if only {
+        BTreeSet::new()
+    } else {
+        let live = worktrees.iter().map(|w| (*w).clone()).collect::<Vec<_>>();
+        crate::lifecycle_ops::row_landings(ctx, &live, state, None)
+            .await
+            .into_iter()
+            .filter_map(|(slug, landing)| landing.base.then_some(slug))
+            .collect::<BTreeSet<_>>()
+    };
     let members = worktrees
         .iter()
+        .filter(|w| !archived.contains(&wt_core::worktree_target_key(&w.target)))
         .map(|w| {
             ChainMember::new(
                 w.target.slug(),
@@ -191,7 +209,9 @@ async fn move_members(
             )
         })
         .collect::<Vec<_>>();
-    let stacks = build_stack_index(&members, &ctx.config.branch.base);
+    let stacks = build_display_stack_index(&members, &ctx.config.branch.base, |member| {
+        landed.contains(&member.slug)
+    });
     let mut named = Vec::new();
     let mut unresolved = Vec::new();
     for arg in &positionals[..positionals.len() - 1] {
@@ -411,6 +431,90 @@ mod tests {
             .unwrap();
         assert_eq!(state["slugs"]["one"]["section"], "Release");
         assert_eq!(state["slugs"]["two"]["section"], "Hold");
+        fixture.close().await.unwrap();
+    }
+
+    /// A move takes the rows the board draws as one unit: not an archived
+    /// row, and not what is stacked on a row whose own work has landed.
+    #[tokio::test]
+    async fn a_move_leaves_archived_rows_and_what_was_stacked_on_a_landed_row() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let rows = ctx.repository.inventory(&ctx.cancellation).await.unwrap();
+        let two = rows
+            .iter()
+            .find(|row| row.target.slug() == "two")
+            .map(|row| wt_core::worktree_target_key(&row.target))
+            .unwrap();
+        let base = |on: &'static str| async move {
+            ctx.database
+                .call(move |store| {
+                    store.set_slug_base("two", Some((on, None)))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        let mv = |section: &str| SectionArgs {
+            json: false,
+            command: Some(SectionCommand::Mv {
+                positionals: vec!["one".into(), section.into()],
+                only: false,
+            }),
+        };
+        let section = |slug: &'static str| async move {
+            ctx.database
+                .call(|store| Ok(store.read_wt_state()?))
+                .await
+                .unwrap()["slugs"][slug]["section"]
+                .clone()
+        };
+        base("feature/one").await;
+        let archived = two.clone();
+        ctx.database
+            .call(move |store| Ok(store.toggle_archived_seen(&archived, None, "Archived")?))
+            .await
+            .unwrap();
+        assert_eq!(run(ctx, &mv("Release")).await.unwrap(), 0);
+        assert_eq!(section("one").await, "Release");
+        assert!(section("two").await.is_null());
+        ctx.database
+            .call(move |store| Ok(store.toggle_archived_seen(&two, None, "Archived")?))
+            .await
+            .unwrap();
+
+        // Land "one": its commit is on the base branch the origin advertises.
+        let git = |args: Vec<String>| async move {
+            let output = crate::commands::resolve::run_git(ctx, &ctx.cwd, args.iter())
+                .await
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}");
+            output.stdout_text().trim().to_owned()
+        };
+        let words = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let origin = fixture._root.path().join("origin.git");
+        let origin = origin.to_string_lossy();
+        git(words(&["init", "--bare", &origin])).await;
+        git(words(&["remote", "add", "origin", &origin])).await;
+        let anchor = git(words(&["rev-parse", "HEAD"])).await;
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(ctx.cwd.join("work.txt"), "landed work\n").unwrap();
+        git(words(&["add", "work.txt"])).await;
+        git(words(&["commit", "-m", "feature work"])).await;
+        // Not landed yet: the stack moves together.
+        assert_eq!(run(ctx, &mv("Soon")).await.unwrap(), 0);
+        assert_eq!(section("two").await, "Soon");
+        git(words(&["push", "origin", "HEAD:refs/heads/main"])).await;
+        assert_eq!(run(ctx, &mv("Done")).await.unwrap(), 0);
+        assert_eq!(section("one").await, "Done");
+        assert_eq!(section("two").await, "Soon");
         fixture.close().await.unwrap();
     }
 }

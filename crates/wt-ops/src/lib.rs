@@ -19,6 +19,7 @@ pub mod merge_arm;
 pub mod origin;
 pub mod remote;
 pub mod restack_action;
+pub mod status_checks;
 pub mod updates;
 pub mod watch_actions;
 pub mod watch_probe;

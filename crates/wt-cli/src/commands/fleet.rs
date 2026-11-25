@@ -210,6 +210,14 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
     );
     let (state, reports_removed) = stored?;
     let registry = registry?;
+    let records = rows
+        .iter()
+        .map(|row| row.worktree.clone())
+        .collect::<Vec<_>>();
+    // This command's own GitHub read, when it succeeded, proves PR landings.
+    let landings =
+        wt_ops::lifecycle_ops::row_landings(ctx, &records, &state, fetched.as_ref().ok()).await;
+    let separate_production = ctx.config.branch.separate_production();
     let (prs, queue, pr_note) = match fetched {
         Ok(data) => (Some(data.prs), Some(data.merge_queue), None),
         Err(error) => (None, None, Some(error.to_string())),
@@ -352,12 +360,23 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             .as_ref()
             .and_then(|entries| entries.get(&row.worktree.target.branch))
             .map(queue_json);
+        let owed = super::owed::derive(
+            &state,
+            &slug,
+            landings
+                .get(&slug)
+                .copied()
+                .unwrap_or(wt_core::Landing::NONE),
+            clock.now_ms,
+        );
         let report = json!({
             "kind":"live", "slug":slug, "branch":row.worktree.target.branch,
             "path":row.worktree.target.path, "head":row.worktree.head_sha,
             "base":worktree_state.and_then(|record| record.get("baseBranch")).and_then(Value::as_str).unwrap_or(&ctx.config.branch.base),
             "section":section, "work":work, "edges":edges,
             "watches":super::watch::watches_json(&watches, &slug, clock),
+            "owes":super::owed::owes_json(&owed.items, clock),
+            "owed_phase":super::owed::phase_json(owed.phase),
             "dirty":row.status.as_ref().map(|status| status.dirty),
             "session":{"alive":alive,"busy":busy,"last_activity":last_activity}, "session_note":session_note,
             "operation":operation,"operation_note":operation_note,
@@ -374,7 +393,8 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             add_snake_case_aliases(work);
         }
         let verification_owed = wt_store::verification_owed_at_removal(&entry);
-        reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_in":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| work.verify_in.clone().unwrap_or_else(|| "staging".into()))),"verify_after_merge":entry.work.and_then(|work| work.verify_after_merge),"verification_owed":verification_owed}));
+        let owed = super::owed::derive_removed(&entry, separate_production, clock.now_ms);
+        reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_in":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| wt_core::VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),"verify_after_merge":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_deref()),"verification_owed":verification_owed,"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase)}));
     }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&reports)?);

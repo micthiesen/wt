@@ -113,14 +113,18 @@ pub async fn lifecycle_facts(
     // Without such a rule, only the worktrees a pending watch depends on
     // are worth the Git calls.
     let watched = wt_ops::lifecycle_ops::watch_wants(state);
-    if !required && watched.is_empty() {
+    // wt wakes the session of a worktree whose owed check came due, with or
+    // without a rule: that takes the row's landing.
+    let checked = wt_ops::lifecycle_ops::check_wants(state);
+    if !required && watched.is_empty() && checked.is_empty() {
         return Ok(PreparedLifecycleFacts::default());
     }
     let mut result = PreparedLifecycleFacts::default();
     let mut rows = Vec::new();
     for snapshot in snapshots.iter().filter(|snapshot| {
+        let slug = snapshot.worktree.target.slug();
         !snapshot.worktree.is_main
-            && (required || watched.contains_key(snapshot.worktree.target.slug()))
+            && (required || watched.contains_key(slug) || checked.contains_key(slug))
     }) {
         let slug = snapshot.worktree.target.slug();
         // An accepted removal owns this checkout; its files may disappear at
@@ -419,6 +423,45 @@ pub async fn prepare(
             )
         })
         .collect::<BTreeMap<_, _>>();
+    // The default `status.verification_due` settle of wt-config: with a
+    // deploy probe for both stages the trigger itself waits for the deploy.
+    let check_settle_seconds = if ctx.config.environments.staging.is_some()
+        && ctx.config.environments.production.is_some()
+    {
+        30.0
+    } else {
+        600.0
+    };
+    let unmet_requirements = ctx
+        .config
+        .automations
+        .iter()
+        .filter(|rule| rule.on == wt_config::AutomationTrigger::StatusVerificationDue)
+        .filter_map(|rule| {
+            ctx.config
+                .actions
+                .iter()
+                .find(|action| action.id == rule.run && !action.requires.is_empty())
+        })
+        .flat_map(|definition| {
+            rows.iter().filter_map(|row| {
+                let deployed = input
+                    .board
+                    .and_then(|board| board.rows.iter().find(|shown| shown.slug == row.slug))
+                    .is_some_and(|shown| shown.stage_url.is_some());
+                let (unmet, pr_unknown) = row_requirements(
+                    definition,
+                    ctx.config.issue_tracker.as_ref(),
+                    row,
+                    deployed,
+                    github_fresh,
+                    &github_covered_branches,
+                );
+                // A PR GitHub has not confirmed yet is not a refusal.
+                (unmet.is_some() && !pr_unknown).then(|| (definition.id.clone(), row.slug.clone()))
+            })
+        })
+        .collect::<BTreeSet<_>>();
     let row_vars = rows
         .iter()
         .filter_map(|row| {
@@ -495,6 +538,8 @@ pub async fn prepare(
             .collect(),
         // Set on every pass from the stored watches.
         watches: Vec::new(),
+        check_settle_seconds,
+        unmet_requirements,
     };
     context.local_day = OffsetDateTime::now_utc().date().to_string();
     let fires = evaluate(&ctx.config.automations, &rows, &context);
@@ -882,6 +927,32 @@ fn requirement_state(
             RequirementState::FrozenUnmet("worktree is no longer available".into())
         };
     };
+    let (unmet, pr_unknown) = row_requirements(
+        definition,
+        issue_tracker,
+        row,
+        deployed,
+        github_confirmed,
+        github_covered_branches,
+    );
+    match unmet {
+        Some(_) if pr_unknown => RequirementState::Waiting,
+        Some(reason) if fire.frozen_vars.is_some() => RequirementState::FrozenUnmet(reason),
+        Some(_) => RequirementState::Waiting,
+        None => RequirementState::Ready,
+    }
+}
+
+/// Why the row does not meet the action's `requires`, if it does not, and
+/// whether that is only because GitHub has not confirmed the row's PR yet.
+fn row_requirements(
+    definition: &wt_config::ActionDef,
+    issue_tracker: Option<&wt_config::IssueTrackerConfig>,
+    row: &AutomationRow,
+    deployed: bool,
+    github_confirmed: bool,
+    github_covered_branches: &BTreeSet<String>,
+) -> (Option<String>, bool) {
     let action_row = wt_actions::ActionRow {
         slug: row.slug.clone(),
         issue_id: row.issue_id.clone(),
@@ -909,12 +980,10 @@ fn requirement_state(
                 wt_config::RequireTag::Pr | wt_config::RequireTag::PrReady
             )
         });
-    match wt_actions::evaluate_requirements(&definition.requires, &action_row) {
-        Some(_) if pr_unknown => RequirementState::Waiting,
-        Some(reason) if fire.frozen_vars.is_some() => RequirementState::FrozenUnmet(reason),
-        Some(_) => RequirementState::Waiting,
-        None => RequirementState::Ready,
-    }
+    (
+        wt_actions::evaluate_requirements(&definition.requires, &action_row),
+        pr_unknown,
+    )
 }
 
 /// Quiescence requires confirmed discoveries and inventory (judge E1):
@@ -987,6 +1056,7 @@ mod tests {
             mcp_event: None,
             watch: None,
             detail: String::new(),
+            check: None,
         };
         for run in [
             "builtin:clean",
@@ -1088,6 +1158,7 @@ mod tests {
             mcp_event: None,
             watch: None,
             detail: String::new(),
+            check: None,
         };
         let mut facts = PreparedAutomationFacts::default();
         refresh_requirements(&fixture.ctx, &mut facts, None, &[]);
@@ -1127,6 +1198,7 @@ mod tests {
             mcp_event: None,
             watch: None,
             detail: String::new(),
+            check: None,
         };
         let mut actions = [wt_config::ActionDef {
             id: "release".into(),

@@ -248,9 +248,6 @@ fn compose(
                 for detail in &mut row.details {
                     *detail = wt_core::sanitize_terminal_text(detail);
                 }
-                if let Some(steps) = &mut row.verify_steps {
-                    *steps = wt_core::sanitize_terminal_text(steps);
-                }
                 for log in &mut row.logs {
                     log.title = wt_core::sanitize_terminal_text(&log.title);
                     for line in &mut log.lines {
@@ -291,6 +288,7 @@ fn compose(
                 {
                     *value = wt_core::sanitize_terminal_text(value);
                 }
+                row.owes.iter_mut().for_each(sanitize_owed);
                 board.rows.push(row);
             }
             if let Some(remote) = &data.board {
@@ -335,10 +333,10 @@ fn compose(
                     for line in &mut row.details {
                         *line = wt_core::sanitize_terminal_text(line);
                     }
+                    row.owes.iter_mut().for_each(sanitize_owed);
                     for value in [
                         &mut row.work_state,
                         &mut row.blocked_on,
-                        &mut row.verify_steps,
                         &mut row.git_state,
                         &mut row.pr_state,
                         &mut row.issue_status,
@@ -452,6 +450,32 @@ fn compose(
     wt_sources::board_layout::prepare(&mut board, &state, &config.branch.base, config.ui.sort);
     wt_app_core::feeds::bound_feeds(&mut board);
     snapshot.derive(Some(Arc::new(board)))
+}
+
+/// What a remote row owes is derived on its host; this board only draws it.
+fn sanitize_owed(item: &mut wt_tui::OwedView) {
+    for value in [&mut item.what, &mut item.headline, &mut item.when] {
+        *value = wt_core::sanitize_terminal_text(value);
+    }
+    for value in [
+        &mut item.id,
+        &mut item.due_at,
+        &mut item.not_before_in,
+        &mut item.by,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *value = wt_core::sanitize_terminal_text(value);
+    }
+    for cond in &mut item.conditions {
+        for value in [&mut cond.key, &mut cond.text] {
+            *value = wt_core::sanitize_terminal_text(value);
+        }
+        for value in [&mut cond.reason, &mut cond.due_in].into_iter().flatten() {
+            *value = wt_core::sanitize_terminal_text(value);
+        }
+    }
 }
 
 /// A remote's per-domain provenance: the host's own board domains plus this
@@ -599,6 +623,15 @@ mod tests {
             met: false,
             held: false,
         }];
+        let mut owed = wt_tui::OwedView::new(
+            wt_core::OwedKind::Step,
+            wt_core::OwedState::Due,
+            "confirm \u{1b}[31mthe logs",
+        );
+        owed.id = Some("abc234".into());
+        owed.when = "due since \u{1b}[31m11:36".into();
+        row.owes = vec![owed];
+        row.owed_phase = Some(wt_core::OwedPhase::Due);
         let message = |text: &str| wt_core::WorktreeEvent {
             at_ms: 1,
             event: wt_core::WorktreeEventKind::Message {
@@ -653,6 +686,19 @@ mod tests {
             Some("exited 2: boom")
         );
         assert_eq!(watch.conditions[0].state, wt_tui::WatchTruth::Unknown);
+        // And what it owes, with where it stands.
+        let [owed] = remote_row.owes.as_slice() else {
+            panic!("{:?}", remote_row.owes)
+        };
+        assert_eq!(
+            (
+                owed.what.as_str(),
+                owed.headline.as_str(),
+                owed.when.as_str()
+            ),
+            ("confirm the logs", "confirm the logs", "due since 11:36")
+        );
+        assert_eq!(remote_row.owed_phase, Some(wt_core::OwedPhase::Due));
         fixture.close().await.unwrap();
     }
     #[tokio::test]

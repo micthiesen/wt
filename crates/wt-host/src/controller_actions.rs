@@ -920,50 +920,40 @@ async fn set_status(
                         )));
                     }
                 }
-                Ok(state.map(|state| {
-                    let terminal = matches!(
-                        state,
-                        wt_core::WorkState::Verified | wt_core::WorkState::Dropped
-                    );
-                    let (verify_after_merge, verify_in) = if terminal {
-                        (None, None)
+                let Some(state) = state else {
+                    return Ok(None);
+                };
+                let before = previous.and_then(wt_store::WorkStatusRecord::to_core);
+                let mut next = wt_core::WorkStatusRecord::new(state, at);
+                next.note = note
+                    .map(|text| wt_core::sanitize_work_note(&text))
+                    .filter(|text| !text.is_empty());
+                next.risk = before
+                    .as_ref()
+                    .filter(|_| state == wt_core::WorkState::Ready)
+                    .and_then(|work| work.risk);
+                next.sha = Some(head);
+                next.by = Some("human".into());
+                // The menu edits the one check it showed: the first still
+                // owed. Steps set that stage's check and empty steps drop
+                // it; a check owed in the other stage is carried either way.
+                let edit = verify.map(|text| {
+                    let steps = wt_core::sanitize_work_note(&text);
+                    let shown = before
+                        .as_ref()
+                        .and_then(|work| work.verification().map(|(stage, _)| stage));
+                    let stage = wt_core::VerifyStage::or_default(verify_in.or(shown));
+                    if steps.is_empty() {
+                        wt_ops::status_checks::CheckEdit::Drop { stage }
                     } else {
-                        match verify {
-                            Some(text) => {
-                                let steps = (!text.trim().is_empty())
-                                    .then(|| wt_core::sanitize_work_note(&text));
-                                let stage = steps
-                                    .as_ref()
-                                    .and(verify_in)
-                                    .map(|stage| stage.as_str().to_owned());
-                                (steps, stage)
-                            }
-                            None => previous
-                                .map(|work| {
-                                    (work.verify_after_merge.clone(), work.verify_in.clone())
-                                })
-                                .unwrap_or_default(),
-                        }
-                    };
-                    wt_store::WorkStatusRecord {
-                        state: state.as_str().into(),
-                        at,
-                        note: note
-                            .map(|text| wt_core::sanitize_work_note(&text))
-                            .filter(|text| !text.is_empty()),
-                        risk: if state == wt_core::WorkState::Ready {
-                            previous.and_then(|work| work.risk.clone())
-                        } else {
-                            None
-                        },
-                        sha: Some(head),
-                        by: Some("human".into()),
-                        blocked_on: None,
-                        verify_after_merge,
-                        verify_in,
-                        extra: Default::default(),
+                        wt_ops::status_checks::CheckEdit::Owe { stage, steps }
                     }
-                }))
+                });
+                wt_ops::status_checks::assert_checks(&mut next, before.as_ref(), edit);
+                let stored = serde_json::to_value(&next)
+                    .and_then(serde_json::from_value::<wt_store::WorkStatusRecord>)
+                    .context("encode status record")?;
+                Ok(Some(stored))
             })??;
             Ok(())
         })
@@ -1188,6 +1178,49 @@ mod tests {
                 .get("verifyAfterMerge")
                 .is_none()
         );
+        // The menu edits one stage's check and carries the other, by the
+        // rule `wt status` uses.
+        let set = |state: &'static str, steps: Option<&'static str>, stage| {
+            let (ctx, key) = (&fixture.ctx, key.clone());
+            async move {
+                set_status(
+                    ctx,
+                    &key,
+                    Some(state.into()),
+                    None,
+                    steps.map(str::to_owned),
+                    stage,
+                    None,
+                )
+                .await
+                .unwrap();
+                ctx.database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await
+                    .unwrap()["slugs"]["one"]["work"]["checks"]
+                    .clone()
+            }
+        };
+        set(
+            "ready",
+            Some("1. staging"),
+            Some(wt_core::VerifyStage::Staging),
+        )
+        .await;
+        let both = set(
+            "ready",
+            Some("1. production"),
+            Some(wt_core::VerifyStage::Production),
+        )
+        .await;
+        assert_eq!(both["staging"]["steps"], "1. staging");
+        assert_eq!(both["production"]["steps"], "1. production");
+        assert_eq!(set("working", None, None).await, both);
+        // Emptied steps drop the check the menu showed: the first one.
+        let left = set("working", Some(""), None).await;
+        assert!(left.get("staging").is_none(), "{left}");
+        assert_eq!(left["production"]["steps"], "1. production");
+        assert_eq!(set("verified", None, None).await, serde_json::json!({}));
         fixture.close().await.unwrap();
     }
 

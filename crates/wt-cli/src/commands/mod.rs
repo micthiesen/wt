@@ -21,6 +21,7 @@ pub mod merge;
 pub mod new;
 pub mod next;
 pub mod open;
+pub mod owed;
 pub mod remote;
 pub mod restack;
 pub mod restore;

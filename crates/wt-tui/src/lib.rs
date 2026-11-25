@@ -39,12 +39,12 @@ pub use model::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
     AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
     GitPresentation, GuideView, HostChoice, Interaction, LandingKind, LiveSlotView, LocalStamp,
-    LogView, MergeQueueView, Model, PerfGroupView, PerfProcessView, PerfTone, PerfView,
-    PrCommentView, PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView,
-    RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
-    SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem,
-    WatchActionKind, WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount,
-    WorkStateCount,
+    LogView, MergeQueueView, Model, OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION, OwedBlock, OwedView,
+    PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation,
+    PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot,
+    ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView,
+    TerminalSlotView, TitleSource, UsageItem, WatchActionKind, WatchConditionView, WatchTruth,
+    WatchView, WorkPresentation, WorkRiskCount, WorkStateCount, owed_block_refusal,
 };
 pub use mutations::{
     AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,

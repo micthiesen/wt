@@ -298,6 +298,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let metadata_key = metadata_facts_key(confirmed_metadata.as_deref());
             let watches_await_production = confirmed_metadata.as_deref().is_some_and(|(state, _)| {
                 wt_ops::lifecycle_ops::watch_wants(state).values().any(|wants| wants.production)
+                    || wt_ops::lifecycle_ops::check_wants(state).values().any(|wants| wants.production)
             });
             let production = production_tip.current(&context, watches_await_production).await;
             let deployed = deploys_rx.borrow_and_update().data().map(|deploys| {
@@ -525,17 +526,18 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             };
             record_skipped(&context, engine.take_skipped()).await;
             if settled_watches.len() > 512 { settled_watches.clear(); }
-            for (id, action) in tick.settled_watches {
+            for settled in tick.settled_watches {
+                let (id, action) = (settled.id.clone(), settled.action);
                 if !settled_watches.insert((id.clone(), action)) { continue; }
-                let done = id.clone();
                 // The ledger says the fire ran, not that the gate was
-                // written: a crash between the two leaves it set.
+                // written or the wake recorded: a crash between the two
+                // leaves the action on its watch. A wake settles the way its
+                // delivery would have, by the landing this pass evaluated.
+                let at = facts.context.now_ms;
                 let settle = move |store: &mut wt_store::Store| {
-                    match action {
-                        wt_core::watch::WatchAction::Unblock => { store.deliver_unblock(&done)?; }
-                        _ => { store.complete_action(&done, action)?; }
-                    }
-                    Ok(())
+                    Ok(wt_ops::watch_actions::settle(
+                        store, &settled.id, settled.action, settled.landing, settled.unconfirmed, at,
+                    )?)
                 };
                 if let Err(error) = context.database.call(settle).await {
                     settled_watches.remove(&(id, action));
@@ -708,6 +710,8 @@ async fn dispatch_claim(
     let fire = claim.fire().clone();
     let (outcome, error) = if fire.watch.is_some() {
         wt_ops::watch_actions::dispatch(&context, &fire).await
+    } else if wt_automations::is_check_wake(&fire) {
+        wt_ops::watch_actions::dispatch_check(&context, &fire).await
     } else if fire.rule.run.starts_with("builtin:") {
         match wt_ops::automation_builtins::execute(&context, &fire).await {
             wt_ops::automation_builtins::BuiltinExecution::Retry { reason } => {
@@ -1226,6 +1230,7 @@ mod tests {
             mcp_event: None,
             watch: None,
             detail: String::new(),
+            check: None,
         }
     }
 

@@ -317,6 +317,192 @@ pub struct WatchConditionView {
     pub due_in: Option<String>,
 }
 
+/// One thing a worktree owes, prepared by the host that stores it from
+/// `wt_core::owed_items`: the merge gate, a check owed in a stage, or a step
+/// the worktree comes back for. Every pane that says what a row owes reads
+/// this list.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OwedView {
+    /// What `wt done` takes for a due step; the watch's id for a waiting
+    /// step or a gate something watches.
+    #[serde(default)]
+    pub id: Option<String>,
+    pub kind: wt_core::OwedKind,
+    pub state: wt_core::OwedState,
+    /// A check's stage, or the stage of the row's own a step waits for.
+    #[serde(default)]
+    pub stage: Option<wt_core::VerifyStage>,
+    /// The gate text, the check's steps or the step's prompt, in full.
+    pub what: String,
+    /// One line naming it, as `wt owed` prints it.
+    pub headline: String,
+    /// When it is due or cleared, in words with the host's clock.
+    #[serde(default)]
+    pub when: String,
+    /// The conditions a gate's watch or a waiting step waits for, with each
+    /// one's truth as the engine last recorded it.
+    #[serde(default)]
+    pub conditions: Vec<WatchConditionView>,
+    /// When a step came due, UTC epoch milliseconds, and the host's label
+    /// for it (`11:36`, `Nov 27 18:12`).
+    #[serde(default)]
+    pub due_at_ms: Option<u64>,
+    #[serde(default)]
+    pub due_at: Option<String>,
+    /// How long a check that was put off still waits, such as `1h`.
+    #[serde(default)]
+    pub not_before_in: Option<String>,
+    /// Who set a step.
+    #[serde(default)]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub before_release: bool,
+    #[serde(default)]
+    pub overdue: bool,
+    #[serde(default)]
+    pub awaiting_deploy: bool,
+    /// A due step whose wake was sent without proof it arrived.
+    #[serde(default)]
+    pub unconfirmed: bool,
+    /// Its conditions held and delivery is under way.
+    #[serde(default)]
+    pub met: bool,
+    /// Automations are paused for the row or everywhere, so nothing is
+    /// delivered until they resume.
+    #[serde(default)]
+    pub held: bool,
+    /// Its watch also wakes the row's session: a gate set with `--then`.
+    #[serde(default)]
+    pub wakes: bool,
+}
+
+impl OwedView {
+    /// An item with nothing but its kind, state and text.
+    pub fn new(kind: wt_core::OwedKind, state: wt_core::OwedState, what: &str) -> Self {
+        let line = wt_core::watch::headline(what);
+        Self {
+            id: None,
+            kind,
+            state,
+            stage: None,
+            what: what.to_owned(),
+            headline: match kind {
+                wt_core::OwedKind::Check => format!("check: {line}"),
+                wt_core::OwedKind::Gate | wt_core::OwedKind::Step => line,
+            },
+            when: String::new(),
+            conditions: Vec::new(),
+            due_at_ms: None,
+            due_at: None,
+            not_before_in: None,
+            by: None,
+            before_release: false,
+            overdue: false,
+            awaiting_deploy: false,
+            unconfirmed: false,
+            met: false,
+            held: false,
+            wakes: false,
+        }
+    }
+
+    pub fn due(&self) -> bool {
+        self.state == wt_core::OwedState::Due
+    }
+
+    /// Whether removing the worktree would lose it. A merge gate alone holds
+    /// nothing once the work has landed; the wake that follows one does.
+    pub fn holds_cleanup(&self) -> bool {
+        self.kind != wt_core::OwedKind::Gate || self.wakes
+    }
+
+    /// A condition it waits for cannot be read, so it may never come due.
+    pub fn unreadable(&self) -> bool {
+        !self.met
+            && self
+                .conditions
+                .iter()
+                .any(|cond| cond.state == WatchTruth::Unknown)
+    }
+}
+
+/// Key prefix of the blocks `[ui] owed_sections` derives for landed rows.
+pub const OWED_BLOCK_PREFIX: &str = "\0owed:";
+/// The option's name as notices print it.
+pub const OWED_SECTIONS_OPTION: &str = "[ui] owed_sections";
+
+/// Why a row or block under a derived block cannot be moved. `title` is the
+/// block's.
+pub fn owed_block_refusal(title: &str) -> String {
+    format!(
+        "{title} is derived from what landed rows owe; set {OWED_SECTIONS_OPTION} = false to file rows by hand"
+    )
+}
+
+/// The derived block a landed row is shown in under `[ui] owed_sections`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OwedBlock {
+    Due,
+    WaitingStaging,
+    WaitingProduction,
+    Waiting,
+    Done,
+}
+
+impl OwedBlock {
+    pub const ALL: [Self; 5] = [
+        Self::Due,
+        Self::WaitingStaging,
+        Self::WaitingProduction,
+        Self::Waiting,
+        Self::Done,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Due => "\0owed:due",
+            Self::WaitingStaging => "\0owed:staging",
+            Self::WaitingProduction => "\0owed:production",
+            Self::Waiting => "\0owed:waiting",
+            Self::Done => "\0owed:done",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Due => "Due",
+            Self::WaitingStaging => "Waiting for staging",
+            Self::WaitingProduction => "Waiting for production",
+            Self::Waiting => "Waiting",
+            Self::Done => "Done",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|block| block.key() == key)
+    }
+
+    /// Where a landed row with this phase and list belongs. A waiting row is
+    /// filed by the first thing removal would lose.
+    pub fn of(phase: wt_core::OwedPhase, owes: &[OwedView]) -> Self {
+        match phase {
+            wt_core::OwedPhase::Due => Self::Due,
+            wt_core::OwedPhase::Done => Self::Done,
+            wt_core::OwedPhase::Waiting => {
+                match owes
+                    .iter()
+                    .find(|item| item.holds_cleanup())
+                    .and_then(|item| item.stage)
+                {
+                    Some(wt_core::VerifyStage::Staging) => Self::WaitingStaging,
+                    Some(wt_core::VerifyStage::Production) => Self::WaitingProduction,
+                    None => Self::Waiting,
+                }
+            }
+        }
+    }
+}
+
 /// A condition's truth as the engine last recorded it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -369,11 +555,10 @@ pub struct RemovedHistoryRow {
     pub work_state: Option<String>,
     #[serde(default)]
     pub blocked_on: Option<String>,
-    /// Saved verify-after-merge steps, and whether they were still owed.
+    /// What the removed row still owes: its checks per stage and the steps
+    /// that had come due.
     #[serde(default)]
-    pub verify_steps: Option<String>,
-    #[serde(default)]
-    pub verify_owed: bool,
+    pub owes: Vec<OwedView>,
     /// Git and PR outcome recorded at removal, such as `merged`.
     #[serde(default)]
     pub git_state: Option<String>,
@@ -443,6 +628,13 @@ impl BoardSection {
     pub fn drawn(&self) -> bool {
         !self.rows.is_empty() || !self.key.starts_with('\0')
     }
+
+    /// A block `[ui] owed_sections` derives from what landed rows owe.
+    /// Nothing is filed in one: rows cannot be moved into, out of or inside
+    /// it.
+    pub fn owed_block(&self) -> bool {
+        self.key.starts_with(OWED_BLOCK_PREFIX)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -452,8 +644,11 @@ pub struct SectionRollup {
     pub risks: Vec<WorkRiskCount>,
     pub blocked_notes: Vec<String>,
     pub stale_statuses: usize,
-    pub verification_owed: usize,
-    pub verification_overdue: usize,
+    /// Landed rows that still owe something.
+    pub owed: usize,
+    /// Of those, rows with something due now.
+    pub owed_due: usize,
+    pub owed_overdue: usize,
     pub dirty_worktrees: Option<usize>,
     pub unknown_git: usize,
     pub upstream_ahead: usize,
@@ -554,17 +749,22 @@ impl SectionRollup {
                         .is_some_and(|work| work.stale == Some(true))
                 })
                 .count(),
-            verification_owed: rows
-                .iter()
-                .filter(|row| row.work.as_ref().is_some_and(|work| work.verification_owed))
-                .count(),
-            verification_overdue: rows
+            owed: rows
                 .iter()
                 .filter(|row| {
-                    row.work
-                        .as_ref()
-                        .is_some_and(|work| work.verification_overdue)
+                    matches!(
+                        row.owed_phase,
+                        Some(wt_core::OwedPhase::Due | wt_core::OwedPhase::Waiting)
+                    )
                 })
+                .count(),
+            owed_due: rows
+                .iter()
+                .filter(|row| row.owed_phase == Some(wt_core::OwedPhase::Due))
+                .count(),
+            owed_overdue: rows
+                .iter()
+                .filter(|row| row.owes.iter().any(|item| item.overdue))
                 .count(),
             dirty_worktrees: Some(dirty_worktrees),
             unknown_git,
@@ -722,13 +922,6 @@ pub struct WorkPresentation {
     pub derived: bool,
     pub age: Option<String>,
     pub stale: Option<bool>,
-    pub verification_owed: bool,
-    /// Owed but not yet due: a production check on a branch only in staging,
-    /// or a check whose probed stage has not deployed the landing.
-    pub verification_waiting: bool,
-    /// The stage whose deploy a landed check waits on.
-    pub verification_awaiting_deploy: Option<wt_core::VerifyStage>,
-    pub verification_overdue: bool,
     pub blocked: bool,
 }
 
@@ -908,6 +1101,8 @@ pub struct DisplayPolicy {
     pub trunk: String,
     /// The reviewer `E` requests when human reviewer requests are configured.
     pub default_reviewer: Option<String>,
+    /// `[ui] owed_sections`: landed rows are grouped by what they owe.
+    pub owed_sections: bool,
     /// `[guides] enabled`: the details pane shows each row's change guide.
     pub guides: bool,
     /// Staging has a deploy probe (`[environments.staging]`): reaching it
@@ -985,8 +1180,6 @@ pub struct BoardRow {
     /// Stored position of a row created from the board.
     #[serde(default)]
     pub creation_placement: Option<crate::CreatePlacement>,
-    #[serde(default)]
-    pub verify_steps: Option<String>,
     pub issue_id: Option<String>,
     pub issue_status: Option<String>,
     pub issue_url: Option<String>,
@@ -1055,6 +1248,15 @@ pub struct BoardRow {
     /// What the worktree waits for, as its host stores it.
     #[serde(default)]
     pub watches: Vec<WatchView>,
+    /// Everything the worktree owes, most urgent first: what is due, the
+    /// merge gate, then what waits. Watches that only tell the person are
+    /// not owed and stay in `watches`.
+    #[serde(default)]
+    pub owes: Vec<OwedView>,
+    /// Where a landed row stands with what it owes; `None` until its own
+    /// work has landed.
+    #[serde(default)]
+    pub owed_phase: Option<wt_core::OwedPhase>,
     /// The stored creation stamp of this worktree. A later worktree with the
     /// same slug has another, so a menu commit carries it as its witness.
     #[serde(default)]
@@ -1077,8 +1279,6 @@ mod rollup_tests {
                     work: Some(WorkPresentation {
                         effective_state: Some(WorkState::Ready),
                         stale: Some(true),
-                        verification_owed: true,
-                        verification_overdue: true,
                         record: Some(WorkStatusRecord {
                             state: WorkState::Ready,
                             risk: Some(WorkRisk::High),
@@ -1108,6 +1308,16 @@ mod rollup_tests {
                         ..Default::default()
                     }),
                     automations_paused: true,
+                    owed_phase: Some(wt_core::OwedPhase::Due),
+                    owes: vec![{
+                        let mut check = OwedView::new(
+                            wt_core::OwedKind::Check,
+                            wt_core::OwedState::Due,
+                            "check prod",
+                        );
+                        check.overdue = true;
+                        check
+                    }],
                     ..Default::default()
                 },
                 BoardRow {
@@ -1149,8 +1359,10 @@ mod rollup_tests {
         );
         assert_eq!(summary.blocked_notes, ["ready-row: release approval"]);
         assert_eq!(summary.stale_statuses, 1);
-        assert_eq!(summary.verification_owed, 1);
-        assert_eq!(summary.verification_overdue, 1);
+        assert_eq!(
+            (summary.owed, summary.owed_due, summary.owed_overdue),
+            (1, 1, 1)
+        );
         assert_eq!(summary.dirty_worktrees, Some(1));
         assert_eq!(summary.unknown_git, 1);
         assert_eq!(summary.upstream_ahead, 1);

@@ -4,13 +4,16 @@ use wt_config::{AutomationDef, AutomationTrigger};
 use wt_core::{WorkState, watch::WatchAction};
 
 use crate::types::{
-    ActionAudience, AutomationEvalContext, AutomationFire, AutomationRow, BranchRange, FrozenPr,
-    GuideOwner, McpEvent, WatchFire, status_is_gated, status_suffix, status_trigger_state,
+    ActionAudience, AutomationEvalContext, AutomationFire, AutomationRow, BranchRange, CheckFire,
+    FrozenPr, GuideOwner, McpEvent, WatchFire, status_is_gated, status_suffix,
+    status_trigger_state,
 };
 
 pub const FLEET_SLUG: &str = "_fleet";
 pub const WATCH_RULE_ID: &str = "wt.watch";
 pub const WATCH_RUN: &str = "builtin:watch";
+pub const CHECK_RULE_ID: &str = "wt.check";
+pub const CHECK_RUN: &str = "builtin:check";
 /// GitHub's answer about a merge armed more recently than this may predate
 /// the arming, so it is not yet evidence that the merge was dropped. It is
 /// the age up to which the sources still call GitHub data fresh.
@@ -27,6 +30,25 @@ pub fn watch_rule() -> AutomationDef {
         settle_seconds: 0.0,
         ..AutomationDef::default()
     }
+}
+
+/// The rule that wakes a worktree's session when a check it owes comes due.
+/// Like the watch rule it exists without configuration, and configuration
+/// cannot declare it.
+pub fn check_rule(settle_seconds: f64) -> AutomationDef {
+    AutomationDef {
+        id: CHECK_RULE_ID.into(),
+        on: AutomationTrigger::StatusVerificationDue,
+        run: CHECK_RUN.into(),
+        busy: wt_config::AutomationBusyPolicy::Queue,
+        settle_seconds,
+        ..AutomationDef::default()
+    }
+}
+
+/// Whether the fire is wt's own wake for a due check.
+pub fn is_check_wake(fire: &AutomationFire) -> bool {
+    fire.rule.run == CHECK_RUN && fire.check.is_some()
 }
 
 /// Evaluate level conditions from one consistent source snapshot. Callers
@@ -56,6 +78,11 @@ pub fn evaluate(
             AutomationTrigger::McpEvent => fires.extend(evaluate_mcp(rule, rows, context)),
             // Watch fires come from the watches themselves, below.
             AutomationTrigger::WatchMet => {}
+            AutomationTrigger::StatusVerificationDue => {
+                for row in rows.iter().filter(|row| eligible(row, context)) {
+                    fires.extend(evaluate_checks_due(rule, row, context));
+                }
+            }
             trigger => {
                 for row in rows {
                     if eligible(row, context)
@@ -67,7 +94,93 @@ pub fn evaluate(
             }
         }
     }
+    fires.extend(evaluate_own_checks(rules, rows, context));
     fires.extend(evaluate_watches(rows, context));
+    fires
+}
+
+/// One fire per check of the row that is due: the change is in the check's
+/// stage and no not-before holds it back.
+fn evaluate_checks_due(
+    rule: &AutomationDef,
+    row: &AutomationRow,
+    context: &AutomationEvalContext,
+) -> Vec<AutomationFire> {
+    let landing = row_landing(row, context);
+    wt_core::check_standings(row.work.as_ref(), landing, context.now_ms)
+        .into_iter()
+        .filter(|(_, standing)| standing.due)
+        .map(|(check, standing)| {
+            let stage = standing.stage;
+            // Keyed by the obligation, not the assertion: a run that fails and
+            // re-asserts needs-human must not be rerun by its own status write.
+            // New steps are a new check, and so is one put off to a later time.
+            let mut key = format!(
+                "{}:verify:{}:{}:{:016x}",
+                rule.id,
+                row.slug,
+                stage.as_str(),
+                stable_hash(&check.steps)
+            );
+            // Only when set: a key that always carried it would fire every
+            // check delivered before the key had it once more.
+            if let Some(not_before) = check.not_before_ms {
+                key.push_str(&format!(":{not_before}"));
+            }
+            let mut fire = single(
+                rule,
+                row,
+                key,
+                &format!("verify in {}: {}", stage.as_str(), check.steps),
+            );
+            fire.check = Some(CheckFire {
+                stage,
+                steps: check.steps,
+            });
+            fire
+        })
+        .collect()
+}
+
+/// wt's own wake for each due check, where no configured rule already
+/// brings the check to the row's session. Like a wake set with `wt wake`,
+/// it waits for the session and for a paused worktree, and needs no rule.
+fn evaluate_own_checks(
+    rules: &[AutomationDef],
+    rows: &[AutomationRow],
+    context: &AutomationEvalContext,
+) -> Vec<AutomationFire> {
+    let rule = check_rule(context.check_settle_seconds);
+    let mut fires = Vec::new();
+    for row in rows {
+        if row.archived || context.pauses.slugs.contains(&row.slug) {
+            continue;
+        }
+        // A rule that tells the person or the manager, or whose action does
+        // not accept this row, leaves the session unprompted.
+        let owned = rules.iter().any(|configured| {
+            configured.on == AutomationTrigger::StatusVerificationDue
+                && action_traits(configured, context)
+                    .is_some_and(|traits| traits.audience == ActionAudience::Session)
+                && !context
+                    .unmet_requirements
+                    .contains(&(configured.run.clone(), row.slug.clone()))
+        });
+        if owned {
+            continue;
+        }
+        // The owner's incarnation: a later worktree with the same slug and
+        // the same steps owes its own check.
+        let created = row.created_at.as_deref().unwrap_or_default();
+        let prefix = format!("{}:verify:{}:", rule.id, row.slug);
+        for mut fire in evaluate_checks_due(&rule, row, context) {
+            for key in &mut fire.fire_keys {
+                let rest = key.strip_prefix(&prefix).unwrap_or(key);
+                *key = format!("{}:{}:{created}:{rest}", rule.id, row.slug);
+            }
+            fires.push(fire);
+        }
+    }
     fires
 }
 
@@ -89,14 +202,12 @@ fn evaluate_watches(
             .actions
             .iter()
             .any(|(action, _)| *action == WatchAction::Unblock);
+        let owner = rows
+            .iter()
+            .find(|row| row.slug == watch.slug && !row.archived);
         for (action, text) in &watch.actions {
             let wake = *action == WatchAction::Wake;
-            if wake
-                && (owes_unblock
-                    || !rows
-                        .iter()
-                        .any(|row| row.slug == watch.slug && !row.archived))
-            {
+            if wake && (owes_unblock || owner.is_none()) {
                 continue;
             }
             fires.push(AutomationFire {
@@ -123,7 +234,11 @@ fn evaluate_watches(
                     held: watch.held.clone(),
                     text: text.clone(),
                     cleared_gate: watch.cleared_gate.clone(),
+                    landing: owner.map_or(wt_core::OwnerLanding::Unknown, |row| {
+                        owner_landing(row, context)
+                    }),
                 }),
+                check: None,
                 detail: wt_core::sanitize_terminal_text(&format!(
                     "{}: {}",
                     action.as_str(),
@@ -147,7 +262,17 @@ pub fn evaluate_breaker_resets(
     context: &AutomationEvalContext,
 ) -> BTreeSet<(String, String)> {
     let fires = evaluate(rules, rows, context);
-    let fired: BTreeSet<_> = fires.iter().map(fire_identity).collect();
+    // By rule and target: a rule may have one fire per owed check of a row.
+    let fired: BTreeSet<_> = fires
+        .iter()
+        .map(|fire| {
+            format!(
+                "{}|{}",
+                fire.rule.id,
+                fire.stack_id.as_deref().unwrap_or(&fire.slug)
+            )
+        })
+        .collect();
     let mut ineligible_stacks = BTreeSet::new();
     for row in rows {
         if let Some(stack) = &row.stack
@@ -247,19 +372,23 @@ pub fn evaluate_breaker_resets(
 
 pub fn fire_identity(fire: &AutomationFire) -> String {
     let target = fire.stack_id.as_deref().unwrap_or(&fire.slug);
-    match (&fire.mcp_event, &fire.watch) {
+    match (&fire.mcp_event, &fire.watch, &fire.check) {
         // Each event is its own fire; sharing `rule|slug` would let a burst
         // for one guide replace itself in the queue, newest first.
-        (Some(event), _) => format!("{}|{target}|{}", fire.rule.id, event.event_id),
+        (Some(event), _, _) => format!("{}|{target}|{}", fire.rule.id, event.event_id),
         // So is each action of each watch: several met watches on one
         // worktree must not replace each other.
-        (None, Some(watch)) => format!(
+        (None, Some(watch), _) => format!(
             "{}|{target}|{}:{}",
             fire.rule.id,
             watch.id,
             watch.action.as_str()
         ),
-        (None, None) => format!("{}|{target}", fire.rule.id),
+        // And each stage's check: staging and production can be due at once.
+        (None, None, Some(check)) => {
+            format!("{}|{target}|check:{}", fire.rule.id, check.stage.as_str())
+        }
+        (None, None, None) => format!("{}|{target}", fire.rule.id),
     }
 }
 
@@ -429,48 +558,40 @@ fn evaluate_row(
             }
             Some(fire)
         }
-        AutomationTrigger::StatusVerificationDue => {
-            let work = row.work.as_ref()?;
-            if !wt_core::verification_due(Some(work), row_landing(row, context)) {
-                return None;
-            }
-            let (stage, steps) = work.verification()?;
-            // Keyed by the obligation, not the assertion: a run that fails and
-            // re-asserts needs-human must not be rerun by its own status write.
-            // New steps are a new check.
-            Some(single(
-                rule,
-                row,
-                format!(
-                    "{}:verify:{}:{}:{:016x}",
-                    rule.id,
-                    slug,
-                    stage.as_str(),
-                    stable_hash(steps)
-                ),
-                &format!("verify in {}: {steps}", stage.as_str()),
-            ))
-        }
         AutomationTrigger::StatusVerificationOverdue => {
             let work = row.work.as_ref()?;
-            let landing = row_landing(row, context);
-            if !wt_core::verification_overdue_with_days(
+            let overdue = wt_core::checks_overdue_with_days(
                 Some(work),
-                landing,
+                row_landing(row, context),
                 context.now_ms,
                 rule.after_days,
-            ) {
+            );
+            if overdue.is_empty() {
                 return None;
             }
-            let (stage, verify) = work.verification()?;
+            // One reminder a day for the row, naming every overdue check.
+            let detail = overdue
+                .into_iter()
+                .filter_map(|stage| {
+                    let check = work.open_check(stage)?;
+                    Some(format!(
+                        "in {}, verification still owed — {}",
+                        stage.as_str(),
+                        check.steps
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             Some(single(
                 rule,
                 row,
                 format!("{}:unverified:{}:{}", rule.id, slug, context.local_day),
-                &format!("in {}, verification still owed — {verify}", stage.as_str()),
+                &detail,
             ))
         }
-        AutomationTrigger::StackParentMerged
+        // One fire per due check: see `evaluate_checks_due`.
+        AutomationTrigger::StatusVerificationDue
+        | AutomationTrigger::StackParentMerged
         | AutomationTrigger::BranchAdvanced
         | AutomationTrigger::StageDeployed
         | AutomationTrigger::McpEvent
@@ -632,6 +753,7 @@ fn evaluate_merged(
             mcp_event: None,
             watch: None,
             detail: format!("{landed} — closing issue #{issue}"),
+            check: None,
         });
     }
     if deletes_branch {
@@ -653,6 +775,7 @@ fn evaluate_merged(
             mcp_event: None,
             watch: None,
             detail: format!("{landed} — deleting remote branch {}", row.branch),
+            check: None,
         });
     }
     if external {
@@ -674,6 +797,7 @@ fn evaluate_merged(
             mcp_event: None,
             watch: None,
             detail: landed,
+            check: None,
         });
     }
     let mut fire = single(rule, row, keys[0].clone(), &landed);
@@ -826,6 +950,7 @@ fn evaluate_stack(
             mcp_event: None,
             watch: None,
             detail: format!("{} under {} open member(s)", parts.join(" + "), open.len()),
+            check: None,
         });
     }
     fires
@@ -861,6 +986,7 @@ fn evaluate_branch(
         mcp_event: None,
         watch: None,
         detail: format!("{branch} advanced {start}..{end}"),
+        check: None,
     })
 }
 
@@ -902,6 +1028,7 @@ fn evaluate_stage(rule: &AutomationDef, context: &AutomationEvalContext) -> Opti
         mcp_event: None,
         watch: None,
         detail: format!("{} deployed {start}..{end}", stage.as_str()),
+        check: None,
     })
 }
 
@@ -960,6 +1087,7 @@ fn evaluate_mcp(
             mcp_event: Some(event.clone()),
             watch: None,
             detail: wt_core::sanitize_terminal_text(&detail),
+            check: None,
         });
     }
     fires
@@ -1121,6 +1249,19 @@ fn row_landing(row: &AutomationRow, context: &AutomationEvalContext) -> wt_core:
         .with_deploys(row.deploys)
 }
 
+/// Whether the row's own work had landed, for a wake about to be delivered.
+/// A pull request the stale hosting data cannot vouch for, with nothing
+/// local proving a landing, is unknown.
+fn owner_landing(row: &AutomationRow, context: &AutomationEvalContext) -> wt_core::OwnerLanding {
+    if row_landing(row, context).base {
+        wt_core::OwnerLanding::Landed
+    } else if row.pr.is_some() && !context.github_fresh {
+        wt_core::OwnerLanding::Unknown
+    } else {
+        wt_core::OwnerLanding::NotLanded
+    }
+}
+
 /// FNV-1a: fire keys persist in the ledger, so the hash must not change
 /// between builds the way `DefaultHasher` may.
 fn stable_hash(text: &str) -> u64 {
@@ -1144,6 +1285,7 @@ fn single(rule: &AutomationDef, row: &AutomationRow, key: String, detail: &str) 
         frozen_pr: None,
         mcp_event: None,
         watch: None,
+        check: None,
         detail: detail.to_owned(),
     }
 }
@@ -1181,7 +1323,320 @@ mod tests {
     use super::*;
     use crate::types::AutomationStack;
     use wt_config::{AutomationBusyPolicy, AutomationDef};
-    use wt_core::{WorkRisk, WorkStatusRecord};
+    use wt_core::{OwnerLanding, VerifyStage, WorkRisk, WorkStatusRecord};
+
+    /// What the configured rules fire. wt's own wake for a due check has
+    /// its own tests below.
+    fn evaluate(
+        rules: &[AutomationDef],
+        rows: &[AutomationRow],
+        context: &AutomationEvalContext,
+    ) -> Vec<AutomationFire> {
+        super::evaluate(rules, rows, context)
+            .into_iter()
+            .filter(|fire| fire.rule.id != CHECK_RULE_ID)
+            .collect()
+    }
+
+    fn own_checks(
+        rules: &[AutomationDef],
+        rows: &[AutomationRow],
+        context: &AutomationEvalContext,
+    ) -> Vec<AutomationFire> {
+        super::evaluate(rules, rows, context)
+            .into_iter()
+            .filter(|fire| fire.rule.id == CHECK_RULE_ID)
+            .collect()
+    }
+
+    fn owing(stages: &[(VerifyStage, &str)]) -> WorkStatusRecord {
+        let mut work = WorkStatusRecord::new(WorkState::Ready, "2026-01-01T00:00:00Z");
+        for (stage, steps) in stages {
+            work.set_check(*stage, *steps);
+        }
+        work
+    }
+
+    #[test]
+    fn each_owed_stage_fires_on_its_own_and_a_check_put_off_fires_again() {
+        let due = rule("verify", AutomationTrigger::StatusVerificationDue, "verify");
+        let mut context = AutomationEvalContext {
+            separate_production: true,
+            now_ms: 1_000,
+            ..AutomationEvalContext::default()
+        };
+        let mut row = row();
+        let mut work = owing(&[
+            (VerifyStage::Staging, "check staging"),
+            (VerifyStage::Production, "check prod"),
+        ]);
+        row.work = Some(work.clone());
+        row.local_merged = Some(true);
+        let fires = evaluate(
+            std::slice::from_ref(&due),
+            std::slice::from_ref(&row),
+            &context,
+        );
+        // Only staging has the change.
+        assert_eq!(fires.len(), 1);
+        assert_eq!(
+            fires[0].check,
+            Some(CheckFire {
+                stage: VerifyStage::Staging,
+                steps: "check staging".into()
+            })
+        );
+        let staging_key = fires[0].fire_keys[0].clone();
+        // A key written before checks were owed per stage reads the same:
+        // no check already delivered fires again.
+        assert_eq!(
+            staging_key,
+            format!(
+                "verify:verify:feature-1:staging:{:016x}",
+                stable_hash("check staging")
+            )
+        );
+        row.in_production = true;
+        let fires = evaluate(
+            std::slice::from_ref(&due),
+            std::slice::from_ref(&row),
+            &context,
+        );
+        assert_eq!(
+            fires
+                .iter()
+                .map(|fire| fire.detail.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "verify in staging: check staging",
+                "verify in production: check prod"
+            ]
+        );
+        // Two fires of one rule on one row must not replace each other.
+        assert_ne!(fire_identity(&fires[0]), fire_identity(&fires[1]));
+        assert_eq!(fires[0].fire_keys, std::slice::from_ref(&staging_key));
+        // With both due the rule's breaker is not reset.
+        context.github_fresh = true;
+        assert!(
+            evaluate_breaker_resets(
+                std::slice::from_ref(&due),
+                std::slice::from_ref(&row),
+                &context
+            )
+            .is_empty()
+        );
+
+        // Put off: not due before its time, and then a new obligation.
+        assert!(work.defer_check(VerifyStage::Staging, Some(5_000)));
+        row.work = Some(work);
+        let stages = |context: &AutomationEvalContext| {
+            evaluate(
+                std::slice::from_ref(&due),
+                std::slice::from_ref(&row),
+                context,
+            )
+            .into_iter()
+            .map(|fire| (fire.check.unwrap().stage, fire.fire_keys[0].clone()))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            stages(&context)
+                .iter()
+                .map(|(stage, _)| *stage)
+                .collect::<Vec<_>>(),
+            [VerifyStage::Production]
+        );
+        context.now_ms = 5_000;
+        let again = stages(&context);
+        assert_eq!(again[0].0, VerifyStage::Staging);
+        assert_eq!(again[0].1, format!("{staging_key}:5000"));
+    }
+
+    #[test]
+    fn an_overdue_reminder_names_every_overdue_check_once_a_day() {
+        let nag = rule(
+            "nag",
+            AutomationTrigger::StatusVerificationOverdue,
+            "notify",
+        );
+        let mut context = AutomationEvalContext {
+            now_ms: wt_core::parse_iso_millis("2026-01-05T00:00:00Z").unwrap(),
+            local_day: "2026-01-05".into(),
+            ..AutomationEvalContext::default()
+        };
+        let mut row = row();
+        let mut work = owing(&[
+            (VerifyStage::Staging, "check staging"),
+            (VerifyStage::Production, "check prod"),
+        ]);
+        row.work = Some(work.clone());
+        row.local_merged = Some(true);
+        let fires = evaluate(
+            std::slice::from_ref(&nag),
+            std::slice::from_ref(&row),
+            &context,
+        );
+        assert_eq!(fires.len(), 1);
+        assert_eq!(
+            fires[0].detail,
+            "in staging, verification still owed — check staging; in production, verification still owed — check prod"
+        );
+        assert_eq!(fires[0].fire_keys, ["nag:unverified:feature-1:2026-01-05"]);
+        // A check put off is nobody's lapse until its time has passed.
+        let later = context.now_ms + 86_400_000;
+        assert!(work.defer_check(VerifyStage::Staging, Some(later)));
+        assert!(work.defer_check(VerifyStage::Production, Some(later)));
+        row.work = Some(work);
+        context.now_ms += 3_600_000;
+        assert!(evaluate(&[nag], &[row], &context).is_empty());
+    }
+
+    #[test]
+    fn wt_wakes_the_session_for_a_due_check_unless_a_rule_already_does() {
+        let mut context = AutomationEvalContext {
+            check_settle_seconds: 600.0,
+            ..AutomationEvalContext::default()
+        };
+        let mut row = row();
+        row.created_at = Some("2026-01-01T00:00:00Z".into());
+        row.work = Some(owing(&[(VerifyStage::Staging, "1. open the page")]));
+        // Not landed: nothing is due.
+        assert!(own_checks(&[], std::slice::from_ref(&row), &context).is_empty());
+        row.local_merged = Some(true);
+        let fires = own_checks(&[], std::slice::from_ref(&row), &context);
+        assert_eq!(fires.len(), 1);
+        let fire = &fires[0];
+        assert!(is_check_wake(fire));
+        assert_eq!(
+            (fire.rule.run.as_str(), fire.rule.settle_seconds),
+            (CHECK_RUN, 600.0)
+        );
+        assert_eq!(fire.quiesce_slugs, ["feature-1"]);
+        // Slug, the owner's incarnation, stage, steps.
+        assert_eq!(
+            fire.fire_keys,
+            [format!(
+                "wt.check:feature-1:2026-01-01T00:00:00Z:staging:{:016x}",
+                stable_hash("1. open the page")
+            )]
+        );
+        // A session at work does not lose the prompt: it waits like a wake.
+        row.busy = true;
+        assert_eq!(
+            own_checks(&[], std::slice::from_ref(&row), &context).len(),
+            1
+        );
+        row.busy = false;
+
+        // A rule whose action prompts the row's own session owns the delivery.
+        let configured = rule("verify", AutomationTrigger::StatusVerificationDue, "verify");
+        let audience = |audience| crate::types::ActionTraits {
+            audience,
+            ..Default::default()
+        };
+        context
+            .actions
+            .insert("verify".into(), audience(ActionAudience::Session));
+        let rules = std::slice::from_ref(&configured);
+        assert!(own_checks(rules, std::slice::from_ref(&row), &context).is_empty());
+        assert_eq!(
+            evaluate(rules, std::slice::from_ref(&row), &context).len(),
+            1
+        );
+        // One that tells the manager, or runs a command, leaves the session
+        // unprompted.
+        for other in [ActionAudience::Manager, ActionAudience::None] {
+            context.actions.insert("verify".into(), audience(other));
+            assert_eq!(
+                own_checks(rules, std::slice::from_ref(&row), &context).len(),
+                1
+            );
+        }
+        let notify = rule(
+            "tell",
+            AutomationTrigger::StatusVerificationDue,
+            "builtin:notify",
+        );
+        assert_eq!(
+            own_checks(&[notify], std::slice::from_ref(&row), &context).len(),
+            1
+        );
+        // So does a session rule whose action does not accept this row,
+        // and only for this row.
+        context
+            .actions
+            .insert("verify".into(), audience(ActionAudience::Session));
+        context
+            .unmet_requirements
+            .insert(("verify".into(), "feature-1".into()));
+        let mut other = row.clone();
+        other.slug = "feature-2".into();
+        let fired = own_checks(rules, &[row.clone(), other], &context);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].slug, "feature-1");
+        context.unmet_requirements.clear();
+        context.actions.clear();
+
+        // A paused or archived worktree is not prompted.
+        context.pauses.slugs.insert("feature-1".into());
+        assert!(own_checks(&[], std::slice::from_ref(&row), &context).is_empty());
+        context.pauses.slugs.clear();
+        row.archived = true;
+        assert!(own_checks(&[], std::slice::from_ref(&row), &context).is_empty());
+        row.archived = false;
+        // A later worktree of the same name owes its own check.
+        let first = own_checks(&[], std::slice::from_ref(&row), &context)[0]
+            .fire_keys
+            .clone();
+        row.created_at = Some("2026-02-01T00:00:00Z".into());
+        assert_ne!(
+            own_checks(&[], std::slice::from_ref(&row), &context)[0].fire_keys,
+            first
+        );
+    }
+
+    #[test]
+    fn a_wake_carries_whether_its_worktree_had_landed() {
+        let landing = |row: &AutomationRow, context: &AutomationEvalContext| {
+            let mut context = context.clone();
+            context.watches = vec![crate::types::MetWatch {
+                id: "aaaaaa".into(),
+                slug: row.slug.clone(),
+                by: row.slug.clone(),
+                held: "17:00".into(),
+                actions: vec![(WatchAction::Wake, "go".into())],
+                cleared_gate: None,
+            }];
+            super::evaluate(&[], std::slice::from_ref(row), &context)[0]
+                .watch
+                .as_ref()
+                .unwrap()
+                .landing
+        };
+        let fresh = AutomationEvalContext {
+            github_fresh: true,
+            ..AutomationEvalContext::default()
+        };
+        let stale = AutomationEvalContext::default();
+        let mut row = row();
+        row.pr = None;
+        // Nothing says it landed, and no pull request could have.
+        assert_eq!(landing(&row, &stale), OwnerLanding::NotLanded);
+        row.local_merged = Some(true);
+        assert_eq!(landing(&row, &stale), OwnerLanding::Landed);
+        row.local_merged = None;
+        row.pr = Some(crate::types::AutomationPr {
+            number: 7,
+            state: "MERGED".into(),
+            ..Default::default()
+        });
+        assert_eq!(landing(&row, &fresh), OwnerLanding::Landed);
+        // A merge the stale data reports is not proof either way.
+        assert_eq!(landing(&row, &stale), OwnerLanding::Unknown);
+        row.pr.as_mut().unwrap().state = "OPEN".into();
+        assert_eq!(landing(&row, &stale), OwnerLanding::Unknown);
+        assert_eq!(landing(&row, &fresh), OwnerLanding::NotLanded);
+    }
 
     fn rule(id: &str, on: AutomationTrigger, run: &str) -> AutomationDef {
         AutomationDef {

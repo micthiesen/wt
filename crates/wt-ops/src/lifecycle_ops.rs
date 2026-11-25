@@ -272,49 +272,19 @@ pub async fn plan_automation_facts(
         } else {
             false
         };
-        let separate_production = ctx.config.branch.separate_production();
-        let owed_stage = owed_check_stage(stored).filter(|_| landing.landed());
+        let owed = landing.landed().then(|| owed_check_stages(stored));
         // A watch asks the same questions an owed check does, of the stages
         // its conditions name.
         let watched = wants.get(&slug).copied().filter(|_| landing.landed());
         let asked = |stage| {
-            owed_stage == Some(stage) || watched.is_some_and(|watched| watched.stage(stage))
+            owed.is_some_and(|owed| owed.stage(stage))
+                || watched.is_some_and(|watched| watched.stage(stage))
         };
-        let in_production = separate_production
-            && asked(wt_core::VerifyStage::Production)
-            && reached_production(ctx, &row, github).await;
-        let probed = [
-            wt_core::VerifyStage::Staging,
-            wt_core::VerifyStage::Production,
-        ]
-        .into_iter()
-        .filter(|stage| asked(*stage) && ctx.config.environments.get(*stage).is_some())
-        .collect::<Vec<_>>();
-        let commits = if watched.is_some() || !probed.is_empty() {
-            landing_commits(ctx, &row, github).await
-        } else {
-            None
-        };
-        // A probed stage nobody asked about is still not shown deployed.
-        let mut deploys = wt_core::StageDeploys::default()
-            .for_probes(|stage| ctx.config.environments.get(stage).is_some());
-        for stage in probed {
-            // A deploy cannot be ahead of the Git landing it ships.
-            let landed = match stage {
-                wt_core::VerifyStage::Staging => true,
-                wt_core::VerifyStage::Production => in_production || !separate_production,
-            };
-            let deployed = landed
-                && match &commits {
-                    Some(commits) => {
-                        crate::deploys::landing_deployed(ctx, stage, commits, &ctx.cancellation)
-                            .await
-                            == Some(true)
-                    }
-                    None => false,
-                };
-            deploys.set(stage, Some(deployed));
-        }
+        let StageReach {
+            in_production,
+            deploys,
+            commits,
+        } = stage_reach(ctx, &row, github, asked, watched.is_some()).await;
         // The merge commit when the PR merged at HEAD, else HEAD itself.
         if watched.is_some()
             && let Some(commit) = commits.as_ref().and_then(|commits| commits.last())
@@ -337,6 +307,104 @@ pub async fn plan_automation_facts(
         tracing::debug!(%warning, "automation landing evidence is partial");
     }
     Ok(evidence)
+}
+
+/// How far a landed row's work travelled past the base branch.
+struct StageReach {
+    in_production: bool,
+    deploys: wt_core::StageDeploys,
+    /// The row's landing commits, read only when something needed them.
+    commits: Option<Vec<String>>,
+}
+
+/// Production and deploy proof for the stages `asked` about. The probes
+/// cost several Git calls per row, so a stage nobody asks about is not
+/// read: it reads not promoted and, where it has a probe, not deployed.
+async fn stage_reach(
+    ctx: &AppContext,
+    row: &WorktreeRecord,
+    github: &GithubData,
+    asked: impl Fn(wt_core::VerifyStage) -> bool,
+    want_commits: bool,
+) -> StageReach {
+    let separate_production = ctx.config.branch.separate_production();
+    let in_production = separate_production
+        && asked(wt_core::VerifyStage::Production)
+        && reached_production(ctx, row, github).await;
+    let probed = wt_core::VerifyStage::ALL
+        .into_iter()
+        .filter(|stage| asked(*stage) && ctx.config.environments.get(*stage).is_some())
+        .collect::<Vec<_>>();
+    let commits = if want_commits || !probed.is_empty() {
+        landing_commits(ctx, row, github).await
+    } else {
+        None
+    };
+    // A probed stage nobody asked about is still not shown deployed.
+    let mut deploys = wt_core::StageDeploys::default()
+        .for_probes(|stage| ctx.config.environments.get(stage).is_some());
+    for stage in probed {
+        // A deploy cannot be ahead of the Git landing it ships.
+        let landed = match stage {
+            wt_core::VerifyStage::Staging => true,
+            wt_core::VerifyStage::Production => in_production || !separate_production,
+        };
+        let deployed = landed
+            && match &commits {
+                Some(commits) => {
+                    crate::deploys::landing_deployed(ctx, stage, commits, &ctx.cancellation).await
+                        == Some(true)
+                }
+                None => false,
+            };
+        deploys.set(stage, Some(deployed));
+    }
+    StageReach {
+        in_production,
+        deploys,
+        commits,
+    }
+}
+
+/// What this process can prove of each row's landing, for saying what the
+/// row owes: the base landing, and production and deploy proof for the
+/// stages its checks name. `github` is the caller's own fresh read; without
+/// one only Git ancestry proves a landing, so a squash-merged row reads as
+/// not landed. A row whose evidence cannot be read is left out. Display
+/// only: removal takes its proof from [`plan`].
+pub async fn row_landings(
+    ctx: &AppContext,
+    rows: &[WorktreeRecord],
+    state: &serde_json::Value,
+    github: Option<&GithubData>,
+) -> BTreeMap<String, wt_core::Landing> {
+    let empty = GithubData::default();
+    let github = github.unwrap_or(&empty);
+    let mut published_bases = BTreeMap::new();
+    let mut warning = None;
+    let mut landings = BTreeMap::new();
+    for row in rows.iter().filter(|row| !row.is_main) {
+        let slug = row.target.slug();
+        let stored = &state["slugs"][slug];
+        let Ok(landing) =
+            landing_evidence(ctx, row, stored, github, &mut published_bases, &mut warning).await
+        else {
+            continue;
+        };
+        let owed = landing.landed().then(|| owed_check_stages(stored));
+        let asked = |stage| owed.is_some_and(|owed| owed.stage(stage));
+        let reach = stage_reach(ctx, row, github, asked, false).await;
+        landings.insert(
+            slug.to_owned(),
+            wt_core::Landing::new(
+                landing.landed(),
+                reach.in_production,
+                ctx.config.branch.separate_production(),
+            )
+            .with_deploys(reach.deploys),
+        );
+    }
+    landings
 }
 
 /// The board's "in production" proof: HEAD, or the exact merge commit of the
@@ -411,18 +479,36 @@ async fn landing_commits(
     Some(std::iter::once(head).chain(merge).collect())
 }
 
-/// The stage of the row's undischarged check. The production and deploy
+/// The stages of the row's undischarged checks. The production and deploy
 /// probes cost several Git calls per row, so they run only where their
-/// answer decides something: that stage.
-fn owed_check_stage(stored: &serde_json::Value) -> Option<wt_core::VerifyStage> {
-    wt_core::parse_work_status(&stored["work"])
-        .filter(|work| {
-            !matches!(
-                work.state,
-                wt_core::WorkState::Verified | wt_core::WorkState::Dropped
-            )
+/// answer decides something: those stages.
+fn owed_check_stages(stored: &serde_json::Value) -> WatchWants {
+    let mut wants = WatchWants::default();
+    for (stage, _) in wt_core::parse_work_status(&stored["work"])
+        .map(|work| work.open_checks())
+        .unwrap_or_default()
+    {
+        match stage {
+            wt_core::VerifyStage::Staging => wants.staging = true,
+            wt_core::VerifyStage::Production => wants.production = true,
+        }
+    }
+    wants
+}
+
+/// The worktrees that owe a post-merge check, by slug, with the stages
+/// owed: their landing is worth reading even where no rule asks for it,
+/// because wt itself wakes a session whose check came due.
+pub fn check_wants(state: &serde_json::Value) -> BTreeMap<String, WatchWants> {
+    state["slugs"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(slug, stored)| {
+            let wants = owed_check_stages(stored);
+            (wants != WatchWants::default()).then(|| (slug.clone(), wants))
         })
-        .and_then(|work| work.verification().map(|(stage, _)| stage))
+        .collect()
 }
 
 struct Landing {

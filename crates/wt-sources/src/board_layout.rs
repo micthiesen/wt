@@ -5,9 +5,10 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use wt_config::UiSort;
 use wt_core::{
-    ChainMember, SpineMember, build_stack_index, parse_work_status, spine_layout, work_record_rank,
+    ChainMember, SpineMember, build_display_stack_index, parse_work_status, spine_layout,
+    work_record_rank,
 };
-use wt_tui::{Board, BoardSection};
+use wt_tui::{Board, BoardRow, BoardSection, OwedBlock};
 
 /// Apply explicit positions for unstarted rows. Invalid cycles retain every row.
 fn apply_creation_positions(rows: &mut Vec<usize>, positions: &[(usize, Option<usize>)]) {
@@ -45,6 +46,26 @@ pub const INBOX: &str = "\0inbox";
 pub const REMOVING: &str = "\0removing";
 pub const ARCHIVED: &str = "\0archived";
 
+/// The block `[ui] owed_sections` shows a row in instead of its stored
+/// section: only a local row on the board whose own work has landed, whose
+/// only remaining meaning is what it owes. `None` before the owed overlay
+/// has prepared the row.
+fn owed_block(board: &Board, row: &BoardRow) -> Option<OwedBlock> {
+    if !board.display.owed_sections
+        || row.host.is_some()
+        || row.is_main
+        || row.pending_creation
+        || row.git.landed_on.is_none()
+    {
+        return None;
+    }
+    row.owed_phase.map(|phase| OwedBlock::of(phase, &row.owes))
+}
+
+/// Lay the board out from the stored placement. With
+/// `board.display.owed_sections`, landed rows are drawn in derived blocks;
+/// nothing stored is read differently or written, so the option can be
+/// turned off again.
 pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
     let members = board
         .rows
@@ -60,7 +81,18 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             )
         })
         .collect::<Vec<_>>();
-    let stacks = build_stack_index(&members, trunk);
+    // Display only: a member whose own work landed is no longer a parent
+    // here, so it sorts and moves alone. Stack ids, the stack pause and
+    // automations keep the stored index.
+    let landed: std::collections::BTreeSet<&str> = board
+        .rows
+        .iter()
+        .filter(|row| row.git.landed_on.is_some())
+        .map(|row| row.key.as_str())
+        .collect();
+    let stacks = build_display_stack_index(&members, trunk, |member| {
+        landed.contains(member.slug.as_str())
+    });
     let nodes: Vec<_> = board
         .rows
         .iter()
@@ -70,7 +102,7 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
     // Each row lives in its own stored section. Moving a stack writes every
     // member's placement, and `--only` deliberately splits one off, so the
     // read side must not pull members back to the root.
-    let section_keys: Vec<String> = board
+    let stored_keys: Vec<String> = board
         .rows
         .iter()
         .map(|row| {
@@ -92,20 +124,39 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             .get("creationAfter")
             .filter(|_| !entry["order"].is_number())
             .map(|after| wt_tui::CreatePlacement {
-                section: (section_keys[index] != INBOX).then(|| section_keys[index].clone()),
+                section: (stored_keys[index] != INBOX).then(|| stored_keys[index].clone()),
                 after: after.as_str().map(str::to_owned),
             });
     }
+    // Where each row is drawn: its stored section, or the block derived
+    // from what it owes.
+    let section_keys: Vec<String> = board
+        .rows
+        .iter()
+        .zip(stored_keys)
+        .map(|(row, stored)| match owed_block(board, row) {
+            Some(block) if stored != REMOVING && stored != ARCHIVED => block.key().to_owned(),
+            _ => stored,
+        })
+        .collect();
     let index_by_branch: BTreeMap<String, usize> = board
         .rows
         .iter()
         .enumerate()
         .map(|(index, row)| (branch_key(row, &row.branch), index))
         .collect();
+    // A member still names the branch it was forked from after that branch
+    // landed; only a parent in the same shown stack is one here.
     let parent_of = |index: usize| {
-        node_of(index)
-            .and_then(|entry| entry.node.parent_branch.as_ref())
+        let entry = node_of(index)?;
+        entry
+            .node
+            .parent_branch
+            .as_ref()
             .and_then(|branch| index_by_branch.get(branch).copied())
+            .filter(|&parent| {
+                node_of(parent).is_some_and(|parent| parent.node.stack_id == entry.node.stack_id)
+            })
     };
     // A stack sorts as one unit inside a section, anchored at its
     // shallowest member in that section; members filed elsewhere form
@@ -240,6 +291,9 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 usize::MAX
             } else if section.key == REMOVING {
                 usize::MAX - 1
+            } else if let Some(block) = OwedBlock::from_key(&section.key) {
+                // After every stored section and the Inbox, most urgent first.
+                usize::MAX - 2 - (OwedBlock::ALL.len() - 1 - block as usize)
             } else {
                 order
                     .iter()
@@ -302,7 +356,10 @@ fn section_title(key: &str) -> String {
         INBOX => "Inbox".to_owned(),
         ARCHIVED => "Archived".to_owned(),
         REMOVING => "Removing".to_owned(),
-        _ => wt_core::sanitize_terminal_text(key),
+        _ => OwedBlock::from_key(key).map_or_else(
+            || wt_core::sanitize_terminal_text(key),
+            |block| block.title().to_owned(),
+        ),
     }
 }
 
@@ -485,6 +542,248 @@ mod tests {
                 .unwrap()
                 .rows,
             [2, 1, 0]
+        );
+    }
+
+    fn landed(slug: &str) -> BoardRow {
+        let mut row = row(slug);
+        row.git.landed_on = Some(wt_tui::LandingKind::Base);
+        row
+    }
+
+    fn owing(
+        slug: &str,
+        phase: wt_core::OwedPhase,
+        stage: Option<wt_core::VerifyStage>,
+    ) -> BoardRow {
+        let mut row = landed(slug);
+        row.owed_phase = Some(phase);
+        if phase != wt_core::OwedPhase::Done {
+            let state = if phase == wt_core::OwedPhase::Due {
+                wt_core::OwedState::Due
+            } else {
+                wt_core::OwedState::Waiting
+            };
+            let mut item = wt_tui::OwedView::new(wt_core::OwedKind::Step, state, "x");
+            item.stage = stage;
+            row.owes = vec![item];
+        }
+        row
+    }
+
+    fn layout(board: &Board) -> Vec<(String, String, Vec<String>, bool)> {
+        board
+            .sections
+            .iter()
+            .filter(|section| section.drawn())
+            .map(|section| {
+                (
+                    section.key.clone(),
+                    section.title.clone(),
+                    section
+                        .rows
+                        .iter()
+                        .map(|&index| board.rows[index].key.clone())
+                        .collect(),
+                    section.folded,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn owed_sections_show_landed_rows_by_what_they_owe_and_leave_the_stored_layout() {
+        use wt_core::{OwedPhase, VerifyStage};
+        use wt_tui::OwedBlock;
+        let mut archived = owing("archived", OwedPhase::Due, None);
+        archived.archived = true;
+        let mut remote = owing("remote", OwedPhase::Due, None);
+        remote.key = wt_core::remote_worktree_ledger_key("builder", "remote");
+        remote.host = Some("builder".into());
+        let mut removing = owing("removing", OwedPhase::Done, None);
+        removing.removal = Some(wt_tui::RemovalView::default());
+        // Landed, but the owed overlay has not prepared it yet.
+        let unprepared = landed("unprepared");
+        let mut board = Board {
+            rows: vec![
+                row("open"),
+                owing("done", OwedPhase::Done, None),
+                owing("wait-other", OwedPhase::Waiting, None),
+                owing(
+                    "wait-prod",
+                    OwedPhase::Waiting,
+                    Some(VerifyStage::Production),
+                ),
+                owing(
+                    "wait-staging",
+                    OwedPhase::Waiting,
+                    Some(VerifyStage::Staging),
+                ),
+                owing("due", OwedPhase::Due, Some(VerifyStage::Staging)),
+                archived,
+                remote,
+                removing,
+                unprepared,
+            ],
+            ..Board::default()
+        };
+        let state = json!({"slugs": {
+            "open": {"section": "Batch", "order": 1},
+            "done": {"section": "Batch", "order": 2},
+            "due": {"section": "Batch", "order": 3},
+            "wait-staging": {"section": "Verify in Staging"},
+        }, "sectionsOrder": ["Batch", "Verify in Staging", "Empty"],
+           "foldedSections": [OwedBlock::Done.key()]});
+        let before = state.clone();
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        let stored = layout(&board);
+        let keys = |shown: &[(String, String, Vec<String>, bool)]| -> Vec<(String, Vec<String>)> {
+            shown
+                .iter()
+                .map(|(_, title, rows, _)| (title.clone(), rows.clone()))
+                .collect()
+        };
+        let named = |pairs: &[(&str, &[&str])]| -> Vec<(String, Vec<String>)> {
+            pairs
+                .iter()
+                .map(|(title, rows)| {
+                    (
+                        (*title).to_owned(),
+                        rows.iter().map(|row| (*row).to_owned()).collect(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            keys(&stored),
+            named(&[
+                ("Batch", &["open", "done", "due"]),
+                ("Verify in Staging", &["wait-staging"]),
+                ("Empty", &[]),
+                (
+                    "Inbox",
+                    &[
+                        "@remote/builder/remote",
+                        "unprepared",
+                        "wait-other",
+                        "wait-prod"
+                    ]
+                ),
+                ("Removing", &["removing"]),
+                ("Archived", &["archived"]),
+            ])
+        );
+        // On: only landed local rows on the board move, into blocks after
+        // the stored sections and the Inbox, most urgent first. Empty
+        // blocks are not drawn; they fold like any section.
+        board.display.owed_sections = true;
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        let shown = layout(&board);
+        assert_eq!(
+            keys(&shown),
+            named(&[
+                ("Batch", &["open"]),
+                ("Verify in Staging", &[]),
+                ("Empty", &[]),
+                ("Inbox", &["@remote/builder/remote", "unprepared"]),
+                ("Due", &["due"]),
+                ("Waiting for staging", &["wait-staging"]),
+                ("Waiting for production", &["wait-prod"]),
+                ("Waiting", &["wait-other"]),
+                ("Done", &["done"]),
+                ("Removing", &["removing"]),
+                ("Archived", &["archived"]),
+            ])
+        );
+        let done = shown.iter().find(|section| section.1 == "Done").unwrap();
+        assert_eq!((done.0.as_str(), done.3), (OwedBlock::Done.key(), true));
+        assert!(
+            board
+                .sections
+                .iter()
+                .filter(|section| section.owed_block())
+                .all(|section| section.key.starts_with('\0'))
+        );
+        // Nothing was written, the manual sections are still what a move
+        // may target, and off again is the layout it was.
+        assert_eq!(state, before);
+        assert_eq!(board.section_order, ["Batch", "Verify in Staging", "Empty"]);
+        board.display.owed_sections = false;
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(layout(&board), stored);
+        // No landed row owes anything in a block that was never needed.
+        board.display.owed_sections = true;
+        board
+            .rows
+            .retain(|row| row.key == "open" || row.key == "done");
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(
+            keys(&layout(&board)),
+            named(&[
+                ("Batch", &["open"]),
+                ("Verify in Staging", &[]),
+                ("Empty", &[]),
+                ("Done", &["done"]),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_landed_head_is_its_own_unit_and_what_was_stacked_on_it_stays_a_stack() {
+        let section_rows = |board: &Board, key: &str| -> Vec<String> {
+            board
+                .sections
+                .iter()
+                .find(|section| section.key == key)
+                .map(|section| {
+                    section
+                        .rows
+                        .iter()
+                        .map(|&index| board.rows[index].key.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let state = json!({"slugs": {
+            "head": {"section": "Batch", "order": 2},
+            "child": {"section": "Batch", "baseBranch": "head"},
+            "grandchild": {"section": "Batch", "baseBranch": "child"},
+            "other": {"section": "Batch", "order": 1},
+        }, "sectionsOrder": ["Batch"]});
+        let mut board = Board {
+            rows: vec![row("grandchild"), row("child"), row("head"), row("other")],
+            ..Board::default()
+        };
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        // Unlanded: one stack, sorted as a unit at its head's position.
+        assert_eq!(
+            section_rows(&board, "Batch"),
+            ["other", "head", "child", "grandchild"]
+        );
+        assert_eq!(board.rows[2].stack_prefix, "┌");
+        // Landed: the head sorts by its own order with no rail; its
+        // children are a stack of their own, at their own position.
+        board.rows[2].git.landed_on = Some(wt_tui::LandingKind::Base);
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(
+            section_rows(&board, "Batch"),
+            ["child", "grandchild", "other", "head"]
+        );
+        assert_eq!(board.rows[2].stack_prefix, "");
+        assert_eq!(board.rows[1].stack_prefix, "┌");
+        assert_eq!(board.rows[0].stack_prefix, "└");
+        assert_eq!(board.rows[1].split_parent_section, None);
+        // Grouped by what it owes, only the landed head leaves the section.
+        board.display.owed_sections = true;
+        board.rows[2].owed_phase = Some(wt_core::OwedPhase::Done);
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(
+            section_rows(&board, "Batch"),
+            ["child", "grandchild", "other"]
+        );
+        assert_eq!(
+            section_rows(&board, wt_tui::OwedBlock::Done.key()),
+            ["head"]
         );
     }
 

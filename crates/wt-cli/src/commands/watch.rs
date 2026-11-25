@@ -41,6 +41,10 @@ pub struct WakeArgs {
     /// The worktree whose session to wake (default: the current one).
     #[arg(long, value_name = "SLUG")]
     pub slug: Option<String>,
+    /// Mark the step as one that must happen before the next production
+    /// release: `wt owed --all` lists it under that heading.
+    #[arg(long)]
+    pub before_release: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -338,6 +342,7 @@ pub(crate) async fn set(
     slug: &str,
     when: Vec<WatchCondition>,
     then: WatchActions,
+    before_release: bool,
     clock: LocalClock,
 ) -> Result<Result<SetWatch, String>> {
     if then.wake.is_some()
@@ -355,7 +360,7 @@ pub(crate) async fn set(
         utc_offset_minutes: clock.utc_offset_minutes,
         when,
         then,
-        before_release: false,
+        before_release,
     };
     let added = ctx
         .database
@@ -395,46 +400,6 @@ async fn report_set(ctx: &AppContext, set: &SetWatch, does: &str, read: &ReadCon
     }
 }
 
-/// A wake for this worktree's own deploy is usually a check of the deployed
-/// change, which the board can only show as owed when it is a status.
-///
-/// `owed` is the stage the worktree already owes a check in. A status holds
-/// one, so a step at the other stage has only a wake to come back with.
-fn deployed_check_hint(when: &[WatchCondition], owed: Option<&str>) -> Option<String> {
-    let stage = when.iter().find_map(|cond| match cond.cond {
-        Condition::Own(RowState::Staging) => Some("staging"),
-        Condition::Own(RowState::Production) => Some("production"),
-        _ => None,
-    })?;
-    match owed {
-        None => Some(format!(
-            "to check the deployed change, use `wt status ready --verify-in-{stage}` instead: the row then shows the check as owed and returns as needs-testing; a wake shows only a bell"
-        )),
-        Some(owed) if owed == stage => Some(format!(
-            "this worktree already owes a check in {stage} and returns as needs-testing then: keep this wake only for a different step"
-        )),
-        Some(_) => None,
-    }
-}
-
-/// The stage `slug` owes a post-merge check in.
-async fn owed_stage(ctx: &AppContext, slug: &str) -> Option<String> {
-    let slug = slug.to_owned();
-    let state = ctx
-        .database
-        .call(move |store| Ok(store.read_slug_state(&slug)?))
-        .await
-        .ok()??;
-    let work = state.get("work")?;
-    work.get("verifyAfterMerge")?.as_str()?;
-    Some(
-        work.get("verifyIn")
-            .and_then(Value::as_str)
-            .unwrap_or("staging")
-            .to_owned(),
-    )
-}
-
 /// `✓ watch abc234: wakes one at 01:01 tomorrow`.
 fn set_text(watch: &Watch, does: &str, already: bool) -> String {
     format!(
@@ -470,7 +435,14 @@ pub async fn run_wake(ctx: &AppContext, args: &WakeArgs) -> Result<i32> {
         wake: Some(prompt),
         ..WatchActions::default()
     };
-    set_and_report(ctx, args.slug.as_deref(), &args.conditions, then).await
+    set_and_report(
+        ctx,
+        args.slug.as_deref(),
+        &args.conditions,
+        then,
+        args.before_release,
+    )
+    .await
 }
 
 pub async fn run_notify(ctx: &AppContext, args: &NotifyArgs) -> Result<i32> {
@@ -482,7 +454,7 @@ pub async fn run_notify(ctx: &AppContext, args: &NotifyArgs) -> Result<i32> {
         notify: Some(args.message.as_deref().and_then(clean).unwrap_or_default()),
         ..WatchActions::default()
     };
-    set_and_report(ctx, args.slug.as_deref(), &args.conditions, then).await
+    set_and_report(ctx, args.slug.as_deref(), &args.conditions, then, false).await
 }
 
 async fn set_and_report(
@@ -490,6 +462,7 @@ async fn set_and_report(
     slug: Option<&str>,
     conditions: &[String],
     then: WatchActions,
+    before_release: bool,
 ) -> Result<i32> {
     let slug = match owner(ctx, slug, "a watch").await {
         Ok(slug) => slug,
@@ -499,27 +472,28 @@ async fn set_and_report(
         }
     };
     let clock = clock();
-    let mut read = match read_conditions(ctx, conditions, clock).await {
+    let read = match read_conditions(ctx, conditions, clock).await {
         Ok(read) => read,
         Err(message) => {
             eprintln!("{message}");
             return Ok(2);
         }
     };
-    if then.wake.is_some() {
-        let owed = owed_stage(ctx, &slug).await;
-        read.notes
-            .extend(deployed_check_hint(&read.when, owed.as_deref()));
-    }
-    let does = if then.wake.is_some() {
+    let wakes = then.wake.is_some();
+    let does = if wakes {
         format!("wakes {slug}")
     } else {
         "tells you".to_owned()
     };
     let when = read.when.clone();
-    match set(ctx, &slug, when, then, clock).await? {
+    match set(ctx, &slug, when, then, before_release, clock).await? {
         Ok(set) => {
             report_set(ctx, &set, &does, &read).await;
+            // A wake is owed by the worktree; telling the person is not.
+            if wakes {
+                super::status::drop_ops_none(ctx, &slug).await?;
+                super::owed::print_list(ctx, &slug).await;
+            }
             Ok(0)
         }
         Err(message) => {
@@ -537,6 +511,21 @@ fn print_cancelled(watch: &Watch) {
             "  the gate \"{gate}\" stays set and no longer clears by itself; clear it with: wt status {} --unblock",
             watch.slug
         );
+    }
+}
+
+/// Cancelling a wake or a gate's watch changes what its worktree owes:
+/// print each affected worktree's list once.
+async fn print_lists_after_cancel(ctx: &AppContext, cancelled: &[Watch]) {
+    let mut slugs = Vec::new();
+    for watch in cancelled {
+        let owed = watch.then.wake.is_some() || watch.then.unblock.is_some();
+        if owed && !watch.owner_gone && !slugs.contains(&watch.slug) {
+            slugs.push(watch.slug.clone());
+        }
+    }
+    for slug in slugs {
+        super::owed::print_list(ctx, &slug).await;
     }
 }
 
@@ -748,6 +737,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
             println!("{by} has set no watches on {slug}");
         }
         cancelled.iter().for_each(print_cancelled);
+        print_lists_after_cancel(ctx, &cancelled).await;
         return Ok(0);
     }
     if ids.is_empty() {
@@ -762,6 +752,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
         })
         .await?;
     cancelled.iter().for_each(print_cancelled);
+    print_lists_after_cancel(ctx, &cancelled).await;
     let missing = ids
         .iter()
         .filter(|id| !cancelled.iter().any(|watch| watch.id == **id))
@@ -811,32 +802,6 @@ async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
         }
     }
     Ok(if failed { 2 } else { 0 })
-}
-
-#[cfg(test)]
-mod hint_tests {
-    use super::*;
-
-    #[test]
-    fn a_wake_for_this_worktrees_deploy_points_at_the_owed_check_it_would_duplicate() {
-        let clock = clock();
-        let when = |arg: &str| vec![parse(arg, clock).unwrap()];
-        let hint = |arg: &str, owed| deployed_check_hint(&when(arg), owed);
-        assert!(
-            hint("production", None)
-                .unwrap()
-                .contains("--verify-in-production")
-        );
-        assert!(
-            hint("staging", Some("staging"))
-                .unwrap()
-                .contains("already owes")
-        );
-        // A status holds one stage: the other stage's step is a wake.
-        assert_eq!(hint("production", Some("staging")), None);
-        assert_eq!(hint("merged", None), None);
-        assert_eq!(hint("3h", None), None);
-    }
 }
 
 #[cfg(test)]
@@ -1102,6 +1067,7 @@ mod tests {
             conditions: conditions.iter().map(|arg| (*arg).to_owned()).collect(),
             message: Some("Run the smoke test".into()),
             slug: slug.map(str::to_owned),
+            before_release: false,
         };
         assert_eq!(
             run_wake(ctx, &wake(&["+3h", "pr:7:production"], None))
@@ -1114,6 +1080,7 @@ mod tests {
             conditions: Vec::new(),
             message: None,
             slug: None,
+            before_release: false,
         };
         assert_eq!(run_wake(ctx, &lost).await.unwrap(), 2);
         assert_eq!(

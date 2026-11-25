@@ -16,6 +16,15 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
     if row.archived {
         return LocalMenu::Notice("restore the archived row before moving it to a section".into());
     }
+    // A landed row under `[ui] owed_sections` is drawn where what it owes
+    // puts it; filing it would change nothing on screen.
+    if let Some(block) = board
+        .sections
+        .iter()
+        .find(|section| section.owed_block() && section.rows.contains(&index))
+    {
+        return LocalMenu::Notice(crate::owed_block_refusal(&block.title));
+    }
     let current = current_section(board, index);
     // The Inbox (only when the row is in a section), every other section in
     // board order with its size, then "+ new section" on its `n` chord.

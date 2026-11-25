@@ -152,6 +152,19 @@ pub struct RunningFire {
 /// Recorded fires kept for display.
 const RECENT_HISTORY: usize = 10;
 
+/// A watch action the ledger shows ended while its watch still lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettledWatch {
+    pub id: String,
+    pub action: wt_core::watch::WatchAction,
+    /// Whether the owner's work had landed, as this pass evaluated it: what
+    /// decides whether a settled wake stays owed as a due step.
+    pub landing: wt_core::OwnerLanding,
+    /// The ledger does not show the fire delivered: it was sent without
+    /// proof, or ended without being sent.
+    pub unconfirmed: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AutomationTick {
     pub pending: usize,
@@ -159,7 +172,7 @@ pub struct AutomationTick {
     /// Watch actions the ledger shows ended while the watch still lists
     /// them: the process stopped between recording the fire and updating the
     /// watch. The caller removes each from its watch.
-    pub settled_watches: Vec<(String, wt_core::watch::WatchAction)>,
+    pub settled_watches: Vec<SettledWatch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -482,9 +495,12 @@ impl AutomationEngine {
                 && !executing.contains(&fire_identity(fire))
                 && fire.fire_keys.iter().all(|key| ledger.settled(key))
             {
-                report
-                    .settled_watches
-                    .push((watch.id.clone(), watch.action));
+                report.settled_watches.push(SettledWatch {
+                    id: watch.id.clone(),
+                    action: watch.action,
+                    landing: watch.landing,
+                    unconfirmed: !fire.fire_keys.iter().all(|key| ledger.delivered(key)),
+                });
             }
         }
         let deferred = self.deferrals.keys().cloned().collect::<BTreeSet<_>>();
@@ -1084,10 +1100,13 @@ impl AutomationEngine {
     }
 }
 
+/// A prompt into the worktree's own session that no rule asked for: a
+/// watch's wake, or wt's wake for a due check.
 fn is_wake(fire: &AutomationFire) -> bool {
     fire.watch
         .as_ref()
         .is_some_and(|watch| watch.action == wt_core::watch::WatchAction::Wake)
+        || wt_automations::is_check_wake(fire)
 }
 
 /// The rule name a person reads: every watch fire runs under one implicit
@@ -1095,6 +1114,8 @@ fn is_wake(fire: &AutomationFire) -> bool {
 fn shown_rule(fire: &AutomationFire) -> String {
     if fire.watch.is_some() {
         "watch".into()
+    } else if wt_automations::is_check_wake(fire) {
+        "check".into()
     } else {
         fire.rule.id.clone()
     }
@@ -1126,6 +1147,8 @@ fn breaker_exempt(fire: &AutomationFire, manager_run: bool) -> bool {
         || fire.rule.on == wt_config::AutomationTrigger::McpEvent
         // A watch is met once and each of its actions is delivered once.
         || fire.watch.is_some()
+        // So is a due check: its key is the obligation.
+        || wt_automations::is_check_wake(fire)
         || fire.rule.run == "builtin:notify"
         || fire.rule.run == "builtin:close-issue"
         || fire.rule.run == "builtin:delete-branch"
@@ -2202,6 +2225,161 @@ mod tests {
         assert_eq!(tick.claims[0].fire().quiesce_slugs, ["worktree"]);
     }
 
+    /// wt's own wake for a due check needs no rule and behaves like a wake:
+    /// it waits for the session, a pause or a cleared queue consumes
+    /// nothing, and it is delivered once per obligation.
+    #[tokio::test]
+    async fn a_due_check_wakes_its_session_once_and_waits_like_a_wake() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let mut owing = row();
+        owing.local_merged = Some(true);
+        let mut work = wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "t");
+        work.set_check(wt_core::VerifyStage::Staging, "1. open the page");
+        owing.work = Some(work);
+        let rows = [owing];
+        let context = AutomationEvalContext::default();
+        let (requirements, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let (busy, idle) = (busy_session(), BTreeMap::new());
+        let start = now_ms();
+
+        let mut paused = input(&[], &rows, &context, &requirements, &idle, &activity, start);
+        paused.globally_paused = true;
+        assert!(engine.tick(paused).await.unwrap().claims.is_empty());
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &busy,
+                &activity,
+                start + 1,
+            ))
+            .await
+            .unwrap();
+        assert!(tick.claims.is_empty());
+        let queued = engine.queued();
+        assert_eq!(
+            (
+                queued[0].rule.as_str(),
+                queued[0].detail.as_str(),
+                queued[0].waiting_for.as_str()
+            ),
+            (
+                "check",
+                "verify in staging: 1. open the page",
+                "session busy on worktree"
+            )
+        );
+        let cleared = engine
+            .cancel_pending(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &busy,
+                &activity,
+                start + 2,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared, 0);
+
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 3,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        let fire = tick.claims[0].fire();
+        assert!(wt_automations::is_check_wake(fire));
+        assert_eq!(fire.quiesce_slugs, ["worktree"]);
+        engine
+            .finish(&tick.claims[0], DONE, start + 4)
+            .await
+            .unwrap();
+        // Still owed, still due: not prompted again.
+        let again = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 5,
+            ))
+            .await
+            .unwrap();
+        assert!(again.claims.is_empty());
+        assert!(engine.queued().is_empty());
+    }
+
+    /// A wake the ledger shows sent without proof is settled as such, with
+    /// the landing this pass evaluated: the store then keeps it as a due
+    /// step that says its delivery is not confirmed.
+    #[tokio::test]
+    async fn a_settled_wake_carries_its_landing_and_whether_delivery_was_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let mut landed = row();
+        landed.local_merged = Some(true);
+        let rows = [landed];
+        let context = watching(vec![met("aaaaaa", &[(WatchAction::Wake, "go")])]);
+        let (requirements, quiescence, activity) =
+            (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let pass = |at| {
+            input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+        let tick = engine.tick(pass(start)).await.unwrap();
+        assert_eq!(
+            tick.claims[0].fire().watch.as_ref().unwrap().landing,
+            wt_core::OwnerLanding::Landed
+        );
+        engine
+            .finish(
+                &tick.claims[0],
+                AutomationOutcome::Ambiguous {
+                    reason: "the session did not answer".into(),
+                    slot: DeliverySlot::None,
+                },
+                start + 1,
+            )
+            .await
+            .unwrap();
+        let mut restarted = AutomationEngine::new(ledger, CancellationToken::new());
+        let tick = restarted.tick(pass(start + 2)).await.unwrap();
+        assert!(tick.claims.is_empty());
+        assert_eq!(
+            tick.settled_watches,
+            [SettledWatch {
+                id: "aaaaaa".into(),
+                action: WatchAction::Wake,
+                landing: wt_core::OwnerLanding::Landed,
+                unconfirmed: true,
+            }]
+        );
+    }
+
     /// The process can stop after the ledger recorded a watch action and
     /// before the watch dropped it. The next pass reports the action as
     /// settled instead of leaving the watch met with nothing to deliver it,
@@ -2245,7 +2423,12 @@ mod tests {
         assert!(tick.claims.is_empty());
         assert_eq!(
             tick.settled_watches,
-            [("aaaaaa".to_owned(), WatchAction::Notify)]
+            [SettledWatch {
+                id: "aaaaaa".into(),
+                action: WatchAction::Notify,
+                landing: wt_core::OwnerLanding::NotLanded,
+                unconfirmed: false,
+            }]
         );
     }
 

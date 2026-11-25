@@ -357,6 +357,21 @@ enum Command {
     Notify(commands::watch::NotifyArgs),
     /// List, cancel or check watches: what worktrees are waiting for.
     Watch(commands::watch::WatchArgs),
+    /// Show what a worktree still owes: its merge gate, the checks owed
+    /// once deployed, and the steps it comes back for.
+    ///
+    /// One list per worktree; `--all` groups the fleet's by what is due now,
+    /// what must happen before the next production release, and what is
+    /// waiting. Watches that only tell the person are not owed and stay
+    /// under `wt watch`.
+    Owed(commands::owed::OwedArgs),
+    /// Close something the worktree owes, with the evidence for it.
+    ///
+    /// A wake delivered after the worktree's work landed stays owed until
+    /// it is closed: `wt done <id> -m "what you did and what you saw"`. A
+    /// check is closed by its stage: `wt done staging -m "..."`. To put
+    /// either off instead: `wt done <id> --again tomorrow`.
+    Done(commands::owed::DoneArgs),
     /// Show, set or clear a recorded fork base.
     Base(commands::base::BaseArgs),
     /// Organize worktrees into named sections.
@@ -733,6 +748,8 @@ async fn dispatch_command(
         Command::Wake(args) => commands::watch::run_wake(context, args).await,
         Command::Notify(args) => commands::watch::run_notify(context, args).await,
         Command::Watch(args) => commands::watch::run_watch(context, args).await,
+        Command::Owed(args) => commands::owed::run_owed(context, args).await,
+        Command::Done(args) => commands::owed::run_done(context, args).await,
         Command::Base(args) => commands::base::run(context, args).await,
         Command::Section(args) => wt_ops::commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,

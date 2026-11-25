@@ -1,5 +1,7 @@
-//! Each row's pending watches on the board: what the worktree waits for,
-//! whether each condition holds yet, and what wt will do then.
+//! Each row's pending watches and everything it owes on the board: what the
+//! worktree waits for, whether each condition holds yet, what wt will do
+//! then, and the one owed list `wt_core::owed_items` derives from its
+//! status, its watches and the steps that came due.
 //!
 //! Nothing is read here. Watches live in the repository state, which the
 //! metadata leaf already reads from SQLite (never persisted, refreshed by the
@@ -16,11 +18,13 @@ use std::{sync::Arc, time::Duration};
 
 use wt_app_core::watch_view::{Shown, headline, shown};
 use wt_core::{
-    sanitize_terminal_text,
+    OwedItem, OwedKind, OwedWhen, sanitize_terminal_text,
     watch::{Condition, LocalClock, Watch, WatchAction, WatchCondition},
 };
 use wt_runtime::{SourceHandle, SourceSnapshot, SourceState, TaskScope, derived_channel};
-use wt_tui::{Board, BoardRow, WatchActionKind, WatchConditionView, WatchTruth, WatchView};
+use wt_tui::{
+    Board, BoardRow, OwedView, WatchActionKind, WatchConditionView, WatchTruth, WatchView,
+};
 
 use crate::local_source::Metadata;
 
@@ -29,10 +33,13 @@ const REFRESH: Duration = Duration::from_secs(30);
 /// Why conditions read unknown when this process runs no engine.
 const ENGINE_OFF: &str = "automations are off (WT_AUTOMATIONS=off), so nothing evaluates it";
 
+/// `separate_production` is whether `[branch] production` names a branch
+/// other than base, as the work overlay reads a landing.
 pub fn overlay(
     scope: &TaskScope,
     board: SourceHandle<Board>,
     metadata: SourceHandle<Metadata>,
+    separate_production: bool,
 ) -> SourceHandle<Board> {
     let (output, mut publisher) = derived_channel(scope, "watch-board");
     let cancellation = scope.token();
@@ -72,7 +79,7 @@ pub fn overlay(
                 utc_offset_minutes: wt_app_core::display_time::local_utc_offset_minutes(now_ms)
                     .unwrap_or(0),
             };
-            let (prepared, next) = attach(base, &state, clock, idle);
+            let (prepared, next) = attach(base, &state, clock, idle, separate_production);
             wake = next.map(|after| tokio::time::Instant::now() + after);
             publisher.publish_if_changed(prepared);
         }
@@ -80,14 +87,15 @@ pub fn overlay(
     output
 }
 
-/// Put each local worktree's watches and creation stamp on its row. Returns
-/// the board and how long until it should be prepared again: `None` while
-/// no row waits for anything.
+/// Put each local worktree's watches, owed list and creation stamp on its
+/// row. Returns the board and how long until it should be prepared again:
+/// `None` while no row waits for anything.
 fn attach(
     base: SourceSnapshot<Board>,
     metadata: &SourceSnapshot<Metadata>,
     clock: LocalClock,
     idle: Option<&str>,
+    separate_production: bool,
 ) -> (SourceSnapshot<Board>, Option<Duration>) {
     // A failed read keeps its last state; rows then show what was last known.
     let (Some(board), Some(state)) = (base.data(), metadata.data()) else {
@@ -98,22 +106,52 @@ fn attach(
     }
     let state = &state.0;
     let watches = wt_store::stored_watches(state);
+    let due_steps = wt_store::stored_owed(state);
     let mut board = board.as_ref().clone();
     let mut next = None::<Duration>;
     let paused_everywhere = board.automations_paused;
     for row in board.rows.iter_mut().filter(|row| local_worktree(row)) {
         let created_at = state["slugs"][&row.slug]["createdAt"].as_str();
         let held = paused_everywhere || row.automations_paused;
-        row.watches = watches
+        let own = wt_core::owed::row_watches(&watches, &row.slug, created_at);
+        row.watches = own
             .iter()
-            .filter(|watch| {
-                watch.slug == row.slug && !watch.owner_gone && watch.owned_by(created_at)
-            })
             .map(|watch| WatchView {
                 held,
                 ..view(watch, clock, idle)
             })
             .collect();
+        // The stored record, read as every other reader of the owed list
+        // reads it: a gate is matched to its watch by its text.
+        let record = wt_core::parse_work_status(&state["slugs"][&row.slug]["work"]);
+        let landing = wt_core::Landing::new(
+            row.git.landed_on.is_some(),
+            row.git.landed_on == Some(wt_tui::LandingKind::Production),
+            separate_production,
+        )
+        .with_deploys(row.git.deploys);
+        let items = wt_core::owed_items(
+            record.as_ref(),
+            &landing,
+            &own,
+            &wt_core::owed::row_due(&due_steps, &row.slug, created_at),
+            clock.now_ms,
+        );
+        row.owed_phase = wt_core::owed_phase(&items, landing.base);
+        row.owes = items
+            .iter()
+            .map(|item| owed_view(item, &own, clock, idle, held))
+            .collect();
+        // A check put off to a time comes back when that time does.
+        for at_ms in items.iter().filter_map(|item| match item.when {
+            OwedWhen::Stage { not_before_ms, .. } => not_before_ms,
+            _ => None,
+        }) {
+            if let Ok(until @ 1..) = u64::try_from(at_ms - clock.now_ms) {
+                let until = Duration::from_millis(until).min(REFRESH);
+                next = Some(next.map_or(until, |next| next.min(until)));
+            }
+        }
         row.created_at = created_at.map(sanitize_terminal_text);
         for watch in watches.iter().filter(|watch| watch.slug == row.slug) {
             next = Some(next.map_or(REFRESH, |next| next.min(REFRESH)));
@@ -178,6 +216,61 @@ fn view(watch: &Watch, clock: LocalClock, idle: Option<&str>) -> WatchView {
         headline: text,
         met: watch.is_met(),
         held: false,
+    }
+}
+
+/// One owed item as a row shows it. `watches` are the row's own: a gate's
+/// watch and a waiting step's give the item its conditions.
+pub(crate) fn owed_view(
+    item: &OwedItem,
+    watches: &[Watch],
+    clock: LocalClock,
+    idle: Option<&str>,
+    paused: bool,
+) -> OwedView {
+    let watch = match item.when {
+        OwedWhen::Conditions { .. } => item
+            .id
+            .as_deref()
+            .and_then(|id| watches.iter().find(|watch| watch.id == id)),
+        _ => None,
+    };
+    OwedView {
+        id: item.id.as_deref().map(sanitize_terminal_text),
+        kind: item.kind,
+        state: item.state,
+        stage: item.stage,
+        what: sanitize_terminal_text(&item.what),
+        headline: sanitize_terminal_text(&item.headline()),
+        when: sanitize_terminal_text(&item.when_words(clock)),
+        conditions: watch
+            .map(|watch| {
+                watch
+                    .when
+                    .iter()
+                    .map(|cond| condition(watch, cond, clock, idle))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        due_at_ms: item.due_at_ms.and_then(|at_ms| u64::try_from(at_ms).ok()),
+        due_at: item
+            .due_at_ms
+            .map(|at_ms| sanitize_terminal_text(&wt_core::watch::describe_instant(at_ms, clock))),
+        not_before_in: match item.when {
+            OwedWhen::Stage {
+                not_before_ms: Some(at_ms),
+                ..
+            } if at_ms > clock.now_ms => Some(remaining(at_ms - clock.now_ms)),
+            _ => None,
+        },
+        by: item.by.as_deref().map(sanitize_terminal_text),
+        before_release: item.before_release,
+        overdue: item.overdue,
+        awaiting_deploy: item.awaiting_deploy,
+        unconfirmed: item.unconfirmed,
+        met: watch.is_some_and(Watch::is_met),
+        held: paused,
+        wakes: item.kind == OwedKind::Gate && watch.is_some_and(Watch::wakes_owner),
     }
 }
 
@@ -308,9 +401,234 @@ mod tests {
             SourceState::Ready,
             wt_core::Domain::Metadata,
         );
-        let (snapshot, next) = attach(board, &metadata, CLOCK, idle);
+        let (snapshot, next) = attach(board, &metadata, CLOCK, idle, false);
         assert!(snapshot.domains().contains_key(&wt_core::Domain::Metadata));
         (snapshot.data().unwrap().as_ref().clone(), next)
+    }
+
+    fn prepared_state(
+        rows: Vec<BoardRow>,
+        state: serde_json::Value,
+        separate_production: bool,
+    ) -> (Board, Option<Duration>) {
+        let board = SourceSnapshot::test_live(
+            Some(Board {
+                rows,
+                ..Default::default()
+            }),
+            SourceState::Ready,
+            wt_core::Domain::Git,
+        );
+        let metadata = SourceSnapshot::test_live(
+            Some((state, Default::default())),
+            SourceState::Ready,
+            wt_core::Domain::Metadata,
+        );
+        let (snapshot, next) = attach(board, &metadata, CLOCK, None, separate_production);
+        (snapshot.data().unwrap().as_ref().clone(), next)
+    }
+
+    fn landed(slug: &str, on: wt_tui::LandingKind) -> BoardRow {
+        let mut row = row(slug);
+        row.git.landed_on = Some(on);
+        row
+    }
+
+    fn kinds(row: &BoardRow) -> Vec<(wt_core::OwedKind, wt_core::OwedState, &str)> {
+        row.owes
+            .iter()
+            .map(|item| (item.kind, item.state, item.when.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn an_unlanded_row_carries_one_list_of_its_gate_checks_and_wakes() {
+        use wt_core::{OwedKind, OwedState};
+        let gate = watch(
+            "gate22",
+            "one",
+            "one",
+            &["#3806:production"],
+            WatchActions {
+                unblock: Some("prod secret".into()),
+                wake: Some("Deploy it.".into()),
+                ..Default::default()
+            },
+        );
+        let timed = watch(
+            "wake33",
+            "one",
+            "manager",
+            &["+130m"],
+            wake("Run it\nthen say so"),
+        );
+        let told = watch("tell44", "one", "human", &["merged"], notify());
+        let state = json!({
+            "slugs": { "one": {
+                "createdAt": CREATED,
+                "work": {
+                    "state": "ready", "at": "2026-11-24T11:00:00Z",
+                    "blockedOn": "prod secret",
+                    "checks": {
+                        "staging": { "steps": "Look. STEPS: 1. open /health" },
+                        "production": { "steps": "check the dashboard" },
+                    },
+                },
+            } },
+            "watches": [gate, timed, told],
+        });
+        let (board, next) = prepared_state(vec![row("one")], state, true);
+        assert_eq!(next, Some(REFRESH));
+        let one = &board.rows[0];
+        // Not landed: the asserted status says where the row stands.
+        assert_eq!(one.owed_phase, None);
+        assert_eq!(
+            kinds(one),
+            [
+                (
+                    OwedKind::Gate,
+                    OwedState::Waiting,
+                    "clears when #3806 in production"
+                ),
+                (OwedKind::Check, OwedState::Waiting, "once in staging"),
+                (OwedKind::Check, OwedState::Waiting, "once in production"),
+                (OwedKind::Step, OwedState::Waiting, "at 14:10"),
+            ]
+        );
+        let [gate, staging, _, step] = one.owes.as_slice() else {
+            panic!("{:?}", one.owes)
+        };
+        // The gate's watch is part of the gate: its wake is not a step of
+        // its own.
+        assert_eq!(gate.what, "prod secret");
+        assert_eq!(gate.id.as_deref(), Some("gate22"));
+        assert!(gate.wakes && !gate.met);
+        assert_eq!(gate.conditions[0].text, "#3806 in production");
+        assert_eq!(staging.stage, Some(wt_core::VerifyStage::Staging));
+        assert_eq!(staging.headline, "check: Look. STEPS: 1. open /health");
+        assert_eq!(step.what, "Run it then say so");
+        assert_eq!(step.headline, "Run it");
+        assert_eq!(step.by.as_deref(), Some("manager"));
+        assert_eq!(step.conditions[0].due_in.as_deref(), Some("2h10m"));
+        // What only tells the person is not owed; every watch stays listed
+        // for the menus that need it.
+        assert_eq!(one.watches.len(), 3);
+        assert!(
+            !one.owes
+                .iter()
+                .any(|item| item.id.as_deref() == Some("tell44"))
+        );
+    }
+
+    #[test]
+    fn a_landed_rows_phase_follows_what_is_due_waiting_or_done() {
+        use wt_core::{OwedKind, OwedPhase, OwedState};
+        let state = |deferred: bool, due: bool| {
+            let mut state = json!({
+                "slugs": { "one": {
+                    "createdAt": CREATED,
+                    "work": {
+                        "state": "ready", "at": "2026-11-24T11:00:00Z",
+                        "checks": {
+                            "staging": { "steps": "open /health" },
+                            "production": { "steps": "check the dashboard" },
+                        },
+                    },
+                } },
+                "owed": [
+                    {
+                        "id": "93co6q", "slug": "one", "incarnation": CREATED, "by": "one",
+                        "what": "confirm prod logs", "whenText": "in production",
+                        "dueAtMs": NOON - 24 * 60_000, "beforeRelease": true,
+                    },
+                    // Another worktree's, and an earlier worktree of this name.
+                    { "id": "other1", "slug": "two", "incarnation": CREATED, "by": "two",
+                      "what": "x", "whenText": "y", "dueAtMs": NOON },
+                    { "id": "older1", "slug": "one", "incarnation": "2026-01-01T00:00:00Z",
+                      "by": "one", "what": "x", "whenText": "y", "dueAtMs": NOON },
+                ],
+            });
+            if deferred {
+                state["slugs"]["one"]["work"]["checks"]["staging"]["notBeforeMs"] =
+                    json!(NOON + 3_600_000);
+            }
+            if !due {
+                state["owed"] = json!([]);
+            }
+            state
+        };
+        // Landed on base with a separate production branch: the step that
+        // came due and the staging check are due, production still waits.
+        let base = || landed("one", wt_tui::LandingKind::Base);
+        let (board, next) = prepared_state(vec![base()], state(false, true), true);
+        assert_eq!(next, None, "nothing here changes with time");
+        let one = &board.rows[0];
+        assert_eq!(one.owed_phase, Some(OwedPhase::Due));
+        assert_eq!(
+            kinds(one),
+            [
+                (OwedKind::Check, OwedState::Due, "due in staging"),
+                (OwedKind::Step, OwedState::Due, "due since 11:36"),
+                (OwedKind::Check, OwedState::Waiting, "once in production"),
+            ]
+        );
+        let step = &one.owes[1];
+        assert_eq!(step.id.as_deref(), Some("93co6q"));
+        assert_eq!(step.due_at.as_deref(), Some("11:36"));
+        assert_eq!(
+            step.due_at_ms,
+            Some(u64::try_from(NOON - 24 * 60_000).unwrap())
+        );
+        assert!(step.before_release);
+        // Put off for an hour: waiting, counted down, and prepared again.
+        let (board, next) = prepared_state(vec![base()], state(true, false), true);
+        let one = &board.rows[0];
+        assert_eq!(one.owed_phase, Some(OwedPhase::Waiting));
+        // Its stage has the change, so only the time holds it back: it
+        // sorts with what waits for a time.
+        assert_eq!(
+            kinds(one),
+            [
+                (OwedKind::Check, OwedState::Waiting, "once in production"),
+                (
+                    OwedKind::Check,
+                    OwedState::Waiting,
+                    "once in staging, not before 13:00"
+                ),
+            ]
+        );
+        assert_eq!(one.owes[1].not_before_in.as_deref(), Some("1h"));
+        assert_eq!(next, Some(REFRESH));
+        // A probed stage that is not running the change yet.
+        let mut awaiting = base();
+        awaiting.git.deploys.staging = Some(false);
+        let (board, _) = prepared_state(vec![awaiting], state(false, false), true);
+        let one = &board.rows[0];
+        assert_eq!(one.owed_phase, Some(OwedPhase::Waiting));
+        assert!(one.owes[0].awaiting_deploy && !one.owes[0].due());
+        assert_eq!(one.owes[0].when, "awaiting staging deploy");
+        // In production everything it owes is due.
+        let (board, _) = prepared_state(
+            vec![landed("one", wt_tui::LandingKind::Production)],
+            state(false, false),
+            true,
+        );
+        assert!(board.rows[0].owes.iter().all(OwedView::due));
+        // Landed and nothing open: done, which is what cleanup removes.
+        let (board, _) = prepared_state(
+            vec![base()],
+            json!({ "slugs": { "one": { "createdAt": CREATED } } }),
+            true,
+        );
+        assert_eq!(board.rows[0].owed_phase, Some(OwedPhase::Done));
+        assert!(board.rows[0].owes.is_empty());
+        // A remote row's list is its host's to derive.
+        let mut remote = base();
+        remote.key = wt_core::remote_worktree_ledger_key("builder", "one");
+        remote.host = Some("builder".into());
+        let (board, _) = prepared_state(vec![remote], state(false, true), true);
+        assert!(board.rows[0].owes.is_empty());
+        assert_eq!(board.rows[0].owed_phase, None);
     }
 
     #[test]
@@ -489,7 +807,7 @@ mod tests {
     fn a_board_or_state_not_read_yet_passes_through() {
         let empty = SourceSnapshot::<Board>::default();
         let metadata = SourceSnapshot::<Metadata>::default();
-        let (snapshot, next) = attach(empty, &metadata, CLOCK, None);
+        let (snapshot, next) = attach(empty, &metadata, CLOCK, None, false);
         assert!(snapshot.data().is_none());
         assert_eq!(next, None);
     }

@@ -1133,7 +1133,7 @@ mod tests {
                 title: "remove 界面 worktree".into(),
                 lines: vec![
                     "dirty changes will be lost".into(),
-                    "post-merge verification still owed".into(),
+                    "still owes: check: open /health (in staging)".into(),
                 ],
                 selected: 0,
                 cancel_key: Some('d'),

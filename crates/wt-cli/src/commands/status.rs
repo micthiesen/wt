@@ -20,7 +20,7 @@ use wt_vcs::WorktreeRecord;
 use wt_app_core::{context::AppContext, database::Database};
 use wt_ops::commands::resolve::resolve_worktree;
 
-const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo, and --until <condition> clears the gate by itself once the condition holds (e.g. --until pr:3806:production; see `wt watch check`); --verify-in-staging / --verify-in-production record a check owed once the change deploys there.";
+const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo, and --until <condition> clears the gate by itself once the condition holds (e.g. --until pr:3806:production; see `wt watch check`); --verify-in-staging / --verify-in-production record a check owed once the change deploys there (both may be given; --no-verify-in-<stage> drops one). `wt owed` lists what the worktree owes and `wt done` closes it.";
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StatusArgs {
@@ -44,19 +44,21 @@ pub struct StatusArgs {
     pub blocked_on: Option<String>,
     /// Numbered steps for a check only staging can prove, once this lands on
     /// the base branch; the worktree returns as needs-testing then. Without a
-    /// state, amends in place.
-    #[arg(
-        long,
-        allow_hyphen_values = true,
-        value_name = "STEPS",
-        conflicts_with = "verify_in_production"
-    )]
+    /// state, amends in place. A check owed in production is left alone.
+    #[arg(long, allow_hyphen_values = true, value_name = "STEPS")]
     pub verify_in_staging: Option<String>,
     /// Numbered steps for a check only production can prove, once the landing
     /// reaches `[branch] production` (the base landing when there is none).
-    /// Without a state, amends in place.
+    /// Without a state, amends in place. A check owed in staging is left
+    /// alone.
     #[arg(long, allow_hyphen_values = true, value_name = "STEPS")]
     pub verify_in_production: Option<String>,
+    /// Stop owing the check in staging without running it.
+    #[arg(long, conflicts_with = "verify_in_staging")]
+    pub no_verify_in_staging: bool,
+    /// Stop owing the check in production without running it.
+    #[arg(long, conflicts_with = "verify_in_production")]
+    pub no_verify_in_production: bool,
     /// Replaced: say where the check runs with --verify-in-staging or
     /// --verify-in-production.
     #[arg(long, allow_hyphen_values = true, hide = true)]
@@ -106,6 +108,15 @@ struct Verify {
     steps: String,
 }
 
+impl Verify {
+    fn edit(self) -> wt_ops::status_checks::CheckEdit {
+        wt_ops::status_checks::CheckEdit::Owe {
+            stage: self.stage,
+            steps: self.steps,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
     All {
@@ -126,7 +137,8 @@ enum Action {
         note: Option<String>,
         risk: Option<WorkRisk>,
         blocked: Option<String>,
-        verify: Option<Verify>,
+        verify: Vec<Verify>,
+        unverify: Vec<VerifyStage>,
         append: bool,
     },
     Amend {
@@ -134,7 +146,8 @@ enum Action {
         note: Option<String>,
         risk: Option<WorkRisk>,
         blocked: Option<Option<String>>,
-        verify: Option<Verify>,
+        verify: Vec<Verify>,
+        unverify: Vec<VerifyStage>,
         append: bool,
     },
     Error(String),
@@ -227,6 +240,58 @@ fn parse_status_args(args: &StatusArgs) -> Action {
     action
 }
 
+/// The hand-written phase lines a ready note used to carry. What a worktree
+/// owes is tracked, so a note that restates it is refused once, with where
+/// each kind goes.
+const OPS_PHASE_LINES: [&str; 4] = [
+    "OPS BEFORE MERGE:",
+    "OPS AFTER MERGE:",
+    "OPS BEFORE RELEASE:",
+    "OPS AFTER RELEASE:",
+];
+const OPS_NONE: &str = "OPS: none";
+
+fn ops_lines_refusal(supplied: &str) -> Option<String> {
+    let line = OPS_PHASE_LINES
+        .iter()
+        .find(|line| supplied.contains(**line))?;
+    Some(format!(
+        "the note has \"{line}\": what this worktree still owes is tracked, not written in the note. Leave it out and record each step where wt can see it:\n  a gate before merging: --blocked-on \"<why>\" [--until <condition>]\n  a check once deployed: --verify-in-staging \"<steps>\" / --verify-in-production \"<steps>\"\n  any other step to come back for: wt wake <condition> -m \"<what to do>\"\n  a step before the next production release: wt wake staging --before-release -m \"<what to do>\"\n`wt owed` shows the list; a note may say \"{OPS_NONE}\" when it is empty."
+    ))
+}
+
+/// A note with its "OPS: none" taken out: the claim stopped being true.
+fn without_ops_none(note: &str) -> Option<String> {
+    let cleaned = sanitize_work_note(&note.replace(OPS_NONE, " "));
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// What the note of a status about to be written may say about the list.
+/// `supplied` is the text this command gave; `owes` whether the worktree
+/// will owe anything once the status is written.
+fn settle_ops_none(
+    note: Option<String>,
+    supplied: Option<&str>,
+    owes: bool,
+) -> Result<Option<String>, String> {
+    if !owes {
+        return Ok(note);
+    }
+    if supplied.is_some_and(|supplied| supplied.contains(OPS_NONE)) {
+        return Err(format!(
+            "the note says \"{OPS_NONE}\" but this worktree owes something (`wt owed` lists it): drop \"{OPS_NONE}\" from the note, or close what is owed first"
+        ));
+    }
+    // Carried from an earlier status, when the list was empty.
+    Ok(note.and_then(|note| {
+        if note.contains(OPS_NONE) {
+            without_ops_none(&note)
+        } else {
+            Some(note)
+        }
+    }))
+}
+
 /// `--until` belongs to a gate and `--then` to `--until`.
 fn until_misuse(args: &StatusArgs) -> Option<&'static str> {
     if args.until.is_empty() {
@@ -273,26 +338,43 @@ fn parse_status_action(args: &StatusArgs) -> Action {
             "--verify-after-merge is replaced: say where the check runs with --verify-in-staging <steps> (once it lands on the base branch) or --verify-in-production <steps> (once it reaches production)",
         );
     }
-    let verify = match (
-        args.verify_in_staging.as_deref(),
-        args.verify_in_production.as_deref(),
-    ) {
-        (Some(_), Some(_)) => {
-            return fail("pick one of --verify-in-staging and --verify-in-production");
+    let mut verify = Vec::new();
+    for (stage, flag, value) in [
+        (
+            VerifyStage::Staging,
+            "--verify-in-staging",
+            args.verify_in_staging.as_deref(),
+        ),
+        (
+            VerifyStage::Production,
+            "--verify-in-production",
+            args.verify_in_production.as_deref(),
+        ),
+    ] {
+        let Some(value) = value else { continue };
+        match sanitize(value) {
+            Some(steps) => verify.push(Verify { stage, steps }),
+            None => return Action::Error(format!("{flag} requires non-empty steps")),
         }
-        (Some(value), None) | (None, Some(value)) => {
-            let (stage, flag) = if args.verify_in_staging.is_some() {
-                (VerifyStage::Staging, "--verify-in-staging")
-            } else {
-                (VerifyStage::Production, "--verify-in-production")
-            };
-            match sanitize(value) {
-                Some(steps) => Some(Verify { stage, steps }),
-                None => return Action::Error(format!("{flag} requires non-empty steps")),
-            }
+    }
+    let unverify = [
+        (VerifyStage::Staging, args.no_verify_in_staging),
+        (VerifyStage::Production, args.no_verify_in_production),
+    ]
+    .into_iter()
+    .filter_map(|(stage, drop)| drop.then_some(stage))
+    .collect::<Vec<_>>();
+    // Only what this command supplies is judged: a note carried or appended
+    // to from an earlier status is not.
+    for supplied in [args.note.as_deref(), args.note_only.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(message) = ops_lines_refusal(supplied) {
+            return Action::Error(message);
         }
-        (None, None) => None,
-    };
+    }
+    let checks_touched = !verify.is_empty() || !unverify.is_empty();
     let verdict = match args.examined.as_deref() {
         Some(value) => match sanitize(value) {
             Some(value) => Some(value),
@@ -319,7 +401,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
             || args.all
             || risk.is_some()
             || gate.is_some()
-            || verify.is_some()
+            || checks_touched
             || args.unblock
             || verdict.is_some()
             || positions.len() > 1
@@ -340,7 +422,8 @@ fn parse_status_action(args: &StatusArgs) -> Action {
             note: Some(note),
             risk: None,
             blocked: None,
-            verify: None,
+            verify: Vec::new(),
+            unverify: Vec::new(),
             append,
         };
     }
@@ -353,7 +436,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
             || note.is_some()
             || risk.is_some()
             || gate.is_some()
-            || verify.is_some()
+            || checks_touched
             || args.unblock
             || append
             || positions.len() > 1
@@ -373,7 +456,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
             || note.is_some()
             || risk.is_some()
             || gate.is_some()
-            || verify.is_some()
+            || checks_touched
             || args.unblock
             || !positions.is_empty()
             || args.note_only.is_some()
@@ -386,7 +469,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
         if note.is_some()
             || risk.is_some()
             || gate.is_some()
-            || verify.is_some()
+            || checks_touched
             || args.unblock
             || append
             || positions.len() > 1
@@ -411,7 +494,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
     let Some(raw_state) = state else {
         if gate.is_some()
             || args.unblock
-            || verify.is_some()
+            || checks_touched
             || risk.is_some()
             || !args.until.is_empty()
         {
@@ -425,6 +508,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
                     gate.map(Some)
                 },
                 verify,
+                unverify,
                 append,
             };
         }
@@ -468,8 +552,10 @@ fn parse_status_action(args: &StatusArgs) -> Action {
     if state == WorkState::Verified && note.is_none() {
         return fail("verified requires -m explaining what you checked and where");
     }
-    if verify.is_some() && matches!(state, WorkState::Verified | WorkState::Dropped) {
-        return fail("--verify-in-* doesn't apply to verified or dropped");
+    if checks_touched && matches!(state, WorkState::Verified | WorkState::Dropped) {
+        return fail(
+            "--verify-in-* doesn't apply to verified or dropped: verified closes the checks that are due and dropped drops them all",
+        );
     }
     Action::Set {
         target,
@@ -478,6 +564,7 @@ fn parse_status_action(args: &StatusArgs) -> Action {
         risk,
         blocked: gate,
         verify,
+        unverify,
         append,
     }
 }
@@ -510,9 +597,15 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
         Action::All { json: wants_json } => {
             let now = now_ms();
             if wants_json {
+                let rows = worktrees.iter().map(|w| (*w).clone()).collect::<Vec<_>>();
+                let landings = wt_ops::lifecycle_ops::row_landings(ctx, &rows, &state, None).await;
                 let mut entries = Vec::with_capacity(worktrees.len());
                 for w in &worktrees {
-                    entries.push(live_json(ctx, &state, w).await?);
+                    let landing = landings
+                        .get(w.target.slug())
+                        .copied()
+                        .unwrap_or(wt_core::Landing::NONE);
+                    entries.push(live_json(ctx, &state, w, landing).await?);
                 }
                 let live = worktrees
                     .iter()
@@ -523,7 +616,12 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                     .call(move |store| Ok(store.recently_removed_worktrees(&live, now)?))
                     .await?;
                 let mut output = entries;
-                output.extend(removed.into_iter().map(removed_json));
+                let separate = ctx.config.branch.separate_production();
+                output.extend(
+                    removed
+                        .into_iter()
+                        .map(|entry| removed_json(entry, separate)),
+                );
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {
                 for w in worktrees {
@@ -577,9 +675,18 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             if wants_json {
+                let landing = wt_ops::lifecycle_ops::row_landings(
+                    ctx,
+                    std::slice::from_ref(&record),
+                    &state,
+                    None,
+                )
+                .await
+                .remove(record.target.slug())
+                .unwrap_or(wt_core::Landing::NONE);
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&live_json(ctx, &state, &record).await?)?
+                    serde_json::to_string_pretty(&live_json(ctx, &state, &record, landing).await?)?
                 );
                 return Ok(0);
             }
@@ -691,6 +798,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             risk,
             blocked,
             verify,
+            unverify,
             append,
         } => {
             let record = match resolve_worktree(ctx, target.as_deref()).await {
@@ -712,6 +820,14 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
+            let steps_owed = steps_owed(&state, &slug);
+            if work_state == WorkState::Verified
+                && let Some(code) =
+                    verify_checks(ctx, &record, &state, note.clone(), append, steps_owed).await?
+            {
+                return Ok(code);
+            }
+            let dropped = drop_checks(ctx, &slug, &unverify).await?;
             let mut next = WorkStatusRecord::new(work_state, now_iso());
             next.sha = record.head_sha.clone();
             next.by = std::env::var("WT_AGENT")
@@ -720,36 +836,36 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 .filter(|s| !s.is_empty());
             next.risk = risk;
             next.blocked_on = blocked;
-            let StatusWrite {
-                previous,
-                next,
-                wrote,
-                cancelled,
-            } = update_status(&ctx.database, &slug, move |previous| {
-                next.note = merge_note(
+            let list_asked = !verify.is_empty() || dropped || next.blocked_on.is_some();
+            let write = update_status(&ctx.database, &slug, move |previous| {
+                let merged = merge_note(
                     previous.as_ref().and_then(|p| p.note.as_deref()),
                     note.as_deref(),
                     append,
                     false,
                 );
-                if !matches!(work_state, WorkState::Verified | WorkState::Dropped) {
-                    match verify {
-                        Some(verify) => {
-                            next.verify_after_merge = Some(verify.steps);
-                            next.verify_in = Some(verify.stage);
-                        }
-                        None => {
-                            if let Some(previous) = previous {
-                                next.verify_after_merge = previous.verify_after_merge;
-                                next.verify_in = previous.verify_in;
-                            }
-                        }
-                    }
-                }
+                wt_ops::status_checks::assert_checks(
+                    &mut next,
+                    previous.as_ref(),
+                    verify.into_iter().map(Verify::edit),
+                );
+                let owes = steps_owed || record_owes(&next);
+                next.note = settle_ops_none(merged, note.as_deref(), owes)?;
                 Ok(next)
             })
-            .await?
-            .map_err(anyhow::Error::msg)?;
+            .await?;
+            let StatusWrite {
+                previous,
+                next,
+                wrote,
+                cancelled,
+            } = match write {
+                Ok(write) => write,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return Ok(2);
+                }
+            };
             let (previous_note, previous_gate) = previous
                 .map(|previous| (previous.note, previous.blocked_on))
                 .unwrap_or_default();
@@ -776,12 +892,28 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 Ok(clears) => clears,
                 Err(code) => return Ok(code),
             };
-            print_guidance(
-                work_state,
-                next.blocked_on.as_deref(),
-                next.verification(),
-                clears.as_deref(),
-            );
+            print_guidance(work_state, next.blocked_on.as_deref(), clears.as_deref());
+            let owed = super::owed::read(ctx, &record).await?;
+            // A plain assertion does not change the list; `ready` repeats
+            // it, since that is where what is owed gets handed over.
+            if list_asked
+                || clears.is_some()
+                || previous_gate != next.blocked_on
+                || (work_state == WorkState::Ready && !owed.items.is_empty())
+            {
+                print_owed(ctx, &record, &owed).await;
+            } else if work_state == WorkState::Ready
+                && owed.items.is_empty()
+                && !hints_off()
+                && !next
+                    .note
+                    .as_deref()
+                    .is_some_and(|note| note.contains(OPS_NONE))
+            {
+                println!(
+                    "nothing is recorded as owed after this merges: say \"{OPS_NONE}\" in the note, or record what is (--verify-in-<stage>, wt wake <condition> -m, --blocked-on)."
+                );
+            }
             Ok(0)
         }
         Action::Amend {
@@ -790,6 +922,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             risk,
             blocked,
             verify,
+            unverify,
             append,
         } => {
             let record = match resolve_worktree(ctx, target.as_deref()).await {
@@ -804,16 +937,34 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
+            let steps_owed = steps_owed(&state, &slug);
+            let dropped = drop_checks(ctx, &slug, &unverify).await?;
+            // Dropping a check is the whole amendment when nothing else was
+            // asked for.
+            if !unverify.is_empty()
+                && note.is_none()
+                && risk.is_none()
+                && blocked.is_none()
+                && verify.is_empty()
+                && until.is_none()
+            {
+                print_owed(ctx, &record, &super::owed::read(ctx, &record).await?).await;
+                return Ok(i32::from(!dropped));
+            }
             let needs_gate = until.is_some();
             let write = update_status(&ctx.database, &slug, {
                 let slug = slug.clone();
                 move |previous| {
-                    let next = amend_record(&slug, previous, note, risk, blocked, verify, append)?;
+                    let supplied = note.clone();
+                    let mut next =
+                        amend_record(&slug, previous, note, risk, blocked, verify, append)?;
                     if needs_gate && next.blocked_on.is_none() {
                         return Err(format!(
                             "{slug} has no gate for --until to clear: add --blocked-on \"<why>\""
                         ));
                     }
+                    let owes = steps_owed || record_owes(&next);
+                    next.note = settle_ops_none(next.note.take(), supplied.as_deref(), owes)?;
                     Ok(next)
                 }
             })
@@ -831,9 +982,9 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let previous = previous.expect("an amend is refused without a previous status");
+            let old_checks = previous.open_checks();
             let previous_note = previous.note;
             let old_gate = previous.blocked_on;
-            let old_verify = (previous.verify_after_merge, previous.verify_in);
             println!(
                 "✓ {slug} {}{}",
                 work_state_name(next.state),
@@ -847,8 +998,8 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 println!("  blocked on: {gate}");
             }
             report_cancelled_watches(&cancelled);
-            if let Some((stage, steps)) = next.verification() {
-                println!("  verify in {}: {steps}", stage.as_str());
+            for (stage, check) in next.open_checks() {
+                println!("  verify in {}: {}", stage.as_str(), check.steps);
             }
             if let Some(note) = &next.note {
                 println!("  note: {note}");
@@ -859,21 +1010,168 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 Ok(clears) => clears,
                 Err(code) => return Ok(code),
             };
-            if clears.is_some()
+            let list_changed = dropped
+                || clears.is_some()
                 || old_gate != next.blocked_on
-                || old_verify != (next.verify_after_merge.clone(), next.verify_in)
-            {
-                print_guidance(
-                    next.state,
-                    next.blocked_on.as_deref(),
-                    next.verification(),
-                    clears.as_deref(),
-                );
+                || old_checks != next.open_checks();
+            if clears.is_some() || old_gate != next.blocked_on {
+                print_guidance(next.state, next.blocked_on.as_deref(), clears.as_deref());
+            }
+            if list_changed {
+                print_owed(ctx, &record, &super::owed::read(ctx, &record).await?).await;
             }
             Ok(0)
         }
         Action::Error(_) => unreachable!(),
     }
+}
+
+/// The worktree came to owe something outside its status (a wake was set):
+/// a note that still says "OPS: none" stops saying so.
+pub(crate) async fn drop_ops_none(ctx: &AppContext, slug: &str) -> Result<()> {
+    let wanted = slug.to_owned();
+    let stored = ctx
+        .database
+        .call(move |store| Ok(store.read_slug_state(&wanted)?))
+        .await?;
+    let claims = stored
+        .as_ref()
+        .and_then(|stored| stored["work"]["note"].as_str())
+        .is_some_and(|note| note.contains(OPS_NONE));
+    if !claims {
+        return Ok(());
+    }
+    let write = update_status(&ctx.database, slug, |previous| {
+        let mut next = previous.ok_or_else(String::new)?;
+        next.note = next.note.as_deref().and_then(without_ops_none);
+        Ok(next)
+    })
+    .await?;
+    if write.is_ok_and(|write| write.wrote) {
+        println!(
+            "  the status note no longer says \"{OPS_NONE}\": this worktree owes something now"
+        );
+    }
+    Ok(())
+}
+
+/// Whether the status record itself holds something owed: a gate or a
+/// check.
+fn record_owes(record: &WorkStatusRecord) -> bool {
+    record.blocked_on.is_some() || !record.open_checks().is_empty()
+}
+
+/// Whether the worktree owes steps outside its status: a wake still to
+/// come, or one that came due and was not closed.
+fn steps_owed(state: &Value, slug: &str) -> bool {
+    let created_at = state["slugs"][slug]["createdAt"].as_str();
+    wt_core::owes_anything(
+        None,
+        &wt_core::owed::row_watches(&wt_store::stored_watches(state), slug, created_at),
+        &wt_core::owed::row_due(&wt_store::stored_owed(state), slug, created_at),
+    )
+}
+
+/// The list, as every command that changed it ends.
+async fn print_owed(ctx: &AppContext, record: &WorktreeRecord, owed: &super::owed::RowOwed) {
+    println!(
+        "{}",
+        super::owed::owed_text(
+            &super::owed::who(ctx, record).await,
+            record.target.slug(),
+            owed,
+            super::watch::clock()
+        )
+    );
+}
+
+/// Stop owing the checks in `stages` without running them. Returns whether
+/// any was owed.
+async fn drop_checks(ctx: &AppContext, slug: &str, stages: &[VerifyStage]) -> Result<bool> {
+    let mut any = false;
+    for stage in stages.iter().copied() {
+        let (owner, by) = (slug.to_owned(), super::watch::agent());
+        let dropped = ctx
+            .database
+            .call(move |store| Ok(store.drop_check(&owner, stage, by.as_deref())?))
+            .await?;
+        match dropped {
+            Some(check) => {
+                any = true;
+                println!(
+                    "✓ {slug} no longer owes the check in {}: {}",
+                    stage.as_str(),
+                    wt_app_core::watch_view::headline(&check.steps)
+                );
+            }
+            None => println!("  {slug} owed no check in {}", stage.as_str()),
+        }
+    }
+    Ok(any)
+}
+
+/// `wt status verified` on a row that owes checks: close every check that
+/// is due, or the earliest one when none is (its agent may have confirmed
+/// the deploy itself). The status becomes verified only once no check
+/// remains. `None` when the row owes no check: the assertion is then an
+/// ordinary one.
+async fn verify_checks(
+    ctx: &AppContext,
+    record: &WorktreeRecord,
+    state: &Value,
+    note: Option<String>,
+    append: bool,
+    steps_owed: bool,
+) -> Result<Option<i32>> {
+    let slug = record.target.slug().to_owned();
+    let Some(previous) = parse_work_status(&state["slugs"][slug.as_str()]["work"])
+        .filter(|previous| !previous.open_checks().is_empty())
+    else {
+        return Ok(None);
+    };
+    if steps_owed && note.as_deref().is_some_and(|note| note.contains(OPS_NONE)) {
+        eprintln!(
+            "the note says \"{OPS_NONE}\" but this worktree owes something (`wt owed` lists it): drop \"{OPS_NONE}\" from the note, or close what is owed first"
+        );
+        return Ok(Some(2));
+    }
+    let landing =
+        wt_ops::lifecycle_ops::row_landings(ctx, std::slice::from_ref(record), state, None)
+            .await
+            .remove(&slug)
+            .unwrap_or(wt_core::Landing::NONE);
+    let merged = merge_note(previous.note.as_deref(), note.as_deref(), append, false);
+    let verified = super::owed::verified_record(record.head_sha.as_deref(), merged)?;
+    let targets = wt_store::CheckTargets::Verified {
+        landing,
+        now_ms: now_ms(),
+    };
+    let (owner, evidence) = (slug.clone(), note.clone());
+    let closed = ctx
+        .database
+        .call(move |store| {
+            Ok(store.close_checks(&owner, &targets, &verified, evidence.as_deref())?)
+        })
+        .await?;
+    let wt_store::ChecksClosed::Closed {
+        closed,
+        remaining,
+        record: written,
+        cancelled_watches,
+    } = closed
+    else {
+        // Closed by someone else since the state was read.
+        return Ok(None);
+    };
+    super::owed::print_checks_closed(&slug, &closed, &remaining, Some(&written.state), false);
+    report_cancelled_watches(&cancelled_watches);
+    if remaining.is_empty()
+        && let Some(note) = &written.note
+    {
+        println!("  note: {note}");
+    }
+    print_owed(ctx, record, &super::owed::read(ctx, record).await?).await;
+    Ok(Some(0))
 }
 
 /// Set the watch that clears the gate just written. Returns what will clear
@@ -900,7 +1198,7 @@ async fn gate_watch(
     };
     let asked_to_wake = actions.wake.is_some();
     let when = until.when.clone();
-    match super::watch::set(ctx, slug, when, actions, clock).await? {
+    match super::watch::set(ctx, slug, when, actions, false, clock).await? {
         Ok(set) => {
             until.print();
             let watch = set.watch;
@@ -948,7 +1246,7 @@ struct StatusWrite {
 
 /// A status write that changes the gate cancels the watch that was to clear
 /// it, with the wake that was to follow: say so, or the wake is lost quietly.
-fn report_cancelled_watches(cancelled: &[wt_core::watch::Watch]) {
+pub(crate) fn report_cancelled_watches(cancelled: &[wt_core::watch::Watch]) {
     for watch in cancelled {
         let wake = watch
             .then
@@ -1024,7 +1322,7 @@ fn amend_record(
     note: Option<String>,
     risk: Option<WorkRisk>,
     blocked: Option<Option<String>>,
-    verify: Option<Verify>,
+    verify: Vec<Verify>,
     append: bool,
 ) -> Result<WorkStatusRecord, String> {
     let Some(mut next) = previous else {
@@ -1041,7 +1339,7 @@ fn amend_record(
     if blocked == Some(None) && next.blocked_on.is_none() {
         return Err(format!("{slug} has no gate to clear"));
     }
-    if verify.is_some() && matches!(next.state, WorkState::Verified | WorkState::Dropped) {
+    if !verify.is_empty() && matches!(next.state, WorkState::Verified | WorkState::Dropped) {
         return Err(format!(
             "--verify-in-* does not apply to {}",
             work_state_name(next.state)
@@ -1054,10 +1352,12 @@ fn amend_record(
     if let Some(blocked) = blocked {
         next.blocked_on = blocked;
     }
-    if let Some(verify) = verify {
-        next.verify_after_merge = Some(verify.steps);
-        next.verify_in = Some(verify.stage);
-    }
+    let amended = next.clone();
+    wt_ops::status_checks::assert_checks(
+        &mut next,
+        Some(&amended),
+        verify.into_iter().map(Verify::edit),
+    );
     if next.risk.is_some_and(|r| r != WorkRisk::Low) && next.note.is_none() {
         return Err("--risk medium|high requires -m explaining uncertainty".into());
     }
@@ -1081,6 +1381,39 @@ async fn settle_removed(
     let stored: StoredWorkStatusRecord =
         serde_json::from_value(serde_json::to_value(&next)?).context("encode status record")?;
     let db_slug = slug.to_owned();
+    if work_state == WorkState::Verified {
+        // Nothing can be read of a removed row's deploys: verified closes
+        // its earliest check, and the row reads verified once none remains.
+        let evidence = next.note.clone();
+        let closed = ctx
+            .database
+            .call(move |s| {
+                Ok(s.close_removed_checks(
+                    &db_slug,
+                    &wt_store::CheckTargets::Earliest,
+                    &stored,
+                    evidence.as_deref(),
+                )?)
+            })
+            .await?;
+        return Ok(match closed {
+            wt_store::RemovedChecksClosed::Closed { closed, remaining } => {
+                super::owed::print_checks_closed(slug, &closed, &remaining, None, true);
+                if let Some(note) = &next.note {
+                    println!("  note: {note}");
+                }
+                0
+            }
+            wt_store::RemovedChecksClosed::NotOwed => {
+                eprintln!("{slug} was removed and owes no post-merge check");
+                1
+            }
+            wt_store::RemovedChecksClosed::Missing => {
+                eprintln!("{unresolved}");
+                1
+            }
+        });
+    }
     let settled = ctx
         .database
         .call(move |s| Ok(s.settle_removed_verification(&db_slug, &stored)?))
@@ -1177,7 +1510,7 @@ fn report_replaced_note(previous: Option<&str>, current: Option<&str>, append: b
 fn note_budget_hint(state: WorkState, note: Option<&str>) {
     if state == WorkState::Ready && note.is_some_and(|note| note.chars().count() > 500) {
         println!(
-            "note is long; a concise ready note is easier to review. Keep one line of outcome, then the OPS lines that apply / REVERT / IF WRONG / UNTESTED."
+            "note is long; a concise ready note is easier to review. Keep one line of outcome, then REVERT / IF WRONG / UNTESTED; what is still owed goes in the owed list, not the note."
         );
     }
 }
@@ -1186,12 +1519,7 @@ fn hints_off() -> bool {
     std::env::var("WT_NO_HINTS").is_ok_and(|value| value == "1")
 }
 
-fn print_guidance(
-    state: WorkState,
-    blocked_on: Option<&str>,
-    verify: Option<(VerifyStage, &str)>,
-    clears: Option<&str>,
-) {
+fn print_guidance(state: WorkState, blocked_on: Option<&str>, clears: Option<&str>) {
     // Not a hint: it is the one line that says the gate will clear itself.
     if let (Some(gate), Some(clears)) = (blocked_on, clears) {
         println!(
@@ -1200,20 +1528,6 @@ fn print_guidance(
     }
     if hints_off() {
         return;
-    }
-    if let Some((stage, steps)) = verify {
-        let due = match stage {
-            VerifyStage::Staging => "once this lands on the base branch",
-            VerifyStage::Production => "once this reaches production",
-        };
-        println!(
-            "{due}, the row becomes needs-testing; it stays out of `wt clean` from the merge until verified."
-        );
-        println!("owed in {}: {steps}", stage.as_str());
-        println!(
-            "first confirm the {} deploy carrying this change finished; then use `wt status verified -m <what you checked and where>`.",
-            stage.as_str()
-        );
     }
     if blocked_on.is_some() && clears.is_some() {
         return;
@@ -1243,7 +1557,7 @@ fn print_guidance(
             "the note should say what you need and what you already tried; keep working on unblocked parts"
         }
         WorkState::Ready => "leave the PR ready for the human to merge; do not merge it yourself",
-        WorkState::Verified => "deployed verification is complete; nothing is owed on this branch",
+        WorkState::Verified => "deployed verification is complete",
         WorkState::Dropped => {
             "close any open PR and explain why; leave worktree removal to the human"
         }
@@ -1320,8 +1634,12 @@ fn describe(slug: &str, record: Option<&WorkStatusRecord>, head: Option<&str>, n
     if let Some(gate) = &record.blocked_on {
         out.push_str(&format!("\n  blocked on: {gate}"));
     }
-    if let Some((stage, steps)) = record.verification() {
-        out.push_str(&format!("\n  verify in {}: {steps}", stage.as_str()));
+    for (stage, check) in record.open_checks() {
+        out.push_str(&format!(
+            "\n  verify in {}: {}",
+            stage.as_str(),
+            check.steps
+        ));
     }
     if let Some(note) = &record.note {
         out.push_str(&format!("\n  note: {note}"));
@@ -1367,8 +1685,15 @@ async fn base_tip_sha(ctx: &AppContext, branch: &str) -> Result<Option<String>> 
 }
 
 /// One live worktree's entry of `wt status --all --json`.
-async fn live_json(ctx: &AppContext, state: &Value, w: &WorktreeRecord) -> Result<Value> {
+async fn live_json(
+    ctx: &AppContext,
+    state: &Value,
+    w: &WorktreeRecord,
+    landing: wt_core::Landing,
+) -> Result<Value> {
     let slug = w.target.slug();
+    let clock = super::watch::clock();
+    let owed = super::owed::derive(state, slug, landing, clock.now_ms);
     let record = state.get("slugs").and_then(|s| s.get(slug));
     let work = record
         .and_then(|r| r.get("work"))
@@ -1396,15 +1721,17 @@ async fn live_json(ctx: &AppContext, state: &Value, w: &WorktreeRecord) -> Resul
         }
     };
     Ok(
-        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, super::watch::clock()),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
+        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
     )
 }
 
-fn removed_json(entry: wt_store::RemovedWorktree) -> Value {
+fn removed_json(entry: wt_store::RemovedWorktree, separate_production: bool) -> Value {
+    let clock = super::watch::clock();
+    let owed = super::owed::derive_removed(&entry, separate_production, clock.now_ms);
     let work_state = entry.work.as_ref().map(|work| work.state.as_str());
     let verification_owed = wt_store::verification_owed_at_removal(&entry);
     let merged = wt_store::is_merged_removal(&entry);
-    json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_in":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_ref().map(|_|work.verify_in.clone().unwrap_or_else(||"staging".into()))),"verify_after_merge":entry.work.and_then(|work|work.verify_after_merge),"verification_owed":verification_owed})
+    json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_in":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_ref().map(|_|VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),"verify_after_merge":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_deref()),"verification_owed":verification_owed,"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase)})
 }
 
 #[cfg(test)]
@@ -1530,7 +1857,7 @@ mod tests {
         };
         assert_eq!(run(&fixture.ctx, &claim).await.unwrap(), 0);
         let refused = update_status(&fixture.ctx.database, "one", |previous| {
-            amend_record("one", previous, None, None, Some(None), None, false)
+            amend_record("one", previous, None, None, Some(None), Vec::new(), false)
         })
         .await
         .unwrap();
@@ -1692,11 +2019,22 @@ mod tests {
             .unwrap();
         let one = records.iter().find(|w| w.target.slug() == "one").unwrap();
         let state = read_state(&fixture.ctx.database).await.unwrap();
-        let entry = live_json(&fixture.ctx, &state, one).await.unwrap();
+        let entry = live_json(&fixture.ctx, &state, one, wt_core::Landing::NONE)
+            .await
+            .unwrap();
         assert_eq!(entry["slug"], "one");
         assert_eq!(entry["state"], "todo");
         assert_eq!(entry["blocked_on"], "release train lands");
         assert_eq!(entry["kind"], "live");
+        // What the row owes rides along: here its gate, and no phase until
+        // its own work has landed.
+        assert_eq!(entry["owes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            (&entry["owes"][0]["kind"], &entry["owes"][0]["what"]),
+            (&json!("gate"), &json!("release train lands"))
+        );
+        assert!(entry.as_object().unwrap().contains_key("owed_phase"));
+        assert!(entry["owed_phase"].is_null());
         let missing = StatusArgs {
             positionals: vec!["absent".into()],
             json: true,
@@ -1986,7 +2324,9 @@ mod tests {
         // The row's JSON carries it.
         let state = read_state(&fixture.ctx.database).await.unwrap();
         let record = resolve_worktree(&fixture.ctx, Some("one")).await.unwrap();
-        let row = live_json(&fixture.ctx, &state, &record).await.unwrap();
+        let row = live_json(&fixture.ctx, &state, &record, wt_core::Landing::NONE)
+            .await
+            .unwrap();
         assert_eq!(row["watches"][0]["id"], set[0].id.as_str());
         assert_eq!(row["watches"][0]["when"][0]["arg"], "pr:7:production");
         assert_eq!(row["watches"][0]["then"]["unblock"], "#7 ships");
@@ -2030,6 +2370,153 @@ mod tests {
         };
         assert_eq!(run(&fixture.ctx, &unblock).await.unwrap(), 0);
         assert_eq!(watches().await, []);
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_note_restating_what_is_owed_is_refused_with_where_each_step_goes() {
+        for line in OPS_PHASE_LINES {
+            let note = format!("ships the fix. {line} run the backfill");
+            for argv in [
+                vec!["ready", "--risk", "low", "-m", note.as_str()],
+                vec!["--note-only", note.as_str()],
+            ] {
+                let Action::Error(message) = parsed(&argv) else {
+                    panic!("{line} must be refused");
+                };
+                for teaches in [
+                    line,
+                    "--blocked-on",
+                    "--verify-in-staging",
+                    "wt wake <condition> -m",
+                    "--before-release",
+                    "wt owed",
+                ] {
+                    assert!(message.contains(teaches), "{teaches}: {message}");
+                }
+            }
+        }
+        // Saying nothing is owed is a note like any other.
+        assert!(matches!(
+            parsed(&["ready", "--risk", "low", "-m", "ships the fix. OPS: none"]),
+            Action::Set { .. }
+        ));
+        // Both verify flags go together now; a stage cannot be set and
+        // dropped at once.
+        let Action::Set { verify, .. } = parsed(&[
+            "ready",
+            "--risk",
+            "low",
+            "--verify-in-staging",
+            "1. a",
+            "--verify-in-production",
+            "1. b",
+        ]) else {
+            panic!("both flags must parse");
+        };
+        assert_eq!(
+            verify.iter().map(|verify| verify.stage).collect::<Vec<_>>(),
+            [VerifyStage::Staging, VerifyStage::Production]
+        );
+        assert!(matches!(
+            parsed(&["--no-verify-in-production"]),
+            Action::Amend { unverify, .. } if unverify == [VerifyStage::Production]
+        ));
+        assert!(matches!(
+            parsed(&["verified", "-m", "ok", "--no-verify-in-staging"]),
+            Action::Error(_)
+        ));
+    }
+
+    /// The note is judged by what this command supplies. Text carried from
+    /// an earlier status is never refused: a stale "OPS: none" is dropped.
+    #[tokio::test]
+    async fn ops_none_is_refused_while_something_is_owed_and_a_carried_one_is_dropped() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let ready = |note: &str, staging: Option<&str>| StatusArgs {
+            positionals: vec!["ready".into()],
+            risk: Some("low".into()),
+            note: Some(note.into()),
+            verify_in_staging: staging.map(str::to_owned),
+            ..Default::default()
+        };
+        let work =
+            || async { read_state(&ctx.database).await.unwrap()["slugs"]["one"]["work"].clone() };
+        // Nothing owed: the claim stands.
+        assert_eq!(
+            run(ctx, &ready("ships the fix. OPS: none", None))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(work().await["note"], "ships the fix. OPS: none");
+        // Claiming it while recording a check is refused, and nothing is
+        // written.
+        assert_eq!(
+            run(ctx, &ready("again. OPS: none", Some("1. check")))
+                .await
+                .unwrap(),
+            2
+        );
+        let stored = work().await;
+        assert_eq!(stored["note"], "ships the fix. OPS: none");
+        assert_eq!(stored["checks"], json!({}));
+        // An amendment that makes the row owe something carries the note,
+        // and the claim that stopped being true goes.
+        let amend = StatusArgs {
+            verify_in_staging: Some("1. check".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &amend).await.unwrap(), 0);
+        let stored = work().await;
+        assert_eq!(stored["note"], "ships the fix.");
+        assert_eq!(stored["checks"]["staging"]["steps"], "1. check");
+        // Appending to it is judged by the appended text alone.
+        let append = |text: &str| StatusArgs {
+            note_only: Some(text.into()),
+            append: true,
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &append("REVERT: safe")).await.unwrap(), 0);
+        assert_eq!(work().await["note"], "ships the fix. REVERT: safe");
+        assert_eq!(run(ctx, &append("OPS: none")).await.unwrap(), 2);
+        assert_eq!(work().await["note"], "ships the fix. REVERT: safe");
+
+        // A wake is owed too: setting one drops the claim from the note.
+        let drop = StatusArgs {
+            no_verify_in_staging: true,
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &drop).await.unwrap(), 0);
+        assert_eq!(
+            run(ctx, &ready("ships the fix. OPS: none", None))
+                .await
+                .unwrap(),
+            0
+        );
+        let wake = super::super::watch::WakeArgs {
+            conditions: vec!["3h".into()],
+            message: Some("rerun the renewal check".into()),
+            slug: None,
+            before_release: true,
+        };
+        assert_eq!(super::super::watch::run_wake(ctx, &wake).await.unwrap(), 0);
+        assert_eq!(work().await["note"], "ships the fix.");
+        let watches = ctx
+            .database
+            .call(|store| Ok(store.list_watches(Some("one"))?))
+            .await
+            .unwrap();
+        assert!(watches[0].before_release());
+        // And with the wake pending, the claim is refused again.
+        assert_eq!(
+            run(ctx, &ready("ships the fix. OPS: none", None))
+                .await
+                .unwrap(),
+            2
+        );
         fixture.close().await.unwrap();
     }
 }

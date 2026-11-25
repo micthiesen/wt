@@ -120,7 +120,10 @@ fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
     )
     .with_deploys(row.git.deploys);
     let session_state = asking.then_some(DerivedState::Asking);
-    let effective = wt_core::effective_work_state(record, session_state, landing);
+    let effective = wt_core::effective_work_state_at(record, session_state, landing, now_ms);
+    // A landed check waiting on promotion has nothing for anyone to do yet.
+    let check_waiting = wt_core::owes_post_merge_verification(record, landed)
+        && !wt_core::verification_due_at(record, landing, now_ms);
     let Some(mut work) = row
         .work
         .clone()
@@ -141,13 +144,7 @@ fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
         .and_then(|record| record.sha.as_deref())
         .zip(row.git.head_sha.as_deref())
         .map(|(recorded, head)| recorded != head);
-    work.verification_owed = wt_core::owes_post_merge_verification(record, landed);
-    work.verification_waiting =
-        work.verification_owed && !wt_core::verification_due(record, landing);
-    work.verification_awaiting_deploy = wt_core::verification_awaiting_deploy(record, landing);
-    work.verification_overdue = wt_core::verification_overdue(record, landing, now_ms);
-    // A landed check waiting on promotion has nothing for anyone to do yet.
-    row.needs_attention |= !work.verification_waiting
+    row.needs_attention |= !check_waiting
         && matches!(
             work.effective_state,
             Some(
@@ -654,8 +651,6 @@ mod tests {
         assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
         assert!(work.derived);
         assert_eq!(work.stale, Some(true));
-        assert!(work.verification_owed);
-        assert!(work.verification_overdue);
         assert_eq!(work.record.as_ref().unwrap().risk, Some(WorkRisk::High));
         assert_eq!(
             work.record.as_ref().unwrap().note.as_deref(),
@@ -689,7 +684,6 @@ mod tests {
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::Ready));
         assert!(work.blocked);
-        assert!(!work.verification_owed);
         assert_eq!(work.stale, Some(false));
     }
 
@@ -721,21 +715,18 @@ mod tests {
             row.work.as_ref().unwrap().effective_state,
             Some(WorkState::Ready)
         );
-        assert!(!row.work.as_ref().unwrap().verification_owed);
         row.pr.as_mut().unwrap().head_sha = Some("current".into());
         prepare_work(&mut row, false, 1_800_000_000_000);
         assert_eq!(
             row.work.as_ref().unwrap().effective_state,
             Some(WorkState::Ready)
         );
-        assert!(!row.work.as_ref().unwrap().verification_owed);
         row.git.landed_on = Some(wt_tui::LandingKind::Base);
         prepare_work(&mut row, false, 1_800_000_000_000);
         assert_eq!(
             row.work.as_ref().unwrap().effective_state,
             Some(WorkState::NeedsTesting)
         );
-        assert!(row.work.as_ref().unwrap().verification_owed);
     }
 
     #[test]
@@ -760,14 +751,11 @@ mod tests {
         prepare_work(&mut row, true, 1_800_000_000_000);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::Ready));
-        assert!(work.verification_owed && work.verification_waiting);
-        assert!(!work.verification_overdue);
         assert!(!row.needs_attention);
         row.git.landed_on = Some(wt_tui::LandingKind::Production);
         prepare_work(&mut row, true, 1_800_000_000_000);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
-        assert!(!work.verification_waiting);
         assert!(row.needs_attention);
     }
 
@@ -799,24 +787,12 @@ mod tests {
         prepare_work(&mut row, false, now);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::Ready));
-        assert!(work.verification_owed && work.verification_waiting);
-        assert_eq!(
-            work.verification_awaiting_deploy,
-            Some(wt_core::VerifyStage::Staging)
-        );
-        assert!(!work.verification_overdue);
         assert!(!row.needs_attention);
-        // A probe that never answers must not hide a check owed for days.
-        prepare_work(&mut row, false, now + 3 * 86_400_000);
-        let work = row.work.as_ref().unwrap();
-        assert!(work.verification_waiting && work.verification_overdue);
 
         row.git.deploys.staging = Some(true);
         prepare_work(&mut row, false, now);
         let work = row.work.as_ref().unwrap();
         assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
-        assert!(!work.verification_waiting);
-        assert_eq!(work.verification_awaiting_deploy, None);
         assert!(row.needs_attention);
         // Without a probe the Git landing alone makes it due, as before.
         row.git.deploys.staging = None;

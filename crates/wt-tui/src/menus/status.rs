@@ -53,9 +53,9 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
                 wt_core::VerifyStage::Production,
             ] {
                 // Steps prefill only into their own stage's row.
-                let steps = verification
-                    .filter(|(current, _)| *current == stage)
-                    .map(|(_, steps)| steps.to_owned());
+                let steps = record
+                    .and_then(|record| record.open_check(stage))
+                    .map(|check| wt_core::sanitize_terminal_text(&check.steps));
                 options.push(PickerOption {
                     value: Some("ready".into()),
                     label: format!("ready + verify in {}", stage.as_str()),

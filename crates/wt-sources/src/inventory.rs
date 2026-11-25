@@ -112,10 +112,6 @@ pub fn board(
                         url: guide.url,
                     }
                 }),
-            verify_steps: work
-                .as_ref()
-                .and_then(|work| work.verify_after_merge.as_deref())
-                .map(clean_text),
             // The work overlay owns the status contribution: only it knows
             // whether a landed row's owed check is due or still waiting.
             needs_attention: false,
@@ -231,6 +227,7 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
             .reviewers
             .then(|| config.github.default_reviewer.clone())
             .flatten(),
+        owed_sections: config.ui.owed_sections,
         guides: config.guides.enabled,
         staging_probe: config
             .environments

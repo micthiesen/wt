@@ -113,6 +113,26 @@ impl<'a> Known<'a> {
 pub(crate) fn collapse(events: &[WorktreeEvent]) -> Vec<Entry<'_>> {
     let mut standing = None;
     let mut known: Vec<Known<'_>> = Vec::new();
+    // A wake delivered after its worktree landed records that the step came
+    // due where another wake records "woken"; either line says it held.
+    let came_due = |held: &WorktreeEvent| {
+        let Kind::Watch {
+            id: Some(held_id),
+            change: wt_core::WatchChange::Held,
+            ..
+        } = &held.event
+        else {
+            return false;
+        };
+        events.iter().any(|event| {
+            event.at_ms >= held.at_ms
+                && matches!(
+                    &event.event,
+                    Kind::Owed { id: Some(id), change: wt_core::OwedChange::Due, .. }
+                        if id == held_id
+                )
+        })
+    };
     for line in wt_core::fold_watch_history(events) {
         let prev = standing;
         // A status folded into a watch's line still stands.
@@ -124,6 +144,7 @@ pub(crate) fn collapse(events: &[WorktreeEvent]) -> Vec<Entry<'_>> {
             }
         }
         match line {
+            wt_core::HistoryLine::Event(event) if came_due(event) => {}
             wt_core::HistoryLine::Event(event) if event.event != Kind::Unknown => {
                 known.push(Known {
                     at_ms: event.at_ms,
@@ -459,9 +480,46 @@ fn show_event(
             body = Some(format!("\"{text}\""));
             "message".to_owned()
         }
-        owed @ Kind::Owed { by, .. } => {
+        Kind::Owed {
+            id,
+            change,
+            what,
+            evidence,
+            by,
+            stage,
+            when,
+            unconfirmed,
+        } => {
+            use wt_core::OwedChange as Change;
+            // One line: the first line of what was owed, a check named by
+            // its stage. The evidence follows dimly.
+            let what = wt_core::watch::headline(what);
+            let what = match stage {
+                Some(stage) => format!("{stage} check: {what}"),
+                None => what,
+            };
+            let headline = match (change, when) {
+                (Change::Due, _) => {
+                    meta.extend(
+                        id.as_deref()
+                            .or(stage.as_deref())
+                            .map(|target| format!("wt done {target}")),
+                    );
+                    if *unconfirmed {
+                        meta.push("wake sent, delivery not confirmed".to_owned());
+                    }
+                    format!("due: {what}")
+                }
+                (Change::Done, _) => format!("done: {what}"),
+                (Change::Again, Some(when)) => format!("again {when}: {what}"),
+                (Change::Again, None) => format!("again: {what}"),
+                (Change::Dropped, _) => format!("dropped: {what}"),
+            };
+            if matches!(change, Change::Done | Change::Dropped) {
+                meta.extend(evidence.as_deref().map(wt_core::watch::headline));
+            }
             meta.extend(named(by));
-            wt_core::owed_sentence(owed).unwrap_or_default()
+            headline
         }
         Kind::Skill { name, args, by } => {
             meta.extend(args.clone());
@@ -1350,6 +1408,111 @@ mod tests {
         assert_eq!(
             said(&instant[..2]),
             ["will tell you  when merged", "held  merged"]
+        );
+    }
+
+    #[test]
+    fn what_a_row_owes_is_one_line_a_change_with_the_evidence_dim() {
+        use wt_core::{OwedChange, WatchChange};
+        let owed = |change, id: Option<&str>, stage: Option<&str>| Kind::Owed {
+            id: id.map(str::to_owned),
+            change,
+            what: "confirm prod logs\nthen open the PR".into(),
+            evidence: None,
+            by: Some("fix-login".into()),
+            stage: stage.map(str::to_owned),
+            when: None,
+            unconfirmed: false,
+        };
+        let line = |event: Kind| {
+            let shown = show_event(&event, None, &DisplayPolicy::default(), "fix-login").unwrap();
+            (
+                format!("{}  {}", shown.headline, shown.meta.join(" · ")),
+                (shown.badge.glyph, shown.badge.color),
+                shown.body,
+            )
+        };
+        assert_eq!(
+            line(owed(OwedChange::Due, Some("93co6q"), None)),
+            (
+                "due: confirm prod logs  wt done 93co6q".to_owned(),
+                (crate::glyphs::DOT, theme::WARN),
+                None
+            )
+        );
+        let mut unsure = owed(OwedChange::Due, None, Some("staging"));
+        if let Kind::Owed { unconfirmed, .. } = &mut unsure {
+            *unconfirmed = true;
+        }
+        assert_eq!(
+            line(unsure).0,
+            "due: staging check: confirm prod logs  wt done staging · wake sent, delivery not confirmed"
+        );
+        // Done: the evidence is metadata, dim beside the headline.
+        let mut done = owed(OwedChange::Done, Some("93co6q"), None);
+        if let Kind::Owed { evidence, by, .. } = &mut done {
+            *evidence = Some("logs clean for 1h".into());
+            *by = Some("manager".into());
+        }
+        assert_eq!(
+            line(done.clone()),
+            (
+                "done: confirm prod logs  logs clean for 1h · by manager".to_owned(),
+                (crate::glyphs::TASK_COMPLETE, theme::OK),
+                None
+            )
+        );
+        let drawn = entry_line(
+            "now",
+            show_event(&done, None, &DisplayPolicy::default(), "fix-login").unwrap(),
+        );
+        let evidence = drawn
+            .spans
+            .iter()
+            .find(|span| span.content.contains("logs clean"))
+            .unwrap();
+        assert_eq!(evidence.style.fg, Some(theme::FG_DIM));
+        let mut again = owed(OwedChange::Again, Some("93co6q"), None);
+        if let Kind::Owed { when, .. } = &mut again {
+            *when = Some("at 17:00".into());
+        }
+        assert_eq!(
+            line(again),
+            (
+                "again at 17:00: confirm prod logs  ".to_owned(),
+                (crate::glyphs::DOT_OUTLINE, badges::WAITING),
+                None
+            )
+        );
+        assert_eq!(
+            line(owed(OwedChange::Dropped, None, Some("production"))),
+            (
+                "dropped: production check: confirm prod logs  ".to_owned(),
+                (crate::glyphs::TASK_CANCELLED, theme::FG_DIM),
+                None
+            )
+        );
+        // A wake delivered after landing: "due" says that it held.
+        let held = |id: &str| Kind::Watch {
+            id: Some(id.into()),
+            change: WatchChange::Held,
+            what: "in production".into(),
+            by: None,
+            reason: None,
+            then: Vec::new(),
+            unconfirmed: false,
+        };
+        let events = [
+            at(0, held("93co6q")),
+            at(1, owed(OwedChange::Due, Some("93co6q"), None)),
+            at(2, held("other1")),
+        ];
+        assert_eq!(
+            said(&events),
+            [
+                "due: confirm prod logs  wt done 93co6q",
+                "held  in production"
+            ]
         );
     }
 

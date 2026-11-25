@@ -2126,14 +2126,27 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
         "ready but gated on an external prerequisite",
         "blocked gate",
     ));
-    work_items.push(glyph_item(
-        presented(WorkPresentation {
-            verification_overdue: true,
-            ..Default::default()
-        }),
-        "post-merge verification overdue",
-        "verify after merge",
-    ));
+    for (phase, overdue, label) in [
+        (
+            wt_core::OwedPhase::Due,
+            false,
+            "landed · something it owes is due (wt owed, wt done)",
+        ),
+        (
+            wt_core::OwedPhase::Waiting,
+            false,
+            "landed · what it owes is not due yet",
+        ),
+        (
+            wt_core::OwedPhase::Due,
+            true,
+            "landed · a check it owes is overdue",
+        ),
+    ] {
+        if let Some(badge) = badges::owed_phase_badge(phase, overdue) {
+            work_items.push(glyph_item(badge, label, "owed owes verify"));
+        }
+    }
 
     let row = |edit: &dyn Fn(&mut BoardRow)| {
         let mut row = BoardRow {
@@ -2318,12 +2331,51 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
         ),
         glyph_item(badges::REMOTE_HOST, "hosted on an SSH remote", "remote"),
     ]);
+    let owing = |due: bool, overdue: bool, unreadable: bool| {
+        let mut item = crate::OwedView::new(
+            wt_core::OwedKind::Step,
+            if due {
+                wt_core::OwedState::Due
+            } else {
+                wt_core::OwedState::Waiting
+            },
+            "",
+        );
+        item.overdue = overdue;
+        if unreadable {
+            item.conditions = vec![crate::WatchConditionView {
+                state: crate::WatchTruth::Unknown,
+                ..Default::default()
+            }];
+        }
+        badges::owes_badge(&[item]).map(|(badge, _)| badge)
+    };
+    for (badge, label) in [
+        (
+            owing(true, false, false),
+            "owes something that is due; a count when several are (wt owed, wt done)",
+        ),
+        (owing(true, true, false), "an owed check is overdue"),
+        (
+            owing(false, false, false),
+            "owes something that is not due yet: a check, a wake, a gate that clears itself",
+        ),
+        (
+            owing(false, false, true),
+            "owes something that waits on what wt cannot read right now",
+        ),
+    ] {
+        if let Some(badge) = badge {
+            row_items.push(glyph_item(badge, label, "owed owes watch wake verify"));
+        }
+    }
     let waiting = |state: crate::WatchTruth, met: bool| {
         badges::watch_badge(&[crate::WatchView {
             conditions: vec![crate::WatchConditionView {
                 state,
                 ..Default::default()
             }],
+            actions: vec![crate::WatchActionKind::Notify],
             met,
             ..Default::default()
         }])
@@ -2331,19 +2383,19 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
     for (badge, label) in [
         (
             waiting(crate::WatchTruth::NotYet, false),
-            "wt is waiting: it will clear the gate, wake the session or tell you (W, wt wake / notify)",
+            "wt will tell you when something holds (W, wt notify)",
         ),
         (
             waiting(crate::WatchTruth::Unknown, false),
-            "waiting on something wt cannot read right now",
+            "it waits on something wt cannot read right now",
         ),
         (
             waiting(crate::WatchTruth::Holds, true),
-            "what it waited for held; wt is acting on it",
+            "what it waited for held; wt is telling you",
         ),
     ] {
         if let Some(badge) = badge {
-            row_items.push(glyph_item(badge, label, "watch notify wake bell"));
+            row_items.push(glyph_item(badge, label, "watch notify bell"));
         }
     }
     // Facts only the history timeline draws; the rest of its glyphs are the
@@ -2917,10 +2969,10 @@ mod tests {
             interaction: Interaction::Log {
                 title: "Clean worktrees".into(),
                 lines: vec![
-                    "Nothing safe to clean in the background results.".into(),
+                    "Nothing is ready to clean.".into(),
                     String::new(),
                     "Keeping · 1".into(),
-                    "MaxBook: Keep auth-proxy: post-merge verification still owed before cleanup"
+                    "MaxBook: Keep auth-proxy: still owes: check: open /health and confirm the worker"
                         .into(),
                 ],
                 scroll: 0,
@@ -2931,8 +2983,8 @@ mod tests {
         let screen = rows(&buffer).join("\n");
         let (x, y) = find(&buffer, "auth-proxy · MaxBook").expect(&screen);
         assert_eq!(buffer[(x, y)].fg, theme::FG_DIM);
-        let (reason_x, reason_y) = find(&buffer, "post-merge verification").expect(&screen);
-        find(&buffer, "before cleanup").expect(&screen);
+        let (reason_x, reason_y) = find(&buffer, "still owes").expect(&screen);
+        find(&buffer, "worker").expect(&screen);
         assert_ne!(buffer[(reason_x, reason_y + 1)].symbol(), " ");
         assert_eq!(buffer[(reason_x - 1, reason_y + 1)].symbol(), " ");
         assert!(reason_x > x);

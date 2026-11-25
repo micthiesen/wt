@@ -72,5 +72,13 @@ pub(crate) const SEND: &str = "\u{F1D8}"; // paper plane: a message to the agent
 pub(crate) const SKILL: &str = "\u{F120}"; // terminal prompt: a skill or slash command ran
 pub(crate) const NOTE: &str = "\u{F249}"; // sticky note: a mark someone added
 
+// What a row owes, in the details pane. Base-font shapes: they center on
+// the line like the note rail beneath them, unlike the Nerd Font dots.
+pub(crate) const OWED_DUE: &str = "●";
+pub(crate) const OWED_WAITING: &str = "○";
+pub(crate) const OWED_UNKNOWN: &str = "?";
+pub(crate) const OWED_CLOCK: &str = "◷"; // a landed row with nothing due yet
+pub(crate) const OWED_DONE: &str = "✓"; // a landed row that owes nothing
+
 /// Pause marker for automation state. Plain Unicode, renders everywhere.
 pub(crate) const PAUSE: &str = "⏸";

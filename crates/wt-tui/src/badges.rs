@@ -21,8 +21,8 @@ use wt_core::{
 };
 
 use crate::{
-    BoardRow, CheckState, DisplayPolicy, LandingKind, PrPresentation, ReviewState, SessionView,
-    WatchTruth, WatchView, WorkPresentation, glyphs, theme,
+    BoardRow, CheckState, DisplayPolicy, LandingKind, OwedView, PrPresentation, ReviewState,
+    SessionView, WatchTruth, WatchView, WorkPresentation, glyphs, theme,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,10 +69,9 @@ pub(crate) fn risk_color(risk: WorkRisk) -> Color {
 }
 
 /// The work-status dot. Unasserted rows get the same hollow dim dot as
-/// `todo`, because a blank slot reads as a rendering gap. An overdue
-/// post-merge verification goes red; a gated `ready` wears a warn
-/// circle-slash so a blocked branch never sits green in the merge band; a
-/// stale record hollows the dot but keeps its hue.
+/// `todo`, because a blank slot reads as a rendering gap. A gated `ready`
+/// wears a warn circle-slash so a blocked branch never sits green in the
+/// merge band; a stale record hollows the dot but keeps its hue.
 pub(crate) fn work_status_badge(work: Option<&WorkPresentation>) -> Badge {
     let Some(work) = work else {
         return badge(glyphs::DOT_OUTLINE, theme::FG_DIM);
@@ -80,9 +79,6 @@ pub(crate) fn work_status_badge(work: Option<&WorkPresentation>) -> Badge {
     let Some(state) = work.effective_state else {
         return badge(glyphs::DOT_OUTLINE, theme::FG_DIM);
     };
-    if work.verification_overdue {
-        return badge(glyphs::DOT, theme::ERR);
-    }
     if work.blocked {
         return badge(glyphs::SLASH, theme::WARN);
     }
@@ -182,24 +178,33 @@ pub(crate) fn status_verb(row: &BoardRow) -> (Badge, String) {
     (badge(glyphs::CLEAN, theme::FG_DIM), "clean".into())
 }
 
+/// The dot of a landed row that still owes something: warn while
+/// something is due, red once anything is overdue, dim while everything it
+/// owes waits. `None` for a row that owes nothing, which wears the merge
+/// glyph.
+pub(crate) fn owed_phase_badge(phase: wt_core::OwedPhase, overdue: bool) -> Option<Badge> {
+    match phase {
+        wt_core::OwedPhase::Done => None,
+        _ if overdue => Some(badge(glyphs::DOT, theme::ERR)),
+        wt_core::OwedPhase::Due => Some(badge(glyphs::DOT, theme::WARN)),
+        wt_core::OwedPhase::Waiting => Some(badge(glyphs::DOT, theme::FG_DIM)),
+    }
+}
+
 /// Leftmost glyph of a worktree row. With a production branch configured,
 /// release position owns the shape and work status owns the color. Without
-/// one, the loud mechanical states keep the slot unless a post-merge
-/// verification is owed, which only the work dot can say.
+/// one, the loud mechanical states keep the slot. A landed row follows
+/// where it stands with what it owes instead of its asserted state.
 pub(crate) fn marker(row: &BoardRow, policy: &DisplayPolicy) -> Badge {
     let work = work_status_badge(row.work.as_ref());
-    let owes = row.work.as_ref().is_some_and(|work| work.verification_owed);
+    let owed = row
+        .owed_phase
+        .and_then(|phase| owed_phase_badge(phase, row.owes.iter().any(|item| item.overdue)));
+    let color = owed.map_or(work.color, |owed| owed.color);
     let base = match (row.git.landed_on, policy.production) {
-        (Some(LandingKind::Production), true) => Badge {
-            glyph: glyphs::PRODUCTION,
-            ..work
-        },
-        (Some(LandingKind::Base), true) => Badge {
-            glyph: glyphs::MERGE,
-            ..work
-        },
-        _ if !owes => loud_status_badge(row).unwrap_or(work),
-        _ => work,
+        (Some(LandingKind::Production), true) => badge(glyphs::PRODUCTION, color),
+        (Some(LandingKind::Base), true) => badge(glyphs::MERGE, color),
+        _ => owed.unwrap_or_else(|| loud_status_badge(row).unwrap_or(work)),
     };
     if row.archived {
         Badge {
@@ -582,15 +587,13 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
                 | wt_core::WatchChange::Notified => theme::OK,
             },
         ),
-        Event::Owed { change, .. } => badge(
-            glyphs::WATCH,
-            match change {
-                wt_core::OwedChange::Due => theme::WARN,
-                wt_core::OwedChange::Done => theme::OK,
-                wt_core::OwedChange::Again => WAITING,
-                wt_core::OwedChange::Dropped => theme::FG_DIM,
-            },
-        ),
+        // The dots of the owed list: due, closed, waiting again, let go.
+        Event::Owed { change, .. } => match change {
+            wt_core::OwedChange::Due => badge(glyphs::DOT, theme::WARN),
+            wt_core::OwedChange::Done => badge(glyphs::TASK_COMPLETE, theme::OK),
+            wt_core::OwedChange::Again => badge(glyphs::DOT_OUTLINE, WAITING),
+            wt_core::OwedChange::Dropped => badge(glyphs::TASK_CANCELLED, theme::FG_DIM),
+        },
         Event::Unknown => return None,
     })
 }
@@ -599,29 +602,64 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
 /// asks for a person, and the same teal a polling session wears.
 pub(crate) const WAITING: Color = theme::TEAL;
 
-/// The bell a row wears while wt will act for it later: clear its gate,
-/// wake its session or tell the person. Teal while waiting; warn when a
-/// condition cannot be read, since such a watch may never fire; green once
-/// every condition held and delivery is under way, which it is not while
-/// automations are paused.
+/// The bell a row wears while wt will tell the person something later.
+/// Only watches that tell the person count: what the row itself waits for
+/// is in its owed list. Teal while waiting; warn when a condition cannot be
+/// read, since such a watch may never fire; green once every condition held
+/// and delivery is under way, which it is not while automations are paused.
 pub(crate) fn watch_badge(watches: &[WatchView]) -> Option<Badge> {
-    if watches.is_empty() {
-        return None;
-    }
+    let mut telling = watches
+        .iter()
+        .filter(|watch| watch.does(crate::WatchActionKind::Notify))
+        .peekable();
+    telling.peek()?;
     let unreadable = |watch: &WatchView| {
         watch
             .conditions
             .iter()
             .any(|cond| cond.state == WatchTruth::Unknown)
     };
-    let color = if watches.iter().any(|watch| !watch.met && unreadable(watch)) {
+    let (mut unknown, mut delivering) = (false, true);
+    for watch in telling {
+        unknown |= !watch.met && unreadable(watch);
+        delivering &= watch.met && !watch.held;
+    }
+    let color = if unknown {
         theme::WARN
-    } else if watches.iter().all(|watch| watch.met && !watch.held) {
+    } else if delivering {
         theme::OK
     } else {
         WAITING
     };
     Some(badge(glyphs::WATCH, color))
+}
+
+/// The one mark for what a row owes, and how many items are due: a filled
+/// dot while something is due (red when anything is overdue), a hollow dim
+/// dot while everything waits, warn when a condition it waits for cannot be
+/// read. A gate only a person clears is the marker's slash already and
+/// wears no mark here.
+pub(crate) fn owes_badge(owes: &[OwedView]) -> Option<(Badge, usize)> {
+    let overdue = owes.iter().any(|item| item.overdue);
+    let due = owes.iter().filter(|item| item.due()).count();
+    if due > 0 {
+        let color = if overdue { theme::ERR } else { theme::WARN };
+        return Some((badge(glyphs::DOT, color), due));
+    }
+    if !owes
+        .iter()
+        .any(|item| item.holds_cleanup() || !item.conditions.is_empty())
+    {
+        return None;
+    }
+    let color = if overdue {
+        theme::ERR
+    } else if owes.iter().any(OwedView::unreadable) {
+        theme::WARN
+    } else {
+        theme::FG_DIM
+    };
+    Some((badge(glyphs::DOT_OUTLINE, color), 0))
 }
 
 fn shows(policy: &DisplayPolicy, slot: &str) -> bool {
@@ -650,10 +688,26 @@ pub(crate) fn cluster(row: &BoardRow, policy: &DisplayPolicy) -> Vec<ClusterSlot
         });
     };
     let session = row_session_activity(row, policy);
-    if shows(policy, "watch")
-        && let Some(watch) = watch_badge(&row.watches)
-    {
-        push(watch.glyph, dim.unwrap_or(watch.color), 2);
+    if shows(policy, "watch") {
+        match owes_badge(&row.owes) {
+            Some((mark, due)) if due > 1 => {
+                let count = if due >= 10 {
+                    "+".to_owned()
+                } else {
+                    due.to_string()
+                };
+                push(
+                    &format!("{} {count}", mark.glyph),
+                    dim.unwrap_or(mark.color),
+                    4,
+                );
+            }
+            Some((mark, _)) => push(mark.glyph, dim.unwrap_or(mark.color), 2),
+            None => {}
+        }
+        if let Some(watch) = watch_badge(&row.watches) {
+            push(watch.glyph, dim.unwrap_or(watch.color), 2);
+        }
     }
     if row.action_running && shows(policy, "action") {
         push(glyphs::COMMENT, theme::OK, 2);
@@ -882,15 +936,6 @@ mod tests {
             work_status_badge(Some(&gated)),
             badge(glyphs::SLASH, theme::WARN)
         );
-        let overdue = WorkPresentation {
-            verification_overdue: true,
-            blocked: true,
-            ..work(WorkState::Ready)
-        };
-        assert_eq!(
-            work_status_badge(Some(&overdue)),
-            badge(glyphs::DOT, theme::ERR)
-        );
         assert_eq!(
             work_status_badge(Some(&work(WorkState::Verified))).glyph,
             glyphs::MERGE
@@ -898,14 +943,17 @@ mod tests {
     }
 
     #[test]
-    fn marker_prefers_loud_git_state_unless_verification_is_owed() {
+    fn a_landed_rows_marker_follows_what_it_owes_and_loud_git_state_otherwise() {
+        use wt_core::{OwedKind, OwedPhase, OwedState};
         let policy = DisplayPolicy::default();
         let mut landed = row();
         landed.git.landed_on = Some(LandingKind::Base);
         landed.work = Some(work(WorkState::Ready));
+        landed.owed_phase = Some(OwedPhase::Done);
         assert_eq!(marker(&landed, &policy), badge(glyphs::MERGE, theme::OK));
-        landed.work.as_mut().unwrap().verification_owed = true;
-        landed.work.as_mut().unwrap().effective_state = Some(WorkState::NeedsTesting);
+        // Something due keeps the dot, in warn, whatever state was asserted.
+        landed.owes = vec![OwedView::new(OwedKind::Step, OwedState::Due, "confirm")];
+        landed.owed_phase = Some(OwedPhase::Due);
         assert_eq!(marker(&landed, &policy), badge(glyphs::DOT, theme::WARN));
         let production = DisplayPolicy {
             production: true,
@@ -916,6 +964,14 @@ mod tests {
             marker(&landed, &production),
             badge(glyphs::PRODUCTION, theme::WARN)
         );
+        // Everything it owes still waits: the dot recedes.
+        landed.owes = vec![OwedView::new(OwedKind::Check, OwedState::Waiting, "check")];
+        landed.owed_phase = Some(OwedPhase::Waiting);
+        assert_eq!(marker(&landed, &policy), badge(glyphs::DOT, theme::FG_DIM));
+        // Overdue is one state: red, even while its deploy is awaited.
+        landed.owes[0].overdue = true;
+        landed.owes[0].awaiting_deploy = true;
+        assert_eq!(marker(&landed, &policy), badge(glyphs::DOT, theme::ERR));
         let mut busy = row();
         busy.busy = Some(crate::BusyView {
             op: "remove".into(),
@@ -1029,6 +1085,63 @@ mod tests {
             met,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_watch_slot_wears_one_owes_mark_and_the_bell_only_for_notifications() {
+        use wt_core::{OwedKind, OwedState};
+        let policy = DisplayPolicy::default();
+        let shown = |row: &BoardRow| -> Vec<(String, Color)> {
+            cluster(row, &policy)
+                .iter()
+                .map(|slot| (slot.text.clone(), slot.color))
+                .collect()
+        };
+        let mut row = row();
+        // A gate only a person clears is the marker's slash already.
+        row.owes = vec![OwedView::new(OwedKind::Gate, OwedState::Waiting, "QA")];
+        assert!(shown(&row).is_empty());
+        // A wake is owed, not a notification: the hollow dot, no bell.
+        let mut step = OwedView::new(OwedKind::Step, OwedState::Waiting, "rerun");
+        step.id = Some("wake33".into());
+        row.owes.push(step.clone());
+        row.watches = vec![WatchView {
+            id: "wake33".into(),
+            actions: vec![crate::WatchActionKind::Wake],
+            ..Default::default()
+        }];
+        assert_eq!(
+            shown(&row),
+            [(glyphs::DOT_OUTLINE.to_owned(), theme::FG_DIM)]
+        );
+        // What it waits for cannot be read: it may never come due.
+        row.owes[1].conditions = vec![crate::WatchConditionView {
+            state: WatchTruth::Unknown,
+            ..Default::default()
+        }];
+        assert_eq!(shown(&row)[0].1, theme::WARN);
+        // One thing due is a dot; several are counted; overdue is red.
+        row.owes = vec![OwedView::new(OwedKind::Step, OwedState::Due, "confirm")];
+        assert_eq!(shown(&row), [(glyphs::DOT.to_owned(), theme::WARN)]);
+        row.owes
+            .push(OwedView::new(OwedKind::Check, OwedState::Due, "check"));
+        row.owes.push(step);
+        assert_eq!(shown(&row), [(format!("{} 2", glyphs::DOT), theme::WARN)]);
+        row.owes[1].overdue = true;
+        assert_eq!(shown(&row)[0].1, theme::ERR);
+        // A notification rides beside the mark, and both hide together.
+        row.watches.push(waiting(WatchTruth::NotYet, false));
+        assert_eq!(
+            shown(&row)[1],
+            (glyphs::WATCH.to_owned(), WAITING),
+            "{:?}",
+            shown(&row)
+        );
+        let hidden = DisplayPolicy {
+            hidden_badges: vec!["watch".into()],
+            ..Default::default()
+        };
+        assert!(cluster(&row, &hidden).is_empty());
     }
 
     #[test]

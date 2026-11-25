@@ -76,6 +76,13 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
         let pushes = collect_push_facts(ctx, &live, &state).await?;
         let dev = collect_dev_status(ctx, &live).await?;
+        let records = live
+            .iter()
+            .map(|snapshot| snapshot.worktree.clone())
+            .collect::<Vec<_>>();
+        // Local evidence only: this listing reads no PR data.
+        let landings = wt_ops::lifecycle_ops::row_landings(ctx, &records, &state, None).await;
+        let separate_production = ctx.config.branch.separate_production();
         let mut rows = live
             .iter()
             .map(|snapshot| {
@@ -90,10 +97,18 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
                         lock: locks.get(slug).and_then(|lock| lock.as_ref()),
                         dev: dev.get(slug).and_then(|row| row.status.as_ref()),
                         dev_error: dev.get(slug).and_then(|row| row.error.as_deref()),
+                        landing: landings
+                            .get(slug)
+                            .copied()
+                            .unwrap_or(wt_core::Landing::NONE),
                     },
                 )
             })
-            .chain(removed.iter().map(removed_json))
+            .chain(
+                removed
+                    .iter()
+                    .map(|entry| removed_json(entry, separate_production)),
+            )
             .collect::<Vec<_>>();
         if args.all {
             for row in &mut rows {
@@ -394,6 +409,8 @@ struct LiveFacts<'a> {
     lock: Option<&'a OperationLock>,
     dev: Option<&'a DevServerStatus>,
     dev_error: Option<&'a str>,
+    /// What this process can prove of the row's landing, for what it owes.
+    landing: wt_core::Landing,
 }
 
 fn live_json(
@@ -408,8 +425,11 @@ fn live_json(
         lock,
         dev,
         dev_error,
+        landing,
     } = facts;
     let target = &snapshot.worktree.target;
+    let clock = super::watch::clock();
+    let owed = super::owed::derive(state, target.slug(), landing, clock.now_ms);
     let entry = state
         .get("slugs")
         .and_then(|slugs| slugs.get(target.slug()));
@@ -467,8 +487,10 @@ fn live_json(
         "work_risk": work.as_ref().and_then(|work| work.risk.as_deref()),
         "work_blocked_on": work.as_ref().and_then(|work| work.blocked_on.as_deref()),
         "work_verify_after_merge": work.as_ref().and_then(|work| work.verify_after_merge.as_deref()),
-        "work_verify_in": work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| work.verify_in.as_deref().unwrap_or("staging"))),
+        "work_verify_in": work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| wt_core::VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),
         "work_at": work.as_ref().map(|work| work.at.as_str()),
+        "owes": super::owed::owes_json(&owed.items, clock),
+        "owed_phase": super::owed::phase_json(owed.phase),
         "inventory_error": snapshot.error,
     })
 }
@@ -488,7 +510,9 @@ fn issue_url(ctx: &AppContext, id: &str, remote_url: Option<&str>) -> Option<Str
     )
 }
 
-fn removed_json(entry: &RemovedWorktree) -> Value {
+fn removed_json(entry: &RemovedWorktree, separate_production: bool) -> Value {
+    let clock = super::watch::clock();
+    let owed = super::owed::derive_removed(entry, separate_production, clock.now_ms);
     let work = entry.work.as_ref();
     let verify = work.and_then(|work| work.verify_after_merge.as_deref());
     let verification_owed = wt_store::verification_owed_at_removal(entry);
@@ -502,8 +526,10 @@ fn removed_json(entry: &RemovedWorktree) -> Value {
         "archived_at": entry.removed_at,
         "work_state": work.map(|work| work.state.as_str()),
         "verify_after_merge": verify,
-        "verify_in": work.and_then(|work| work.verify_after_merge.as_ref().map(|_| work.verify_in.as_deref().unwrap_or("staging"))),
+        "verify_in": work.and_then(|work| work.verify_after_merge.as_ref().map(|_| wt_core::VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),
         "verification_owed": verification_owed,
+        "owes": super::owed::owes_json(&owed.items, clock),
+        "owed_phase": super::owed::phase_json(owed.phase),
     })
 }
 
@@ -543,9 +569,20 @@ mod tests {
             extra: serde_json::Map::from_iter([("prState".into(), json!("MERGED"))]),
         };
         assert!(is_merged(&row));
-        let json = removed_json(&row);
+        let json = removed_json(&row, false);
         assert_eq!(json["kind"], "merged");
         assert_eq!(json["verify_after_merge"], "check staging");
+        assert_eq!(json["verify_in"], "staging");
         assert_eq!(json["verification_owed"], true);
+        // The row landed before it was removed: its check is due.
+        assert_eq!(json["owed_phase"], "due");
+        assert_eq!(
+            json["owes"],
+            json!([{
+                "id": null, "kind": "check", "state": "due", "stage": "staging",
+                "when": "overdue in staging", "what": "check staging",
+                "before_release": false, "overdue": true, "due_at": null,
+            }])
+        );
     }
 }

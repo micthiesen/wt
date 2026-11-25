@@ -810,8 +810,16 @@ mod tests {
         dirty.git.untracked_files = Some(1);
         let mut unlanded = landed("unlanded");
         unlanded.git.landed_on = None;
+        // Dropped work that never landed is kept for a reason worth showing;
+        // work that is simply unfinished is none of the menu's business.
+        let mut dropped = landed("dropped");
+        dropped.git.landed_on = None;
+        dropped.work = Some(crate::WorkPresentation {
+            effective_state: Some(wt_core::WorkState::Dropped),
+            ..Default::default()
+        });
         let board = crate::Board {
-            rows: vec![landed("done"), dirty, unlanded],
+            rows: vec![landed("done"), dirty, unlanded, dropped],
             ..Default::default()
         };
         let model = Model {
@@ -841,7 +849,18 @@ mod tests {
         let (held, style) = title(1);
         assert_eq!(style.fg, Some(theme::WARN));
         assert!(held.spans.iter().all(|span| span.style.bg.is_none()));
-        assert_eq!(title(2).1.fg, Some(theme::FG_DIM));
+        assert_eq!(title(3).1.fg, Some(theme::FG_DIM));
+        // Left out of the menu, so drawn as it is with no menu open.
+        let plain = RowContext {
+            model: &model,
+            width: 60,
+            gutter: 0,
+            cleanup: None,
+        };
+        assert_eq!(
+            context.row(&board.rows[2], None).line,
+            plain.row(&board.rows[2], None).line
+        );
     }
 
     #[test]
@@ -1103,8 +1122,14 @@ mod tests {
                     1 => work.blocked = true,
                     2 => work.stale = Some(true),
                     3 => {
-                        work.verification_owed = true;
-                        work.verification_overdue = true;
+                        let mut check = crate::OwedView::new(
+                            wt_core::OwedKind::Check,
+                            wt_core::OwedState::Due,
+                            "check",
+                        );
+                        check.overdue = true;
+                        row.owes = vec![check];
+                        row.owed_phase = Some(wt_core::OwedPhase::Due);
                     }
                     4 => row.git.landed_on = Some(crate::LandingKind::Base),
                     5 => row.git.landed_on = Some(crate::LandingKind::Production),
