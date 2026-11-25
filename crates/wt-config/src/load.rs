@@ -344,6 +344,8 @@ impl Config {
             ));
         }
 
+        let environments = parse_environments(&raw, &mut errors);
+
         let stage_raw: RawStage = section(&raw, "stage", &mut errors);
         let stage = StageConfig {
             prefix: nonempty(stage_raw.prefix).unwrap_or_else(|| format!("{}-", branch.prefix)),
@@ -769,6 +771,7 @@ impl Config {
             &raw,
             &actions,
             &branch,
+            &environments,
             &mcp_servers,
             &mut errors,
             &mut warnings,
@@ -791,6 +794,7 @@ impl Config {
             tmux,
             resources,
             branch,
+            environments,
             stage,
             lifecycle,
             backend: BackendConfig {
@@ -1204,10 +1208,68 @@ fn parse_mcp_servers(
     servers
 }
 
+/// `[environments.<stage>]` deploy probes. Stages are the two an owed check
+/// can name, so any other table could never be consulted.
+fn parse_environments(raw: &toml::Value, errors: &mut Vec<String>) -> EnvironmentsConfig {
+    let mut environments = EnvironmentsConfig::default();
+    let Some(value) = raw.get("environments") else {
+        return environments;
+    };
+    let Some(table) = value.as_table() else {
+        errors.push(
+            "environments must be a table of [environments.staging] and [environments.production]"
+                .into(),
+        );
+        return environments;
+    };
+    for (name, value) in table {
+        let tag = format!("environments.{name}");
+        let Some(stage) = wt_core::VerifyStage::parse(name).filter(|stage| stage.as_str() == name)
+        else {
+            errors.push(format!(
+                "{tag}: unknown stage (expected one of staging, production)"
+            ));
+            continue;
+        };
+        if !value.is_table() {
+            errors.push(format!("{tag} must be a table"));
+            continue;
+        }
+        let probe: EnvironmentConfig = match value.clone().try_into() {
+            Ok(probe) => probe,
+            Err(error) => {
+                errors.push(format!("{tag}: {error}"));
+                continue;
+            }
+        };
+        if probe.deployed.is_empty() || probe.deployed.iter().any(|arg| arg.trim().is_empty()) {
+            errors.push(format!("{tag}.deployed must be an array of nonempty strings (argv, not a shell command) that prints the deployed commit SHA"));
+            continue;
+        }
+        if probe.every_seconds < EnvironmentConfig::MIN_EVERY_SECONDS {
+            errors.push(format!(
+                "{tag}.every_seconds must be at least {}",
+                EnvironmentConfig::MIN_EVERY_SECONDS
+            ));
+            continue;
+        }
+        if probe.timeout_seconds == 0 {
+            errors.push(format!("{tag}.timeout_seconds must be a positive integer"));
+            continue;
+        }
+        match stage {
+            wt_core::VerifyStage::Staging => environments.staging = Some(probe),
+            wt_core::VerifyStage::Production => environments.production = Some(probe),
+        }
+    }
+    environments
+}
+
 fn parse_automations(
     raw: &toml::Value,
     actions: &[ActionDef],
     branch: &BranchConfig,
+    environments: &EnvironmentsConfig,
     mcp_servers: &BTreeMap<String, McpServerConfig>,
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
@@ -1380,6 +1442,38 @@ fn parse_automations(
             errors.push(format!("{tag}.branch \"{name}\" is neither [branch] base nor in [branch] keep_fresh — nothing would advance it, so the rule could never fire"));
             continue;
         }
+        let stage = match input.stage.as_deref().map(str::trim) {
+            Some(_) if on != AutomationTrigger::StageDeployed => {
+                errors.push(format!(
+                    "{tag}.stage only applies to on = \"stage.deployed\" (got \"{}\")",
+                    trigger_name(on)
+                ));
+                continue;
+            }
+            Some(value) => match wt_core::VerifyStage::parse(value) {
+                Some(stage) => Some(stage),
+                None => {
+                    errors.push(format!(
+                        "{tag}.stage must be \"staging\" or \"production\" (got \"{value}\")"
+                    ));
+                    continue;
+                }
+            },
+            None if on == AutomationTrigger::StageDeployed => {
+                errors.push(format!(
+                    "{tag}: on = \"stage.deployed\" requires stage = \"staging\" or \"production\""
+                ));
+                continue;
+            }
+            None => None,
+        };
+        if let Some(stage) = stage
+            && environments.get(stage).is_none()
+        {
+            let name = stage.as_str();
+            errors.push(format!("{tag}.stage \"{name}\" has no [environments.{name}] deploy probe, so nothing would report a deploy and the rule could never fire"));
+            continue;
+        }
         let mcp = on == AutomationTrigger::McpEvent;
         if !mcp && (input.server.is_some() || input.event.is_some() || input.arguments.is_some()) {
             errors.push(format!(
@@ -1452,8 +1546,11 @@ fn parse_automations(
             busy: input.busy,
             cooldown_minutes: input.cooldown_minutes,
             after_days: input.after_days.unwrap_or(2.0),
-            settle_seconds: input.settle_seconds.unwrap_or_else(|| default_settle(on)),
+            settle_seconds: input
+                .settle_seconds
+                .unwrap_or_else(|| default_settle(on, branch, environments)),
             branch: branch_name,
+            stage,
             server: input.server,
             event: input.event.map(|event| event.trim().to_owned()),
             arguments,
@@ -1462,7 +1559,7 @@ fn parse_automations(
     result
 }
 
-const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verified, status.verification_due, status.verification_overdue, branch.advanced, mcp.event";
+const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verified, status.verification_due, status.verification_overdue, branch.advanced, stage.deployed, mcp.event";
 
 fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
     let value = match value {
@@ -1486,6 +1583,7 @@ fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
         "status.verification_due" => AutomationTrigger::StatusVerificationDue,
         "status.verification_overdue" => AutomationTrigger::StatusVerificationOverdue,
         "branch.advanced" => AutomationTrigger::BranchAdvanced,
+        "stage.deployed" => AutomationTrigger::StageDeployed,
         "mcp.event" => AutomationTrigger::McpEvent,
         _ => return None,
     })
@@ -1506,10 +1604,15 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::StatusVerificationDue => "status.verification_due",
         AutomationTrigger::StatusVerificationOverdue => "status.verification_overdue",
         AutomationTrigger::BranchAdvanced => "branch.advanced",
+        AutomationTrigger::StageDeployed => "stage.deployed",
         AutomationTrigger::McpEvent => "mcp.event",
     }
 }
-fn default_settle(on: AutomationTrigger) -> f64 {
+fn default_settle(
+    on: AutomationTrigger,
+    branch: &BranchConfig,
+    environments: &EnvironmentsConfig,
+) -> f64 {
     match on {
         AutomationTrigger::WtCreated
         | AutomationTrigger::StatusNeedsHuman
@@ -1518,12 +1621,22 @@ fn default_settle(on: AutomationTrigger) -> f64 {
         | AutomationTrigger::StatusVerified
         | AutomationTrigger::StatusVerificationOverdue
         | AutomationTrigger::McpEvent => 0.0,
+        // With a deploy probe for every stage a check can come due on, the
+        // trigger itself waits for the deploy and the settle only lets the
+        // new release start serving.
+        AutomationTrigger::StatusVerificationDue
+            if environments.staging.is_some()
+                && (environments.production.is_some() || !branch.separate_production()) =>
+        {
+            30.0
+        }
         // Deploys lag merges; a run that starts once the deploy has likely
         // finished checks it once instead of polling for it.
         AutomationTrigger::StatusVerificationDue => 600.0,
         AutomationTrigger::WtMerged
         | AutomationTrigger::StackParentMerged
-        | AutomationTrigger::BranchAdvanced => 10.0,
+        | AutomationTrigger::BranchAdvanced
+        | AutomationTrigger::StageDeployed => 10.0,
         _ => 120.0,
     }
 }
@@ -1743,6 +1856,7 @@ struct RawAutomation {
     after_days: Option<f64>,
     settle_seconds: Option<f64>,
     branch: Option<String>,
+    stage: Option<String>,
     server: Option<String>,
     event: Option<String>,
     arguments: Option<toml::Table>,

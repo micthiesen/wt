@@ -9,6 +9,7 @@ pub mod attention_source;
 pub mod automation_facts;
 pub mod automation_source;
 pub mod board_layout;
+pub mod deploy_source;
 pub mod dev_source;
 pub mod freshness;
 pub mod git_presentation;

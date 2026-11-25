@@ -69,6 +69,9 @@ pub struct LifecycleFacts {
     pub clean_candidate: bool,
     /// The landing reached `[branch] production`. False is unknown.
     pub in_production: bool,
+    /// Deploy proof for the stage of the check this row owes, when that
+    /// stage has a probe. Other stages stay unprobed: nothing reads them.
+    pub deploys: wt_core::StageDeploys,
 }
 
 pub struct RemovalPlan {
@@ -217,16 +220,38 @@ pub async fn plan_automation_facts(
         } else {
             false
         };
-        let in_production = landing.landed()
-            && ctx.config.branch.separate_production()
-            && owes_production_check(stored)
+        let separate_production = ctx.config.branch.separate_production();
+        let owed_stage = owed_check_stage(stored).filter(|_| landing.landed());
+        let in_production = separate_production
+            && owed_stage == Some(wt_core::VerifyStage::Production)
             && reached_production(ctx, &row, github).await;
+        let mut deploys = wt_core::StageDeploys::default();
+        if let Some(stage) = owed_stage
+            && ctx.config.environments.get(stage).is_some()
+        {
+            // A deploy cannot be ahead of the Git landing it ships.
+            let landed = match stage {
+                wt_core::VerifyStage::Staging => true,
+                wt_core::VerifyStage::Production => in_production || !separate_production,
+            };
+            let deployed = landed
+                && match landing_commits(ctx, &row, github).await {
+                    Some(commits) => {
+                        crate::deploys::landing_deployed(ctx, stage, &commits, &ctx.cancellation)
+                            .await
+                            == Some(true)
+                    }
+                    None => false,
+                };
+            deploys.set(stage, Some(deployed));
+        }
         evidence.rows.insert(
             slug,
             LifecycleFacts {
                 local_merged: landing.local_merged.then_some(true),
                 clean_candidate,
                 in_production,
+                deploys,
             },
         );
     }
@@ -263,23 +288,10 @@ async fn reached_production(ctx: &AppContext, row: &WorktreeRecord, github: &Git
         );
         return false;
     };
-    let Ok(head) = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"]).await else {
+    let Some(commits) = landing_commits(ctx, row, github).await else {
         return false;
     };
-    if !head.status.success() {
-        return false;
-    }
-    let head = head.stdout_text().trim().to_owned();
-    let merge = github.prs.get(&row.target.branch).and_then(|pr| {
-        wt_core::exact_merged_pr_oid(
-            pr.head_ref_oid.as_deref(),
-            &head,
-            &pr.state,
-            pr.merge_commit_oid.as_deref(),
-        )
-        .map(str::to_owned)
-    });
-    for commit in std::iter::once(head).chain(merge) {
+    for commit in commits {
         if let Ok(output) = run_git(
             ctx,
             path,
@@ -294,17 +306,45 @@ async fn reached_production(ctx: &AppContext, row: &WorktreeRecord, github: &Git
     false
 }
 
-/// The probe costs several Git calls per row, so it runs only where its
-/// answer decides something: an undischarged production-stage check.
-fn owes_production_check(stored: &serde_json::Value) -> bool {
-    wt_core::parse_work_status(&stored["work"]).is_some_and(|work| {
-        !matches!(
-            work.state,
-            wt_core::WorkState::Verified | wt_core::WorkState::Dropped
-        ) && work
-            .verification()
-            .is_some_and(|(stage, _)| stage == wt_core::VerifyStage::Production)
-    })
+/// The commits that prove where the row's work landed: HEAD, and the exact
+/// merge commit of the PR merged at HEAD. `None` when HEAD cannot be read.
+async fn landing_commits(
+    ctx: &AppContext,
+    row: &WorktreeRecord,
+    github: &GithubData,
+) -> Option<Vec<String>> {
+    let path = Path::new(&row.target.path);
+    let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
+        .await
+        .ok()
+        .filter(|output| output.status.success())?
+        .stdout_text()
+        .trim()
+        .to_owned();
+    let merge = github.prs.get(&row.target.branch).and_then(|pr| {
+        wt_core::exact_merged_pr_oid(
+            pr.head_ref_oid.as_deref(),
+            &head,
+            &pr.state,
+            pr.merge_commit_oid.as_deref(),
+        )
+        .map(str::to_owned)
+    });
+    Some(std::iter::once(head).chain(merge).collect())
+}
+
+/// The stage of the row's undischarged check. The production and deploy
+/// probes cost several Git calls per row, so they run only where their
+/// answer decides something: that stage.
+fn owed_check_stage(stored: &serde_json::Value) -> Option<wt_core::VerifyStage> {
+    wt_core::parse_work_status(&stored["work"])
+        .filter(|work| {
+            !matches!(
+                work.state,
+                wt_core::WorkState::Verified | wt_core::WorkState::Dropped
+            )
+        })
+        .and_then(|work| work.verification().map(|(stage, _)| stage))
 }
 
 struct Landing {
@@ -1184,6 +1224,106 @@ mod tests {
         assert!(!facts().await);
         git(ctx, path, &["reset", "--hard", "HEAD~1"]).await;
         assert!(facts().await);
+        fixture.close().await.unwrap();
+    }
+
+    /// Deploy proof is read only for the stage of the check a landed row
+    /// owes, and only where that stage has a probe.
+    #[tokio::test]
+    async fn automation_facts_wait_for_a_probed_stage_to_run_the_landing() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .environments
+            .staging = Some(wt_config::EnvironmentConfig {
+            deployed: vec!["unused".into()],
+            ..Default::default()
+        });
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, path, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(
+            ctx,
+            path,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        let base = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        let anchor = base.clone();
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        std::fs::write(path.join("work.txt"), "landed work\n").unwrap();
+        git(ctx, path, &["add", "work.txt"]).await;
+        git(ctx, path, &["commit", "-m", "feature work"]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        let head = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        let row = ctx
+            .repository
+            .inventory(&ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "one")
+            .unwrap();
+        let stored = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let owe = |stage: Option<wt_core::VerifyStage>| {
+            let mut work =
+                wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "2026-01-01T00:00:00Z");
+            work.verify_after_merge = stage.map(|_| "check it".to_owned());
+            work.verify_in = stage;
+            let mut state = stored.clone();
+            state["slugs"]["one"]["work"] = serde_json::to_value(work).unwrap();
+            state
+        };
+        let deploys = |state: serde_json::Value| {
+            let row = row.clone();
+            async move {
+                let evidence = plan_automation_facts(ctx, vec![row], &state, None)
+                    .await
+                    .unwrap();
+                assert!(evidence.row_errors.is_empty(), "{:?}", evidence.row_errors);
+                assert_eq!(evidence.rows["one"].local_merged, Some(true));
+                evidence.rows["one"].deploys
+            }
+        };
+        let staging = |deployed| wt_core::StageDeploys {
+            staging: Some(deployed),
+            production: None,
+        };
+        let main = &ctx.config.paths.main_clone;
+        let record = |oid: String| async move {
+            wt_vcs::record_deployed(
+                &ctx.processes,
+                main,
+                wt_core::VerifyStage::Staging,
+                &oid,
+                &ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        };
+        // Nothing owed: the probe's answer would decide nothing.
+        let state = owe(None);
+        assert_eq!(deploys(state).await, wt_core::StageDeploys::default());
+        // Owed in staging, and the probe has reported nothing yet.
+        let state = owe(Some(wt_core::VerifyStage::Staging));
+        assert_eq!(deploys(state.clone()).await, staging(false));
+        record(base).await;
+        assert_eq!(deploys(state.clone()).await, staging(false));
+        record(head).await;
+        assert_eq!(deploys(state).await, staging(true));
+        // A production check on a stage with no probe keeps the Git landing.
+        let state = owe(Some(wt_core::VerifyStage::Production));
+        assert_eq!(deploys(state).await, wt_core::StageDeploys::default());
         fixture.close().await.unwrap();
     }
 }

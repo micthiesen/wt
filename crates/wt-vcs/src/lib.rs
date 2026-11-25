@@ -1,12 +1,17 @@
 //! Read-only Git repository and worktree inventory services.
 
 mod backup;
+mod deployed;
 mod mainline;
 mod origin;
 mod repository;
 mod status;
 
 pub use backup::backup_owner;
+pub use deployed::{
+    DeployProofError, deployed_contains, deployed_oid, parse_probe_output, record_deployed,
+    resolve_deployed_commit,
+};
 pub use mainline::{
     MAINLINE_WALK, branch_reflog_args, committed_on_branch, contained_head_landed, mainline_args,
     on_first_parent_line,

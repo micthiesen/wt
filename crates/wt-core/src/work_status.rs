@@ -59,6 +59,12 @@ impl VerifyStage {
             _ => None,
         }
     }
+
+    /// The Git ref in the main clone that holds the commit a deploy probe
+    /// last reported for this stage.
+    pub fn deployed_ref(self) -> String {
+        format!("refs/wt/deployed/{}", self.as_str())
+    }
 }
 
 /// The merge commit of a PR merged at exactly `current_head`, if any. Only
@@ -86,19 +92,55 @@ fn lenient_stage<'de, D: serde::Deserializer<'de>>(
         .and_then(VerifyStage::parse))
 }
 
+/// Whether a landing is deployed, per stage. `None` means the stage has no
+/// deploy probe (`[environments.<stage>]`), so the Git landing alone decides.
+/// `Some(false)` means a probe exists and has not shown the landing deployed:
+/// not deployed yet, or unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StageDeploys {
+    pub staging: Option<bool>,
+    pub production: Option<bool>,
+}
+
+impl StageDeploys {
+    pub const UNPROBED: Self = Self {
+        staging: None,
+        production: None,
+    };
+
+    pub const fn get(self, stage: VerifyStage) -> Option<bool> {
+        match stage {
+            VerifyStage::Staging => self.staging,
+            VerifyStage::Production => self.production,
+        }
+    }
+
+    pub fn set(&mut self, stage: VerifyStage, deployed: Option<bool>) {
+        match stage {
+            VerifyStage::Staging => self.staging = deployed,
+            VerifyStage::Production => self.production = deployed,
+        }
+    }
+}
+
 /// How far a worktree's branch has landed, as far as an owed check cares.
 /// `production` is true once the landing reached production, and also for any
 /// base landing when the repository configures no separate production branch.
+/// `base` and `production` are the Git landing; `deploys` adds whether a
+/// probed stage is actually running it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Landing {
     pub base: bool,
     pub production: bool,
+    pub deploys: StageDeploys,
 }
 
 impl Landing {
     pub const NONE: Self = Self {
         base: false,
         production: false,
+        deploys: StageDeploys::UNPROBED,
     };
 
     /// `separate_production` is whether `[branch] production` names a branch
@@ -108,14 +150,37 @@ impl Landing {
         Self {
             base,
             production: in_production || (base && !separate_production),
+            deploys: StageDeploys::UNPROBED,
         }
     }
 
-    fn reached(self, stage: VerifyStage) -> bool {
+    pub fn with_deploys(mut self, deploys: StageDeploys) -> Self {
+        self.deploys = deploys;
+        self
+    }
+
+    /// The Git landing alone, as if no stage had a deploy probe.
+    pub fn git_only(self) -> Self {
+        self.with_deploys(StageDeploys::UNPROBED)
+    }
+
+    /// The landing reached the stage's branch in Git.
+    pub fn landed(self, stage: VerifyStage) -> bool {
         match stage {
             VerifyStage::Staging => self.base,
             VerifyStage::Production => self.production,
         }
+    }
+
+    /// The stage has the change: landed in Git and, when the stage has a
+    /// deploy probe, deployed there.
+    pub fn reached(self, stage: VerifyStage) -> bool {
+        self.landed(stage) && self.deploys.get(stage) != Some(false)
+    }
+
+    /// Landed in Git on a probed stage that is not running it yet.
+    pub fn awaiting_deploy(self, stage: VerifyStage) -> bool {
+        self.landed(stage) && self.deploys.get(stage) == Some(false)
     }
 }
 
@@ -302,12 +367,27 @@ pub fn owes_post_merge_verification(record: Option<&WorkStatusRecord>, landed: b
 
 /// An owed check whose environment now has the change: the landing reached
 /// the check's stage. A production check on a branch only in staging is owed
-/// but not yet due.
+/// but not yet due, and so is a check whose probed stage has not deployed it.
 pub fn verification_due(record: Option<&WorkStatusRecord>, landing: Landing) -> bool {
     owes_post_merge_verification(record, landing.base)
         && record
             .and_then(WorkStatusRecord::verification)
             .is_some_and(|(stage, _)| landing.reached(stage))
+}
+
+/// The stage an owed check waits on a deploy of: its landing is in Git and
+/// the stage's probe has not shown it deployed.
+pub fn verification_awaiting_deploy(
+    record: Option<&WorkStatusRecord>,
+    landing: Landing,
+) -> Option<VerifyStage> {
+    if !owes_post_merge_verification(record, landing.base) {
+        return None;
+    }
+    record
+        .and_then(WorkStatusRecord::verification)
+        .map(|(stage, _)| stage)
+        .filter(|stage| landing.awaiting_deploy(*stage))
 }
 
 pub fn effective_work_state(
@@ -345,14 +425,16 @@ pub fn verification_overdue(
 }
 
 /// Only a due check can be overdue: a production check waiting on a
-/// promotion is nobody's lapse yet.
+/// promotion is nobody's lapse yet. Due here means the Git landing: a deploy
+/// probe that stopped answering must not hide a check that has been owed
+/// for days.
 pub fn verification_overdue_with_days(
     record: Option<&WorkStatusRecord>,
     landing: Landing,
     now_ms: i64,
     days: f64,
 ) -> bool {
-    if !verification_due(record, landing) {
+    if !verification_due(record, landing.git_only()) {
         return false;
     }
     let Some(record) = record else {
@@ -714,6 +796,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(future.verify_in, None);
+    }
+
+    #[test]
+    fn a_probed_stage_is_reached_only_once_deployed() {
+        use VerifyStage::{Production, Staging};
+        let deploys = |staging, production| StageDeploys {
+            staging,
+            production,
+        };
+        // (base, in production, separate production branch)
+        let staged = Landing::new(true, false, true);
+        let promoted = Landing::new(true, true, true);
+        let released = Landing::new(true, false, false);
+        // No probe: the Git landing decides, as before.
+        for landing in [Landing::NONE, staged, promoted, released] {
+            for stage in [Staging, Production] {
+                assert_eq!(landing.reached(stage), landing.landed(stage));
+                assert!(!landing.awaiting_deploy(stage));
+            }
+        }
+        for (landing, stage, proof, reached, awaiting) in [
+            (staged, Staging, Some(false), false, true),
+            (staged, Staging, Some(true), true, false),
+            // A deploy cannot stand in for a landing Git does not show.
+            (staged, Production, Some(true), false, false),
+            (staged, Production, Some(false), false, false),
+            (promoted, Production, Some(false), false, true),
+            (promoted, Production, Some(true), true, false),
+            (released, Production, Some(false), false, true),
+            (released, Production, Some(true), true, false),
+            (Landing::NONE, Staging, Some(true), false, false),
+        ] {
+            let mut facts = StageDeploys::UNPROBED;
+            facts.set(stage, proof);
+            let landing = landing.with_deploys(facts);
+            assert_eq!(landing.reached(stage), reached, "{landing:?} {stage:?}");
+            assert_eq!(landing.awaiting_deploy(stage), awaiting);
+        }
+        // One stage's probe says nothing about the other.
+        let mixed = promoted.with_deploys(deploys(Some(false), None));
+        assert!(!mixed.reached(Staging) && mixed.reached(Production));
+
+        let mut ready = record(WorkState::Ready);
+        ready.verify_after_merge = Some("check staging".into());
+        let waiting = staged.with_deploys(deploys(Some(false), None));
+        assert!(owes_post_merge_verification(Some(&ready), waiting.base));
+        assert!(!verification_due(Some(&ready), waiting));
+        assert_eq!(
+            verification_awaiting_deploy(Some(&ready), waiting),
+            Some(Staging)
+        );
+        assert_eq!(
+            effective_work_state(Some(&ready), None, waiting)
+                .unwrap()
+                .state,
+            WorkState::Ready
+        );
+        let live = staged.with_deploys(deploys(Some(true), None));
+        assert!(verification_due(Some(&ready), live));
+        assert_eq!(verification_awaiting_deploy(Some(&ready), live), None);
+        // A probe that never answers cannot hide a check owed for days.
+        let now = parse_iso_millis(AT).unwrap() + 3 * 86_400_000;
+        assert!(verification_overdue(Some(&ready), waiting, now));
+        assert!(!verification_overdue(Some(&ready), Landing::NONE, now));
+        ready.state = WorkState::Verified;
+        assert_eq!(verification_awaiting_deploy(Some(&ready), waiting), None);
+        assert_eq!(Staging.deployed_ref(), "refs/wt/deployed/staging");
     }
 
     #[test]

@@ -1069,6 +1069,7 @@ fn manager_bound(fire: &AutomationFire, context: &wt_automations::AutomationEval
 
 fn breaker_exempt(fire: &AutomationFire, manager_run: bool) -> bool {
     fire.rule.on == wt_config::AutomationTrigger::BranchAdvanced
+        || fire.rule.on == wt_config::AutomationTrigger::StageDeployed
         // Each event is a distinct occurrence, and the server leaves out the
         // agents' own writes, so a reply cannot wake its sender in a loop.
         || fire.rule.on == wt_config::AutomationTrigger::McpEvent

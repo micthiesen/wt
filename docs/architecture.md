@@ -335,6 +335,16 @@ corrupt, oversized or week-old file is deleted and ignored. The directory is own
 temporary files a crashed writer left behind are removed. Sources that read SQLite, logs or live process state are `Never`:
 durable state is read directly and never cached here.
 
+**Deploy proof.** The `deploy-proof` leaf (`Never`: live probe output) polls
+each `[environments.<stage>]` probe and records the commit it reports as
+`refs/wt/deployed/<stage>` in the main clone. The proof lives in Git, not
+SQLite, so the Disk-persisted Git presentation leaf can read it. Every landing
+computation (automation lifecycle facts, the board's Git facts) asks
+`wt_ops::deploys::landing_deployed`, one `merge-base --is-ancestor` against
+that ref, and `wt_core::Landing` combines the answer with the Git landing.
+The leaf's snapshot only wakes those readers when a ref moves. A stage with
+a probe and no ref yet is not deployed.
+
 **Confirmed inputs.** `LeafHandle::confirmed()` returns `Confirmed<T>` only for
 live data (for GitHub this includes an events-daemon snapshot, which is a fresh
 read by the daemon stamped with its own fetch start, not a restored cache); a derived handle has no such method, and `Confirmed` has no public

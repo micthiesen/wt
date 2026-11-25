@@ -16,6 +16,9 @@ pub struct AutomationRow {
     pub gone: Option<bool>,
     /// The landing is proven on `[branch] production`. False is unknown.
     pub in_production: bool,
+    /// Deploy proof for the stage of the check this row owes, when that
+    /// stage has a deploy probe.
+    pub deploys: wt_core::StageDeploys,
     /// The lifecycle's complete clean-safety predicate, including the
     /// non-vacuous owned-commit guard.
     pub clean_candidate: bool,
@@ -117,6 +120,8 @@ pub struct AutomationEvalContext {
     pub reviewers_enabled: bool,
     pub actions: BTreeMap<String, ActionTraits>,
     pub pauses: PauseSnapshot,
+    /// Watched tips by name: a `branch.advanced` rule's branch, or a
+    /// `stage.deployed` rule's deployed ref (`VerifyStage::deployed_ref`).
     pub branch_tips: BTreeMap<String, BranchTip>,
     /// Frozen template values for post-merge external fires.
     pub row_vars: BTreeMap<String, BTreeMap<String, String>>,

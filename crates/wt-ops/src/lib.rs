@@ -8,6 +8,7 @@ pub mod action_dispatch;
 pub mod automation_builtins;
 pub mod commands;
 pub mod controller_tunnels;
+pub mod deploys;
 pub mod events;
 pub mod fork_base;
 pub mod host_cleanup;

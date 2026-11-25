@@ -102,6 +102,7 @@ fn snapshot(config: &Config) -> serde_json::Value {
                 wt_config::AutomationTrigger::StatusVerificationDue => "status.verification_due",
                 wt_config::AutomationTrigger::StatusVerificationOverdue => "status.verification_overdue",
                 wt_config::AutomationTrigger::BranchAdvanced => "branch.advanced",
+                wt_config::AutomationTrigger::StageDeployed => "stage.deployed",
                 wt_config::AutomationTrigger::McpEvent => "mcp.event",
             },
             "run": automation.run, "busy": if automation.busy == wt_config::AutomationBusyPolicy::Skip { "skip" } else { "queue" },
@@ -808,4 +809,135 @@ fn mcp_event_rules_name_a_server_an_event_and_a_prompt_action() {
         "{error}"
     );
     assert!(error.contains("automations[3]"), "{error}");
+}
+
+#[test]
+fn environments_name_a_deploy_probe_per_stage_and_reject_anything_else() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let load = |extra: &str| {
+        let mut text = minimal_config(root.path());
+        text.push_str(extra);
+        Config::from_raw(toml_value(&text), &options(root.path(), &home, &[]))
+    };
+    let config = load("").unwrap();
+    assert!(config.environments.is_empty());
+
+    let config = load(
+        "\n[environments.staging]\ndeployed = ['deploy-tool', 'sha', 'staging']\n\
+         [environments.production]\ndeployed = ['deploy-tool', 'sha']\nevery_seconds = 15\ntimeout_seconds = 5\n",
+    )
+    .unwrap();
+    let staging = config
+        .environments
+        .get(wt_core::VerifyStage::Staging)
+        .unwrap();
+    assert_eq!(staging.deployed, ["deploy-tool", "sha", "staging"]);
+    assert_eq!((staging.every_seconds, staging.timeout_seconds), (60, 20));
+    let production = config.environments.production.as_ref().unwrap();
+    assert_eq!(
+        (production.every_seconds, production.timeout_seconds),
+        (15, 5)
+    );
+    assert_eq!(config.environments.probed().count(), 2);
+
+    for (extra, expected) in [
+        (
+            "\n[environments.canary]\ndeployed = ['x']\n",
+            "environments.canary: unknown stage (expected one of staging, production)",
+        ),
+        (
+            "\n[environments.staging]\ndeployed = []\n",
+            "environments.staging.deployed must be an array of nonempty strings",
+        ),
+        (
+            "\n[environments.staging]\nevery_seconds = 30\n",
+            "environments.staging.deployed must be an array of nonempty strings",
+        ),
+        (
+            "\n[environments.production]\ndeployed = ['x', ' ']\n",
+            "environments.production.deployed must be an array of nonempty strings",
+        ),
+        (
+            "\n[environments.staging]\ndeployed = ['x']\nevery_seconds = 14\n",
+            "environments.staging.every_seconds must be at least 15",
+        ),
+        (
+            "\n[environments.staging]\ndeployed = ['x']\ntimeout_seconds = 0\n",
+            "environments.staging.timeout_seconds must be a positive integer",
+        ),
+        (
+            "\n[environments.staging]\ndeployed = 'x --sha'\n",
+            "environments.staging: ",
+        ),
+        (
+            "\n[environments]\nstaging = 'x'\n",
+            "environments.staging must be a table",
+        ),
+    ] {
+        let error = load(extra).unwrap_err().to_string();
+        assert!(error.contains(expected), "{extra}: {error}");
+    }
+}
+
+#[test]
+fn stage_deployed_rules_need_a_probed_stage_and_probes_shorten_the_verification_settle() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let load = |branch: &str, extra: &str| {
+        let mut text = minimal_config(root.path());
+        text.push_str(branch);
+        text.push_str(extra);
+        Config::from_raw(toml_value(&text), &options(root.path(), &home, &[]))
+    };
+    let due =
+        "\n[[automations]]\nid='verify'\non='status.verification_due'\nrun='builtin:notify'\n";
+    let staging = "\n[environments.staging]\ndeployed = ['x']\n";
+    let production = "\n[environments.production]\ndeployed = ['x']\n";
+    let promoted = "production='release'\nkeep_fresh=['release']\n";
+    let settle =
+        |branch: &str, extra: String| load(branch, &extra).unwrap().automations[0].settle_seconds;
+    // No probe, or a stage that can come due without one: the old delay.
+    assert_eq!(settle("", due.to_owned()), 600.0);
+    assert_eq!(settle("", format!("{production}{due}")), 600.0);
+    assert_eq!(settle(promoted, format!("{staging}{due}")), 600.0);
+    // Every stage that can come due is probed.
+    assert_eq!(settle("", format!("{staging}{due}")), 30.0);
+    assert_eq!(
+        settle(promoted, format!("{staging}{production}{due}")),
+        30.0
+    );
+    assert_eq!(settle("", format!("{staging}{due}settle_seconds=5\n")), 5.0);
+
+    let deployed = "\n[[automations]]\nid='released'\non='stage.deployed'\nrun='builtin:notify'\n";
+    let rule = load("", &format!("{staging}{deployed}stage=' staging '\n"))
+        .unwrap()
+        .automations
+        .remove(0);
+    assert_eq!(rule.on, wt_config::AutomationTrigger::StageDeployed);
+    assert_eq!(rule.stage, Some(wt_core::VerifyStage::Staging));
+    assert_eq!(rule.settle_seconds, 10.0);
+    for (extra, expected) in [
+        (
+            deployed.to_owned(),
+            "on = \"stage.deployed\" requires stage = \"staging\" or \"production\"",
+        ),
+        (
+            format!("{staging}{deployed}stage='canary'\n"),
+            "automations[0].stage must be \"staging\" or \"production\" (got \"canary\")",
+        ),
+        (
+            format!("{staging}{deployed}stage='production'\n"),
+            "automations[0].stage \"production\" has no [environments.production] deploy probe",
+        ),
+        (
+            format!("{staging}{due}stage='staging'\n"),
+            "automations[0].stage only applies to on = \"stage.deployed\" (got \"status.verification_due\")",
+        ),
+    ] {
+        let error = load("", &extra).unwrap_err().to_string();
+        assert!(error.contains(expected), "{extra}: {error}");
+    }
 }

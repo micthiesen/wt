@@ -203,6 +203,59 @@ Only the main clone is touched. Under the `rift` backend each worktree
 is an independent clone with its own refs — see
 [backends.md](backends.md#stale-remote-tracking-refs).
 
+## `[environments.staging]` and `[environments.production]`: optional deploy probes
+
+A branch landing is not a deploy. Without a probe, wt takes a stage to be
+running whatever its branch holds: staging runs `[branch] base`, production
+runs `[branch] production`. A probe tells wt what the stage is actually
+running, so a post-merge check waits for the deploy instead of guessing a
+delay.
+
+```toml
+[environments.staging]
+deployed = ["curl", "-fsS", "https://staging.example.com/version"]
+
+[environments.production]
+deployed = ["./scripts/deployed-sha", "production"]
+every_seconds = 120
+```
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `deployed` | **yes** | — | Argv, run in the main clone with no shell. It exits 0 and prints the deployed commit SHA: the first whitespace-delimited token of stdout, 7 to 40 hexadecimal characters. |
+| `every_seconds` | no | `60` | How often the probe runs. Minimum `15`. |
+| `timeout_seconds` | no | `20` | A probe still running after this long is stopped and counts as a failure. |
+
+Only `staging` and `production` exist, the two stages a
+[`--verify-in-*` check](cli.md#the-check-that-can-only-run-once-it-ships) can
+name; any other table is a load error. Each stage is independent: configure
+one, both or neither.
+
+After each successful probe wt points `refs/wt/deployed/<stage>` in the main
+clone at the reported commit, fetching it from origin once when the clone
+does not have it yet. A landing **is deployed to a stage** when its commit
+(HEAD, or the exact merge commit of the PR merged at HEAD) is that commit or
+an ancestor of it. The board, [`status.verification_due`](automations.md#triggers)
+and [`stage.deployed`](automations.md#triggers) all read that one ref, so
+they cannot disagree. `git rev-parse refs/wt/deployed/staging` shows what wt
+last saw.
+
+With a probe configured for a check's stage:
+
+- the check comes due once the landing is in Git **and** deployed there;
+  until then the row reads `awaiting staging deploy` or
+  `awaiting production deploy` and asks nothing of anyone;
+- a stage whose probe has not answered yet is not deployed, so checks wait;
+- cleanup retention is unchanged: the worktree is kept from the merge on;
+- `status.verification_overdue` still counts from the Git landing, so a
+  probe that stopped answering cannot hide a check owed for days.
+
+A failing probe keeps the last recorded commit. A failure that outlasts
+three intervals is reported in the attention feed, once per distinct error
+(a non-zero exit, output that is not a SHA, a commit that is neither in the
+clone nor on origin). The probe runs on each host that loads this
+configuration, with that host's credentials.
+
 ## `[remote]` and `[[remotes]]` — optional SSH worktree hosts
 
 Configure one or more machines whose clone, config, and worktree root remain
@@ -1096,16 +1149,17 @@ settle_seconds   = 300
 | key | required | default | meaning |
 |---|---|---|---|
 | `id` | **yes** | — | Unique rule id (used in fire-key bookkeeping and logs). |
-| `on` | **yes** | — | Trigger: `mcp.event` (an event from a `[mcp_servers]` entry; see [automations.md](automations.md#mcp-events)), `pr.checks.failed`, `review_bot.unresolved` (the `[review_bot]`'s findings; `rabbit.unresolved` is a legacy alias), `review.changes_requested`, `pr.conflict`, `wt.merged` (a non-stacked worktree landed), `stack.parent_merged` (a stack member's parent landed), `status.needs_human` / `status.needs_testing` / `status.ready` / `status.verified` (the worktree's asserted work status is that state; hyphenated spellings are accepted aliases), `status.verification_due` (an owed post-merge check reached its stage), `status.verification_overdue`, `branch.advanced`. A trigger this wt does not know skips the rule with a warning in the attention pane and `wt doctor` instead of rejecting the config, so an older wt (such as a session pinned to the build that started it) keeps working when a newer one adds triggers. |
+| `on` | **yes** | — | Trigger: `mcp.event` (an event from a `[mcp_servers]` entry; see [automations.md](automations.md#mcp-events)), `pr.checks.failed`, `review_bot.unresolved` (the `[review_bot]`'s findings; `rabbit.unresolved` is a legacy alias), `review.changes_requested`, `pr.conflict`, `wt.merged` (a non-stacked worktree landed), `stack.parent_merged` (a stack member's parent landed), `status.needs_human` / `status.needs_testing` / `status.ready` / `status.verified` (the worktree's asserted work status is that state; hyphenated spellings are accepted aliases), `status.verification_due` (an owed post-merge check reached its stage), `status.verification_overdue`, `branch.advanced`, `stage.deployed` (a stage's [deploy probe](#environmentsstaging-and-environmentsproduction-optional-deploy-probes) reported a new commit). A trigger this wt does not know skips the rule with a warning in the attention pane and `wt doctor` instead of rejecting the config, so an older wt (such as a session pinned to the build that started it) keeps working when a newer one adds triggers. |
 | `run` | **yes** | — | An `[[actions]]` id, or a builtin: `builtin:restack` (only valid with `stack.parent_merged`), `builtin:clean` (any single-worktree trigger), `builtin:notify` (any trigger; a macOS banner), `builtin:close-issue` (only valid with `wt.merged`; closes the worktree's attached GitHub issue as completed once the branch lands), `builtin:delete-branch` (only valid with `wt.merged`; deletes the branch's ref on the origin repo once it lands, the same effect as GitHub's "Automatically delete head branches" setting for repos that have not enabled it). |
 | `busy` | no | `"queue"` | When the worktree isn't quiescent at delivery time: `queue` holds the intent until it settles, `skip` drops it. |
 | `cooldown_minutes` | no | *(none)* | Minimum minutes between dispatches per (rule, worktree). |
 | `branch` | no | *(none)* | **`branch.advanced` only** (required there, rejected elsewhere): which branch to watch. Must be `[branch] base` or listed in `[branch] keep_fresh` — nothing else advances a local head, so watching an unfetched branch is a rule that can never fire. No default on purpose: guessing the trunk would watch the wrong thing on exactly the fleets this exists for, where the release branch is the one you *don't* fork from. |
+| `stage` | no | *(none)* | **`stage.deployed` only** (required there, rejected elsewhere): `"staging"` or `"production"`. The stage must have an `[environments.<stage>]` probe: without one nothing reports a deploy, so the rule could never fire and the loader refuses it. |
 | `server` | no | *(none)* | **`mcp.event` only** (required there, rejected elsewhere): the `[mcp_servers]` entry to poll. |
 | `event` | no | *(none)* | **`mcp.event` only** (required there): the event type name, such as `comment.created`. |
 | `arguments` | no | `{}` | **`mcp.event` only**: the subscription's arguments as a TOML table, as the server's `events/list` input schema describes them (artifacts.boo takes `artifact` and, for `artifact.answered`, `component`). Changing them starts a new subscription from now. |
 | `after_days` | no | `2` | **`status.verification_overdue` only** (rejected on any other trigger): how long an outstanding post-merge verification may sit before the rule starts firing. A knob because deploy cadence is the one thing wt cannot guess — a fleet that deploys on merge wants `1`, one that batches a weekly release wants `7`, and a default wrong in either direction turns the reminder into noise or into nothing. |
-| `settle_seconds` | no | `120` (merge and `branch.advanced` triggers: `10`; `status.verification_due`: `600`; `wt.created`, other status and `mcp.event` triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period and as a delay. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. `status.verification_due` defaults to 10 minutes because a deploy lags its merge: a run that starts once the deploy has likely finished confirms it once instead of polling for it. |
+| `settle_seconds` | no | `120` (merge, `branch.advanced` and `stage.deployed` triggers: `10`; `status.verification_due`: `600`, or `30` with deploy probes; `wt.created`, other status and `mcp.event` triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period and as a delay. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. `status.verification_due` defaults to 10 minutes because a deploy lags its merge: a run that starts once the deploy has likely finished confirms it once instead of polling for it. When every stage a check can come due on has an `[environments]` probe (staging, and production or no separate production branch), the trigger itself waits for the deploy and the default drops to 30 seconds. |
 
 At runtime, `Q` lists running, queued and recent automation runs (each queued one with when it will run), `A` pauses all automations and `Ctrl+A` pauses the selected worktree (or its whole stack); both pauses persist across restarts.
 

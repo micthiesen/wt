@@ -42,6 +42,9 @@ pub struct AutomationSources {
     pub inventory: LeafHandle<SessionInventory>,
     pub activity: SourceHandle<SessionActivitySnapshot>,
     pub edits: SourceHandle<std::collections::BTreeMap<String, i64>>,
+    /// What each probed stage is running. The proof is read from Git; this
+    /// tells the engine when it moved.
+    pub deploys: SourceHandle<crate::deploy_source::DeploySnapshot>,
 }
 
 #[derive(Clone)]
@@ -147,6 +150,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut activity_rx = sources.activity.subscribe();
         let mut edits_rx = sources.edits.subscribe();
         let mut board_rx = sources.board.subscribe();
+        let mut deploys_rx = sources.deploys.subscribe();
         let mut last_edit = std::collections::BTreeMap::new();
         let mut previous_status = std::collections::BTreeMap::new();
         let mut previous_git_revision = None;
@@ -190,6 +194,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 changed = activity_rx.changed() => if changed.is_err() { break; },
                 changed = edits_rx.changed() => if changed.is_err() { break; },
                 changed = board_rx.changed() => if changed.is_err() { break; },
+                changed = deploys_rx.changed() => if changed.is_err() { break; },
                 completed = dispatches.join_next_with_id(), if !dispatches.is_empty() => {
                     match completed {
                         Some(Ok((id, (claim, outcome, error))) ) => {
@@ -274,12 +279,16 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 && *metadata.state() == SourceState::Ready;
             let metadata_key = metadata_facts_key(confirmed_metadata.as_deref());
             let production = production_tip.current(&context).await;
+            let deployed = deploys_rx.borrow_and_update().data().map(|deploys| {
+                (deploys.staging.oid.clone(), deploys.production.oid.clone())
+            });
             let key = (
                 confirmed_git.as_deref().cloned(),
                 lanes_ready,
                 metadata_key,
                 fresh_github.as_deref().cloned(),
                 production.clone(),
+                deployed.clone(),
             );
             let retry_lifecycle = lifecycle_retry.due();
             if cache_key.as_ref() != Some(&key) || retry_lifecycle {
@@ -303,6 +312,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     lifecycle_metadata_key(confirmed_metadata.as_deref()),
                     fresh_github.as_deref().cloned(),
                     production,
+                    deployed,
                 );
                 if lifecycle_cache_key.as_ref() != Some(&lifecycle_key) || retry_lifecycle {
                     match automation_facts::lifecycle_facts(
@@ -1316,6 +1326,7 @@ mod tests {
                 inventory,
                 activity,
                 edits,
+                deploys: crate::deploy_source::start(&scope, &fixture.ctx).view(),
             },
         );
         tokio::time::timeout(Duration::from_secs(5), async {

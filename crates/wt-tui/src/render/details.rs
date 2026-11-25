@@ -33,8 +33,23 @@ const MAX_CONFLICT_FILES: usize = 8;
 const COLLAPSED_PREAMBLE_LINES: usize = 2;
 /// Lines each blocker note may spend in a folded-section summary.
 const SECTION_NOTE_LINES: usize = 4;
-/// Labels recognized at the start of a structured ready note.
-const NOTE_LABELS: [&str; 4] = ["IF WRONG", "UNTESTED", "REVERT", "OPS"];
+/// Labels recognized at the start of a structured ready note. A label must
+/// be followed by a colon, so `OPS` and its phased forms never shadow each
+/// other.
+const NOTE_LABELS: [&str; 8] = [
+    "IF WRONG",
+    "UNTESTED",
+    "REVERT",
+    "OPS BEFORE MERGE",
+    "OPS AFTER MERGE",
+    "OPS BEFORE RELEASE",
+    "OPS AFTER RELEASE",
+    "OPS",
+];
+/// Widest label that shares a line with its body. The phased `OPS` labels
+/// are wider and sit on their own line, so they do not widen the gutter of
+/// every other field in a narrow pane.
+const INLINE_NOTE_LABEL_WIDTH: usize = 8;
 
 type Spans = Vec<Span<'static>>;
 
@@ -992,7 +1007,11 @@ fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> V
     let (glyph, text) = if work.blocked {
         ("⊘", format!("blocked · {}", state.as_str()))
     } else if work.verification_waiting {
-        ("●", format!("awaiting production · {}", state.as_str()))
+        let waiting_on = match work.verification_awaiting_deploy {
+            Some(stage) => format!("awaiting {} deploy", stage.as_str()),
+            None => "awaiting production".to_owned(),
+        };
+        ("●", format!("{waiting_on} · {}", state.as_str()))
     } else if work.verification_owed {
         ("●", format!("unverified · {}", state.as_str()))
     } else if work.derived {
@@ -1060,20 +1079,27 @@ fn banner_glyph(state: WorkState) -> &'static str {
 }
 
 /// The note behind a state-colored rail. Structured `LABEL:` sections line
-/// up under a hanging indent; `REVERT` reads green when safe and red when
-/// not, `OPS: none` recedes, and `UNTESTED` warns.
+/// up under a hanging indent, with a phased `OPS` label on its own line;
+/// `REVERT` reads green when safe and red when not, `OPS: none` recedes,
+/// and `UNTESTED` warns.
 fn note_lines(note: &str, color: ratatui::style::Color, width: usize) -> Vec<Line<'static>> {
     let sections = split_note_sections(note);
     let gutter = sections
         .iter()
         .filter_map(|(label, _)| label.map(str::width))
+        .filter(|width| *width <= INLINE_NOTE_LABEL_WIDTH)
         .max()
         .map_or(0, |widest| widest + 2);
     let inner = width.saturating_sub(2).max(1);
     let rail = || Span::styled("│ ", theme::fg(color));
     let mut lines = Vec::new();
     for (label, body) in sections {
-        let indent = if label.is_some() { gutter } else { 0 };
+        let own_line = label.is_some_and(|label| label.width() > INLINE_NOTE_LABEL_WIDTH);
+        let indent = match label {
+            Some(_) if own_line => gutter.max(2),
+            Some(_) => gutter,
+            None => 0,
+        };
         let body_color = match label {
             Some("REVERT") => {
                 let head = body.trim().to_ascii_lowercase();
@@ -1093,12 +1119,18 @@ fn note_lines(note: &str, color: ratatui::style::Color, width: usize) -> Vec<Lin
         } else {
             theme::FG_DIM
         };
+        if let (Some(label), true) = (label, own_line) {
+            lines.push(Line::from(vec![
+                rail(),
+                Span::styled(label, theme::fg(label_color)),
+            ]));
+        }
         for (index, line) in wrap(&body, inner.saturating_sub(indent).max(1))
             .into_iter()
             .enumerate()
         {
             let lead = match label {
-                Some(label) if index == 0 => {
+                Some(label) if index == 0 && !own_line => {
                     Span::styled(format!("{label:<gutter$}"), theme::fg(label_color))
                 }
                 _ => Span::raw(" ".repeat(indent)),
@@ -1113,8 +1145,8 @@ fn note_lines(note: &str, color: ratatui::style::Color, width: usize) -> Vec<Lin
     lines
 }
 
-/// Split a ready note at `IF WRONG:`, `UNTESTED:`, `REVERT:`, and `OPS:`
-/// labels that start a word and are followed by whitespace. Text before the
+/// Split a ready note at `IF WRONG:`, `UNTESTED:`, `REVERT:`, `OPS:`, and
+/// the phased `OPS BEFORE MERGE:`-style labels that start a word and are followed by whitespace. Text before the
 /// first label is the unlabeled lead.
 fn split_note_sections(note: &str) -> Vec<(Option<&'static str>, String)> {
     let note = note.trim();
@@ -2104,6 +2136,35 @@ mod tests {
                 (Some("IF WRONG"), "500s".to_owned()),
             ]
         );
+        let phased = split_note_sections(
+            "Ships it.\nOPS BEFORE MERGE: rotate key\nOPS AFTER RELEASE: drop old column\nREVERT: safe",
+        );
+        assert_eq!(
+            phased,
+            [
+                (None, "Ships it.".to_owned()),
+                (Some("OPS BEFORE MERGE"), "rotate key".to_owned()),
+                (Some("OPS AFTER RELEASE"), "drop old column".to_owned()),
+                (Some("REVERT"), "safe".to_owned()),
+            ]
+        );
+        let rendered: Vec<String> = note_lines(
+            "Ships it. OPS AFTER MERGE: backfill REVERT: safe",
+            theme::OK,
+            40,
+        )
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            rendered,
+            [
+                "│ Ships it.",
+                "│ OPS AFTER MERGE",
+                "│         backfill",
+                "│ REVERT  safe"
+            ]
+        );
         let (preamble, steps) = parse_verify_steps(
             "Check prod after deploy. STEPS: 1. open /health 2. expect 200 within 30s",
         );
@@ -2157,6 +2218,48 @@ mod tests {
         landed.detail_groups[0] = group("branch", &["feature/eng-12", "origin/main"]);
         let lines = screen(landed, 90, 40);
         assert!(find(&lines, "   git ").contains("merged into origin/main"));
+    }
+
+    #[test]
+    fn a_landed_check_waiting_on_a_deploy_says_so_quietly() {
+        let waiting = |stage: Option<wt_core::VerifyStage>| {
+            let mut row = row();
+            let work = row.work.as_mut().unwrap();
+            let record = work.record.as_mut().unwrap();
+            record.verify_after_merge = Some("STEPS: 1. open /health".into());
+            record.verify_in = Some(stage.unwrap_or(wt_core::VerifyStage::Production));
+            work.verification_owed = true;
+            work.verification_waiting = true;
+            work.verification_awaiting_deploy = stage;
+            row.git.landed_on = Some(crate::LandingKind::Base);
+            row
+        };
+        for (stage, expected) in [
+            (
+                Some(wt_core::VerifyStage::Staging),
+                "● awaiting staging deploy · ready",
+            ),
+            (
+                Some(wt_core::VerifyStage::Production),
+                "● awaiting production deploy · ready",
+            ),
+            (None, "● awaiting production · ready"),
+        ] {
+            let lines = work_status_lines(&waiting(stage), false);
+            let header = lines[0].to_string();
+            assert!(header.starts_with(expected), "{header}");
+            // The asserted state's own color: nothing is asked of anyone yet.
+            assert_eq!(
+                lines[0].spans[1].style.fg,
+                Some(badges::work_state_color(WorkState::Ready))
+            );
+        }
+        let mut due = waiting(Some(wt_core::VerifyStage::Staging));
+        let work = due.work.as_mut().unwrap();
+        work.verification_waiting = false;
+        work.verification_awaiting_deploy = None;
+        let header = work_status_lines(&due, false)[0].to_string();
+        assert!(header.starts_with("● unverified · ready"), "{header}");
     }
 
     fn section_screen(rows: Vec<BoardRow>, key: &str) -> Vec<String> {

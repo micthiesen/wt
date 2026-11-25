@@ -103,6 +103,9 @@ pub async fn dispatch_automation(
                 ("from".into(), range.from.clone()),
                 ("to".into(), range.to.clone()),
             ]);
+            if let Some(stage) = fire.rule.stage {
+                overrides.insert("stage".into(), stage.as_str().into());
+            }
         }
         if unowned_event {
             action_context.slug = "fleet".into();

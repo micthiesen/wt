@@ -544,6 +544,8 @@ pub struct GitPresentation {
     pub ahead: Option<u32>,
     pub behind: Option<u32>,
     pub landed_on: Option<LandingKind>,
+    /// Whether the landing is deployed, for each stage with a deploy probe.
+    pub deploys: wt_core::StageDeploys,
     pub rebasing: bool,
     /// Unmerged paths in the working tree (a rebase or merge stopped on them).
     pub conflict_files: Vec<String>,
@@ -627,8 +629,11 @@ pub struct WorkPresentation {
     pub age: Option<String>,
     pub stale: Option<bool>,
     pub verification_owed: bool,
-    /// Owed but not yet due: a production check on a branch only in staging.
+    /// Owed but not yet due: a production check on a branch only in staging,
+    /// or a check whose probed stage has not deployed the landing.
     pub verification_waiting: bool,
+    /// The stage whose deploy a landed check waits on.
+    pub verification_awaiting_deploy: Option<wt_core::VerifyStage>,
     pub verification_overdue: bool,
     pub blocked: bool,
 }

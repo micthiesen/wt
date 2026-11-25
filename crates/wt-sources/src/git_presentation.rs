@@ -102,6 +102,7 @@ struct RowSignature<'a> {
     rebase_apply: FileStamp,
     base_ref: Vec<FileStamp>,
     production_ref: Vec<FileStamp>,
+    deployed_refs: Vec<FileStamp>,
     packed_refs: FileStamp,
 }
 
@@ -165,6 +166,7 @@ pub fn start(
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<Metadata>,
     github: SourceHandle<GithubData>,
+    deploys: SourceHandle<crate::deploy_source::DeploySnapshot>,
 ) -> SourceHandle<PresentationMap> {
     let (source, mut publisher) = leaf_channel(scope, facts_spec(context));
     let cancellation = scope.token();
@@ -173,6 +175,9 @@ pub fn start(
         let mut git_updates = git.subscribe();
         let mut metadata_updates = metadata.subscribe();
         let mut github_updates = github.subscribe();
+        // Only a wake-up: a moved deployed ref changes the row signatures,
+        // and the proof itself is read from Git.
+        let mut deploy_updates = deploys.subscribe();
         git_updates.mark_changed();
         metadata_updates.mark_changed();
         github_updates.mark_changed();
@@ -203,6 +208,10 @@ pub fn start(
                 changed = git_updates.changed() => if changed.is_err() { break; },
                 changed = metadata_updates.changed() => if changed.is_err() { break; },
                 changed = github_updates.changed() => if changed.is_err() { break; },
+                changed = deploy_updates.changed() => {
+                    if changed.is_err() { break; }
+                    deploy_updates.borrow_and_update();
+                },
                 _ = retry_timer => {},
                 _ = activity_tick.tick() => {},
             }
@@ -563,6 +572,7 @@ fn apply_facts(
         {
             applied = true;
             row.git.landed_on = fact.presentation.landed_on;
+            row.git.deploys = fact.presentation.deploys;
             row.git.rebasing = fact.presentation.rebasing;
             row.git
                 .conflict_files
@@ -659,6 +669,13 @@ async fn row_signature<'a>(
                 FileStamp::default(),
             )
         };
+    let mut deployed_refs = Vec::new();
+    if let Some(git_dir) = &worktree.git_dir {
+        let common = worktree.common_dir.as_deref().unwrap_or(git_dir);
+        for (stage, _) in context.config.environments.probed() {
+            deployed_refs.push(file_stamp(&common.join(stage.deployed_ref())).await);
+        }
+    }
     let status = row.status.as_ref().map(|status| StatusSignature {
         branch: status.branch.as_deref(),
         head: status.head_sha.as_deref(),
@@ -700,6 +717,7 @@ async fn row_signature<'a>(
         rebase_apply,
         base_ref,
         production_ref,
+        deployed_refs,
         packed_refs,
     }
 }
@@ -964,6 +982,38 @@ async fn enrich(
                     if head_on_production || merge_on_production {
                         result.landed_on = Some(LandingKind::Production);
                     }
+                }
+            }
+            if result.landed_on.is_some() && !context.config.environments.is_empty() {
+                let merge_oid = pr.and_then(|pr| {
+                    wt_core::exact_merged_pr_oid(
+                        pr.head_ref_oid.as_deref(),
+                        head,
+                        &pr.state,
+                        pr.merge_commit_oid.as_deref(),
+                    )
+                });
+                let commits = std::iter::once(head).chain(merge_oid).collect::<Vec<_>>();
+                let separate_production = context.config.branch.separate_production();
+                for (stage, _) in context.config.environments.probed() {
+                    // A deploy cannot be ahead of the Git landing it ships.
+                    let landed = match stage {
+                        wt_core::VerifyStage::Staging => true,
+                        wt_core::VerifyStage::Production => {
+                            result.landed_on == Some(LandingKind::Production)
+                                || !separate_production
+                        }
+                    };
+                    let deployed = landed
+                        && wt_ops::deploys::landing_deployed(
+                            context,
+                            stage,
+                            &commits,
+                            cancellation,
+                        )
+                        .await
+                            == Some(true);
+                    result.deploys.set(stage, Some(deployed));
                 }
             }
         }
@@ -1835,7 +1885,8 @@ mod tests {
             SourceState::Ready,
             Domain::Github,
         ));
-        let facts = start(&scope, &fixture.ctx, git, metadata, github);
+        let deploys = crate::deploy_source::start(&scope, &fixture.ctx).view();
+        let facts = start(&scope, &fixture.ctx, git, metadata, github, deploys);
         let mut updates = facts.subscribe();
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -2062,6 +2113,96 @@ mod tests {
             &["merge", "-q", "--no-ff", "-m", "merge one", "feature/one"],
         );
         assert_eq!(probe(find().await).await, Some(LandingKind::Base));
+    }
+
+    /// With a deploy probe for a stage, a landed row also says whether that
+    /// stage runs it, read from the stage's deployed ref; moving the ref
+    /// invalidates the row's cached facts.
+    #[tokio::test]
+    async fn a_landed_row_reports_whether_each_probed_stage_runs_it() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        Arc::make_mut(&mut fixture.ctx.config).environments.staging =
+            Some(wt_config::EnvironmentConfig {
+                deployed: vec!["unused".into()],
+                ..Default::default()
+            });
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let anchor = git(&main, &["rev-parse", "HEAD"]);
+        let find = || async {
+            fixture
+                .ctx
+                .repository
+                .inventory_status(&fixture.ctx.cancellation)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.worktree.target.branch == "feature/one")
+                .unwrap()
+        };
+        let worktree = PathBuf::from(&find().await.worktree.target.path);
+        let slug = find().await.worktree.target.slug().to_owned();
+        let state = serde_json::json!({"slugs": {slug: {"baseBranch": "main", "baseSha": anchor}}});
+        let facts = || async {
+            let row = find().await;
+            let presentation = enrich(
+                &fixture.ctx,
+                &row,
+                &state,
+                None,
+                &ConflictCache::default(),
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .0;
+            let signature =
+                serde_json::to_string(&row_signature(&row, &state, None, &fixture.ctx).await)
+                    .unwrap();
+            (presentation.landed_on, presentation.deploys, signature)
+        };
+        let unprobed = wt_core::StageDeploys::default();
+        // Not landed: no stage is asked about it.
+        assert_eq!(facts().await.1, unprobed);
+        std::fs::write(worktree.join("own.txt"), "own\n").unwrap();
+        git(&worktree, &["add", "own.txt"]);
+        git(&worktree, &["commit", "-qm", "own work"]);
+        git(
+            &main,
+            &["merge", "-q", "--no-ff", "-m", "merge one", "feature/one"],
+        );
+        let waiting = wt_core::StageDeploys {
+            staging: Some(false),
+            production: None,
+        };
+        // Landed, and the probe has reported nothing yet.
+        let (landed, deploys, before) = facts().await;
+        assert_eq!(landed, Some(LandingKind::Base));
+        assert_eq!(deploys, waiting);
+        // Staging still runs the commit before the merge.
+        git(&main, &["update-ref", "refs/wt/deployed/staging", &anchor]);
+        let (_, deploys, stale) = facts().await;
+        assert_eq!(deploys, waiting);
+        assert_ne!(before, stale);
+        git(&main, &["update-ref", "refs/wt/deployed/staging", "HEAD"]);
+        let (_, deploys, current) = facts().await;
+        assert_eq!(
+            deploys,
+            wt_core::StageDeploys {
+                staging: Some(true),
+                production: None,
+            }
+        );
+        assert_ne!(stale, current);
     }
 
     /// A recorded base that exists only as a remote-tracking ref, or not at

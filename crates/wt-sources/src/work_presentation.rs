@@ -117,7 +117,8 @@ fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
         landed,
         row.git.landed_on == Some(wt_tui::LandingKind::Production),
         separate_production,
-    );
+    )
+    .with_deploys(row.git.deploys);
     let session_state = asking.then_some(DerivedState::Asking);
     let effective = wt_core::effective_work_state(record, session_state, landing);
     let Some(mut work) = row
@@ -143,6 +144,7 @@ fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
     work.verification_owed = wt_core::owes_post_merge_verification(record, landed);
     work.verification_waiting =
         work.verification_owed && !wt_core::verification_due(record, landing);
+    work.verification_awaiting_deploy = wt_core::verification_awaiting_deploy(record, landing);
     work.verification_overdue = wt_core::verification_overdue(record, landing, now_ms);
     // A landed check waiting on promotion has nothing for anyone to do yet.
     row.needs_attention |= !work.verification_waiting
@@ -765,6 +767,63 @@ mod tests {
         assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
         assert!(!work.verification_waiting);
         assert!(row.needs_attention);
+    }
+
+    #[test]
+    fn a_landed_check_waits_quietly_for_its_probed_stage_to_deploy() {
+        let at = "2026-10-08T00:00:00Z";
+        let now = wt_core::parse_iso_millis(at).unwrap() + 3_600_000;
+        let record = WorkStatusRecord {
+            verify_after_merge: Some("check staging".into()),
+            verify_in: Some(wt_core::VerifyStage::Staging),
+            ..WorkStatusRecord::new(WorkState::Ready, at)
+        };
+        let mut row = BoardRow {
+            git: GitPresentation {
+                landed_on: Some(wt_tui::LandingKind::Base),
+                deploys: wt_core::StageDeploys {
+                    staging: Some(false),
+                    production: None,
+                },
+                ..Default::default()
+            },
+            needs_attention: false,
+            work: Some(WorkPresentation {
+                record: Some(record),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        prepare_work(&mut row, false, now);
+        let work = row.work.as_ref().unwrap();
+        assert_eq!(work.effective_state, Some(WorkState::Ready));
+        assert!(work.verification_owed && work.verification_waiting);
+        assert_eq!(
+            work.verification_awaiting_deploy,
+            Some(wt_core::VerifyStage::Staging)
+        );
+        assert!(!work.verification_overdue);
+        assert!(!row.needs_attention);
+        // A probe that never answers must not hide a check owed for days.
+        prepare_work(&mut row, false, now + 3 * 86_400_000);
+        let work = row.work.as_ref().unwrap();
+        assert!(work.verification_waiting && work.verification_overdue);
+
+        row.git.deploys.staging = Some(true);
+        prepare_work(&mut row, false, now);
+        let work = row.work.as_ref().unwrap();
+        assert_eq!(work.effective_state, Some(WorkState::NeedsTesting));
+        assert!(!work.verification_waiting);
+        assert_eq!(work.verification_awaiting_deploy, None);
+        assert!(row.needs_attention);
+        // Without a probe the Git landing alone makes it due, as before.
+        row.git.deploys.staging = None;
+        row.needs_attention = false;
+        prepare_work(&mut row, false, now);
+        assert_eq!(
+            row.work.as_ref().unwrap().effective_state,
+            Some(WorkState::NeedsTesting)
+        );
     }
 
     #[test]

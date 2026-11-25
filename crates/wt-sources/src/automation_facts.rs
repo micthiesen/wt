@@ -290,6 +290,7 @@ pub async fn prepare(
         let clean_candidate = lifecycle.clean_candidate;
         let local_merged = lifecycle.local_merged;
         let in_production = lifecycle.in_production;
+        let deploys = lifecycle.deploys;
         let locked = match FileLock::try_acquire(
             &ctx.config.paths.lock_dir,
             &slug,
@@ -318,6 +319,7 @@ pub async fn prepare(
             local_merged,
             gone: None,
             in_production,
+            deploys,
             clean_candidate,
             pr,
             conflict,
@@ -676,6 +678,31 @@ async fn branch_tips(
             newly_observed.insert(branch.to_owned(), now.clone());
         }
         tips.insert(branch.to_owned(), BranchTip { now, seen });
+    }
+    // A stage's deployed ref is watched like a branch: its watermark is kept
+    // with the branch tips, under the ref's name.
+    let stages = [
+        wt_core::VerifyStage::Staging,
+        wt_core::VerifyStage::Production,
+    ]
+    .into_iter()
+    .filter(|stage| {
+        rules.iter().any(|rule| {
+            rule.on == wt_config::AutomationTrigger::StageDeployed && rule.stage == Some(*stage)
+        })
+    });
+    for stage in stages {
+        let Some(now) = wt_ops::deploys::deployed_oid(ctx, stage, &ctx.cancellation).await else {
+            continue;
+        };
+        let deployed_ref = stage.deployed_ref();
+        let seen = state["branchTips"][&deployed_ref]
+            .as_str()
+            .map(str::to_owned);
+        if seen.is_none() {
+            newly_observed.insert(deployed_ref.clone(), now.clone());
+        }
+        tips.insert(deployed_ref, BranchTip { now, seen });
     }
     Ok(BranchTipFacts {
         tips,

@@ -370,6 +370,8 @@ pub enum AutomationTrigger {
     StatusVerificationOverdue,
     #[serde(rename = "branch.advanced")]
     BranchAdvanced,
+    #[serde(rename = "stage.deployed")]
+    StageDeployed,
     #[serde(rename = "mcp.event")]
     McpEvent,
 }
@@ -393,6 +395,8 @@ pub struct AutomationDef {
     pub after_days: f64,
     pub settle_seconds: f64,
     pub branch: Option<String>,
+    /// `stage.deployed`: the stage whose deploys fire the rule.
+    pub stage: Option<wt_core::VerifyStage>,
     /// `mcp.event`: the `[mcp_servers]` entry to poll.
     pub server: Option<String>,
     /// `mcp.event`: the event type name, such as `comment.created`.
@@ -413,6 +417,7 @@ impl Default for AutomationDef {
             after_days: 2.0,
             settle_seconds: 120.0,
             branch: None,
+            stage: None,
             server: None,
             event: None,
             arguments: BTreeMap::new(),
@@ -478,6 +483,63 @@ impl Default for BranchConfig {
             keep_fresh: Vec::new(),
             production: None,
         }
+    }
+}
+
+/// How wt learns what one stage is running: a command that prints the
+/// deployed commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvironmentConfig {
+    /// Argv, run in the main clone with no shell. The first
+    /// whitespace-delimited token of its stdout is the deployed commit SHA.
+    pub deployed: Vec<String>,
+    pub every_seconds: u64,
+    pub timeout_seconds: u64,
+}
+
+impl EnvironmentConfig {
+    pub const MIN_EVERY_SECONDS: u64 = 15;
+}
+
+impl Default for EnvironmentConfig {
+    fn default() -> Self {
+        Self {
+            deployed: Vec::new(),
+            every_seconds: 60,
+            timeout_seconds: 20,
+        }
+    }
+}
+
+/// Deploy probes by stage. A stage without one is taken to run whatever its
+/// branch holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvironmentsConfig {
+    pub staging: Option<EnvironmentConfig>,
+    pub production: Option<EnvironmentConfig>,
+}
+
+impl EnvironmentsConfig {
+    pub fn get(&self, stage: wt_core::VerifyStage) -> Option<&EnvironmentConfig> {
+        match stage {
+            wt_core::VerifyStage::Staging => self.staging.as_ref(),
+            wt_core::VerifyStage::Production => self.production.as_ref(),
+        }
+    }
+
+    pub fn probed(&self) -> impl Iterator<Item = (wt_core::VerifyStage, &EnvironmentConfig)> {
+        [
+            wt_core::VerifyStage::Staging,
+            wt_core::VerifyStage::Production,
+        ]
+        .into_iter()
+        .filter_map(|stage| self.get(stage).map(|probe| (stage, probe)))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.staging.is_none() && self.production.is_none()
     }
 }
 
@@ -625,6 +687,8 @@ pub struct Config {
     pub tmux: TmuxConfig,
     pub resources: crate::ResourcesConfig,
     pub branch: BranchConfig,
+    /// Deploy probes: `[environments.staging]` and `[environments.production]`.
+    pub environments: EnvironmentsConfig,
     pub stage: StageConfig,
     pub lifecycle: LifecycleConfig,
     pub backend: BackendConfig,

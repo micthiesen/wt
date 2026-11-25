@@ -65,11 +65,15 @@ and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
 The work-status block follows when a status is saved: state,
 risk, age, and commits since the status, then the gate and the note behind a
 rail in the state's color. `OPS`, `REVERT`, `IF WRONG`, and `UNTESTED` note
-fields align under a hanging indent. A post-merge obligation shows its stage
+fields align under a hanging indent; a phased `OPS BEFORE MERGE`-style label
+sits on its own line above its step. A post-merge obligation shows its stage
 (`verify in staging` / `verify in production`) and step count with a two-line
 preview; `V` expands or collapses the steps, and they start expanded once the
 check is due. A production check on a branch that has only reached base reads
-`awaiting production` and does not ask for attention.
+`awaiting production` and does not ask for attention. With a
+[deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes)
+for the check's stage, a landing that stage is not running yet reads
+`awaiting staging deploy` or `awaiting production deploy`, as quietly.
 
 Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
 order and visibility: `branch` (with its landing base), `issue` (also

@@ -29,6 +29,11 @@ pub fn evaluate(
                     fires.push(fire);
                 }
             }
+            AutomationTrigger::StageDeployed => {
+                if let Some(fire) = evaluate_stage(rule, context) {
+                    fires.push(fire);
+                }
+            }
             AutomationTrigger::McpEvent => fires.extend(evaluate_mcp(rule, rows, context)),
             trigger => {
                 for row in rows {
@@ -70,9 +75,11 @@ pub fn evaluate_breaker_resets(
     for rule in rules {
         if matches!(
             rule.on,
-            AutomationTrigger::BranchAdvanced | AutomationTrigger::McpEvent
+            AutomationTrigger::BranchAdvanced
+                | AutomationTrigger::StageDeployed
+                | AutomationTrigger::McpEvent
         ) {
-            // Branch movement and MCP events are each a distinct occurrence;
+            // Branch movement, deploys and MCP events are each a distinct occurrence;
             // no worktree condition clears them.
             continue;
         }
@@ -334,6 +341,7 @@ fn evaluate_row(
         }
         AutomationTrigger::StackParentMerged
         | AutomationTrigger::BranchAdvanced
+        | AutomationTrigger::StageDeployed
         | AutomationTrigger::McpEvent => None,
     }
 }
@@ -639,6 +647,44 @@ fn evaluate_branch(
     })
 }
 
+/// A stage's probe reported a new deployed commit. The watermark lives with
+/// the branch tips, keyed by the stage's deployed ref, and likewise advances
+/// only once a run has started: the first sighting fires nothing.
+fn evaluate_stage(rule: &AutomationDef, context: &AutomationEvalContext) -> Option<AutomationFire> {
+    let stage = rule.stage?;
+    let deployed_ref = stage.deployed_ref();
+    let tip = context.branch_tips.get(&deployed_ref)?;
+    let from = tip.seen.as_ref()?;
+    if from == &tip.now {
+        return None;
+    }
+    let (start, end) = (&from[..from.len().min(7)], &tip.now[..tip.now.len().min(7)]);
+    Some(AutomationFire {
+        rule: rule.clone(),
+        slug: FLEET_SLUG.into(),
+        quiesce_slugs: Vec::new(),
+        fire_keys: vec![format!(
+            "{}:deployed:{}:{}",
+            rule.id,
+            stage.as_str(),
+            tip.now
+        )],
+        stack_id: None,
+        close_issue: None,
+        delete_branch: None,
+        delete_branch_pr: None,
+        branch_range: Some(BranchRange {
+            branch: deployed_ref,
+            from: from.clone(),
+            to: tip.now.clone(),
+        }),
+        frozen_vars: None,
+        frozen_pr: None,
+        mcp_event: None,
+        detail: format!("{} deployed {start}..{end}", stage.as_str()),
+    })
+}
+
 /// One fire per pending event. An event about an artifact a live worktree
 /// recorded as its guide goes to that worktree; it waits while the worktree
 /// is paused, archived or busy. Any other event goes to the manager.
@@ -851,6 +897,7 @@ fn row_landing(row: &AutomationRow, context: &AutomationEvalContext) -> wt_core:
         || row.gone == Some(true)
         || (context.github_fresh && row.pr.as_ref().is_some_and(|pr| pr.state == "MERGED"));
     wt_core::Landing::new(base, row.in_production, context.separate_production)
+        .with_deploys(row.deploys)
 }
 
 /// FNV-1a: fire keys persist in the ledger, so the hash must not change
@@ -1026,6 +1073,129 @@ mod tests {
         production.verify_in = Some(wt_core::VerifyStage::Production);
         row.work = Some(production);
         assert_eq!(evaluate(&[due], &[row], &context).len(), 1);
+    }
+
+    #[test]
+    fn verification_due_waits_for_a_probed_stage_to_deploy_and_overdue_does_not() {
+        let rules = [
+            rule("verify", AutomationTrigger::StatusVerificationDue, "verify"),
+            rule(
+                "nag",
+                AutomationTrigger::StatusVerificationOverdue,
+                "notify",
+            ),
+        ];
+        let mut context = AutomationEvalContext {
+            separate_production: true,
+            now_ms: wt_core::parse_iso_millis("2026-01-01T01:00:00Z").unwrap(),
+            local_day: "2026-01-01".into(),
+            ..AutomationEvalContext::default()
+        };
+        let mut row = row();
+        let mut work = WorkStatusRecord::new(WorkState::Ready, "2026-01-01T00:00:00Z");
+        work.verify_after_merge = Some("check staging".into());
+        work.verify_in = Some(wt_core::VerifyStage::Staging);
+        row.work = Some(work.clone());
+        row.local_merged = Some(true);
+        let fired = |row: &AutomationRow, context: &AutomationEvalContext| {
+            evaluate(&rules, std::slice::from_ref(row), context)
+                .into_iter()
+                .map(|fire| fire.rule.id)
+                .collect::<Vec<_>>()
+        };
+        // Landed in Git; the staging probe has not shown it deployed.
+        row.deploys.staging = Some(false);
+        assert!(fired(&row, &context).is_empty());
+        row.deploys.staging = Some(true);
+        assert_eq!(fired(&row, &context), ["verify"]);
+        // The obligation's key does not depend on how it came due.
+        let probed = evaluate(&rules, std::slice::from_ref(&row), &context)[0]
+            .fire_keys
+            .clone();
+        row.deploys.staging = None;
+        assert_eq!(
+            evaluate(&rules, std::slice::from_ref(&row), &context)[0].fire_keys,
+            probed
+        );
+
+        // A production check waits for the promotion, then for its deploy.
+        work.verify_in = Some(wt_core::VerifyStage::Production);
+        row.work = Some(work);
+        row.deploys = wt_core::StageDeploys {
+            staging: None,
+            production: Some(false),
+        };
+        assert!(fired(&row, &context).is_empty());
+        row.in_production = true;
+        assert!(fired(&row, &context).is_empty());
+        row.deploys.production = Some(true);
+        assert_eq!(fired(&row, &context), ["verify"]);
+
+        // A probe that stopped answering cannot hide a check owed for days.
+        row.deploys.production = Some(false);
+        context.now_ms += 3 * 86_400_000;
+        assert_eq!(fired(&row, &context), ["nag"]);
+    }
+
+    #[test]
+    fn stage_deployed_needs_a_prior_watermark_and_fires_once_per_deployed_commit() {
+        let staging = AutomationDef {
+            stage: Some(wt_core::VerifyStage::Staging),
+            ..rule("released", AutomationTrigger::StageDeployed, "announce")
+        };
+        let deployed_ref = wt_core::VerifyStage::Staging.deployed_ref();
+        let mut context = AutomationEvalContext::default();
+        // No probe result yet: nothing to compare.
+        assert!(evaluate(std::slice::from_ref(&staging), &[], &context).is_empty());
+        // First sight only sets the baseline.
+        context.branch_tips.insert(
+            deployed_ref.clone(),
+            crate::types::BranchTip {
+                now: "abcdef123".into(),
+                seen: None,
+            },
+        );
+        assert!(evaluate(std::slice::from_ref(&staging), &[], &context).is_empty());
+        context.branch_tips.insert(
+            deployed_ref.clone(),
+            crate::types::BranchTip {
+                now: "abcdef123".into(),
+                seen: Some("abcdef123".into()),
+            },
+        );
+        assert!(evaluate(std::slice::from_ref(&staging), &[], &context).is_empty());
+        context.branch_tips.insert(
+            deployed_ref.clone(),
+            crate::types::BranchTip {
+                now: "abcdef123".into(),
+                seen: Some("123456789".into()),
+            },
+        );
+        let fire = evaluate(std::slice::from_ref(&staging), &[], &context)
+            .pop()
+            .unwrap();
+        assert_eq!(fire.slug, FLEET_SLUG);
+        assert_eq!(fire.fire_keys, ["released:deployed:staging:abcdef123"]);
+        assert_eq!(fire.detail, "staging deployed 1234567..abcdef1");
+        assert!(fire.quiesce_slugs.is_empty());
+        let range = fire.branch_range.unwrap();
+        assert_eq!(
+            (range.branch, range.from, range.to),
+            (deployed_ref, "123456789".into(), "abcdef123".into())
+        );
+        // The other stage has its own watermark, and a branch rule never
+        // reads a stage's.
+        let production = AutomationDef {
+            stage: Some(wt_core::VerifyStage::Production),
+            ..staging.clone()
+        };
+        let branch = AutomationDef {
+            branch: Some("main".into()),
+            ..rule("advance", AutomationTrigger::BranchAdvanced, "publish")
+        };
+        assert!(evaluate(&[production, branch], &[], &context).is_empty());
+        // A deploy is an occurrence: nothing observed later clears its breaker.
+        assert!(evaluate_breaker_resets(&[staging], &[], &context).is_empty());
     }
 
     #[test]

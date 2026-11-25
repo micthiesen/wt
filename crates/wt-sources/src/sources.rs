@@ -91,12 +91,14 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
             issues: issues.statuses,
         },
     );
+    let deploys = crate::deploy_source::start(scope, context);
     let git_facts = crate::git_presentation::start(
         scope,
         context,
         local_sources.git.view(),
         local_sources.metadata.view(),
         github.view(),
+        deploys.view(),
     );
     let board = crate::git_presentation::overlay(
         scope,
@@ -151,6 +153,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
             inventory: sessions.inventory.clone(),
             activity: session_activity.clone(),
             edits: local_sources.edits,
+            deploys: deploys.view(),
         },
     );
     let board = crate::update_source::overlay(
