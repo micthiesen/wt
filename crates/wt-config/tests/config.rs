@@ -884,6 +884,15 @@ fn checks_and_notify_are_argv_and_the_watch_trigger_is_reserved() {
             "\n[[checks]]\nid = 'a'\nrun = 'vault has x'\n",
             "checks[0]: ",
         ),
+        // The watch's argument may fill an argument, never pick the program.
+        (
+            "\n[[checks]]\nid = 'a'\nrun = ['{{arg}}', 'x']\n",
+            "checks[0].run[0] is the program to run and cannot be a template",
+        ),
+        (
+            "\n[[checks]]\nid = 'a'\nrun = ['bin/{{slug}}']\n",
+            "checks[0].run[0] is the program to run and cannot be a template",
+        ),
         (
             "\n[[checks]]\nid = 'a'\nrun = ['x']\nevery_seconds = 29\n",
             "checks[0].every_seconds must be at least 30",
@@ -960,6 +969,10 @@ fn environments_name_a_deploy_probe_per_stage_and_reject_anything_else() {
             "environments.production.deployed must be an array of nonempty strings",
         ),
         (
+            "\n[environments.staging]\ndeployed = ['{{main_clone}}/probe']\n",
+            "environments.staging.deployed[0] is the program to run and cannot be a template",
+        ),
+        (
             "\n[environments.staging]\ndeployed = ['x']\nevery_seconds = 14\n",
             "environments.staging.every_seconds must be at least 15",
         ),
@@ -1003,8 +1016,9 @@ fn stage_deployed_rules_need_a_probed_stage_and_probes_shorten_the_verification_
     assert_eq!(settle("", due.to_owned()), 600.0);
     assert_eq!(settle("", format!("{production}{due}")), 600.0);
     assert_eq!(settle(promoted, format!("{staging}{due}")), 600.0);
-    // Every stage that can come due is probed.
-    assert_eq!(settle("", format!("{staging}{due}")), 30.0);
+    // One probe is not both, with or without a production branch.
+    assert_eq!(settle("", format!("{staging}{due}")), 600.0);
+    assert_eq!(settle("", format!("{staging}{production}{due}")), 30.0);
     assert_eq!(
         settle(promoted, format!("{staging}{production}{due}")),
         30.0

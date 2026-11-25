@@ -1251,6 +1251,12 @@ fn parse_environments(raw: &toml::Value, errors: &mut Vec<String>) -> Environmen
             errors.push(format!("{tag}.deployed must be an array of nonempty strings (argv, not a shell command) that prints the deployed commit SHA"));
             continue;
         }
+        if probe.deployed[0].contains("{{") {
+            errors.push(format!(
+                "{tag}.deployed[0] is the program to run and cannot be a template"
+            ));
+            continue;
+        }
         if probe.every_seconds < EnvironmentConfig::MIN_EVERY_SECONDS {
             errors.push(format!(
                 "{tag}.every_seconds must be at least {}",
@@ -1309,6 +1315,12 @@ fn parse_checks(raw: &toml::Value, errors: &mut Vec<String>) -> Vec<CheckConfig>
         }
         if check.run.is_empty() || check.run.iter().any(|arg| arg.trim().is_empty()) {
             errors.push(format!("{tag}.run must be an array of nonempty strings (argv, not a shell command) that exits 0 when the check holds and 1 when it does not yet"));
+            continue;
+        }
+        // The argument comes from whoever sets the watch; it may fill an
+        // argument, never choose the program.
+        if check.run[0].contains("{{") {
+            errors.push(format!("{tag}.run[0] is the program to run and cannot be a template such as {{{{arg}}}}; pass the value as a later argument"));
             continue;
         }
         if check.every_seconds < CheckConfig::MIN_EVERY_SECONDS {
@@ -1638,7 +1650,7 @@ fn parse_automations(
             after_days: input.after_days.unwrap_or(2.0),
             settle_seconds: input
                 .settle_seconds
-                .unwrap_or_else(|| default_settle(on, branch, environments)),
+                .unwrap_or_else(|| default_settle(on, environments)),
             branch: branch_name,
             stage,
             server: input.server,
@@ -1705,11 +1717,7 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::WatchMet => WATCH_TRIGGER,
     }
 }
-fn default_settle(
-    on: AutomationTrigger,
-    branch: &BranchConfig,
-    environments: &EnvironmentsConfig,
-) -> f64 {
+fn default_settle(on: AutomationTrigger, environments: &EnvironmentsConfig) -> f64 {
     match on {
         AutomationTrigger::WtCreated
         | AutomationTrigger::StatusNeedsHuman
@@ -1719,12 +1727,12 @@ fn default_settle(
         | AutomationTrigger::StatusVerificationOverdue
         | AutomationTrigger::McpEvent
         | AutomationTrigger::WatchMet => 0.0,
-        // With a deploy probe for every stage a check can come due on, the
-        // trigger itself waits for the deploy and the settle only lets the
-        // new release start serving.
+        // With a deploy probe for both stages, the trigger itself waits for
+        // the deploy and the settle only lets the new release start serving.
+        // One probe is not enough even without a separate production
+        // branch: a production check then comes due on the Git landing.
         AutomationTrigger::StatusVerificationDue
-            if environments.staging.is_some()
-                && (environments.production.is_some() || !branch.separate_production()) =>
+            if environments.staging.is_some() && environments.production.is_some() =>
         {
             30.0
         }

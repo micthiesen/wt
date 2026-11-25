@@ -349,6 +349,11 @@ enum Command {
     /// the smoke test"`, `wt wake 17:00 -m "check the nightly job"`.
     Wake(commands::watch::WakeArgs),
     /// Tell the person once conditions hold.
+    ///
+    /// A desktop banner (and the `[notify]` command when configured) says
+    /// what held, or your text. Use it for news that needs no session:
+    /// `wt notify pr:3806:production`, `wt notify release:production+24h -m
+    /// "soak is over"`, `wt notify 5pm -m "stand-up"`.
     Notify(commands::watch::NotifyArgs),
     /// List, cancel or check watches: what worktrees are waiting for.
     Watch(commands::watch::WatchArgs),

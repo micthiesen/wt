@@ -11,8 +11,8 @@ use wt_core::{
 };
 
 use crate::{
-    NewWatch, RemovedWorktree, RepositoryIdentity, Store, WatchRefusal, WatchSelector,
-    WorkStatusRecord,
+    NewWatch, RemovedWorktree, RepositoryIdentity, Store, UnblockDelivery, WatchRefusal,
+    WatchSelector, WorkStatusRecord,
 };
 
 /// 2026-11-24 12:00:00 UTC.
@@ -109,6 +109,7 @@ fn watch_events(store: &Store, slug: &str) -> Vec<(WatchChange, String, Option<S
                 reason,
                 by: _,
                 then: _,
+                id: _,
             } => Some((change, what, reason)),
             _ => None,
         })
@@ -211,8 +212,10 @@ fn a_watch_with_nothing_to_wait_for_or_to_do_is_refused() {
 #[test]
 fn watches_are_capped_per_worktree_and_per_repository() {
     let (_temp, mut store) = store();
-    for _ in 0..WATCHES_PER_SLUG_MAX {
-        add(&mut store, "one", &["merged"], notify());
+    // Each tells the person something else: the same watch twice is one.
+    let telling = |index: usize| then(|then| then.notify = Some(format!("news {index}")));
+    for index in 0..WATCHES_PER_SLUG_MAX {
+        add(&mut store, "one", &["merged"], telling(index));
     }
     let refusal = store
         .add_watch(new("one", &["merged"], notify()), NOON)
@@ -221,8 +224,13 @@ fn watches_are_capped_per_worktree_and_per_repository() {
     assert_eq!(refusal, WatchRefusal::TooManyForSlug { slug: "one".into() });
     assert!(refusal.to_string().contains("one already has 20 watches"));
     for slug in 1..WATCHES_MAX / WATCHES_PER_SLUG_MAX {
-        for _ in 0..WATCHES_PER_SLUG_MAX {
-            add(&mut store, &format!("slug-{slug}"), &["merged"], notify());
+        for index in 0..WATCHES_PER_SLUG_MAX {
+            add(
+                &mut store,
+                &format!("slug-{slug}"),
+                &["merged"],
+                telling(index),
+            );
         }
     }
     assert_eq!(
@@ -521,23 +529,54 @@ fn a_gate_watch_lives_and_dies_with_the_gate_text_it_witnessed() {
     assert!(store.clear_slug_work_status("one", None).unwrap());
     assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
 
-    // A met watch is already being delivered: its remaining actions stay
-    // for the delivery, whose own write clears the gate.
-    store
-        .set_slug_work_status("one", Some(&status(Some("after #9"))))
-        .unwrap();
-    let met = add(&mut store, "one", &["#9"], gate("after #9"));
-    let stamps = evaluate(&met, &pr_merged(9), NOON).stamps.unwrap();
-    store.apply_evaluation(&[stamps]).unwrap();
+    // So does a met watch not yet delivered, wake included: left behind,
+    // it would clear a later gate that reads the same.
+    let met_gate = |store: &mut Store| {
+        store
+            .set_slug_work_status("one", Some(&status(Some("after #9"))))
+            .unwrap();
+        let met = add(store, "one", &["#9"], gate("after #9"));
+        let stamps = evaluate(&met, &pr_merged(9), NOON).stamps.unwrap();
+        store.apply_evaluation(&[stamps]).unwrap();
+        met
+    };
+    met_gate(&mut store);
     store
         .set_slug_work_status("one", Some(&status(None)))
         .unwrap();
+    assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
+    assert_eq!(changes(&store, "one").last(), Some(&WatchChange::Cancelled));
+
+    // A build that cancels no watches cleared the gate, and it is set again
+    // with the same words: the met watch witnessed the earlier gate.
+    let met = met_gate(&mut store);
+    let mut state = store.read_wt_state().unwrap();
+    state["slugs"]["one"]["work"]
+        .as_object_mut()
+        .unwrap()
+        .remove("blockedOn");
+    store
+        .write_repository_state_json(&state.to_string())
+        .unwrap();
     assert_eq!(ids(&mut store), [reminder.id.clone(), met.id.clone()]);
-    assert!(
-        store
-            .complete_action(&met.id, WatchAction::Unblock)
-            .unwrap()
+    let mut again = status(Some("after #9"));
+    again.note = Some("set again".into());
+    let write = store
+        .update_slug_work_status("one", |_| Ok::<_, ()>(Some(again)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        write
+            .cancelled_watches
+            .iter()
+            .map(|watch| (watch.id.as_str(), watch.then.wake.as_deref()))
+            .collect::<Vec<_>>(),
+        [(met.id.as_str(), Some("go on"))]
     );
+    assert_eq!(ids(&mut store), std::slice::from_ref(&reminder.id));
+    store
+        .set_slug_work_status("one", Some(&status(None)))
+        .unwrap();
 
     // The explicit cancel takes the gate's watch whatever its state.
     assert_eq!(
@@ -608,29 +647,28 @@ fn a_watch_does_not_pass_to_the_next_worktree_with_its_slug() {
     let (_temp, mut store) = store();
     let old = add(&mut store, "one", &["merged"], wake());
     let unrecorded = add(&mut store, "old", &["merged"], wake());
-    // The same incarnation, and a worktree whose creation was never
+    // The same incarnation, and a worktree whose creation is still not
     // recorded, keep their watches.
-    let same = live(&[("one", CREATED), ("old", "2026-11-20T00:00:00Z")]);
+    let mut same = live(&[("one", CREATED)]);
+    same.insert("old".to_owned(), None);
     assert_eq!(
         store.drop_orphans(&same, &BTreeMap::new(), NOON).unwrap(),
         []
     );
     assert_eq!(store.list_watches(None).unwrap().len(), 2);
 
-    let reborn = live(&[("one", "2026-11-24T13:00:00Z")]);
+    // A worktree created later has a recorded creation: it is not the
+    // unrecorded one, whatever the slug.
+    let reborn = live(&[
+        ("one", "2026-11-24T13:00:00Z"),
+        ("old", "2026-11-24T13:00:00Z"),
+    ]);
     let dropped = store.drop_orphans(&reborn, &BTreeMap::new(), NOON).unwrap();
     assert_eq!(dropped, [old, unrecorded]);
     assert_eq!(store.list_watches(None).unwrap(), []);
     // The new worktree's history does not report the old one's watch.
     assert_eq!(changes(&store, "one"), [WatchChange::Set]);
-    assert_eq!(
-        watch_events(&store, "old")[1],
-        (
-            WatchChange::Dropped,
-            "merged".to_owned(),
-            Some("its worktree was removed".to_owned())
-        )
-    );
+    assert_eq!(changes(&store, "old"), [WatchChange::Set]);
     assert_eq!(
         store.drop_orphans(&reborn, &BTreeMap::new(), NOON).unwrap(),
         []
@@ -802,7 +840,7 @@ fn an_earlier_incarnations_removal_record_says_nothing_about_a_later_watch() {
 }
 
 #[test]
-fn a_cleared_gate_is_remembered_and_an_action_that_cannot_happen_is_given_up() {
+fn clearing_the_gate_is_one_write_and_a_changed_gate_takes_the_watch_with_it() {
     let (_temp, mut store) = store();
     store
         .set_slug_work_status("one", Some(&status(Some("after #7"))))
@@ -813,42 +851,113 @@ fn a_cleared_gate_is_remembered_and_an_action_that_cannot_happen_is_given_up() {
             then.wake = Some("test it".into());
         })
     };
+    let gate = |store: &mut Store| {
+        store.read_wt_state().unwrap()["slugs"]["one"]["work"]["blockedOn"]
+            .as_str()
+            .map(str::to_owned)
+    };
     let watch = add(&mut store, "one", &["#7"], both());
     assert_eq!(crate::cleared_gate(&watch), None);
-    store
-        .complete_action(&watch.id, WatchAction::Unblock)
-        .unwrap();
+    // The gate is cleared with the record that it was, and the watch keeps
+    // its wake through its own write.
+    assert_eq!(
+        store.deliver_unblock(&watch.id).unwrap(),
+        UnblockDelivery::Cleared
+    );
+    assert_eq!(gate(&mut store), None);
     let left = store.list_watches(None).unwrap().remove(0);
     assert_eq!(crate::cleared_gate(&left), Some("after #7"));
-    store.complete_action(&watch.id, WatchAction::Wake).unwrap();
-
-    // The gate was rewritten after the watch was met: the unblock is given
-    // up, the wake is still owed and says nothing of a cleared gate.
-    let watch = add(&mut store, "one", &["#7"], both());
-    assert!(
-        store
-            .abandon_action(&watch.id, WatchAction::Unblock, "the gate changed")
-            .unwrap()
-    );
-    assert!(
-        !store
-            .abandon_action(&watch.id, WatchAction::Unblock, "the gate changed")
-            .unwrap()
-    );
-    let left = store.list_watches(None).unwrap().remove(0);
     assert_eq!(
         left.then.remaining().collect::<Vec<_>>(),
         [WatchAction::Wake]
     );
-    assert_eq!(crate::cleared_gate(&left), None);
+    // A second delivery (a retried fire, or the pass that finds the fire
+    // in the ledger) owes nothing, even with the same gate set again.
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #7"))))
+        .unwrap();
+    assert_eq!(
+        store.deliver_unblock(&watch.id).unwrap(),
+        UnblockDelivery::NotOwed
+    );
+    assert_eq!(gate(&mut store).as_deref(), Some("after #7"));
+    assert_eq!(
+        store.deliver_unblock("nosuch").unwrap(),
+        UnblockDelivery::NotOwed
+    );
+    store.complete_action(&watch.id, WatchAction::Wake).unwrap();
+
+    // A build that cancels no watches rewrote the gate: it stays, and the
+    // watch goes whole, because the gate its wake was to follow is gone.
+    let watch = add(&mut store, "one", &["#7"], both());
+    let mut state = store.read_wt_state().unwrap();
+    state["slugs"]["one"]["work"]["blockedOn"] = "after #7 and #8".into();
+    store
+        .write_repository_state_json(&state.to_string())
+        .unwrap();
+    assert_eq!(
+        store.deliver_unblock(&watch.id).unwrap(),
+        UnblockDelivery::GateChanged
+    );
+    assert_eq!(gate(&mut store).as_deref(), Some("after #7 and #8"));
+    assert_eq!(store.list_watches(None).unwrap(), []);
     assert_eq!(
         watch_events(&store, "one").last().unwrap(),
         &(
             WatchChange::Dropped,
-            left.summary(),
-            Some("the gate changed".to_owned())
+            watch.summary(),
+            Some("the gate it was to clear was cleared or changed".to_owned())
         )
     );
+}
+
+#[test]
+fn setting_the_same_watch_again_returns_the_one_already_set() {
+    let (_temp, mut store) = store();
+    let first = add(&mut store, "one", &["#7", "17:00"], wake());
+    assert_eq!(
+        store
+            .add_watch(new("one", &["pr:7:merged", "17:00"], wake()), NOON + 5)
+            .unwrap(),
+        Err(WatchRefusal::AlreadySet {
+            watch: Box::new(first)
+        })
+    );
+    // Another prompt, another condition or another setter is another watch.
+    add(
+        &mut store,
+        "one",
+        &["#7", "17:00"],
+        then(|then| then.wake = Some("something else".into())),
+    );
+    add(&mut store, "one", &["#7"], wake());
+    let managers = NewWatch {
+        by: "manager".into(),
+        ..new("one", &["#7", "17:00"], wake())
+    };
+    store.add_watch(managers, NOON).unwrap().unwrap();
+    assert_eq!(store.list_watches(None).unwrap().len(), 4);
+}
+
+#[test]
+fn a_gate_watch_set_again_without_a_wake_keeps_the_one_it_had() {
+    let (_temp, mut store) = store();
+    store
+        .set_slug_work_status("one", Some(&status(Some("after #7"))))
+        .unwrap();
+    let gate = |wake: Option<&str>| {
+        then(|then| {
+            then.unblock = Some("after #7".into());
+            then.wake = wake.map(str::to_owned);
+        })
+    };
+    add(&mut store, "one", &["#7"], gate(Some("verify it")));
+    let again = add(&mut store, "one", &["#7:production"], gate(None));
+    assert_eq!(again.then.wake.as_deref(), Some("verify it"));
+    // A wake given now replaces it.
+    let replaced = add(&mut store, "one", &["#7:production"], gate(Some("other")));
+    assert_eq!(replaced.then.wake.as_deref(), Some("other"));
+    assert_eq!(store.list_watches(None).unwrap(), [replaced]);
 }
 
 #[test]
@@ -877,7 +986,7 @@ fn a_menu_sets_and_cancels_only_on_the_worktree_it_showed() {
             .add_watch_seen(human(&["ready"]), NOON, Some(CREATED))
             .unwrap(),
         Err(WatchRefusal::AlreadySet {
-            id: watch.id.clone()
+            watch: Box::new(watch.clone())
         })
     );
     // An agent waiting for the same thing is not the person's watch.

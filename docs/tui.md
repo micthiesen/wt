@@ -256,7 +256,9 @@ you (`wt notify`, or `W` on the row). Such a row wears a bell at the left of
 its badge cluster: teal while it waits, yellow when a condition cannot be read
 right now (a probe that fails, a pull request GitHub will not show), since
 that watch may never fire, and green once everything it waited for held and wt
-is delivering. The bell is not the gate's yellow circle-slash: a gate asks
+is delivering. While automations are paused, for the row or everywhere, a
+watch whose conditions held is not delivered: its bell stays teal and its
+line reads `held: automations paused` instead of `delivering`. The bell is not the gate's yellow circle-slash: a gate asks
 for someone, a watch does not. A folded section's header counts markers only,
 so it never shows a bell its rows would not.
 
@@ -265,15 +267,21 @@ In the details pane a gate that clears itself says so under its
 unknown with the reason dim beside it:
 
     blocked on: prod secret missing
-    clears when ✓ #3806 in production and ? check secret=API_KEY (check
-    secret exited 2: vault sealed), then wakes the session · Deploy the fix
+    clears when ✓ #3806 in production and ? check secret=API_KEY (exited 2:
+    vault sealed), then wakes the session · Deploy the fix
+
+Once wt has cleared the gate, what that watch still owes (its wake) moves to
+a line of its own until it is delivered.
 
 Every other watch is one line below the status block, wrapped like it on a
 narrow pane: `wakes 17:00 (in 2h10m) · Run the smoke test` for a wake at a
 time, `wakes when ○ PR checks green · ...` for one on a condition, and `tells
 you when ○ merged` for a notification. A wake's prompt or a notification's
-text follows, cut to its first line; `by <who>` names a setter that is neither
-the row's own agent nor you; `delivering` marks one whose conditions held.
+text follows, cut to its first line that says anything; `by <who>` names a
+setter that is neither the row's own agent nor you; `delivering` marks one
+whose conditions held. A long condition wraps with the line rather than being
+cut. The pane lists six watches per row and counts the rest as
+`+N more (wt watch)`.
 Times are in this machine's clock (`tomorrow 09:00`, `Mon 30 Nov 09:00`), and
 the countdown is refreshed at least every 30 seconds while anything waits.
 

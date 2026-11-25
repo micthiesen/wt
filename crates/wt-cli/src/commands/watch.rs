@@ -21,7 +21,7 @@ use wt_core::{
 use wt_ops::commands::resolve::resolve_worktree;
 use wt_store::{NewWatch, WatchRefusal, WatchSelector};
 
-const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, +3h, 2026-11-25T17:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request (pr:3806, pr:3806:production), another worktree (<slug>:merged, <slug>:gone), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
+const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, 5pm, 3h, \"tomorrow 09:00\", 2026-11-25T17:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request (pr:3806, pr:3806:production), another worktree (wt:<slug>:merged, wt:<slug>:gone; <slug>:merged also reads), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
 
 #[derive(Debug, Clone, Args)]
 pub struct WakeArgs {
@@ -70,7 +70,7 @@ pub struct WatchArgs {
     pub all: bool,
     /// Print an array: id, slug, by, created_at, when (arg, description,
     /// state: holds, not_yet, unknown or not_evaluated_yet, and reason),
-    /// then, met_at, last_error, evaluated_at, evaluating.
+    /// then, met_at, last_error, evaluated_at, owner_gone, evaluating.
     #[arg(long)]
     pub json: bool,
     /// The worktree whose watches to list (default: the current one).
@@ -80,7 +80,8 @@ pub struct WatchArgs {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum WatchCommand {
-    /// Cancel watches by id, or every watch you set on this worktree.
+    /// Cancel watches by id, whoever set them, or (--mine) every watch you
+    /// set on this worktree.
     Cancel {
         /// Watch ids, as `wt watch` lists them.
         #[arg(value_name = "ID")]
@@ -217,6 +218,48 @@ pub(crate) struct ReadConditions {
     pub when: Vec<WatchCondition>,
     /// What the conditions mean here that their words do not say.
     pub notes: Vec<String>,
+    /// What looks like a mistake but may be meant.
+    pub warnings: Vec<String>,
+}
+
+impl ReadConditions {
+    pub(crate) fn print(&self) {
+        for warning in &self.warnings {
+            println!("  warning: {warning}");
+        }
+        // Not "note": that is the status note's label.
+        for note in &self.notes {
+            println!("  hint: {note}");
+        }
+    }
+}
+
+/// What to say about a condition on a worktree that is not there. `live`
+/// is every live worktree's slug.
+fn absent_worktree(cond: &Condition, live: &[String]) -> Option<String> {
+    let known = |slug: &String| live.contains(slug);
+    match cond {
+        Condition::Worktree { slug, state } if !known(slug) => Some(format!(
+            "no worktree named {slug} right now; this waits until one exists and reaches {}",
+            state.as_str()
+        )),
+        Condition::Gone { slug } if !known(slug) => Some(format!(
+            "no worktree named {slug} right now, so this holds already"
+        )),
+        _ => None,
+    }
+}
+
+async fn live_slugs(ctx: &AppContext) -> Result<Vec<String>, String> {
+    Ok(ctx
+        .repository
+        .inventory(&ctx.cancellation)
+        .await
+        .map_err(|error| format!("cannot list the worktrees: {error:#}"))?
+        .iter()
+        .filter(|record| !record.is_main)
+        .map(|record| record.target.slug().to_owned())
+        .collect())
 }
 
 /// Read condition arguments for a watch about to be set. A release
@@ -233,9 +276,16 @@ pub(crate) async fn read_conditions(
     let mut read = ReadConditions {
         when: Vec::new(),
         notes: Vec::new(),
+        warnings: Vec::new(),
     };
+    let live = live_slugs(ctx).await?;
     for arg in args {
         let mut cond = parse(arg, clock).map_err(|error| error.to_string())?;
+        if let Some(warning) = absent_worktree(&cond.cond, &live)
+            && !read.warnings.contains(&warning)
+        {
+            read.warnings.push(warning);
+        }
         if let Some((note, true)) = config_fact(&ctx.config, &cond.cond)?
             && !read.notes.contains(&note)
         {
@@ -265,14 +315,32 @@ async fn owner(ctx: &AppContext, slug: Option<&str>) -> Result<String, String> {
     }
 }
 
-/// Store a watch. `Err` carries what to do instead.
+/// What [`set`] stored, or found stored.
+pub(crate) struct SetWatch {
+    pub watch: Watch,
+    /// The same watch was pending already: nothing was written.
+    pub already: bool,
+}
+
+/// Store a watch. `Err` carries what to do instead. A session cannot be
+/// woken about its own worktree being gone, so that is refused here for
+/// every command that sets a wake.
 pub(crate) async fn set(
     ctx: &AppContext,
     slug: &str,
     when: Vec<WatchCondition>,
     then: WatchActions,
     clock: LocalClock,
-) -> Result<Result<Watch, String>> {
+) -> Result<Result<SetWatch, String>> {
+    if then.wake.is_some()
+        && when
+            .iter()
+            .any(|cond| matches!(&cond.cond, Condition::Gone { slug: gone } if gone == slug))
+    {
+        return Ok(Err(format!(
+            "{slug}'s session cannot be woken once {slug} is gone: there is nothing left to wake. To be told instead: wt notify wt:{slug}:gone"
+        )));
+    }
     let new = NewWatch {
         slug: slug.to_owned(),
         by: author(),
@@ -284,22 +352,40 @@ pub(crate) async fn set(
         .database
         .call(move |store| Ok(store.add_watch(new, clock.now_ms)?))
         .await?;
-    Ok(added.map_err(|refusal| match refusal {
-        WatchRefusal::TooManyForSlug { .. } | WatchRefusal::TooMany => {
-            format!("{refusal}: list them with `wt watch --all` and cancel with `wt watch cancel <id>`")
+    Ok(match added {
+        Ok(watch) => Ok(SetWatch {
+            watch,
+            already: false,
+        }),
+        // Agents retry commands: the second run is the first one's watch.
+        Err(WatchRefusal::AlreadySet { watch }) => Ok(SetWatch {
+            watch: *watch,
+            already: true,
+        }),
+        Err(refusal @ (WatchRefusal::TooManyForSlug { .. } | WatchRefusal::TooMany)) => {
+            Err(format!(
+                "{refusal}: list them with `wt watch --all` and cancel with `wt watch cancel <id>`"
+            ))
         }
-        WatchRefusal::GateChanged { .. } => {
-            format!("{refusal}; set the gate and its condition together: wt status --blocked-on \"<why>\" --until <condition>")
-        }
-        other => other.to_string(),
-    }))
+        Err(refusal @ WatchRefusal::GateChanged { .. }) => Err(format!(
+            "{refusal}; set the gate and its condition together: wt status --blocked-on \"<why>\" --until <condition>"
+        )),
+        Err(other) => Err(other.to_string()),
+    })
 }
 
-async fn report_set(ctx: &AppContext, watch: &Watch, does: &str, notes: &[String]) {
-    println!("✓ watch {}: {does} when {}", watch.id, watch.summary());
-    for note in notes {
-        println!("  note: {note}");
+async fn report_set(ctx: &AppContext, set: &SetWatch, does: &str, read: &ReadConditions) {
+    let watch = &set.watch;
+    if set.already {
+        println!(
+            "already set: watch {}: {does} when {}",
+            watch.id,
+            watch.summary()
+        );
+    } else {
+        println!("✓ watch {}: {does} when {}", watch.id, watch.summary());
     }
+    read.print();
     println!("  cancel: wt watch cancel {}", watch.id);
     if !super::automations::engine_running(ctx).await {
         println!(
@@ -313,13 +399,19 @@ fn clean(text: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// A prompt keeps its line breaks: steps written as lines arrive as lines.
+pub(crate) fn clean_prompt(text: &str) -> Option<String> {
+    let text = wt_core::sanitize_terminal_lines(text);
+    (!text.is_empty()).then_some(text)
+}
+
 pub async fn run_wake(ctx: &AppContext, args: &WakeArgs) -> Result<i32> {
     // Before -m: a shell comment takes the conditions and -m together.
     if no_conditions(&args.conditions) {
         eprintln!("{NO_CONDITIONS}");
         return Ok(2);
     }
-    let Some(prompt) = args.message.as_deref().and_then(clean) else {
+    let Some(prompt) = args.message.as_deref().and_then(clean_prompt) else {
         eprintln!("-m needs what the session should do once the conditions hold");
         return Ok(2);
     };
@@ -368,15 +460,27 @@ async fn set_and_report(
     } else {
         "tells you".to_owned()
     };
-    match set(ctx, &slug, read.when, then, clock).await? {
-        Ok(watch) => {
-            report_set(ctx, &watch, &does, &read.notes).await;
+    let when = read.when.clone();
+    match set(ctx, &slug, when, then, clock).await? {
+        Ok(set) => {
+            report_set(ctx, &set, &does, &read).await;
             Ok(0)
         }
         Err(message) => {
             eprintln!("{message}");
             Ok(1)
         }
+    }
+}
+
+/// What cancelling a watch leaves behind that its setter may not expect.
+fn print_cancelled(watch: &Watch) {
+    println!("✓ cancelled {} ({})", watch.id, watch.summary());
+    if let Some(gate) = &watch.then.unblock {
+        println!(
+            "  the gate \"{gate}\" stays set and no longer clears by itself; clear it with: wt status {} --unblock",
+            watch.slug
+        );
     }
 }
 
@@ -497,7 +601,7 @@ pub async fn run_watch(ctx: &AppContext, args: &WatchArgs) -> Result<i32> {
         Some(WatchCommand::Cancel { ids, mine, slug }) => {
             return cancel(ctx, ids, *mine, slug.as_deref()).await;
         }
-        Some(WatchCommand::Check { conditions }) => return Ok(check(&ctx.config, conditions)),
+        Some(WatchCommand::Check { conditions }) => return check(ctx, conditions).await,
         None => {}
     }
     // Outside a worktree there is no "this worktree": show them all.
@@ -573,9 +677,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
         if cancelled.is_empty() {
             println!("{by} has set no watches on {slug}");
         }
-        for watch in cancelled {
-            println!("✓ cancelled {} ({})", watch.id, watch.summary());
-        }
+        cancelled.iter().for_each(print_cancelled);
         return Ok(0);
     }
     if ids.is_empty() {
@@ -589,9 +691,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
             Ok(store.cancel_watches(WatchSelector::Ids(&wanted), cancelled_by.as_deref())?)
         })
         .await?;
-    for watch in &cancelled {
-        println!("✓ cancelled {} ({})", watch.id, watch.summary());
-    }
+    cancelled.iter().for_each(print_cancelled);
     let missing = ids
         .iter()
         .filter(|id| !cancelled.iter().any(|watch| watch.id == **id))
@@ -604,8 +704,16 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
     Ok(i32::from(!missing.is_empty()))
 }
 
-fn check(config: &Config, conditions: &[String]) -> i32 {
+async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
+    let config = &ctx.config;
     let clock = clock();
+    let live = match live_slugs(ctx).await {
+        Ok(live) => live,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(1);
+        }
+    };
     let mut failed = false;
     for arg in conditions {
         let cond = match parse(arg, clock) {
@@ -620,6 +728,9 @@ fn check(config: &Config, conditions: &[String]) -> i32 {
         if let Condition::At { .. } = cond.cond {
             println!("  at {} local time", cond.to_arg(clock.utc_offset_minutes));
         }
+        if let Some(warning) = absent_worktree(&cond.cond, &live) {
+            println!("  warning: {warning}");
+        }
         match config_fact(config, &cond.cond) {
             Ok(Some((fact, _))) => println!("  {fact}"),
             Ok(None) => {}
@@ -629,7 +740,7 @@ fn check(config: &Config, conditions: &[String]) -> i32 {
             }
         }
     }
-    if failed { 2 } else { 0 }
+    Ok(if failed { 2 } else { 0 })
 }
 
 #[cfg(test)]
@@ -701,9 +812,10 @@ mod tests {
 
         // The watch's one recorded problem is shown on the condition it is about.
         watch.last_error = Some("check secret exited 3: vault sealed".into());
+        // The condition already names the check.
         assert_eq!(
             state(&watch, 3, NOON, true),
-            Shown::Unknown("check secret exited 3: vault sealed".into())
+            Shown::Unknown("exited 3: vault sealed".into())
         );
         assert_eq!(state(&watch, 4, NOON, true), Shown::NotYet(None));
         watch.last_error = Some("#7 was closed without merging; still waiting".into());
@@ -724,7 +836,7 @@ mod tests {
         };
         assert_eq!(
             listing_text(&watch, clock, true),
-            "aaaaaa  one  set by one, 1m ago\n  not yet  17:00 today\n  holds    merged\n  not evaluated yet #7 in production (the wt TUI evaluates watches)\n  not evaluated yet PR checks green (the wt TUI evaluates watches)\n  then: clear the gate \"the release\"\n  then: wake the session: Run the smoke test."
+            "aaaaaa  one  set by one, 1m ago\n  not yet  17:00\n  holds    merged\n  not evaluated yet #7 in production (the wt TUI evaluates watches)\n  not evaluated yet PR checks green (the wt TUI evaluates watches)\n  then: clear the gate \"the release\"\n  then: wake the session: Run the smoke test."
         );
         let listed = listing_json(&watch, clock, true);
         // A condition prints as it can be typed back, without a # for a
@@ -861,6 +973,10 @@ mod tests {
             slug: None,
         };
         assert_eq!(run_wake(ctx, &lost).await.unwrap(), 2);
+        assert_eq!(
+            clean_prompt("\n1. Deploy.\x1b[2J\n\n2. Verify.\n").as_deref(),
+            Some("1. Deploy.\n\n2. Verify.")
+        );
         let lost = NotifyArgs {
             conditions: Vec::new(),
             message: None,
@@ -893,6 +1009,42 @@ mod tests {
             slug: Some("one".into()),
         };
         assert_eq!(run_notify(ctx, &notify).await.unwrap(), 0);
+        // The same command again (agents retry) sets nothing new.
+        assert_eq!(run_notify(ctx, &notify).await.unwrap(), 0);
+        // A session cannot be woken once its own worktree is gone; being
+        // told about it is fine.
+        assert_eq!(
+            run_wake(ctx, &wake(&["one:gone"], Some("one")))
+                .await
+                .unwrap(),
+            1
+        );
+        // A worktree that is not there is accepted, with a warning.
+        let read = read_conditions(
+            ctx,
+            &[
+                "ghost:merged".into(),
+                "wt:ghost:gone".into(),
+                "two:ready".into(),
+            ],
+            clock(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read.warnings,
+            [
+                "no worktree named ghost right now; this waits until one exists and reaches merged",
+                "no worktree named ghost right now, so this holds already",
+            ]
+        );
+        // The argument of a check is one argv entry of someone's command.
+        assert_eq!(
+            run_wake(ctx, &wake(&["check:secret=--force"], None))
+                .await
+                .unwrap(),
+            2
+        );
 
         let list = || async {
             ctx.database

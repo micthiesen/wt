@@ -145,7 +145,12 @@ fn unavailable(row: &BoardRow, policy: &DisplayPolicy, state: &str) -> Option<St
         row.git.landed_on == Some(LandingKind::Production),
         policy.production,
     )
-    .with_deploys(row.git.deploys);
+    // A probed stage the row carries no deploy answer for is not known to
+    // be running the change.
+    .with_deploys(row.git.deploys.for_probes(|stage| match stage {
+        VerifyStage::Staging => policy.staging_probe,
+        VerifyStage::Production => policy.production_probe,
+    }));
     let stage = |stage: VerifyStage, tracked: bool| {
         let probed = match stage {
             VerifyStage::Staging => policy.staging_probe,
@@ -315,7 +320,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let (_, choices, _) = picker(&board(landed, probed));
+        let (_, choices, _) = picker(&board(landed.clone(), probed.clone()));
         assert_eq!(
             choices[1..],
             [
@@ -325,6 +330,10 @@ mod tests {
                 choice("in production", Some("add:production"), None),
             ]
         );
+        // A probed stage whose deploy is not known is not "already there".
+        landed.git.deploys = wt_core::StageDeploys::default();
+        let (_, choices, _) = picker(&board(landed, probed));
+        assert_eq!(choices[3], choice("on staging", Some("add:staging"), None));
     }
 
     #[test]

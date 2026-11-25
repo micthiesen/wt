@@ -227,16 +227,23 @@ fn run_at<'a>(events: &[(&'a WorktreeEvent, Option<&'a Kind>)]) -> (What<'a>, us
 
 /// A watch's `held` directly followed, within [`IMMEDIATE_MS`], by the first
 /// thing wt did about it; optionally led by its `waiting` when it held within
-/// [`JUST_SET_MS`] of being set. All for the same wait. A later action of the
-/// same watch keeps its own line: clearing a gate and waking a session are
-/// two facts.
+/// [`JUST_SET_MS`] of being set. All for the same watch: by id, since two
+/// watches on one row can wait for the same thing, and by wording for events
+/// recorded before they carried one. A later action of the same watch keeps
+/// its own line: clearing a gate and waking a session are two facts.
 fn fired_at<'a>(events: &[(&'a WorktreeEvent, Option<&'a Kind>)]) -> Option<(&'a Kind, usize)> {
     use wt_core::WatchChange as Change;
     let watch = |index: usize| match &events.get(index)?.0.event {
-        Kind::Watch { change, what, .. } => Some((*change, what, events[index].0.at_ms)),
+        Kind::Watch {
+            change, what, id, ..
+        } => Some((*change, (id, what), events[index].0.at_ms)),
         _ => None,
     };
     let (first, what, started) = watch(0)?;
+    let same_watch = |other: (&Option<String>, &String)| match (what.0, other.0) {
+        (Some(id), Some(other)) => id == other,
+        _ => what.1 == other.1,
+    };
     let held = match first {
         Change::Set => 1,
         Change::Held => 0,
@@ -259,7 +266,7 @@ fn fired_at<'a>(events: &[(&'a WorktreeEvent, Option<&'a Kind>)]) -> Option<(&'a
         } else {
             IMMEDIATE_MS
         };
-        if !expected || same != what || at_ms.saturating_sub(last) > window {
+        if !expected || !same_watch(same) || at_ms.saturating_sub(last) > window {
             return None;
         }
         last = at_ms;
@@ -489,6 +496,7 @@ fn show_event(
             by,
             reason,
             then,
+            id: _,
         } => {
             use wt_core::WatchChange as Change;
             // The headline and the first metadata read as one phrase:
@@ -1224,7 +1232,12 @@ mod tests {
     }
 
     fn watch(change: wt_core::WatchChange, what: &str) -> Kind {
+        watch_of(None, change, what)
+    }
+
+    fn watch_of(id: Option<&str>, change: wt_core::WatchChange, what: &str) -> Kind {
         Kind::Watch {
+            id: id.map(str::to_owned),
             change,
             what: what.into(),
             by: None,
@@ -1307,6 +1320,20 @@ mod tests {
             at(0, watch(Change::Held, "merged")),
             at(1, watch(Change::Notified, "ready")),
         ]));
+        // Another watch with the same wording: its action is not this
+        // one's, and this one's own still folds.
+        assert!(unfolded(&[
+            at(0, watch_of(Some("aaaaaa"), Change::Held, "merged")),
+            at(1, watch_of(Some("bbbbbb"), Change::Notified, "merged")),
+        ]));
+        assert_eq!(
+            collapse(&[
+                at(0, watch_of(Some("aaaaaa"), Change::Held, "merged")),
+                at(1, watch_of(Some("aaaaaa"), Change::Notified, "merged")),
+            ])
+            .len(),
+            1
+        );
         // Something happened in between.
         assert!(unfolded(&[
             at(0, watch(Change::Held, "merged")),
@@ -1355,6 +1382,7 @@ mod tests {
             )
         };
         let set = Kind::Watch {
+            id: None,
             change: Change::Set,
             what: "#3806 in production".into(),
             by: Some("manager".into()),
@@ -1372,6 +1400,7 @@ mod tests {
         );
         // The row's own agent is not named, as on a status line.
         let own = Kind::Watch {
+            id: None,
             change: Change::Set,
             what: "17:00".into(),
             by: Some("fix-login".into()),
@@ -1399,6 +1428,7 @@ mod tests {
             assert_eq!(badge.color, color);
         }
         let dropped = Kind::Watch {
+            id: None,
             change: Change::Dropped,
             what: "merged".into(),
             by: None,

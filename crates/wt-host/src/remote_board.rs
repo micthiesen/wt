@@ -597,6 +597,7 @@ mod tests {
             actions: vec![wt_tui::WatchActionKind::Wake],
             headline: Some("run \u{1b}[31mit".into()),
             met: false,
+            held: false,
         }];
         let message = |text: &str| wt_core::WorktreeEvent {
             at_ms: 1,

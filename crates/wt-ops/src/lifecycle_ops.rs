@@ -69,8 +69,9 @@ pub struct LifecycleFacts {
     pub clean_candidate: bool,
     /// The landing reached `[branch] production`. False is unknown.
     pub in_production: bool,
-    /// Deploy proof for the stage of the check this row owes, when that
-    /// stage has a probe. Other stages stay unprobed: nothing reads them.
+    /// Deploy proof for the stages an owed check or a watch asks about.
+    /// Every other stage with a probe reads not deployed; `None` is only a
+    /// stage without one.
     pub deploys: wt_core::StageDeploys,
 }
 
@@ -294,7 +295,9 @@ pub async fn plan_automation_facts(
         } else {
             None
         };
-        let mut deploys = wt_core::StageDeploys::default();
+        // A probed stage nobody asked about is still not shown deployed.
+        let mut deploys = wt_core::StageDeploys::default()
+            .for_probes(|stage| ctx.config.environments.get(stage).is_some());
         for stage in probed {
             // A deploy cannot be ahead of the Git landing it ships.
             let landed = match stage {
@@ -1386,9 +1389,10 @@ mod tests {
             .await
             .unwrap();
         };
-        // Nothing owed: the probe's answer would decide nothing.
+        // Nothing owed, so nothing is looked up: a probed stage then reads
+        // not deployed, never as a stage without a probe.
         let state = owe(None);
-        assert_eq!(deploys(state).await, wt_core::StageDeploys::default());
+        assert_eq!(deploys(state).await, staging(false));
         // Owed in staging, and the probe has reported nothing yet.
         let state = owe(Some(wt_core::VerifyStage::Staging));
         assert_eq!(deploys(state.clone()).await, staging(false));
@@ -1398,7 +1402,7 @@ mod tests {
         assert_eq!(deploys(state).await, staging(true));
         // A production check on a stage with no probe keeps the Git landing.
         let state = owe(Some(wt_core::VerifyStage::Production));
-        assert_eq!(deploys(state).await, wt_core::StageDeploys::default());
+        assert_eq!(deploys(state).await.production, None);
         fixture.close().await.unwrap();
     }
 }

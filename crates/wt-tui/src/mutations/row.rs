@@ -83,6 +83,10 @@ impl Family for RowChange {
         match self {
             Self::Automations { paused } if target.key.is_none() => {
                 board.automations_paused = *paused;
+                for row in &mut board.rows {
+                    let held = *paused || row.automations_paused;
+                    row.watches.iter_mut().for_each(|watch| watch.held = held);
+                }
             }
             Self::Primary { harness } => {
                 if let Some(harness) = harness {
@@ -90,6 +94,7 @@ impl Family for RowChange {
                 }
             }
             _ => {
+                let paused_everywhere = board.automations_paused;
                 let Some(row) = target_row_mut(board, target) else {
                     return;
                 };
@@ -109,7 +114,11 @@ impl Family for RowChange {
                     }
                     Self::Base { base } => row.base_branch = base.clone(),
                     Self::Issue { issue_id } => row.issue_id = issue_id.clone(),
-                    Self::Automations { paused } => row.automations_paused = *paused,
+                    Self::Automations { paused } => {
+                        row.automations_paused = *paused;
+                        let held = *paused || paused_everywhere;
+                        row.watches.iter_mut().for_each(|watch| watch.held = held);
+                    }
                     Self::Notify {
                         change: NotifyChange::Add { state },
                     } => {

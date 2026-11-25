@@ -95,7 +95,8 @@ fn lenient_stage<'de, D: serde::Deserializer<'de>>(
 /// Whether a landing is deployed, per stage. `None` means the stage has no
 /// deploy probe (`[environments.<stage>]`), so the Git landing alone decides.
 /// `Some(false)` means a probe exists and has not shown the landing deployed:
-/// not deployed yet, or unknown.
+/// not deployed yet, unknown, or never looked up. A default value has not
+/// met the configuration yet: see [`StageDeploys::for_probes`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StageDeploys {
@@ -113,6 +114,20 @@ impl StageDeploys {
         match stage {
             VerifyStage::Staging => self.staging,
             VerifyStage::Production => self.production,
+        }
+    }
+
+    /// These facts under a configuration: a stage `probed` names that has
+    /// no answer here was not looked up, which is not the same as having no
+    /// probe, and reads as not shown deployed. A stage without a probe has
+    /// no deploy fact at all. Every place that hands deploy facts to a
+    /// decision passes them through this.
+    #[must_use]
+    pub fn for_probes(self, probed: impl Fn(VerifyStage) -> bool) -> Self {
+        let fact = |stage| probed(stage).then(|| self.get(stage) == Some(true));
+        Self {
+            staging: fact(VerifyStage::Staging),
+            production: fact(VerifyStage::Production),
         }
     }
 
@@ -606,6 +621,18 @@ pub fn sanitize_terminal_text(input: &str) -> String {
     sanitize_work_note(input)
 }
 
+/// [`sanitize_terminal_text`] for text whose line breaks mean something (a
+/// prompt): each line is cleaned by itself, and blank lines around the text
+/// are dropped.
+pub fn sanitize_terminal_lines(input: &str) -> String {
+    let lines: Vec<String> = input.lines().map(sanitize_work_note).collect();
+    let said = |line: &String| !line.is_empty();
+    match (lines.iter().position(said), lines.iter().rposition(said)) {
+        (Some(first), Some(last)) => lines[first..=last].join("\n"),
+        _ => String::new(),
+    }
+}
+
 pub fn work_status_suffix(record: &WorkStatusRecord) -> String {
     let risk = record
         .risk
@@ -834,6 +861,21 @@ mod tests {
             assert_eq!(landing.reached(stage), reached, "{landing:?} {stage:?}");
             assert_eq!(landing.awaiting_deploy(stage), awaiting);
         }
+        // Facts nobody computed are not facts about a stage without a probe.
+        let only_staging = |stage| stage == Staging;
+        assert_eq!(
+            StageDeploys::default().for_probes(only_staging),
+            deploys(Some(false), None)
+        );
+        assert_eq!(
+            deploys(Some(true), Some(true)).for_probes(only_staging),
+            deploys(Some(true), None)
+        );
+        assert!(
+            !staged
+                .with_deploys(StageDeploys::default().for_probes(only_staging))
+                .reached(Staging)
+        );
         // One stage's probe says nothing about the other.
         let mixed = promoted.with_deploys(deploys(Some(false), None));
         assert!(!mixed.reached(Staging) && mixed.reached(Production));

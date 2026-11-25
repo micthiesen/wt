@@ -85,6 +85,7 @@ pub fn sanitize(event: &mut WorktreeEventKind) {
             reason,
             then,
             change: _,
+            id: _,
         } => {
             clean(what);
             clean_some(by);

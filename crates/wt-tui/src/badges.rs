@@ -577,7 +577,8 @@ pub(crate) const WAITING: Color = theme::TEAL;
 /// The bell a row wears while wt will act for it later: clear its gate,
 /// wake its session or tell the person. Teal while waiting; warn when a
 /// condition cannot be read, since such a watch may never fire; green once
-/// every condition held and delivery is under way.
+/// every condition held and delivery is under way, which it is not while
+/// automations are paused.
 pub(crate) fn watch_badge(watches: &[WatchView]) -> Option<Badge> {
     if watches.is_empty() {
         return None;
@@ -590,7 +591,7 @@ pub(crate) fn watch_badge(watches: &[WatchView]) -> Option<Badge> {
     };
     let color = if watches.iter().any(|watch| !watch.met && unreadable(watch)) {
         theme::WARN
-    } else if watches.iter().all(|watch| watch.met) {
+    } else if watches.iter().all(|watch| watch.met && !watch.held) {
         theme::OK
     } else {
         WAITING
@@ -1032,6 +1033,14 @@ mod tests {
                 theme::WARN,
             ),
             (vec![waiting(WatchTruth::Holds, true)], theme::OK),
+            // Met, but automations are paused: nothing is being delivered.
+            (
+                vec![WatchView {
+                    held: true,
+                    ..waiting(WatchTruth::Holds, true)
+                }],
+                WAITING,
+            ),
             (
                 vec![
                     waiting(WatchTruth::Holds, true),
@@ -1198,6 +1207,7 @@ mod tests {
         );
         let watch = |change| {
             event(Event::Watch {
+                id: None,
                 change,
                 what: "merged".into(),
                 by: None,

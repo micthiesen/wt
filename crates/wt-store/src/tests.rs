@@ -1760,6 +1760,7 @@ fn an_armed_merge_is_one_record_per_slug_cleared_by_cancel_end_or_removal() {
         head: Some("abc".into()),
         armed_at_ms,
         mechanism: MergeMechanism::Queue,
+        seen_armed_at_ms: None,
     };
     assert!(store.set_slug_merge_arm("one", &arm(10)).unwrap());
     assert!(!store.set_slug_merge_arm("one", &arm(10)).unwrap());
@@ -1788,6 +1789,21 @@ fn an_armed_merge_is_one_record_per_slug_cleared_by_cancel_end_or_removal() {
     let cleared = store.read_wt_state().unwrap()["slugs"]["one"].clone();
     assert!(cleared.get("mergeArm").is_none());
     assert_eq!(cleared["createdAt"], "2026-11-01T00:00:00Z");
+
+    // GitHub seen holding an arming is recorded once, on that arming only.
+    store.set_slug_merge_arm("one", &arm(25)).unwrap();
+    assert!(!store.note_slug_merge_arm_seen("one", 20, 26).unwrap());
+    assert!(!store.note_slug_merge_arm_seen("absent", 25, 26).unwrap());
+    assert!(store.note_slug_merge_arm_seen("one", 25, 26).unwrap());
+    assert!(!store.note_slug_merge_arm_seen("one", 25, 99).unwrap());
+    assert_eq!(
+        serde_json::from_value::<MergeArm>(
+            store.read_wt_state().unwrap()["slugs"]["one"]["mergeArm"].clone()
+        )
+        .unwrap()
+        .seen_armed_at_ms,
+        Some(26)
+    );
 
     // A cancel clears whatever arming there is, and removal takes the
     // record with the slug's other state.

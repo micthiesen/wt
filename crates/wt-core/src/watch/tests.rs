@@ -119,12 +119,27 @@ fn every_form_of_the_grammar_parses() {
                 goal: PrGoal::Reached(stage),
             },
         ),
-        // Only a number makes `pr:` a pull request.
+        // `wt:` names a worktree whatever its slug is.
         (
-            "pr:merged",
+            "wt:pr:merged",
             Worktree {
                 slug: "pr".into(),
                 state: RowState::Merged,
+            },
+        ),
+        (
+            "wt:release:staging",
+            Worktree {
+                slug: "release".into(),
+                state: RowState::Staging,
+            },
+        ),
+        ("wt:wt:gone", Gone { slug: "wt".into() }),
+        (
+            "wt:other:verified",
+            Worktree {
+                slug: "other".into(),
+                state: RowState::Verified,
             },
         ),
         (
@@ -176,6 +191,50 @@ fn every_form_of_the_grammar_parses() {
 }
 
 #[test]
+fn a_worktree_named_like_the_grammar_needs_its_prefix_and_old_records_still_read() {
+    // Bare, each of these could mean two things; the refusal shows the
+    // spelling that cannot.
+    for (arg, explicit) in [
+        ("pr:merged", "wt:pr:merged"),
+        ("wt:merged", "wt:wt:merged"),
+        ("at:gone", "wt:at:gone"),
+        ("3h:merged", "wt:3h:merged"),
+        ("5pm:ready", "wt:5pm:ready"),
+    ] {
+        let problem = problem(arg);
+        assert!(
+            problem.contains("could mean two things"),
+            "{arg}: {problem}"
+        );
+        assert!(problem.ends_with(explicit), "{arg}: {problem}");
+        assert!(parse(explicit, UTC).is_ok(), "{explicit}");
+    }
+    // These read as their own form first; the refusal still shows the way.
+    assert!(problem("release:merged").ends_with("a worktree named release is wt:release:merged"));
+    assert!(problem("commit:gone").ends_with("a worktree named commit is wt:commit:gone"));
+    // The stored spelling is the explicit one, so no two conditions share a
+    // text; what an earlier build stored bare reads back as it did.
+    let stored = |cond: &WatchCondition| serde_json::to_value(cond).unwrap()["cond"].clone();
+    assert_eq!(stored(&cond("other:merged")), "wt:other:merged");
+    assert_eq!(stored(&cond("other:gone")), "wt:other:gone");
+    for (record, slug) in [
+        ("pr:merged", "pr"),
+        ("wt:merged", "wt"),
+        ("other:merged", "other"),
+    ] {
+        let read: WatchCondition = serde_json::from_value(json!({ "cond": record })).unwrap();
+        assert_eq!(
+            read.cond,
+            Condition::Worktree {
+                slug: slug.into(),
+                state: RowState::Merged
+            },
+            "{record}"
+        );
+    }
+}
+
+#[test]
 fn times_are_local_wall_clock_and_strictly_in_the_future() {
     let at = |arg: &str, clock| match parse(arg, clock).unwrap().cond {
         Condition::At { at_ms } => at_ms,
@@ -194,6 +253,20 @@ fn times_are_local_wall_clock_and_strictly_in_the_future() {
     assert_eq!(at("2026-11-25T17:00", UTC), NOON + 29 * HOUR_MS);
     assert_eq!(at("2026-11-25 17:00", WEST), NOON + 34 * HOUR_MS);
     assert_eq!(at("2026-11-25T17:00:30", UTC), NOON + 29 * HOUR_MS + 30_000);
+    // The spellings people and agents reach for first.
+    assert_eq!(at("5pm", UTC), NOON + 5 * HOUR_MS);
+    assert_eq!(at("5:30PM", UTC), NOON + 5 * HOUR_MS + 30 * MINUTE_MS);
+    assert_eq!(at("12am", UTC), NOON + 12 * HOUR_MS);
+    assert_eq!(at("12pm", UTC), NOON + DAY_MS);
+    assert_eq!(at("9am", UTC), NOON + 21 * HOUR_MS);
+    assert_eq!(at("3h", UTC), at("+3h", UTC));
+    assert_eq!(at("90m", UTC), at("+90m", UTC));
+    assert_eq!(at("2d", UTC), at("+2d", UTC));
+    assert_eq!(at("tomorrow 09:00", UTC), NOON + 21 * HOUR_MS);
+    assert_eq!(at("tomorrow 5pm", UTC), NOON + 29 * HOUR_MS);
+    assert_eq!(at("tomorrow 13:00", UTC), NOON + 25 * HOUR_MS);
+    assert_eq!(at("today 17:00", UTC), NOON + 5 * HOUR_MS);
+    assert_eq!(at("tomorrow 09:00", WEST), NOON + 26 * HOUR_MS);
     // A relative time lands on a whole second so it prints exactly.
     let ragged = LocalClock {
         now_ms: NOON + 1,
@@ -210,6 +283,26 @@ fn what_cannot_be_meant_is_refused_with_the_reason() {
     assert!(problem("2026-11-25").contains("2026-11-25T17:00"));
     assert!(problem("25:00").contains("00:00 to 23:59"));
     assert!(problem("+3w").contains("+90m"));
+    assert_eq!(problem("today 09:00"), "that time has already passed");
+    assert!(problem("13pm").contains("12-hour"));
+    assert!(problem("tomorrow morning").contains("\"tomorrow 09:00\""));
+    // What was meant as a time is answered with how a time is written.
+    for meant in [
+        "in 3 hours",
+        "5 o'clock",
+        "tomorrow",
+        "5 pm tomorrow",
+        "noon",
+        "3 hours",
+    ] {
+        let problem = problem(meant);
+        assert!(
+            problem.starts_with("a time is a clock time"),
+            "{meant}: {problem}"
+        );
+    }
+    // A slug may start with a digit.
+    assert!(problem("123-fix:mergd").contains("is not a state"));
     assert!(problem("+0h").contains("+90m"));
     assert!(problem("mergd").contains("is not a state"));
     assert!(problem("other:mergd").contains("is not a state"));
@@ -224,6 +317,11 @@ fn what_cannot_be_meant_is_refused_with_the_reason() {
     for check in ["check:", "check:=x", "check:secret="] {
         assert!(problem(check).contains("check:<id>"), "{check}");
     }
+    // The argument is one argv entry of someone's command.
+    assert!(problem("check:secret=--help").contains("cannot start with `-`"));
+    assert!(problem("check:secret=-rf+1h").contains("cannot start with `-`"));
+    assert!(problem("check:secret=a\u{1b}[2Jb").contains("control characters"));
+    assert!(problem("check:secret=a\nb").contains("control characters"));
     assert!(problem("merged+soon").contains("a delay looks like"));
     assert!(problem("17:00+1h").contains("a time takes no delay"));
     assert!(problem("+3h+1h").contains("+90m"));
@@ -235,10 +333,10 @@ fn a_refusal_teaches_the_grammar() {
     let text = parse("mergd", UTC).unwrap_err().to_string();
     assert!(text.starts_with("cannot read the condition `mergd`: `mergd` is not a state"));
     for form in [
-        "17:00 | +3h",
+        "17:00 | 5pm | 5:30pm | 3h",
         "pr:3806:merged|staging|production|closed",
         "an unquoted # starts a shell comment",
-        "<slug>:merged",
+        "wt:<slug>:merged",
         "release:staging | release:production",
         "check:<id>=<arg>",
         "+<duration>",
@@ -306,6 +404,7 @@ fn what_is_printed_parses_back_to_the_same_condition() {
     assert_eq!(cond("#3806").to_arg(0), "pr:3806:merged");
     assert_eq!(cond("#7:staging+30m").to_arg(0), "pr:7:staging+30m");
     assert_eq!(cond("pr:7").cond.to_string(), "pr:7:merged");
+    assert_eq!(cond("other:green+1h").to_arg(0), "wt:other:green+1h");
     // A record keeps the spelling earlier builds read.
     assert_eq!(
         serde_json::to_value(cond("pr:7:production")).unwrap()["cond"],
@@ -320,9 +419,10 @@ fn conditions_read_in_words() {
         ("#3806", "#3806 merged"),
         ("release:production", "next production release"),
         ("release:production+24h", "1d after next production release"),
-        ("17:00", "17:00 today"),
+        ("17:00", "17:00"),
         ("09:00", "tomorrow 09:00"),
-        ("2026-11-30T09:00", "2026-11-30 09:00"),
+        ("2026-11-30T09:00:30", "Nov 30 09:00"),
+        ("2027-01-02T09:00", "Jan 2 09:00, 2027"),
         ("green+1h", "PR checks green for 1h"),
         ("check:secret=FOO", "check secret=FOO"),
         ("check:up+10m", "check up for 10m"),
@@ -335,11 +435,16 @@ fn conditions_read_in_words() {
         assert_eq!(cond(arg).describe(UTC), words, "{arg}");
     }
     // Local 07:00: 01:00 UTC tomorrow is still today, 20:00 local.
-    assert_eq!(cond("at:1795568400000").describe(WEST), "20:00 today");
+    assert_eq!(cond("at:1795568400000").describe(WEST), "20:00");
     let mut both = watch(&["#3806:production", "17:00"]);
-    assert_eq!(both.describe(UTC), "#3806 in production and 17:00 today");
+    assert_eq!(both.describe(UTC), "#3806 in production and 17:00");
+    // Kept text reads from the day the watch was set, in its setter's time.
     both.utc_offset_minutes = 60;
-    assert_eq!(both.summary(), "#3806 in production and 2026-11-24 18:00");
+    assert_eq!(both.summary(), "#3806 in production and 18:00");
+    assert_eq!(watch(&["09:00"]).summary(), "tomorrow 09:00");
+    assert_eq!(watch(&["2026-11-26T17:00:05"]).summary(), "Nov 26 17:00");
+    // What is typed back keeps the whole instant.
+    assert_eq!(cond("2026-11-26T17:00:05").to_arg(0), "2026-11-26 17:00:05");
 }
 
 #[test]
@@ -377,7 +482,10 @@ fn a_record_round_trips_with_keys_this_build_does_not_know() {
         "when": [{"cond": "merged"}], "then": {"notify": ""}
     }))
     .unwrap();
-    assert!(minimal.then.notify_only() && !minimal.is_met() && minimal.owned_by(Some("any")));
+    assert!(minimal.then.notify_only() && !minimal.is_met());
+    // No recorded incarnation is the worktree that has none, not any
+    // worktree that later takes the slug.
+    assert!(minimal.owned_by(None) && !minimal.owned_by(Some("any")));
     assert_eq!(
         serde_json::to_value(&minimal).unwrap(),
         json!({
@@ -863,7 +971,7 @@ fn a_stamped_landing_commit_outlives_the_process_that_saw_the_landing() {
 }
 
 #[test]
-fn an_evaluation_is_recorded_once_a_minute() {
+fn an_evaluation_is_recorded_at_first_and_then_hourly() {
     let mut pending = watch(&["merged"]);
     assert_eq!(pending.evaluated_at_ms(), None);
     let at = NOON + 5 * MINUTE_MS + 30 * SECOND_MS;
@@ -875,13 +983,18 @@ fn an_evaluation_is_recorded_once_a_minute() {
     };
     assert!(stamp.apply(&mut pending).changed);
     assert_eq!(pending.evaluated_at_ms(), Some(minute));
+    // Not again every minute: each stamp rewrites the shared state.
     assert_eq!(
-        WatchStamps::evaluation_due(&pending, at + 29 * SECOND_MS),
+        WatchStamps::evaluation_due(&pending, at + 30 * SECOND_MS),
         None
     );
     assert_eq!(
-        WatchStamps::evaluation_due(&pending, at + 30 * SECOND_MS),
-        Some(minute + MINUTE_MS)
+        WatchStamps::evaluation_due(&pending, minute + HOUR_MS + 59 * SECOND_MS),
+        None
+    );
+    assert_eq!(
+        WatchStamps::evaluation_due(&pending, minute + HOUR_MS + MINUTE_MS),
+        Some(minute + HOUR_MS + MINUTE_MS)
     );
     // An older stamp never moves the record back.
     let older = WatchStamps {

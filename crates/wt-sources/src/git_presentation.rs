@@ -669,12 +669,15 @@ async fn row_signature<'a>(
                 FileStamp::default(),
             )
         };
+    // The deployed refs live in the main clone, which is not the common
+    // directory of a row that is a clone of its own.
     let mut deployed_refs = Vec::new();
-    if let Some(git_dir) = &worktree.git_dir {
-        let common = worktree.common_dir.as_deref().unwrap_or(git_dir);
-        for (stage, _) in context.config.environments.probed() {
-            deployed_refs.push(file_stamp(&common.join(stage.deployed_ref())).await);
-        }
+    let main_clone = &context.config.paths.main_clone;
+    let main_common = Some(main_clone.join(".git"))
+        .filter(|git| git.is_dir())
+        .unwrap_or_else(|| main_clone.clone());
+    for (stage, _) in context.config.environments.probed() {
+        deployed_refs.push(file_stamp(&main_common.join(stage.deployed_ref())).await);
     }
     let status = row.status.as_ref().map(|status| StatusSignature {
         branch: status.branch.as_deref(),
@@ -1017,6 +1020,11 @@ async fn enrich(
                 }
             }
         }
+        // A row with nothing looked up is still not shown deployed on a
+        // probed stage.
+        result.deploys = result
+            .deploys
+            .for_probes(|stage| context.config.environments.get(stage).is_some());
         // Presentation-only activity facts. These are best effort: a
         // missing base ref or an old Git leaves them unknown rather than
         // failing the row, since nothing decides safety from them.
@@ -2170,9 +2178,15 @@ mod tests {
                     .unwrap();
             (presentation.landed_on, presentation.deploys, signature)
         };
-        let unprobed = wt_core::StageDeploys::default();
-        // Not landed: no stage is asked about it.
-        assert_eq!(facts().await.1, unprobed);
+        // Not landed: nothing is looked up, and the probed stage reads not
+        // deployed rather than as a stage without a probe.
+        assert_eq!(
+            facts().await.1,
+            wt_core::StageDeploys {
+                staging: Some(false),
+                production: None,
+            }
+        );
         std::fs::write(worktree.join("own.txt"), "own\n").unwrap();
         git(&worktree, &["add", "own.txt"]);
         git(&worktree, &["commit", "-qm", "own work"]);
@@ -2193,7 +2207,17 @@ mod tests {
         let (_, deploys, stale) = facts().await;
         assert_eq!(deploys, waiting);
         assert_ne!(before, stale);
+        // A row that is its own clone has another common directory; the
+        // ref it depends on is still the main clone's.
+        let mut independent = find().await;
+        independent.worktree.common_dir = independent.worktree.git_dir.clone();
+        let signature = |row: WorktreeSnapshot| {
+            let (state, ctx) = (&state, &fixture.ctx);
+            async move { serde_json::to_string(&row_signature(&row, state, None, ctx).await).unwrap() }
+        };
+        let own_clone_before = signature(independent.clone()).await;
         git(&main, &["update-ref", "refs/wt/deployed/staging", "HEAD"]);
+        assert_ne!(own_clone_before, signature(independent).await);
         let (_, deploys, current) = facts().await;
         assert_eq!(
             deploys,

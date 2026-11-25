@@ -41,7 +41,7 @@ pub struct NewWatch {
 }
 
 /// Why [`Store::add_watch`] wrote nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum WatchRefusal {
     NoConditions,
     NoActions,
@@ -55,9 +55,9 @@ pub enum WatchRefusal {
     },
     /// The worktree the setter saw is not the one that has the slug now.
     OwnerChanged,
-    /// The setter already has this exact watch pending.
+    /// This exact watch is already pending.
     AlreadySet {
-        id: String,
+        watch: Box<Watch>,
     },
 }
 
@@ -81,12 +81,22 @@ impl std::fmt::Display for WatchRefusal {
                 current: Some(current),
             } => write!(f, "the gate now reads: {current}"),
             Self::OwnerChanged => f.write_str("the worktree was removed or created again"),
-            Self::AlreadySet { id } => write!(f, "watch {id} already waits for that"),
+            Self::AlreadySet { watch } => write!(f, "watch {} already waits for that", watch.id),
         }
     }
 }
 
 impl std::error::Error for WatchRefusal {}
+
+/// What [`Store::deliver_unblock`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnblockDelivery {
+    Cleared,
+    /// The watch is gone or no longer owes the gate: nothing was written.
+    NotOwed,
+    /// The gate reads something else; the watch was dropped.
+    GateChanged,
+}
 
 /// Which watches [`Store::cancel_watches`] removes.
 #[derive(Clone, Copy, Debug)]
@@ -111,7 +121,9 @@ pub fn stored_watches(state: &WtState) -> Vec<Watch> {
 impl Store {
     /// Set a watch. A watch that clears the gate must name the gate text the
     /// worktree has at this moment, and replaces the pending one that would
-    /// have cleared it.
+    /// have cleared it; given no wake of its own, it keeps that one's.
+    /// Refused as [`WatchRefusal::AlreadySet`] when the same setter already
+    /// has a pending watch there with the same conditions and actions.
     pub fn add_watch(
         &mut self,
         new: NewWatch,
@@ -121,9 +133,7 @@ impl Store {
     }
 
     /// Set a watch from a menu that showed the worktree as `incarnation`
-    /// (its `createdAt`). Refused when the slug names another worktree now,
-    /// or when the same setter already waits for the same thing: the menu
-    /// would have offered to cancel that one instead.
+    /// (its `createdAt`). Refused when the slug names another worktree now.
     pub fn add_watch_seen(
         &mut self,
         new: NewWatch,
@@ -135,7 +145,7 @@ impl Store {
 
     fn add_watch_checked(
         &mut self,
-        new: NewWatch,
+        mut new: NewWatch,
         now_ms: i64,
         seen: Option<Option<&str>>,
     ) -> Result<Result<Watch, WatchRefusal>, StoreError> {
@@ -148,24 +158,35 @@ impl Store {
             if new.then.is_empty() {
                 return refuse(WatchRefusal::NoActions);
             }
-            if let Some(incarnation) = seen {
-                if created_at(state, &new.slug) != incarnation {
-                    return refuse(WatchRefusal::OwnerChanged);
-                }
-                let same = entries(state).iter().filter_map(read).find(|watch| {
-                    watch.slug == new.slug
-                        && watch.by == new.by
-                        && !watch.owner_gone
-                        && watch.then == new.then
-                        && watch
-                            .when
-                            .iter()
-                            .map(|cond| (&cond.cond, cond.delay))
-                            .eq(new.when.iter().map(|cond| (&cond.cond, cond.delay)))
+            if let Some(incarnation) = seen
+                && created_at(state, &new.slug) != incarnation
+            {
+                return refuse(WatchRefusal::OwnerChanged);
+            }
+            if new.then.unblock.is_some() && new.then.wake.is_none() {
+                new.then.wake = entries(state)
+                    .iter()
+                    .filter(|entry| pending_gate(entry, &new.slug) == new.then.unblock.as_deref())
+                    .filter_map(read)
+                    .find_map(|replaced| replaced.then.wake);
+            }
+            let incarnation = created_at(state, &new.slug);
+            let same = entries(state).iter().filter_map(read).find(|watch| {
+                watch.slug == new.slug
+                    && watch.by == new.by
+                    && !watch.owner_gone
+                    && watch.owned_by(incarnation)
+                    && watch.then == new.then
+                    && watch
+                        .when
+                        .iter()
+                        .map(|cond| (&cond.cond, cond.delay))
+                        .eq(new.when.iter().map(|cond| (&cond.cond, cond.delay)))
+            });
+            if let Some(same) = same {
+                return refuse(WatchRefusal::AlreadySet {
+                    watch: Box::new(same),
                 });
-                if let Some(same) = same {
-                    return refuse(WatchRefusal::AlreadySet { id: same.id });
-                }
             }
             let current = gate(state, &new.slug);
             if new.then.unblock.is_some() && new.then.unblock.as_deref() != current {
@@ -372,35 +393,55 @@ impl Store {
         })
     }
 
-    /// Give up one action of a watch that can no longer happen (the gate it
-    /// was to clear reads something else now). The rest of the watch stays.
-    /// Returns whether the action was still owed.
-    pub fn abandon_action(
-        &mut self,
-        id: &str,
-        action: WatchAction,
-        reason: &str,
-    ) -> Result<bool, StoreError> {
+    /// Clear the gate a met watch was set to clear, in one transaction with
+    /// the record that it did, so no crash leaves one without the other and
+    /// a second call finds nothing owed. The gate is cleared only while it
+    /// still reads the text the watch witnessed; state, risk, note, author
+    /// and timestamp are kept. When it reads anything else the gate the
+    /// watch belonged to is gone, and the whole watch goes with it, its
+    /// wake included.
+    pub fn deliver_unblock(&mut self, id: &str) -> Result<UnblockDelivery, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
             let Some(index) = entries(state)
                 .iter()
                 .position(|entry| text(entry, "id") == Some(id))
             else {
-                return Ok((false, false));
+                return Ok((UnblockDelivery::NotOwed, false));
             };
             let Some(mut watch) = read(&entries(state)[index]) else {
-                return Ok((false, false));
+                return Ok((UnblockDelivery::NotOwed, false));
             };
-            if watch.then.take(action).is_none() {
-                return Ok((false, false));
+            let Some(witness) = watch.then.unblock.clone() else {
+                return Ok((UnblockDelivery::NotOwed, false));
+            };
+            if gate(state, &watch.slug) != Some(witness.as_str()) {
+                entries_mut(state).remove(index);
+                log.best_effort(|log| {
+                    record(
+                        log,
+                        &watch,
+                        WatchChange::Dropped,
+                        None,
+                        Some("the gate it was to clear was cleared or changed"),
+                    )
+                });
+                return Ok((UnblockDelivery::GateChanged, true));
             }
+            watch.then.unblock = None;
+            // The wake that follows tells the session its gate is gone.
+            watch
+                .extra
+                .insert(CLEARED_GATE.to_owned(), Value::String(witness));
+            // Before the status write, which drops what still clears the
+            // slug's gate.
             if watch.then.is_empty() {
                 entries_mut(state).remove(index);
             } else {
                 entries_mut(state)[index] = serde_json::to_value(&watch)?;
             }
-            log.best_effort(|log| record(log, &watch, WatchChange::Dropped, None, Some(reason)));
-            Ok((true, true))
+            crate::mutations::clear_gate(state, log, &watch.slug)?;
+            log.best_effort(|log| record(log, &watch, WatchChange::ClearedGate, None, None));
+            Ok((UnblockDelivery::Cleared, true))
         })
     }
 
@@ -512,14 +553,39 @@ pub(crate) fn owner_removed(state: &mut WtState, record: &Map<String, Value>, no
     }
 }
 
-/// A worktree's status was written and its gate now reads `gate`. A pending
-/// watch that was to clear another gate text has nothing left to clear and
-/// is cancelled with the write. A met watch is left to its delivery, whose
-/// witnessed write finds the gate changed.
-pub(crate) fn gate_written(state: &mut WtState, slug: &str, gate: Option<&str>) {
+/// A worktree's status was written: its gate read `previous` and now reads
+/// `gate`. A watch that was to clear another gate text has nothing left to
+/// clear. Neither has any watch set before the gate changed, met or not:
+/// the new gate may read the same as one it witnessed earlier (cleared by a
+/// build that cancels no watches, then set again), and is not its to clear.
+/// Each goes whole, with the wake that was to follow its gate. Returns the
+/// watches cancelled.
+pub(crate) fn gate_written(
+    state: &mut WtState,
+    slug: &str,
+    previous: Option<&str>,
+    gate: Option<&str>,
+) -> Vec<Watch> {
     remove_where(state, |entry| {
-        pending_gate(entry, slug).is_some_and(|witness| Some(witness) != gate)
-    });
+        text(entry, "slug") == Some(slug)
+            && entry["then"]["unblock"]
+                .as_str()
+                .is_some_and(|witness| Some(witness) != gate || previous != gate)
+    })
+    .iter()
+    .filter_map(read)
+    .collect()
+}
+
+/// Record watches a status write cancelled, by whoever wrote the status.
+pub(crate) fn log_cancelled(
+    log: &EventLog<'_>,
+    cancelled: &[Watch],
+    by: Option<&str>,
+) -> Result<(), StoreError> {
+    cancelled
+        .iter()
+        .try_for_each(|watch| record(log, watch, WatchChange::Cancelled, by, None))
 }
 
 fn entries(state: &WtState) -> &[Value] {
@@ -605,6 +671,7 @@ fn record(
     log.append(
         &watch.slug,
         &WorktreeEventKind::Watch {
+            id: Some(watch.id.clone()),
             change,
             what: watch.summary(),
             by: by

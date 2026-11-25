@@ -29,7 +29,9 @@ pub use types::{
     ForeignRepositoryRow, GuideRecord, MergeEdge, RemovedWorktree, RepositoryIdentity,
     ReviewRequestDismissal, WorkStatusRecord, WorkStatusWrite, WtState,
 };
-pub use watches::{NewWatch, WatchRefusal, WatchSelector, cleared_gate, stored_watches};
+pub use watches::{
+    NewWatch, UnblockDelivery, WatchRefusal, WatchSelector, cleared_gate, stored_watches,
+};
 
 #[cfg(test)]
 mod events_tests;

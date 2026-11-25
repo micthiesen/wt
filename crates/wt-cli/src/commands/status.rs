@@ -505,7 +505,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             }
         }
     };
-    let then = args.then.as_deref().map(sanitize_work_note);
+    let then = args.then.as_deref().and_then(super::watch::clean_prompt);
     match action {
         Action::All { json: wants_json } => {
             let now = now_ms();
@@ -620,10 +620,21 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 .ok()
                 .map(|by| by.trim().to_owned())
                 .filter(|by| !by.is_empty());
-            ctx.database
-                .call(move |s| Ok(s.clear_slug_work_status(&db_slug, by.as_deref())?))
+            let cancelled = ctx
+                .database
+                .call(move |s| {
+                    // Clearing the status clears its gate, and with it the
+                    // watch that was to clear it.
+                    let mut gate_watches = s.list_watches(Some(&db_slug))?;
+                    gate_watches.retain(|watch| watch.then.unblock.is_some());
+                    s.clear_slug_work_status(&db_slug, by.as_deref())?;
+                    let left = s.list_watches(Some(&db_slug))?;
+                    gate_watches.retain(|watch| !left.iter().any(|kept| kept.id == watch.id));
+                    Ok(gate_watches)
+                })
                 .await?;
             println!("✓ {slug} status cleared");
+            report_cancelled_watches(&cancelled);
             Ok(0)
         }
         Action::Examine { target, verdict } => {
@@ -713,6 +724,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 previous,
                 next,
                 wrote,
+                cancelled,
             } = update_status(&ctx.database, &slug, move |previous| {
                 next.note = merge_note(
                     previous.as_ref().and_then(|p| p.note.as_deref()),
@@ -754,6 +766,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             ) {
                 println!("{line}");
             }
+            report_cancelled_watches(&cancelled);
             report_replaced_note(previous_note.as_deref(), next.note.as_deref(), append);
             if let Some(note) = &next.note {
                 println!("  note: {note}");
@@ -809,6 +822,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 previous,
                 next,
                 wrote,
+                cancelled,
             } = match write {
                 Ok(write) => write,
                 Err(refusal) => {
@@ -832,6 +846,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             if let Some(gate) = &next.blocked_on {
                 println!("  blocked on: {gate}");
             }
+            report_cancelled_watches(&cancelled);
             if let Some((stage, steps)) = next.verification() {
                 println!("  verify in {}: {steps}", stage.as_str());
             }
@@ -883,21 +898,29 @@ async fn gate_watch(
         wake: then,
         ..Default::default()
     };
-    let wakes = actions.wake.is_some();
-    match super::watch::set(ctx, slug, until.when, actions, clock).await? {
-        Ok(watch) => {
-            for note in &until.notes {
-                println!("  note: {note}");
+    let asked_to_wake = actions.wake.is_some();
+    let when = until.when.clone();
+    match super::watch::set(ctx, slug, when, actions, clock).await? {
+        Ok(set) => {
+            until.print();
+            let watch = set.watch;
+            if let Some(kept) = watch.then.wake.as_deref().filter(|_| !asked_to_wake) {
+                println!(
+                    "  keeps the wake set with this gate earlier: {} (to drop it: wt watch cancel {}, then set --until again)",
+                    wt_app_core::watch_view::headline(kept),
+                    watch.id
+                );
             }
             Ok(Ok(Some(format!(
-                "{}{} (watch {})",
+                "{}{} (watch {}{})",
                 watch.summary(),
-                if wakes {
+                if watch.then.wake.is_some() {
                     ", and then wakes this session"
                 } else {
                     ""
                 },
-                watch.id
+                watch.id,
+                if set.already { ", already set" } else { "" }
             ))))
         }
         // The status is written; only its self-clearing is missing.
@@ -912,6 +935,31 @@ struct StatusWrite {
     previous: Option<WorkStatusRecord>,
     next: WorkStatusRecord,
     wrote: bool,
+    /// Watches that were to clear the gate this write removed or replaced.
+    cancelled: Vec<wt_core::watch::Watch>,
+}
+
+/// A status write that changes the gate cancels the watch that was to clear
+/// it, with the wake that was to follow: say so, or the wake is lost quietly.
+fn report_cancelled_watches(cancelled: &[wt_core::watch::Watch]) {
+    for watch in cancelled {
+        let wake = watch
+            .then
+            .wake
+            .as_deref()
+            .map(|prompt| {
+                format!(
+                    "; it would then have woken the session with: {}",
+                    wt_app_core::watch_view::headline(prompt)
+                )
+            })
+            .unwrap_or_default();
+        println!(
+            "  cancelled watch {}, which cleared the old gate when {}{wake}",
+            watch.id,
+            watch.summary()
+        );
+    }
 }
 
 /// Write the status `build` computes from the record stored at the moment of
@@ -952,6 +1000,7 @@ async fn update_status(
                         previous,
                         next,
                         wrote: write.changed,
+                        cancelled: write.cancelled_watches,
                     }))
                 }
                 Err(Refusal::Usage(message)) => Ok(Err(message)),
@@ -1923,7 +1972,31 @@ mod tests {
         assert_eq!(replaced.len(), 1);
         assert_ne!(replaced[0].id, set[0].id);
         assert_eq!(replaced[0].then.unblock.as_deref(), Some("#7 ships"));
-        assert_eq!(replaced[0].then.wake, None);
+        // The wake set with the gate is not dropped by a command that does
+        // not mention it.
+        assert_eq!(replaced[0].then.wake.as_deref(), Some("run the smoke test"));
+        // The same command again (agents retry) is the same watch.
+        assert_eq!(run(&fixture.ctx, &bare).await.unwrap(), 0);
+        assert_eq!(watches().await, replaced);
+        // A session cannot be woken about its own worktree being gone.
+        let own_removal = StatusArgs {
+            until: vec!["one:gone".into()],
+            then: Some("clean up".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &own_removal).await.unwrap(), 1);
+        assert_eq!(watches().await, replaced);
+        // A prompt written as steps keeps its lines.
+        let steps = StatusArgs {
+            until: vec!["merged".into()],
+            then: Some("1. Deploy.\n2. Verify.\n".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &steps).await.unwrap(), 0);
+        assert_eq!(
+            watches().await[0].then.wake.as_deref(),
+            Some("1. Deploy.\n2. Verify.")
+        );
 
         // Clearing the gate by hand leaves nothing to clear it later.
         let unblock = StatusArgs {

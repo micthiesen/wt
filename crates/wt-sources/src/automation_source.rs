@@ -447,6 +447,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             }
             facts.context.now_ms = now_ms();
             facts.context.github_fresh = fresh_github.is_some();
+            facts.context.github_read_at_ms = fresh_github
+                .as_ref()
+                .and_then(|github| github.age())
+                .map(|age| facts.context.now_ms.saturating_sub(i64::try_from(age.as_millis()).unwrap_or(i64::MAX)));
             facts.context.watches.clear();
             if let Some((state, _)) = confirmed_metadata.as_deref() {
                 let watches = wt_store::stored_watches(state);
@@ -498,6 +502,18 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     latest_error = Some(format!("cannot forget an ended merge: {error:#}"));
                 }
             }
+            // The trigger needs GitHub to have held the merge once.
+            for (slug, armed_at) in wt_automations::observed_merge_arms(&facts.rows, &facts.context) {
+                let (seen, now) = (slug.clone(), facts.context.now_ms);
+                match context.database.call(move |store| Ok(store.note_slug_merge_arm_seen(&seen, armed_at, now)?)).await {
+                    Ok(_) => {
+                        if let Some(arm) = facts.rows.iter_mut().filter(|row| row.slug == slug).find_map(|row| row.merge_arm.as_mut()).filter(|arm| arm.armed_at_ms == armed_at) {
+                            arm.seen_armed_at_ms = Some(now);
+                        }
+                    }
+                    Err(error) => latest_error = Some(format!("cannot record a merge seen armed: {error:#}")),
+                }
+            }
             let pass = pass_input(&context, facts, facts.context.now_ms);
             let tick = match engine.tick(pass).await {
                 Ok(tick) => tick,
@@ -512,7 +528,16 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             for (id, action) in tick.settled_watches {
                 if !settled_watches.insert((id.clone(), action)) { continue; }
                 let done = id.clone();
-                if let Err(error) = context.database.call(move |store| Ok(store.complete_action(&done, action)?)).await {
+                // The ledger says the fire ran, not that the gate was
+                // written: a crash between the two leaves it set.
+                let settle = move |store: &mut wt_store::Store| {
+                    match action {
+                        wt_core::watch::WatchAction::Unblock => { store.deliver_unblock(&done)?; }
+                        _ => { store.complete_action(&done, action)?; }
+                    }
+                    Ok(())
+                };
+                if let Err(error) = context.database.call(settle).await {
                     settled_watches.remove(&(id, action));
                     latest_error = Some(format!("cannot record a finished watch action: {error:#}"));
                 }

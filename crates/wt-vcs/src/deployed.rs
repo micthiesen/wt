@@ -69,38 +69,71 @@ pub async fn deployed_contains(
     }
 }
 
-/// The full id of the commit a probe named. With `fetch`, a commit this clone
-/// lacks is fetched from origin once before giving up.
+/// Why a probe's commit could not be resolved.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum UnresolvedCommit {
+    /// Origin was asked for exactly this commit and does not have it:
+    /// asking again will not help until the probe names another.
+    #[error("commit {0} is not in this repository or on origin")]
+    AbsentOnOrigin(String),
+    /// Not here, and not asked for: it may arrive with a later fetch.
+    #[error("{0}")]
+    NotLocal(String),
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<DeployProofError> for UnresolvedCommit {
+    fn from(error: DeployProofError) -> Self {
+        Self::Failed(error.0)
+    }
+}
+
+/// The full id of the commit a probe named. With `fetch`, a full id this
+/// clone lacks is fetched from origin as that one object. An abbreviation
+/// cannot be requested by name, and fetching origin's branches for it would
+/// run outside wt's fetch lock, so it waits for wt's regular fetch.
 pub async fn resolve_deployed_commit(
     runner: &ProcessRunner,
     main_clone: &Path,
     sha: &str,
     fetch: bool,
     cancel: &CancellationToken,
-) -> Result<String, DeployProofError> {
+) -> Result<String, UnresolvedCommit> {
     let sha = parse_probe_output(sha)?;
     if let Some(oid) = rev_parse_commit(runner, main_clone, sha, cancel).await? {
         return Ok(oid);
     }
+    if sha.len() != 40 {
+        return Err(UnresolvedCommit::NotLocal(format!(
+            "commit {sha} is not known locally yet; wt's regular fetch brings it in (a probe that prints the full 40-character id is fetched at once)"
+        )));
+    }
     if !fetch {
-        return Err(DeployProofError(format!(
+        return Err(UnresolvedCommit::NotLocal(format!(
             "commit {sha} is not in this repository"
         )));
     }
-    // Only a full id can be requested by name; an abbreviation needs the
-    // remote's branches.
-    let mut args = vec!["fetch", "--quiet", "--no-write-fetch-head", "origin"];
-    if sha.len() == 40 {
-        args.extend(["--no-tags", sha]);
-    }
+    let args = [
+        "fetch",
+        "--quiet",
+        "--no-write-fetch-head",
+        "--no-tags",
+        "origin",
+        sha,
+    ];
     let fetched = git(runner, main_clone, args, FETCH_TIMEOUT, cancel).await?;
+    // A remote that lacks the object refuses the request by name; that is
+    // its answer, unlike a fetch that never reached it.
+    let refused = fetched.stderr_text().to_ascii_lowercase();
+    let absent = fetched.status.success()
+        || refused.contains("not our ref")
+        || refused.contains("couldn't find remote ref");
     match rev_parse_commit(runner, main_clone, sha, cancel).await? {
         Some(oid) => Ok(oid),
-        None if fetched.status.success() => Err(DeployProofError(format!(
-            "commit {sha} is not in this repository or on origin"
-        ))),
-        None => Err(DeployProofError(format!(
-            "commit {sha} is not in this repository and fetching origin failed: {}",
+        None if absent => Err(UnresolvedCommit::AbsentOnOrigin(sha.to_owned())),
+        None => Err(UnresolvedCommit::Failed(format!(
+            "commit {sha} is not in this repository and fetching it from origin failed: {}",
             last_line(&fetched.stderr_text())
         ))),
     }
@@ -308,25 +341,56 @@ mod tests {
             None
         );
 
-        // A reported commit the clone lacks is fetched, full or abbreviated.
+        // A reported commit the clone lacks is fetched by its full id only.
+        assert!(matches!(
+            resolve_deployed_commit(&runner, &clone, &second, false, &cancel).await,
+            Err(UnresolvedCommit::NotLocal(_))
+        ));
+        // An abbreviation is never fetched for: that would take origin's
+        // branches, outside the fetch lock.
+        let error = resolve_deployed_commit(&runner, &clone, &third[..10], true, &cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, UnresolvedCommit::NotLocal(_)), "{error}");
         assert!(
-            resolve_deployed_commit(&runner, &clone, &second, false, &cancel)
-                .await
-                .is_err()
+            error.to_string().contains("not known locally yet"),
+            "{error}"
+        );
+        assert_eq!(
+            fixture_git(&runner, &clone, &["rev-parse", "origin/main"]).await,
+            first
         );
         assert_eq!(
             resolve_deployed_commit(&runner, &clone, &second, true, &cancel).await,
             Ok(second.clone())
         );
+        // Once here, its abbreviation resolves like any other.
         assert_eq!(
-            resolve_deployed_commit(&runner, &clone, &third[..10], true, &cancel).await,
-            Ok(third.clone())
+            resolve_deployed_commit(&runner, &clone, &second[..10], true, &cancel).await,
+            Ok(second.clone())
         );
         let unknown = "f".repeat(40);
-        let error = resolve_deployed_commit(&runner, &clone, &unknown, true, &cancel)
-            .await
-            .unwrap_err();
-        assert!(error.0.contains("is not in this repository"), "{error}");
+        assert_eq!(
+            resolve_deployed_commit(&runner, &clone, &unknown, true, &cancel).await,
+            Err(UnresolvedCommit::AbsentOnOrigin(unknown.clone()))
+        );
+        assert_eq!(
+            resolve_deployed_commit(&runner, &clone, &third, true, &cancel).await,
+            Ok(third.clone())
+        );
+        // Origin unreachable is a failure to ask, not an answer.
+        let origin = fixture_git(&runner, &clone, &["remote", "get-url", "origin"]).await;
+        fixture_git(
+            &runner,
+            &clone,
+            &["remote", "set-url", "origin", "/nonexistent/origin"],
+        )
+        .await;
+        assert!(matches!(
+            resolve_deployed_commit(&runner, &clone, &"e".repeat(40), true, &cancel).await,
+            Err(UnresolvedCommit::Failed(_))
+        ));
+        fixture_git(&runner, &clone, &["remote", "set-url", "origin", &origin]).await;
 
         record_deployed(&runner, &clone, stage, &second, &cancel)
             .await

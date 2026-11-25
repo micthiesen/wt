@@ -308,11 +308,18 @@ pub async fn prepare(
         let issue_override = stored["issueId"].as_str();
         let issue_id = wt_app_core::issue_identity::resolve(&slug, issue_override);
         let github_issue = stored["githubIssue"].as_u64();
-        let lifecycle = input.lifecycle.get(&slug).copied().unwrap_or_default();
+        // A row with no landing evidence yet has no deploy answer either,
+        // which a probed stage must not read as "no probe".
+        let probed = |stage| ctx.config.environments.get(stage).is_some();
+        let gathered = input.lifecycle.get(&slug).copied().map(|mut lifecycle| {
+            lifecycle.deploys = lifecycle.deploys.for_probes(probed);
+            lifecycle
+        });
+        let lifecycle = gathered.unwrap_or_default();
         let clean_candidate = lifecycle.clean_candidate;
         let local_merged = lifecycle.local_merged;
         let in_production = lifecycle.in_production;
-        let deploys = lifecycle.deploys;
+        let deploys = lifecycle.deploys.for_probes(probed);
         let locked = match FileLock::try_acquire(
             &ctx.config.paths.lock_dir,
             &slug,
@@ -340,7 +347,7 @@ pub async fn prepare(
                 pr: github.prs.get(&branch),
                 // GitHub read this branch just now: no PR is an answer.
                 pr_read: github_fresh && github_covered_branches.contains(&branch),
-                lifecycle: input.lifecycle.get(&slug).copied(),
+                lifecycle: gathered,
                 separate_production: ctx.config.branch.separate_production(),
             }),
         );
@@ -457,6 +464,7 @@ pub async fn prepare(
         .collect();
     let mut context = AutomationEvalContext {
         github_fresh,
+        github_read_at_ms: None,
         now_ms,
         local_day: OffsetDateTime::now_utc().date().to_string(),
         base_branch: ctx.config.branch.base.clone(),
@@ -1284,6 +1292,62 @@ mod tests {
             wt_ops::lifecycle_ops::plan_with_facts(ctx, rows, &metadata.0, None, None)
                 .await
                 .is_err()
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// A check owed on a probed stage must not come due through a row whose
+    /// deploy was never looked up.
+    #[tokio::test]
+    async fn a_row_without_landing_evidence_is_not_shown_deployed_on_a_probed_stage() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .environments
+            .staging = Some(wt_config::EnvironmentConfig {
+            deployed: vec!["true".into()],
+            ..wt_config::EnvironmentConfig::default()
+        });
+        let ctx = &fixture.ctx;
+        let git = Confirmed::for_test(
+            ctx.repository
+                .inventory_status(&ctx.cancellation)
+                .await
+                .unwrap(),
+        );
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let metadata = Confirmed::for_test((state, BTreeSet::new()));
+        let (edits, no_evidence) = (BTreeMap::new(), BTreeMap::new());
+        let prepared = prepare(
+            ctx,
+            AutomationInputs {
+                git: Some(&git),
+                metadata: Some(&metadata),
+                lanes_ready: true,
+                github: None,
+                discoveries: None,
+                inventory: None,
+                activity: None,
+                board: None,
+                last_edit_at_ms: &edits,
+                rules: &ctx.config.automations,
+                lifecycle: &no_evidence,
+            },
+        )
+        .await
+        .unwrap();
+        let row = prepared.rows.iter().find(|row| row.slug == "one").unwrap();
+        assert_eq!(
+            row.deploys,
+            wt_core::StageDeploys {
+                staging: Some(false),
+                production: None,
+            }
         );
         fixture.close().await.unwrap();
     }

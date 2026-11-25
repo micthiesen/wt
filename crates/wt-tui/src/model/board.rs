@@ -265,6 +265,9 @@ pub struct WatchView {
     pub headline: Option<String>,
     /// Every condition held and its actions are being delivered.
     pub met: bool,
+    /// Automations are paused for the row or everywhere, so a met watch is
+    /// not delivered until they resume.
+    pub held: bool,
 }
 
 impl WatchView {

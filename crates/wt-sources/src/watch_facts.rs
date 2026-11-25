@@ -304,7 +304,7 @@ fn named_worktrees(watches: &[Watch]) -> BTreeSet<String> {
 
 /// What to store for every pending watch: newly held conditions, baselines,
 /// "met", the reason a watch cannot progress when there is one, that it was
-/// judged (once a minute), and its owner's landing commit once known.
+/// judged (at first, then hourly), and its owner's landing commit once known.
 /// `landings` are the landing commits of live rows, by slug.
 pub fn stamps(
     watches: &[Watch],
@@ -560,13 +560,13 @@ mod tests {
         assert!(first[1].apply(&mut other.clone()).changed);
         assert_eq!(follows.landing_commit(), Some("0123abcdef"));
 
-        // Nothing more to write for the rest of the minute.
+        // Nothing more to write for the next hour.
         assert_eq!(
-            stamps(&[follows.clone()], &known, &landings, at + 29_000),
+            stamps(&[follows.clone()], &known, &landings, at + 3_600_000),
             []
         );
-        let next = stamps(&[follows.clone()], &known, &landings, at + 30_000);
-        assert_eq!(next[0].evaluated_at_ms, Some(NOON + 120_000));
+        let next = stamps(&[follows.clone()], &known, &landings, at + 3_630_000);
+        assert_eq!(next[0].evaluated_at_ms, Some(NOON + 3_720_000));
         assert_eq!(next[0].landing_commit, None);
 
         // Another worktree took the slug: its landing is not this watch's.
@@ -628,7 +628,7 @@ mod tests {
         assert!(!has_orphans(&watches, &live));
         let delivered = deliverable(&watches, &live, NOON);
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].held, "12:30 today");
+        assert_eq!(delivered[0].held, "12:30");
         assert_eq!(delivered[0].actions, [(WatchAction::Wake, "go".to_owned())]);
 
         for rows in [&second, &BTreeMap::new()] {

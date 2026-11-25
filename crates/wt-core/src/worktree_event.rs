@@ -110,6 +110,9 @@ pub enum WorktreeEventKind {
     /// Something the worktree waits for was set, came true, was acted on or
     /// was given up.
     Watch {
+        /// The watch's id. Absent from events recorded before v0.1.73.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         change: WatchChange,
         /// What was waited for, in words.
         what: String,
@@ -254,6 +257,7 @@ mod tests {
     #[test]
     fn a_watch_event_is_tagged_like_every_other_kind() {
         let event = WorktreeEventKind::Watch {
+            id: None,
             change: WatchChange::ClearedGate,
             what: "#3806 in production".into(),
             by: None,
@@ -278,6 +282,7 @@ mod tests {
         assert_eq!(
             dropped,
             WorktreeEventKind::Watch {
+                id: None,
                 change: WatchChange::Dropped,
                 what: "merged".into(),
                 by: Some("one".into()),
@@ -286,6 +291,7 @@ mod tests {
             }
         );
         let set = WorktreeEventKind::Watch {
+            id: Some("aaaaaa".into()),
             change: WatchChange::Set,
             what: "merged".into(),
             by: None,
@@ -294,6 +300,7 @@ mod tests {
         };
         let stored = serde_json::to_value(&set).unwrap();
         assert_eq!(stored["then"], serde_json::json!(["unblock", "wake"]));
+        assert_eq!(stored["id"], "aaaaaa");
         let phrase = |then: &[&str]| {
             watch_then_phrase(
                 &then

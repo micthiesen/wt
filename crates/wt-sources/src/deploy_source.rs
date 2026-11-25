@@ -62,7 +62,8 @@ struct Probe {
     failures: u32,
     /// The attention line already written for the current failure.
     reported: Option<String>,
-    /// A reported commit this clone lacked after fetching origin for it.
+    /// A reported commit origin answered it does not have. A fetch that
+    /// failed is not that answer and is tried again.
     unfetchable: Option<String>,
     next_at: Instant,
     last_run: Option<Instant>,
@@ -172,8 +173,10 @@ impl Probe {
         {
             Ok(oid) => oid,
             Err(error) => {
-                self.unfetchable = Some(sha.to_owned());
-                return Err(bounded(&error.0));
+                if matches!(error, wt_vcs::UnresolvedCommit::AbsentOnOrigin(_)) {
+                    self.unfetchable = Some(sha.to_owned());
+                }
+                return Err(bounded(&error.to_string()));
             }
         };
         wt_vcs::record_deployed(&context.processes, main_clone, self.stage, &oid, cancel)
@@ -368,7 +371,10 @@ mod tests {
         let error = probe.deploy.error.clone().unwrap();
         assert!(error.contains("is not in this repository"), "{error}");
         assert_ne!(probe.reported.as_deref(), Some(first_report.as_str()));
-        assert_eq!(probe.unfetchable.as_deref(), Some("f".repeat(40).as_str()));
+        // This clone has no origin to ask, so the fetch failed. That is
+        // not origin's answer: the commit is asked for again next time.
+        assert!(error.contains("fetching it from origin failed"), "{error}");
+        assert_eq!(probe.unfetchable, None);
         std::fs::remove_file(&answer).unwrap();
         probe.run(&context, &cancel).await;
         let error = probe.deploy.error.clone().unwrap();

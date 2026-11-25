@@ -234,6 +234,7 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
             by: who,
             reason,
             then,
+            id: _,
         } => match change {
             WatchChange::Set => {
                 let then = wt_core::watch_then_phrase(then)
@@ -329,6 +330,7 @@ mod tests {
     fn a_watch_reads_as_what_was_waited_for_and_what_wt_did() {
         let watch = |change, by: Option<&str>, reason: Option<&str>, then: &[&str]| {
             describe(&WorktreeEventKind::Watch {
+                id: None,
                 change,
                 what: "#3806 in production".into(),
                 by: by.map(str::to_owned),

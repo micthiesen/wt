@@ -177,6 +177,8 @@ mod watch_action {
 #[derive(Clone, Debug, Default)]
 pub struct AutomationEvalContext {
     pub github_fresh: bool,
+    /// When the GitHub data behind this pass was read, if that is known.
+    pub github_read_at_ms: Option<i64>,
     pub now_ms: i64,
     /// Local date `YYYY-MM-DD`, calculated by the app in its configured zone.
     pub local_day: String,

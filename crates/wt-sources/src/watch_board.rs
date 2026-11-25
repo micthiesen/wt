@@ -100,14 +100,19 @@ fn attach(
     let watches = wt_store::stored_watches(state);
     let mut board = board.as_ref().clone();
     let mut next = None::<Duration>;
+    let paused_everywhere = board.automations_paused;
     for row in board.rows.iter_mut().filter(|row| local_worktree(row)) {
         let created_at = state["slugs"][&row.slug]["createdAt"].as_str();
+        let held = paused_everywhere || row.automations_paused;
         row.watches = watches
             .iter()
             .filter(|watch| {
                 watch.slug == row.slug && !watch.owner_gone && watch.owned_by(created_at)
             })
-            .map(|watch| view(watch, clock, idle))
+            .map(|watch| WatchView {
+                held,
+                ..view(watch, clock, idle)
+            })
             .collect();
         row.created_at = created_at.map(sanitize_terminal_text);
         for watch in watches.iter().filter(|watch| watch.slug == row.slug) {
@@ -172,6 +177,7 @@ fn view(watch: &Watch, clock: LocalClock, idle: Option<&str>) -> WatchView {
         actions,
         headline: text,
         met: watch.is_met(),
+        held: false,
     }
 }
 
@@ -358,7 +364,7 @@ mod tests {
                 (
                     "check secret=API_KEY",
                     WatchTruth::Unknown,
-                    Some("check secret exited 2: vault sealed")
+                    Some("exited 2: vault sealed")
                 ),
             ]
         );
@@ -366,7 +372,7 @@ mod tests {
         // Terminal controls never reach the renderer.
         assert_eq!(timed.headline.as_deref(), Some("Run the smoke test now"));
         let due = &timed.conditions[0];
-        assert_eq!(due.text, "14:10 today");
+        assert_eq!(due.text, "14:10");
         assert_eq!(due.at_ms, Some(u64::try_from(NOON).unwrap() + 130 * 60_000));
         assert_eq!(due.due_in.as_deref(), Some("2h10m"));
         assert_eq!(due.state, WatchTruth::NotYet);
@@ -435,6 +441,17 @@ mod tests {
         due.met_at_ms = Some(NOON);
         let (board, _) = prepared(vec![row("one")], &[due], None);
         assert!(board.rows[0].watches[0].met);
+    }
+
+    #[test]
+    fn a_watch_on_a_paused_row_is_marked_held() {
+        let watches = [watch("tell44", "one", "human", &["merged"], notify())];
+        let (board, _) = prepared(vec![row("one")], &watches, None);
+        assert!(!board.rows[0].watches[0].held);
+        let mut paused = row("one");
+        paused.automations_paused = true;
+        let (board, _) = prepared(vec![paused], &watches, None);
+        assert!(board.rows[0].watches[0].held);
     }
 
     #[test]

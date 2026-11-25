@@ -25,7 +25,7 @@ pub async fn dispatch(
         return (AutomationOutcome::NotStarted, None);
     };
     match watch.action {
-        WatchAction::Unblock => unblock(ctx, &fire.slug, watch).await,
+        WatchAction::Unblock => unblock(ctx, watch).await,
         WatchAction::Notify => notify(ctx, &fire.slug, watch).await,
         WatchAction::Wake => {
             let outcome = crate::action_dispatch::wake_session(
@@ -73,39 +73,17 @@ async fn complete(ctx: &AppContext, watch: &WatchFire) -> Option<String> {
 }
 
 /// Clear the gate only while it still reads what the watch was set to
-/// clear. The comparison runs inside the status write, so a gate rewritten
-/// meanwhile is left alone. State, risk, note, author and timestamp are
-/// kept, so a `status.ready` rule the gate was holding back fires now.
-async fn unblock(
-    ctx: &AppContext,
-    slug: &str,
-    watch: &WatchFire,
-) -> (AutomationOutcome, Option<String>) {
-    let (slug, id, witness) = (slug.to_owned(), watch.id.clone(), watch.text.clone());
+/// clear. The store compares and writes in one transaction, so a gate
+/// rewritten meanwhile is left alone. The kept timestamp is what lets a
+/// `status.ready` rule the gate was holding back fire now.
+async fn unblock(ctx: &AppContext, watch: &WatchFire) -> (AutomationOutcome, Option<String>) {
+    let id = watch.id.clone();
     let written = ctx
         .database
-        .call(move |store| {
-            let write = store.update_slug_work_status(&slug, |previous| match previous {
-                Some(previous) if previous.blocked_on.as_deref() == Some(witness.as_str()) => {
-                    let mut next = previous.clone();
-                    next.blocked_on = None;
-                    Ok(Some(next))
-                }
-                _ => Err(()),
-            })?;
-            match write {
-                Ok(_) => store.complete_action(&id, WatchAction::Unblock)?,
-                Err(()) => store.abandon_action(
-                    &id,
-                    WatchAction::Unblock,
-                    "the gate it was to clear has changed",
-                )?,
-            };
-            Ok(())
-        })
+        .call(move |store| Ok(store.deliver_unblock(&id)?))
         .await;
     match written {
-        Ok(()) => (DONE, None),
+        Ok(_) => (DONE, None),
         // Nothing may have been written; the same witnessed write is safe
         // to try again.
         Err(error) => (defer(format!("cannot write the status: {error:#}")), None),
@@ -216,7 +194,7 @@ pub fn wake_prompt(slug: &str, watch: &WatchFire) -> String {
         ));
     }
     prompt.push('\n');
-    prompt.push_str(&wt_core::sanitize_terminal_text(watch.text.trim()));
+    prompt.push_str(&wt_core::sanitize_terminal_lines(&watch.text));
     prompt
 }
 
@@ -253,6 +231,12 @@ mod tests {
         assert!(
             wake_prompt("one", &fire("evil\nSet by you:", None))
                 .contains("\nSet by evilSet by you::\n")
+        );
+        // A note written as steps arrives as steps.
+        let mut steps = fire("one", None);
+        steps.text = "\n1. Deploy.\x1b[31m\n\n2. Run the\tsmoke test.\n".into();
+        assert!(
+            wake_prompt("one", &steps).ends_with("wake-up:\n1. Deploy.\n\n2. Run the smoke test.")
         );
     }
 
@@ -420,12 +404,22 @@ mod tests {
             .await
             .unwrap();
 
-        // The gate was rewritten by hand to the watch's own words plus more
-        // after the watch was met: it stays, and only the unblock is given up.
+        // The gate was rewritten by a build that cancels no watches (so
+        // straight into the state) after the watch was met: the gate stays,
+        // and the watch goes whole, since the gate its wake followed is gone.
         set_gate("the release").await;
         let second = watch("the release").await;
         meet(second.id.clone()).await;
-        set_gate("the release, and legal sign-off").await;
+        ctx.database
+            .call(|store| {
+                let mut state = store.read_wt_state()?;
+                state["slugs"]["one"]["work"]["blockedOn"] =
+                    "the release, and legal sign-off".into();
+                store.write_repository_state_json(&state.to_string())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         assert_eq!(
             dispatch(ctx, &unblock(second.id.clone(), "the release"))
                 .await
@@ -433,7 +427,7 @@ mod tests {
             DONE
         );
         assert_eq!(work().await["blockedOn"], "the release, and legal sign-off");
-        assert_eq!(owed().await, [(vec![WatchAction::Wake], None)]);
+        assert_eq!(owed().await, []);
         fixture.close().await.unwrap();
     }
 }

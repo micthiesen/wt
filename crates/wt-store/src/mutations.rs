@@ -1215,11 +1215,17 @@ impl Store {
     ) -> Result<bool, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
             let previous = stored_work_status(state, slug);
-            let changed = write_work_status(state, slug, previous.as_ref(), record)?;
+            let written = write_work_status(state, slug, previous.as_ref(), record)?;
+            let changed = written.changed;
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
-                    log_status(log, slug, previous.as_ref(), record, None)
+                    log_status(log, slug, previous.as_ref(), record, None)?;
+                    crate::watches::log_cancelled(
+                        log,
+                        &written.cancelled_watches,
+                        record.and_then(|record| record.by.as_deref()),
+                    )
                 });
             }
             Ok((changed, changed))
@@ -1235,11 +1241,13 @@ impl Store {
     ) -> Result<bool, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
             let previous = stored_work_status(state, slug);
-            let changed = write_work_status(state, slug, previous.as_ref(), None)?;
+            let written = write_work_status(state, slug, previous.as_ref(), None)?;
+            let changed = written.changed;
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
-                    log_status(log, slug, previous.as_ref(), None, by)
+                    log_status(log, slug, previous.as_ref(), None, by)?;
+                    crate::watches::log_cancelled(log, &written.cancelled_watches, by)
                 });
             }
             Ok((previous.is_some(), changed))
@@ -1263,11 +1271,17 @@ impl Store {
                 Ok(record) => record,
                 Err(refusal) => return Ok((Err(refusal), false)),
             };
-            let changed = write_work_status(state, slug, previous.as_ref(), record.as_ref())?;
+            let written = write_work_status(state, slug, previous.as_ref(), record.as_ref())?;
+            let changed = written.changed;
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
-                    log_status(log, slug, previous.as_ref(), record.as_ref(), None)
+                    log_status(log, slug, previous.as_ref(), record.as_ref(), None)?;
+                    crate::watches::log_cancelled(
+                        log,
+                        &written.cancelled_watches,
+                        record.as_ref().and_then(|record| record.by.as_deref()),
+                    )
                 });
             }
             Ok((
@@ -1275,6 +1289,7 @@ impl Store {
                     previous,
                     record,
                     changed,
+                    cancelled_watches: written.cancelled_watches,
                 }),
                 changed,
             ))
@@ -1316,6 +1331,33 @@ impl Store {
             }
             entry.insert(MERGE_ARM.to_owned(), next.clone());
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Record that GitHub was seen holding the merge armed at
+    /// `armed_at_ms`. Written once: a later sighting, or one of another
+    /// arming, changes nothing. Returns whether the record changed.
+    pub fn note_slug_merge_arm_seen(
+        &mut self,
+        slug: &str,
+        armed_at_ms: i64,
+        seen_at_ms: i64,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let Some(arm) = state
+                .get_mut("slugs")
+                .and_then(|slugs| slugs.get_mut(slug))
+                .and_then(|entry| entry.get_mut(MERGE_ARM))
+                .and_then(Value::as_object_mut)
+                .filter(|arm| {
+                    arm.get("armedAtMs").and_then(Value::as_i64) == Some(armed_at_ms)
+                        && !arm.contains_key("seenArmedAtMs")
+                })
+            else {
+                return Ok((false, false));
+            };
+            arm.insert("seenArmedAtMs".to_owned(), seen_at_ms.into());
             Ok((true, true))
         })
     }
@@ -2517,20 +2559,46 @@ fn log_status(
     }
 }
 
-/// Returns whether the stored status changed.
+/// wt clears `slug`'s merge gate, keeping everything else of its status.
+pub(crate) fn clear_gate(
+    state: &mut WtState,
+    log: &crate::events::EventLog<'_>,
+    slug: &str,
+) -> Result<(), StoreError> {
+    let Some(previous) = stored_work_status(state, slug) else {
+        return Ok(());
+    };
+    let mut next = previous.clone();
+    next.blocked_on = None;
+    if write_work_status(state, slug, Some(&previous), Some(&next))?.changed {
+        log.best_effort(|log| {
+            log_incarnation(log, state, slug)?;
+            log_status(log, slug, Some(&previous), Some(&next), None)
+        });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct StatusWritten {
+    changed: bool,
+    /// Watches that were to clear a gate this write removed or replaced.
+    cancelled_watches: Vec<wt_core::watch::Watch>,
+}
+
 fn write_work_status(
     state: &mut WtState,
     slug: &str,
     previous: Option<&WorkStatusRecord>,
     record: Option<&WorkStatusRecord>,
-) -> Result<bool, StoreError> {
+) -> Result<StatusWritten, StoreError> {
     if record.is_none() && !has_slug(state, slug) {
-        return Ok(false);
+        return Ok(StatusWritten::default());
     }
     if let (Some(record), Some(previous)) = (record, previous)
         && previous.same_claim(record)
     {
-        return Ok(false);
+        return Ok(StatusWritten::default());
     }
     let mut entry = slug_entry(state, slug);
     if let Some(record) = record {
@@ -2555,10 +2623,14 @@ fn write_work_status(
         entry.remove("work");
     }
     object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
-    crate::watches::gate_written(
+    let cancelled_watches = crate::watches::gate_written(
         state,
         slug,
+        previous.and_then(|previous| previous.blocked_on.as_deref()),
         record.and_then(|record| record.blocked_on.as_deref()),
     );
-    Ok(true)
+    Ok(StatusWritten {
+        changed: true,
+        cancelled_watches,
+    })
 }

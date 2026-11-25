@@ -72,6 +72,9 @@ pub struct WorkStatusWrite {
     pub previous: Option<WorkStatusRecord>,
     pub record: Option<WorkStatusRecord>,
     pub changed: bool,
+    /// Watches that were to clear the gate this write removed or replaced,
+    /// cancelled with it.
+    pub cancelled_watches: Vec<wt_core::watch::Watch>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

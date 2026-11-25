@@ -163,8 +163,10 @@ impl fmt::Display for Condition {
             Self::At { at_ms } => write!(f, "at:{at_ms}"),
             Self::Own(state) => f.write_str(state.as_str()),
             Self::Pr { number, goal } => write!(f, "pr:{number}:{}", goal.as_str()),
-            Self::Worktree { slug, state } => write!(f, "{slug}:{}", state.as_str()),
-            Self::Gone { slug } => write!(f, "{slug}:gone"),
+            // The prefix keeps a worktree named like a word of the grammar
+            // (`release`, `pr`, `wt`) apart from that word.
+            Self::Worktree { slug, state } => write!(f, "wt:{slug}:{}", state.as_str()),
+            Self::Gone { slug } => write!(f, "wt:{slug}:gone"),
             Self::Release(stage) => write!(f, "release:{}", stage.as_str()),
             Self::Check { id, arg: None } => write!(f, "check:{id}"),
             Self::Check { id, arg: Some(arg) } => write!(f, "check:{id}={arg}"),
@@ -185,10 +187,12 @@ impl Condition {
         }
     }
 
+    /// Reads every spelling a build has stored, including a worktree
+    /// without its `wt:` prefix, which typed input no longer always may be.
     fn from_stored(text: &str) -> Self {
         absolute_ms(text)
             .map(|at_ms| Self::At { at_ms })
-            .or_else(|| parse_untimed(text).ok())
+            .or_else(|| parse_untimed(text, Spelling::Stored).ok())
             .unwrap_or_else(|| Self::Unknown(text.to_owned()))
     }
 
@@ -326,8 +330,9 @@ impl WatchCondition {
         }
     }
 
-    /// The condition in words, with a time relative to today: `17:00 today`,
-    /// `#3806 in production`, `PR checks green for 1h`.
+    /// The condition in words, with a time relative to today: `17:00`,
+    /// `tomorrow 09:00`, `Nov 26 17:00`, `#3806 in production`, `PR checks
+    /// green for 1h`.
     pub fn describe(&self, clock: LocalClock) -> String {
         self.describe_in(Local {
             utc_offset_minutes: clock.utc_offset_minutes,
@@ -458,8 +463,10 @@ pub struct Watch {
 // that does not know them carries them through a rewrite like any other.
 const LANDING_COMMIT: &str = "landingCommit";
 const EVALUATED_AT: &str = "evaluatedAtMs";
-/// How often an engine records that it judged a watch.
-pub const EVALUATED_EVERY_MS: i64 = MINUTE_MS;
+/// How often an engine records again that it judged a watch. Every stamp
+/// rewrites the state and wakes every process that reads it, and the
+/// record is only asked whether an engine has judged the watch at all.
+pub const EVALUATED_EVERY_MS: i64 = HOUR_MS;
 
 /// What is known about a removed owner's branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -482,8 +489,8 @@ impl Watch {
         self.extra.get(LANDING_COMMIT)?.as_str()
     }
 
-    /// When an engine last judged the watch, to the minute. `None` until
-    /// one has.
+    /// When an engine recorded judging the watch, to the minute: the first
+    /// time, then about hourly. `None` until one has.
     pub fn evaluated_at_ms(&self) -> Option<i64> {
         self.extra.get(EVALUATED_AT)?.as_i64()
     }
@@ -499,8 +506,10 @@ impl Watch {
     }
 
     /// Whether `created_at` names the worktree this watch was set on.
+    /// A watch set on a worktree with no recorded creation belongs only to
+    /// one that still has none: any worktree created later has a stamp.
     pub fn owned_by(&self, created_at: Option<&str>) -> bool {
-        self.incarnation.is_none() || self.incarnation.as_deref() == created_at
+        self.incarnation.as_deref() == created_at
     }
 
     /// The conditions in words for a reader now.
@@ -508,10 +517,13 @@ impl Watch {
         self.join(|cond| cond.describe(clock))
     }
 
-    /// The conditions in words with times written out in the setter's local
-    /// time, for text that is kept.
+    /// The conditions in words for text that is kept, with times in the
+    /// setter's local time and relative to the day the watch was set.
     pub fn summary(&self) -> String {
-        let local = Local::absolute(self.utc_offset_minutes);
+        let local = Local {
+            utc_offset_minutes: self.utc_offset_minutes,
+            now_ms: Some(self.created_at_ms),
+        };
         self.join(|cond| cond.describe_in(local))
     }
 
@@ -585,10 +597,11 @@ pub struct GrammarError {
 }
 
 const GRAMMAR: &str = "A condition is one of:
-  17:00 | +3h | +90m | +2d | 2026-11-25T17:00    a local time
+  17:00 | 5pm | 5:30pm | 3h | 90m | 2d | \"tomorrow 09:00\" | 2026-11-25T17:00    a local time
   merged | staging | production | ready | green | verified | closed    this worktree
   pr:3806 | pr:3806:merged|staging|production|closed    a pull request
-  <slug>:merged|staging|production|ready|green|verified|closed|gone    another worktree
+  wt:<slug>:merged|staging|production|ready|green|verified|closed|gone    another worktree
+      (<slug>:<state> reads the same unless the slug is a word of this grammar)
   release:staging | release:production    the next release there
   check:<id> | check:<id>=<arg>    a configured check
 Anything but a time may end in +<duration>: it must have held that long.
@@ -630,7 +643,13 @@ pub fn parse(arg: &str, clock: LocalClock) -> Result<WatchCondition, GrammarErro
     if delay.is_some() && !matches!(parse_time(body, clock), Ok(None)) {
         return Err(fail("a time takes no delay; write the later time".into()));
     }
-    let cond = parse_untimed(body).map_err(&fail)?;
+    let cond = parse_untimed(body, Spelling::Typed).map_err(|problem| {
+        fail(if looks_like_time(text) {
+            TIME_FORMS.to_owned()
+        } else {
+            problem
+        })
+    })?;
     Ok(WatchCondition::new(cond, delay))
 }
 
@@ -638,9 +657,70 @@ fn absolute_ms(text: &str) -> Option<i64> {
     digits(text.strip_prefix("at:")?)
 }
 
+const TIME_FORMS: &str = "a time is a clock time (17:00, 5pm, 5:30pm), a time from now (3h, 90m, 2d), \"tomorrow 09:00\" as one quoted argument, or a date and time (2026-11-25T17:00)";
+
+/// Whether text that is no condition was probably meant as a time, so its
+/// refusal should say how a time is written.
+fn looks_like_time(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // A slug may start with a digit; `<slug>:<state>` has no space.
+    (lower.starts_with(|first: char| first.is_ascii_digit())
+        && (!lower.contains(':') || lower.contains(' ')))
+        || [
+            "in ", "at ", "today", "tomorrow", "tonight", "next ", "noon", "midnight",
+        ]
+        .iter()
+        .any(|word| lower.starts_with(word))
+        || lower.contains("o'clock")
+}
+
+/// `17:00`, `5pm` or `5:30pm` as milliseconds into the day. `None` when the
+/// text is not a clock time at all.
+fn clock_of_day(text: &str) -> Result<Option<i64>, String> {
+    let lower = text.to_ascii_lowercase();
+    let (body, half) = match (lower.strip_suffix("am"), lower.strip_suffix("pm")) {
+        (Some(body), _) => (body.trim_end(), Some(0)),
+        (_, Some(body)) => (body.trim_end(), Some(12)),
+        _ => (lower.as_str(), None),
+    };
+    let (hour, minute) = match body.split_once(':') {
+        Some((hour, minute)) if minute.len() == 2 => (hour, digits(minute)),
+        Some(_) => return Ok(None),
+        // An hour alone is a time only with am or pm.
+        None if half.is_some() => (body, Some(0)),
+        None => return Ok(None),
+    };
+    let (Some(hour), Some(minute)) = (
+        Some(hour)
+            .filter(|hour| (1..=2).contains(&hour.len()))
+            .and_then(digits),
+        minute,
+    ) else {
+        return Ok(None);
+    };
+    let hour = match half {
+        None if hour > 23 => return Err("a clock time runs from 00:00 to 23:59".into()),
+        None => hour,
+        Some(_) if !(1..=12).contains(&hour) => {
+            return Err("a 12-hour time runs from 12am to 11:59pm; 17:00 works too".into());
+        }
+        Some(half) => hour % 12 + half,
+    };
+    if minute > 59 {
+        return Err("a clock time runs from 00:00 to 23:59".into());
+    }
+    Ok(Some(hour * HOUR_MS + minute * MINUTE_MS))
+}
+
 fn parse_time(text: &str, clock: LocalClock) -> Result<Option<i64>, String> {
     let offset_ms = i64::from(clock.utc_offset_minutes) * MINUTE_MS;
-    if let Some(duration) = text.strip_prefix('+') {
+    // `3h` is `+3h`: nothing else in the grammar is digits and a unit.
+    let from_now = text.strip_prefix('+').or_else(|| {
+        Some(text).filter(|text| {
+            text.starts_with(|first: char| first.is_ascii_digit()) && Delay::parse(text).is_some()
+        })
+    });
+    if let Some(duration) = from_now {
         let delay = Delay::parse(duration)
             .ok_or("a time from now looks like +90m, +3h or +2d, up to a year")?;
         // Whole seconds, so the time reads back exactly as it prints.
@@ -650,16 +730,21 @@ fn parse_time(text: &str, clock: LocalClock) -> Result<Option<i64>, String> {
     if let Some(at_ms) = absolute_ms(text) {
         return Ok(Some(at_ms));
     }
-    if let Some((hour, minute)) = text.split_once(':')
-        && (1..=2).contains(&hour.len())
-        && minute.len() == 2
-        && let (Some(hour), Some(minute)) = (digits(hour), digits(minute))
-    {
-        if hour > 23 || minute > 59 {
-            return Err("a clock time runs from 00:00 to 23:59".into());
+    let local_now = clock.now_ms + offset_ms;
+    let midnight = local_now - local_now.rem_euclid(DAY_MS);
+    let lower = text.to_ascii_lowercase();
+    for (word, day) in [("today", 0), ("tomorrow", DAY_MS)] {
+        if let Some(rest) = lower.strip_prefix(word)
+            && rest.starts_with(' ')
+        {
+            let of_day = clock_of_day(rest.trim())?.ok_or_else(|| {
+                format!("after `{word}` comes a clock time: \"{word} 09:00\"; any other day is a date and time, 2026-11-25T17:00")
+            })?;
+            return Ok(Some(midnight + day + of_day - offset_ms));
         }
-        let local_now = clock.now_ms + offset_ms;
-        let mut at = local_now - local_now.rem_euclid(DAY_MS) + hour * HOUR_MS + minute * MINUTE_MS;
+    }
+    if let Some(of_day) = clock_of_day(text)? {
+        let mut at = midnight + of_day;
         if at <= local_now {
             at += DAY_MS;
         }
@@ -739,7 +824,35 @@ fn parse_stage(text: &str) -> Option<VerifyStage> {
     }
 }
 
-fn parse_untimed(text: &str) -> Result<Condition, String> {
+/// Where a condition's text came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// An argument someone typed: a worktree whose slug is a word of the
+    /// grammar must be named with `wt:`.
+    Typed,
+    /// A record: whatever a build has stored reads back.
+    Stored,
+}
+
+/// Slugs that, written bare before `:<state>`, read as another form or
+/// could be taken for one.
+fn grammar_word(slug: &str) -> bool {
+    ["release", "check", "commit", "pr", "wt", "at"].contains(&slug)
+        || slug.starts_with(['#', '+'])
+        || slug.contains('+')
+        || Delay::parse(slug).is_some()
+        || !matches!(clock_of_day(slug), Ok(None))
+}
+
+fn parse_untimed(text: &str, spelling: Spelling) -> Result<Condition, String> {
+    let named = |form: &str, rest: &str| {
+        let state = rest.rsplit_once(':').map_or(rest, |(_, state)| state);
+        if state == "gone" || RowState::parse(state).is_some() {
+            format!("; a worktree named {form} is wt:{form}:{rest}")
+        } else {
+            String::new()
+        }
+    };
     // `pr:` before a digit is a pull request; before anything else it is a
     // worktree named `pr`.
     let pr = text.strip_prefix('#').or_else(|| {
@@ -768,7 +881,10 @@ fn parse_untimed(text: &str) -> Result<Condition, String> {
     }
     if let Some(stage) = text.strip_prefix("release:") {
         return parse_stage(stage).map(Condition::Release).ok_or_else(|| {
-            format!("a release is release:staging or release:production, not `{stage}`")
+            format!(
+                "a release is release:staging or release:production, not `{stage}`{}",
+                named("release", stage)
+            )
         });
     }
     if let Some(check) = text.strip_prefix("check:") {
@@ -780,6 +896,20 @@ fn parse_untimed(text: &str) -> Result<Condition, String> {
             return Err(
                 "a check is check:<id> or check:<id>=<arg>, with neither part empty".into(),
             );
+        }
+        // The argument becomes one argv entry of the check's command, which
+        // must not read it as an option of its own.
+        if spelling == Spelling::Typed
+            && let Some(arg) = arg
+        {
+            if arg.starts_with('-') {
+                return Err(format!(
+                    "a check's argument cannot start with `-`: the command would read `{arg}` as an option"
+                ));
+            }
+            if arg.chars().any(char::is_control) {
+                return Err("a check's argument cannot contain control characters".into());
+            }
         }
         return Ok(Condition::Check {
             id: id.to_owned(),
@@ -798,10 +928,18 @@ fn parse_untimed(text: &str) -> Result<Condition, String> {
                     stage: parse_stage(stage)?,
                 })
             })
-            .ok_or_else(|| "a commit is commit:<sha>:staging or commit:<sha>:production".into());
+            .ok_or_else(|| {
+                format!(
+                    "a commit is commit:<sha>:staging or commit:<sha>:production{}",
+                    named("commit", commit)
+                )
+            });
     }
     let states = "merged, staging, production, ready, green, verified or closed";
-    let Some((slug, state)) = text.rsplit_once(':') else {
+    // `wt:` before `<slug>:<state>` names a worktree whatever its slug.
+    // Before a state alone it is a worktree named `wt`.
+    let explicit = text.strip_prefix("wt:").filter(|rest| rest.contains(':'));
+    let Some((slug, state)) = explicit.unwrap_or(text).rsplit_once(':') else {
         return match text {
             "gone" => Err("`gone` needs a worktree: <slug>:gone".into()),
             _ => RowState::parse(text)
@@ -812,22 +950,36 @@ fn parse_untimed(text: &str) -> Result<Condition, String> {
     if slug.is_empty() || slug.contains(char::is_whitespace) {
         return Err(format!("`{slug}` is not a worktree"));
     }
-    let slug = slug.to_owned();
-    match state {
-        "gone" => Ok(Condition::Gone { slug }),
+    let cond = match state {
+        "gone" => Condition::Gone {
+            slug: slug.to_owned(),
+        },
         _ => RowState::parse(state)
-            .map(|state| Condition::Worktree { slug, state })
-            .ok_or_else(|| format!("`{state}` is not a state: use {states}, or gone")),
+            .map(|state| Condition::Worktree {
+                slug: slug.to_owned(),
+                state,
+            })
+            .ok_or_else(|| format!("`{state}` is not a state: use {states}, or gone"))?,
+    };
+    if explicit.is_none() && spelling == Spelling::Typed && grammar_word(slug) {
+        return Err(format!(
+            "`{slug}` is also a word of the grammar, so `{text}` could mean two things; a worktree named {slug} is {cond}"
+        ));
     }
+    Ok(cond)
 }
 
-/// How times are written: at an offset, and relative to today when the
-/// reader's present is known.
+/// How times are written: at an offset, and relative to a day when one is
+/// given: the reader's present, or the day a kept text is about.
 #[derive(Clone, Copy)]
 struct Local {
     utc_offset_minutes: i32,
     now_ms: Option<i64>,
 }
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 impl Local {
     fn absolute(utc_offset_minutes: i32) -> Self {
@@ -863,12 +1015,22 @@ impl Local {
         )
     }
 
+    /// `17:00` on the reference day, `tomorrow 09:00`, else `Nov 26 17:00`,
+    /// with the year when it is another one. Never seconds: this is read,
+    /// not typed back.
     fn describe(self, at_ms: i64) -> String {
         let day = |ms| self.local(ms).div_euclid(DAY_MS);
-        match self.now_ms.map(|now_ms| day(at_ms) - day(now_ms)) {
-            Some(0) => format!("{} today", self.clock(at_ms)),
-            Some(1) => format!("tomorrow {}", self.clock(at_ms)),
-            _ => self.stamp(at_ms),
+        let clock = self.clock(at_ms);
+        let (year, month, date) = civil_from_days(day(at_ms));
+        let dated = format!(
+            "{} {date} {clock}",
+            MONTHS[(month - 1).clamp(0, 11) as usize]
+        );
+        match self.now_ms {
+            Some(now_ms) if day(at_ms) == day(now_ms) => clock,
+            Some(now_ms) if day(at_ms) == day(now_ms) + 1 => format!("tomorrow {clock}"),
+            Some(now_ms) if civil_from_days(day(now_ms)).0 == year => dated,
+            _ => format!("{dated}, {year}"),
         }
     }
 }
@@ -1066,8 +1228,8 @@ pub struct WatchStamps {
     pub last_error: Option<Option<String>>,
     /// The owner's landing commit, when the record does not have it yet.
     pub landing_commit: Option<String>,
-    /// The minute of this evaluation, when the record shows an earlier one
-    /// or none.
+    /// The minute of this evaluation, when the record shows none or one
+    /// more than [`EVALUATED_EVERY_MS`] old.
     pub evaluated_at_ms: Option<i64>,
 }
 
@@ -1101,12 +1263,12 @@ impl WatchStamps {
     }
 
     /// The minute to record an evaluation at `now_ms` under, unless the
-    /// watch already shows that minute or a later one.
+    /// watch already shows one from the last [`EVALUATED_EVERY_MS`].
     pub fn evaluation_due(watch: &Watch, now_ms: i64) -> Option<i64> {
-        let minute = now_ms - now_ms.rem_euclid(EVALUATED_EVERY_MS);
+        let minute = now_ms - now_ms.rem_euclid(MINUTE_MS);
         watch
             .evaluated_at_ms()
-            .is_none_or(|at| at < minute)
+            .is_none_or(|at| at.saturating_add(EVALUATED_EVERY_MS) < minute)
             .then_some(minute)
     }
 

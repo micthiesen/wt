@@ -68,18 +68,47 @@ pub fn shown(watch: &Watch, cond: &WatchCondition, now_ms: i64, idle: Option<&st
         _ => false,
     };
     match watch.last_error.as_ref().filter(about_this) {
-        Some(error) => Shown::Unknown(error.clone()),
+        // Beside its condition the problem need not name the check again.
+        Some(error) => Shown::Unknown(match &cond.cond {
+            Condition::Check { id, .. } => error
+                .strip_prefix(&format!("check {id} "))
+                .or_else(|| error.strip_prefix(&format!("check {id}: ")))
+                .unwrap_or(error)
+                .to_owned(),
+            _ => error.clone(),
+        }),
         None if watch.evaluated_at_ms().is_some() => Shown::NotYet(None),
         None => Shown::NotEvaluated,
     }
 }
 
-/// The first line of a prompt or a notification text, cut to 80 cells.
+/// The first line with anything on it of a prompt or a notification text,
+/// cut to 80 cells.
 pub fn headline(text: &str) -> String {
-    let line = text.lines().next().unwrap_or_default();
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
     if line.chars().count() > 80 {
         format!("{}…", line.chars().take(79).collect::<String>())
     } else {
         line.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_headline_is_the_first_line_that_says_something() {
+        assert_eq!(
+            headline("\n  \n  Run the smoke test.\nThen report."),
+            "Run the smoke test."
+        );
+        assert_eq!(headline(""), "");
+        let long = "x".repeat(100);
+        assert_eq!(headline(&long).chars().count(), 80);
     }
 }

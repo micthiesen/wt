@@ -23,4 +23,9 @@ pub struct MergeArm {
     pub head: Option<String>,
     pub armed_at_ms: i64,
     pub mechanism: MergeMechanism,
+    /// When GitHub was first seen holding the merge, in a read made after
+    /// the arming. Until then the record alone is not proof it was armed:
+    /// builds that cancel without clearing the record leave it behind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_armed_at_ms: Option<i64>,
 }

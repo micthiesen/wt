@@ -218,9 +218,14 @@ pub fn evaluate_breaker_resets(
             }
             // An armed merge whose queue membership the read cannot tell is
             // not known to be intact.
+            // Nor is one GitHub may not have caught up with, or has never
+            // been seen holding.
             if rule.on == AutomationTrigger::PrMergeDropped
-                && row.merge_arm.is_some()
-                && row.pr.as_ref().is_some_and(|pr| pr.merge_queued.is_none())
+                && row.merge_arm.as_ref().is_some_and(|arm| {
+                    row.pr.as_ref().is_some_and(|pr| pr.merge_queued.is_none())
+                        || arm.seen_armed_at_ms.is_none()
+                        || context.now_ms.saturating_sub(arm.armed_at_ms) < MERGE_ARM_GRACE_MS
+                })
             {
                 continue;
             }
@@ -363,7 +368,10 @@ fn evaluate_row(
         AutomationTrigger::PrMergeDropped => {
             let arm = row.merge_arm.as_ref()?;
             let pr = fresh_open_pr(row, context)?;
+            // A record GitHub was never seen to hold may be one a build
+            // that does not clear records cancelled.
             if pr.number != arm.pr
+                || arm.seen_armed_at_ms.is_none()
                 || pr.auto_merge
                 || pr.merge_queued != Some(false)
                 || context.now_ms.saturating_sub(arm.armed_at_ms) < MERGE_ARM_GRACE_MS
@@ -503,6 +511,30 @@ fn merge_dropped_detail(
     } else {
         wt_core::sanitize_terminal_text(&format!("{what} ({})", causes.join("; ")))
     }
+}
+
+/// Armed merges GitHub is now seen to hold, as `(slug, armed_at_ms)`, for
+/// records that do not say so yet. Only a read that started after the
+/// arming counts: an earlier one may show an arming since cancelled.
+pub fn observed_merge_arms(
+    rows: &[AutomationRow],
+    context: &AutomationEvalContext,
+) -> Vec<(String, i64)> {
+    let Some(read_at_ms) = context.github_read_at_ms.filter(|_| context.github_fresh) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let arm = row.merge_arm.as_ref()?;
+            let pr = row.pr.as_ref()?;
+            (arm.seen_armed_at_ms.is_none()
+                && read_at_ms > arm.armed_at_ms
+                && pr.number == arm.pr
+                && pr.state == "OPEN"
+                && (pr.auto_merge || pr.merge_queued == Some(true)))
+            .then(|| (row.slug.clone(), arm.armed_at_ms))
+        })
+        .collect()
 }
 
 /// Armed merges that have ended, as `(slug, armed_at_ms)`: the branch
@@ -848,8 +880,10 @@ fn evaluate_stage(rule: &AutomationDef, context: &AutomationEvalContext) -> Opti
         rule: rule.clone(),
         slug: FLEET_SLUG.into(),
         quiesce_slugs: Vec::new(),
+        // Keyed by the move, not the commit: a stage redeployed to a commit
+        // it ran before (a rollback and the roll forward) is a new deploy.
         fire_keys: vec![format!(
-            "{}:deployed:{}:{}",
+            "{}:deployed:{}:{from}:{}",
             rule.id,
             stage.as_str(),
             tip.now
@@ -1201,6 +1235,7 @@ mod tests {
                 head: Some("abc12345".into()),
                 armed_at_ms,
                 mechanism,
+                seen_armed_at_ms: Some(armed_at_ms + 1),
             });
             row
         };
@@ -1228,10 +1263,35 @@ mod tests {
         assert_eq!(resets(&row, &context), 0);
         context.now_ms = ARMED + MERGE_ARM_GRACE_MS;
 
-        // GitHub's answer may predate an arming this recent.
+        // GitHub's answer may predate an arming this recent: not a drop,
+        // and not proof the merge is intact either.
         context.now_ms -= 1;
         assert!(fires(&row, &context).is_empty());
+        assert_eq!(resets(&row, &context), 0);
         context.now_ms += 1;
+
+        // A record GitHub was never seen to hold may be a cancelled merge
+        // an older build left behind.
+        row.merge_arm.as_mut().unwrap().seen_armed_at_ms = None;
+        assert!(fires(&row, &context).is_empty());
+        assert_eq!(resets(&row, &context), 0);
+        // Seeing it armed takes a read made after the arming.
+        row.pr.as_mut().unwrap().merge_queued = Some(true);
+        let seen = |context: &AutomationEvalContext, row: &AutomationRow| {
+            observed_merge_arms(std::slice::from_ref(row), context)
+        };
+        assert_eq!(seen(&context, &row), []);
+        context.github_read_at_ms = Some(ARMED);
+        assert_eq!(seen(&context, &row), []);
+        context.github_read_at_ms = Some(ARMED + 1);
+        assert_eq!(seen(&context, &row), [("feature-1".to_owned(), ARMED)]);
+        context.github_fresh = false;
+        assert_eq!(seen(&context, &row), []);
+        context.github_fresh = true;
+        row.pr.as_mut().unwrap().merge_queued = Some(false);
+        assert_eq!(seen(&context, &row), []);
+        row.merge_arm.as_mut().unwrap().seen_armed_at_ms = Some(ARMED + 1);
+        assert_eq!(seen(&context, &row), []);
 
         // Stale data proves nothing, and neither does a partial queue read.
         context.github_fresh = false;
@@ -1504,7 +1564,22 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(fire.slug, FLEET_SLUG);
-        assert_eq!(fire.fire_keys, ["released:deployed:staging:abcdef123"]);
+        assert_eq!(
+            fire.fire_keys,
+            ["released:deployed:staging:123456789:abcdef123"]
+        );
+        // Rolled back and forward again: the same commit, another deploy.
+        context.branch_tips.insert(
+            deployed_ref.clone(),
+            crate::types::BranchTip {
+                now: "abcdef123".into(),
+                seen: Some("fedcba987".into()),
+            },
+        );
+        assert_ne!(
+            evaluate(std::slice::from_ref(&staging), &[], &context)[0].fire_keys,
+            fire.fire_keys
+        );
         assert_eq!(fire.detail, "staging deployed 1234567..abcdef1");
         assert!(fire.quiesce_slugs.is_empty());
         let range = fire.branch_range.unwrap();

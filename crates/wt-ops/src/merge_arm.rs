@@ -28,6 +28,7 @@ pub async fn armed(
         } else {
             MergeMechanism::AutoMerge
         },
+        seen_armed_at_ms: None,
     };
     let owner = slug.to_owned();
     if let Err(error) = database

@@ -222,7 +222,7 @@ every_seconds = 120
 
 | key | required | default | meaning |
 |---|---|---|---|
-| `deployed` | **yes** | — | Argv, run in the main clone with no shell. It exits 0 and prints the deployed commit SHA: the first whitespace-delimited token of stdout, 7 to 40 hexadecimal characters. |
+| `deployed` | **yes** | — | Argv, run in the main clone with no shell. It exits 0 and prints the deployed commit SHA: the first whitespace-delimited token of stdout, 7 to 40 hexadecimal characters. The first element is the program and cannot contain a `{{...}}` template. Prefer the full 40-character id (see below). |
 | `every_seconds` | no | `60` | How often the probe runs. Minimum `15`. |
 | `timeout_seconds` | no | `20` | A probe still running after this long is stopped and counts as a failure. |
 
@@ -232,8 +232,13 @@ name; any other table is a load error. Each stage is independent: configure
 one, both or neither.
 
 After each successful probe wt points `refs/wt/deployed/<stage>` in the main
-clone at the reported commit, fetching it from origin once when the clone
-does not have it yet. A landing **is deployed to a stage** when its commit
+clone at the reported commit. When the clone does not have a commit reported
+by its full 40-character id, wt fetches that one object from origin; if
+origin answers that it does not have it, wt does not ask again until the
+probe reports another commit, while a fetch that failed (origin unreachable)
+is retried on the next probe. An abbreviated SHA the clone does not have yet
+is not fetched for: the probe reports it as not known locally yet and it
+resolves once wt's regular origin fetch has brought the commit in. A landing **is deployed to a stage** when its commit
 (HEAD, or the exact merge commit of the PR merged at HEAD) is that commit or
 an ancestor of it. The board, [`status.verification_due`](automations.md#triggers)
 and [`stage.deployed`](automations.md#triggers) all read that one ref, so
@@ -279,7 +284,7 @@ wt status ready --risk low --blocked-on "needs STRIPE_KEY in production" --until
 |---|---|---|---|
 | `id` | **yes** | — | The name in `check:<id>`. Letters, digits, `-`, `_` and `.`; unique. |
 | `description` | no | *(none)* | What the check answers, shown by `wt watch check`. |
-| `run` | **yes** | — | Argv, run in the main clone with no shell. Exit `0` means it holds, `1` means not yet; any other exit, or a timeout, is an error that `wt watch` shows while the watch keeps waiting. |
+| `run` | **yes** | — | Argv, run in the main clone with no shell. Exit `0` means it holds, `1` means not yet; any other exit, or a timeout, is an error that `wt watch` shows while the watch keeps waiting. The first element is the program and cannot contain a `{{...}}` template: a load error. |
 | `every_seconds` | no | `300` | How often it runs while a pending watch needs it. Minimum `30`. |
 | `timeout_seconds` | no | `30` | A run still going after this long is stopped and counts as an error. |
 
@@ -287,7 +292,9 @@ wt status ready --risk low --blocked-on "needs STRIPE_KEY in production" --until
 (the worktree the watch belongs to) and `{{main_clone}}` are replaced inside
 each argument. A value never splits into further arguments and is never read
 by a shell, so an argument written by an agent cannot run anything the
-command itself does not. A check runs only while a pending watch waits on
+command itself does not. For the same reason `check:<id>=<arg>` is refused
+when it is set if the argument starts with `-` (the command would read it
+as one of its options) or contains a control character. A check runs only while a pending watch waits on
 it, at most two at a time, on each host that evaluates that watch, with that
 host's credentials. A watch naming an id that is not configured is refused
 when it is set.
@@ -1095,7 +1102,7 @@ entry remains last.
 | key | required | default | meaning |
 |---|---|---|---|
 | `rows` | no | `["branch", "issue", "stage", "dev", "pr", "claude", "git"]` | Detail-pane row order. Available ids: `branch` (renders `<branch> → <base>`; the branch gives up cells first when the line is tight, so the target is always readable), `path`, `issue` (legacy alias: `linear`), `stage`, `dev`, `pr`, `guide`, `claude`, `git`. `guide` shows only with `[guides] enabled`; unlisted, the guide rides the end of the `pr` line, or gets its own row when `pr` is not listed either. Unknown ids are ignored (including the retired `base` id, now merged into `branch`, and the retired `status` id — the asserted work status now renders as a fixed full-width banner at the top of the pane, so its note never truncates); omitted ones are hidden. A row also hides itself when its integration isn't configured (e.g. `issue` without `[issue_tracker]`, `dev` without `[dev_server]`). The rebase state (restacking / mid-rebase / conflict + files) isn't a row — it renders as a fixed block below the rows. |
-| `hidden_badges` | no | `[]` | Glyph slots to suppress from the **list-pane** badge cluster. Ids: `watch` (the bell of a row wt will act for later: a gate that clears itself, a wake, a notification), `action` (running action), `dirty` (uncommitted-changes pencil), `rebase` (restacking / conflict), `deploy` (SST-or-dev-server bolt), `session` (harness glyph), `review_bot`, `review` (human review), `pr` (PR state, doubling as the merge-queue slot), `checks` (CI rollup). Unknown ids fail the load. Opt-out rather than an ordered allow-list like `rows`, because the cluster's left-to-right order is designed (`[bot] [review] [pr] [checks]` reads as one "state of this PR" run) and an allow-list would hide slots added in later versions. Details-pane segments are unaffected — hiding a badge declutters the list without losing the signal. |
+| `hidden_badges` | no | `[]` | Glyph slots to suppress from the **list-pane** badge cluster. Ids: `watch` (the bell of a row wt will act for later: a gate that clears itself, a wake, a notification), `action` (running action), `dirty` (uncommitted-changes pencil), `rebase` (restacking / conflict), `deploy` (SST-or-dev-server bolt), `session` (harness glyph), `review_bot`, `review` (human review), `pr` (PR state, doubling as the merge-queue slot), `checks` (CI rollup). Unknown ids fail the load. That includes `watch` on a build older than v0.1.73, which does not know the id and refuses the whole configuration, so add `"watch"` only once no session still runs an older build (sessions stay pinned to the build that started them). The rest of that release is safe to configure early: older builds ignore the `[environments]`, `[[checks]]` and `[notify]` tables and skip a rule whose trigger they do not know (`stage.deployed`, `pr.merge_dropped`) with a warning. Opt-out rather than an ordered allow-list like `rows`, because the cluster's left-to-right order is designed (`[bot] [review] [pr] [checks]` reads as one "state of this PR" run) and an allow-list would hide slots added in later versions. Details-pane segments are unaffected — hiding a badge declutters the list without losing the signal. |
 | `activity_pane` | no | `"column"` | Where the activity pane (harness sessions, action runs, the attention and firehose feeds) sits. `"column"` puts it in the right-hand column under the details pane, so the list pane gets the full TUI height — the better default when the board is long enough to scroll. `"full_width"` spans it across the bottom under both panes with at most 12 lines of content (at least 5); extra terminal height goes to the list and details above it. The trade is the one you'd expect: `full_width` buys the feed the whole terminal width before its word-wrap kicks in (attention lines are mostly word-wrapped status notes, so width is what they spend), and pays for it in list rows. Neither changes what renders, only the box it renders in. |
 | `sort` | no | `"status"` | Row ordering inside each list section. `"status"` ranks rows by work-status urgency — `ready` (the merge is yours to do), `needs-human`, `needs-testing`, `review`, `working`, statusless, `todo`, then merged/gone last — with the manual order as the stable tie-break, so same-status rows keep their hand order and `J`/`K` still reorders within a rank (a cross-rank nudge is refused with a hint). With no statuses asserted it's a pure no-op. `"manual"` restores the pure hand order. Stack sections always keep spine order either way. The cursor tracks the worktree, not the position, so a re-sort never moves your selection. |
 
@@ -1212,7 +1219,7 @@ settle_seconds   = 300
 | `event` | no | *(none)* | **`mcp.event` only** (required there): the event type name, such as `comment.created`. |
 | `arguments` | no | `{}` | **`mcp.event` only**: the subscription's arguments as a TOML table, as the server's `events/list` input schema describes them (artifacts.boo takes `artifact` and, for `artifact.answered`, `component`). Changing them starts a new subscription from now. |
 | `after_days` | no | `2` | **`status.verification_overdue` only** (rejected on any other trigger): how long an outstanding post-merge verification may sit before the rule starts firing. A knob because deploy cadence is the one thing wt cannot guess — a fleet that deploys on merge wants `1`, one that batches a weekly release wants `7`, and a default wrong in either direction turns the reminder into noise or into nothing. |
-| `settle_seconds` | no | `120` (merge, `branch.advanced` and `stage.deployed` triggers: `10`; `status.verification_due`: `600`, or `30` with deploy probes; `wt.created`, other status and `mcp.event` triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period and as a delay. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. `status.verification_due` defaults to 10 minutes because a deploy lags its merge: a run that starts once the deploy has likely finished confirms it once instead of polling for it. When every stage a check can come due on has an `[environments]` probe (staging, and production or no separate production branch), the trigger itself waits for the deploy and the default drops to 30 seconds. |
+| `settle_seconds` | no | `120` (merge, `branch.advanced` and `stage.deployed` triggers: `10`; `status.verification_due`: `600`, or `30` when both stages have deploy probes; `wt.created`, other status and `mcp.event` triggers: `0`) | Quiescence window: the condition must hold and the worktree be edit-free this long before delivery. Doubles as your cancellation grace period and as a delay. Status triggers default to 0 — an assertion is a deliberate write, not flappy derived state. `status.verification_due` defaults to 10 minutes because a deploy lags its merge: a run that starts once the deploy has likely finished confirms it once instead of polling for it. When both `[environments.staging]` and `[environments.production]` have a probe, the trigger itself waits for the deploy and the default drops to 30 seconds; with only one of them it stays 600. |
 
 At runtime, `Q` lists running, queued and recent automation runs (each queued one with when it will run), `A` pauses all automations and `Ctrl+A` pauses the selected worktree (or its whole stack); both pauses persist across restarts.
 
