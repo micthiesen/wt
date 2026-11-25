@@ -31,6 +31,8 @@ six failing names and counts the rest in a final `+N more` entry.
 | `automation` | a fire finishes or is skipped for good | the automation source |
 | `watch` | a watch is set, holds, clears its gate, tells the person, wakes the session, is cancelled or is dropped | the store's watch writes |
 | `restack` | a restack replays the branch or stops on a conflict | `restack_action::record_outcome` |
+| `skill` | a skill or slash command listed in `[history] skills` is used in the worktree's Claude Code session | `wt mark --claude-hook`, run by a Claude Code hook |
+| `mark` | someone adds a note | `wt mark` |
 | `pr`, `checks`, `review`, `merge_queue`, `conflict`, `landed` | the fact is observed to change | the host's observer |
 | `status`, `status_cleared` (again) | a status was written by a build without the log | the host's observer |
 
@@ -52,6 +54,12 @@ A watch's wake-up prompt is not a `message` event: the `watch` event with
 prompt was sent without proof it arrived. The timeline and `wt history` read
 a watch's events as two lines, when it was set and what wt did; `--json`
 prints every event as stored.
+
+A skill's `by` is absent when the person typed the command, and the session's
+agent identity (`WT_AGENT`, else the worktree's slug) when the agent invoked
+the skill itself. wt records only what the hook reports: a session without
+the hook, another harness, or a skill the configuration does not list leaves
+no event. A mark's `by` is `WT_AGENT` when set.
 
 An automation fire that will run again (not started, deferred, still queued)
 is not an event. `delivered` means it ran, `failed` that a built-in ran and

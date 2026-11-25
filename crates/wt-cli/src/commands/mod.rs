@@ -16,6 +16,7 @@ pub mod history;
 pub mod init;
 pub mod install;
 pub mod list;
+pub mod mark;
 pub mod merge;
 pub mod new;
 pub mod next;

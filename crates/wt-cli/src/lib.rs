@@ -368,6 +368,12 @@ enum Command {
     /// Show a worktree's recorded history: statuses, PR, checks, reviews,
     /// messages and automation fires, newest first.
     History(commands::history::HistoryArgs),
+    /// Add a one-line note to a worktree's history.
+    ///
+    /// `wt mark "handed to QA"`. With `--claude-hook` it instead reads a
+    /// Claude Code hook event on stdin and records a skill or slash command
+    /// that `[history] skills` lists.
+    Mark(commands::mark::MarkArgs),
     /// Show or set the worktree's title.
     ///
     /// Titles rank user > agent > issue > fallback; a lower source never
@@ -421,7 +427,11 @@ pub fn main(info: BuildInfo) {
         println!("wt {}", wt_app_core::build_info::native_version());
         return;
     }
+    let hook = matches!(&cli.command, Some(Command::Mark(args)) if args.claude_hook);
     match run(cli) {
+        // A harness shows a hook's output to the model or the person on
+        // every prompt, so a hook that cannot record says nothing.
+        _ if hook => std::process::exit(0),
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("wt: {}", error_chain(&error));
@@ -459,7 +469,7 @@ unsafe fn startup_options() -> LoadOptions {
     options
 }
 
-fn run(cli: Cli) -> Result<i32> {
+fn run(mut cli: Cli) -> Result<i32> {
     // SAFETY: the worker runtime below starts the first other thread.
     let options = unsafe { startup_options() };
     let boot = if matches!(
@@ -549,6 +559,16 @@ fn run(cli: Cli) -> Result<i32> {
             }
             if cli.command.is_none() {
                 wt_ops::updates::startup_check(&options, &config, &token).await?;
+            }
+            // The hook runs on every prompt: one that has nothing to record
+            // ends before the database and the worktree inventory are opened.
+            if let Some(Command::Mark(args)) = &mut cli.command
+                && args.claude_hook
+            {
+                args.hook_use = commands::mark::read_hook(&config.history);
+                if args.hook_use.is_none() {
+                    return Ok(0);
+                }
             }
             run_application(cli, options, config, &scope, token, &mut scope_drained).await
         }
@@ -718,6 +738,7 @@ async fn dispatch_command(
         Command::Edge(args) => commands::edge::run(context, args).await,
         Command::Guide(args) => commands::guide::run(context, args).await,
         Command::History(args) => commands::history::run(context, args).await,
+        Command::Mark(args) => commands::mark::run(context, args).await,
         Command::Title(args) => commands::title::run(context, args).await,
         Command::Merge(args) => commands::merge::run(context, args).await,
         Command::Open(args) => commands::open::run(context, args).await,

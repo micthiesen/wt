@@ -556,6 +556,8 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
                 Some(false) => theme::ERR,
             },
         ),
+        Event::Skill { .. } => badge(glyphs::SKILL, theme::FG_BRIGHT),
+        Event::Mark { .. } => badge(glyphs::NOTE, theme::FG_MID),
         Event::Restack { ok: true, .. } => busy_badge("restack"),
         Event::Restack { ok: false, .. } => badge(glyphs::RESTACK, theme::ERR),
         // A removal that discarded unlanded work is the one worth noticing.

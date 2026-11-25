@@ -348,6 +348,7 @@ impl Config {
         let environments = parse_environments(&raw, &mut errors);
         let checks = parse_checks(&raw, &mut errors);
         let notify = parse_notify(&raw, &mut errors);
+        let history = parse_history(&raw, &mut errors);
 
         let stage_raw: RawStage = section(&raw, "stage", &mut errors);
         let stage = StageConfig {
@@ -800,6 +801,7 @@ impl Config {
             environments,
             checks,
             notify,
+            history,
             stage,
             lifecycle,
             backend: BackendConfig {
@@ -1361,6 +1363,37 @@ fn parse_notify(raw: &toml::Value, errors: &mut Vec<String>) -> NotifyConfig {
         return NotifyConfig::default();
     }
     notify
+}
+
+fn parse_history(raw: &toml::Value, errors: &mut Vec<String>) -> HistoryConfig {
+    let Some(value) = raw.get("history") else {
+        return HistoryConfig::default();
+    };
+    if !value.is_table() {
+        errors.push("history must be a table".into());
+        return HistoryConfig::default();
+    }
+    let mut history: HistoryConfig = match value.clone().try_into() {
+        Ok(history) => history,
+        Err(error) => {
+            errors.push(format!("history: {error}"));
+            return HistoryConfig::default();
+        }
+    };
+    for name in &mut history.skills {
+        if let Some(bare) = name.strip_prefix('/') {
+            *name = bare.to_owned();
+        }
+    }
+    if history
+        .skills
+        .iter()
+        .any(|name| name.is_empty() || name.contains(char::is_whitespace))
+    {
+        errors.push("history.skills must be an array of skill or slash-command names with no whitespace (\"*\" records every one)".into());
+        return HistoryConfig::default();
+    }
+    history
 }
 
 fn parse_automations(

@@ -559,6 +559,27 @@ pub struct NotifyConfig {
     pub command: Option<Vec<String>>,
 }
 
+/// What a worktree's history records beyond wt's own events.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Skill or slash-command names, without the leading slash, whose use
+    /// in a worktree's session is recorded. `*` records every one.
+    pub skills: Vec<String>,
+}
+
+impl HistoryConfig {
+    /// Whether a use of `name` is recorded. A plugin's `plugin:name` is
+    /// listed whole or by the part after the plugin.
+    pub fn records_skill(&self, name: &str) -> bool {
+        let name = name.strip_prefix('/').unwrap_or(name);
+        let short = name.rsplit_once(':').map(|(_, short)| short);
+        self.skills
+            .iter()
+            .any(|listed| listed == "*" || listed == name || Some(listed.as_str()) == short)
+    }
+}
+
 /// Deploy probes by stage. A stage without one is taken to run whatever its
 /// branch holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -740,6 +761,8 @@ pub struct Config {
     pub checks: Vec<CheckConfig>,
     /// `[notify]`: an extra command for watch notifications.
     pub notify: NotifyConfig,
+    /// `[history]`: which skill uses a worktree's history records.
+    pub history: HistoryConfig,
     pub stage: StageConfig,
     pub lifecycle: LifecycleConfig,
     pub backend: BackendConfig,

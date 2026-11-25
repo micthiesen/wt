@@ -132,6 +132,27 @@ pub enum WorktreeEventKind {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         unconfirmed: bool,
     },
+    /// A skill or slash command was used in the worktree's session, as its
+    /// harness reported through `wt mark`.
+    Skill {
+        /// Without the leading slash.
+        name: String,
+        /// First line of what followed the name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
+        /// The session's agent (a worktree slug or `manager`) when it
+        /// invoked the skill itself, `None` when the person typed it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+    },
+    /// A one-line note added with `wt mark`.
+    Mark {
+        text: String,
+        /// Who added it: a worktree slug, `manager`, or `None` for the
+        /// person.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }

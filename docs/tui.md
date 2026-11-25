@@ -364,6 +364,17 @@ session: check flag=go held`, `told you: merged`, `cleared the gate: <what>`,
 `held: <what>`, `stopped waiting for <what>`, `gave up waiting for <what>:
 <why>`.
 
+A skill or slash command used in the row's Claude Code session, when
+`[history] skills` lists it, is one line with a terminal glyph: the command
+in bright text, then its arguments and who ran it in dim, such as
+`/fable-review` or `/check  src/foo · by agent`. Nothing follows a command
+the person typed; `by agent` is the row's own agent invoking the skill, and
+`by <who>` anyone else. The summary line counts them (`2 skill runs`). A
+`wt mark` note wears a sticky-note glyph and reads `note  <text>`, with `by
+<who>` unless the row's own agent or you added it. `wt history` says `ran
+/fable-review`, `ran /check src/foo (by <slug>)`, and a note's text alone,
+ending `(by <who>)` when an agent added it.
+
 The modal is drawn from the board on every frame. While it is open, new
 events appear at the top; a reader who has scrolled down stays on the line
 they were reading. In a terminal too short to keep the header pinned, the

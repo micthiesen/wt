@@ -316,6 +316,27 @@ is reported; the notification counts as delivered when either the banner or
 the command succeeded, and is tried again later when neither did. It applies
 to watches only: `builtin:notify` rules keep raising the banner alone.
 
+## `[history]`: which skill uses a worktree's history records
+
+A worktree's history can show when a skill or slash command was used in its
+session, such as `/fable-review`. Nothing is recorded until the skills are
+named here.
+
+```toml
+[history]
+skills = ["fable-review", "check"]
+```
+
+| Key | Required | Default | Meaning |
+|---|---|---|---|
+| `skills` | no | `[]` | Skill or slash-command names to record, without the leading slash (one is accepted and dropped). `"*"` records every one. Names match exactly and are case sensitive; a plugin's `plugin:name` matches an entry that is the whole `plugin:name` or just `name`. An entry that is empty or contains whitespace fails the load. |
+
+wt learns of a use from the session's harness through
+[`wt mark --claude-hook`](cli.md#wt-mark-text---slug-slug--wt-mark---claude-hook),
+a Claude Code hook you add yourself; no other harness reports skill uses.
+Builds older than the one that added this table ignore it and skip the
+events it records.
+
 ## `[remote]` and `[[remotes]]` — optional SSH worktree hosts
 
 Configure one or more machines whose clone, config, and worktree root remain

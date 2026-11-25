@@ -29,14 +29,15 @@ pub fn warn(args: &[OsString], running_version: &str, running_build: &str) {
     }
 }
 
-/// The board, wt's own hidden workers and machine-read output stay silent: a
-/// line on stderr there is noise at best and breaks a `2>&1` JSON parse at worst.
+/// The board, wt's own hidden workers, machine-read output and a harness hook
+/// stay silent: a line on stderr there is noise at best and breaks a `2>&1`
+/// JSON parse at worst.
 fn wants_notice(args: &[OsString]) -> bool {
     let mut args = args.iter().skip(1).map(|arg| arg.to_string_lossy());
     let Some(command) = args.next() else {
         return false;
     };
-    !command.starts_with(['_', '-']) && !args.any(|arg| arg == "--json")
+    !command.starts_with(['_', '-']) && !args.any(|arg| arg == "--json" || arg == "--claude-hook")
 }
 
 /// The notice for a binary run from an install's `versions` directory while
@@ -118,6 +119,8 @@ mod tests {
         assert!(!wants_notice(&args(&["wt"])));
         assert!(!wants_notice(&args(&["wt", "_claude_hook", "stop"])));
         assert!(!wants_notice(&args(&["wt", "ls", "--json"])));
+        assert!(wants_notice(&args(&["wt", "mark", "note"])));
+        assert!(!wants_notice(&args(&["wt", "mark", "--claude-hook"])));
         assert!(!wants_notice(&args(&["wt", "--version"])));
 
         let dir = tempfile::tempdir().unwrap();

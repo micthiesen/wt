@@ -110,6 +110,15 @@ pub fn bound_worktree_event(event: &mut WorktreeEventKind) {
             some(reason);
             then.iter_mut().for_each(line);
         }
+        WorktreeEventKind::Skill { name, args, by } => {
+            line(name);
+            some(args);
+            some(by);
+        }
+        WorktreeEventKind::Mark { text, by } => {
+            line(text);
+            some(by);
+        }
         WorktreeEventKind::Pr { .. }
         | WorktreeEventKind::MergeQueue { .. }
         | WorktreeEventKind::Conflict { .. }

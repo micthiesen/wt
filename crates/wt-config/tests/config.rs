@@ -921,6 +921,61 @@ fn checks_and_notify_are_argv_and_the_watch_trigger_is_reserved() {
 }
 
 #[test]
+fn history_lists_the_skills_it_records_by_name() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let load = |extra: &str| {
+        let mut text = minimal_config(root.path());
+        text.push_str(extra);
+        Config::from_raw(toml_value(&text), &options(root.path(), &home, &[]))
+    };
+    let config = load("").unwrap();
+    assert!(config.history.skills.is_empty());
+    assert!(!config.history.records_skill("check"));
+
+    let config = load("\n[history]\nskills = ['/fable-review', 'check', 'tools:lint']\n").unwrap();
+    assert_eq!(
+        config.history.skills,
+        ["fable-review", "check", "tools:lint"]
+    );
+    for (name, recorded) in [
+        ("fable-review", true),
+        ("/check", true),
+        ("Check", false),
+        ("checks", false),
+        // A plugin's skill is listed whole or by its own name.
+        ("other:check", true),
+        ("tools:lint", true),
+        ("lint", false),
+        ("check:other", false),
+    ] {
+        assert_eq!(config.history.records_skill(name), recorded, "{name}");
+    }
+    let every = load("\n[history]\nskills = ['*']\n").unwrap();
+    assert!(every.history.records_skill("anything:at-all"));
+
+    for (extra, expected) in [
+        ("\n[history]\nskills = 'check'\n", "history: "),
+        (
+            "\n[history]\nskills = ['check', '']\n",
+            "history.skills must be an array of skill or slash-command names",
+        ),
+        (
+            "\n[history]\nskills = ['/']\n",
+            "history.skills must be an array of skill or slash-command names",
+        ),
+        (
+            "\n[history]\nskills = ['fable review']\n",
+            "history.skills must be an array of skill or slash-command names",
+        ),
+    ] {
+        let error = load(extra).unwrap_err().to_string();
+        assert!(error.contains(expected), "{extra}: {error}");
+    }
+}
+
+#[test]
 fn environments_name_a_deploy_probe_per_stage_and_reject_anything_else() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");

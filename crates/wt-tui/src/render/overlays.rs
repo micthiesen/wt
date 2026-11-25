@@ -2369,6 +2369,21 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
             },
             "message to the agent (yellow unconfirmed, red not delivered)",
         ),
+        (
+            wt_core::WorktreeEventKind::Skill {
+                name: String::new(),
+                args: None,
+                by: None,
+            },
+            "skill or slash command used in the session",
+        ),
+        (
+            wt_core::WorktreeEventKind::Mark {
+                text: String::new(),
+                by: None,
+            },
+            "note added with wt mark",
+        ),
     ]
     .into_iter()
     .filter_map(|(event, label)| {

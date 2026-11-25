@@ -459,6 +459,24 @@ fn show_event(
             body = Some(format!("\"{text}\""));
             "message".to_owned()
         }
+        Kind::Skill { name, args, by } => {
+            meta.extend(args.clone());
+            // Unlike a status, who ran it is the point: the person typing
+            // it and the row's own agent choosing it read differently.
+            meta.extend(by.as_deref().map(|by| {
+                if by == own {
+                    "by agent".to_owned()
+                } else {
+                    format!("by {by}")
+                }
+            }));
+            format!("/{name}")
+        }
+        Kind::Mark { text, by } => {
+            meta.extend(named(by));
+            body = Some(text.clone());
+            "note".to_owned()
+        }
         Kind::Restack { ok, onto } => {
             meta.extend(onto.as_ref().map(|onto| format!("onto {onto}")));
             if *ok { "restacked" } else { "restack failed" }.to_owned()
@@ -702,6 +720,10 @@ pub(crate) fn summary(events: &[WorktreeEvent], now_ms: u64) -> Line<'static> {
     });
     if automations > 0 {
         parts.push((plural(automations, "automation"), theme::FG_MID));
+    }
+    let skills = count(|event| matches!(event, Kind::Skill { .. }));
+    if skills > 0 {
+        parts.push((plural(skills, "skill run"), theme::FG_MID));
     }
     let mut spans = Vec::new();
     for (index, (text, color)) in parts.into_iter().enumerate() {
@@ -1501,6 +1523,66 @@ mod tests {
             assert_eq!(entry.line.spans[0].content.width(), TIME_CELLS + 2);
             assert_eq!(entry.line.spans[1].content.width(), 3);
         }
+    }
+
+    #[test]
+    fn a_skill_use_leads_with_its_command_and_says_when_an_agent_ran_it() {
+        let skill = |name: &str, args: Option<&str>, by: Option<&str>| Kind::Skill {
+            name: name.into(),
+            args: args.map(str::to_owned),
+            by: by.map(str::to_owned),
+        };
+        let events = [
+            at(NOW - 5 * MINUTE, Kind::Created { base: None }),
+            at(NOW - 4 * MINUTE, skill("fable-review", None, None)),
+            at(
+                NOW - 3 * MINUTE,
+                skill("check", Some("src/foo"), Some("fix-login")),
+            ),
+            at(NOW - 2 * MINUTE, skill("check", None, Some("manager"))),
+            at(
+                NOW - MINUTE,
+                Kind::Mark {
+                    text: "handed to QA".into(),
+                    by: Some("fix-login".into()),
+                },
+            ),
+        ];
+        assert_eq!(
+            said(&events)[1..],
+            [
+                "/fable-review",
+                "/check  src/foo · by agent",
+                "/check  by manager",
+                "note  handed to QA",
+            ]
+        );
+        let lines = texts(&events, &BTreeMap::new());
+        assert_eq!(
+            lines[1..3],
+            [
+                format!("   1m  {}  note  handed to QA", glyphs::NOTE),
+                format!("   2m  {}  /check  by manager", glyphs::SKILL),
+            ]
+        );
+        let drawn = timeline(
+            &events,
+            &BTreeMap::new(),
+            &DisplayPolicy::default(),
+            "fix-login",
+            NOW,
+        );
+        let ran = &drawn[3].line;
+        assert_eq!(ran.spans[2].content, "/check");
+        assert_eq!(ran.spans[2].style, theme::bold(theme::FG_BRIGHT));
+        assert_eq!(ran.spans[3].style.fg, Some(theme::FG_DIM), "arguments");
+        let note = &drawn[1].line;
+        assert_eq!(note.spans[1].style.fg, Some(theme::FG_MID), "glyph");
+        assert_eq!(note.spans[3].content, "  handed to QA");
+        assert_eq!(
+            text(&summary(&events, NOW)),
+            "created 5m ago · 3 skill runs"
+        );
     }
 
     #[test]

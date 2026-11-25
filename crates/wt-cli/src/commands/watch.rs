@@ -117,13 +117,17 @@ pub(crate) fn clock() -> LocalClock {
     }
 }
 
-/// Who is setting or cancelling: the agent's identity, or the person.
-pub(crate) fn author() -> String {
+/// The agent identity this command runs as, when it runs in a session.
+pub(crate) fn agent() -> Option<String> {
     std::env::var("WT_AGENT")
         .ok()
         .map(|by| by.trim().to_owned())
         .filter(|by| !by.is_empty())
-        .unwrap_or_else(|| "human".into())
+}
+
+/// Who is setting or cancelling: the agent's identity, or the person.
+pub(crate) fn author() -> String {
+    agent().unwrap_or_else(|| "human".into())
 }
 
 /// What a condition means under this configuration, and whether that is
@@ -300,14 +304,18 @@ pub(crate) async fn read_conditions(
     Ok(read)
 }
 
-/// The worktree a watch is set on: the named one or the current one.
-async fn owner(ctx: &AppContext, slug: Option<&str>) -> Result<String, String> {
+/// The worktree `what` (a watch, a mark) is set on: the named one or the
+/// current one.
+pub(crate) async fn owner(
+    ctx: &AppContext,
+    slug: Option<&str>,
+    what: &str,
+) -> Result<String, String> {
     match resolve_worktree(ctx, slug).await {
         Ok(record) if !record.is_main => Ok(record.target.slug().to_owned()),
-        Ok(_) => Err(
-            "a watch belongs to a worktree and the main clone is not one: pass --slug <slug>"
-                .into(),
-        ),
+        Ok(_) => Err(format!(
+            "{what} belongs to a worktree and the main clone is not one: pass --slug <slug>"
+        )),
         Err(_) if slug.is_none() => {
             Err("not inside a worktree: run this in one, or pass --slug <slug>".into())
         }
@@ -388,15 +396,42 @@ async fn report_set(ctx: &AppContext, set: &SetWatch, does: &str, read: &ReadCon
 
 /// A wake for this worktree's own deploy is usually a check of the deployed
 /// change, which the board can only show as owed when it is a status.
-fn deployed_check_hint(when: &[WatchCondition]) -> Option<String> {
+///
+/// `owed` is the stage the worktree already owes a check in. A status holds
+/// one, so a step at the other stage has only a wake to come back with.
+fn deployed_check_hint(when: &[WatchCondition], owed: Option<&str>) -> Option<String> {
     let stage = when.iter().find_map(|cond| match cond.cond {
         Condition::Own(RowState::Staging) => Some("staging"),
         Condition::Own(RowState::Production) => Some("production"),
         _ => None,
     })?;
-    Some(format!(
-        "to check the deployed change, use `wt status ready --verify-in-{stage}` instead: the row then shows the check as owed and returns as needs-testing; a wake shows only a bell"
-    ))
+    match owed {
+        None => Some(format!(
+            "to check the deployed change, use `wt status ready --verify-in-{stage}` instead: the row then shows the check as owed and returns as needs-testing; a wake shows only a bell"
+        )),
+        Some(owed) if owed == stage => Some(format!(
+            "this worktree already owes a check in {stage} and returns as needs-testing then: keep this wake only for a different step"
+        )),
+        Some(_) => None,
+    }
+}
+
+/// The stage `slug` owes a post-merge check in.
+async fn owed_stage(ctx: &AppContext, slug: &str) -> Option<String> {
+    let slug = slug.to_owned();
+    let state = ctx
+        .database
+        .call(move |store| Ok(store.read_slug_state(&slug)?))
+        .await
+        .ok()??;
+    let work = state.get("work")?;
+    work.get("verifyAfterMerge")?.as_str()?;
+    Some(
+        work.get("verifyIn")
+            .and_then(Value::as_str)
+            .unwrap_or("staging")
+            .to_owned(),
+    )
 }
 
 /// `✓ watch abc234: wakes one at 01:01 tomorrow`.
@@ -455,7 +490,7 @@ async fn set_and_report(
     conditions: &[String],
     then: WatchActions,
 ) -> Result<i32> {
-    let slug = match owner(ctx, slug).await {
+    let slug = match owner(ctx, slug, "a watch").await {
         Ok(slug) => slug,
         Err(message) => {
             eprintln!("{message}");
@@ -471,7 +506,9 @@ async fn set_and_report(
         }
     };
     if then.wake.is_some() {
-        read.notes.extend(deployed_check_hint(&read.when));
+        let owed = owed_stage(ctx, &slug).await;
+        read.notes
+            .extend(deployed_check_hint(&read.when, owed.as_deref()));
     }
     let does = if then.wake.is_some() {
         format!("wakes {slug}")
@@ -640,7 +677,7 @@ pub async fn run_watch(ctx: &AppContext, args: &WatchArgs) -> Result<i32> {
     let scope = if args.all {
         None
     } else {
-        match owner(ctx, args.slug.as_deref()).await {
+        match owner(ctx, args.slug.as_deref(), "a watch").await {
             Ok(slug) => Some(slug),
             Err(_) if args.slug.is_none() => None,
             Err(message) => {
@@ -686,7 +723,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
     let by = author();
     let cancelled_by = (by != "human").then(|| by.clone());
     if mine {
-        let slug = match owner(ctx, slug).await {
+        let slug = match owner(ctx, slug, "a watch").await {
             Ok(slug) => slug,
             Err(message) => {
                 eprintln!("{message}");
@@ -773,6 +810,32 @@ async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
         }
     }
     Ok(if failed { 2 } else { 0 })
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn a_wake_for_this_worktrees_deploy_points_at_the_owed_check_it_would_duplicate() {
+        let clock = clock();
+        let when = |arg: &str| vec![parse(arg, clock).unwrap()];
+        let hint = |arg: &str, owed| deployed_check_hint(&when(arg), owed);
+        assert!(
+            hint("production", None)
+                .unwrap()
+                .contains("--verify-in-production")
+        );
+        assert!(
+            hint("staging", Some("staging"))
+                .unwrap()
+                .contains("already owes")
+        );
+        // A status holds one stage: the other stage's step is a wake.
+        assert_eq!(hint("production", Some("staging")), None);
+        assert_eq!(hint("merged", None), None);
+        assert_eq!(hint("3h", None), None);
+    }
 }
 
 #[cfg(test)]

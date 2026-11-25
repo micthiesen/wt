@@ -117,6 +117,12 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
             .map(|who| format!(" by {who}"))
             .unwrap_or_default()
     };
+    // Bracketed where free text comes before it.
+    let by_agent = |who: &Option<String>| {
+        who.as_ref()
+            .map(|who| format!(" (by {who})"))
+            .unwrap_or_default()
+    };
     let state = |state: &wt_core::WorkState| {
         serde_json::to_value(state)
             .ok()
@@ -269,6 +275,18 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
                 None => format!("gave up waiting for {what}"),
             },
         },
+        WorktreeEventKind::Skill {
+            name,
+            args,
+            by: who,
+        } => {
+            let args = args
+                .as_ref()
+                .map(|args| format!(" {args}"))
+                .unwrap_or_default();
+            format!("ran /{name}{args}{}", by_agent(who))
+        }
+        WorktreeEventKind::Mark { text, by: who } => format!("{text}{}", by_agent(who)),
         WorktreeEventKind::Removed { landed: true } => "removed after landing".into(),
         WorktreeEventKind::Removed { landed: false } => "removed".into(),
         WorktreeEventKind::Unknown => return None,
@@ -337,6 +355,32 @@ mod tests {
         // "YYYY-MM-DD HH:MM", then two spaces.
         assert_eq!(lines[1].find("  "), Some(16), "{}", lines[1]);
         assert!(!lines.iter().any(|line| line.contains('\u{2014}')));
+    }
+
+    #[test]
+    fn a_skill_use_and_a_mark_say_who_only_when_an_agent_did_it() {
+        let skill = |name: &str, args: Option<&str>, by: Option<&str>| {
+            describe(&WorktreeEventKind::Skill {
+                name: name.into(),
+                args: args.map(str::to_owned),
+                by: by.map(str::to_owned),
+            })
+            .unwrap()
+        };
+        assert_eq!(skill("fable-review", None, None), "ran /fable-review");
+        assert_eq!(
+            skill("check", Some("src/foo"), Some("one")),
+            "ran /check src/foo (by one)"
+        );
+        let mark = |by: Option<&str>| {
+            describe(&WorktreeEventKind::Mark {
+                text: "handed to QA".into(),
+                by: by.map(str::to_owned),
+            })
+            .unwrap()
+        };
+        assert_eq!(mark(None), "handed to QA");
+        assert_eq!(mark(Some("manager")), "handed to QA (by manager)");
     }
 
     #[test]

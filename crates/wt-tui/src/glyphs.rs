@@ -69,6 +69,8 @@ pub(crate) const PI: &str = "π";
 pub(crate) const BRANCH: &str = "\u{F418}"; // worktree created
 pub(crate) const AUTOMATION: &str = "\u{F085}"; // cogs: an automation rule fired
 pub(crate) const SEND: &str = "\u{F1D8}"; // paper plane: a message to the agent
+pub(crate) const SKILL: &str = "\u{F120}"; // terminal prompt: a skill or slash command ran
+pub(crate) const NOTE: &str = "\u{F249}"; // sticky note: a mark someone added
 
 /// Pause marker for automation state. Plain Unicode, renders everywhere.
 pub(crate) const PAUSE: &str = "⏸";

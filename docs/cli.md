@@ -451,7 +451,29 @@ Record or show the worktree's change guide; requires `[guides] enabled` (see [co
 
 ### `wt history [<slug>] [--json] [--limit <n>]`
 
-Print a worktree's recorded history: status changes, pull request state, checks, reviews, merge queue, conflicts, landings, messages sent to its agent, automation fires and restacks. With no slug it reads the worktree of the current directory, then `WT_AGENT`. The text form is newest first, one event per line, with the local time and a plain-words summary; a watch is two lines, when it was set (`will wake the session at 23:08`) and what wt did (`woke the session at 23:08`, `cleared the gate: check flag=go held`, `wake sent, delivery not confirmed at 23:08`). `--json` prints an array of `{at_ms, event}`, oldest first, where `event` is tagged by `kind`; a kind written by a newer build reads as `{"kind": "unknown"}`. `--limit` keeps the newest N events (default 100, at most 500). The command only reads. A name that matches no live worktree is taken as the slug of a removed one, whose last history is kept for 90 days, so this is how to answer "why is this row still here" or "what happened to that branch". [worktree-history.md](worktree-history.md) lists the events and what records each.
+Print a worktree's recorded history: status changes, pull request state, checks, reviews, merge queue, conflicts, landings, messages sent to its agent, automation fires, restacks, recorded skill uses (`ran /fable-review`, or `ran /check src/foo (by <slug>)` when the agent invoked it) and `wt mark` notes. With no slug it reads the worktree of the current directory, then `WT_AGENT`. The text form is newest first, one event per line, with the local time and a plain-words summary; a watch is two lines, when it was set (`will wake the session at 23:08`) and what wt did (`woke the session at 23:08`, `cleared the gate: check flag=go held`, `wake sent, delivery not confirmed at 23:08`). `--json` prints an array of `{at_ms, event}`, oldest first, where `event` is tagged by `kind`; a kind written by a newer build reads as `{"kind": "unknown"}`. `--limit` keeps the newest N events (default 100, at most 500). The command only reads. A name that matches no live worktree is taken as the slug of a removed one, whose last history is kept for 90 days, so this is how to answer "why is this row still here" or "what happened to that branch". [worktree-history.md](worktree-history.md) lists the events and what records each.
+
+### `wt mark <text>... [--slug <slug>]` / `wt mark --claude-hook`
+
+Add a one-line note to a worktree's history: `wt mark "handed to QA"`. The text is kept as its first line, cut to 160 characters, and `WT_AGENT` is recorded as who added it when set. With no `--slug` it marks the worktree of the current directory, then `WT_AGENT`. The main clone has no history: there, or outside every worktree, the command exits 1 and writes nothing. It prints `✓ marked <slug>: <text>`; the note shows in `wt history` and in the TUI's `H` timeline.
+
+`wt mark --claude-hook` is for a Claude Code hook, not for typing. It reads one hook event as JSON on stdin and records a skill use in the history of the worktree that contains the event's `cwd` (the current directory when the event names none), when [`[history] skills`](configuration.md#history-which-skill-uses-a-worktrees-history-records) lists that skill:
+
+- a `UserPromptSubmit` event whose prompt starts with `/<name>` is a command the person typed. The name is letters, digits, `_`, `:`, `.` and `-`; the rest of that line is kept as its arguments.
+- a `PreToolUse` event for the `Skill` tool is a skill the agent invoked itself, recorded as run by `WT_AGENT`, or by the worktree's own slug when that is unset.
+
+It always exits 0 and prints nothing, whatever happens: Claude Code adds a `UserPromptSubmit` hook's output to the model's context. Unreadable input, a skill that is not listed, the main clone, a directory outside every worktree and a configuration that does not load all record nothing. With no skill listed it does not read stdin. `--claude-hook` takes no text and no `--slug`.
+
+wt does not install the hook. Add it to the Claude Code settings the sessions read (`~/.claude/settings.json`, or the repository's `.claude/settings.json`):
+
+```json
+"hooks": {
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "wt mark --claude-hook 2>/dev/null || true", "timeout": 5 }] }],
+  "PreToolUse": [{ "matcher": "Skill", "hooks": [{ "type": "command", "command": "wt mark --claude-hook 2>/dev/null || true", "timeout": 5 }] }]
+}
+```
+
+Keep the `|| true`: a session still running a wt from before this command exits 2 on it, and Claude Code treats exit 2 from a `UserPromptSubmit` hook as a refusal of the prompt.
 
 ### `wt title [<title…>] [-w <slug>]`
 
