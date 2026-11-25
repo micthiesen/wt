@@ -232,6 +232,14 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
             .then(|| config.github.default_reviewer.clone())
             .flatten(),
         guides: config.guides.enabled,
+        staging_probe: config
+            .environments
+            .get(wt_core::VerifyStage::Staging)
+            .is_some(),
+        production_probe: config
+            .environments
+            .get(wt_core::VerifyStage::Production)
+            .is_some(),
     }
 }
 

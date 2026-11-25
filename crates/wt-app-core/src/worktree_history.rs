@@ -83,11 +83,13 @@ pub fn sanitize(event: &mut WorktreeEventKind) {
             what,
             by,
             reason,
+            then,
             change: _,
         } => {
             clean(what);
             clean_some(by);
             clean_some(reason);
+            then.iter_mut().for_each(clean);
         }
         WorktreeEventKind::Pr { .. }
         | WorktreeEventKind::MergeQueue { .. }

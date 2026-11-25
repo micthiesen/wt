@@ -23,10 +23,10 @@ mod theme;
 pub use actions::{
     ActionController, ActionSurface, CleanupTarget, ConfirmAction, CreatePlacement, CreatePlan,
     CreationPlacementAccepted, CreationPrepared, CreationTitle, FailedRemovalSeen,
-    LiveSessionIdentity, PickerAction, PickerOption, PrPin, RemovalRevision, RemovalSeen,
-    ReplyOutcome, ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget, StatusClaim,
-    TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest, UrlKind,
-    action_channel,
+    LiveSessionIdentity, NotifyChange, PickerAction, PickerOption, PrPin, RemovalRevision,
+    RemovalSeen, ReplyOutcome, ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget,
+    StatusClaim, TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest,
+    UrlKind, action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
@@ -43,7 +43,8 @@ pub use model::{
     PrCommentView, PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView,
     RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
     SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem,
-    WorkPresentation, WorkRiskCount, WorkStateCount,
+    WatchActionKind, WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount,
+    WorkStateCount,
 };
 pub use mutations::{
     AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,

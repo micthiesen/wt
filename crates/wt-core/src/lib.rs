@@ -3,6 +3,7 @@
 mod domain;
 mod fork_base;
 mod harness;
+mod merge_arm;
 mod merge_edges;
 mod stack_layout;
 mod stage;
@@ -17,6 +18,7 @@ mod worktree_target;
 pub use domain::Domain;
 pub use fork_base::*;
 pub use harness::HarnessId;
+pub use merge_arm::*;
 pub use merge_edges::*;
 pub use stack_layout::*;
 pub use stage::stage_name;

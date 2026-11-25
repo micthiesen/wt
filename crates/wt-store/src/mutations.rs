@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Number, Value, json};
 
-use wt_core::WorktreeEventKind;
+use wt_core::{MergeArm, WorktreeEventKind};
 
 use crate::{
     GuideRecord, MergeEdge, RemovedWorktree, ReviewRequestDismissal, Store, StoreError,
@@ -21,6 +21,7 @@ const STACK_PREFIX: &str = "\0stack:";
 /// Marks a state whose sections were adopted as explicit (see
 /// `adopt_explicit_sections`).
 const EXPLICIT_SECTIONS: &str = "explicitSections";
+const MERGE_ARM: &str = "mergeArm";
 const REMOVED_MAX_ENTRIES: usize = 30;
 const REMOVED_MAX_AGE_MS: i64 = 14 * 24 * 60 * 60 * 1000;
 const MAX_REVIEW_REQUEST_DISMISSALS: usize = 200;
@@ -1301,6 +1302,53 @@ impl Store {
             };
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
             Ok((true, true))
+        })
+    }
+
+    /// Record that wt armed a worktree's pull request to merge, replacing
+    /// any earlier arming. Returns whether the record changed.
+    pub fn set_slug_merge_arm(&mut self, slug: &str, arm: &MergeArm) -> Result<bool, StoreError> {
+        let next = serde_json::to_value(arm)?;
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            if entry.get(MERGE_ARM) == Some(&next) {
+                return Ok((false, false));
+            }
+            entry.insert(MERGE_ARM.to_owned(), next.clone());
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Forget a worktree's armed merge: it was cancelled, or it ended. With
+    /// `armed_at_ms`, only the arming made then is forgotten, so a later
+    /// arming survives a caller that saw the earlier one end. Returns
+    /// whether a record was removed.
+    pub fn clear_slug_merge_arm(
+        &mut self,
+        slug: &str,
+        armed_at_ms: Option<i64>,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let Some(entry) = state
+                .get_mut("slugs")
+                .and_then(|slugs| slugs.get_mut(slug))
+                .and_then(Value::as_object_mut)
+            else {
+                return Ok((false, false));
+            };
+            let stored = entry
+                .get(MERGE_ARM)
+                .map(|arm| arm.get("armedAtMs").and_then(Value::as_i64));
+            let matches = match (stored, armed_at_ms) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(stored), Some(wanted)) => stored == Some(wanted),
+            };
+            if matches {
+                entry.remove(MERGE_ARM);
+            }
+            Ok((matches, matches))
         })
     }
 

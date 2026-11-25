@@ -97,6 +97,20 @@ pub struct Board {
     pub palettes: std::collections::BTreeMap<String, PreparedPalette>,
 }
 
+impl Board {
+    /// Whether the automation engine has anything to show or to pause:
+    /// configured rules, fires it holds or ran, or a row that waits for
+    /// something. Watches run under an implicit rule, so a repository with no
+    /// `[[automations]]` still queues their fires.
+    pub fn automations_shown(&self) -> bool {
+        let view = &self.automations_view;
+        self.display.automations
+            || self.automations_pending > 0
+            || !(view.running.is_empty() && view.queued.is_empty() && view.recent.is_empty())
+            || self.rows.iter().any(|row| !row.watches.is_empty())
+    }
+}
+
 /// One action palette prepared by the host for a surface.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreparedPalette {
@@ -234,12 +248,83 @@ pub struct LogView {
     pub lines: Vec<String>,
 }
 
+/// One thing a worktree waits for, prepared by the host that stores it: a
+/// gate that clears itself, a wake for its session, or a notification.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WatchView {
+    /// Empty while the watch is only this controller's pending request.
+    pub id: String,
+    /// Who set it: a worktree slug, `manager` or `human`.
+    pub by: String,
+    /// All must hold.
+    pub conditions: Vec<WatchConditionView>,
+    /// What it still owes once they do, in delivery order.
+    pub actions: Vec<WatchActionKind>,
+    /// The first line of the wake prompt or the notification text.
+    pub headline: Option<String>,
+    /// Every condition held and its actions are being delivered.
+    pub met: bool,
+}
+
+impl WatchView {
+    pub fn does(&self, action: WatchActionKind) -> bool {
+        self.actions.contains(&action)
+    }
+
+    /// A watch that only tells the person, set by the person: what the
+    /// notify menu offers to cancel.
+    pub fn is_human_notify(&self) -> bool {
+        self.by == "human" && self.actions == [WatchActionKind::Notify]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchActionKind {
+    /// Clear the merge gate.
+    Unblock,
+    /// Tell the person.
+    Notify,
+    /// Send the worktree's session its prompt.
+    Wake,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WatchConditionView {
+    /// The condition as stored (`ready`, `#3806:production`): its identity
+    /// within the watch, never shown.
+    pub key: String,
+    /// The condition in words, with a time in the host's local clock.
+    pub text: String,
+    pub state: WatchTruth,
+    /// Why it is unknown, or what a holding condition still waits out.
+    pub reason: Option<String>,
+    /// A time condition's instant, UTC epoch milliseconds. The controller
+    /// labels it in `Board::history_times`.
+    pub at_ms: Option<u64>,
+    /// How long until a time condition comes due, such as `2h10m`.
+    pub due_in: Option<String>,
+}
+
+/// A condition's truth as the engine last recorded it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchTruth {
+    Holds,
+    #[default]
+    NotYet,
+    /// Not known now; never shown as holding or as not holding.
+    Unknown,
+}
+
 /// One timestamp in the controller's timezone.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct LocalStamp {
-    /// The day heading it falls under: `today`, `yesterday`, or a date
-    /// such as `Mon 23 Nov`.
+    /// The day heading it falls under: `today`, `yesterday`, `tomorrow`,
+    /// or a date such as `Mon 23 Nov`.
     pub day: String,
     /// The clock time, `14:32`.
     pub clock: String,
@@ -816,6 +901,11 @@ pub struct DisplayPolicy {
     pub default_reviewer: Option<String>,
     /// `[guides] enabled`: the details pane shows each row's change guide.
     pub guides: bool,
+    /// Staging has a deploy probe (`[environments.staging]`): reaching it
+    /// means deployed there, not only merged.
+    pub staging_probe: bool,
+    /// The same for `[environments.production]`.
+    pub production_probe: bool,
 }
 
 /// A recorded change guide. `current` compares the HEAD it described with
@@ -953,6 +1043,13 @@ pub struct BoardRow {
     pub live_sessions: Vec<LiveSlotView>,
     #[serde(default)]
     pub logs: Vec<LogView>,
+    /// What the worktree waits for, as its host stores it.
+    #[serde(default)]
+    pub watches: Vec<WatchView>,
+    /// The stored creation stamp of this worktree. A later worktree with the
+    /// same slug has another, so a menu commit carries it as its witness.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[cfg(test)]

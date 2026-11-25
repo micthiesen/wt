@@ -108,6 +108,7 @@ fn watch_events(store: &Store, slug: &str) -> Vec<(WatchChange, String, Option<S
                 what,
                 reason,
                 by: _,
+                then: _,
             } => Some((change, what, reason)),
             _ => None,
         })
@@ -847,5 +848,124 @@ fn a_cleared_gate_is_remembered_and_an_action_that_cannot_happen_is_given_up() {
             left.summary(),
             Some("the gate changed".to_owned())
         )
+    );
+}
+
+#[test]
+fn a_menu_sets_and_cancels_only_on_the_worktree_it_showed() {
+    let (_temp, mut store) = store();
+    let human = |conditions: &[&str]| NewWatch {
+        by: "human".into(),
+        ..new("one", conditions, notify())
+    };
+    // The menu showed another worktree with this slug, or one never recorded.
+    for stale in [Some("2026-01-01T00:00:00Z"), None] {
+        assert_eq!(
+            store
+                .add_watch_seen(human(&["ready"]), NOON, stale)
+                .unwrap(),
+            Err(WatchRefusal::OwnerChanged)
+        );
+    }
+    let watch = store
+        .add_watch_seen(human(&["ready"]), NOON, Some(CREATED))
+        .unwrap()
+        .unwrap();
+    assert_eq!(watch.incarnation.as_deref(), Some(CREATED));
+    assert_eq!(
+        store
+            .add_watch_seen(human(&["ready"]), NOON, Some(CREATED))
+            .unwrap(),
+        Err(WatchRefusal::AlreadySet {
+            id: watch.id.clone()
+        })
+    );
+    // An agent waiting for the same thing is not the person's watch.
+    let agents = add(&mut store, "one", &["ready"], notify());
+    for (id, by, incarnation) in [
+        (&agents.id, "human", Some(CREATED)),
+        (&watch.id, "one", Some(CREATED)),
+        (&watch.id, "human", None),
+    ] {
+        assert_eq!(
+            store.cancel_watch_seen(id, "one", by, incarnation).unwrap(),
+            None
+        );
+    }
+    let cancelled = store
+        .cancel_watch_seen(&watch.id, "one", "human", Some(CREATED))
+        .unwrap();
+    assert_eq!(cancelled.map(|watch| watch.id), Some(watch.id.clone()));
+    assert_eq!(
+        store
+            .cancel_watch_seen(&watch.id, "one", "human", Some(CREATED))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        changes(&store, "one"),
+        [WatchChange::Set, WatchChange::Set, WatchChange::Cancelled]
+    );
+    // The person is not named, and the event says what the watch will do.
+    let events = store.read_worktree_events("one", 500).unwrap();
+    let set = events
+        .iter()
+        .find(|event| matches!(event.event, WorktreeEventKind::Watch { .. }))
+        .unwrap();
+    assert!(matches!(
+        &set.event,
+        WorktreeEventKind::Watch { then, by: None, .. } if then == &["notify".to_owned()]
+    ));
+}
+
+/// The engine stamps a landed row's commit onto the watch that follows it.
+/// A process started after that, which never saw the row landed, still
+/// carries the watch past the worktree's removal.
+#[test]
+fn a_landing_commit_stamped_before_a_restart_carries_the_watch_past_removal() {
+    use wt_core::watch::WatchStamps;
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("wt.sqlite");
+    let open = || Store::open(&path, RepositoryIdentity::new("repo", "/repo")).unwrap();
+    let mut store = open();
+    store.record_slug_created("one", CREATED).unwrap();
+    let tells = add(&mut store, "one", &["production"], notify());
+    let stamp = WatchStamps {
+        landing_commit: Some(SHA.into()),
+        evaluated_at_ms: Some(NOON),
+        ..WatchStamps::new(&tells.id)
+    };
+    assert!(
+        store
+            .apply_evaluation(std::slice::from_ref(&stamp))
+            .unwrap()
+    );
+    // Written only when it changes.
+    assert!(!store.apply_evaluation(&[stamp]).unwrap());
+    assert_eq!(raw(&store)["watches"][0]["landingCommit"], SHA);
+    assert_eq!(raw(&store)["watches"][0]["evaluatedAtMs"], NOON);
+    drop(store);
+
+    let mut store = open();
+    store
+        .record_removed_worktrees(&[removed("one", "base")], NOON + 1_000)
+        .unwrap();
+    // This process knows no landing commits of its own.
+    assert_eq!(
+        store
+            .drop_orphans(&BTreeMap::new(), &BTreeMap::new(), NOON + 2_000)
+            .unwrap(),
+        []
+    );
+    let kept = store.list_watches(None).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert!(kept[0].owner_gone);
+    assert_eq!(kept[0].evaluated_at_ms(), Some(NOON));
+    assert_eq!(
+        kept[0].when[0].cond,
+        Condition::Commit {
+            oid: SHA.into(),
+            stage: VerifyStage::Production
+        }
     );
 }

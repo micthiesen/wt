@@ -487,15 +487,15 @@ impl Model {
                 })
             }
             KeyCode::Char('Q') if !control => {
-                if !self.board.display.automations {
-                    return self.notify("no [[automations]] configured");
+                if !self.board.automations_shown() {
+                    return self.notify("no [[automations]] configured and nothing is waiting");
                 }
                 self.interaction = Interaction::Automations { scroll: 0 };
                 InputResult::Draw
             }
             KeyCode::Char('A') if !control => {
-                if !self.board.display.automations {
-                    return self.notify("no [[automations]] configured");
+                if !self.board.automations_shown() {
+                    return self.notify("no [[automations]] configured and nothing is waiting");
                 }
                 InputResult::Action(UiAction::ToggleAutomations {
                     key: None,
@@ -760,6 +760,9 @@ impl Model {
                 self.row_action(|key| UiAction::PrepareStatus { key })
             }
             KeyCode::Char('b') if !control => self.row_action(|key| UiAction::PrepareBase { key }),
+            KeyCode::Char('W') if !control => {
+                self.row_action(|key| UiAction::PrepareNotify { key })
+            }
             KeyCode::Char('#') => {
                 if let Some(row) = self.actionable_row() {
                     self.interaction = Interaction::Text(TextPrompt {

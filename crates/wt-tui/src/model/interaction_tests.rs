@@ -862,7 +862,19 @@ fn feedback_toasts_replace_silent_no_ops() {
     ch(&mut model, 'x');
     assert_eq!(toast(&model), Some("attention feed is empty"));
     ch(&mut model, 'A');
-    assert_eq!(toast(&model), Some("no [[automations]] configured"));
+    assert_eq!(
+        toast(&model),
+        Some("no [[automations]] configured and nothing is waiting")
+    );
+    ch(&mut model, 'Q');
+    assert!(matches!(model.interaction, Interaction::None));
+    // A row that waits for something has fires to list and to pause.
+    let mut waiting = board(&["a"]);
+    waiting.rows[0].watches = vec![crate::WatchView::default()];
+    let mut model = Model::default();
+    model.apply(ready(waiting));
+    ch(&mut model, 'Q');
+    assert!(matches!(model.interaction, Interaction::Automations { .. }));
 
     let mut model = Model::default();
     assert_eq!(ch(&mut model, '!'), InputResult::Draw);
@@ -1447,4 +1459,72 @@ fn a_vanished_picker_option_drops_the_next_commit_key() {
             ) if selection.session_id.as_deref() == Some("s3")
         ));
     }
+}
+
+#[test]
+fn w_opens_the_notify_menu_from_the_board_and_commits_what_it_showed() {
+    let mut value = board(&["a"]);
+    value.rows[0].created_at = Some("2026-11-01T00:00:00Z".into());
+    let mut model = Model::default();
+    model.apply(ready(value.clone()));
+    assert_eq!(ch(&mut model, 'W'), InputResult::Draw);
+    assert!(model.pending_request.is_none(), "no host round trip");
+    // No PR: the row stays listed, and picking it says why and keeps the menu.
+    assert_eq!(ch(&mut model, 'c'), InputResult::Draw);
+    assert_eq!(toast(&model), Some("checks green: no PR"));
+    assert!(matches!(model.interaction, Interaction::Picker(_)));
+    let seen = crate::Seen(Some("2026-11-01T00:00:00Z".to_owned()));
+    assert_eq!(
+        ch(&mut model, 'm'),
+        InputResult::Action(UiAction::SetNotify {
+            key: "a".into(),
+            change: crate::NotifyChange::Add {
+                state: "merged".into()
+            },
+            seen: seen.clone(),
+        })
+    );
+    assert!(matches!(model.interaction, Interaction::None));
+
+    // Once stored, the same row offers to cancel it, by id. `W W` confirms.
+    value.rows[0].watches = vec![crate::WatchView {
+        id: "abc234".into(),
+        by: "human".into(),
+        conditions: vec![crate::WatchConditionView {
+            key: "ready".into(),
+            text: "ready".into(),
+            ..Default::default()
+        }],
+        actions: vec![crate::WatchActionKind::Notify],
+        ..Default::default()
+    }];
+    model.apply(ready(value));
+    ch(&mut model, 'W');
+    assert_eq!(
+        ch(&mut model, 'r'),
+        InputResult::Action(UiAction::SetNotify {
+            key: "a".into(),
+            change: crate::NotifyChange::Cancel {
+                id: "abc234".into()
+            },
+            seen,
+        })
+    );
+    ch(&mut model, 'W');
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("the notify menu opens")
+    };
+    // The cursor starts on the first choice that sets something.
+    assert_eq!(picker.options[picker.selected].label, "merged");
+    assert!(matches!(
+        ch(&mut model, 'W'),
+        InputResult::Action(UiAction::SetNotify {
+            change: crate::NotifyChange::Add { .. },
+            ..
+        })
+    ));
+
+    let mut empty = Model::default();
+    assert_eq!(ch(&mut empty, 'W'), InputResult::Draw);
+    assert_eq!(toast(&empty), Some("select a worktree first"));
 }

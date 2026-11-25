@@ -20,7 +20,7 @@ use wt_vcs::WorktreeRecord;
 use wt_app_core::{context::AppContext, database::Database};
 use wt_ops::commands::resolve::resolve_worktree;
 
-const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo, and --until <condition> clears the gate by itself once the condition holds (e.g. --until '#3806:production'; see `wt watch check`); --verify-in-staging / --verify-in-production record a check owed once the change deploys there.";
+const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo, and --until <condition> clears the gate by itself once the condition holds (e.g. --until pr:3806:production; see `wt watch check`); --verify-in-staging / --verify-in-production record a check owed once the change deploys there.";
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct StatusArgs {
@@ -68,10 +68,17 @@ pub struct StatusArgs {
     #[arg(long)]
     pub unblock: bool,
     /// When the `--blocked-on` gate clears by itself: a condition as
-    /// `wt wake` reads it ('#3806:production', release:production+24h,
+    /// `wt wake` reads it (pr:3806:production, release:production+24h,
     /// 17:00, check:<id>). Repeat it; all must hold. Needs a gate, given
     /// here or already set.
-    #[arg(long, value_name = "CONDITION")]
+    // The value is optional to the parser so that one a shell took as a
+    // comment (`--until #3806`) is answered with why, not a usage error.
+    #[arg(
+        long,
+        value_name = "CONDITION",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub until: Vec<String>,
     /// With `--until`: also wake the session with this prompt once the
     /// gate has cleared.
@@ -1505,6 +1512,40 @@ mod tests {
         )
     }
 
+    /// `--until #7:production` reaches wt as a bare `--until`. It must
+    /// parse, so the command can say what happened.
+    #[test]
+    fn until_parses_with_its_condition_lost_to_a_shell_comment() {
+        #[derive(clap::Parser)]
+        struct Harness {
+            #[command(flatten)]
+            args: StatusArgs,
+        }
+        use clap::Parser;
+        let until = |argv: &[&str]| {
+            Harness::try_parse_from(argv.iter().copied())
+                .unwrap()
+                .args
+                .until
+        };
+        assert_eq!(
+            until(&[
+                "status",
+                "ready",
+                "--risk",
+                "low",
+                "--blocked-on",
+                "x",
+                "--until"
+            ]),
+            [""]
+        );
+        assert_eq!(
+            until(&["status", "--until", "pr:7", "--until", "+1h"]),
+            ["pr:7", "+1h"]
+        );
+    }
+
     #[test]
     fn a_flag_swallowed_as_another_flags_value_is_named() {
         let Action::Error(message) = parsed(&[
@@ -1847,11 +1888,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run(&fixture.ctx, &unreadable).await.unwrap(), 2);
+        // What a shell leaves of `--until #7:production`: the flag alone.
+        let lost = StatusArgs {
+            until: vec![String::new()],
+            ..unreadable.clone()
+        };
+        assert_eq!(run(&fixture.ctx, &lost).await.unwrap(), 2);
         let state = read_state(&fixture.ctx.database).await.unwrap();
         assert!(state["slugs"]["one"].get("work").is_none());
 
         let gated = StatusArgs {
-            until: vec!["#7:production".into(), "+1h".into()],
+            until: vec!["pr:7:production".into(), "+1h".into()],
             then: Some("run the smoke test".into()),
             ..unreadable.clone()
         };
@@ -1867,7 +1914,7 @@ mod tests {
         let record = resolve_worktree(&fixture.ctx, Some("one")).await.unwrap();
         let row = live_json(&fixture.ctx, &state, &record).await.unwrap();
         assert_eq!(row["watches"][0]["id"], set[0].id.as_str());
-        assert_eq!(row["watches"][0]["when"][0]["arg"], "#7:production");
+        assert_eq!(row["watches"][0]["when"][0]["arg"], "pr:7:production");
         assert_eq!(row["watches"][0]["then"]["unblock"], "#7 ships");
 
         // --until on the existing gate replaces the watch that clears it.

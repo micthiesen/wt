@@ -181,6 +181,11 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         // Landing commits outlive the rows they were read from: a watch
         // follows its commit once its worktree is removed.
         let mut known_landings = std::collections::BTreeMap::<String, String>::new();
+        // The landing commits of the rows as last read: what a watch about
+        // its own landing gets stamped with, so a later process has it too.
+        let mut row_landings = std::collections::BTreeMap::<String, String>::new();
+        // Armed merges already asked to be forgotten; the snapshot lags.
+        let mut ended_arms = BTreeSet::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -352,6 +357,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                                 }
                             }
                             lifecycle_errors = next.errors;
+                            row_landings.clone_from(&next.landing_commits);
                             known_landings.extend(next.landing_commits);
                             lifecycle_cache = next.rows;
                             lifecycle_cache_key = Some(lifecycle_key);
@@ -450,7 +456,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 // this pass uses what has arrived so far.
                 externals.request(&context, &wt_core::watch::needs(&watches), &facts.watch_prs, &facts.branches);
                 let known = crate::watch_facts::facts(&watches, &facts.watch_rows, facts.state_ready, &facts.watch_prs, &externals);
-                let stamps = crate::watch_facts::stamps(&watches, &known, now);
+                let stamps = crate::watch_facts::stamps(&watches, &known, &row_landings, now);
                 if !stamps.is_empty() && applied_stamps.as_ref() != Some(&(revision, stamps.clone())) {
                     let write = stamps.clone();
                     match context.database.call(move |store| Ok(store.apply_evaluation(&write)?)).await {
@@ -480,6 +486,17 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 }
                 known_landings.retain(|slug, _| watches.iter().any(|watch| watch.slug == *slug));
                 facts.context.watches = crate::watch_facts::deliverable(&watches, &live, now);
+            }
+            // A merge that landed, or whose pull request closed, is no
+            // longer armed; a later arming is a new record.
+            if ended_arms.len() > 512 { ended_arms.clear(); }
+            for (slug, armed_at) in wt_automations::finished_merge_arms(&facts.rows, &facts.context) {
+                if !ended_arms.insert((slug.clone(), armed_at)) { continue; }
+                let ended = slug.clone();
+                if let Err(error) = context.database.call(move |store| Ok(store.clear_slug_merge_arm(&ended, Some(armed_at))?)).await {
+                    ended_arms.remove(&(slug, armed_at));
+                    latest_error = Some(format!("cannot forget an ended merge: {error:#}"));
+                }
             }
             let pass = pass_input(&context, facts, facts.context.now_ms);
             let tick = match engine.tick(pass).await {
@@ -1080,6 +1097,7 @@ fn metadata_facts_key(metadata: Option<&crate::local_source::Metadata>) -> serde
                 "githubIssue",
                 "automationsPaused",
                 "guide",
+                "mergeArm",
             ] {
                 if let Some(value) = record.get(field) {
                     relevant.insert(field.into(), value.clone());

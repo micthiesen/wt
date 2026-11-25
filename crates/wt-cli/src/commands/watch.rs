@@ -6,7 +6,10 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use wt_app_core::context::AppContext;
+use wt_app_core::{
+    context::AppContext,
+    watch_view::{Shown, headline},
+};
 use wt_config::Config;
 use wt_core::{
     VerifyStage,
@@ -18,11 +21,13 @@ use wt_core::{
 use wt_ops::commands::resolve::resolve_worktree;
 use wt_store::{NewWatch, WatchRefusal, WatchSelector};
 
-const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, +3h, 2026-11-25T17:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request ('#3806:production'; quote it, # starts a shell comment), another worktree (<slug>:merged, <slug>:gone), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
+const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, +3h, 2026-11-25T17:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request (pr:3806, pr:3806:production), another worktree (<slug>:merged, <slug>:gone), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
 
 #[derive(Debug, Clone, Args)]
 pub struct WakeArgs {
-    #[arg(value_name = "CONDITION", required = true, help = CONDITION_HELP)]
+    // Not required by the parser: a command that lost its conditions to a
+    // shell comment gets the explanation instead of a usage error.
+    #[arg(value_name = "CONDITION", help = CONDITION_HELP)]
     pub conditions: Vec<String>,
     /// What the session should do then. It arrives as a prompt, with what
     /// held and this note.
@@ -32,7 +37,7 @@ pub struct WakeArgs {
         value_name = "PROMPT",
         allow_hyphen_values = true
     )]
-    pub message: String,
+    pub message: Option<String>,
     /// The worktree whose session to wake (default: the current one).
     #[arg(long, value_name = "SLUG")]
     pub slug: Option<String>,
@@ -40,7 +45,7 @@ pub struct WakeArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct NotifyArgs {
-    #[arg(value_name = "CONDITION", required = true, help = CONDITION_HELP)]
+    #[arg(value_name = "CONDITION", help = CONDITION_HELP)]
     pub conditions: Vec<String>,
     /// What to tell the person (default: what held).
     #[arg(
@@ -64,8 +69,8 @@ pub struct WatchArgs {
     #[arg(long)]
     pub all: bool,
     /// Print an array: id, slug, by, created_at, when (arg, description,
-    /// state: holds, not_yet or unknown, and reason), then, met_at,
-    /// last_error, evaluating.
+    /// state: holds, not_yet, unknown or not_evaluated_yet, and reason),
+    /// then, met_at, last_error, evaluated_at, evaluating.
     #[arg(long)]
     pub json: bool,
     /// The worktree whose watches to list (default: the current one).
@@ -199,6 +204,15 @@ fn config_fact(config: &Config, cond: &Condition) -> Result<Option<(String, bool
     })
 }
 
+/// What to say when a command names no condition. The usual cause is a pull
+/// request written with `#`: unquoted, the shell takes it and the rest of
+/// the line as a comment, so the command arrives without them.
+pub(crate) const NO_CONDITIONS: &str = "name at least one condition, such as pr:3806:production, release:production+24h or 17:00.\nIf you wrote a pull request as #3806, the shell read # as the start of a comment and dropped it with the rest of the command: write pr:3806";
+
+fn no_conditions(args: &[String]) -> bool {
+    args.is_empty() || args.iter().any(|arg| arg.trim().is_empty())
+}
+
 pub(crate) struct ReadConditions {
     pub when: Vec<WatchCondition>,
     /// What the conditions mean here that their words do not say.
@@ -213,11 +227,8 @@ pub(crate) async fn read_conditions(
     args: &[String],
     clock: LocalClock,
 ) -> Result<ReadConditions, String> {
-    if args.is_empty() {
-        return Err(
-            "name at least one condition. A pull request must be quoted: '#3806' (# starts a shell comment)"
-                .into(),
-        );
+    if no_conditions(args) {
+        return Err(NO_CONDITIONS.into());
     }
     let mut read = ReadConditions {
         when: Vec::new(),
@@ -303,7 +314,12 @@ fn clean(text: &str) -> Option<String> {
 }
 
 pub async fn run_wake(ctx: &AppContext, args: &WakeArgs) -> Result<i32> {
-    let Some(prompt) = clean(&args.message) else {
+    // Before -m: a shell comment takes the conditions and -m together.
+    if no_conditions(&args.conditions) {
+        eprintln!("{NO_CONDITIONS}");
+        return Ok(2);
+    }
+    let Some(prompt) = args.message.as_deref().and_then(clean) else {
         eprintln!("-m needs what the session should do once the conditions hold");
         return Ok(2);
     };
@@ -315,6 +331,10 @@ pub async fn run_wake(ctx: &AppContext, args: &WakeArgs) -> Result<i32> {
 }
 
 pub async fn run_notify(ctx: &AppContext, args: &NotifyArgs) -> Result<i32> {
+    if no_conditions(&args.conditions) {
+        eprintln!("{NO_CONDITIONS}");
+        return Ok(2);
+    }
     let then = WatchActions {
         notify: Some(args.message.as_deref().and_then(clean).unwrap_or_default()),
         ..WatchActions::default()
@@ -360,69 +380,11 @@ async fn set_and_report(
     }
 }
 
-/// A condition's truth as the engine last recorded it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Shown {
-    Holds,
-    NotYet(Option<String>),
-    Unknown(String),
-}
+/// Why a condition reads unknown when nothing evaluates watches.
+const NOT_EVALUATING: &str = "nothing is evaluating it: the wt TUI is not open for this repository";
 
-impl Shown {
-    fn word(&self) -> &'static str {
-        match self {
-            Self::Holds => "holds",
-            Self::NotYet(_) => "not yet",
-            Self::Unknown(_) => "unknown",
-        }
-    }
-
-    fn reason(&self) -> Option<&str> {
-        match self {
-            Self::Holds => None,
-            Self::NotYet(reason) => reason.as_deref(),
-            Self::Unknown(reason) => Some(reason),
-        }
-    }
-}
-
-/// Read a condition's stored record. The record keeps since when a
-/// condition has held and the watch's last problem, not every "unknown", so
-/// a condition nothing has reported on reads "not yet" while an engine runs
-/// and "unknown" while none does.
 fn shown(watch: &Watch, cond: &WatchCondition, now_ms: i64, evaluating: bool) -> Shown {
-    if cond.latched || watch.is_met() {
-        return Shown::Holds;
-    }
-    if let Condition::At { at_ms } = cond.cond {
-        return if now_ms >= at_ms {
-            Shown::Holds
-        } else {
-            Shown::NotYet(None)
-        };
-    }
-    if let Some(since) = cond.first_held_at_ms {
-        return match cond.delay {
-            Some(delay) if now_ms < since.saturating_add(delay.as_ms()) => {
-                Shown::NotYet(Some(format!("holding, {delay} not yet over")))
-            }
-            _ => Shown::Holds,
-        };
-    }
-    if !evaluating {
-        return Shown::Unknown(
-            "nothing is evaluating it: the wt TUI is not open for this repository".into(),
-        );
-    }
-    let about_this = |error: &&String| match &cond.cond {
-        Condition::Check { .. } => !error.starts_with('#'),
-        Condition::Pr { number, .. } => error.starts_with(&format!("#{number} ")),
-        _ => false,
-    };
-    match watch.last_error.as_ref().filter(about_this) {
-        Some(error) => Shown::Unknown(error.clone()),
-        None => Shown::NotYet(None),
-    }
+    wt_app_core::watch_view::shown(watch, cond, now_ms, (!evaluating).then_some(NOT_EVALUATING))
 }
 
 fn iso(ms: i64) -> Option<String> {
@@ -480,18 +442,10 @@ fn listing_json(watch: &Watch, clock: LocalClock, evaluating: bool) -> Value {
         "then": then_json(&watch.then),
         "met_at": watch.met_at_ms.and_then(iso),
         "last_error": watch.last_error,
+        "evaluated_at": watch.evaluated_at_ms().and_then(iso),
         "owner_gone": watch.owner_gone,
         "evaluating": evaluating,
     })
-}
-
-fn headline(text: &str) -> String {
-    let line = text.lines().next().unwrap_or_default();
-    if line.chars().count() > 80 {
-        format!("{}…", line.chars().take(79).collect::<String>())
-    } else {
-        line.to_owned()
-    }
 }
 
 fn listing_text(watch: &Watch, clock: LocalClock, evaluating: bool) -> String {
@@ -724,7 +678,16 @@ mod tests {
         assert_eq!(state(&watch, 0, NOON, false), Shown::NotYet(None));
         assert_eq!(state(&watch, 0, NOON + 5 * 3_600_000, false), Shown::Holds);
         assert!(matches!(state(&watch, 1, NOON, false), Shown::Unknown(_)));
+        // "Not yet" is an answer, and only an engine that judged the watch
+        // has given one.
+        assert_eq!(state(&watch, 1, NOON, true), Shown::NotEvaluated);
+        let evaluated = wt_core::watch::WatchStamps {
+            evaluated_at_ms: Some(NOON),
+            ..wt_core::watch::WatchStamps::new(&watch.id)
+        };
+        evaluated.apply(&mut watch);
         assert_eq!(state(&watch, 1, NOON, true), Shown::NotYet(None));
+        assert!(matches!(state(&watch, 1, NOON, false), Shown::Unknown(_)));
 
         watch.when[1].first_held_at_ms = Some(NOON);
         assert_eq!(state(&watch, 1, NOON, false), Shown::Holds);
@@ -753,7 +716,7 @@ mod tests {
 
     #[test]
     fn listings_show_each_condition_and_what_follows() {
-        let mut watch = stored(&["17:00", "merged"]);
+        let mut watch = stored(&["17:00", "merged", "pr:7:production", "green"]);
         watch.when[1].first_held_at_ms = Some(NOON);
         let clock = LocalClock {
             now_ms: NOON + 60_000,
@@ -761,9 +724,23 @@ mod tests {
         };
         assert_eq!(
             listing_text(&watch, clock, true),
-            "aaaaaa  one  set by one, 1m ago\n  not yet  17:00 today\n  holds    merged\n  then: clear the gate \"the release\"\n  then: wake the session: Run the smoke test."
+            "aaaaaa  one  set by one, 1m ago\n  not yet  17:00 today\n  holds    merged\n  not evaluated yet #7 in production (the wt TUI evaluates watches)\n  not evaluated yet PR checks green (the wt TUI evaluates watches)\n  then: clear the gate \"the release\"\n  then: wake the session: Run the smoke test."
         );
         let listed = listing_json(&watch, clock, true);
+        // A condition prints as it can be typed back, without a # for a
+        // shell to take as a comment.
+        assert_eq!(listed["when"][2]["arg"], "pr:7:production");
+        assert_eq!(listed["when"][2]["state"], "not_evaluated_yet");
+        assert_eq!(listed["evaluated_at"], Value::Null);
+        let evaluated = wt_core::watch::WatchStamps {
+            evaluated_at_ms: Some(NOON),
+            ..wt_core::watch::WatchStamps::new(&watch.id)
+        };
+        evaluated.apply(&mut watch);
+        let listed = listing_json(&watch, clock, true);
+        assert_eq!(listed["when"][3]["state"], "not_yet");
+        assert_eq!(listed["evaluated_at"], "2026-11-24T12:00:00Z");
+        watch.when.truncate(2);
         assert_eq!(listed["when"][0]["arg"], "2026-11-24 17:00");
         assert_eq!(listed["when"][0]["state"], "not_yet");
         assert_eq!(listed["when"][1]["state"], "holds");
@@ -868,15 +845,37 @@ mod tests {
         let ctx = &fixture.ctx;
         let wake = |conditions: &[&str], slug: Option<&str>| WakeArgs {
             conditions: conditions.iter().map(|arg| (*arg).to_owned()).collect(),
-            message: "Run the smoke test".into(),
+            message: Some("Run the smoke test".into()),
             slug: slug.map(str::to_owned),
         };
         assert_eq!(
-            run_wake(ctx, &wake(&["+3h", "#7:production"], None))
+            run_wake(ctx, &wake(&["+3h", "pr:7:production"], None))
                 .await
                 .unwrap(),
             0
         );
+        // What a shell leaves of `wt wake #7:production -m "..."`.
+        let lost = WakeArgs {
+            conditions: Vec::new(),
+            message: None,
+            slug: None,
+        };
+        assert_eq!(run_wake(ctx, &lost).await.unwrap(), 2);
+        let lost = NotifyArgs {
+            conditions: Vec::new(),
+            message: None,
+            slug: None,
+        };
+        assert_eq!(run_notify(ctx, &lost).await.unwrap(), 2);
+        for lost in [&[][..], &[String::new()][..]] {
+            assert!(
+                read_conditions(ctx, lost, clock())
+                    .await
+                    .err()
+                    .unwrap()
+                    .contains("write pr:3806")
+            );
+        }
         assert_eq!(run_wake(ctx, &wake(&["soonish"], None)).await.unwrap(), 2);
         assert_eq!(
             run_wake(ctx, &wake(&["check:nosuch"], None)).await.unwrap(),

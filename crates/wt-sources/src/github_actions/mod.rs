@@ -64,6 +64,8 @@ pub struct GithubActions {
     default_reviewer: Option<String>,
     /// Trunk and production, for checking GitHub stacks before arming.
     branch: wt_config::BranchConfig,
+    /// Where an armed merge is recorded for `pr.merge_dropped`.
+    database: wt_app_core::database::Database,
 }
 
 /// What a ship request will do, decided before anything is sent.
@@ -93,7 +95,12 @@ impl GithubActions {
         );
         let ledger = WriteLedger::new(refresh);
         spawn_confirmer(scope, ledger.clone());
-        let retries = Retries::start(scope, client.clone(), ledger.clone());
+        let retries = Retries::start(
+            scope,
+            client.clone(),
+            ledger.clone(),
+            context.database.clone(),
+        );
         Self {
             client,
             ledger,
@@ -102,6 +109,24 @@ impl GithubActions {
             reviewers_enabled: context.config.github.reviewers,
             default_reviewer: context.config.github.default_reviewer.clone(),
             branch: context.config.branch.clone(),
+            database: context.database.clone(),
+        }
+    }
+
+    async fn record_armed(
+        &self,
+        owner: Option<&str>,
+        target: &PrMergeTarget,
+        result: &GhActionResult,
+    ) {
+        if let Some(slug) = owner {
+            wt_ops::merge_arm::armed(&self.database, slug, target, result).await;
+        }
+    }
+
+    async fn record_cancelled(&self, owner: Option<&str>) {
+        if let Some(slug) = owner {
+            wt_ops::merge_arm::cancelled(&self.database, slug).await;
         }
     }
 
@@ -164,13 +189,20 @@ impl GithubActions {
             )));
         }
 
+        // This host's engine evaluates only its own worktrees, so an armed
+        // merge is recorded only for those.
+        let owner = row.host.is_none().then_some(row.slug.as_str());
         match action {
             GithubAction::MarkReady { .. } => self.mark_ready(pr, &branch, github).await,
             GithubAction::SetAutoMerge { enable, .. } => {
-                self.set_auto_merge(pr, &branch, &row.slug, github, enable, &landing)
-                    .await
+                if enable {
+                    self.enable(pr, &branch, &row.slug, owner, github, &landing)
+                        .await
+                } else {
+                    self.disarm(pr, &branch, owner, github).await
+                }
             }
-            GithubAction::Ship { .. } => Ok(self.ship(pr, &branch, github, &landing).await),
+            GithubAction::Ship { .. } => Ok(self.ship(pr, &branch, owner, github, &landing).await),
             GithubAction::FailedChecks { .. } => self.failed_checks(pr, &branch).await,
         }
     }
@@ -205,27 +237,12 @@ impl GithubActions {
         ))
     }
 
-    async fn set_auto_merge(
-        &self,
-        pr: &PullRequest,
-        branch: &str,
-        worktree: &str,
-        github: &Confirmed<GithubData>,
-        enable: bool,
-        landing: &MergeLanding,
-    ) -> Result<UiReply> {
-        if enable {
-            self.enable(pr, branch, worktree, github, landing).await
-        } else {
-            self.disarm(pr, branch, github).await
-        }
-    }
-
     async fn enable(
         &self,
         pr: &PullRequest,
         branch: &str,
         worktree: &str,
+        owner: Option<&str>,
         github: &Confirmed<GithubData>,
         landing: &MergeLanding,
     ) -> Result<UiReply> {
@@ -254,6 +271,7 @@ impl GithubActions {
         let write = GithubWrite::auto_merge(branch, number, true);
         if result.ok {
             let at = self.ledger.accepted(write);
+            self.record_armed(owner, &target, &result).await;
             return Ok(UiReply::accepted(
                 format!("merge when ready armed for PR #{number}"),
                 at,
@@ -263,7 +281,12 @@ impl GithubActions {
             return Ok(
                 match self
                     .retries
-                    .start_arm(target, branch.to_owned(), worktree.to_owned())
+                    .start_arm(
+                        target,
+                        branch.to_owned(),
+                        worktree.to_owned(),
+                        owner.is_some(),
+                    )
                     .await?
                 {
                     RetryStart::Started => UiReply::deferred(format!(
@@ -290,21 +313,32 @@ impl GithubActions {
         &self,
         pr: &PullRequest,
         branch: &str,
+        owner: Option<&str>,
         github: &Confirmed<GithubData>,
     ) -> Result<UiReply> {
         let number = pr.number;
         let cancellation = self.retries.cancel(number).await?;
         if let Some(result) = self.finish_retry_cancel(pr, branch, cancellation).await {
+            if disarmed(&result) {
+                self.record_cancelled(owner).await;
+            }
             return Ok(result);
         }
         // Sent whenever this host's own writes say the PR may be armed, even
         // when the lagging read still shows it disarmed.
         if self.ledger.guard(github, branch, number, false) != Guard::Send {
+            // Asked to cancel a merge GitHub no longer holds: no drop is
+            // left to report.
+            self.record_cancelled(owner).await;
             return Ok(UiReply::no_change(format!(
                 "merge when ready is not armed for PR #{number}"
             )));
         }
-        self.disable(pr, branch).await
+        let reply = self.disable(pr, branch).await?;
+        if disarmed(&reply) {
+            self.record_cancelled(owner).await;
+        }
+        Ok(reply)
     }
 
     async fn disable(&self, pr: &PullRequest, branch: &str) -> Result<UiReply> {
@@ -394,6 +428,7 @@ impl GithubActions {
         &self,
         pr: &PullRequest,
         branch: &str,
+        owner: Option<&str>,
         github: &Confirmed<GithubData>,
         landing: &MergeLanding,
     ) -> UiReply {
@@ -410,7 +445,7 @@ impl GithubActions {
                 ControlFlow::Continue(progress) => progress,
                 ControlFlow::Break(reply) => return reply,
             };
-        let progress = match self.ship_arm(&plan, branch, progress).await {
+        let progress = match self.ship_arm(&plan, branch, owner, progress).await {
             ControlFlow::Continue(progress) => progress,
             ControlFlow::Break(reply) => return reply,
         };
@@ -533,6 +568,7 @@ impl GithubActions {
         &self,
         plan: &ShipPlan,
         branch: &str,
+        owner: Option<&str>,
         mut progress: ShipProgress,
     ) -> ControlFlow<UiReply, ShipProgress> {
         let Some(target) = plan.target.as_ref() else {
@@ -557,6 +593,7 @@ impl GithubActions {
             return ControlFlow::Break(self.write_failed(write, message, ambiguous));
         }
         progress.at = Some(self.ledger.accepted(write));
+        self.record_armed(owner, target, &result).await;
         ControlFlow::Continue(progress)
     }
 
@@ -607,6 +644,16 @@ impl GithubActions {
             "{error}; the request may have reached GitHub and is unconfirmed; check before retrying"
         ))
     }
+}
+
+/// Whether a cancel left no merge armed, as far as GitHub confirmed. An
+/// unconfirmed disable may have left one.
+fn disarmed(reply: &UiReply) -> bool {
+    !reply.failed
+        && matches!(
+            reply.outcome,
+            Some(wt_tui::ReplyOutcome::Accepted(_) | wt_tui::ReplyOutcome::NoChange)
+        )
 }
 
 /// The final ship reply once every step that ran succeeded.

@@ -33,8 +33,8 @@ pub use board::{
     MergeQueueView, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
     PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
     RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
-    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WorkPresentation,
-    WorkRiskCount, WorkStateCount,
+    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WatchActionKind,
+    WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount, WorkStateCount,
 };
 pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{

@@ -100,11 +100,13 @@ pub fn bound_worktree_event(event: &mut WorktreeEventKind) {
             what,
             by,
             reason,
+            then,
             change: _,
         } => {
             line(what);
             some(by);
             some(reason);
+            then.iter_mut().for_each(line);
         }
         WorktreeEventKind::Pr { .. }
         | WorktreeEventKind::MergeQueue { .. }

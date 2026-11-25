@@ -20,9 +20,10 @@ section by a blank line. A row shows, left to right: the stack rail (tinted per
 stack lane), the work-status marker, the title exactly as named (issue
 identity appears in details, never as a title prefix), a dim `→ Section` when a stack member sits apart
 from its parent's section, and a right-aligned glyph cluster. The cluster's
-fixed order is action running, dirty, rebase or conflict, deploy, AI session
+fixed order is waiting (the bell, see [Waiting rows](#waiting-rows)), action
+running, dirty, rebase or conflict, deploy, AI session
 state, review bot, review decision, PR state or merge-queue position, and CI
-checks. `[ui].hidden_badges` removes slots by name (`action`, `dirty`,
+checks. `[ui].hidden_badges` removes slots by name (`watch`, `action`, `dirty`,
 `rebase`, `deploy`, `session`, `review_bot`, `review`, `pr`, `checks`).
 Archived rows render dimmed. Review requests and the archive sit at the bottom
 of the list. The cursor keeps three rows of context while scrolling and the
@@ -74,6 +75,7 @@ check is due. A production check on a branch that has only reached base reads
 [deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes)
 for the check's stage, a landing that stage is not running yet reads
 `awaiting staging deploy` or `awaiting production deploy`, as quietly.
+What the row waits for comes next: see [Waiting rows](#waiting-rows).
 
 Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
 order and visibility: `branch` (with its landing base), `issue` (also
@@ -246,6 +248,57 @@ verification, landing, notes, and the row's recorded history when it has one. `E
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
+### Waiting rows
+
+A row waits when wt will act for it later: clear its merge gate
+(`wt status --blocked-on ... --until`), wake its session (`wt wake`), or tell
+you (`wt notify`, or `W` on the row). Such a row wears a bell at the left of
+its badge cluster: teal while it waits, yellow when a condition cannot be read
+right now (a probe that fails, a pull request GitHub will not show), since
+that watch may never fire, and green once everything it waited for held and wt
+is delivering. The bell is not the gate's yellow circle-slash: a gate asks
+for someone, a watch does not. A folded section's header counts markers only,
+so it never shows a bell its rows would not.
+
+In the details pane a gate that clears itself says so under its
+`blocked on:` line, each condition marked `✓` holds, `○` not yet, or `?`
+unknown with the reason dim beside it:
+
+    blocked on: prod secret missing
+    clears when ✓ #3806 in production and ? check secret=API_KEY (check
+    secret exited 2: vault sealed), then wakes the session · Deploy the fix
+
+Every other watch is one line below the status block, wrapped like it on a
+narrow pane: `wakes 17:00 (in 2h10m) · Run the smoke test` for a wake at a
+time, `wakes when ○ PR checks green · ...` for one on a condition, and `tells
+you when ○ merged` for a notification. A wake's prompt or a notification's
+text follows, cut to its first line; `by <who>` names a setter that is neither
+the row's own agent nor you; `delivering` marks one whose conditions held.
+Times are in this machine's clock (`tomorrow 09:00`, `Mon 30 Nov 09:00`), and
+the countdown is refreshed at least every 30 seconds while anything waits.
+
+`W` opens **Notify me when `<slug>` is…** from the board on screen: `r`
+ready, `c` checks green, `m` merged, `s` on staging, `p` in production.
+Picking one sets a notification that is yours (`set by human` in `wt watch`);
+picking one that is set cancels it, and your other notifications on the row
+(set with `wt notify`) are listed below to cancel. A choice that cannot
+happen stays listed, dimmed, with its reason: `(no PR)`, `(already merged)`,
+`(same as merged here)` for staging without a
+[deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes),
+and the same for production with neither a probe nor a production branch.
+Picking it only says why. The bell and the line appear at once and settle
+when the host has stored the watch. The commit names the worktree the menu
+showed by its creation time, so a menu left open while the worktree was
+removed and created again writes nothing and reopens. Rows on a remote host
+show what they wait for, but `W` is refused there: a notification raised on
+another host cannot reach this desktop. A notification that outlived its
+worktree (kept across a landed removal) has no row and is listed only by
+`wt watch --all`.
+
+Watches are delivered by the automation engine, so `Q`, `A` and `Ctrl+A`
+work whenever a row waits or a fire is queued, even with no `[[automations]]`
+configured. Pausing holds deliveries; conditions keep being evaluated.
+
 ### Row history
 
 `H` opens the selected row's history as a modal. Its header is the row's
@@ -274,6 +327,22 @@ the round count), and the same automation outcome repeated within ten
 minutes (`×3`). Only neighbouring events fold, so a line never hides
 something that happened in between. A status that sets or clears a gate or
 an owed check is never folded.
+
+A watch wears the bell on every line. `waiting  for <what> · then clears the
+gate and wakes the session` (teal) is when it was set, with `by <who>` unless
+that was the row's own agent or you. `held  <what>` is when every condition
+held, and what wt then did follows in green: `gate cleared by wt  when
+<what>`, `told you  when <what>`, `session woken  when <what>`. `stopped
+waiting  for <what>` (dim) is a cancel, and `gave up waiting  for <what> ·
+<why>` (yellow) is a watch wt dropped. When wt acts within a minute of the
+conditions holding, the `held` line folds into the first action; when the
+conditions already held within ten seconds of the watch being set, its
+`waiting` line folds in too and the action ends `as soon as it was set`. A
+second action of the same watch (the wake after the gate) keeps its line.
+`wt history` says the same in sentences: `waiting for <what>, then wt tells
+you`, `held: <what>`, `gate cleared: <what>`, `told you: <what>`,
+`session woken: <what>`, `stopped waiting for <what>`, `gave up waiting for
+<what>: <why>`.
 
 The modal is drawn from the board on every frame. While it is open, new
 events appear at the top; a reader who has scrolled down stays on the line
@@ -342,6 +411,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
 | `V` | Show or hide this row's post-merge verification steps (open by default when the check is due) |
 | `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note) |
+| `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
 | `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists every section in board order with its size |
 | `D` | Delete the current section; its worktrees move to the Inbox (confirmation when it has any) |
@@ -461,8 +531,8 @@ Dismiss (Enter or Esc) and Copy details (`c`). Dismiss returns control to the
 board. The copied details include the local build, remote platform, and release
 lookup error, including GitHub 404 when that is the cause.
 
-Most menus open at once from the board on screen: status `u`, fork base `b`,
-section move, sessions `;`, start agent Shift+F12, stop a running terminal
+Most menus open at once from the board on screen: status `u`, notify `W`,
+fork base `b`, section move, sessions `;`, start agent Shift+F12, stop a running terminal
 Shift+F10/F11, GitHub `e`/`E`, review checkout `w`, history restore, hard
 refresh, create, removal of a clean worktree `d`, and an action palette that
 was prefetched for the selected row. An open menu updates as newer data
@@ -515,7 +585,7 @@ that exit successfully close normally.
 
 | Key | Action |
 |---|---|
-| `Q` | Automations overlay: running, queued (with when each runs) and the last ten recorded fires; `A` pauses inside it |
+| `Q` | Automations overlay: running, queued (with when each runs) and the last ten recorded fires, watch deliveries included; `A` pauses inside it. Toasts when no `[[automations]]` is configured and nothing waits |
 | `A` | Pause / resume all automations |
 | `Ctrl+A` | Pause / resume automations for the selected worktree |
 | `Ctrl+Shift+A` | Cancel queued automations |

@@ -105,15 +105,17 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::PrepareCleanup
         | A::PrepareStatus { .. }
         | A::PrepareBase { .. }
+        | A::PrepareNotify { .. }
         | A::PrepareSessions { .. }
         | A::PrepareHarnesses { .. }
         | A::PrepareStopTerminal { .. }
         | A::GithubFailedChecks { .. } => unreachable!("menu declaration handles preparations"),
         A::Create { .. } | A::CreateResolved { .. } => Lane::Creation(host),
         A::Remove { key, .. } | A::DismissFailedRemoval { key, .. } => Lane::Removal(host, key),
-        A::SetTitle { key, .. } | A::SetStatus { key, .. } | A::SetIssueOverride { key, .. } => {
-            Lane::Metadata(host, key)
-        }
+        A::SetTitle { key, .. }
+        | A::SetStatus { key, .. }
+        | A::SetNotify { key, .. }
+        | A::SetIssueOverride { key, .. } => Lane::Metadata(host, key),
         A::SubmitReviewers { key, .. }
         | A::GithubMarkReady { key, .. }
         | A::GithubSetAutoMerge { key, .. }

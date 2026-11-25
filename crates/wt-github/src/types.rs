@@ -281,6 +281,10 @@ pub struct GhActionResult {
     /// treat the write as unconfirmed and never resend it automatically.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ambiguous: bool,
+    /// A successful merge arm was a merge-queue submission, not classic
+    /// auto-merge.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queued: bool,
 }
 
 impl GhActionResult {
@@ -290,6 +294,17 @@ impl GhActionResult {
             error: None,
             retryable: None,
             ambiguous: false,
+            queued: false,
+        }
+    }
+    /// The pull request was submitted to its base branch's merge queue.
+    pub const fn queued() -> Self {
+        Self {
+            ok: true,
+            error: None,
+            retryable: None,
+            ambiguous: false,
+            queued: true,
         }
     }
     pub fn error(message: impl Into<String>) -> Self {
@@ -298,6 +313,7 @@ impl GhActionResult {
             error: Some(message.into()),
             retryable: None,
             ambiguous: false,
+            queued: false,
         }
     }
     pub fn failed(message: impl Into<String>, retryable: bool) -> Self {
@@ -306,6 +322,7 @@ impl GhActionResult {
             error: Some(message.into()),
             retryable: Some(retryable),
             ambiguous: false,
+            queued: false,
         }
     }
     /// The request may have taken effect; its outcome is unknown.
@@ -315,6 +332,7 @@ impl GhActionResult {
             error: Some(message.into()),
             retryable: Some(false),
             ambiguous: true,
+            queued: false,
         }
     }
     pub fn is_ok(&self) -> bool {

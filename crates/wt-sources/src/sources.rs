@@ -139,6 +139,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     let board = crate::attention_source::overlay(scope, context, board, attention_sources);
     let board =
         crate::work_presentation::overlay(scope, context.config.clone(), board, github.view());
+    let board = crate::watch_board::overlay(scope, board, local_sources.metadata.view());
     let palettes = crate::palette_source::start(scope);
     let board = crate::palette_source::overlay(scope, board, palettes.snapshot.view());
     let automations = crate::automation_source::start(

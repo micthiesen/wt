@@ -152,6 +152,17 @@ facts, and decides what is new from the log itself inside the appending
 transaction, so restarts and a second host on one database record a fact
 once. Remote rows carry the history their own host published.
 
+The `watch-board` stage puts what each local row waits for on the row
+(`BoardRow::watches`: every condition with whether it holds, and what wt does
+then), with the worktree's stored creation stamp that the notify menu's commit
+carries as its witness. It reads nothing itself: watches are part of the
+repository state the metadata leaf already reads, so a watch set in another
+process arrives through that leaf's file watcher. While any row waits the
+stage prepares the board again every 30 seconds, and exactly when a
+waited-for time comes due; a board on which nothing waits is never woken by
+time. Remote rows carry what their own host prepared. A watch kept after its
+worktree was removed has no row and is not on the board.
+
 The activity source backfills a bounded tail from the seven rolling native
 JSON logs and manager reports. Attention transitions are written to that same
 log with their event timestamp, so both feeds can recover them after restart

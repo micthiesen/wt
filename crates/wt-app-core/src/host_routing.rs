@@ -61,6 +61,8 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::SetStatus { .. }
         | UiAction::PrepareBase { .. }
         | UiAction::SetBase { .. }
+        | UiAction::PrepareNotify { .. }
+        | UiAction::SetNotify { .. }
         | UiAction::ToggleAutomations { .. }
         | UiAction::CancelAutomations
         | UiAction::PrepareGithub { .. }
@@ -137,6 +139,8 @@ fn visit_keys(
         | UiAction::SetStatus { key, .. }
         | UiAction::PrepareBase { key }
         | UiAction::SetBase { key, .. }
+        | UiAction::PrepareNotify { key }
+        | UiAction::SetNotify { key, .. }
         | UiAction::SetIssueOverride { key, .. }
         | UiAction::OpenUrl { key, .. }
         | UiAction::PrepareSection { key }

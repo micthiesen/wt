@@ -10,6 +10,7 @@ use tokio::{
     time::{Instant, sleep},
 };
 use tokio_util::sync::CancellationToken;
+use wt_app_core::database::Database;
 use wt_github::{GithubClient, PrMergeTarget};
 use wt_runtime::TaskScope;
 
@@ -25,6 +26,8 @@ enum RetryCommand {
         branch: String,
         /// The worktree the arm was requested for, for log attribution.
         worktree: String,
+        /// The worktree is this host's own, so its arm is recorded.
+        record: bool,
         reply: oneshot::Sender<RetryStart>,
     },
     IsPending {
@@ -84,9 +87,14 @@ pub(super) struct Retries {
 
 impl Retries {
     /// Starts the single scoped retry owner.
-    pub(super) fn start(scope: &TaskScope, client: GithubClient, ledger: WriteLedger) -> Self {
+    pub(super) fn start(
+        scope: &TaskScope,
+        client: GithubClient,
+        ledger: WriteLedger,
+        database: Database,
+    ) -> Self {
         let (commands, receiver) = mpsc::channel(16);
-        spawn_retry_owner(scope, client, ledger, scope.token(), receiver);
+        spawn_retry_owner(scope, client, ledger, database, scope.token(), receiver);
         Self { commands }
     }
 
@@ -109,12 +117,14 @@ impl Retries {
         target: PrMergeTarget,
         branch: String,
         worktree: String,
+        record: bool,
     ) -> Result<RetryStart> {
         let (reply, receiver) = oneshot::channel();
         self.send(RetryCommand::Start {
             target,
             branch,
             worktree,
+            record,
             reply,
         })
         .await?;
@@ -138,6 +148,7 @@ fn spawn_retry_owner(
     scope: &TaskScope,
     client: GithubClient,
     ledger: WriteLedger,
+    database: Database,
     cancellation: CancellationToken,
     mut commands: mpsc::Receiver<RetryCommand>,
 ) {
@@ -152,7 +163,7 @@ fn spawn_retry_owner(
                 command = commands.recv() => {
                     let Some(command) = command else { break; };
                     match command {
-                        RetryCommand::Start { target, branch, worktree, reply } => {
+                        RetryCommand::Start { target, branch, worktree, record, reply } => {
                             let result = if active.contains_key(&target.number) {
                                 RetryStart::AlreadyRunning
                             } else if active.len() >= MAX_RETRIES {
@@ -162,8 +173,9 @@ fn spawn_retry_owner(
                                 active.insert(target.number, token.clone());
                                 let client = client.clone();
                                 let ledger = ledger.clone();
+                                let record = record.then(|| (database.clone(), worktree.clone()));
                                 jobs.spawn(async move {
-                                    let result = retry_arm(client, ledger, target.clone(), branch.clone(), token).await;
+                                    let result = retry_arm(client, ledger, record, target.clone(), branch.clone(), token).await;
                                     RetryFinished { number: target.number, branch, worktree, result }
                                 });
                                 RetryStart::Started
@@ -251,6 +263,7 @@ fn log_dropped(finished: &RetryFinished) {
 async fn retry_arm(
     client: GithubClient,
     ledger: WriteLedger,
+    record: Option<(Database, String)>,
     target: PrMergeTarget,
     branch: String,
     cancellation: CancellationToken,
@@ -268,6 +281,9 @@ async fn retry_arm(
         if result.ok {
             // Recorded so a disarm before the next read still sends disable.
             ledger.accepted(GithubWrite::auto_merge(&branch, target.number, true));
+            if let Some((database, worktree)) = &record {
+                wt_ops::merge_arm::armed(database, worktree, &target, &result).await;
+            }
             return RetryOutcome::Armed;
         }
         if result.retryable != Some(true) {

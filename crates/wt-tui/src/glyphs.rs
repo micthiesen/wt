@@ -57,6 +57,7 @@ pub(crate) const BOLT: &str = "\u{F0E7}"; // environment live (stage deployed / 
 pub(crate) const BAN: &str = "\u{F05E}"; // environment not running
 pub(crate) const COMMENT: &str = "\u{F41F}"; // headless action running
 pub(crate) const REMOTE: &str = "\u{F233}"; // server: SSH host
+pub(crate) const WATCH: &str = "\u{F0F3}"; // bell: wt will act when something holds
 
 // Harnesses.
 pub(crate) const CLAUDE: &str = "\u{F06A9}";

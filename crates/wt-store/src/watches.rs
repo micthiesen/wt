@@ -53,6 +53,12 @@ pub enum WatchRefusal {
     GateChanged {
         current: Option<String>,
     },
+    /// The worktree the setter saw is not the one that has the slug now.
+    OwnerChanged,
+    /// The setter already has this exact watch pending.
+    AlreadySet {
+        id: String,
+    },
 }
 
 impl std::fmt::Display for WatchRefusal {
@@ -74,6 +80,8 @@ impl std::fmt::Display for WatchRefusal {
             Self::GateChanged {
                 current: Some(current),
             } => write!(f, "the gate now reads: {current}"),
+            Self::OwnerChanged => f.write_str("the worktree was removed or created again"),
+            Self::AlreadySet { id } => write!(f, "watch {id} already waits for that"),
         }
     }
 }
@@ -109,6 +117,28 @@ impl Store {
         new: NewWatch,
         now_ms: i64,
     ) -> Result<Result<Watch, WatchRefusal>, StoreError> {
+        self.add_watch_checked(new, now_ms, None)
+    }
+
+    /// Set a watch from a menu that showed the worktree as `incarnation`
+    /// (its `createdAt`). Refused when the slug names another worktree now,
+    /// or when the same setter already waits for the same thing: the menu
+    /// would have offered to cancel that one instead.
+    pub fn add_watch_seen(
+        &mut self,
+        new: NewWatch,
+        now_ms: i64,
+        incarnation: Option<&str>,
+    ) -> Result<Result<Watch, WatchRefusal>, StoreError> {
+        self.add_watch_checked(new, now_ms, Some(incarnation))
+    }
+
+    fn add_watch_checked(
+        &mut self,
+        new: NewWatch,
+        now_ms: i64,
+        seen: Option<Option<&str>>,
+    ) -> Result<Result<Watch, WatchRefusal>, StoreError> {
         let candidates = candidate_ids()?;
         self.mutate_wt_state_logged(|state, log| {
             let refuse = |refusal| Ok((Err(refusal), false));
@@ -117,6 +147,25 @@ impl Store {
             }
             if new.then.is_empty() {
                 return refuse(WatchRefusal::NoActions);
+            }
+            if let Some(incarnation) = seen {
+                if created_at(state, &new.slug) != incarnation {
+                    return refuse(WatchRefusal::OwnerChanged);
+                }
+                let same = entries(state).iter().filter_map(read).find(|watch| {
+                    watch.slug == new.slug
+                        && watch.by == new.by
+                        && !watch.owner_gone
+                        && watch.then == new.then
+                        && watch
+                            .when
+                            .iter()
+                            .map(|cond| (&cond.cond, cond.delay))
+                            .eq(new.when.iter().map(|cond| (&cond.cond, cond.delay)))
+                });
+                if let Some(same) = same {
+                    return refuse(WatchRefusal::AlreadySet { id: same.id });
+                }
             }
             let current = gate(state, &new.slug);
             if new.then.unblock.is_some() && new.then.unblock.as_deref() != current {
@@ -216,6 +265,35 @@ impl Store {
                     .try_for_each(|watch| record(log, watch, WatchChange::Cancelled, by, None))
             });
             Ok((cancelled, changed))
+        })
+    }
+
+    /// Cancel one watch from a menu that showed it on the worktree
+    /// `incarnation` names, set by `by`. `None` when that watch is no longer
+    /// there to cancel: it fired, was cancelled, or its slug names another
+    /// worktree now. Recorded as cancelled by the person.
+    pub fn cancel_watch_seen(
+        &mut self,
+        id: &str,
+        slug: &str,
+        by: &str,
+        incarnation: Option<&str>,
+    ) -> Result<Option<Watch>, StoreError> {
+        self.mutate_wt_state_logged(|state, log| {
+            if created_at(state, slug) != incarnation {
+                return Ok((None, false));
+            }
+            let removed = remove_where(state, |entry| {
+                text(entry, "id") == Some(id)
+                    && text(entry, "slug") == Some(slug)
+                    && text(entry, "by") == Some(by)
+            });
+            let cancelled = removed.first().and_then(read);
+            log.best_effort(|log| match &cancelled {
+                Some(watch) => record(log, watch, WatchChange::Cancelled, None, None),
+                None => Ok(()),
+            });
+            Ok((cancelled, !removed.is_empty()))
         })
     }
 
@@ -534,6 +612,15 @@ fn record(
                 .filter(|by| !by.is_empty() && *by != "human")
                 .map(str::to_owned),
             reason: reason.map(str::to_owned),
+            then: if change == WatchChange::Set {
+                watch
+                    .then
+                    .remaining()
+                    .map(|action| action.as_str().to_owned())
+                    .collect()
+            } else {
+                Vec::new()
+            },
         },
     )
 }

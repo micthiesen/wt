@@ -22,8 +22,9 @@ use wt_core::WorkState;
 
 use super::text::{age, now_ms, truncate_end, truncate_start, wrap};
 use crate::{
-    BoardRow, BoardSection, CheckState, DisplayPolicy, GuideView, Model, PrPresentation,
-    PreparedDetailGroup, ReviewRequestRow, ReviewState, SessionView, badges, glyphs,
+    BoardRow, BoardSection, CheckState, DisplayPolicy, GuideView, LocalStamp, Model,
+    PrPresentation, PreparedDetailGroup, ReviewRequestRow, ReviewState, SessionView,
+    WatchActionKind, WatchConditionView, WatchTruth, WatchView, badges, glyphs,
     model::ARCHIVED_SECTION, theme,
 };
 
@@ -51,7 +52,15 @@ const NOTE_LABELS: [&str; 8] = [
 /// every other field in a narrow pane.
 const INLINE_NOTE_LABEL_WIDTH: usize = 8;
 
+/// Most cells of a wake prompt or notification text shown beside its watch.
+const WATCH_HEADLINE_CELLS: usize = 48;
+/// Fewest worth showing on the watch's own line; with less left the line
+/// wraps and the prompt takes the most.
+const WATCH_HEADLINE_MIN_CELLS: usize = 16;
+
 type Spans = Vec<Span<'static>>;
+/// The controller's local labels for instants (`Board::history_times`).
+type Times = std::collections::BTreeMap<u64, LocalStamp>;
 
 pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     let title = pane_title(model);
@@ -200,7 +209,10 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
     let policy = &model.board.display;
     let now = now_ms();
     let mut lines = title_lines(&row.title, Some(row.title_source.as_str()), width);
-    let work = work_status_block(row, model.show_verification, width);
+    let times = &model.board.history_times;
+    let mut work = work_status_block(row, model.show_verification, times, width);
+    let gate_shown = !work.is_empty() && gate_watch(row).is_some();
+    work.extend(watch_lines(row, gate_shown, times, width));
     // The facts follow the title directly, as in TS; a status block gets a
     // blank line after it.
     if !work.is_empty() {
@@ -235,7 +247,7 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
         lines.extend(rebase);
     }
 
-    if row.automations_paused && policy.automations {
+    if row.automations_paused && (policy.automations || !row.watches.is_empty()) {
         lines.push(Line::default());
         lines.push(fit_line(
             vec![
@@ -977,14 +989,19 @@ fn comment_lines(pr: &PrPresentation, width: usize) -> Vec<Line<'static>> {
 /// Work-status block for tests that read it without a pane width.
 #[cfg(test)]
 pub(crate) fn work_status_lines(row: &BoardRow, show_verification: bool) -> Vec<Line<'static>> {
-    work_status_block(row, show_verification, 200)
+    work_status_block(row, show_verification, &Times::new(), 200)
 }
 
 /// Full-width work-status banner: header (state, risk, age, staleness),
 /// then gate, note, and post-merge steps, in that order. The gate decides
 /// whether the row may merge at all, the note is what a merger needs now,
 /// and the steps belong to whoever holds the row after it lands.
-fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> Vec<Line<'static>> {
+fn work_status_block(
+    row: &BoardRow,
+    show_verification: bool,
+    times: &Times,
+    width: usize,
+) -> Vec<Line<'static>> {
     let Some(work) = row.work.as_ref() else {
         return Vec::new();
     };
@@ -1047,6 +1064,9 @@ fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> V
                 .into_iter()
                 .map(|line| Line::styled(line, theme::fg(theme::WARN))),
         );
+        if let Some(watch) = gate_watch(row) {
+            lines.extend(gate_watch_lines(watch, times, width));
+        }
     }
     if let Some(note) = record.and_then(|record| record.note.as_deref()) {
         lines.extend(note_lines(note, color, width));
@@ -1064,6 +1084,163 @@ fn work_status_block(row: &BoardRow, show_verification: bool, width: usize) -> V
             expanded,
             width,
         ));
+    }
+    lines
+}
+
+/// The watch that clears the row's gate by itself, if one is pending.
+fn gate_watch(row: &BoardRow) -> Option<&WatchView> {
+    row.watches
+        .iter()
+        .find(|watch| watch.does(WatchActionKind::Unblock))
+}
+
+/// One condition: a mark for whether it holds, its words, how far off a
+/// time is, and dimly why it cannot be read. A lone time needs no mark.
+fn condition_spans(cond: &WatchConditionView, times: &Times, marked: bool) -> Spans {
+    let (mark, color) = match cond.state {
+        WatchTruth::Holds => ("✓", theme::OK),
+        WatchTruth::NotYet => ("○", theme::FG_DIM),
+        WatchTruth::Unknown => ("?", theme::WARN),
+    };
+    // The controller's clock when it labelled the instant, else the host's.
+    let text = cond
+        .at_ms
+        .and_then(|at_ms| times.get(&at_ms))
+        .map(|stamp| match stamp.day.as_str() {
+            "today" => stamp.clock.clone(),
+            day => format!("{day} {}", stamp.clock),
+        })
+        .unwrap_or_else(|| cond.text.clone());
+    let mut spans = Vec::new();
+    if marked {
+        // No-break, so a wrap never strands the mark.
+        spans.push(Span::styled(format!("{mark}\u{a0}"), theme::fg(color)));
+    }
+    spans.push(Span::styled(
+        text.replace(' ', "\u{a0}"),
+        theme::fg(theme::FG_MID),
+    ));
+    if let Some(due_in) = cond
+        .due_in
+        .as_deref()
+        .filter(|_| cond.state == WatchTruth::NotYet)
+    {
+        spans.push(Span::styled(format!(" (in\u{a0}{due_in})"), theme::dim()));
+    }
+    if let Some(reason) = cond.reason.as_deref().filter(|reason| !reason.is_empty()) {
+        spans.push(Span::styled(format!(" ({reason})"), theme::dim()));
+    }
+    spans
+}
+
+fn conditions_spans(watch: &WatchView, times: &Times, marked: bool) -> Spans {
+    let mut spans = Vec::new();
+    for (index, cond) in watch.conditions.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" and ", theme::dim()));
+        }
+        spans.extend(condition_spans(cond, times, marked));
+    }
+    spans
+}
+
+/// What follows a watch's conditions: its prompt or text, who set it when
+/// that is neither the row's agent nor the person, and that it is firing.
+/// `used` is the cells the line already holds: the prompt takes what is
+/// left of `width`, so a watch stays on one line wherever it can.
+fn watch_tail(watch: &WatchView, own: &str, used: usize, width: usize) -> Spans {
+    let mut suffix = Vec::new();
+    if !watch.by.is_empty() && watch.by != own && watch.by != "human" {
+        suffix.push(Span::styled(
+            format!(" ·\u{a0}by\u{a0}{}", watch.by),
+            theme::dim(),
+        ));
+    }
+    if watch.met {
+        suffix.push(Span::styled(" ·\u{a0}delivering", theme::fg(theme::OK)));
+    }
+    let mut spans = Vec::new();
+    if let Some(headline) = watch
+        .headline
+        .as_deref()
+        .map(str::trim)
+        .filter(|headline| !headline.is_empty())
+    {
+        let separator = " · ";
+        let left = width.saturating_sub(used + separator.width() + spans_width(&suffix));
+        // With no room worth using the line wraps anyway, and a wrapped
+        // line may as well say the whole thing.
+        let room = if left < WATCH_HEADLINE_MIN_CELLS {
+            WATCH_HEADLINE_CELLS
+        } else {
+            left.min(WATCH_HEADLINE_CELLS)
+        };
+        spans.push(Span::styled(separator, theme::dim()));
+        spans.push(Span::styled(
+            truncate_end(headline, room),
+            theme::fg(theme::FG_MID),
+        ));
+    }
+    spans.extend(suffix);
+    spans
+}
+
+/// Under `blocked on`: what clears the gate without anyone, and whether
+/// each part already holds.
+fn gate_watch_lines(watch: &WatchView, times: &Times, width: usize) -> Vec<Line<'static>> {
+    let mut spans = vec![Span::styled("clears when ", theme::dim())];
+    spans.extend(conditions_spans(watch, times, true));
+    if watch.does(WatchActionKind::Wake) {
+        spans.push(Span::styled(", then wakes the session", theme::dim()));
+    }
+    // The gate's agent set it; the slug is the usual setter and is not named.
+    let used = spans_width(&spans);
+    spans.extend(watch_tail(watch, &watch.by, used, width));
+    wrap_spans(spans, width)
+}
+
+/// One line per watch the gate line does not already show: a wake
+/// (`wakes 17:00 (in 2h10m) · run the smoke test`) or a notification
+/// (`tells you when ○ merged`).
+fn watch_lines(
+    row: &BoardRow,
+    gate_shown: bool,
+    times: &Times,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let gate = gate_watch(row).filter(|_| gate_shown).map(|gate| &gate.id);
+    let mut lines = Vec::new();
+    for watch in row.watches.iter().filter(|watch| Some(&watch.id) != gate) {
+        let Some(badge) = badges::watch_badge(std::slice::from_ref(watch)) else {
+            continue;
+        };
+        let verb = match (
+            watch.does(WatchActionKind::Unblock),
+            watch.does(WatchActionKind::Notify),
+            watch.does(WatchActionKind::Wake),
+        ) {
+            (true, _, true) => "clears the gate and wakes",
+            (true, ..) => "clears the gate",
+            (false, true, true) => "tells you and wakes",
+            (false, false, true) => "wakes",
+            (false, true, false) => "tells you",
+            (false, false, false) => "waits",
+        };
+        let mut spans = vec![
+            Span::styled(format!("{}  ", badge.glyph), theme::fg(badge.color)),
+            Span::styled(verb, theme::fg(badge.color)),
+        ];
+        // "wakes 17:00" reads without "when", and a time carries no mark.
+        let timed = matches!(watch.conditions.as_slice(), [only] if only.at_ms.is_some());
+        spans.push(Span::styled(
+            if timed { " " } else { " when " },
+            theme::dim(),
+        ));
+        spans.extend(conditions_spans(watch, times, !timed));
+        let used = spans_width(&spans);
+        spans.extend(watch_tail(watch, &row.slug, used, width));
+        lines.extend(wrap_spans(spans, width));
     }
     lines
 }
@@ -2260,6 +2437,221 @@ mod tests {
         work.verification_awaiting_deploy = None;
         let header = work_status_lines(&due, false)[0].to_string();
         assert!(header.starts_with("● unverified · ready"), "{header}");
+    }
+
+    fn waits(key: &str, text: &str, state: WatchTruth) -> WatchConditionView {
+        WatchConditionView {
+            key: key.into(),
+            text: text.into(),
+            state,
+            ..Default::default()
+        }
+    }
+
+    /// Lines as text, with the no-break spaces that hold a mark to its words
+    /// written as plain ones.
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.to_string().replace('\u{a0}', " "))
+            .collect()
+    }
+
+    #[test]
+    fn a_gate_says_what_clears_it_and_whether_each_part_holds() {
+        let mut gated = row();
+        let work = gated.work.as_mut().unwrap();
+        work.blocked = true;
+        work.record.as_mut().unwrap().blocked_on = Some("prod secret missing".into());
+        let mut unreadable = waits(
+            "check:secret=API_KEY",
+            "check secret=API_KEY",
+            WatchTruth::Unknown,
+        );
+        unreadable.reason = Some("check secret exited 2: vault sealed".into());
+        gated.watches = vec![WatchView {
+            id: "gate22".into(),
+            by: "eng-12-fix".into(),
+            conditions: vec![
+                waits("#3806:production", "#3806 in production", WatchTruth::Holds),
+                unreadable,
+            ],
+            actions: vec![WatchActionKind::Unblock, WatchActionKind::Wake],
+            headline: Some("Deploy the fix".into()),
+            met: false,
+        }];
+        let block = work_status_block(&gated, false, &Times::new(), 200);
+        let lines = plain(&block);
+        assert_eq!(lines[1], "blocked on: prod secret missing");
+        assert_eq!(
+            lines[2],
+            "clears when ✓ #3806 in production and ? check secret=API_KEY (check secret exited 2: vault sealed), then wakes the session · Deploy the fix"
+        );
+        let color = |needle: &str| {
+            block[2]
+                .spans
+                .iter()
+                .find(|span| span.content.contains(needle))
+                .and_then(|span| span.style.fg)
+        };
+        assert_eq!(color("✓"), Some(theme::OK));
+        assert_eq!(color("?"), Some(theme::WARN));
+        // The reason recedes: it explains, it does not ask.
+        assert_eq!(color("vault sealed"), Some(theme::FG_DIM));
+        // The gate's watch is said once, under the gate.
+        assert!(watch_lines(&gated, true, &Times::new(), 200).is_empty());
+        // With no status block to carry it, it still shows as its own line.
+        gated.work = None;
+        assert!(work_status_block(&gated, false, &Times::new(), 200).is_empty());
+        assert!(
+            plain(&watch_lines(&gated, false, &Times::new(), 200))[0]
+                .contains("clears the gate and wakes when ✓ #3806 in production")
+        );
+        // In the pane, a narrow width wraps it like the gate above it.
+        let narrow = work_status_block(&row_gated(), false, &Times::new(), 36);
+        assert!(narrow.len() > 3);
+        assert!(narrow.iter().all(|line| line.width() <= 36), "{narrow:?}");
+    }
+
+    fn row_gated() -> BoardRow {
+        let mut gated = row();
+        let work = gated.work.as_mut().unwrap();
+        work.blocked = true;
+        work.record.as_mut().unwrap().blocked_on = Some("prod secret missing".into());
+        gated.watches = vec![WatchView {
+            id: "gate22".into(),
+            by: "eng-12-fix".into(),
+            conditions: vec![
+                waits("#3806:production", "#3806 in production", WatchTruth::Holds),
+                waits(
+                    "release:production",
+                    "next production release",
+                    WatchTruth::NotYet,
+                ),
+            ],
+            actions: vec![WatchActionKind::Unblock],
+            ..Default::default()
+        }];
+        gated
+    }
+
+    #[test]
+    fn every_other_watch_is_one_line_saying_what_wt_will_do_and_when() {
+        let at_ms = 1_800_000_000_000;
+        let mut due = waits("at:1800000000000", "17:00 today", WatchTruth::NotYet);
+        due.at_ms = Some(at_ms);
+        due.due_in = Some("2h10m".into());
+        let wake = WatchView {
+            id: "wake33".into(),
+            by: "manager".into(),
+            conditions: vec![due],
+            actions: vec![WatchActionKind::Wake],
+            headline: Some("Run the smoke test against staging".into()),
+            met: false,
+        };
+        let tell = WatchView {
+            id: "tell44".into(),
+            by: "human".into(),
+            conditions: vec![waits("merged", "merged", WatchTruth::NotYet)],
+            actions: vec![WatchActionKind::Notify],
+            ..Default::default()
+        };
+        let mut waiting = row();
+        waiting.watches = vec![wake, tell];
+        let stamp = |day: &str| -> Times {
+            [(
+                at_ms,
+                LocalStamp {
+                    day: day.into(),
+                    clock: "18:00".into(),
+                },
+            )]
+            .into()
+        };
+        let bell = glyphs::WATCH;
+        // The controller's clock for the instant; without one, the host's.
+        for (times, when) in [
+            (stamp("today"), "18:00"),
+            (stamp("tomorrow"), "tomorrow 18:00"),
+            (Times::new(), "17:00 today"),
+        ] {
+            let lines = watch_lines(&waiting, false, &times, 200);
+            assert_eq!(
+                plain(&lines),
+                [
+                    format!(
+                        "{bell}  wakes {when} (in 2h10m) · Run the smoke test against staging · by manager"
+                    ),
+                    format!("{bell}  tells you when ○ merged"),
+                ]
+            );
+            assert_eq!(lines[0].spans[0].style.fg, Some(badges::WAITING));
+        }
+
+        // Fired and being delivered: no countdown, and it says so.
+        let mut firing = waiting.clone();
+        firing.watches[0].met = true;
+        firing.watches[0].conditions[0].state = WatchTruth::Holds;
+        firing.watches[0].by = firing.slug.clone();
+        firing.watches[1].conditions[0].state = WatchTruth::Unknown;
+        firing.watches[1].conditions[0].reason = Some("no current data for this worktree".into());
+        let lines = watch_lines(&firing, false, &stamp("today"), 200);
+        assert_eq!(
+            plain(&lines),
+            [
+                format!("{bell}  wakes 18:00 · Run the smoke test against staging · delivering"),
+                format!("{bell}  tells you when ? merged (no current data for this worktree)"),
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme::OK));
+        assert_eq!(lines[1].spans[0].style.fg, Some(theme::WARN));
+
+        // A long prompt is cut, and gives way so the watch keeps one line.
+        let mut long = waiting.clone();
+        long.watches[0].headline = Some("x".repeat(200));
+        let lines = watch_lines(&long, false, &Times::new(), 200);
+        assert!(lines[0].width() < 110, "{}", lines[0].width());
+        for width in [64, 70, 84] {
+            let lines = watch_lines(&waiting, false, &Times::new(), width);
+            assert_eq!(lines.len(), 2, "{width}: {:?}", plain(&lines));
+            assert!(plain(&lines)[0].ends_with(" · by manager"));
+            assert!(lines[0].width() <= width);
+        }
+        // Too narrow to say anything of the prompt on the first line: wrap.
+        let narrow = watch_lines(&waiting, false, &Times::new(), 30);
+        assert!(narrow.len() > 2);
+        assert!(narrow.iter().all(|line| line.width() <= 30), "{narrow:?}");
+    }
+
+    #[test]
+    fn watches_sit_between_the_status_and_the_facts() {
+        let mut waiting = row();
+        waiting.watches = vec![WatchView {
+            id: "tell44".into(),
+            by: "human".into(),
+            conditions: vec![waits("merged", "merged", WatchTruth::NotYet)],
+            actions: vec![WatchActionKind::Notify],
+            ..Default::default()
+        }];
+        let lines = screen(waiting, 70, 40);
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} missing from:\n{}", lines.join("\n")))
+        };
+        let told = at("tells you when");
+        assert!(at("REVERT") < told && told < at("feature/eng-12"));
+        // A row with no saved status still shows what it waits for.
+        let mut bare = row();
+        bare.work = None;
+        bare.watches = vec![WatchView {
+            actions: vec![WatchActionKind::Notify],
+            conditions: vec![waits("ready", "ready", WatchTruth::NotYet)],
+            ..Default::default()
+        }];
+        let lines = screen(bare, 70, 40);
+        assert!(find(&lines, "tells you when").contains("ready"));
     }
 
     fn section_screen(rows: Vec<BoardRow>, key: &str) -> Vec<String> {

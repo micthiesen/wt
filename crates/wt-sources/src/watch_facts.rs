@@ -303,13 +303,43 @@ fn named_worktrees(watches: &[Watch]) -> BTreeSet<String> {
 }
 
 /// What to store for every pending watch: newly held conditions, baselines,
-/// "met", and the reason a watch cannot progress when there is one.
-pub fn stamps(watches: &[Watch], facts: &WatchFacts, now_ms: i64) -> Vec<WatchStamps> {
+/// "met", the reason a watch cannot progress when there is one, that it was
+/// judged (once a minute), and its owner's landing commit once known.
+/// `landings` are the landing commits of live rows, by slug.
+pub fn stamps(
+    watches: &[Watch],
+    facts: &WatchFacts,
+    landings: &BTreeMap<String, String>,
+    now_ms: i64,
+) -> Vec<WatchStamps> {
     watches
         .iter()
         .filter(|watch| !watch.is_met())
-        .filter_map(|watch| judge(watch, facts, now_ms))
+        .filter_map(|watch| {
+            let mut stamps =
+                judge(watch, facts, now_ms).unwrap_or_else(|| WatchStamps::new(&watch.id));
+            stamps.evaluated_at_ms = WatchStamps::evaluation_due(watch, now_ms);
+            stamps.landing_commit = landing_to_keep(watch, facts, landings);
+            (!stamps.is_empty()).then_some(stamps)
+        })
         .collect()
+}
+
+/// The landing commit to put on the watch's record: this process forgets
+/// it on exit, and the watch needs it once the worktree is removed.
+fn landing_to_keep(
+    watch: &Watch,
+    facts: &WatchFacts,
+    landings: &BTreeMap<String, String>,
+) -> Option<String> {
+    let oid = landings.get(&watch.slug)?;
+    let row = facts.rows.get(&watch.slug)?;
+    (!watch.owner_gone
+        && watch.follows_own_landing()
+        && row.exists
+        && watch.owned_by(row.incarnation.as_deref())
+        && watch.landing_commit() != Some(oid))
+    .then(|| oid.clone())
 }
 
 fn judge(watch: &Watch, facts: &WatchFacts, now_ms: i64) -> Option<WatchStamps> {
@@ -323,12 +353,9 @@ fn judge(watch: &Watch, facts: &WatchFacts, now_ms: i64) -> Option<WatchStamps> 
         .and_then(|stamps| stamps.last_error)
         .flatten();
     let error = check_error.or_else(|| closed_unmerged(watch, facts));
-    let mut stamps = evaluation.stamps.unwrap_or_else(|| WatchStamps {
-        id: watch.id.clone(),
-        conditions: Vec::new(),
-        met_at_ms: None,
-        last_error: None,
-    });
+    let mut stamps = evaluation
+        .stamps
+        .unwrap_or_else(|| WatchStamps::new(&watch.id));
     stamps.last_error = (watch.last_error != error).then_some(error);
     (stamps.met_at_ms.is_some() || !stamps.conditions.is_empty() || stamps.last_error.is_some())
         .then_some(stamps)
@@ -503,6 +530,56 @@ mod tests {
         facts.releases.insert(VerifyStage::Production, "new".into());
         assert!(apply(&mut watch, &facts, NOON + 3));
         assert_eq!(watch.met_at_ms, Some(NOON + 3));
+    }
+
+    /// The loop learns a row's landing commit and that it judged a watch;
+    /// both go on the record, each written once rather than every pass.
+    #[test]
+    fn a_pass_records_the_landing_commit_and_that_it_judged_the_watch() {
+        let mut follows = watch("aaaaaa", "one", &["production"]);
+        follows.then = WatchActions {
+            notify: Some(String::new()),
+            ..WatchActions::default()
+        };
+        let other = watch("bbbbbb", "one", &["green"]);
+        let known = WatchFacts {
+            rows: BTreeMap::from([("one".to_owned(), row("first"))]),
+            ..WatchFacts::default()
+        };
+        let landings = BTreeMap::from([("one".to_owned(), "0123abcdef".to_owned())]);
+        let at = NOON + 90_000;
+        let both = [follows.clone(), other.clone()];
+        let first = stamps(&both, &known, &landings, at);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].landing_commit.as_deref(), Some("0123abcdef"));
+        assert_eq!(first[0].evaluated_at_ms, Some(NOON + 60_000));
+        // A watch that is not about its own landing has no use for it.
+        assert_eq!(first[1].landing_commit, None);
+        assert_eq!(first[1].evaluated_at_ms, Some(NOON + 60_000));
+        assert!(first[0].apply(&mut follows).changed);
+        assert!(first[1].apply(&mut other.clone()).changed);
+        assert_eq!(follows.landing_commit(), Some("0123abcdef"));
+
+        // Nothing more to write for the rest of the minute.
+        assert_eq!(
+            stamps(&[follows.clone()], &known, &landings, at + 29_000),
+            []
+        );
+        let next = stamps(&[follows.clone()], &known, &landings, at + 30_000);
+        assert_eq!(next[0].evaluated_at_ms, Some(NOON + 120_000));
+        assert_eq!(next[0].landing_commit, None);
+
+        // Another worktree took the slug: its landing is not this watch's.
+        let reborn = WatchFacts {
+            rows: BTreeMap::from([("one".to_owned(), row("second"))]),
+            ..WatchFacts::default()
+        };
+        let mut fresh = watch("cccccc", "one", &["staging"]);
+        fresh.incarnation = Some("first".into());
+        assert_eq!(
+            stamps(&[fresh], &reborn, &landings, at)[0].landing_commit,
+            None
+        );
     }
 
     #[test]

@@ -11,6 +11,10 @@ use crate::types::{
 pub const FLEET_SLUG: &str = "_fleet";
 pub const WATCH_RULE_ID: &str = "wt.watch";
 pub const WATCH_RUN: &str = "builtin:watch";
+/// GitHub's answer about a merge armed more recently than this may predate
+/// the arming, so it is not yet evidence that the merge was dropped. It is
+/// the age up to which the sources still call GitHub data fresh.
+pub const MERGE_ARM_GRACE_MS: i64 = 90_000;
 
 /// The rule every watch fire runs under. It exists without configuration,
 /// and configuration cannot declare it.
@@ -171,6 +175,7 @@ pub fn evaluate_breaker_resets(
             AutomationTrigger::PrChecksFailed
                 | AutomationTrigger::ReviewBotUnresolved
                 | AutomationTrigger::ReviewChangesRequested
+                | AutomationTrigger::PrMergeDropped
                 | AutomationTrigger::WtMerged
                 | AutomationTrigger::StackParentMerged
                 | AutomationTrigger::StatusVerificationDue
@@ -208,6 +213,14 @@ pub fn evaluate_breaker_resets(
             // A stale GitHub snapshot cannot prove a PR-backed conflict
             // cleared. PR-less conflict probes are local and remain usable.
             if rule.on == AutomationTrigger::PrConflict && row.pr.is_some() && !context.github_fresh
+            {
+                continue;
+            }
+            // An armed merge whose queue membership the read cannot tell is
+            // not known to be intact.
+            if rule.on == AutomationTrigger::PrMergeDropped
+                && row.merge_arm.is_some()
+                && row.pr.as_ref().is_some_and(|pr| pr.merge_queued.is_none())
             {
                 continue;
             }
@@ -347,6 +360,25 @@ fn evaluate_row(
                 &format!("conflicts with {base}"),
             ))
         }
+        AutomationTrigger::PrMergeDropped => {
+            let arm = row.merge_arm.as_ref()?;
+            let pr = fresh_open_pr(row, context)?;
+            if pr.number != arm.pr
+                || pr.auto_merge
+                || pr.merge_queued != Some(false)
+                || context.now_ms.saturating_sub(arm.armed_at_ms) < MERGE_ARM_GRACE_MS
+            {
+                return None;
+            }
+            // Keyed by the arming: one arming is reported once, and arming
+            // again is a new merge to lose.
+            Some(single(
+                rule,
+                row,
+                format!("{}:{}:{}", rule.id, slug, arm.armed_at_ms),
+                &merge_dropped_detail(arm, pr, row),
+            ))
+        }
         AutomationTrigger::WtMerged => evaluate_merged(rule, row, context),
         AutomationTrigger::StatusNeedsHuman
         | AutomationTrigger::StatusNeedsTesting
@@ -436,6 +468,62 @@ fn evaluate_row(
         | AutomationTrigger::McpEvent
         | AutomationTrigger::WatchMet => None,
     }
+}
+
+/// What was observed, and the likely cause when the row already shows one.
+fn merge_dropped_detail(
+    arm: &wt_core::MergeArm,
+    pr: &crate::types::AutomationPr,
+    row: &AutomationRow,
+) -> String {
+    let what = match arm.mechanism {
+        wt_core::MergeMechanism::Queue => format!("#{} left the merge queue", pr.number),
+        wt_core::MergeMechanism::AutoMerge => format!("auto-merge was dropped on #{}", pr.number),
+    };
+    let mut causes = Vec::new();
+    if pr.checks_failed {
+        causes.push(if pr.failed_checks.is_empty() {
+            "checks failing".to_owned()
+        } else {
+            format!("checks failing: {}", pr.failed_checks.join(", "))
+        });
+    }
+    if let Some(conflict) = row.conflict.as_ref().filter(|conflict| conflict.conflicted) {
+        let base = conflict
+            .base
+            .strip_prefix("origin/")
+            .unwrap_or(&conflict.base);
+        causes.push(format!("conflicts with {base}"));
+    }
+    if arm.head.is_some() && arm.head != pr.head_sha {
+        causes.push("new commits were pushed after it was armed".to_owned());
+    }
+    if causes.is_empty() {
+        what
+    } else {
+        wt_core::sanitize_terminal_text(&format!("{what} ({})", causes.join("; ")))
+    }
+}
+
+/// Armed merges that have ended, as `(slug, armed_at_ms)`: the branch
+/// landed, or fresh GitHub data shows the armed pull request no longer open
+/// or replaced by another. The caller forgets each record.
+pub fn finished_merge_arms(
+    rows: &[AutomationRow],
+    context: &AutomationEvalContext,
+) -> Vec<(String, i64)> {
+    rows.iter()
+        .filter_map(|row| {
+            let arm = row.merge_arm.as_ref()?;
+            let pr_ended = context.github_fresh
+                && row
+                    .pr
+                    .as_ref()
+                    .is_some_and(|pr| pr.number != arm.pr || pr.state != "OPEN");
+            (pr_ended || row.local_merged == Some(true) || row.gone == Some(true))
+                .then(|| (row.slug.clone(), arm.armed_at_ms))
+        })
+        .collect()
 }
 
 fn evaluate_merged(
@@ -1084,9 +1172,150 @@ mod tests {
                 failed_checks: vec!["test".into()],
                 review_bot_unresolved: 2,
                 changes_requested: true,
+                auto_merge: false,
+                merge_queued: None,
             }),
             ..AutomationRow::default()
         }
+    }
+
+    #[test]
+    fn a_dropped_merge_fires_once_per_arming_on_fresh_complete_data() {
+        use wt_core::{MergeArm, MergeMechanism};
+        const ARMED: i64 = 1_000_000;
+        let dropped = rule("dropped", AutomationTrigger::PrMergeDropped, "rearm");
+        let rules = std::slice::from_ref(&dropped);
+        let mut context = AutomationEvalContext {
+            github_fresh: true,
+            now_ms: ARMED + MERGE_ARM_GRACE_MS,
+            ..AutomationEvalContext::default()
+        };
+        let armed = |armed_at_ms, mechanism| {
+            let mut row = row();
+            let pr = row.pr.as_mut().unwrap();
+            pr.checks_failed = false;
+            pr.failed_checks.clear();
+            pr.merge_queued = Some(false);
+            row.merge_arm = Some(MergeArm {
+                pr: 42,
+                head: Some("abc12345".into()),
+                armed_at_ms,
+                mechanism,
+            });
+            row
+        };
+        let fires = |row: &AutomationRow, context: &AutomationEvalContext| {
+            evaluate(rules, std::slice::from_ref(row), context)
+        };
+        let resets = |row: &AutomationRow, context: &AutomationEvalContext| {
+            evaluate_breaker_resets(rules, std::slice::from_ref(row), context).len()
+        };
+
+        // wt never armed it: an open PR with no merge pending is ordinary.
+        let mut unarmed = armed(ARMED, MergeMechanism::Queue);
+        unarmed.merge_arm = None;
+        assert!(fires(&unarmed, &context).is_empty());
+        assert_eq!(finished_merge_arms(&[unarmed], &context), []);
+
+        let mut row = armed(ARMED, MergeMechanism::Queue);
+        let fire = fires(&row, &context).pop().unwrap();
+        assert_eq!(fire.fire_keys, ["dropped:feature-1:1000000"]);
+        assert_eq!(fire.detail, "#42 left the merge queue");
+        assert_eq!(fire.quiesce_slugs, ["feature-1"]);
+        // The same arming is the same fire on every later pass.
+        context.now_ms += 3_600_000;
+        assert_eq!(fires(&row, &context)[0].fire_keys, fire.fire_keys);
+        assert_eq!(resets(&row, &context), 0);
+        context.now_ms = ARMED + MERGE_ARM_GRACE_MS;
+
+        // GitHub's answer may predate an arming this recent.
+        context.now_ms -= 1;
+        assert!(fires(&row, &context).is_empty());
+        context.now_ms += 1;
+
+        // Stale data proves nothing, and neither does a partial queue read.
+        context.github_fresh = false;
+        assert!(fires(&row, &context).is_empty());
+        assert_eq!(resets(&row, &context), 0);
+        context.github_fresh = true;
+        row.pr.as_mut().unwrap().merge_queued = None;
+        assert!(fires(&row, &context).is_empty());
+        assert_eq!(resets(&row, &context), 0);
+
+        // Still queued, or auto-merge still requested: nothing was dropped.
+        row.pr.as_mut().unwrap().merge_queued = Some(true);
+        assert!(fires(&row, &context).is_empty());
+        assert_eq!(resets(&row, &context), 1);
+        row.pr.as_mut().unwrap().merge_queued = Some(false);
+        row.pr.as_mut().unwrap().auto_merge = true;
+        assert!(fires(&row, &context).is_empty());
+        row.pr.as_mut().unwrap().auto_merge = false;
+
+        // Merged or closed is an ending, not a drop, and ends the record.
+        for state in ["MERGED", "CLOSED"] {
+            row.pr.as_mut().unwrap().state = state.into();
+            assert!(fires(&row, &context).is_empty(), "{state}");
+            assert_eq!(
+                finished_merge_arms(std::slice::from_ref(&row), &context),
+                [("feature-1".to_owned(), ARMED)]
+            );
+            context.github_fresh = false;
+            assert_eq!(
+                finished_merge_arms(std::slice::from_ref(&row), &context),
+                []
+            );
+            context.github_fresh = true;
+        }
+        row.pr.as_mut().unwrap().state = "OPEN".into();
+        assert_eq!(
+            finished_merge_arms(std::slice::from_ref(&row), &context),
+            []
+        );
+        row.local_merged = Some(true);
+        assert_eq!(
+            finished_merge_arms(std::slice::from_ref(&row), &context).len(),
+            1
+        );
+        row.local_merged = None;
+        // The branch has another pull request now.
+        row.pr.as_mut().unwrap().number = 43;
+        assert!(fires(&row, &context).is_empty());
+        assert_eq!(
+            finished_merge_arms(std::slice::from_ref(&row), &context).len(),
+            1
+        );
+        row.pr.as_mut().unwrap().number = 42;
+
+        // Cancelled: the record is gone.
+        row.merge_arm = None;
+        assert!(fires(&row, &context).is_empty());
+
+        // Armed again: a new record, and a new fire if that one drops too.
+        let rearmed = armed(ARMED + 500_000, MergeMechanism::AutoMerge);
+        context.now_ms = ARMED + 500_000 + MERGE_ARM_GRACE_MS;
+        let again = fires(&rearmed, &context).pop().unwrap();
+        assert_eq!(again.fire_keys, ["dropped:feature-1:1500000"]);
+        assert_ne!(again.fire_keys, fire.fire_keys);
+        assert_eq!(again.detail, "auto-merge was dropped on #42");
+
+        // The likely cause is named when the row already shows it.
+        let mut caused = rearmed;
+        let pr = caused.pr.as_mut().unwrap();
+        pr.checks_failed = true;
+        pr.failed_checks = vec!["test".into(), "lint".into()];
+        pr.head_sha = Some("def67890".into());
+        caused.conflict = Some(crate::types::AutomationConflict {
+            base: "origin/main".into(),
+            conflicted: true,
+        });
+        assert_eq!(
+            fires(&caused, &context)[0].detail,
+            "auto-merge was dropped on #42 (checks failing: test, lint; conflicts with main; new commits were pushed after it was armed)"
+        );
+
+        // A paused or busy worktree is not evaluated at all.
+        caused.busy = true;
+        assert!(fires(&caused, &context).is_empty());
     }
 
     #[test]

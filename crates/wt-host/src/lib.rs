@@ -19,3 +19,4 @@ pub mod remote_host;
 pub mod section_actions;
 pub mod session_ui;
 pub mod terminal_palette;
+mod watch_actions;

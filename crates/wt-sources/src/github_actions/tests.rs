@@ -174,6 +174,7 @@ async fn fake_gh() -> FakeGh {
         reviewers_enabled: false,
         default_reviewer: None,
         branch: fixture.ctx.config.branch.clone(),
+        database: fixture.ctx.database.clone(),
     };
     FakeGh {
         fixture,
@@ -425,11 +426,12 @@ async fn quitting_while_an_arm_waits_for_checks_names_the_pr_in_attention() {
         &scope,
         fake.actions.client.clone(),
         WriteLedger::new(GithubRefresh::detached()),
+        fake.fixture.ctx.database.clone(),
     );
     let target = merge_target(&pr("feature/one"), &MergeLanding::default()).unwrap();
     assert_eq!(
         retries
-            .start_arm(target, "feature/one".into(), "one".into())
+            .start_arm(target, "feature/one".into(), "one".into(), true)
             .await
             .unwrap(),
         RetryStart::Started

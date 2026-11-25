@@ -106,6 +106,28 @@ fn every_form_of_the_grammar_parses() {
             },
         ),
         (
+            "pr:3806",
+            Pr {
+                number: 3806,
+                goal: PrGoal::Merged,
+            },
+        ),
+        (
+            "pr:3806:production",
+            Pr {
+                number: 3806,
+                goal: PrGoal::Reached(stage),
+            },
+        ),
+        // Only a number makes `pr:` a pull request.
+        (
+            "pr:merged",
+            Worktree {
+                slug: "pr".into(),
+                state: RowState::Merged,
+            },
+        ),
+        (
             "other:verified",
             Worktree {
                 slug: "other".into(),
@@ -193,10 +215,11 @@ fn what_cannot_be_meant_is_refused_with_the_reason() {
     assert!(problem("other:mergd").contains("is not a state"));
     assert!(problem("gone").contains("<slug>:gone"));
     assert!(problem(":merged").contains("is not a worktree"));
-    for pr in ["#", "#0", "#12a", "#-3", "#:merged"] {
+    for pr in ["#", "#0", "#12a", "#-3", "#:merged", "pr:0", "pr:12a"] {
         assert!(problem(pr).contains("is not a pull request number"), "{pr}");
     }
     assert!(problem("#12:ready").contains("a pull request can be"));
+    assert!(problem("pr:12:ready").contains("a pull request can be"));
     assert!(problem("release:canary").contains("release:staging"));
     for check in ["check:", "check:=x", "check:secret="] {
         assert!(problem(check).contains("check:<id>"), "{check}");
@@ -213,12 +236,13 @@ fn a_refusal_teaches_the_grammar() {
     assert!(text.starts_with("cannot read the condition `mergd`: `mergd` is not a state"));
     for form in [
         "17:00 | +3h",
-        "#3806:merged|staging|production|closed",
+        "pr:3806:merged|staging|production|closed",
+        "an unquoted # starts a shell comment",
         "<slug>:merged",
         "release:staging | release:production",
         "check:<id>=<arg>",
         "+<duration>",
-        "Examples: #3806:production   release:production+24h   17:00",
+        "Examples: pr:3806:production   release:production+24h   17:00",
     ] {
         assert!(text.contains(form), "{form}\n{text}");
     }
@@ -230,6 +254,7 @@ fn a_delay_follows_anything_but_a_time() {
     assert_eq!(delayed.cond, Condition::Release(VerifyStage::Production));
     assert_eq!(delayed.delay, Delay::from_ms(DAY_MS));
     assert_eq!(cond("#3823:production+1h").delay, Delay::from_ms(HOUR_MS));
+    assert_eq!(cond("pr:3823:production+1h"), cond("#3823:production+1h"));
     assert_eq!(cond("check:secret=FOO+90m").delay, Delay::parse("90m"));
     for (text, ms) in [
         ("1d", DAY_MS),
@@ -252,6 +277,7 @@ fn what_is_printed_parses_back_to_the_same_condition() {
         "staging+2h",
         "#3806:merged",
         "#7:staging+30m",
+        "pr:7:closed",
         "other:green+1h",
         "other:gone",
         "release:production+24h",
@@ -276,7 +302,15 @@ fn what_is_printed_parses_back_to_the_same_condition() {
     }
     assert_eq!(cond("2026-11-25T17:00").to_arg(0), "2026-11-25 17:00");
     assert_eq!(cond("2026-11-25T17:00").to_arg(-300), "2026-11-25 12:00");
-    assert_eq!(cond("#3806").to_arg(0), "#3806:merged");
+    // What is printed for a shell never starts a comment.
+    assert_eq!(cond("#3806").to_arg(0), "pr:3806:merged");
+    assert_eq!(cond("#7:staging+30m").to_arg(0), "pr:7:staging+30m");
+    assert_eq!(cond("pr:7").cond.to_string(), "pr:7:merged");
+    // A record keeps the spelling earlier builds read.
+    assert_eq!(
+        serde_json::to_value(cond("pr:7:production")).unwrap()["cond"],
+        "#7:production"
+    );
 }
 
 #[test]
@@ -777,4 +811,83 @@ fn civil_dates_invert_across_eras_and_leap_days() {
             (year, month, day)
         );
     }
+}
+
+/// The engine remembers a row's landing commit only while it runs. A watch
+/// that carries the commit goes on after a restart between the landing and
+/// the worktree's removal.
+#[test]
+fn a_stamped_landing_commit_outlives_the_process_that_saw_the_landing() {
+    let mut tells = watch(&["merged", "production+1h"]);
+    assert!(tells.follows_own_landing());
+    assert!(!watch(&["merged", "green"]).follows_own_landing());
+    let stamp = WatchStamps {
+        landing_commit: Some("0123abcdef".into()),
+        ..WatchStamps::new(&tells.id)
+    };
+    assert!(!stamp.is_empty());
+    assert!(stamp.apply(&mut tells).changed);
+    assert!(!stamp.apply(&mut tells).changed);
+    assert_eq!(tells.landing_commit(), Some("0123abcdef"));
+
+    // Through the store and back, as a new process reads it.
+    let restarted: Watch = serde_json::from_value(serde_json::to_value(&tells).unwrap()).unwrap();
+    let unknown = OwnerRemoval {
+        landed: true,
+        landing_commit: None,
+    };
+    let kept = restarted.without_owner(unknown, NOON).unwrap();
+    assert_eq!(
+        kept.when[1].cond,
+        Condition::Commit {
+            oid: "0123abcdef".into(),
+            stage: VerifyStage::Production
+        }
+    );
+    // What this process read itself is newer than the stamp.
+    let seen = OwnerRemoval {
+        landed: true,
+        landing_commit: Some("fedcba9876"),
+    };
+    assert_eq!(
+        restarted.without_owner(seen, NOON).unwrap().when[1].cond,
+        Condition::Commit {
+            oid: "fedcba9876".into(),
+            stage: VerifyStage::Production
+        }
+    );
+    assert_eq!(
+        watch(&["production"]).without_owner(unknown, NOON),
+        Err("its worktree was removed and no landing commit is known".into())
+    );
+}
+
+#[test]
+fn an_evaluation_is_recorded_once_a_minute() {
+    let mut pending = watch(&["merged"]);
+    assert_eq!(pending.evaluated_at_ms(), None);
+    let at = NOON + 5 * MINUTE_MS + 30 * SECOND_MS;
+    let minute = NOON + 5 * MINUTE_MS;
+    assert_eq!(WatchStamps::evaluation_due(&pending, at), Some(minute));
+    let stamp = WatchStamps {
+        evaluated_at_ms: Some(minute),
+        ..WatchStamps::new(&pending.id)
+    };
+    assert!(stamp.apply(&mut pending).changed);
+    assert_eq!(pending.evaluated_at_ms(), Some(minute));
+    assert_eq!(
+        WatchStamps::evaluation_due(&pending, at + 29 * SECOND_MS),
+        None
+    );
+    assert_eq!(
+        WatchStamps::evaluation_due(&pending, at + 30 * SECOND_MS),
+        Some(minute + MINUTE_MS)
+    );
+    // An older stamp never moves the record back.
+    let older = WatchStamps {
+        evaluated_at_ms: Some(NOON),
+        ..WatchStamps::new(&pending.id)
+    };
+    assert!(!older.apply(&mut pending).changed);
+    assert!(WatchStamps::new(&pending.id).is_empty());
 }

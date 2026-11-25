@@ -112,6 +112,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::PrepareCleanup
         | UiAction::PrepareStatus { .. }
         | UiAction::PrepareBase { .. }
+        | UiAction::PrepareNotify { .. }
         | UiAction::OpenUrl { .. }
         | UiAction::PrepareSessions { .. }
         | UiAction::PrepareHarnesses { .. }
@@ -323,6 +324,14 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         UiAction::SetBase { key, base, .. } => {
             on_row(board, host, key, RowChange::Base { base: base.clone() })
         }
+        UiAction::SetNotify { key, change, .. } => on_row(
+            board,
+            host,
+            key,
+            RowChange::Notify {
+                change: change.clone(),
+            },
+        ),
         UiAction::SetIssueOverride { key, issue_id } => on_row(
             board,
             host,

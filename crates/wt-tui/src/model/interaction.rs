@@ -610,6 +610,7 @@ impl Model {
                     PickerAction::ActionArg { .. } => KeyCode::Enter,
                     PickerAction::Status { .. } => KeyCode::Char('u'),
                     PickerAction::Base { .. } => KeyCode::Char('b'),
+                    PickerAction::Notify { .. } => KeyCode::Char('W'),
                     PickerAction::Section { .. } => KeyCode::Char('l'),
                     PickerAction::Output { .. } => KeyCode::Char('\''),
                     PickerAction::Sessions { .. } => KeyCode::Char(';'),
@@ -735,6 +736,32 @@ impl Model {
                         base: option.value,
                         seen: seen.clone(),
                     }),
+                    PickerAction::Notify { key, seen } => {
+                        let change = option
+                            .value
+                            .as_deref()
+                            .and_then(crate::NotifyChange::from_value);
+                        match change {
+                            Some(change) => InputResult::Action(UiAction::SetNotify {
+                                key: key.clone(),
+                                change,
+                                seen: seen.clone(),
+                            }),
+                            // An unavailable row stays listed; picking it
+                            // says why and leaves the menu open.
+                            None => {
+                                let why = option
+                                    .detail
+                                    .as_deref()
+                                    .map(|detail| detail.trim_matches(['(', ')']))
+                                    .unwrap_or("not available");
+                                self.toast =
+                                    Some((format!("{}: {why}", option.label), ToastTone::Notice));
+                                self.interaction = interaction;
+                                InputResult::Draw
+                            }
+                        }
+                    }
                     PickerAction::Status { key, seen } => {
                         if let Some(steps) = option.verify_after_merge {
                             let stage = option.verify_in.unwrap_or(wt_core::VerifyStage::Staging);

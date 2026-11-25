@@ -61,6 +61,7 @@ pub(crate) const LINES: &[&str] = &[
     "  D                  Delete current section; its worktrees go to the Inbox",
     "  b                  Record fork base (picker); b b confirms; never rebases",
     "  u                  Work status: t w r n h y v d, a/p ready + verify in staging/production, x clears, m note",
+    "  W                  Notify me when the row is ready, green, merged or deployed; picking a set one cancels it",
     "  R                  Restack (rebase) the row or its stack; /restack on conflict",
     "  J / K              Move row, stack, or folded section",
     "",

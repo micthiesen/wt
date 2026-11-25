@@ -825,7 +825,7 @@ impl GithubClient {
                         AsyncMergeEndpoint::Submission,
                     ) {
                         Ok(AsyncMergeOutcome::Succeeded) if out.status.success() => {
-                            return GhActionResult::success();
+                            return GhActionResult::queued();
                         }
                         Ok(AsyncMergeOutcome::Succeeded) => {
                             return GhActionResult::unknown(format!(
@@ -871,7 +871,7 @@ impl GithubClient {
                                     AsyncMergeEndpoint::Poll,
                                 ) {
                                     Ok(AsyncMergeOutcome::Succeeded) => {
-                                        return GhActionResult::success();
+                                        return GhActionResult::queued();
                                     }
                                     Ok(AsyncMergeOutcome::Pending { uuid: polled_uuid })
                                         if polled_uuid == uuid =>

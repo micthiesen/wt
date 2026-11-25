@@ -6,8 +6,9 @@ mod queue;
 mod types;
 
 pub use evaluate::{
-    FLEET_SLUG, WATCH_RULE_ID, WATCH_RUN, eligible, evaluate, evaluate_breaker_resets,
-    fire_identity, guide_owner, mcp_fire_key, mcp_subscription, pending_mcp_events, watch_rule,
+    FLEET_SLUG, MERGE_ARM_GRACE_MS, WATCH_RULE_ID, WATCH_RUN, eligible, evaluate,
+    evaluate_breaker_resets, finished_merge_arms, fire_identity, guide_owner, mcp_fire_key,
+    mcp_subscription, pending_mcp_events, watch_rule,
 };
 pub use ledger::{
     AutomationLedger, BREAKER_LIMIT, BreakerState, DispatchClaim, DispatchClaimResult,

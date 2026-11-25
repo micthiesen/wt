@@ -122,6 +122,7 @@ pub async fn execute_with_shutdown(
         // service refuses them before dispatch.
         UiAction::PrepareStatus { .. }
         | UiAction::PrepareBase { .. }
+        | UiAction::PrepareNotify { .. }
         | UiAction::PrepareSection { .. }
         | UiAction::PrepareDeleteSection { .. }
         | UiAction::PrepareHardRefresh
@@ -623,6 +624,9 @@ pub async fn execute_with_shutdown(
             seen,
         } => set_status(ctx, &key, state, note, verify_after_merge, verify_in, seen).await,
         UiAction::SetBase { key, base, seen } => set_base(ctx, &key, base, seen).await,
+        UiAction::SetNotify { key, change, seen } => {
+            crate::watch_actions::set_notify(ctx, &key, change, seen.0).await
+        }
         UiAction::SetIssueOverride { key, issue_id } => {
             let row = resolve_key(ctx, &key).await?;
             let value = issue_id.unwrap_or_default().trim().to_ascii_uppercase();

@@ -120,6 +120,11 @@ pub enum WorktreeEventKind {
         /// Why wt dropped it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+        /// What it does once every condition holds, as
+        /// `WatchAction::as_str` names in delivery order. Recorded when it
+        /// is set.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        then: Vec<String>,
     },
     #[serde(other)]
     Unknown,
@@ -140,6 +145,27 @@ pub enum WatchChange {
     Cancelled,
     /// wt gave it up; the event's `reason` says why.
     Dropped,
+}
+
+/// What a watch does once met, in words: `clears the gate and wakes the
+/// session`. `then` is a watch event's list; names this build does not know
+/// are left out, and `None` means nothing is known.
+pub fn watch_then_phrase(then: &[String]) -> Option<String> {
+    let known: Vec<&str> = then
+        .iter()
+        .filter_map(|action| match action.as_str() {
+            "unblock" => Some("clears the gate"),
+            "notify" => Some("tells you"),
+            "wake" => Some("wakes the session"),
+            _ => None,
+        })
+        .collect();
+    let (last, rest) = known.split_last()?;
+    Some(if rest.is_empty() {
+        (*last).to_owned()
+    } else {
+        format!("{} and {last}", rest.join(", "))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +258,7 @@ mod tests {
             what: "#3806 in production".into(),
             by: None,
             reason: None,
+            then: Vec::new(),
         };
         let stored = serde_json::to_value(&event).unwrap();
         assert_eq!(
@@ -255,7 +282,39 @@ mod tests {
                 what: "merged".into(),
                 by: Some("one".into()),
                 reason: Some("gone".into()),
+                then: Vec::new(),
             }
+        );
+        let set = WorktreeEventKind::Watch {
+            change: WatchChange::Set,
+            what: "merged".into(),
+            by: None,
+            reason: None,
+            then: vec!["unblock".into(), "wake".into()],
+        };
+        let stored = serde_json::to_value(&set).unwrap();
+        assert_eq!(stored["then"], serde_json::json!(["unblock", "wake"]));
+        let phrase = |then: &[&str]| {
+            watch_then_phrase(
+                &then
+                    .iter()
+                    .map(|action| (*action).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            phrase(&["unblock", "wake"]).as_deref(),
+            Some("clears the gate and wakes the session")
+        );
+        assert_eq!(
+            phrase(&["unblock", "notify", "teleport", "wake"]).as_deref(),
+            Some("clears the gate, tells you and wakes the session")
+        );
+        assert_eq!(phrase(&["notify"]).as_deref(), Some("tells you"));
+        assert_eq!(phrase(&[]), None);
+        assert_eq!(
+            serde_json::from_value::<WorktreeEventKind>(stored).unwrap(),
+            set
         );
     }
 

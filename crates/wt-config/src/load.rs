@@ -30,6 +30,7 @@ pub const RESERVED_MANAGED_ENV: &[&str] = &[
     "GIT_TERMINAL_PROMPT",
 ];
 const BADGE_SLOTS: &[&str] = &[
+    "watch",
     "action",
     "dirty",
     "rebase",
@@ -1648,7 +1649,7 @@ fn parse_automations(
     result
 }
 
-const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verified, status.verification_due, status.verification_overdue, branch.advanced, stage.deployed, mcp.event";
+const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.changes_requested, pr.conflict, pr.merge_dropped, wt.merged, wt.created, stack.parent_merged, status.needs_human, status.needs_testing, status.ready, status.verified, status.verification_due, status.verification_overdue, branch.advanced, stage.deployed, mcp.event";
 
 /// The implicit watch rule's trigger. `parse_trigger` does not know it, so
 /// no `[[automations]]` rule can carry it.
@@ -1666,6 +1667,7 @@ fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
         "review_bot.unresolved" => AutomationTrigger::ReviewBotUnresolved,
         "review.changes_requested" => AutomationTrigger::ReviewChangesRequested,
         "pr.conflict" => AutomationTrigger::PrConflict,
+        "pr.merge_dropped" => AutomationTrigger::PrMergeDropped,
         "wt.merged" => AutomationTrigger::WtMerged,
         "wt.created" => AutomationTrigger::WtCreated,
         "stack.parent_merged" => AutomationTrigger::StackParentMerged,
@@ -1687,6 +1689,7 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::ReviewBotUnresolved => "review_bot.unresolved",
         AutomationTrigger::ReviewChangesRequested => "review.changes_requested",
         AutomationTrigger::PrConflict => "pr.conflict",
+        AutomationTrigger::PrMergeDropped => "pr.merge_dropped",
         AutomationTrigger::WtMerged => "wt.merged",
         AutomationTrigger::WtCreated => "wt.created",
         AutomationTrigger::StackParentMerged => "stack.parent_merged",

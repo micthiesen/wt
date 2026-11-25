@@ -345,7 +345,7 @@ enum Command {
     /// Wake this worktree's session once conditions hold.
     ///
     /// The session gets a prompt saying what held, with your note. Use it
-    /// instead of sleeping or polling: `wt wake '#3806:production' -m "run
+    /// instead of sleeping or polling: `wt wake pr:3806:production -m "run
     /// the smoke test"`, `wt wake 17:00 -m "check the nightly job"`.
     Wake(commands::watch::WakeArgs),
     /// Tell the person once conditions hold.

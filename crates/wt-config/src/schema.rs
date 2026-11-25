@@ -350,6 +350,10 @@ pub enum AutomationTrigger {
     ReviewChangesRequested,
     #[serde(rename = "pr.conflict")]
     PrConflict,
+    /// A merge wt armed is no longer armed and the pull request is still
+    /// open.
+    #[serde(rename = "pr.merge_dropped")]
+    PrMergeDropped,
     #[serde(rename = "wt.merged")]
     WtMerged,
     #[serde(rename = "wt.created")]

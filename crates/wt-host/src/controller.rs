@@ -313,6 +313,8 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::PrepareDeleteSection { .. } => "prepare section delete",
         A::PrepareStatus { .. } => "prepare status picker",
         A::PrepareBase { .. } => "prepare fork base picker",
+        A::PrepareNotify { .. } => "prepare notify picker",
+        A::SetNotify { .. } => "save notification",
         A::PrepareSessions { .. } => "prepare session picker",
         A::DiscoverSessions { .. } => "discover sessions",
         A::PrepareHarnesses { .. } => "prepare harness picker",
@@ -402,6 +404,8 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::SetIssueOverride { key, .. }
         | A::SetBase { key, .. }
         | A::PrepareBase { key }
+        | A::SetNotify { key, .. }
+        | A::PrepareNotify { key }
         | A::EnterHarness { key, .. }
         | A::PrepareHarnesses { key }
         | A::StopTerminal { key, .. }

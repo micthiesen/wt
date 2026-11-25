@@ -145,11 +145,19 @@ fn visible_timestamps(board: &Board) -> BTreeSet<u64> {
 }
 
 fn history_timestamps(board: &Board) -> BTreeSet<u64> {
+    // The instants rows wait for wear the same day and clock labels.
+    let waited_for = board
+        .rows
+        .iter()
+        .flat_map(|row| &row.watches)
+        .flat_map(|watch| &watch.conditions)
+        .filter_map(|cond| cond.at_ms);
     let mut timestamps: BTreeSet<u64> = board
         .row_history
         .values()
         .flatten()
         .map(|event| event.at_ms)
+        .chain(waited_for)
         .filter(|timestamp| *timestamp > 0)
         .collect();
     while timestamps.len() > MAX_HISTORY_TIMESTAMPS {
@@ -178,6 +186,8 @@ fn history_stamps(timestamps: Vec<u64>, today: i64) -> BTreeMap<u64, wt_tui::Loc
             let day = match today - i64::from(date.to_julian_day()) {
                 0 => "today".to_owned(),
                 1 => "yesterday".to_owned(),
+                // Only a time a row waits for lies ahead.
+                -1 => "tomorrow".to_owned(),
                 _ => {
                     let weekday = date.weekday().to_string();
                     let month = month.to_string();
@@ -306,6 +316,45 @@ mod tests {
         assert_eq!(
             history_stamps(vec![noon], today + 1)[&noon].day,
             "yesterday"
+        );
+        // A time a row waits for lies ahead.
+        assert_eq!(
+            history_stamps(vec![noon + DAY_MS], today)[&(noon + DAY_MS)].day,
+            "tomorrow"
+        );
+    }
+
+    #[test]
+    fn the_instants_rows_wait_for_are_labelled_with_their_history() {
+        let board = Board {
+            rows: vec![wt_tui::BoardRow {
+                watches: vec![wt_tui::WatchView {
+                    conditions: vec![
+                        wt_tui::WatchConditionView {
+                            at_ms: Some(1_800_000_000_000),
+                            ..Default::default()
+                        },
+                        wt_tui::WatchConditionView::default(),
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            row_history: [(
+                "one".to_owned(),
+                vec![wt_core::WorktreeEvent {
+                    at_ms: 1_700_000_000_000,
+                    event: wt_core::WorktreeEventKind::Conflict { resolved: true },
+                }],
+            )]
+            .into(),
+            ..Board::default()
+        };
+        assert_eq!(
+            super::history_timestamps(&board)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [1_700_000_000_000, 1_800_000_000_000]
         );
     }
 

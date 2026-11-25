@@ -372,10 +372,8 @@ mod tests {
         // gate by the status write itself.
         let meet = |id: String| async move {
             let stamp = wt_core::watch::WatchStamps {
-                id,
-                conditions: Vec::new(),
                 met_at_ms: Some(2),
-                last_error: None,
+                ..wt_core::watch::WatchStamps::new(&id)
             };
             ctx.database
                 .call(move |store| Ok(store.apply_evaluation(&[stamp])?))

@@ -22,6 +22,9 @@ pub struct AutomationRow {
     /// The lifecycle's complete clean-safety predicate, including the
     /// non-vacuous owned-commit guard.
     pub clean_candidate: bool,
+    /// The merge wt armed for this worktree's pull request and has not seen
+    /// cancelled or ended.
+    pub merge_arm: Option<wt_core::MergeArm>,
     pub pr: Option<AutomationPr>,
     pub conflict: Option<AutomationConflict>,
     pub work: Option<WorkStatusRecord>,
@@ -40,6 +43,12 @@ pub struct AutomationPr {
     pub failed_checks: Vec<String>,
     pub review_bot_unresolved: u32,
     pub changes_requested: bool,
+    /// Classic auto-merge is requested.
+    pub auto_merge: bool,
+    /// Whether the pull request is in its base branch's merge queue.
+    /// `None` when the read did not hold the whole queue: a missing entry
+    /// then proves nothing.
+    pub merge_queued: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

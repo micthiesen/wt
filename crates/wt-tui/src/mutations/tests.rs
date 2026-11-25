@@ -62,6 +62,21 @@ fn pr(board: &mut Board) -> &mut PrPresentation {
     board.rows[0].pr.as_mut().unwrap()
 }
 
+/// The person's stored watch that tells them when the row is merged.
+fn told_when_merged() -> crate::WatchView {
+    crate::WatchView {
+        id: "abc234".into(),
+        by: "human".into(),
+        conditions: vec![crate::WatchConditionView {
+            key: "merged".into(),
+            text: "merged".into(),
+            ..Default::default()
+        }],
+        actions: vec![crate::WatchActionKind::Notify],
+        ..Default::default()
+    }
+}
+
 /// Every mutation kind meets the shared optimistic contract against data a
 /// real fetch would return.
 #[tokio::test(start_paused = true)]
@@ -111,6 +126,24 @@ async fn every_mutation_kind_meets_the_contract() {
                     ..Default::default()
                 })
             }),
+        ),
+        (
+            row(RowChange::Notify {
+                change: crate::NotifyChange::Add {
+                    state: "merged".into(),
+                },
+            }),
+            board(),
+            with(|b| b.rows[0].watches = vec![told_when_merged()]),
+        ),
+        (
+            row(RowChange::Notify {
+                change: crate::NotifyChange::Cancel {
+                    id: "abc234".into(),
+                },
+            }),
+            with(|b| b.rows[0].watches = vec![told_when_merged()]),
+            board(),
         ),
         (
             row(LayoutChange::Archive { archived: true }),
@@ -664,4 +697,64 @@ fn pending_removal_does_not_hide_a_durable_failure() {
     removal.apply(&target, &mut latest);
     assert_eq!(latest.rows[0].badge, "Removal failed");
     assert!(latest.rows[0].busy.is_none());
+}
+
+#[test]
+fn a_notify_choice_shows_at_once_and_only_the_persons_own_watch_confirms_it() {
+    let add = UiAction::SetNotify {
+        key: "a".into(),
+        change: crate::NotifyChange::Add {
+            state: "merged".into(),
+        },
+        seen: crate::Seen(None),
+    };
+    let Effect::Mutation(mutation) = add.effect(&board()) else {
+        panic!("setting a notification changes the board")
+    };
+    assert_eq!(mutation.domains(), [Domain::Metadata]);
+    let mut shown = board();
+    mutation.apply(&mut shown);
+    mutation.apply(&mut shown);
+    let [pending] = shown.rows[0].watches.as_slice() else {
+        panic!("one pending watch, however often it is projected")
+    };
+    assert!(pending.id.is_empty() && pending.is_human_notify());
+    assert_eq!(pending.conditions[0].text, "merged");
+    // An agent waiting for the same thing is not what was asked for.
+    let agents = with(|b| {
+        b.rows[0].watches = vec![crate::WatchView {
+            by: "a".into(),
+            ..told_when_merged()
+        }]
+    });
+    assert!(!mutation.observed(&agents));
+
+    // Two choices on one row are two changes, and a cancel leaves the rest.
+    let cancel = UiAction::SetNotify {
+        key: "a".into(),
+        change: crate::NotifyChange::Cancel {
+            id: "abc234".into(),
+        },
+        seen: crate::Seen(None),
+    };
+    let Effect::Mutation(cancel) = cancel.effect(&board()) else {
+        panic!()
+    };
+    assert_ne!(cancel.key(), mutation.key());
+    let mut both = with(|b| {
+        b.rows[0].watches = vec![
+            told_when_merged(),
+            crate::WatchView {
+                id: "zzz999".into(),
+                ..told_when_merged()
+            },
+        ]
+    });
+    cancel.apply(&mut both);
+    assert_eq!(both.rows[0].watches.len(), 1);
+    assert_eq!(both.rows[0].watches[0].id, "zzz999");
+    assert_eq!(
+        UiAction::PrepareNotify { key: "a".into() }.effect(&board()),
+        Effect::ReadOnly
+    );
 }

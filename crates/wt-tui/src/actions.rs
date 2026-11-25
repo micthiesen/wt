@@ -266,6 +266,19 @@ pub enum UiAction {
         #[serde(default)]
         seen: Option<Seen<Option<StatusClaim>>>,
     },
+    /// `W`: what the person can ask to be told about this row.
+    PrepareNotify {
+        key: String,
+    },
+    /// Set a watch that tells the person, or cancel one they set.
+    SetNotify {
+        key: String,
+        change: NotifyChange,
+        /// The creation stamp of the worktree the notify menu showed
+        /// (`BoardRow::created_at`). Another worktree with the slug has
+        /// another, and the host refuses it.
+        seen: Seen<Option<String>>,
+    },
     PrepareBase {
         key: String,
     },
@@ -406,6 +419,37 @@ pub enum SessionTarget {
     Main,
     WtSource,
     Dotfiles,
+}
+
+/// One choice of the notify menu.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotifyChange {
+    /// Tell the person when the row reaches this state, named as a watch
+    /// condition: `ready`, `green`, `merged`, `staging` or `production`.
+    Add { state: String },
+    /// Cancel the person's own watch with this id.
+    Cancel { id: String },
+}
+
+impl NotifyChange {
+    /// The picker option value of this choice. Names the choice, never its
+    /// position: an open menu rebuilds on every snapshot.
+    pub fn value(&self) -> String {
+        match self {
+            Self::Add { state } => format!("add:{state}"),
+            Self::Cancel { id } => format!("cancel:{id}"),
+        }
+    }
+
+    pub fn from_value(value: &str) -> Option<Self> {
+        match value.split_once(':')? {
+            ("add", state) if !state.is_empty() => Some(Self::Add {
+                state: state.to_owned(),
+            }),
+            ("cancel", id) if !id.is_empty() => Some(Self::Cancel { id: id.to_owned() }),
+            _ => None,
+        }
+    }
 }
 
 /// The status claim a status menu showed: everything it displays or carries
@@ -608,6 +652,12 @@ pub enum PickerAction {
     /// Shift+F12 harness picker. Option values are `HarnessId::as_str`.
     Harness {
         key: String,
+    },
+    /// `W` notify menu. Option values are [`NotifyChange::value`]; a row
+    /// with none is unavailable and its detail says why.
+    Notify {
+        key: String,
+        seen: Seen<Option<String>>,
     },
 }
 

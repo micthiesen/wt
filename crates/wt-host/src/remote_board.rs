@@ -269,6 +269,28 @@ fn compose(
                     slot.harness = wt_core::sanitize_terminal_text(&slot.harness);
                     slot.state = wt_core::sanitize_terminal_text(&slot.state);
                 }
+                // What the row waits for is stored, evaluated and delivered
+                // on its host; this board only draws it.
+                for watch in &mut row.watches {
+                    watch.id = wt_core::sanitize_terminal_text(&watch.id);
+                    watch.by = wt_core::sanitize_terminal_text(&watch.by);
+                    for cond in &mut watch.conditions {
+                        for value in [&mut cond.key, &mut cond.text] {
+                            *value = wt_core::sanitize_terminal_text(value);
+                        }
+                        for value in [&mut cond.reason, &mut cond.due_in].into_iter().flatten() {
+                            *value = wt_core::sanitize_terminal_text(value);
+                        }
+                    }
+                }
+                for value in row
+                    .watches
+                    .iter_mut()
+                    .filter_map(|watch| watch.headline.as_mut())
+                    .chain(row.created_at.as_mut())
+                {
+                    *value = wt_core::sanitize_terminal_text(value);
+                }
                 board.rows.push(row);
             }
             if let Some(remote) = &data.board {
@@ -555,12 +577,27 @@ mod tests {
             host: "builder".into(),
             ..Default::default()
         };
-        let row = wt_tui::BoardRow {
+        let mut row = wt_tui::BoardRow {
             key: "one".into(),
             slug: "one".into(),
             branch: "feature/one".into(),
             ..Default::default()
         };
+        row.watches = vec![wt_tui::WatchView {
+            id: "abc234".into(),
+            by: "one".into(),
+            conditions: vec![wt_tui::WatchConditionView {
+                key: "check:probe".into(),
+                text: "check probe".into(),
+                state: wt_tui::WatchTruth::Unknown,
+                reason: Some("exited 2: \u{1b}[31mboom".into()),
+                at_ms: None,
+                due_in: None,
+            }],
+            actions: vec![wt_tui::WatchActionKind::Wake],
+            headline: Some("run \u{1b}[31mit".into()),
+            met: false,
+        }];
         let message = |text: &str| wt_core::WorktreeEvent {
             at_ms: 1,
             event: wt_core::WorktreeEventKind::Message {
@@ -600,7 +637,21 @@ mod tests {
             ),
             "{remote:?}"
         );
-        assert!(composed.rows.iter().any(|row| row.key == remote_key));
+        // The remote row keeps what it waits for, cleaned like its history.
+        let remote_row = composed
+            .rows
+            .iter()
+            .find(|row| row.key == remote_key)
+            .unwrap();
+        let [watch] = remote_row.watches.as_slice() else {
+            panic!("{:?}", remote_row.watches)
+        };
+        assert_eq!(watch.headline.as_deref(), Some("run it"));
+        assert_eq!(
+            watch.conditions[0].reason.as_deref(),
+            Some("exited 2: boom")
+        );
+        assert_eq!(watch.conditions[0].state, wt_tui::WatchTruth::Unknown);
         fixture.close().await.unwrap();
     }
     #[tokio::test]

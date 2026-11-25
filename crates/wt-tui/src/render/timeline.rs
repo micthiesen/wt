@@ -35,6 +35,10 @@ use crate::{
 const TIME_CELLS: usize = 5;
 /// Fires of one automation this close together are one burst.
 const BURST_MS: u64 = 10 * 60 * 1000;
+/// A watch that holds and is acted on within this long reads as one event.
+const IMMEDIATE_MS: u64 = 60 * 1000;
+/// A watch that holds this soon after it was set never really waited.
+const JUST_SET_MS: u64 = 10 * 1000;
 /// A status has to change this many times in a row to read as flapping.
 const FLAP_MIN: usize = 3;
 /// Narrowest content the modal asks for, so a short history is not a sliver.
@@ -79,6 +83,14 @@ pub(crate) enum What<'a> {
     Burst {
         event: &'a Kind,
         times: usize,
+    },
+    /// A watch held and wt acted on it at once: the `held` line, and a
+    /// `waiting` line set moments before it, say nothing the action does
+    /// not. `event` is the action.
+    Fired {
+        event: &'a Kind,
+        /// It held within [`JUST_SET_MS`] of being set.
+        just_set: bool,
     },
 }
 
@@ -203,7 +215,56 @@ fn run_at<'a>(events: &[(&'a WorktreeEvent, Option<&'a Kind>)]) -> (What<'a>, us
             );
         }
     }
+    if let Some((event, len)) = fired_at(events) {
+        let fired = What::Fired {
+            event,
+            just_set: len == 3,
+        };
+        return (fired, len);
+    }
     (What::Event(first), 1)
+}
+
+/// A watch's `held` directly followed, within [`IMMEDIATE_MS`], by the first
+/// thing wt did about it; optionally led by its `waiting` when it held within
+/// [`JUST_SET_MS`] of being set. All for the same wait. A later action of the
+/// same watch keeps its own line: clearing a gate and waking a session are
+/// two facts.
+fn fired_at<'a>(events: &[(&'a WorktreeEvent, Option<&'a Kind>)]) -> Option<(&'a Kind, usize)> {
+    use wt_core::WatchChange as Change;
+    let watch = |index: usize| match &events.get(index)?.0.event {
+        Kind::Watch { change, what, .. } => Some((*change, what, events[index].0.at_ms)),
+        _ => None,
+    };
+    let (first, what, started) = watch(0)?;
+    let held = match first {
+        Change::Set => 1,
+        Change::Held => 0,
+        _ => return None,
+    };
+    let mut last = started;
+    for index in held..=held + 1 {
+        let (change, same, at_ms) = watch(index)?;
+        let expected = if index == held {
+            change == Change::Held
+        } else {
+            matches!(
+                change,
+                Change::ClearedGate | Change::Notified | Change::Woken
+            )
+        };
+        // The step from `waiting` to `held` is the wait itself.
+        let window = if index == held && held == 1 {
+            JUST_SET_MS
+        } else {
+            IMMEDIATE_MS
+        };
+        if !expected || same != what || at_ms.saturating_sub(last) > window {
+            return None;
+        }
+        last = at_ms;
+    }
+    Some((&events[held + 1].0.event, held + 2))
 }
 
 /// What one line says, before layout.
@@ -264,6 +325,13 @@ fn show(entry: &Entry<'_>, policy: &DisplayPolicy, own: &str) -> Option<Shown> {
         What::Burst { event, times } => {
             let mut shown = show_event(event, None, policy, own)?;
             shown.meta.insert(0, format!("×{times}"));
+            Some(shown)
+        }
+        What::Fired { event, just_set } => {
+            let mut shown = show_event(event, None, policy, own)?;
+            if *just_set {
+                shown.meta.push("as soon as it was set".to_owned());
+            }
             Some(shown)
         }
     }
@@ -420,18 +488,29 @@ fn show_event(
             what,
             by,
             reason,
+            then,
         } => {
-            meta.push(what.clone());
+            use wt_core::WatchChange as Change;
+            // The headline and the first metadata read as one phrase:
+            // "waiting  for merged", "told you  when merged".
+            meta.push(match change {
+                Change::Set | Change::Cancelled | Change::Dropped => format!("for {what}"),
+                Change::ClearedGate | Change::Woken | Change::Notified => format!("when {what}"),
+                Change::Held => what.clone(),
+            });
+            if *change == Change::Set {
+                meta.extend(wt_core::watch_then_phrase(then).map(|then| format!("then {then}")));
+            }
             meta.extend(named(by));
             meta.extend(reason.clone());
             match change {
-                wt_core::WatchChange::Set => "waiting",
-                wt_core::WatchChange::Held => "wait over",
-                wt_core::WatchChange::ClearedGate => "gate cleared by wt",
-                wt_core::WatchChange::Woken => "woken",
-                wt_core::WatchChange::Notified => "notified",
-                wt_core::WatchChange::Cancelled => "wait cancelled",
-                wt_core::WatchChange::Dropped => "wait dropped",
+                Change::Set => "waiting",
+                Change::Held => "held",
+                Change::ClearedGate => "gate cleared by wt",
+                Change::Woken => "session woken",
+                Change::Notified => "told you",
+                Change::Cancelled => "stopped waiting",
+                Change::Dropped => "gave up waiting",
             }
             .to_owned()
         }
@@ -1142,6 +1221,196 @@ mod tests {
             ]
         );
         assert_eq!((entries[0].first_ms, entries[0].at_ms), (0, 14 * MINUTE));
+    }
+
+    fn watch(change: wt_core::WatchChange, what: &str) -> Kind {
+        Kind::Watch {
+            change,
+            what: what.into(),
+            by: None,
+            reason: None,
+            then: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_watch_that_holds_and_fires_at_once_is_the_line_of_what_wt_did() {
+        use wt_core::WatchChange as Change;
+        let second = 1_000;
+        // Set long before: its line stays, and `held` folds into the first
+        // action. The wake that follows is its own fact.
+        let events = [
+            at(0, watch(Change::Set, "merged")),
+            at(HOUR, watch(Change::Held, "merged")),
+            at(HOUR + second, watch(Change::ClearedGate, "merged")),
+            at(HOUR + 2 * second, watch(Change::Woken, "merged")),
+        ];
+        let entries = collapse(&events);
+        assert_eq!(
+            entries.iter().map(|entry| &entry.what).collect::<Vec<_>>(),
+            [
+                &What::Event(&events[0].event),
+                &What::Fired {
+                    event: &events[2].event,
+                    just_set: false,
+                },
+                &What::Event(&events[3].event),
+            ]
+        );
+        assert_eq!(
+            (entries[1].first_ms, entries[1].at_ms),
+            (HOUR, HOUR + second)
+        );
+
+        // Set, held and told within a minute: one line.
+        let instant = [
+            at(0, watch(Change::Set, "17:00")),
+            at(second, watch(Change::Held, "17:00")),
+            at(2 * second, watch(Change::Notified, "17:00")),
+        ];
+        assert_eq!(
+            collapse(&instant)
+                .iter()
+                .map(|entry| &entry.what)
+                .collect::<Vec<_>>(),
+            [&What::Fired {
+                event: &instant[2].event,
+                just_set: true,
+            }]
+        );
+        let lines = texts(&instant, &BTreeMap::new());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("told you  when 17:00 · as soon as it was set")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_watch_only_folds_its_own_prompt_action() {
+        use wt_core::WatchChange as Change;
+        let unfolded = |events: &[WorktreeEvent]| {
+            let entries = collapse(events);
+            entries.len() == events.len()
+                && entries
+                    .iter()
+                    .all(|entry| matches!(entry.what, What::Event(_)))
+        };
+        // Delivery that waited (paused automations, a busy session).
+        assert!(unfolded(&[
+            at(0, watch(Change::Held, "merged")),
+            at(IMMEDIATE_MS + 1, watch(Change::Notified, "merged")),
+        ]));
+        // Another watch's action.
+        assert!(unfolded(&[
+            at(0, watch(Change::Held, "merged")),
+            at(1, watch(Change::Notified, "ready")),
+        ]));
+        // Something happened in between.
+        assert!(unfolded(&[
+            at(0, watch(Change::Held, "merged")),
+            at(1, status(WorkState::Ready)),
+            at(2, watch(Change::Notified, "merged")),
+        ]));
+        // Held with nothing done yet, and a set that has not held.
+        assert!(unfolded(&[
+            at(0, watch(Change::Set, "merged")),
+            at(1, watch(Change::Held, "merged")),
+        ]));
+        // A minute's wait is a wait: only `held` folds into the action.
+        let waited = [
+            at(0, watch(Change::Set, "21:36")),
+            at(JUST_SET_MS + 1, watch(Change::Held, "21:36")),
+            at(JUST_SET_MS + 2, watch(Change::Notified, "21:36")),
+        ];
+        assert_eq!(
+            collapse(&waited)
+                .iter()
+                .map(|entry| &entry.what)
+                .collect::<Vec<_>>(),
+            [
+                &What::Event(&waited[0].event),
+                &What::Fired {
+                    event: &waited[2].event,
+                    just_set: false,
+                },
+            ]
+        );
+        assert!(unfolded(&[
+            at(0, watch(Change::Set, "merged")),
+            at(1, watch(Change::Cancelled, "merged")),
+        ]));
+    }
+
+    #[test]
+    fn a_watch_line_says_what_was_waited_for_and_what_wt_did() {
+        use wt_core::WatchChange as Change;
+        let line = |event: Kind| {
+            let shown = show_event(&event, None, &DisplayPolicy::default(), "fix-login").unwrap();
+            let badge = shown.badge;
+            (
+                format!("{}  {}", shown.headline, shown.meta.join(" · ")),
+                badge,
+            )
+        };
+        let set = Kind::Watch {
+            change: Change::Set,
+            what: "#3806 in production".into(),
+            by: Some("manager".into()),
+            reason: None,
+            then: vec!["unblock".into(), "wake".into()],
+        };
+        let (text, badge) = line(set);
+        assert_eq!(
+            text,
+            "waiting  for #3806 in production · then clears the gate and wakes the session · by manager"
+        );
+        assert_eq!(
+            (badge.glyph, badge.color),
+            (crate::glyphs::WATCH, badges::WAITING)
+        );
+        // The row's own agent is not named, as on a status line.
+        let own = Kind::Watch {
+            change: Change::Set,
+            what: "17:00".into(),
+            by: Some("fix-login".into()),
+            reason: None,
+            then: vec!["wake".into()],
+        };
+        assert_eq!(line(own).0, "waiting  for 17:00 · then wakes the session");
+        for (change, expected, color) in [
+            (Change::Held, "held  merged", theme::OK),
+            (
+                Change::ClearedGate,
+                "gate cleared by wt  when merged",
+                theme::OK,
+            ),
+            (Change::Woken, "session woken  when merged", theme::OK),
+            (Change::Notified, "told you  when merged", theme::OK),
+            (
+                Change::Cancelled,
+                "stopped waiting  for merged",
+                theme::FG_DIM,
+            ),
+        ] {
+            let (text, badge) = line(watch(change, "merged"));
+            assert_eq!(text, expected);
+            assert_eq!(badge.color, color);
+        }
+        let dropped = Kind::Watch {
+            change: Change::Dropped,
+            what: "merged".into(),
+            by: None,
+            reason: Some("its worktree was removed".into()),
+            then: Vec::new(),
+        };
+        let (text, badge) = line(dropped);
+        assert_eq!(
+            text,
+            "gave up waiting  for merged · its worktree was removed"
+        );
+        assert_eq!(badge.color, theme::WARN);
     }
 
     #[test]

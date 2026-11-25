@@ -233,16 +233,26 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
             what,
             by: who,
             reason,
+            then,
         } => match change {
-            WatchChange::Set => format!("waiting for {what}{}", by(who)),
-            WatchChange::Held => format!("no longer waiting: {what}"),
-            WatchChange::ClearedGate => format!("gate cleared by wt: {what}"),
-            WatchChange::Woken => format!("woken: {what}"),
+            WatchChange::Set => {
+                let then = wt_core::watch_then_phrase(then)
+                    .map(|then| format!(", then wt {then}"))
+                    .unwrap_or_default();
+                let set_by = who
+                    .as_ref()
+                    .map(|who| format!(" (set by {who})"))
+                    .unwrap_or_default();
+                format!("waiting for {what}{then}{set_by}")
+            }
+            WatchChange::Held => format!("held: {what}"),
+            WatchChange::ClearedGate => format!("gate cleared: {what}"),
+            WatchChange::Woken => format!("session woken: {what}"),
             WatchChange::Notified => format!("told you: {what}"),
             WatchChange::Cancelled => format!("stopped waiting for {what}{}", by(who)),
             WatchChange::Dropped => match reason {
-                Some(reason) => format!("stopped waiting for {what}: {reason}"),
-                None => format!("stopped waiting for {what}"),
+                Some(reason) => format!("gave up waiting for {what}: {reason}"),
+                None => format!("gave up waiting for {what}"),
             },
         },
         WorktreeEventKind::Removed { landed: true } => "removed after landing".into(),
@@ -313,6 +323,61 @@ mod tests {
         // "YYYY-MM-DD HH:MM", then two spaces.
         assert_eq!(lines[1].find("  "), Some(16), "{}", lines[1]);
         assert!(!lines.iter().any(|line| line.contains('\u{2014}')));
+    }
+
+    #[test]
+    fn a_watch_reads_as_what_was_waited_for_and_what_wt_did() {
+        let watch = |change, by: Option<&str>, reason: Option<&str>, then: &[&str]| {
+            describe(&WorktreeEventKind::Watch {
+                change,
+                what: "#3806 in production".into(),
+                by: by.map(str::to_owned),
+                reason: reason.map(str::to_owned),
+                then: then.iter().map(|action| (*action).to_owned()).collect(),
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            watch(
+                WatchChange::Set,
+                Some("manager"),
+                None,
+                &["unblock", "wake"]
+            ),
+            "waiting for #3806 in production, then wt clears the gate and wakes the session (set by manager)"
+        );
+        assert_eq!(
+            watch(WatchChange::Set, None, None, &[]),
+            "waiting for #3806 in production"
+        );
+        for (change, expected) in [
+            (WatchChange::Held, "held: #3806 in production"),
+            (
+                WatchChange::ClearedGate,
+                "gate cleared: #3806 in production",
+            ),
+            (WatchChange::Woken, "session woken: #3806 in production"),
+            (WatchChange::Notified, "told you: #3806 in production"),
+            (
+                WatchChange::Cancelled,
+                "stopped waiting for #3806 in production",
+            ),
+        ] {
+            assert_eq!(watch(change, None, None, &[]), expected);
+        }
+        assert_eq!(
+            watch(WatchChange::Cancelled, Some("one"), None, &[]),
+            "stopped waiting for #3806 in production by one"
+        );
+        assert_eq!(
+            watch(
+                WatchChange::Dropped,
+                None,
+                Some("its worktree is gone"),
+                &[]
+            ),
+            "gave up waiting for #3806 in production: its worktree is gone"
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ pub mod session_discovery;
 pub mod skills;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
+pub mod watch_view;
 pub mod watcher;
 pub mod watcher_cleanup;
 pub mod workload;

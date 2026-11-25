@@ -78,10 +78,15 @@ async fn run_with_client(
             .enable_auto_merge(&target, &context.cancellation)
             .await
     };
+    // The same record the TUI's arm and cancel keep, so a merge GitHub
+    // later drops is noticed whichever way it was armed.
+    let slug = worktree.target.slug();
     if result.ok {
         if args.cancel {
+            wt_ops::merge_arm::cancelled(&context.database, slug).await;
             println!("cancelled merge-when-ready on #{}", target.number);
         } else {
+            wt_ops::merge_arm::armed(&context.database, slug, &target, &result).await;
             println!(
                 "merge when ready armed on #{} → {}\n  GitHub merges it once its requirements are met.",
                 target.number, target.base_ref_name
@@ -146,6 +151,75 @@ print(json.dumps({{'number': 42, 'baseRefName': 'main', 'state': 'OPEN', 'isDraf
         let calls = fs::read_to_string(trace).unwrap();
         assert_eq!(calls.lines().count(), 1);
         assert!(calls.contains("feature/one"));
+        fixture.close().await.unwrap();
+    }
+    /// `wt merge` leaves the record `pr.merge_dropped` compares GitHub
+    /// against, and `wt merge --cancel` takes it away.
+    #[tokio::test]
+    async fn arming_records_the_merge_and_cancelling_forgets_it() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let fake = fixture._root.path().join("fake-gh");
+        fs::write(
+            &fake,
+            r#"#!/usr/bin/env python3
+import json, sys
+argv = sys.argv[1:]
+args = ' '.join(argv)
+if argv[:2] == ['repo', 'view']:
+    print(json.dumps({'nameWithOwner': 'o/r'}))
+elif argv[:2] == ['pr', 'merge']:
+    pass
+elif 'repos/o/r/pulls/42' in args:
+    print('{}')
+elif 'mergeQueue(branch' in args:
+    print(json.dumps({'data': {'repository': {'mergeQueue': None}}}))
+elif 'enablePullRequestAutoMerge' in args:
+    print(json.dumps({'data': {'enablePullRequestAutoMerge': {'pullRequest': {'number': 42}}}}))
+elif 'autoMergeRequest' in args:
+    print(json.dumps({'data': {'node': {'mergeQueueEntry': None, 'autoMergeRequest': {'enabledAt': 'x'}}}}))
+else:
+    print(json.dumps({'number': 42, 'baseRefName': 'main', 'state': 'OPEN', 'isDraft': False,
+                      'title': 'Ready', 'id': 'PR_fake', 'headRefOid': 'abc'}))
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let client = GithubClient::new(
+            fixture.ctx.processes.clone(),
+            fixture.ctx.config.paths.main_clone.clone(),
+            GithubOptions::from_config(&fixture.ctx.config, false),
+        )
+        .with_gh_program(fake);
+        let args = |cancel| MergeArgs {
+            slug: Some("one".into()),
+            cancel,
+        };
+        let stored = || async {
+            fixture
+                .ctx
+                .database
+                .call(|store| Ok(store.read_slug_state("one")?))
+                .await
+                .unwrap()
+                .unwrap_or_default()["mergeArm"]
+                .clone()
+        };
+        assert_eq!(
+            run_with_client(&fixture.ctx, &args(false), &client)
+                .await
+                .unwrap(),
+            0
+        );
+        let arm: wt_core::MergeArm = serde_json::from_value(stored().await).unwrap();
+        assert_eq!((arm.pr, arm.head.as_deref()), (42, Some("abc")));
+        assert_eq!(arm.mechanism, wt_core::MergeMechanism::AutoMerge);
+        assert_eq!(
+            run_with_client(&fixture.ctx, &args(true), &client)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(stored().await.is_null());
         fixture.close().await.unwrap();
     }
 }

@@ -484,6 +484,7 @@ fn picker(
         PickerAction::Harness { .. } => Some("F12"),
         PickerAction::Status { .. } => Some("u"),
         PickerAction::Base { .. } => Some("b"),
+        PickerAction::Notify { .. } => Some("W"),
         PickerAction::Section { .. } => Some("l"),
         PickerAction::Output { .. } => Some("'"),
         PickerAction::Sessions { .. } => Some(";"),
@@ -594,7 +595,8 @@ fn picker(
                     let (glyph, color) = picker_glyph(&picker.action, option, primary);
                     spans.push(Span::styled(format!("{glyph}  "), theme::fg(color)));
                 }
-                let blocked = actions
+                // A parenthesised detail is the reason a row cannot be picked.
+                let blocked = (actions || matches!(picker.action, PickerAction::Notify { .. }))
                     && option
                         .detail
                         .as_deref()
@@ -2316,6 +2318,34 @@ fn legend_blocks(policy: &DisplayPolicy, primary: &str) -> Vec<HelpBlock> {
         ),
         glyph_item(badges::REMOTE_HOST, "hosted on an SSH remote", "remote"),
     ]);
+    let waiting = |state: crate::WatchTruth, met: bool| {
+        badges::watch_badge(&[crate::WatchView {
+            conditions: vec![crate::WatchConditionView {
+                state,
+                ..Default::default()
+            }],
+            met,
+            ..Default::default()
+        }])
+    };
+    for (badge, label) in [
+        (
+            waiting(crate::WatchTruth::NotYet, false),
+            "wt is waiting: it will clear the gate, wake the session or tell you (W, wt wake / notify)",
+        ),
+        (
+            waiting(crate::WatchTruth::Unknown, false),
+            "waiting on something wt cannot read right now",
+        ),
+        (
+            waiting(crate::WatchTruth::Holds, true),
+            "what it waited for held; wt is acting on it",
+        ),
+    ] {
+        if let Some(badge) = badge {
+            row_items.push(glyph_item(badge, label, "watch notify wake bell"));
+        }
+    }
     // Facts only the history timeline draws; the rest of its glyphs are the
     // board's own, listed above.
     let history_items = [
@@ -3088,6 +3118,68 @@ mod tests {
         let dot = find(&buffer, &format!("{}  ready", glyphs::DOT)).unwrap();
         assert_eq!(buffer[dot].fg, theme::OK, "ready dot matches the list");
         assert!(text.contains(&format!("t {}  todo", glyphs::DOT_OUTLINE)));
+    }
+
+    #[test]
+    fn the_notify_picker_dims_what_cannot_be_asked_and_says_why() {
+        let board = crate::Board {
+            rows: vec![crate::BoardRow {
+                key: "one".into(),
+                slug: "fix-login".into(),
+                watches: vec![crate::WatchView {
+                    id: "abc234".into(),
+                    by: "human".into(),
+                    conditions: vec![crate::WatchConditionView {
+                        key: "ready".into(),
+                        text: "ready".into(),
+                        ..Default::default()
+                    }],
+                    actions: vec![crate::WatchActionKind::Notify],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let crate::Menu::Local(crate::LocalMenu::Modal { modal, .. }) =
+            (crate::UiAction::PrepareNotify { key: "one".into() }).menu(&board)
+        else {
+            panic!("the notify menu is built from the board")
+        };
+        let crate::UiModal::Picker {
+            action,
+            title,
+            options,
+            selected,
+        } = *modal
+        else {
+            panic!("the notify menu is a picker")
+        };
+        let mut model = Model {
+            interaction: Interaction::Picker(PickerPrompt {
+                action,
+                title,
+                options,
+                selected,
+            }),
+            ..Model::default()
+        };
+        let buffer = draw(&mut model, 100, 30);
+        let text = rows(&buffer).join("\n");
+        assert!(text.contains("Notify me when fix-login is…"), "{text}");
+        assert!(text.contains("W / ⏎ pick"), "{text}");
+        assert!(text.contains("letter quick pick"), "{text}");
+        // The cursor starts on the first thing that can still be asked for.
+        let (x, y) = find(&buffer, "› m merged").unwrap();
+        assert_eq!(buffer[(x, y)].bg, theme::SELECTED_BG);
+        // Set: offered for cancelling, not dimmed.
+        let set = find(&buffer, "ready").unwrap();
+        assert_ne!(buffer[set].fg, theme::FG_DIM);
+        assert!(text.contains("set · pick to cancel"), "{text}");
+        // No PR: the row recedes and its reason is on it.
+        let green = find(&buffer, "checks green").unwrap();
+        assert_eq!(buffer[green].fg, theme::FG_DIM);
+        assert!(text.contains("(no PR)"), "{text}");
     }
 
     #[test]

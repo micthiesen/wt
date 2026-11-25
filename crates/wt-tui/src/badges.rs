@@ -22,7 +22,7 @@ use wt_core::{
 
 use crate::{
     BoardRow, CheckState, DisplayPolicy, LandingKind, PrPresentation, ReviewState, SessionView,
-    WorkPresentation, glyphs, theme,
+    WatchTruth, WatchView, WorkPresentation, glyphs, theme,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,9 +555,10 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
             if *landed { theme::FG_DIM } else { theme::WARN },
         ),
         Event::Watch { change, .. } => badge(
-            glyphs::AUTOMATION,
+            glyphs::WATCH,
             match change {
-                wt_core::WatchChange::Set | wt_core::WatchChange::Cancelled => theme::FG_DIM,
+                wt_core::WatchChange::Set => WAITING,
+                wt_core::WatchChange::Cancelled => theme::FG_DIM,
                 wt_core::WatchChange::Dropped => theme::WARN,
                 wt_core::WatchChange::Held
                 | wt_core::WatchChange::ClearedGate
@@ -567,6 +568,34 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
         ),
         Event::Unknown => return None,
     })
+}
+
+/// The hue of something wt waits on: quieter than the warn of a gate, which
+/// asks for a person, and the same teal a polling session wears.
+pub(crate) const WAITING: Color = theme::TEAL;
+
+/// The bell a row wears while wt will act for it later: clear its gate,
+/// wake its session or tell the person. Teal while waiting; warn when a
+/// condition cannot be read, since such a watch may never fire; green once
+/// every condition held and delivery is under way.
+pub(crate) fn watch_badge(watches: &[WatchView]) -> Option<Badge> {
+    if watches.is_empty() {
+        return None;
+    }
+    let unreadable = |watch: &WatchView| {
+        watch
+            .conditions
+            .iter()
+            .any(|cond| cond.state == WatchTruth::Unknown)
+    };
+    let color = if watches.iter().any(|watch| !watch.met && unreadable(watch)) {
+        theme::WARN
+    } else if watches.iter().all(|watch| watch.met) {
+        theme::OK
+    } else {
+        WAITING
+    };
+    Some(badge(glyphs::WATCH, color))
 }
 
 fn shows(policy: &DisplayPolicy, slot: &str) -> bool {
@@ -581,9 +610,9 @@ pub(crate) struct ClusterSlot {
 }
 
 /// The right-aligned badge cluster for a worktree row, in a fixed slot
-/// order so a glyph's position means the same thing on every row: action,
-/// dirty, rebase, environment, session, review bot, human review, PR or
-/// merge-queue position, checks.
+/// order so a glyph's position means the same thing on every row: watch,
+/// action, dirty, rebase, environment, session, review bot, human review, PR
+/// or merge-queue position, checks.
 pub(crate) fn cluster(row: &BoardRow, policy: &DisplayPolicy) -> Vec<ClusterSlot> {
     let mut slots = Vec::new();
     let dim = row.archived.then_some(theme::FG_DIM);
@@ -595,6 +624,11 @@ pub(crate) fn cluster(row: &BoardRow, policy: &DisplayPolicy) -> Vec<ClusterSlot
         });
     };
     let session = row_session_activity(row, policy);
+    if shows(policy, "watch")
+        && let Some(watch) = watch_badge(&row.watches)
+    {
+        push(watch.glyph, dim.unwrap_or(watch.color), 2);
+    }
     if row.action_running && shows(policy, "action") {
         push(glyphs::COMMENT, theme::OK, 2);
     }
@@ -955,6 +989,86 @@ mod tests {
         );
     }
 
+    fn waiting(state: WatchTruth, met: bool) -> WatchView {
+        WatchView {
+            id: "abc234".into(),
+            by: "human".into(),
+            conditions: vec![crate::WatchConditionView {
+                key: "ready".into(),
+                text: "ready".into(),
+                state,
+                ..Default::default()
+            }],
+            actions: vec![crate::WatchActionKind::Notify],
+            met,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_waiting_row_wears_the_bell_first_and_its_color_says_how_it_stands() {
+        let policy = DisplayPolicy::default();
+        let mut row = row();
+        row.git.tracked_changes = Some(1);
+        assert_eq!(watch_badge(&row.watches), None);
+        row.watches = vec![waiting(WatchTruth::NotYet, false)];
+        let slots = cluster(&row, &policy);
+        let shown: Vec<_> = slots
+            .iter()
+            .map(|slot| (slot.text.as_str(), slot.color))
+            .collect();
+        assert_eq!(
+            shown,
+            [(glyphs::WATCH, WAITING), (glyphs::PENCIL, theme::WARN)]
+        );
+        // Not the gate's hue: a gate asks for a person, a watch does not.
+        assert_ne!(WAITING, theme::WARN);
+        for (watches, color) in [
+            (
+                vec![
+                    waiting(WatchTruth::Holds, false),
+                    waiting(WatchTruth::Unknown, false),
+                ],
+                theme::WARN,
+            ),
+            (vec![waiting(WatchTruth::Holds, true)], theme::OK),
+            (
+                vec![
+                    waiting(WatchTruth::Holds, true),
+                    waiting(WatchTruth::NotYet, false),
+                ],
+                WAITING,
+            ),
+        ] {
+            assert_eq!(watch_badge(&watches), Some(badge(glyphs::WATCH, color)));
+        }
+        row.archived = true;
+        assert_eq!(cluster(&row, &policy)[0].color, theme::FG_DIM);
+        let hidden = DisplayPolicy {
+            hidden_badges: vec!["watch".into()],
+            ..Default::default()
+        };
+        let shown: Vec<_> = cluster(&row, &hidden)
+            .into_iter()
+            .map(|slot| slot.text)
+            .collect();
+        assert_eq!(shown, [glyphs::PENCIL]);
+    }
+
+    #[test]
+    fn a_folded_tally_counts_markers_and_never_the_watch_bell() {
+        let policy = DisplayPolicy::default();
+        let mut waiting_row = row();
+        waiting_row.work = Some(work(WorkState::Ready));
+        let plain = waiting_row.clone();
+        waiting_row.watches = vec![waiting(WatchTruth::Unknown, false)];
+        assert_eq!(
+            marker_tally(&[&waiting_row], &policy),
+            marker_tally(&[&plain], &policy)
+        );
+        assert_eq!(marker(&waiting_row, &policy), marker(&plain, &policy));
+    }
+
     #[test]
     fn engaged_session_turns_a_base_conflict_into_resolving() {
         let mut conflicted = row();
@@ -1081,6 +1195,31 @@ mod tests {
         assert_eq!(
             event(Event::Removed { landed: true }).map(|badge| badge.glyph),
             Some(glyphs::TRASH)
+        );
+        let watch = |change| {
+            event(Event::Watch {
+                change,
+                what: "merged".into(),
+                by: None,
+                reason: None,
+                then: Vec::new(),
+            })
+        };
+        assert_eq!(
+            watch(wt_core::WatchChange::Set),
+            watch_badge(&[waiting(WatchTruth::NotYet, false)])
+        );
+        assert_eq!(
+            watch(wt_core::WatchChange::Notified),
+            watch_badge(&[waiting(WatchTruth::Holds, true)])
+        );
+        assert_eq!(
+            watch(wt_core::WatchChange::Dropped),
+            Some(badge(glyphs::WATCH, theme::WARN))
+        );
+        assert_eq!(
+            watch(wt_core::WatchChange::Cancelled),
+            Some(badge(glyphs::WATCH, theme::FG_DIM))
         );
         assert_eq!(event(Event::Unknown), None);
     }

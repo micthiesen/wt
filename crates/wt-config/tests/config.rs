@@ -92,6 +92,7 @@ fn snapshot(config: &Config) -> serde_json::Value {
                 wt_config::AutomationTrigger::ReviewBotUnresolved => "review_bot.unresolved",
                 wt_config::AutomationTrigger::ReviewChangesRequested => "review.changes_requested",
                 wt_config::AutomationTrigger::PrConflict => "pr.conflict",
+                wt_config::AutomationTrigger::PrMergeDropped => "pr.merge_dropped",
                 wt_config::AutomationTrigger::WtMerged => "wt.merged",
                 wt_config::AutomationTrigger::WtCreated => "wt.created",
                 wt_config::AutomationTrigger::StackParentMerged => "stack.parent_merged",
@@ -524,7 +525,8 @@ fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
          [[automations]]\nid='legacy-review'\non='rabbit.unresolved'\nrun='triage'\n\
          [[automations]]\nid='needs-human'\non='status.needs-human'\nrun='builtin:notify'\n\
          [[automations]]\nid='advance-release'\non='branch.advanced'\nrun='builtin:notify'\nbranch=' release '\n\
-         [[automations]]\nid='overdue'\non='status.verification_overdue'\nrun='builtin:notify'\nafter_days=4\n",
+         [[automations]]\nid='overdue'\non='status.verification_overdue'\nrun='builtin:notify'\nafter_days=4\n\
+         [[automations]]\nid='dropped'\non='pr.merge_dropped'\nrun='builtin:notify'\n",
     );
     let config = Config::from_raw(toml_value(&text), &options(root.path(), &home, &[])).unwrap();
 
@@ -543,7 +545,7 @@ fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
     assert_eq!(action.label_extract.as_deref(), Some("^([A-Z]+-\\d+)"));
     assert!(action.external);
 
-    assert_eq!(config.automations.len(), 4);
+    assert_eq!(config.automations.len(), 5);
     assert_eq!(
         config.automations[0].on,
         wt_config::AutomationTrigger::ReviewBotUnresolved
@@ -558,6 +560,12 @@ fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
     assert_eq!(config.automations[2].settle_seconds, 10.0);
     assert_eq!(config.automations[3].after_days, 4.0);
     assert_eq!(config.automations[3].settle_seconds, 0.0);
+    assert_eq!(
+        config.automations[4].on,
+        wt_config::AutomationTrigger::PrMergeDropped
+    );
+    // GitHub's reads lag an arming; the default settle rides that out.
+    assert_eq!(config.automations[4].settle_seconds, 120.0);
 }
 
 #[test]

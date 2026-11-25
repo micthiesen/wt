@@ -12,6 +12,7 @@
 //! builder or name the host-only data it needs.
 
 mod base;
+pub(crate) mod notify;
 pub(crate) mod palette;
 mod remove;
 mod section;
@@ -127,6 +128,7 @@ impl UiAction {
             },
             A::PrepareStatus { key } => Menu::Local(status::menu(board, key)),
             A::PrepareBase { key } => base::menu(board, key),
+            A::PrepareNotify { key } => Menu::Local(notify::menu(board, key)),
             A::PrepareSessions { key, target } => {
                 sessions::sessions_menu(board, key.as_deref(), *target)
             }
@@ -175,6 +177,7 @@ impl UiAction {
             | A::ToggleArchive { .. }
             | A::SetStatus { .. }
             | A::SetBase { .. }
+            | A::SetNotify { .. }
             | A::SetIssueOverride { .. }
             | A::OpenUrl { .. }
             | A::Session { .. }

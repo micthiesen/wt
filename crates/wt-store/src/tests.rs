@@ -1745,3 +1745,55 @@ fn restoring_a_slug_entry_replaces_it_whole_and_leaves_other_slugs_alone() {
         Some(json!({"section": "B"}))
     );
 }
+
+#[test]
+fn an_armed_merge_is_one_record_per_slug_cleared_by_cancel_end_or_removal() {
+    use wt_core::{MergeArm, MergeMechanism};
+    let temp = tempdir().unwrap();
+    let mut store =
+        Store::open(temp.path().join("state.sqlite"), identity("repo", "/repo")).unwrap();
+    store
+        .record_slug_created("one", "2026-11-01T00:00:00Z")
+        .unwrap();
+    let arm = |armed_at_ms| MergeArm {
+        pr: 7,
+        head: Some("abc".into()),
+        armed_at_ms,
+        mechanism: MergeMechanism::Queue,
+    };
+    assert!(store.set_slug_merge_arm("one", &arm(10)).unwrap());
+    assert!(!store.set_slug_merge_arm("one", &arm(10)).unwrap());
+    let stored = store.read_wt_state().unwrap()["slugs"]["one"].clone();
+    assert_eq!(
+        stored["mergeArm"],
+        json!({"pr": 7, "head": "abc", "armedAtMs": 10, "mechanism": "queue"})
+    );
+    // The slug's other fields are untouched.
+    assert_eq!(stored["createdAt"], "2026-11-01T00:00:00Z");
+
+    // Arming again replaces the record; whoever saw the first arming end
+    // does not clear the second.
+    assert!(store.set_slug_merge_arm("one", &arm(20)).unwrap());
+    assert!(!store.clear_slug_merge_arm("one", Some(10)).unwrap());
+    assert_eq!(
+        serde_json::from_value::<MergeArm>(
+            store.read_wt_state().unwrap()["slugs"]["one"]["mergeArm"].clone()
+        )
+        .unwrap(),
+        arm(20)
+    );
+    assert!(store.clear_slug_merge_arm("one", Some(20)).unwrap());
+    assert!(!store.clear_slug_merge_arm("one", None).unwrap());
+    assert!(!store.clear_slug_merge_arm("absent", None).unwrap());
+    let cleared = store.read_wt_state().unwrap()["slugs"]["one"].clone();
+    assert!(cleared.get("mergeArm").is_none());
+    assert_eq!(cleared["createdAt"], "2026-11-01T00:00:00Z");
+
+    // A cancel clears whatever arming there is, and removal takes the
+    // record with the slug's other state.
+    store.set_slug_merge_arm("one", &arm(30)).unwrap();
+    assert!(store.clear_slug_merge_arm("one", None).unwrap());
+    store.set_slug_merge_arm("one", &arm(40)).unwrap();
+    store.reap_wt_state(&BTreeSet::new()).unwrap();
+    assert!(store.read_wt_state().unwrap()["slugs"]["one"].is_null());
+}

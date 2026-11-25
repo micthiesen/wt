@@ -290,6 +290,14 @@ pub async fn prepare(
             failed_checks: pr.failed_checks.clone(),
             review_bot_unresolved: pr.review_bot.as_ref().map_or(0, |bot| bot.unresolved),
             changes_requested: pr.review == PrReview::ChangesRequested,
+            auto_merge: pr.auto_merge.is_some(),
+            // A missing entry proves nothing unless the read held the
+            // whole queue.
+            merge_queued: if github.merge_queue.contains_key(&branch) {
+                Some(true)
+            } else {
+                github.merge_queue_complete.then_some(false)
+            },
         });
         let conflict = github.prs.get(&branch).and_then(|pr| {
             pr.mergeable.as_ref().map(|mergeable| AutomationConflict {
@@ -347,6 +355,7 @@ pub async fn prepare(
             in_production,
             deploys,
             clean_candidate,
+            merge_arm: serde_json::from_value(stored["mergeArm"].clone()).ok(),
             pr,
             conflict,
             work,

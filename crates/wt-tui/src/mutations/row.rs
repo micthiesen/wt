@@ -5,7 +5,10 @@ use wt_core::Domain;
 use wt_runtime::Target;
 
 use super::{Family, target_row, target_row_mut};
-use crate::Board;
+use crate::{
+    Board, NotifyChange, WatchActionKind, WatchConditionView, WatchView,
+    menus::notify::{set_for, state_words},
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowChange {
@@ -30,6 +33,10 @@ pub enum RowChange {
     Primary {
         harness: Option<String>,
     },
+    /// A watch that tells the person, set or cancelled from the notify menu.
+    Notify {
+        change: NotifyChange,
+    },
 }
 
 impl Family for RowChange {
@@ -41,6 +48,8 @@ impl Family for RowChange {
             Self::Issue { .. } => "issue",
             Self::Automations { .. } => "automations",
             Self::Primary { .. } => "primary",
+            // Each watch is its own change: two can be pending at once.
+            Self::Notify { change } => return format!("notify:{}", change.value()),
         }
         .into()
     }
@@ -54,6 +63,12 @@ impl Family for RowChange {
             Self::Automations { paused: true } => "pausing automations".into(),
             Self::Automations { paused: false } => "resuming automations".into(),
             Self::Primary { .. } => "switching harness".into(),
+            Self::Notify {
+                change: NotifyChange::Add { .. },
+            } => "setting notification".into(),
+            Self::Notify {
+                change: NotifyChange::Cancel { .. },
+            } => "cancelling notification".into(),
         }
     }
 
@@ -95,6 +110,26 @@ impl Family for RowChange {
                     Self::Base { base } => row.base_branch = base.clone(),
                     Self::Issue { issue_id } => row.issue_id = issue_id.clone(),
                     Self::Automations { paused } => row.automations_paused = *paused,
+                    Self::Notify {
+                        change: NotifyChange::Add { state },
+                    } => {
+                        if set_for(row, state).is_none() {
+                            // No id until the host has stored it.
+                            row.watches.push(WatchView {
+                                by: "human".into(),
+                                conditions: vec![WatchConditionView {
+                                    key: state.clone(),
+                                    text: state_words(state).to_owned(),
+                                    ..Default::default()
+                                }],
+                                actions: vec![WatchActionKind::Notify],
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    Self::Notify {
+                        change: NotifyChange::Cancel { id },
+                    } => row.watches.retain(|watch| watch.id != *id),
                     Self::Primary { .. } => {}
                 }
             }
@@ -120,6 +155,12 @@ impl Family for RowChange {
             Self::Primary { harness } => harness
                 .as_deref()
                 .is_none_or(|h| h.eq_ignore_ascii_case(&board.display.primary_harness)),
+            Self::Notify {
+                change: NotifyChange::Add { state },
+            } => row.is_none_or(|row| set_for(row, state).is_some()),
+            Self::Notify {
+                change: NotifyChange::Cancel { id },
+            } => row.is_none_or(|row| row.watches.iter().all(|watch| watch.id != *id)),
         }
     }
 }

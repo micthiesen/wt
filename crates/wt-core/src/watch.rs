@@ -162,7 +162,7 @@ impl fmt::Display for Condition {
         match self {
             Self::At { at_ms } => write!(f, "at:{at_ms}"),
             Self::Own(state) => f.write_str(state.as_str()),
-            Self::Pr { number, goal } => write!(f, "#{number}:{}", goal.as_str()),
+            Self::Pr { number, goal } => write!(f, "pr:{number}:{}", goal.as_str()),
             Self::Worktree { slug, state } => write!(f, "{slug}:{}", state.as_str()),
             Self::Gone { slug } => write!(f, "{slug}:gone"),
             Self::Release(stage) => write!(f, "release:{}", stage.as_str()),
@@ -175,6 +175,16 @@ impl fmt::Display for Condition {
 }
 
 impl Condition {
+    /// The text a record keeps. A pull request keeps the `#` spelling,
+    /// which builds from before `pr:` read too; a record is never typed
+    /// into a shell.
+    fn stored(&self) -> String {
+        match self {
+            Self::Pr { number, goal } => format!("#{number}:{}", goal.as_str()),
+            other => other.to_string(),
+        }
+    }
+
     fn from_stored(text: &str) -> Self {
         absolute_ms(text)
             .map(|at_ms| Self::At { at_ms })
@@ -217,7 +227,7 @@ impl Condition {
 
 impl Serialize for Condition {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
+        serializer.serialize_str(&self.stored())
     }
 }
 
@@ -444,6 +454,13 @@ pub struct Watch {
     pub extra: Map<String, Value>,
 }
 
+// Kept beside the record's other keys rather than as fields, so a build
+// that does not know them carries them through a rewrite like any other.
+const LANDING_COMMIT: &str = "landingCommit";
+const EVALUATED_AT: &str = "evaluatedAtMs";
+/// How often an engine records that it judged a watch.
+pub const EVALUATED_EVERY_MS: i64 = MINUTE_MS;
+
 /// What is known about a removed owner's branch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnerRemoval<'a> {
@@ -456,6 +473,29 @@ pub struct OwnerRemoval<'a> {
 impl Watch {
     pub fn is_met(&self) -> bool {
         self.met_at_ms.is_some()
+    }
+
+    /// The commit that carried the owner's work onto the base branch, once
+    /// the engine has seen it: what the watch follows after its worktree is
+    /// removed, even by a process that never saw the row landed.
+    pub fn landing_commit(&self) -> Option<&str> {
+        self.extra.get(LANDING_COMMIT)?.as_str()
+    }
+
+    /// When an engine last judged the watch, to the minute. `None` until
+    /// one has.
+    pub fn evaluated_at_ms(&self) -> Option<i64> {
+        self.extra.get(EVALUATED_AT)?.as_i64()
+    }
+
+    /// Whether any condition is about the owner's own row reaching a stage.
+    pub fn follows_own_landing(&self) -> bool {
+        self.when.iter().any(|cond| {
+            matches!(
+                cond.cond,
+                Condition::Own(RowState::Staging | RowState::Production)
+            )
+        })
     }
 
     /// Whether `created_at` names the worktree this watch was set on.
@@ -525,7 +565,7 @@ impl Watch {
                 }
                 _ => continue,
             };
-            let Some(oid) = removal.landing_commit else {
+            let Some(oid) = removal.landing_commit.or(self.landing_commit()) else {
                 return Err("its worktree was removed and no landing commit is known".into());
             };
             cond.cond = Condition::Commit {
@@ -547,12 +587,14 @@ pub struct GrammarError {
 const GRAMMAR: &str = "A condition is one of:
   17:00 | +3h | +90m | +2d | 2026-11-25T17:00    a local time
   merged | staging | production | ready | green | verified | closed    this worktree
-  #3806 | #3806:merged|staging|production|closed    a pull request
+  pr:3806 | pr:3806:merged|staging|production|closed    a pull request
   <slug>:merged|staging|production|ready|green|verified|closed|gone    another worktree
   release:staging | release:production    the next release there
   check:<id> | check:<id>=<arg>    a configured check
 Anything but a time may end in +<duration>: it must have held that long.
-Examples: #3806:production   release:production+24h   17:00";
+A pull request also reads as #3806, but an unquoted # starts a shell comment
+and the rest of the command is lost: write pr:3806.
+Examples: pr:3806:production   release:production+24h   17:00";
 
 impl fmt::Display for GrammarError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -698,7 +740,13 @@ fn parse_stage(text: &str) -> Option<VerifyStage> {
 }
 
 fn parse_untimed(text: &str) -> Result<Condition, String> {
-    if let Some(pr) = text.strip_prefix('#') {
+    // `pr:` before a digit is a pull request; before anything else it is a
+    // worktree named `pr`.
+    let pr = text.strip_prefix('#').or_else(|| {
+        text.strip_prefix("pr:")
+            .filter(|rest| rest.starts_with(|first: char| first.is_ascii_digit()))
+    });
+    if let Some(pr) = pr {
         let (number, goal) = match pr.split_once(':') {
             Some((number, goal)) => (number, Some(goal)),
             None => (pr, None),
@@ -706,7 +754,7 @@ fn parse_untimed(text: &str) -> Result<Condition, String> {
         let number = digits(number)
             .and_then(|number| u64::try_from(number).ok())
             .filter(|number| *number > 0)
-            .ok_or_else(|| format!("`#{number}` is not a pull request number"))?;
+            .ok_or_else(|| format!("`{number}` is not a pull request number"))?;
         let goal = match goal {
             None | Some("merged") => PrGoal::Merged,
             Some("closed") => PrGoal::Closed,
@@ -1016,6 +1064,11 @@ pub struct WatchStamps {
     pub met_at_ms: Option<i64>,
     /// The new `last_error`, when it differs from the stored one.
     pub last_error: Option<Option<String>>,
+    /// The owner's landing commit, when the record does not have it yet.
+    pub landing_commit: Option<String>,
+    /// The minute of this evaluation, when the record shows an earlier one
+    /// or none.
+    pub evaluated_at_ms: Option<i64>,
 }
 
 /// What [`WatchStamps::apply`] did.
@@ -1027,6 +1080,36 @@ pub struct Applied {
 }
 
 impl WatchStamps {
+    /// Stamps that change nothing yet.
+    pub fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            conditions: Vec::new(),
+            met_at_ms: None,
+            last_error: None,
+            landing_commit: None,
+            evaluated_at_ms: None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.conditions.is_empty()
+            && self.met_at_ms.is_none()
+            && self.last_error.is_none()
+            && self.landing_commit.is_none()
+            && self.evaluated_at_ms.is_none()
+    }
+
+    /// The minute to record an evaluation at `now_ms` under, unless the
+    /// watch already shows that minute or a later one.
+    pub fn evaluation_due(watch: &Watch, now_ms: i64) -> Option<i64> {
+        let minute = now_ms - now_ms.rem_euclid(EVALUATED_EVERY_MS);
+        watch
+            .evaluated_at_ms()
+            .is_none_or(|at| at < minute)
+            .then_some(minute)
+    }
+
     /// Write the stamps into `watch`. A watch that is already met keeps its
     /// time, and a condition that was replaced since keeps its record.
     pub fn apply(&self, watch: &mut Watch) -> Applied {
@@ -1050,6 +1133,20 @@ impl WatchStamps {
             && watch.last_error != *error
         {
             watch.last_error.clone_from(error);
+            applied.changed = true;
+        }
+        if let Some(oid) = &self.landing_commit
+            && watch.landing_commit() != Some(oid)
+        {
+            watch
+                .extra
+                .insert(LANDING_COMMIT.to_owned(), Value::String(oid.clone()));
+            applied.changed = true;
+        }
+        if let Some(at) = self.evaluated_at_ms
+            && watch.evaluated_at_ms().is_none_or(|stored| stored < at)
+        {
+            watch.extra.insert(EVALUATED_AT.to_owned(), at.into());
             applied.changed = true;
         }
         // A stale stamp means "met" was judged on other conditions.
@@ -1119,10 +1216,10 @@ pub fn evaluate(watch: &Watch, facts: &WatchFacts, now_ms: i64) -> Evaluation {
     let met = !truths.is_empty() && truths.iter().all(|truth| *truth == Truth::Holds);
     let last_error = (watch.last_error != error).then_some(error);
     let stamps = (met || !conditions.is_empty() || last_error.is_some()).then(|| WatchStamps {
-        id: watch.id.clone(),
         conditions,
         met_at_ms: met.then_some(now_ms),
         last_error,
+        ..WatchStamps::new(&watch.id)
     });
     Evaluation {
         truths,

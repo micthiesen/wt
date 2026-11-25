@@ -15,6 +15,7 @@ pub mod host_cleanup;
 pub mod install;
 pub mod lifecycle_ops;
 pub mod managed;
+pub mod merge_arm;
 pub mod origin;
 pub mod remote;
 pub mod restack_action;
