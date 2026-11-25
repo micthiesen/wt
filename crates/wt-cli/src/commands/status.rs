@@ -969,7 +969,7 @@ fn report_replaced_note(previous: Option<&str>, current: Option<&str>, append: b
 fn note_budget_hint(state: WorkState, note: Option<&str>) {
     if state == WorkState::Ready && note.is_some_and(|note| note.chars().count() > 500) {
         println!(
-            "note is long; a concise ready note is easier to review. Keep one line of outcome, then OPS / REVERT / IF WRONG / UNTESTED."
+            "note is long; a concise ready note is easier to review. Keep one line of outcome, then the OPS lines that apply / REVERT / IF WRONG / UNTESTED."
         );
     }
 }

@@ -73,15 +73,26 @@ with `wt merge`, never `gh pr merge --auto`.
 The ready note is about 400 characters of fragments:
 
     <one line: what changes, in user terms>
-    OPS:      <migrations / redeploys / config, or "none">
+    OPS BEFORE MERGE:   <step that must happen before this merges>
+    OPS AFTER MERGE:    <step once it is deployed to staging>
+    OPS BEFORE RELEASE: <step before the production release that carries it>
+    OPS AFTER RELEASE:  <step once it is in production>
     REVERT:   <"safe", or "no:" + the shortest true reason>
     IF WRONG: <where it shows + the symptom>
     UNTESTED: <checks nobody ran, creating no obligation; omit when none>
 
+- Write an `OPS` line only for a phase that has a step, and `OPS: none` when
+  none does. Every op is yours: perform it at its phase, asking approval where
+  the action needs it, and never hand it to the human. Prefer automation that
+  ships with the change, such as a checked-in migration the normal deploy
+  applies; a step the merge and deploy flow already performs is not an op.
+- An `OPS BEFORE MERGE` step still undone means the branch must not merge:
+  pair it with `--blocked-on`. A later op is one you come back for; when it is
+  a check, pair it with the matching `--verify-in-<stage>`.
 - `--blocked-on "<gate>"` only when merging now would make things worse until
   an external prerequisite happens, never only in the note. A manual deploy or
-  follow-up that leaves the status quo unchanged is not a gate; it goes in
-  `OPS:`. `wt status --unblock` clears a satisfied gate.
+  follow-up that leaves the status quo unchanged is not a gate; it goes in an
+  `OPS AFTER` line. `wt status --unblock` clears a satisfied gate.
 - `--verify-in-staging` or `--verify-in-production` as soon as you know a
   specific check can only run once deployed there. It does not block merging;
   when the change reaches that stage the row returns as `needs-testing`.
