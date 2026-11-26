@@ -12,8 +12,9 @@ pub use evaluate::{
     watch_rule,
 };
 pub use ledger::{
-    AutomationLedger, BREAKER_LIMIT, BreakerState, DispatchClaim, DispatchClaimResult,
-    DispatchKind, DispatchPolicy, DispatchRequest, LedgerError, LedgerRecord, LedgerSnapshot,
+    AutomationLedger, BREAKER_LIMIT, BreakerState, CHECK_WAKE_SEED_WINDOW_MS, DispatchClaim,
+    DispatchClaimResult, DispatchKind, DispatchPolicy, DispatchRequest, LedgerError, LedgerRecord,
+    LedgerSnapshot,
 };
 pub use queue::{
     CancellableFiresInput, LOCAL_SIGHTING_WINDOW_MS, QueueIntentsInput, cancellable_fires,

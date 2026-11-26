@@ -770,6 +770,36 @@ fn record_step(
     log.append(&step.slug, &event)
 }
 
+/// A status write stopped owing checks without closing them through
+/// [`Store::close_checks`]: a status that drops them, a cleared status, or
+/// an edit that removed one. Each gets its history event, so no check
+/// leaves the list unrecorded. A verified status closed them; anything
+/// else dropped them.
+pub(crate) fn log_checks_left(
+    log: &EventLog<'_>,
+    slug: &str,
+    previous: Option<&WorkStatusRecord>,
+    next: Option<&WorkStatusRecord>,
+    by: Option<&str>,
+) -> Result<(), StoreError> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let kept = next.map(WorkStatusRecord::open_checks).unwrap_or_default();
+    let change = if next.is_some_and(|next| next.state == "verified") {
+        OwedChange::Done
+    } else {
+        OwedChange::Dropped
+    };
+    previous
+        .open_checks()
+        .iter()
+        .filter(|(stage, _)| !kept.iter().any(|(still, _)| still == stage))
+        .try_for_each(|(stage, check)| {
+            record_check(log, slug, *stage, check, change, None, by, None)
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_check(
     log: &EventLog<'_>,

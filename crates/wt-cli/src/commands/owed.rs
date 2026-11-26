@@ -115,6 +115,43 @@ pub(crate) fn owes_json(items: &[OwedItem], clock: LocalClock) -> Value {
         .collect()
 }
 
+/// One worktree as `wt owed --json` prints it, alone or in the `--all`
+/// array: the same object either way.
+fn row_json(slug: &str, kind: &str, owed: &RowOwed, clock: LocalClock) -> Value {
+    json!({
+        "slug": slug,
+        "kind": kind,
+        "landing": owed.landing.word(),
+        "owed_phase": phase_json(owed.phase),
+        "owes": owes_json(&owed.items, clock),
+    })
+}
+
+/// Why a check cannot be closed on a worktree known not to have merged: a
+/// check is owed after merging, and closing the last one would replace the
+/// whole status (state, risk, gate) with `verified`. `None` when the work
+/// has landed or its landing is unknown; unknown stays permissive, since
+/// the person may know of a merge wt could not read.
+pub(crate) fn not_merged_refusal(
+    slug: &str,
+    landing: RowLanding,
+    stages: &[VerifyStage],
+) -> Option<String> {
+    let first = stages.first()?;
+    if landing.is_unknown() || landing.shown().base {
+        return None;
+    }
+    let names = stages
+        .iter()
+        .map(|stage| stage.as_str())
+        .collect::<Vec<_>>()
+        .join(" and ");
+    Some(format!(
+        "{slug} has not merged, so the check in {names} cannot be closed yet: a check is run once the change is deployed there. To stop owing it instead: wt status --no-verify-in-{}",
+        first.as_str()
+    ))
+}
+
 /// The "owed_phase" value of the JSON surfaces: due, waiting, done or null.
 pub(crate) fn phase_json(phase: Option<OwedPhase>) -> Value {
     json!(phase.map(OwedPhase::as_str))
@@ -194,11 +231,17 @@ pub(crate) async fn who(ctx: &AppContext, record: &WorktreeRecord) -> String {
 
 /// What the live worktree owes right now, read fresh.
 pub(crate) async fn read(ctx: &AppContext, record: &WorktreeRecord) -> Result<RowOwed> {
+    read_for(ctx, record, Want::Lists).await
+}
+
+/// [`read`] for a surface that also reports the row's phase, which needs
+/// the landing of a row that owes nothing too.
+async fn read_for(ctx: &AppContext, record: &WorktreeRecord, want: Want) -> Result<RowOwed> {
     let state = ctx
         .database
         .call(|store| Ok(store.read_wt_state()?))
         .await?;
-    let landing = landing::read_one(ctx, record, &state, Want::Lists).await;
+    let landing = landing::read_one(ctx, record, &state, want).await;
     Ok(derive(
         &state,
         record.target.slug(),
@@ -238,7 +281,8 @@ pub struct OwedArgs {
     /// release, then waiting by what it waits for.
     #[arg(long)]
     pub all: bool,
-    /// Print JSON: an array of items (id, kind, state, stage, when, what,
+    /// Print JSON: the worktree (slug, kind, landing, owed_phase, owes),
+    /// whose owes is an array of items (id, kind, state, stage, when, what,
     /// before_release, overdue, due_at), or with --all an array of
     /// worktrees (slug, kind, landing, owed_phase, owes).
     #[arg(long)]
@@ -296,7 +340,7 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
                 if args.json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&owes_json(&owed.items, clock))?
+                        serde_json::to_string_pretty(&row_json(slug, "removed", &owed, clock))?
                     );
                 } else {
                     println!(
@@ -309,15 +353,16 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
         }
     };
     if let Some(record) = record {
-        let owed = read(ctx, &record).await?;
         let slug = record.target.slug();
         if args.json {
+            let owed = read_for(ctx, &record, Want::Phases).await?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&owes_json(&owed.items, clock))?
+                serde_json::to_string_pretty(&row_json(slug, "live", &owed, clock))?
             );
             return Ok(0);
         }
+        let owed = read(ctx, &record).await?;
         let who = who(ctx, &record).await;
         println!("{}", owed_text(&who, slug, &owed, clock));
         if owed.tells > 0 {
@@ -372,15 +417,7 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
     if args.json {
         let listing = fleet
             .iter()
-            .map(|(slug, kind, owed)| {
-                json!({
-                    "slug": slug,
-                    "kind": kind,
-                    "landing": owed.landing.word(),
-                    "owed_phase": phase_json(owed.phase),
-                    "owes": owes_json(&owed.items, clock),
-                })
-            })
+            .map(|(slug, kind, owed)| row_json(slug, kind, owed, clock))
             .collect::<Vec<_>>();
         println!("{}", serde_json::to_string_pretty(&listing)?);
         return Ok(0);
@@ -714,6 +751,25 @@ async fn close(
         .collect::<Vec<_>>();
     if stages.is_empty() {
         return Ok(failed);
+    }
+    if let Some(record) = record {
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await?;
+        let landing = landing::read_one(ctx, record, &state, Want::Lists).await;
+        let owed = wt_core::parse_work_status(&state["slugs"][slug]["work"])
+            .map(|work| work.open_checks())
+            .unwrap_or_default();
+        let asked = stages
+            .iter()
+            .copied()
+            .filter(|stage| owed.iter().any(|(owed, _)| owed == stage))
+            .collect::<Vec<_>>();
+        if let Some(refusal) = not_merged_refusal(slug, landing, &asked) {
+            eprintln!("{refusal}");
+            return Ok(true);
+        }
     }
     let verified = verified_record(
         record.and_then(|record| record.head_sha.as_deref()),
@@ -1688,5 +1744,41 @@ mod tests {
                 .any(|item| item.kind == OwedKind::Step && item.state == OwedState::Due)
         );
         fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_check_is_not_closed_on_a_worktree_known_not_to_have_merged() {
+        let stages = [VerifyStage::Staging, VerifyStage::Production];
+        let unmerged = RowLanding::known(Landing::NONE);
+        assert_eq!(
+            not_merged_refusal("one", unmerged, &stages).as_deref(),
+            Some(
+                "one has not merged, so the check in staging and production cannot be closed yet: a check is run once the change is deployed there. To stop owing it instead: wt status --no-verify-in-staging"
+            )
+        );
+        // Merged, or not known either way: closing goes ahead.
+        let merged = RowLanding::known(Landing::new(true, false, true));
+        assert_eq!(not_merged_refusal("one", merged, &stages), None);
+        let unknown = RowLanding::unknown(Landing::NONE);
+        assert_eq!(not_merged_refusal("one", unknown, &stages), None);
+        // Nothing named that is owed: the ordinary "owes no check" answer.
+        assert_eq!(not_merged_refusal("one", unmerged, &[]), None);
+    }
+
+    #[test]
+    fn one_worktree_and_the_fleet_print_the_same_json_object() {
+        let owed = RowOwed {
+            items: Vec::new(),
+            phase: Some(OwedPhase::Done),
+            tells: 0,
+            landing: RowLanding::known(Landing::new(true, false, true)),
+        };
+        assert_eq!(
+            row_json("one", "live", &owed, clock()),
+            json!({
+                "slug": "one", "kind": "live", "landing": "landed",
+                "owed_phase": "done", "owes": [],
+            })
+        );
     }
 }

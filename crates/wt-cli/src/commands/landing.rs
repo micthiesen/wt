@@ -36,7 +36,7 @@ impl RowLanding {
         }
     }
 
-    pub(super) const fn unknown(landing: Landing) -> Self {
+    pub(crate) const fn unknown(landing: Landing) -> Self {
         Self {
             landing,
             known: false,

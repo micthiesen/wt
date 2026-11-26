@@ -159,8 +159,9 @@ wt wake 1h -m "babysit: not merged yet? read the row for an eviction"
 
 A repository with a `pr.merge_dropped` automation prompts you sooner. Each
 time you are woken unmerged, read the row and set the time wake again. A
-wake delivered after the PR merged stays owed: once merged, cancel the
-leftover time wake (`wt watch cancel <id>`), and close the `merged` one with
+wake delivered after the PR merged stays owed, whichever one it is: once
+merged, cancel every babysit wake still pending (`wt watch cancel --mine`: the
+1h one and any `10m` or `green` pass), and close the `merged` one with
 `wt done <id> -m "<what you did>"` when the list below is done.
 
 When the PR is open and not draft but has no `.merge_queue` entry and

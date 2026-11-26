@@ -478,11 +478,38 @@ impl AutomationEngine {
             )
             .cloned()
             .collect::<BTreeSet<_>>();
-        let ledger = self
+        let mut ledger = self
             .ledger
             .snapshot()
             .await
             .context("read automation ledger")?;
+        // A check that was due before wt began waking sessions for due
+        // checks is not prompted for: after an upgrade that would be every
+        // long-merged row a person is already handling.
+        if ledger.seeding_check_wakes(input.now_ms) {
+            let due = current
+                .iter()
+                .filter(|fire| wt_automations::is_check_wake(fire))
+                .filter(|fire| !fire.fire_keys.iter().all(|key| ledger.recorded(key)))
+                .map(|fire| (fire.fire_keys.clone(), fire.slug.clone()))
+                .collect::<Vec<_>>();
+            if !due.is_empty() || !ledger.check_wakes_begun() {
+                self.ledger
+                    .seed_check_wakes(
+                        &due,
+                        wt_automations::CHECK_RULE_ID,
+                        input.now_ms,
+                        &self.cancellation,
+                    )
+                    .await
+                    .context("record the checks already due")?;
+                ledger = self
+                    .ledger
+                    .snapshot()
+                    .await
+                    .context("read automation ledger")?;
+            }
+        }
         self.recent = ledger.recent(RECENT_HISTORY);
         let handled = QueueIntentsInput::handled_keys(
             &candidates,
@@ -498,7 +525,15 @@ impl AutomationEngine {
                 report.settled_watches.push(SettledWatch {
                     id: watch.id.clone(),
                     action: watch.action,
-                    landing: watch.landing,
+                    // The landing the fire was claimed under, not this
+                    // pass's: a wake delivered before the work landed
+                    // closed on delivery, and its prompt said nothing of
+                    // closing it.
+                    landing: fire
+                        .fire_keys
+                        .iter()
+                        .find_map(|key| ledger.owner_landing(key))
+                        .unwrap_or(wt_core::OwnerLanding::NotLanded),
                     unconfirmed: !fire.fire_keys.iter().all(|key| ledger.delivered(key)),
                 });
             }
@@ -715,6 +750,11 @@ impl AutomationEngine {
             let policy = DispatchPolicy {
                 cooldown_ms,
                 breaker_limit: (!breaker_exempt).then_some(wt_automations::BREAKER_LIMIT),
+                owner_landing: fire
+                    .watch
+                    .as_ref()
+                    .filter(|watch| watch.action == wt_core::watch::WatchAction::Wake)
+                    .map(|watch| watch.landing),
             };
             match self
                 .ledger
@@ -2225,6 +2265,65 @@ mod tests {
         assert_eq!(tick.claims[0].fire().quiesce_slugs, ["worktree"]);
     }
 
+    /// The first passes of a build that wakes sessions for due checks find
+    /// every check that was already due, on rows a person is handling.
+    /// Those are not prompted for; a check that comes due later is.
+    #[tokio::test]
+    async fn a_check_already_due_when_wt_first_looks_wakes_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let owing = |slug: &str, landed: bool| {
+            let mut owing = row();
+            owing.slug = slug.into();
+            owing.local_merged = landed.then_some(true);
+            let mut work = wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "t");
+            work.set_check(wt_core::VerifyStage::Staging, "1. open the page");
+            owing.work = Some(work);
+            owing
+        };
+        let context = AutomationEvalContext::default();
+        let (requirements, idle, activity) =
+            (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let window = wt_automations::CHECK_WAKE_SEED_WINDOW_MS;
+        // The landing of "late" is not known on the first pass and arrives
+        // on the next: it was due all along too.
+        let first = [
+            owing("old", true),
+            owing("late", false),
+            owing("new", false),
+        ];
+        let second = [owing("old", true), owing("late", true), owing("new", false)];
+        let third = [owing("old", true), owing("late", true), owing("new", true)];
+        let mut pass = async |rows: &[AutomationRow], at| {
+            engine
+                .tick(input(
+                    &[],
+                    rows,
+                    &context,
+                    &requirements,
+                    &idle,
+                    &activity,
+                    at,
+                ))
+                .await
+                .unwrap()
+                .claims
+                .iter()
+                .map(|claim| claim.fire().slug.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(pass(&first, start).await.is_empty());
+        assert!(pass(&second, start + 30_000).await.is_empty());
+        // Nothing passed over comes back once the window has closed.
+        assert!(pass(&second, start + window).await.is_empty());
+        // A check that comes due after that wakes its session.
+        assert_eq!(pass(&third, start + window + 1).await, ["new"]);
+        let snapshot = ledger.snapshot().await.unwrap();
+        assert!(!snapshot.seeding_check_wakes(start + window));
+    }
+
     /// wt's own wake for a due check needs no rule and behaves like a wake:
     /// it waits for the session, a pause or a cleared queue consumes
     /// nothing, and it is delivered once per obligation.
@@ -2243,6 +2342,18 @@ mod tests {
         let (requirements, activity) = (BTreeMap::new(), RuntimeActivity::default());
         let (busy, idle) = (busy_session(), BTreeMap::new());
         let start = now_ms();
+        // wt has been waking sessions for due checks for a while: this
+        // check came due since.
+        let began = start - wt_automations::CHECK_WAKE_SEED_WINDOW_MS;
+        ledger
+            .seed_check_wakes(
+                &[],
+                wt_automations::CHECK_RULE_ID,
+                began,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
 
         let mut paused = input(&[], &rows, &context, &requirements, &idle, &activity, start);
         paused.globally_paused = true;
@@ -2376,6 +2487,67 @@ mod tests {
                 action: WatchAction::Wake,
                 landing: wt_core::OwnerLanding::Landed,
                 unconfirmed: true,
+            }]
+        );
+    }
+
+    /// A wake delivered before its worktree landed closed on delivery, and
+    /// its prompt said nothing of closing it. Settled after a restart, by
+    /// which time the work has landed, it still closes: the landing is the
+    /// one its fire was claimed under.
+    #[tokio::test]
+    async fn a_wake_settled_after_a_restart_keeps_the_landing_it_was_delivered_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let context = watching(vec![met("aaaaaa", &[(WatchAction::Wake, "go")])]);
+        let (requirements, quiescence, activity) =
+            (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let before = [row()];
+        let tick = engine
+            .tick(input(
+                &[],
+                &before,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            tick.claims[0].fire().watch.as_ref().unwrap().landing,
+            wt_core::OwnerLanding::NotLanded
+        );
+        engine
+            .finish(&tick.claims[0], DONE, start + 1)
+            .await
+            .unwrap();
+        let mut landed = row();
+        landed.local_merged = Some(true);
+        let after = [landed];
+        let mut restarted = AutomationEngine::new(ledger, CancellationToken::new());
+        let tick = restarted
+            .tick(input(
+                &[],
+                &after,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start + 2,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            tick.settled_watches,
+            [SettledWatch {
+                id: "aaaaaa".into(),
+                action: WatchAction::Wake,
+                landing: wt_core::OwnerLanding::NotLanded,
+                unconfirmed: false,
             }]
         );
     }

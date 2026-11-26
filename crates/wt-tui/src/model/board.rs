@@ -602,17 +602,36 @@ pub struct BoardSection {
 }
 
 impl Board {
-    /// The rows a section shows that deleting it would move: drawn in it,
-    /// not archived, not being removed, not a pending creation. Sorted keys,
-    /// so the TUI's witness and the host's check compare equal.
-    pub fn section_witness(&self, name: &str) -> Vec<String> {
-        let mut keys: Vec<String> = self
+    /// The unarchived rows that belong to a named section, as indices in
+    /// board order: those drawn in it, and those filed in it but drawn in a
+    /// derived block. What is stored decides, because that is what deleting
+    /// or counting the section acts on.
+    pub fn section_members(&self, name: &str) -> Vec<usize> {
+        let drawn: std::collections::BTreeSet<usize> = self
             .sections
             .iter()
             .filter(|section| section.key == name)
-            .flat_map(|section| &section.rows)
-            .filter_map(|&row| self.rows.get(row))
-            .filter(|row| !row.archived && row.removal.is_none() && !row.pending_creation)
+            .flat_map(|section| section.rows.iter().copied())
+            .collect();
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(index, row)| {
+                !row.archived && (drawn.contains(index) || row.filed_in.as_deref() == Some(name))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The rows deleting a section would move: its members that are not
+    /// being removed and not a pending creation. Sorted keys, so the TUI's
+    /// witness and the host's check of the stored placement compare equal.
+    pub fn section_witness(&self, name: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .section_members(name)
+            .into_iter()
+            .map(|row| &self.rows[row])
+            .filter(|row| row.removal.is_none() && !row.pending_creation)
             .map(|row| row.key.clone())
             .collect();
         keys.sort();
@@ -1165,6 +1184,12 @@ pub struct BoardRow {
     pub title: String,
     pub branch: String,
     pub base_branch: Option<String>,
+    /// The named section the row is filed in, whatever it is drawn under:
+    /// a landed row under `[ui] owed_sections` is drawn in a derived block
+    /// and stays filed where it was. `None` for the Inbox, and for a row
+    /// whose placement its host has not prepared here.
+    #[serde(default)]
+    pub filed_in: Option<String>,
     /// The repository's main checkout.
     #[serde(default)]
     pub is_main: bool,

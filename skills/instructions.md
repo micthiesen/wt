@@ -64,8 +64,8 @@ The checkout is shared with other agents, the human, and hot-reloading servers.
 
 ### What you still owe
 
-`wt owed`, like every command below, lists what this worktree owes and what
-closes it. A row owing nothing is finished; the note never holds owed work:
+`wt owed` lists what this worktree owes and what closes it. A row owing
+nothing is finished; the note never holds owed work:
 
 - A prerequisite before merging is `--blocked-on "<gate>"`, only when merging
   now would make things worse until it happens (a manual deploy or follow-up
@@ -87,8 +87,8 @@ closes it. A row owing nothing is finished; the note never holds owed work:
 - A due check, and a wake delivered after the work merged, stay owed (and hold
   off cleanup) until closed, even when moot: do it on a deploy that contains
   the change, then `wt done <id|staging|production> -m "<evidence>"`.
-- To change it: `wt done <target> --again <condition>` puts it off,
-  `wt watch cancel <id>` (or `--mine`) drops a pending wake,
+- To change it: `wt done <target> --again <condition>` puts it off (a check
+  takes a time only), `wt watch cancel <id>` (or `--mine`) drops a pending wake,
   `wt status --no-verify-in-<stage>` drops a check.
 - Every op is yours: do it when due, asking approval where the action needs
   it, never handing it to the human. Prefer automation that ships with the
@@ -119,8 +119,8 @@ The ready note is about 400 characters of fragments:
     UNTESTED: <checks nobody ran, creating no obligation; omit when none>
 
 - Write `OPS: none` only when nothing is owed; wt refuses `OPS` phase lines.
-- A branch that will never land: close its PR, then
-  `wt status dropped -m "<why>"`.
+- A branch that will never land: close its PR, `wt status dropped -m "<why>"`,
+  then `wt watch cancel --mine`.
 
 ### Fleet coordination
 

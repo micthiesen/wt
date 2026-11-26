@@ -20,6 +20,11 @@ use tokio_util::sync::CancellationToken;
 use wt_platform::lock::{FileLock, LockError};
 
 const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// When this ledger first met a build that wakes sessions for due checks.
+const CHECK_WAKES_FROM: &str = "checkWakesFrom";
+/// How long after that a check found due is taken as due all along. Landing
+/// and deploy facts arrive over the first passes, so one pass cannot tell.
+pub const CHECK_WAKE_SEED_WINDOW_MS: i64 = 10 * 60 * 1000;
 pub const BREAKER_LIMIT: u64 = 2;
 /// Coarsest file timestamp wt can meet (FAT stores two-second mtimes).
 const STAMP_SETTLE_SECS: i64 = 2;
@@ -161,10 +166,12 @@ struct LedgerView {
     last_dispatch: Map<String, Value>,
     breaker: Map<String, Value>,
     deferred: Map<String, Value>,
+    check_wakes_from: Option<i64>,
 }
 
 impl LedgerView {
     fn from_root(mut root: Value) -> Self {
+        let check_wakes_from = number(root.get(CHECK_WAKES_FROM));
         let mut take = |field: &str| match root.get_mut(field).map(Value::take) {
             Some(Value::Object(map)) => map,
             _ => Map::new(),
@@ -174,6 +181,7 @@ impl LedgerView {
             last_dispatch: take("lastDispatch"),
             breaker: take("breaker"),
             deferred: take("deferred"),
+            check_wakes_from,
         }
     }
 }
@@ -184,6 +192,10 @@ pub struct DispatchPolicy {
     pub cooldown_ms: Option<i64>,
     /// Consecutive-dispatch breaker limit. `None` exempts the fire.
     pub breaker_limit: Option<u64>,
+    /// For a watch's wake: whether its worktree had landed when the fire
+    /// was evaluated. Kept with the claim, so a wake that is settled after
+    /// a restart is settled by the landing it was delivered under.
+    pub owner_landing: Option<wt_core::OwnerLanding>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -281,6 +293,34 @@ impl LedgerSnapshot {
             .fired
             .get(key)
             .is_some_and(|entry| entry.get("state").and_then(Value::as_str) == Some("delivered"))
+    }
+
+    /// The landing a wake's fire was claimed under; see
+    /// [`DispatchPolicy::owner_landing`]. `None` for an entry that records
+    /// none: any other fire, or one claimed by a build from before due
+    /// steps, whose wake closed on delivery.
+    pub fn owner_landing(&self, key: &str) -> Option<wt_core::OwnerLanding> {
+        serde_json::from_value(self.view.fired.get(key)?.get("ownerLanding")?.clone()).ok()
+    }
+
+    /// Whether a check found due at `now_ms` was due before wt began waking
+    /// sessions for due checks: its session is not prompted for it. True
+    /// until the ledger has recorded that beginning, and for
+    /// [`CHECK_WAKE_SEED_WINDOW_MS`] after it.
+    pub fn seeding_check_wakes(&self, now_ms: i64) -> bool {
+        self.view
+            .check_wakes_from
+            .is_none_or(|from| now_ms.saturating_sub(from) < CHECK_WAKE_SEED_WINDOW_MS)
+    }
+
+    /// Whether the ledger holds any record of `key`, whatever its state.
+    pub fn recorded(&self, key: &str) -> bool {
+        self.view.fired.contains_key(key)
+    }
+
+    /// Whether [`AutomationLedger::seed_check_wakes`] has run at all.
+    pub fn check_wakes_begun(&self) -> bool {
+        self.view.check_wakes_from.is_some()
     }
 
     /// Whether `key` was recorded no longer than `window_ms` ago. An entry
@@ -535,16 +575,17 @@ impl AutomationLedger {
 
             let fired = ensure_object(root, "fired");
             for key in &claim_for_write.keys {
-                fired.insert(
-                    key.clone(),
-                    json!({
-                        "state":"dispatched", "at":now_ms,
-                        "ruleId":claim_for_write.rule_id, "slug":claim_for_write.slug,
-                        "claimId":claim_for_write.claim_id, "kind":claim_for_write.kind,
-                        "breakerReserved":claim_for_write.breaker_reserved,
-                        "owner":owner,
-                    }),
-                );
+                let mut entry = json!({
+                    "state":"dispatched", "at":now_ms,
+                    "ruleId":claim_for_write.rule_id, "slug":claim_for_write.slug,
+                    "claimId":claim_for_write.claim_id, "kind":claim_for_write.kind,
+                    "breakerReserved":claim_for_write.breaker_reserved,
+                    "owner":owner,
+                });
+                if let Some(landing) = policy.owner_landing {
+                    entry["ownerLanding"] = json!(landing);
+                }
+                fired.insert(key.clone(), entry);
             }
             if commit_cooldown_at_claim {
                 let last = ensure_object(root, "lastDispatch");
@@ -700,6 +741,41 @@ impl AutomationLedger {
                 );
             }
             !unseen.is_empty()
+        })
+        .await
+    }
+
+    /// Record that wt wakes sessions for due checks from `now_ms` on (kept
+    /// from the first call), and mark `fires` (keys and slug of checks that
+    /// were already due) as skipped, so nobody is prompted for a check that
+    /// was due before this began.
+    pub async fn seed_check_wakes(
+        &self,
+        fires: &[(Vec<String>, String)],
+        rule_id: &str,
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.mutate("seed check wakes", cancellation, |root| {
+            if number(root.get(CHECK_WAKES_FROM)).is_none()
+                && let Some(root) = root.as_object_mut()
+            {
+                root.insert(CHECK_WAKES_FROM.into(), json!(now_ms));
+            }
+            let fired = ensure_object(root, "fired");
+            for (keys, slug) in fires {
+                for key in keys {
+                    if !fired.contains_key(key) {
+                        fired.insert(
+                            key.clone(),
+                            json!({
+                                "state":"skipped", "at":now_ms, "ruleId":rule_id, "slug":slug,
+                                "reason":"already due when wt began waking sessions for due checks",
+                            }),
+                        );
+                    }
+                }
+            }
         })
         .await
     }
@@ -1658,6 +1734,7 @@ mod tests {
         let policy = DispatchPolicy {
             cooldown_ms: Some(60_000),
             breaker_limit: Some(BREAKER_LIMIT),
+            ..Default::default()
         };
         let (first, second) = tokio::join!(
             first_ledger.claim_dispatch_checked(
@@ -1718,6 +1795,7 @@ mod tests {
         let policy = DispatchPolicy {
             cooldown_ms: None,
             breaker_limit: Some(BREAKER_LIMIT),
+            ..Default::default()
         };
         let first = ledger
             .claim_dispatch_checked(request(&["one".into()], "r", "s", policy, now), &cancel)
@@ -1775,6 +1853,7 @@ mod tests {
         let policy = DispatchPolicy {
             cooldown_ms: Some(60_000),
             breaker_limit: None,
+            ..Default::default()
         };
         let first = ledger
             .claim_dispatch_checked(

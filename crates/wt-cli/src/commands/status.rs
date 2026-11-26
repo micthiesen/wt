@@ -821,7 +821,6 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             {
                 return Ok(code);
             }
-            let dropped = drop_checks(ctx, &slug, &unverify).await?;
             let mut next = WorkStatusRecord::new(work_state, now_iso());
             next.sha = record.head_sha.clone();
             next.by = std::env::var("WT_AGENT")
@@ -830,7 +829,11 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 .filter(|s| !s.is_empty());
             next.risk = risk;
             next.blocked_on = blocked;
-            let list_asked = !verify.is_empty() || dropped || next.blocked_on.is_some();
+            let list_asked =
+                !verify.is_empty() || !unverify.is_empty() || next.blocked_on.is_some();
+            // A dropped check goes in the same write as the rest, so a
+            // command that is refused drops nothing.
+            let drops = unverify.clone();
             let write = update_status(&ctx.database, &slug, move |previous| {
                 let merged = merge_note(
                     previous.as_ref().and_then(|p| p.note.as_deref()),
@@ -841,7 +844,10 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 wt_ops::status_checks::assert_checks(
                     &mut next,
                     previous.as_ref(),
-                    verify.into_iter().map(Verify::edit),
+                    verify
+                        .into_iter()
+                        .map(Verify::edit)
+                        .chain(drops.into_iter().map(drop_edit)),
                 );
                 let owes = steps_owed || record_owes(&next);
                 next.note = settle_ops_none(merged, note.as_deref(), owes)?;
@@ -860,6 +866,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                     return Ok(2);
                 }
             };
+            report_dropped_checks(&slug, previous.as_ref(), &unverify);
             let (previous_note, previous_gate) = previous
                 .map(|previous| (previous.note, previous.blocked_on))
                 .unwrap_or_default();
@@ -890,12 +897,16 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             let owed = super::owed::read(ctx, &record).await?;
             // A plain assertion does not change the list; `ready` repeats
             // it, since that is where what is owed gets handed over.
+            let ended = matches!(work_state, WorkState::Verified | WorkState::Dropped);
             if list_asked
                 || clears.is_some()
                 || previous_gate != next.blocked_on
-                || (work_state == WorkState::Ready && !owed.items.is_empty())
+                || ((work_state == WorkState::Ready || ended) && !owed.items.is_empty())
             {
                 print_owed(ctx, &record, &owed).await;
+                if ended && !owed.items.is_empty() {
+                    println!("{STILL_HOLDS}");
+                }
             } else if work_state == WorkState::Ready
                 && owed.items.is_empty()
                 && !hints_off()
@@ -932,7 +943,6 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             };
             let slug = record.target.slug().to_owned();
             let steps_owed = steps_owed(&state, &slug);
-            let dropped = drop_checks(ctx, &slug, &unverify).await?;
             // Dropping a check is the whole amendment when nothing else was
             // asked for.
             if !unverify.is_empty()
@@ -942,9 +952,13 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 && verify.is_empty()
                 && until.is_none()
             {
+                let dropped = drop_checks(ctx, &slug, &unverify).await?;
                 print_owed(ctx, &record, &super::owed::read(ctx, &record).await?).await;
                 return Ok(i32::from(!dropped));
             }
+            // Otherwise it goes in the same write as the rest, so an
+            // amendment that is refused drops nothing.
+            let drops = unverify.clone();
             let needs_gate = until.is_some();
             let write = update_status(&ctx.database, &slug, {
                 let slug = slug.clone();
@@ -952,6 +966,9 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                     let supplied = note.clone();
                     let mut next =
                         amend_record(&slug, previous, note, risk, blocked, verify, append)?;
+                    for stage in drops {
+                        next.drop_check(stage);
+                    }
                     if needs_gate && next.blocked_on.is_none() {
                         return Err(format!(
                             "{slug} has no gate for --until to clear: add --blocked-on \"<why>\""
@@ -976,6 +993,10 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let previous = previous.expect("an amend is refused without a previous status");
+            report_dropped_checks(&slug, Some(&previous), &unverify);
+            let dropped = unverify
+                .iter()
+                .any(|stage| previous.open_check(*stage).is_some());
             let old_checks = previous.open_checks();
             let previous_note = previous.note;
             let old_gate = previous.blocked_on;
@@ -1079,6 +1100,29 @@ async fn print_owed(ctx: &AppContext, record: &WorktreeRecord, owed: &super::owe
     );
 }
 
+/// What a worktree is told when it ends (verified or dropped) while it
+/// still owes something: the status does not let go of it.
+const STILL_HOLDS: &str = "  these still hold cleanup: cancel a wake you no longer need (wt watch cancel --mine), close a due step (wt done <id> -m \"<evidence>\")";
+
+fn drop_edit(stage: VerifyStage) -> wt_ops::status_checks::CheckEdit {
+    wt_ops::status_checks::CheckEdit::Drop { stage }
+}
+
+/// Say what became of each check a status write was asked to drop.
+/// `previous` is the status the write replaced.
+fn report_dropped_checks(slug: &str, previous: Option<&WorkStatusRecord>, stages: &[VerifyStage]) {
+    for stage in stages {
+        match previous.and_then(|previous| previous.open_check(*stage)) {
+            Some(check) => println!(
+                "✓ {slug} no longer owes the check in {}: {}",
+                stage.as_str(),
+                wt_app_core::watch_view::headline(&check.steps)
+            ),
+            None => println!("  {slug} owed no check in {}", stage.as_str()),
+        }
+    }
+}
+
 /// Stop owing the checks in `stages` without running them. Returns whether
 /// any was owed.
 async fn drop_checks(ctx: &AppContext, slug: &str, stages: &[VerifyStage]) -> Result<bool> {
@@ -1131,9 +1175,20 @@ async fn verify_checks(
     }
     // Under a landing that cannot be read nothing is known to be due, so
     // only the earliest check closes: never more than was asserted.
-    let landing = landing::read_one(ctx, record, state, landing::Want::Lists)
-        .await
-        .shown();
+    let landing = landing::read_one(ctx, record, state, landing::Want::Lists).await;
+    if let Some(refusal) = super::owed::not_merged_refusal(
+        &slug,
+        landing,
+        &previous
+            .open_checks()
+            .iter()
+            .map(|(stage, _)| *stage)
+            .collect::<Vec<_>>(),
+    ) {
+        eprintln!("{refusal}");
+        return Ok(Some(1));
+    }
+    let landing = landing.shown();
     let merged = merge_note(previous.note.as_deref(), note.as_deref(), append, false);
     let verified = super::owed::verified_record(record.head_sha.as_deref(), merged)?;
     let (owner, evidence) = (slug.clone(), note.clone());
@@ -1168,7 +1223,11 @@ async fn verify_checks(
     {
         println!("  note: {note}");
     }
-    print_owed(ctx, record, &super::owed::read(ctx, record).await?).await;
+    let owed = super::owed::read(ctx, record).await?;
+    print_owed(ctx, record, &owed).await;
+    if remaining.is_empty() && !owed.items.is_empty() {
+        println!("{STILL_HOLDS}");
+    }
     Ok(Some(0))
 }
 
@@ -2525,6 +2584,44 @@ mod tests {
                 .unwrap(),
             2
         );
+
+        // A command that is refused drops nothing: the check it also asked
+        // to drop is still owed, for an assertion and for an amendment.
+        let owe = StatusArgs {
+            verify_in_staging: Some("1. check".into()),
+            verify_in_production: Some("1. prod".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &owe).await.unwrap(), 0);
+        let mut refused = ready("ships the fix. OPS: none", None);
+        refused.no_verify_in_staging = true;
+        assert_eq!(run(ctx, &refused).await.unwrap(), 2);
+        assert_eq!(work().await["checks"]["staging"]["steps"], "1. check");
+        let refused = StatusArgs {
+            note_only: Some("OPS: none".into()),
+            no_verify_in_staging: true,
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &refused).await.unwrap(), 2);
+        assert_eq!(work().await["checks"]["staging"]["steps"], "1. check");
+        // One that goes through drops it in the same write, and says so in
+        // the history.
+        let mut accepted = ready("ships the fix.", None);
+        accepted.no_verify_in_staging = true;
+        assert_eq!(run(ctx, &accepted).await.unwrap(), 0);
+        let stored = work().await;
+        assert!(stored["checks"].get("staging").is_none(), "{stored}");
+        assert_eq!(stored["checks"]["production"]["steps"], "1. prod");
+        let dropped = ctx
+            .database
+            .call(|store| Ok(store.read_worktree_events("one", 50)?))
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| wt_core::owed_sentence(&event.event))
+            .filter(|line| line == "dropped: staging check: 1. check")
+            .count();
+        assert!(dropped >= 1);
         fixture.close().await.unwrap();
     }
 }

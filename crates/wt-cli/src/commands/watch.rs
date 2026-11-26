@@ -757,12 +757,44 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
         .iter()
         .filter(|id| !cancelled.iter().any(|watch| watch.id == **id))
         .collect::<Vec<_>>();
+    let due = ctx
+        .database
+        .call(|store| {
+            let mut due = store.list_owed(None)?;
+            due.extend(
+                store
+                    .read_removed_worktrees()?
+                    .iter()
+                    .flat_map(wt_store::RemovedWorktree::owed),
+            );
+            Ok(due)
+        })
+        .await
+        .unwrap_or_default();
     for id in &missing {
         eprintln!(
-            "no watch {id}: it may have fired or been cancelled already (wt watch --all lists the pending ones)"
+            "{}",
+            missing_watch(id, due.iter().find(|step| step.id == **id))
         );
     }
     Ok(i32::from(!missing.is_empty()))
+}
+
+/// Why `id` names no watch to cancel. A wake that was delivered after its
+/// worktree's work landed is no longer a watch: it is a step that is due,
+/// and it is closed, not cancelled.
+fn missing_watch(id: &str, due: Option<&wt_core::OwedRecord>) -> String {
+    match due {
+        Some(step) => format!(
+            "{id} is not a pending watch: its wake was delivered and it is now a step {} owes (\"{}\"). Close it with: wt done {id} --slug {} -m \"<what you did and what you saw>\"",
+            step.slug,
+            wt_app_core::watch_view::headline(&step.what),
+            step.slug
+        ),
+        None => format!(
+            "no watch {id}: it may have fired or been cancelled already (wt watch --all lists the pending ones)"
+        ),
+    }
 }
 
 async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
@@ -1214,5 +1246,27 @@ mod tests {
         };
         assert_eq!(run_watch(ctx, &checked).await.unwrap(), 0);
         fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_due_steps_id_says_it_is_due_and_how_to_close_it() {
+        let step = wt_core::OwedRecord {
+            id: "93co6q".into(),
+            slug: "one".into(),
+            incarnation: None,
+            by: "one".into(),
+            what: "confirm prod logs\nthen report".into(),
+            when_text: "in production".into(),
+            due_at_ms: 0,
+            utc_offset_minutes: 0,
+            unconfirmed: false,
+            before_release: false,
+            extra: Default::default(),
+        };
+        assert_eq!(
+            missing_watch("93co6q", Some(&step)),
+            "93co6q is not a pending watch: its wake was delivered and it is now a step one owes (\"confirm prod logs\"). Close it with: wt done 93co6q --slug one -m \"<what you did and what you saw>\""
+        );
+        assert!(missing_watch("zzzzzz", None).starts_with("no watch zzzzzz: "));
     }
 }

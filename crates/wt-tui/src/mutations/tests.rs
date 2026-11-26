@@ -159,6 +159,41 @@ async fn every_mutation_kind_meets_the_contract() {
                 });
             }),
         ),
+        // A landed row restored under `[ui] owed_sections` goes where what
+        // it owes draws it, not to the Inbox.
+        (
+            row(LayoutChange::Archive { archived: false }),
+            with(|b| {
+                b.display.owed_sections = true;
+                b.rows[0].git.landed_on = Some(crate::LandingKind::Base);
+                b.rows[0].owed_phase = Some(wt_core::OwedPhase::Done);
+                b.rows[0].archived = true;
+                b.sections[0].rows.clear();
+                b.sections.push(BoardSection {
+                    key: ARCHIVED_SECTION.into(),
+                    title: "Archived".into(),
+                    rows: vec![0],
+                    ..Default::default()
+                });
+            }),
+            with(|b| {
+                b.display.owed_sections = true;
+                b.rows[0].git.landed_on = Some(crate::LandingKind::Base);
+                b.rows[0].owed_phase = Some(wt_core::OwedPhase::Done);
+                b.sections[0].rows.clear();
+                b.sections.push(BoardSection {
+                    key: ARCHIVED_SECTION.into(),
+                    title: "Archived".into(),
+                    ..Default::default()
+                });
+                b.sections.push(BoardSection {
+                    key: crate::OwedBlock::Done.key().into(),
+                    title: "Done".into(),
+                    rows: vec![0],
+                    ..Default::default()
+                });
+            }),
+        ),
         (
             row(LayoutChange::MoveSection {
                 section: Some("batch".into()),

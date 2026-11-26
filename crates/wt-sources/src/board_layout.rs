@@ -120,6 +120,10 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         .collect();
     for (index, row) in board.rows.iter_mut().enumerate() {
         let entry = &state["slugs"][&row.key];
+        row.filed_in = entry["section"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         row.creation_placement = entry
             .get("creationAfter")
             .filter(|_| !entry["order"].is_number())
@@ -704,6 +708,13 @@ mod tests {
                 .filter(|section| section.owed_block())
                 .all(|section| section.key.starts_with('\0'))
         );
+        // A row drawn in a block is still filed where it was, and still
+        // counts as its section's: deleting "Batch" is witnessed by all
+        // three rows stored there, not only the one drawn in it.
+        assert_eq!(board.section_witness("Batch"), ["done", "due", "open"]);
+        assert_eq!(board.section_members("Verify in Staging").len(), 1);
+        let due = board.rows.iter().find(|row| row.key == "due").unwrap();
+        assert_eq!(due.filed_in.as_deref(), Some("Batch"));
         // Nothing was written, the manual sections are still what a move
         // may target, and off again is the layout it was.
         assert_eq!(state, before);

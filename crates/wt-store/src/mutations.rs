@@ -1222,6 +1222,13 @@ impl Store {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
                     crate::owed::log_discharged(log, slug, &discharged)?;
+                    crate::owed::log_checks_left(
+                        log,
+                        slug,
+                        previous.as_ref(),
+                        record,
+                        record.and_then(|record| record.by.as_deref()),
+                    )?;
                     log_status(log, slug, previous.as_ref(), record, None)?;
                     crate::watches::log_cancelled(
                         log,
@@ -1248,6 +1255,7 @@ impl Store {
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
+                    crate::owed::log_checks_left(log, slug, previous.as_ref(), None, by)?;
                     log_status(log, slug, previous.as_ref(), None, by)?;
                     crate::watches::log_cancelled(log, &written.cancelled_watches, by)
                 });
@@ -1283,6 +1291,13 @@ impl Store {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
                     crate::owed::log_discharged(log, slug, &discharged)?;
+                    crate::owed::log_checks_left(
+                        log,
+                        slug,
+                        previous.as_ref(),
+                        record.as_ref(),
+                        record.as_ref().and_then(|record| record.by.as_deref()),
+                    )?;
                     log_status(log, slug, previous.as_ref(), record.as_ref(), None)?;
                     crate::watches::log_cancelled(
                         log,

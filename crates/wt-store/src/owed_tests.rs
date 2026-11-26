@@ -353,7 +353,10 @@ fn this_build_dropping_a_check_is_not_undone_by_what_was_stored() {
     assert!(stored(&mut store).open_checks().is_empty());
     assert_eq!(
         owed_events(&store, "one"),
-        ["dropped: staging check: open the page"]
+        [
+            "dropped: staging check: open the page",
+            "dropped: production check: watch the logs",
+        ]
     );
 }
 
@@ -579,6 +582,43 @@ fn removal_keeps_the_checks_beside_the_status_where_an_older_settle_leaves_them(
     assert_eq!(
         owed_events(&store, "one"),
         ["done: staging check: open the page: saw it"]
+    );
+}
+
+#[test]
+fn a_status_that_stops_owing_a_check_records_what_became_of_it() {
+    // Dropped work drops its checks; a cleared status does too.
+    let (_temp, mut store) = store();
+    store.set_slug_work_status("one", Some(&both())).unwrap();
+    let mut dropped = status("dropped");
+    dropped.by = None;
+    store
+        .update_slug_work_status("one", |_| Ok::<_, ()>(Some(dropped)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        owed_events(&store, "one"),
+        [
+            "dropped: staging check: open the page",
+            "dropped: production check: watch the logs",
+        ]
+    );
+    store.set_slug_work_status("one", Some(&both())).unwrap();
+    store.clear_slug_work_status("one", None).unwrap();
+    assert_eq!(owed_events(&store, "one").len(), 4);
+    // An assertion that carries one check and leaves the other out
+    // dropped the other; carrying both records nothing.
+    let (_temp, mut store) = self::store();
+    store.set_slug_work_status("one", Some(&both())).unwrap();
+    let mut carried = both();
+    carried.state = "review".into();
+    store.set_slug_work_status("one", Some(&carried)).unwrap();
+    assert!(owed_events(&store, "one").is_empty());
+    let one = status("review").with_check(PRODUCTION, "watch the logs");
+    store.set_slug_work_status("one", Some(&one)).unwrap();
+    assert_eq!(
+        owed_events(&store, "one"),
+        ["dropped: staging check: open the page"]
     );
 }
 

@@ -212,7 +212,8 @@ fn a_status_change_is_one_event_and_a_note_only_reassertion_is_none() {
             by: Some("manager".into()),
         })
     );
-    assert_eq!(kinds(&store, "one").len(), 5);
+    // The check the cleared status owed was dropped with it, and says so.
+    assert_eq!(kinds(&store, "one").len(), 6);
 }
 
 #[test]
@@ -766,7 +767,8 @@ fn what_happens_while_a_worktree_is_being_created_belongs_to_the_new_incarnation
     store
         .set_slug_work_status("one", Some(&status("verified")))
         .unwrap();
-    assert_eq!(kinds(&store, "one").len(), 4);
+    // The verified status and the check it closed.
+    assert_eq!(kinds(&store, "one").len(), 5);
     assert_eq!(
         kinds(&store, "one")
             .iter()

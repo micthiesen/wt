@@ -759,9 +759,14 @@ impl LifecycleService {
                 .as_ref()
                 .map(RemovedWorktree::owed)
                 .unwrap_or_default();
+            // Due steps belong to an incarnation and are attached once
+            // this one has its creation stamp. Until then they stay where
+            // they are, on the removal record: a wt that dies in between
+            // has lost nothing, and the restore can be asked for again.
+            let kept = prior.removed.clone().filter(|_| !owed_steps.is_empty());
             self.mutate_store(cancellation, {
                 let slug = slug.to_owned();
-                move |store| restore_slug_record(store, &slug, base, owed, None)
+                move |store| restore_slug_record(store, &slug, base, owed, kept)
             })
             .await?;
         }
@@ -849,9 +854,12 @@ impl LifecycleService {
             let slug = slug.to_owned();
             move |store| {
                 store.record_slug_created_since(&slug, &created_at, began)?;
-                // Due steps belong to an incarnation, so they are attached
-                // once this one has its creation stamp.
-                store.restore_owed(&slug, &owed_steps).map(|_| ())
+                if store.restore_owed(&slug, &owed_steps)? {
+                    // They are the worktree's own now: the removal record
+                    // kept for them is spent.
+                    store.clear_removed_worktree(&slug)?;
+                }
+                Ok(())
             }
         })
         .await?;
@@ -5210,7 +5218,74 @@ mod tests {
         assert!(removed.is_empty());
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].id, step);
+
+        // Remove it again and restore with a slow install: while the
+        // restore is under way the step is still on the removal record, so
+        // a wt that died here would not have lost it.
+        let again = service
+            .remove(
+                &created.target,
+                RemoveOptions {
+                    force: true,
+                    delete_branch: false,
+                    ..RemoveOptions::default()
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(again.removed);
+        let history = service
+            .mutate_store(&cancellation, |store| store.read_removed_worktrees())
+            .await
+            .unwrap();
+        assert_eq!(history[0].owed().len(), 1);
+        let mut slow = service.clone();
+        slow.config.install_command = Some("sleep 0.6".into());
+        let restore = slow.create_from_removed(
+            "owing",
+            "michael/owing",
+            &history[0].removed_at,
+            CreateOptions {
+                run_install: true,
+                ..options()
+            },
+            &cancellation,
+        );
+        let midway = async {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            service
+                .mutate_store(&cancellation, |store| {
+                    Ok((store.list_owed(None)?, store.read_removed_worktrees()?))
+                })
+                .await
+                .unwrap()
+        };
+        let (restored, (live_steps, kept)) = tokio::join!(restore, midway);
+        restored.unwrap();
+        assert!(
+            live_steps.is_empty(),
+            "not attached before the creation stamp"
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].owed().len(), 1);
+        let (steps, removed) = service
+            .mutate_store(&cancellation, |store| {
+                Ok((
+                    store.list_owed(Some("owing"))?,
+                    store.read_removed_worktrees()?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(removed.is_empty());
+        assert_eq!(steps.len(), 1);
         // The step is the restored worktree's own.
+        let after = service
+            .read_slug_state("owing", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(steps[0].incarnation.as_deref(), after["createdAt"].as_str());
         assert!(steps[0].incarnation.is_some());
     }

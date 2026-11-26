@@ -69,7 +69,7 @@ fn size(rows: usize) -> String {
 
 /// Rows still on the board (not archived) filed under `name`.
 fn live_rows(board: &Board, name: &str) -> usize {
-    section_rows(board, name).len()
+    board.section_members(name).len()
 }
 
 /// Confirm deleting a section that still has rows: they move to the Inbox.
@@ -79,17 +79,35 @@ pub(super) fn delete_confirm(board: &Board, name: &str) -> LocalMenu {
         return LocalMenu::Notice("section is no longer on the board".into());
     };
     let seen = board.section_witness(name);
-    let slug = |key: &String| {
-        board
-            .rows
+    // A landed row under `[ui] owed_sections` is filed here and drawn in a
+    // derived block: it moves too, so it is named with where to find it.
+    let mut shown = Vec::new();
+    let mut elsewhere = std::collections::BTreeMap::<&str, Vec<&str>>::new();
+    for key in &seen {
+        let Some(index) = board.rows.iter().position(|row| &row.key == key) else {
+            shown.push(key.as_str());
+            continue;
+        };
+        let slug = board.rows[index].slug.as_str();
+        match board
+            .sections
             .iter()
-            .find(|row| &row.key == key)
-            .map_or_else(|| key.clone(), |row| row.slug.clone())
-    };
+            .find(|section| section.key != name && section.rows.contains(&index))
+        {
+            Some(block) => elsewhere.entry(&block.title).or_default().push(slug),
+            None => shown.push(slug),
+        }
+    }
     let mut lines = vec![format!("Its {} move to the Inbox:", size(seen.len()))];
-    lines.extend(seen.iter().take(8).map(|key| format!("  {}", slug(key))));
-    if seen.len() > 8 {
-        lines.push(format!("  … and {} more", seen.len() - 8));
+    lines.extend(shown.iter().take(8).map(|slug| format!("  {slug}")));
+    if shown.len() > 8 {
+        lines.push(format!("  … and {} more", shown.len() - 8));
+    }
+    for (title, slugs) in elsewhere {
+        lines.push(format!(
+            "also filed here, shown under {title}: {}",
+            slugs.join(", ")
+        ));
     }
     LocalMenu::modal(UiModal::Confirm {
         title: format!("Delete section {}?", section.title),
@@ -100,18 +118,6 @@ pub(super) fn delete_confirm(board: &Board, name: &str) -> LocalMenu {
         },
         cancel_key: None,
     })
-}
-
-/// The live (unarchived) rows filed under a section, in board order.
-fn section_rows<'a>(board: &'a Board, name: &str) -> Vec<&'a crate::BoardRow> {
-    board
-        .sections
-        .iter()
-        .filter(|section| section.key == name)
-        .flat_map(|section| &section.rows)
-        .filter_map(|&row| board.rows.get(row))
-        .filter(|row| !row.archived)
-        .collect()
 }
 
 /// The section a row is filed under, or `None` for the Inbox. Derived groups
@@ -274,6 +280,68 @@ mod tests {
         assert_eq!(
             text,
             "restore the archived row before moving it to a section"
+        );
+    }
+
+    #[test]
+    fn deleting_a_section_names_the_rows_filed_in_it_and_drawn_elsewhere() {
+        let row = |key: &str, filed: Option<&str>| BoardRow {
+            key: key.into(),
+            slug: key.into(),
+            filed_in: filed.map(str::to_owned),
+            ..Default::default()
+        };
+        let section = |key: &str, title: &str, rows: Vec<usize>| BoardSection {
+            key: key.into(),
+            title: title.into(),
+            rows,
+            ..Default::default()
+        };
+        // "landed" and "waiting" are filed in Batch and drawn in the blocks
+        // that what they owe puts them in.
+        let board = Board {
+            rows: vec![
+                row("open", Some("Batch")),
+                row("landed", Some("Batch")),
+                row("waiting", Some("Batch")),
+                row("other", Some("Busy")),
+            ],
+            sections: vec![
+                section("Batch", "Batch", vec![0]),
+                section("Busy", "Busy", vec![3]),
+                section(crate::OwedBlock::Waiting.key(), "Waiting", vec![2]),
+                section(crate::OwedBlock::Done.key(), "Done", vec![1]),
+            ],
+            section_order: vec!["Batch".into(), "Busy".into()],
+            ..Default::default()
+        };
+        let LocalMenu::Modal { modal, .. } = delete_confirm(&board, "Batch") else {
+            panic!("a section with rows asks first")
+        };
+        let UiModal::Confirm { lines, action, .. } = *modal else {
+            panic!("expected a confirmation")
+        };
+        assert_eq!(
+            lines,
+            [
+                "Its 3 worktrees move to the Inbox:",
+                "  open",
+                "also filed here, shown under Done: landed",
+                "also filed here, shown under Waiting: waiting",
+            ]
+        );
+        assert_eq!(
+            action,
+            crate::ConfirmAction::DeleteSection {
+                section: "Batch".into(),
+                seen: Seen(vec!["landed".into(), "open".into(), "waiting".into()]),
+            }
+        );
+        // The move picker sizes a section by what is filed in it too.
+        let (_, options, _) = picker(menu(&board, "other"));
+        assert!(
+            options.contains(&named("Batch", "3 worktrees")),
+            "{options:?}"
         );
     }
 }

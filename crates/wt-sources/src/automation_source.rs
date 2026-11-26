@@ -475,10 +475,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     .filter(|_| facts.state_ready)
                     .and_then(|git| git.age())
                     .map(|age| now.saturating_sub(i64::try_from(age.as_millis()).unwrap_or(i64::MAX)));
-                let live = crate::watch_facts::live_owners(&facts.watch_rows, &watches, inventory_read_at.unwrap_or(i64::MIN));
+                let live = crate::watch_facts::live_owners(&facts.watch_rows, &watches, state, inventory_read_at.unwrap_or(i64::MIN));
                 if inventory_read_at.is_some()
                     && orphans_settled_at != Some(revision)
-                    && crate::watch_facts::has_orphans(&watches, &live)
+                    && crate::watch_facts::has_orphans(&watches, &wt_store::stored_owed(state), &live)
                 {
                     orphans_settled_at = Some(revision);
                     let (owners, landings) = (live.clone(), known_landings.clone());
@@ -532,7 +532,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 // The ledger says the fire ran, not that the gate was
                 // written or the wake recorded: a crash between the two
                 // leaves the action on its watch. A wake settles the way its
-                // delivery would have, by the landing this pass evaluated.
+                // delivery would have, by the landing its fire was claimed
+                // under.
                 let at = facts.context.now_ms;
                 let settle = move |store: &mut wt_store::Store| {
                     Ok(wt_ops::watch_actions::settle(

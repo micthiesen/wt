@@ -879,6 +879,79 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// Under `[ui] owed_sections` a landed row is drawn in a derived block
+    /// and stays filed in its section. Deleting that section moves it too,
+    /// and the witness the board builds is the stored placement the host
+    /// checks, so the delete goes through.
+    #[tokio::test]
+    async fn delete_counts_a_landed_row_filed_in_the_section_and_drawn_elsewhere() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        ctx.database
+            .call(|store| {
+                store.place_slug("one", Some("Batch"), false)?;
+                Ok(store.place_slug("two", Some("Batch"), false)?)
+            })
+            .await
+            .unwrap();
+        let facts = ctx
+            .repository
+            .inventory_status(&ctx.cancellation)
+            .await
+            .unwrap();
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let mut board =
+            wt_sources::inventory::board(&ctx.config, &facts, &state, &Default::default());
+        board.display.owed_sections = true;
+        let one = board.rows.iter().position(|row| row.key == "one").unwrap();
+        board.rows[one].git.landed_on = Some(wt_tui::LandingKind::Base);
+        board.rows[one].owed_phase = Some(wt_core::OwedPhase::Done);
+        wt_sources::board_layout::prepare(
+            &mut board,
+            &state,
+            &ctx.config.branch.base,
+            ctx.config.ui.sort,
+        );
+        let drawn = |name: &str| {
+            board
+                .sections
+                .iter()
+                .find(|section| section.title == name)
+                .map(|section| {
+                    section
+                        .rows
+                        .iter()
+                        .map(|&row| board.rows[row].key.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(drawn("Batch"), ["two"]);
+        assert_eq!(drawn("Done"), ["one"]);
+        let seen = board.section_witness("Batch");
+        assert_eq!(seen, ["one", "two"]);
+        // Only what is drawn there is not what is stored there.
+        let partial = delete(ctx, "Batch".into(), Seen(vec!["two".into()]), Some(&board)).await;
+        assert!(partial.is_err());
+        delete(ctx, "Batch".into(), Seen(seen), Some(&board))
+            .await
+            .unwrap();
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(state["slugs"]["one"]["section"].is_null());
+        assert!(state["slugs"]["two"]["section"].is_null());
+        fixture.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reorder_swaps_only_same_rank_units_and_crosses_into_visible_sections() {
         let fixture = wt_app_core::test_support::CommandFixture::new()

@@ -376,12 +376,15 @@ fn closed_unmerged(watch: &Watch, facts: &WatchFacts) -> Option<String> {
     })
 }
 
-/// Each live worktree's `createdAt`, for deciding whose watches are whose.
-/// A watch set after the inventory was read may belong to a worktree the
-/// inventory has not seen yet, so its owner counts as live.
+/// Each live worktree's `createdAt`, for deciding whose watches and due
+/// steps are whose. The inventory may be older than the state: a watch set
+/// after it was read may belong to a worktree it has not seen yet, and so
+/// may a worktree the state records as created (or restored, which carries
+/// its due steps over) since. Their owners count as live.
 pub fn live_owners(
     rows: &BTreeMap<String, RowFacts>,
     watches: &[Watch],
+    state: &serde_json::Value,
     inventory_read_at_ms: i64,
 ) -> BTreeMap<String, Option<String>> {
     let mut live: BTreeMap<_, _> = rows
@@ -394,12 +397,32 @@ pub fn live_owners(
             live.insert(watch.slug.clone(), watch.incarnation.clone());
         }
     }
+    for (slug, entry) in state["slugs"].as_object().into_iter().flatten() {
+        let created = entry["createdAt"].as_str();
+        if created
+            .and_then(wt_core::parse_iso_millis)
+            .is_some_and(|at| at >= inventory_read_at_ms)
+        {
+            live.insert(slug.clone(), created.map(str::to_owned));
+        }
+    }
     live
 }
 
-/// Whether any watch belongs to a worktree that is gone or was replaced.
-pub fn has_orphans(watches: &[Watch], live: &BTreeMap<String, Option<String>>) -> bool {
+/// Whether any watch or due step belongs to a worktree that is gone or was
+/// replaced. A due step can be left behind with no watch at all: a build
+/// from before due steps removes a worktree without moving them.
+pub fn has_orphans(
+    watches: &[Watch],
+    due: &[wt_core::OwedRecord],
+    live: &BTreeMap<String, Option<String>>,
+) -> bool {
     watches.iter().any(|watch| !owned(watch, live))
+        || due.iter().any(|step| {
+            !live
+                .get(&step.slug)
+                .is_some_and(|created_at| step.owned_by(created_at.as_deref()))
+        })
 }
 
 fn owned(watch: &Watch, live: &BTreeMap<String, Option<String>>) -> bool {
@@ -624,16 +647,17 @@ mod tests {
         let second = BTreeMap::from([("one".to_owned(), row("second"))]);
         let read_later = NOON + 60_000;
 
-        let live = live_owners(&first, &watches, read_later);
-        assert!(!has_orphans(&watches, &live));
+        let none = serde_json::json!({});
+        let live = live_owners(&first, &watches, &none, read_later);
+        assert!(!has_orphans(&watches, &[], &live));
         let delivered = deliverable(&watches, &live, NOON);
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].held, "12:30");
         assert_eq!(delivered[0].actions, [(WatchAction::Wake, "go".to_owned())]);
 
         for rows in [&second, &BTreeMap::new()] {
-            let live = live_owners(rows, &watches, read_later);
-            assert!(has_orphans(&watches, &live));
+            let live = live_owners(rows, &watches, &none, read_later);
+            assert!(has_orphans(&watches, &[], &live));
             assert_eq!(deliverable(&watches, &live, NOON), []);
         }
         // Its conditions about itself are unknown too, never held by the
@@ -653,11 +677,56 @@ mod tests {
 
         // An inventory read before the watch was set says nothing about its
         // owner; a watch that outlived its owner needs none.
-        let live = live_owners(&BTreeMap::new(), &watches, NOON - 1);
-        assert!(!has_orphans(&watches, &live));
+        let live = live_owners(&BTreeMap::new(), &watches, &none, NOON - 1);
+        assert!(!has_orphans(&watches, &[], &live));
         met.owner_gone = true;
-        let live = live_owners(&BTreeMap::new(), std::slice::from_ref(&met), read_later);
+        let live = live_owners(
+            &BTreeMap::new(),
+            std::slice::from_ref(&met),
+            &none,
+            read_later,
+        );
         assert_eq!(deliverable(&[met], &live, NOON).len(), 1);
+    }
+
+    /// A due step has no watch left. One whose worktree is gone must still
+    /// be settled, and one whose worktree the inventory has not seen yet
+    /// must not be.
+    #[test]
+    fn a_due_step_is_an_orphan_only_when_its_worktree_is_known_gone() {
+        let step = |incarnation: &str| wt_core::OwedRecord {
+            id: "93co6q".into(),
+            slug: "one".into(),
+            incarnation: Some(incarnation.into()),
+            by: "one".into(),
+            what: "confirm prod logs".into(),
+            when_text: "in production".into(),
+            due_at_ms: NOON - 3_600_000,
+            utc_offset_minutes: 0,
+            unconfirmed: false,
+            before_release: false,
+            extra: Default::default(),
+        };
+        let none = serde_json::json!({});
+        let read_at = NOON;
+        // A build from before due steps removed the worktree: no watch is
+        // left to say so, and the step alone is the orphan.
+        let live = live_owners(&BTreeMap::new(), &[], &none, read_at);
+        assert!(has_orphans(&[], &[step("first")], &live));
+        let rows = BTreeMap::from([("one".to_owned(), row("first"))]);
+        let live = live_owners(&rows, &[], &none, read_at);
+        assert!(!has_orphans(&[], &[step("first")], &live));
+        // Restored after the inventory was read: the state records the new
+        // worktree, the inventory does not show it yet, and its step stays.
+        let restored = "2026-11-24T12:00:05Z";
+        assert!(wt_core::parse_iso_millis(restored).unwrap() > read_at);
+        let state = serde_json::json!({ "slugs": { "one": { "createdAt": restored } } });
+        let live = live_owners(&BTreeMap::new(), &[], &state, read_at);
+        assert!(!has_orphans(&[], &[step(restored)], &live));
+        // A worktree created before the inventory that does not list it is gone.
+        let state = serde_json::json!({ "slugs": { "one": { "createdAt": "first" } } });
+        let live = live_owners(&BTreeMap::new(), &[], &state, read_at);
+        assert!(has_orphans(&[], &[step("first")], &live));
     }
 
     #[test]
