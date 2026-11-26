@@ -8,7 +8,7 @@ use wt_core::{
     ChainMember, SpineMember, build_display_stack_index, parse_work_status, spine_layout,
     work_record_rank,
 };
-use wt_tui::{Board, BoardRow, BoardSection, OwedBlock};
+use wt_tui::{Board, BoardRow, BoardSection, LANDED_SECTION};
 
 /// Apply explicit positions for unstarted rows. Invalid cycles retain every row.
 fn apply_creation_positions(rows: &mut Vec<usize>, positions: &[(usize, Option<usize>)]) {
@@ -46,40 +46,42 @@ pub const INBOX: &str = "\0inbox";
 pub const REMOVING: &str = "\0removing";
 pub const ARCHIVED: &str = "\0archived";
 
-/// The block `[ui] owed_sections` shows a row in instead of its stored
-/// section: only a local row on the board whose own work has landed, whose
-/// only remaining meaning is what it owes. `None` before the owed overlay
-/// has prepared the row.
-fn owed_block(board: &Board, row: &BoardRow) -> Option<OwedBlock> {
-    if !board.display.owed_sections
-        || row.host.is_some()
-        || row.is_main
-        || row.pending_creation
-        || row.git.landed_on.is_none()
-    {
-        return None;
-    }
-    row.owed_block
+/// Whether `[ui] owed_sections` draws a row in the Landed block instead of
+/// its stored section: only a local row on the board whose own work has
+/// landed, whose only remaining meaning is what it owes. False before the
+/// owed overlay has prepared the row.
+fn in_landed_block(board: &Board, row: &BoardRow) -> bool {
+    board.display.owed_sections
+        && row.host.is_none()
+        && !row.is_main
+        && !row.pending_creation
+        && row.git.landed_on.is_some()
+        && row.owed_block.is_some()
 }
 
-/// What orders rows inside a derived block: the soonest known time under
-/// Scheduled, the oldest due step under Due. Elsewhere, and for a row with
-/// no such time, nothing.
-fn block_order(block: Option<OwedBlock>, row: &BoardRow) -> u64 {
-    let soonest = |times: &mut dyn Iterator<Item = u64>| times.min().unwrap_or(u64::MAX);
-    match block {
-        Some(OwedBlock::Scheduled) => {
-            soonest(&mut row.owes.iter().filter_map(|item| item.next_at_ms))
-        }
-        Some(OwedBlock::Due) => soonest(&mut row.owes.iter().filter_map(|item| item.due_at_ms)),
-        _ => 0,
-    }
+/// When the row's work landed, which orders the Landed block: its first
+/// recorded landing, else the newest commit of its branch (nothing is
+/// committed after a landing), else the checkout's creation. None of these
+/// changes with what the row owes, so a row keeps its place.
+fn landed_at_ms(board: &Board, row: &BoardRow) -> u64 {
+    board
+        .row_history
+        .get(&row.key)
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| matches!(event.event, wt_core::WorktreeEventKind::Landed { .. }))
+        })
+        .map(|event| event.at_ms)
+        .or(row.git.last_commit_ms)
+        .or(row.git.created_ms)
+        .unwrap_or(u64::MAX)
 }
 
 /// Lay the board out from the stored placement. With
-/// `board.display.owed_sections`, landed rows are drawn in derived blocks;
-/// nothing stored is read differently or written, so the option can be
-/// turned off again.
+/// `board.display.owed_sections`, landed rows are drawn in the one Landed
+/// block, oldest landing first; nothing stored is read differently or
+/// written, so the option can be turned off again.
 pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
     let members = board
         .rows
@@ -146,15 +148,17 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 after: after.as_str().map(str::to_owned),
             });
     }
-    // Where each row is drawn: its stored section, or the block derived
-    // from what it owes.
+    // Where each row is drawn: its stored section, or the Landed block.
     let section_keys: Vec<String> = board
         .rows
         .iter()
         .zip(stored_keys)
-        .map(|(row, stored)| match owed_block(board, row) {
-            Some(block) if stored != REMOVING && stored != ARCHIVED => block.key().to_owned(),
-            _ => stored,
+        .map(|(row, stored)| {
+            if stored != REMOVING && stored != ARCHIVED && in_landed_block(board, row) {
+                LANDED_SECTION.to_owned()
+            } else {
+                stored
+            }
         })
         .collect();
     let index_by_branch: BTreeMap<String, usize> = board
@@ -233,25 +237,31 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         // as in the TS sorter, so tied units stay contiguous.
         let identity = node_of(anchor).map_or(slug, |entry| entry.node.stack_id.as_str());
         (
-            block_order(
-                OwedBlock::from_key(&section_keys[index]),
-                &board.rows[index],
-            ),
             status,
             order,
             identity,
             node_of(index).map_or(0, |entry| entry.node.index),
         )
     };
-    for indices in buckets.values_mut() {
+    for (key, indices) in &mut buckets {
+        if key == LANDED_SECTION {
+            // A stable order: nothing a row owes, and no stored order or
+            // creation anchor, moves it here.
+            indices.sort_by(|&a, &b| {
+                let (a, b) = (&board.rows[a], &board.rows[b]);
+                landed_at_ms(board, a)
+                    .cmp(&landed_at_ms(board, b))
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+            continue;
+        }
         indices.sort_by(|&a, &b| {
             let a = unit(a);
             let b = unit(b);
             a.0.cmp(&b.0)
-                .then_with(|| a.1.cmp(&b.1))
-                .then_with(|| a.2.total_cmp(&b.2))
-                .then_with(|| a.3.cmp(b.3))
-                .then_with(|| a.4.cmp(&b.4))
+                .then_with(|| a.1.total_cmp(&b.1))
+                .then_with(|| a.2.cmp(b.2))
+                .then_with(|| a.3.cmp(&b.3))
         });
         // Apply a creation anchor to whole stack units. A child cannot be
         // emitted before a root that has moved below its own anchor.
@@ -314,9 +324,9 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 usize::MAX
             } else if section.key == REMOVING {
                 usize::MAX - 1
-            } else if let Some(block) = OwedBlock::from_key(&section.key) {
-                // After every stored section and the Inbox, most urgent first.
-                usize::MAX - 2 - (OwedBlock::ALL.len() - 1 - block as usize)
+            } else if section.key == LANDED_SECTION {
+                // After every stored section and the Inbox.
+                usize::MAX - 2
             } else {
                 order
                     .iter()
@@ -379,10 +389,8 @@ fn section_title(key: &str) -> String {
         INBOX => "Inbox".to_owned(),
         ARCHIVED => "Archived".to_owned(),
         REMOVING => "Removing".to_owned(),
-        _ => OwedBlock::from_key(key).map_or_else(
-            || wt_core::sanitize_terminal_text(key),
-            |block| block.title().to_owned(),
-        ),
+        LANDED_SECTION => wt_tui::LANDED_TITLE.to_owned(),
+        _ => wt_core::sanitize_terminal_text(key),
     }
 }
 
@@ -415,7 +423,7 @@ pub fn section_for(board: &Board, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wt_tui::BoardRow;
+    use wt_tui::{BoardRow, OwedBlock};
 
     fn row(slug: &str) -> BoardRow {
         BoardRow {
@@ -633,7 +641,6 @@ mod tests {
     #[test]
     fn owed_sections_show_landed_rows_by_what_they_owe_and_leave_the_stored_layout() {
         use wt_core::{OwedPhase, VerifyStage};
-        use wt_tui::OwedBlock;
         let mut archived = owing("archived", OwedPhase::Due, None);
         archived.archived = true;
         let mut remote = owing("remote", OwedPhase::Due, None);
@@ -674,7 +681,7 @@ mod tests {
             "due": {"section": "Batch", "order": 3},
             "wait-staging": {"section": "Verify in Staging"},
         }, "sectionsOrder": ["Batch", "Verify in Staging", "Empty"],
-           "foldedSections": [OwedBlock::Done.key()]});
+           "foldedSections": [LANDED_SECTION]});
         let before = state.clone();
         prepare(&mut board, &state, "main", UiSort::Manual);
         let stored = layout(&board);
@@ -716,9 +723,9 @@ mod tests {
                 ("Archived", &["archived"]),
             ])
         );
-        // On: only landed local rows on the board move, into blocks after
-        // the stored sections and the Inbox, most urgent first. Empty
-        // blocks are not drawn; they fold like any section.
+        // On: only landed local rows on the board move, into the one Landed
+        // block after the stored sections and the Inbox. With no landing
+        // time known they are drawn by slug.
         board.display.owed_sections = true;
         prepare(&mut board, &state, "main", UiSort::Manual);
         let shown = layout(&board);
@@ -729,27 +736,33 @@ mod tests {
                 ("Verify in Staging", &[]),
                 ("Empty", &[]),
                 ("Inbox", &["@remote/builder/remote", "unprepared"]),
-                ("Due", &["due"]),
-                ("Waiting for staging", &["wait-staging"]),
-                ("Waiting for production", &["wait-prod"]),
-                // Soonest first, whatever order the rows hold.
-                ("Scheduled", &["sooner", "later"]),
-                ("Waiting on other work", &["wait-other"]),
-                ("Done", &["done"]),
+                (
+                    "Landed",
+                    &[
+                        "done",
+                        "due",
+                        "later",
+                        "sooner",
+                        "wait-other",
+                        "wait-prod",
+                        "wait-staging"
+                    ]
+                ),
                 ("Removing", &["removing"]),
                 ("Archived", &["archived"]),
             ])
         );
-        let done = shown.iter().find(|section| section.1 == "Done").unwrap();
-        assert_eq!((done.0.as_str(), done.3), (OwedBlock::Done.key(), true));
-        assert!(
+        let landed = shown.iter().find(|section| section.1 == "Landed").unwrap();
+        assert_eq!((landed.0.as_str(), landed.3), (LANDED_SECTION, true));
+        assert_eq!(
             board
                 .sections
                 .iter()
                 .filter(|section| section.owed_block())
-                .all(|section| section.key.starts_with('\0'))
+                .count(),
+            1
         );
-        // A row drawn in a block is still filed where it was, and still
+        // A row drawn in the block is still filed where it was, and still
         // counts as its section's: deleting "Batch" is witnessed by all
         // three rows stored there, not only the one drawn in it.
         assert_eq!(board.section_witness("Batch"), ["done", "due", "open"]);
@@ -763,11 +776,9 @@ mod tests {
         board.display.owed_sections = false;
         prepare(&mut board, &state, "main", UiSort::Manual);
         assert_eq!(layout(&board), stored);
-        // No landed row owes anything in a block that was never needed.
+        // No landed row, no block.
         board.display.owed_sections = true;
-        board
-            .rows
-            .retain(|row| row.key == "open" || row.key == "done");
+        board.rows.retain(|row| row.key == "open");
         prepare(&mut board, &state, "main", UiSort::Manual);
         assert_eq!(
             keys(&layout(&board)),
@@ -775,39 +786,107 @@ mod tests {
                 ("Batch", &["open"]),
                 ("Verify in Staging", &[]),
                 ("Empty", &[]),
-                ("Done", &["done"]),
             ])
         );
     }
 
     #[test]
-    fn due_rows_are_drawn_oldest_first() {
-        let due = |slug: &str, at_ms: Option<u64>| {
-            let mut row = owing(slug, wt_core::OwedPhase::Due, None);
-            row.owes[0].due_at_ms = at_ms;
-            row
+    fn landed_rows_are_drawn_oldest_landing_first_and_never_move_with_what_they_owe() {
+        use wt_core::{LandedOn, OwedPhase, VerifyStage, WorktreeEvent, WorktreeEventKind};
+        let landing = |at_ms: u64, on: LandedOn| WorktreeEvent {
+            at_ms,
+            event: WorktreeEventKind::Landed { on },
         };
+        let mut committed = owing("committed", OwedPhase::Waiting, None);
+        committed.git.last_commit_ms = Some(2_500);
+        // Neither a landing nor a commit time: its creation orders it.
+        let mut created = owing("created", OwedPhase::Done, None);
+        created.git.created_ms = Some(10);
+        created.git.last_commit_ms = None;
         let mut board = Board {
-            // A due check has no time of its own: it follows the steps.
             rows: vec![
-                due("check", None),
-                due("newer", Some(2_000)),
-                due("older", Some(1_000)),
+                owing("newest", OwedPhase::Due, None),
+                owing("b-tied", OwedPhase::Done, None),
+                owing("a-tied", OwedPhase::Waiting, Some(VerifyStage::Staging)),
+                committed,
+                owing("oldest", OwedPhase::Waiting, Some(VerifyStage::Production)),
+                created,
+                owing("unknown", OwedPhase::Due, None),
             ],
             ..Board::default()
         };
         board.display.owed_sections = true;
-        prepare(&mut board, &json!({}), "main", UiSort::Manual);
-        let drawn: Vec<&str> = board
-            .sections
-            .iter()
-            .find(|section| section.key == OwedBlock::Due.key())
-            .unwrap()
-            .rows
-            .iter()
-            .map(|&index| board.rows[index].key.as_str())
-            .collect();
-        assert_eq!(drawn, ["older", "newer", "check"]);
+        board.row_history = [
+            ("newest", vec![landing(4_000, LandedOn::Base)]),
+            ("a-tied", vec![landing(3_000, LandedOn::Base)]),
+            ("b-tied", vec![landing(3_000, LandedOn::Base)]),
+            // Its first landing counts, not the later release.
+            (
+                "oldest",
+                vec![
+                    landing(1_000, LandedOn::Base),
+                    landing(9_000, LandedOn::Production),
+                ],
+            ),
+        ]
+        .into_iter()
+        .map(|(key, events)| (key.to_owned(), events))
+        .collect();
+        // A stored order or status sort does not reach into the block.
+        let state = json!({"slugs": {"newest": {"order": 1}, "oldest": {"order": 9}}});
+        let drawn = |board: &Board| -> Vec<String> {
+            board
+                .sections
+                .iter()
+                .find(|section| section.key == LANDED_SECTION)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|&index| board.rows[index].key.clone())
+                .collect()
+        };
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        let order = [
+            "created",
+            "oldest",
+            "committed",
+            "a-tied",
+            "b-tied",
+            "newest",
+            "unknown",
+        ];
+        assert_eq!(drawn(&board), order);
+        // What each row owes changes; none of them moves.
+        for row in &mut board.rows {
+            let (phase, block) = match row.owed_phase {
+                Some(OwedPhase::Due) => (OwedPhase::Done, wt_tui::OwedBlock::Done),
+                Some(OwedPhase::Done) => (OwedPhase::Waiting, wt_tui::OwedBlock::Scheduled),
+                _ => (OwedPhase::Due, wt_tui::OwedBlock::Due),
+            };
+            row.owed_phase = Some(phase);
+            row.owed_block = Some(block);
+            for (index, item) in row.owes.iter_mut().enumerate() {
+                item.next_at_ms = Some(50 - index as u64);
+                item.due_at_ms = Some(index as u64);
+            }
+        }
+        prepare(&mut board, &state, "main", UiSort::Status);
+        assert_eq!(drawn(&board), order);
+        // A new landing appends at the bottom.
+        let mut fresh = owing("a-fresh", OwedPhase::Due, None);
+        fresh.git.last_commit_ms = Some(5_000);
+        board.rows.insert(0, fresh);
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        let mut appended = vec![
+            "created",
+            "oldest",
+            "committed",
+            "a-tied",
+            "b-tied",
+            "newest",
+        ];
+        appended.extend(["a-fresh", "unknown"]);
+        assert_eq!(drawn(&board), appended);
     }
 
     #[test]
@@ -855,7 +934,7 @@ mod tests {
         assert_eq!(board.rows[1].stack_prefix, "┌");
         assert_eq!(board.rows[0].stack_prefix, "└");
         assert_eq!(board.rows[1].split_parent_section, None);
-        // Grouped by what it owes, only the landed head leaves the section.
+        // With the Landed block, only the landed head leaves the section.
         board.display.owed_sections = true;
         board.rows[2].owed_phase = Some(wt_core::OwedPhase::Done);
         board.rows[2].owed_block = Some(wt_tui::OwedBlock::Done);
@@ -864,10 +943,7 @@ mod tests {
             section_rows(&board, "Batch"),
             ["child", "grandchild", "other"]
         );
-        assert_eq!(
-            section_rows(&board, wt_tui::OwedBlock::Done.key()),
-            ["head"]
-        );
+        assert_eq!(section_rows(&board, LANDED_SECTION), ["head"]);
     }
 
     #[test]

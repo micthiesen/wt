@@ -315,6 +315,8 @@ pub struct ActionDef {
     pub key: Option<String>,
     pub group: Option<String>,
     pub external: bool,
+    /// Shell only: an automation run that exits non-zero is run again.
+    pub retry_on_failure: bool,
     pub arg_prompt: Option<ActionArgPrompt>,
     pub label_extract: Option<String>,
 }
@@ -334,6 +336,7 @@ impl Default for ActionDef {
             key: None,
             group: None,
             external: false,
+            retry_on_failure: false,
             arg_prompt: None,
             label_extract: None,
         }
@@ -566,6 +569,9 @@ pub struct HistoryConfig {
     /// Skill or slash-command names, without the leading slash, whose use
     /// in a worktree's session is recorded. `*` records every one.
     pub skills: Vec<String>,
+    /// Skills whose round leaves a review stamp on the worktree. A stamping
+    /// skill is recorded whether or not `skills` lists it.
+    pub stamps: Vec<String>,
 }
 
 impl HistoryConfig {
@@ -574,9 +580,26 @@ impl HistoryConfig {
     pub fn records_skill(&self, name: &str) -> bool {
         let name = name.strip_prefix('/').unwrap_or(name);
         let short = name.rsplit_once(':').map(|(_, short)| short);
-        self.skills
+        self.stamp_for(name).is_some()
+            || self
+                .skills
+                .iter()
+                .any(|listed| listed == "*" || listed == name || Some(listed.as_str()) == short)
+    }
+
+    /// The stamp a use of `name` leaves, as `stamps` lists it.
+    pub fn stamp_for(&self, name: &str) -> Option<&str> {
+        let name = name.strip_prefix('/').unwrap_or(name);
+        let short = name.rsplit_once(':').map(|(_, short)| short);
+        self.stamps
             .iter()
-            .any(|listed| listed == "*" || listed == name || Some(listed.as_str()) == short)
+            .find(|listed| *listed == name || Some(listed.as_str()) == short)
+            .map(String::as_str)
+    }
+
+    /// Whether nothing is recorded, so a hook event need not be read.
+    pub fn is_empty(&self) -> bool {
+        self.skills.is_empty() && self.stamps.is_empty()
     }
 }
 

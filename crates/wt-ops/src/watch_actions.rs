@@ -46,9 +46,25 @@ pub async fn dispatch_check(
 pub fn check_prompt(check: &CheckFire) -> String {
     let stage = check.stage.as_str();
     format!(
-        "[wt] The check this worktree owes in {stage} is due: the change is deployed there.\n{}\nTo close it: wt done {stage} -m \"<what you checked and where>\"",
+        "[wt] The check this worktree owes in {stage} is due: the change is deployed there.\n{}\nTo close it: wt done {stage} -m \"<what you checked and where>\"\nNot yet? Put it off with wt done {stage} --again <time>, not a separate wt wake.",
         wt_core::sanitize_terminal_lines(&check.steps)
     )
+}
+
+/// The prompt that brings what a removed row still owes, and is due, to
+/// the manager: the row's own session is gone. `due` is each item's
+/// `wt done` target with its text.
+pub fn removed_due_prompt(slug: &str, due: &[(String, String)]) -> String {
+    let mut prompt = format!(
+        "[wt] {slug} was removed and still owes what is now due. Its session is gone, so this comes to you: do it, or hand it to a worktree that can."
+    );
+    for (target, what) in due {
+        prompt.push_str(&format!(
+            "\n- {}\n  To close it: wt done {target} --slug {slug} -m \"<what you checked and where>\"",
+            wt_core::sanitize_terminal_lines(what).replace('\n', "\n  ")
+        ));
+    }
+    prompt
 }
 
 /// Run one watch action. The second value is a failure to surface that does
@@ -382,7 +398,20 @@ mod tests {
             }),
             "[wt] The check this worktree owes in production is due: the change is deployed there.\n\
              1. Open /health\n2. Expect 200\n\
-             To close it: wt done production -m \"<what you checked and where>\""
+             To close it: wt done production -m \"<what you checked and where>\"\n\
+             Not yet? Put it off with wt done production --again <time>, not a separate wt wake."
+        );
+        assert_eq!(
+            removed_due_prompt(
+                "gone",
+                &[(
+                    "production".into(),
+                    "check: 1. Open /health\n2. Expect 200".into()
+                )]
+            ),
+            "[wt] gone was removed and still owes what is now due. Its session is gone, so this comes to you: do it, or hand it to a worktree that can.\n\
+             - check: 1. Open /health\n  2. Expect 200\n  \
+             To close it: wt done production --slug gone -m \"<what you checked and where>\""
         );
     }
 

@@ -685,9 +685,11 @@ mod tests {
         ctx.database
             .call(move |store| {
                 store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                // Asserted now: a fixed date would be overdue two days on.
                 let owing = wt_core::WorkStatusRecord::new(
                     wt_core::WorkState::Ready,
-                    "2026-11-24T12:00:00Z",
+                    time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)?,
                 )
                 .with_check(wt_core::VerifyStage::Staging, "1. open the page");
                 let stored: wt_store::WorkStatusRecord =

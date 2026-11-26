@@ -91,7 +91,9 @@ session (`wt wake`, `--then`). Watches are not a second scheduler. They run
 through this engine under one implicit rule, id `wt.watch`, trigger
 `watch.met`, run `builtin:watch`, settle 0. The rule always exists, so the
 engine runs with no `[[automations]]` at all, and configuration cannot declare
-the trigger, the run or the id.
+the trigger, the run or the id. [`wt wait`](cli.md#wt-wait-condition---any---timeout-duration---slug-slug---json)
+reads the same conditions with the same evaluator and fact readers, but in
+its own process and without storing a watch, so it never reaches this engine.
 
 - **Evaluation.** Each pass judges every pending watch against the same
   confirmed rows the rules see, plus facts the board does not carry: pull
@@ -153,12 +155,28 @@ or 30 when both stages have deploy probes). Configuration cannot use the id.
 - **What it sends.** One prompt to the row's session per due check:
   `[wt] The check this worktree owes in <stage> is due: the change is
   deployed there.`, the steps, then `To close it: wt done <stage> -m "<what
-  you checked and where>"`. Being prompted closes nothing: the check stays
-  owed until it is closed.
+  you checked and where>"` and `Not yet? Put it off with wt done <stage>
+  --again <time>, not a separate wt wake.` Being prompted closes nothing:
+  the check stays owed until it is closed.
 - **Once per check.** The key is `wt.check:<slug>:<worktree creation
-  time>:<stage>:<hash of the steps>`, with the not-before time appended when
-  the check has one. New steps, a check put off with `wt done <stage> --again
-  <time>`, and a later worktree reusing the slug each fire again.
+  time>:<stage>:<hash of the steps>`, then `:s<when the check began>` for a
+  check set since wt dated them, then the not-before time when the check
+  has one. New steps, a check put off with `wt done <stage> --again <time>`,
+  and a later worktree reusing the slug each fire again. So does the same
+  check owed again after it was closed, and one still open that comes due
+  for a later merged pull request of the same worktree: a follow-up with
+  unchanged steps is prompted for like the first.
+- **Dated when first seen due.** The pass that first finds a check due
+  records the time on it (`dueSinceMs`, with the merged pull request as
+  `duePr`) and writes an `owed` history event. Overdue counts from that
+  time, so asserting the status again does not start the two days over.
+- **A removed row's due items go to the manager.** Its session is gone, so
+  when a check or a due step on a removal record is due, wt sends the
+  manager session one prompt naming the row, what is owed and `wt done
+  <target> --slug <slug> -m`. Each item is told once (again after it is put
+  off and comes due). This is sent directly, outside the queue: it does not
+  wait for the manager to be idle, and while no manager session can be
+  reached it is tried again every five minutes.
 - **Like a wake.** It waits for the session to be idle and resumes a stopped
   one, is held (not consumed) while the worktree or everything is paused, and
   skips archived rows.
@@ -171,7 +189,8 @@ or 30 when both stages have deploy probes). Configuration cannot use the id.
   `wt.check` still fires there. Whichever of the two prompted a session for
   a check is the only one that does: adding or removing such a rule later
   does not prompt again for the same slug, worktree, stage, steps and
-  not-before (the ledger keeps a `check-prompt:` note of it).
+  not-before (the ledger keeps a `check-prompt:` note of it, under the rule
+  id `wt.check`; it is not listed as a fire).
 - **Not for checks that were already due when wt began doing this.** The
   ledger records once when this build first ran (`checkWakesFrom`). Every
   check due on that pass is passed over, and so is one found due later whose
@@ -274,7 +293,11 @@ Dispatch goes through the exact same paths keystrokes use (the action launcher, 
 
 ## Failure handling and the breaker
 
-- A dispatched run that fails is marked delivered and **never retried**. The retry is a new head SHA (push a fix, the condition re-fires under a new key).
+- A dispatched run that fails is **never retried**, with one opt-in exception below. The retry is a new head SHA (push a fix, the condition re-fires under a new key). This covers a built-in that reports failure, a prompt or session delivery (including one whose reply was lost, recorded `ambiguous`), a headless agent run, and a shell action that was killed or never reported an exit code: each may have acted, so none is sent again, and each stays `delivered` in the ledger.
+- A **shell action that exits non-zero** is a definite failure. Its fire ends as `failed` in the ledger and is not run again. It is reported once: the action's own failure line (`Action failed: <slug> / <name>`) on the attention feed, and a `failed` entry (`exit 1`) in the worktree's history.
+- With [`retry_on_failure = true`](configuration.md#actions--the--menu) on the shell action, the fire is run again first: after 1 minute, then 5 minutes, then 30 minutes. It is released from the ledger and requeued with its frozen inputs, shows in the queue as waiting for "a re-check: retry 1 of 3 after exit 1", and, like a deferral, survives restarts, pauses and its worktree's removal when it is an external post-merge run. Each failed attempt is only in the app log; the action's own failure line is kept off the attention feed for automation runs of such an action. A fourth failure ends the fire as `failed` (never retried again), with one attention line (`auto <rule>: failed, exit 1 after 4 runs`) and a `failed` entry in the worktree's history. A retry waits for the rule's cooldown like any dispatch, but the breaker does not count it: the fire's first dispatch was counted once, and its retries continue that dispatch, so a rule under the breaker gets all three. A retry is dropped if its condition clears first. The action must be safe to run again after it failed part-way. The key is refused on a prompt action, which may have acted before it failed.
+- Only the wt process that launched a run watches its exit: a run that ends after that process quit, or more than 24 hours after launch, stays `delivered`, and with `retry_on_failure` its failure then reaches neither a retry nor the attention feed.
+- A failed fire is stored as `delivered` with `failed: true`, the reason and `failedRuns`, because sessions keep the build that started them and a build from before failed fires treats a state it does not know as a claim that never expires. Such a build reads the entry as delivered and handled; it also reads a pending retry as an ordinary deferred fire and runs it once more without retrying after that.
 - A builtin that proves it wrote nothing may instead **defer**: its claim is released and the same fire requeued with a later re-check (30 s, then 5 min after 10 minutes), keeping its frozen inputs and any facts it proved, so it survives its worktree's removal, restarts and pauses, and never counts toward the breaker. One attention warning is raised if it is still deferred after an hour. Only `builtin:delete-branch` defers today.
 - A per-(rule, worktree) **circuit breaker** counts consecutive dispatches after which the condition still held. At 2, the rule trips for that worktree and stops dispatching; it re-arms only when the condition is observed false (i.e. something actually got fixed, by hand or otherwise). Fleet `branch.advanced` fires bypass it because no row can provide that clearing observation. A fire suppressed by a breaker or another terminal pre-dispatch guard is recorded as skipped, so it does not requeue on every pass.
 
@@ -282,8 +305,8 @@ Dispatch goes through the exact same paths keystrokes use (the action launcher, 
 
 `Q` in the TUI opens the automations overlay: what is running now, what is
 queued (with when its settle window ends, or what it is waiting for), and the
-last ten recorded fires from the ledger (delivered, skipped, cancelled or
-ambiguous, newest first). It reads the board, so it updates as the engine
+last ten recorded fires from the ledger (delivered, failed, skipped, cancelled
+or ambiguous, newest first). It reads the board, so it updates as the engine
 does; `A` pauses or resumes from inside it. `wt automations` prints the same
 queue from the CLI.
 

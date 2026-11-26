@@ -106,6 +106,16 @@ impl EventSource for AppEventSource {
             })
         })
     }
+
+    fn rate_limit_reset<'a>(
+        &'a self,
+        cancel: &'a CancellationToken,
+    ) -> EventFuture<'a, Option<u64>> {
+        Box::pin(crate::watch_probe::rate_limit_reset_ms(
+            &self.context,
+            cancel,
+        ))
+    }
 }
 
 pub async fn serve(context: &AppContext) -> Result<()> {

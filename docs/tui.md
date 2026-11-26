@@ -37,7 +37,7 @@ differs from the current observed HEAD, and overdue post-merge verification is
 red. A yellow hourglass replaces the marker while a
 worktree initializes: from the creation request until its checkout exists, and
 then while the dependency install that creation started is still running. The
-ordinary marker returns when the worktree is ready for a session. A landed row's marker follows what it still owes, not its asserted state: a yellow dot while something is due (red once anything is overdue), a dim dot while everything it owes waits, and the green merge glyph when it owes nothing. Landed
+ordinary marker returns when the worktree is ready for a session. A row with a review stamp ([`[history] stamps`](configuration.md#history-which-skill-uses-a-worktrees-history-records)) wears a star in place of its status circle, ✦ while HEAD is the stamped commit and ✧ once it has moved; gated, dropped, initializing and landed rows keep their own marker, and the details status line ends `· ✦ <skill>`. A landed row's marker follows what it still owes, not its asserted state: a yellow dot while something is due (red once anything is overdue), a dim dot while everything it owes waits, and the green merge glyph when it owes nothing. Landed
 means the branch's own commits reached the base: its PR merged, or its HEAD is
 in the base and was either merged in or committed on the branch itself. A
 worktree only fast-forwarded (or reset) to a base commit is never landed, even
@@ -63,33 +63,52 @@ first, and a stack sorts as one unit under its root's identity. A stack member
 whose own work has landed is drawn as a single row and its children as roots,
 so moving a merged head (`l`, `J`/`K`) moves only that row.
 
-With `[ui] owed_sections = true` (off by default) a landed, unarchived local
-row is drawn in a derived block instead of its section, by what it still
-owes: **Due**, **Waiting for staging**, **Waiting for production**,
-**Scheduled** (its next item comes due at a known time), **Waiting on other
-work** and **Done** ([how a row is filed](owed.md#derived-blocks)). Rows
-under Due are drawn oldest due step first. Rows under Scheduled are drawn
-soonest first, each with that time dim at the right edge of its row (`22:32`,
-`Fri 18:12`) where its title leaves room. The blocks sit after the manual
-sections and the Inbox and before the rows being removed and the archive;
-empty ones are hidden and they fold like sections. They cannot be renamed,
-deleted or used as a move target, and a row shown in one cannot be moved or
-reordered: the notice reads `Due is derived from what landed rows owe; set
-[ui] owed_sections = false to file rows by hand`. The row's stored section is
-untouched, so turning the option off restores the layout. A section whose
-rows are all drawn in blocks keeps its header, which says so: `Shipped · 1
-landed, shown below`.
+With `[ui] owed_sections = true` (off by default) every landed, unarchived
+local row is drawn in one derived block, **Landed**, instead of its section.
+The block sits after the manual sections and the Inbox and before the rows
+being removed and the archive, is hidden while empty, and folds like a
+section. Its header counts its rows by where they stand, leaving out a count
+of zero, open or folded:
 
-The details pane's border names the slug. It starts with the wrapped title
-and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
-The work-status block follows: a header line, the list of what the row owes
-(see [What a row owes](#what-a-row-owes)), the watches that only tell you,
-then the note behind a rail in the state's color. Every mark in it (the
-header's, each item's, the bell, the rail) is in the pane's first column and
-all its text starts two cells in. Until the row's own work
+    ── Landed · 3 due · 24 waiting · 2 done ──────────────
+       Renew the add-on expiry             due staging  …
+       Retire the Edge fallback             production  …
+       Rerun the renewal check               Mon 10:53  …
+       Drop the old topic sweep                   done  …
+
+Rows are in landing order, oldest first, and a new landing is added at the
+bottom: a row never moves inside the block when what it owes changes. The
+landing time is the row's first recorded `landed` history event; a row with
+none is placed by the newest commit of its branch, then by when its checkout
+was created, and rows that tie are ordered by slug. History loads after the
+first frame, so until it has loaded every row is placed by its last commit
+time and the order can change once when the landing events arrive.
+
+Each row says, dim and right-aligned just left of its glyph cluster, what it
+waits for next: `due staging`, `due production` or `due` (yellow, red once
+anything is overdue), `staging`, `production`, the time its next item comes
+due (`22:32`, `Fri 18:12`), `other work`, or `done`. The label is the
+heading `wt owed --all` lists the row under
+([how a row is filed](owed.md#the-landed-block)), so the two agree. It gives
+way to a title that needs the room.
+
+The block cannot be renamed, deleted or used as a move target, and a row in
+it cannot be moved or reordered: the notice reads `Landed is derived from
+what landed rows owe; set [ui] owed_sections = false to file rows by hand`.
+The row's stored section is untouched, so turning the option off restores
+the layout. A section whose rows are all drawn in the block keeps its
+header, which says so: `Shipped · 1 landed, shown below`.
+
+The details pane's border names the slug. One blank row always separates the
+border from the title, which wraps in full; only a title a person set is
+tagged, with a dim `(user)` (see [Worktree titles](#worktree-titles)).
+The work-status banner follows: a header line, then the note behind a rail in
+the state's color. Until the row's own work
 lands the header is the asserted state (`blocked · ready` with the gate's
-slash while a gate is set), risk, age, and `commits since` when the status
-predates HEAD. `REVERT`, `IF WRONG`, `UNTESTED` and `OPS: none` note fields
+slash while a gate is set), risk, age, `commits since` when the status
+predates HEAD, and `owes N` when the row owes anything: the list itself
+follows the labeled rows (see [What a row owes](#what-a-row-owes)). `REVERT`,
+`IF WRONG`, `UNTESTED` and `OPS: none` note fields
 align under a hanging indent; any other `OPS` text is prose like the rest,
 because what a worktree owes is in its list, not its note.
 
@@ -100,9 +119,8 @@ failing names, review, review bot, and with `[guides] enabled` the change
 guide last), `claude` (every Claude, Codex, OpenCode, and Pi
 session, the F12 target first), and `git` (dirty or clean, diff against the
 merge-base, last commit and creation ages, upstream counts in parentheses, base
-counts in brackets). The optional `path` group can be added explicitly and
-keeps the checkout name visible when truncated. Unknown group names are
-skipped. On narrow panes the `pr` and `git` rows drop their least important
+counts in brackets). The pane no longer shows a `path` row: the id is ignored
+where it is still listed, as unknown group names are. On narrow panes the `pr` and `git` rows drop their least important
 parts first. A GitHub or host error remains visible as an error, and an
 unavailable fact shows `—` rather than reading as clean.
 
@@ -268,67 +286,70 @@ opens the main clone as it does on the board.
 
 A worktree has one list of what it still owes ([owed.md](owed.md)): its
 merge gate, the check owed in each stage, and the steps it comes back for.
-The details pane lists it between the header and the note, most urgent
-first, one line an item in three columns: when, what, and one detail at the
-right edge. The lines below show every form; the gate is listed only until
-the row's own work lands, so a real row never shows it beside a landed
-header:
+The details pane lists it after the labeled rows and one blank line, always
+in full: nothing folds, and the pane scrolls (`Ctrl+J`/`Ctrl+K`, the wheel)
+to its last line. Each item is a line with its mark, its "when" and one
+detail at the right edge, then all of its text in the same column as the
+"when". The lines below show every form; the gate is listed only until the
+row's own work lands, so a real row never shows it beside a landed header:
 
-    ● due · 4 waiting
-    ● since 11:36     confirm prod logs, then open the PR retiring…   wt done 93co6q
-    ⊘ before merge    prod secret missing
-                      clears when ○ #3806 in production
-    ○ staging         Worker crons fire and renewal moves the expiry…        5 steps
-    ○ production +7d  retire the Edge function fallback                        in 6d
-    ○ Fri 18:12       rerun the renewal check · before release             in 1d 21h
-    ? check vault     rotate the key · exited 2: vault sealed
-      V shows steps
+    ● since 11:36                                          wt done 93co6q
+      confirm prod logs, then open the PR retiring the old path
+    ○ staging                                                     3 steps
+      Chat topic sweep and queue run on the Worker crons.
+      1. post three 50+ char messages in one channel of a brand with topics
+      2. after the next :07/:22/:37/:52, entity_topics rows exist for the
+         brand and the queue table is empty again
+      3. the Worker log shows one sweep and no retries
+    ○ production +7d                                                in 6d
+      retire the Edge function fallback
+    ○ Fri 18:12 · by manager                                    in 1d 21h
+      rerun the renewal check
+    ? check vault · exited 2: vault sealed
+      rotate the key
+    ○ merged                                               before release
+      Before the release carrying #3879: confirm the add-on route.
+    ⊘ before merge
+      prod secret missing
+      clears when ○ #3806 in production
 
+- **Order.** What is due first, then what waits for staging, for
+  production, for a known time (soonest first), for anything else, and the
+  merge gate last. The watches that only tell you follow as dim bell lines.
 - **Mark.** A filled dot in yellow once the item is due (red when overdue),
   the gate's slash, `?` while a condition it waits for cannot be read, and a
   dim hollow dot while it waits. That an item is due is its mark and the
   color of its "when", never a word.
-- **When.** As few words as place it, in a column as wide as the row's
-  longest (22 cells at most, a longer one is cut with an ellipsis). A check,
+- **When.** As few words as place it. A check,
   or a step waiting for the row's own stage, is the stage: `staging`,
   `production`, with a delay `production +7d`. A condition on another pull
   request or commit is `#3889 production`, `#3889 merged`, `be228d9
-  production`; on another worktree `<slug> merged` with a long slug cut; on a
+  production`; on another worktree `<slug> merged`; on a
   release `production release`; on a probe `check <id>`. A time is `22:32`
   today, `Fri 18:12` within six days, `Dec 2 09:24` beyond. Several
   conditions are joined with `&`. A due step reads `since 19:34` and the gate
   `before merge`.
-- **What.** One line: what a check proves (the first line of its text, or
-  its first step when it is only steps), the first line of a step's prompt,
-  the gate's text. It is cut with an ellipsis to leave the detail its room.
-  The gate's text is never cut; what clears it is a dim line of its own
-  under it, `clears when ○ #3806 in production` (`clears at 17:00` for a
-  time, `, then wakes the session` with a `--then`), or `a person clears
-  it`.
 - **Detail.** One thing, dim, right-aligned to the pane, the first of:
   `overdue` (red), `awaiting deploy` while a check's stage does not run the
   landing yet, `wt done <id>` for a due step (a pointer: the command also
   takes `-m`), a countdown for anything whose time is known (`in 6d`, `in 1d
   21h`, `in 40m`: a time, a check put off, a delay that is already running),
-  and `N steps` for a check.
-- **Tails.** Short dim words after the description: `before release` for a
-  step set with `--before-release`, `by <who>` for a setter that is neither
+  `N steps` for text with numbered steps, and `before release` for a step
+  set with `--before-release`.
+- **Tails.** Short dim words after the "when": `before release` when the
+  detail says something else, `by <who>` for a setter that is neither
   the row's own agent nor you, `delivery not confirmed` for a wake sent
   without proof it arrived, `delivering` once the conditions held, `held:
   automations paused` while a pause holds the delivery, and the reason a
   condition cannot be read.
-- **Steps.** `V` shows or hides the steps of every check the row owes at
-  once, each list under its check from the description's column, and an open
-  check says all of what it proves. They start hidden, also when a check is
-  due. The dim `V shows steps` / `V hides steps` line follows the list while
-  a check has steps.
+- **Text.** All of it, wrapped under the "when": what a check proves or a
+  step's prompt with the author's line breaks kept, then its numbered steps,
+  each wrapped under its own text. A gate's text is followed by a dim line
+  saying what clears it, `clears when ○ #3806 in production` (`clears at
+  17:00` for a time, `, then wakes the session` with a `--then`), or `a
+  person clears it`.
 
-A pane too narrow for all three columns gives up the tails first, then the
-detail, and then wraps the description under itself, to two lines. Narrower
-still, the "when" takes a line of its own and the rest starts under the
-header's text.
-
-The pane lists eight items and counts the rest as `+N more (wt owed)`. Times
+A pane too narrow to set the detail apart puts it after the "when". Times
 are in this machine's clock, and countdowns are refreshed at least every 30
 seconds while anything waits.
 
@@ -336,8 +357,8 @@ Once the row's own work has landed, the header reads from the list instead of
 the asserted state, and says nothing else: `● due` for one thing due, `● due
 · 1 waiting` when more waits behind it, `● 2 due · 1 waiting` for several
 (the lines below say what), `◷ waiting for staging · 2 owed` (or `waiting for
-production`, `scheduled`, `waiting on other work`, as the
-[derived blocks](owed.md#derived-blocks) name them), or `✓ done`. The claim's
+production`, `scheduled`, `waiting on other work`, as
+`wt owed --all` heads them), or `✓ done`. The claim's
 risk and age are not repeated: they were about a merge that has happened. A
 state that still asks for someone follows the phase (`· working`, `·
 review`, `· needs-human`). A row with nothing owed lists nothing.
@@ -532,7 +553,6 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
-| `V` | Show or hide the steps of every check this row owes (hidden until asked, also when a check is due) |
 | `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
 | `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
@@ -558,8 +578,9 @@ records its source, and a lower source never replaces a higher one:
 | `fallback` | The same, when the tracker gave no title: the bare ID |
 
 A worktree nobody titled (created from a branch or a one-word slug) shows its
-PR title, then its first commit, then its slug, tagged `pr`, `commit`, or
-`slug`. Titles change only the display, never the branch or directory.
+PR title, then its first commit, then its slug. The details pane tags only a
+person's title, `(user)`. Titles change only the display, never the branch or
+directory.
 
 Titles read in sentence case: `wt new fix calendar week` shows `Fix calendar
 week`. Only a plain lowercase first word is capitalized, so `iOS` or `wt.toml`

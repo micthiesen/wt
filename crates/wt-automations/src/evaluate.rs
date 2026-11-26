@@ -18,6 +18,26 @@ pub const CHECK_RUN: &str = "builtin:check";
 /// the age up to which the sources still call GitHub data fresh.
 pub const MERGE_ARM_GRACE_MS: i64 = 90_000;
 
+/// Whether the merge `arm` records is gone from an open pull request:
+/// neither queued nor set to auto-merge. `None` while that cannot be told:
+/// the read did not hold the whole queue, GitHub was never seen holding the
+/// merge (a build that cancels without clearing the record leaves one
+/// behind), or the arming is too recent for the read to be about it.
+pub fn merge_dropped(
+    arm: &wt_core::MergeArm,
+    pr_number: u64,
+    auto_merge: bool,
+    merge_queued: Option<bool>,
+    now_ms: i64,
+) -> Option<bool> {
+    if pr_number != arm.pr || auto_merge || merge_queued == Some(true) {
+        return Some(false);
+    }
+    merge_queued?;
+    (arm.seen_armed_at_ms.is_some() && now_ms.saturating_sub(arm.armed_at_ms) >= MERGE_ARM_GRACE_MS)
+        .then_some(true)
+}
+
 /// The rule every watch fire runs under. It exists without configuration,
 /// and configuration cannot declare it.
 pub fn watch_rule() -> AutomationDef {
@@ -121,6 +141,14 @@ fn evaluate_checks_due(
                 stage.as_str(),
                 stable_hash(&check.steps)
             );
+            // A check owed again after it was closed, or due for a later
+            // pull request of the same worktree, is prompted for again even
+            // with the same steps. Only when set, like the not-before below:
+            // checks set before wt dated them keep the key they were
+            // delivered under.
+            if let Some(since) = check.since_ms {
+                key.push_str(&format!(":s{since}"));
+            }
             // Only when set: a key that always carried it would fire every
             // check delivered before the key had it once more.
             if let Some(not_before) = check.not_before_ms {
@@ -156,18 +184,22 @@ fn evaluate_checks_due(
         .collect()
 }
 
-/// Since when a due check has been due, where that is recorded. A stage
-/// with a deploy probe came due when the probe reported the deploy, and a
-/// production check behind a separate production branch when the landing
-/// was promoted; neither moment is kept. Without those the check came due
-/// when its pull request merged, or later if the status owing it or its
-/// not-before is later.
+/// Since when a due check has been due, where that is recorded: on the
+/// check itself once wt has seen it due ([`checks_newly_due`]). Before
+/// that, a stage with a deploy probe came due when the probe reported the
+/// deploy, and a production check behind a separate production branch when
+/// the landing was promoted; neither moment can be read back. Without those
+/// the check came due when its pull request merged, or later if the status
+/// owing it or its not-before is later.
 fn check_due_since(
     row: &AutomationRow,
     context: &AutomationEvalContext,
     stage: wt_core::VerifyStage,
     check: &wt_core::Check,
 ) -> Option<i64> {
+    if let Some(recorded) = check.due_at_ms() {
+        return Some(recorded);
+    }
     let probed = match stage {
         wt_core::VerifyStage::Staging => row.deploys.staging.is_some(),
         wt_core::VerifyStage::Production => row.deploys.production.is_some(),
@@ -188,6 +220,44 @@ fn check_due_since(
         .into_iter()
         .flatten()
         .max()
+}
+
+/// The due checks whose first-due time the store has yet to record: one
+/// never seen due, or one due again for a later merged pull request than
+/// the one it was dated for. The caller hands them to
+/// `Store::note_checks_due`, which dates each and writes its history event.
+pub fn checks_newly_due(
+    rows: &[AutomationRow],
+    context: &AutomationEvalContext,
+) -> Vec<wt_core::CheckDue> {
+    let mut due = Vec::new();
+    for row in rows {
+        let merged = row
+            .pr
+            .as_ref()
+            .filter(|pr| pr.state == "MERGED")
+            .map(|pr| pr.number);
+        let landing = row_landing(row, context);
+        for (check, standing) in
+            wt_core::check_standings(row.work.as_ref(), landing, context.now_ms)
+        {
+            let again = matches!((check.due_pr, merged), (Some(was), Some(now)) if was != now);
+            if !standing.due || (check.due_since_ms.is_some() && !again) {
+                continue;
+            }
+            due.push(wt_core::CheckDue {
+                slug: row.slug.clone(),
+                created_at: row.created_at.clone(),
+                stage: standing.stage,
+                since_ms: check_due_since(row, context, standing.stage, &check)
+                    .filter(|_| !again)
+                    .unwrap_or(context.now_ms),
+                steps: check.steps,
+                pr: merged,
+            });
+        }
+    }
+    due
 }
 
 /// wt's own wake for each due check, where no configured rule already
@@ -545,13 +615,13 @@ fn evaluate_row(
         AutomationTrigger::PrMergeDropped => {
             let arm = row.merge_arm.as_ref()?;
             let pr = fresh_open_pr(row, context)?;
-            // A record GitHub was never seen to hold may be one a build
-            // that does not clear records cancelled.
-            if pr.number != arm.pr
-                || arm.seen_armed_at_ms.is_none()
-                || pr.auto_merge
-                || pr.merge_queued != Some(false)
-                || context.now_ms.saturating_sub(arm.armed_at_ms) < MERGE_ARM_GRACE_MS
+            if merge_dropped(
+                arm,
+                pr.number,
+                pr.auto_merge,
+                pr.merge_queued,
+                context.now_ms,
+            ) != Some(true)
             {
                 return None;
             }
@@ -1373,6 +1443,40 @@ mod tests {
     use wt_config::{AutomationBusyPolicy, AutomationDef};
     use wt_core::{OwnerLanding, VerifyStage, WorkRisk, WorkStatusRecord};
 
+    #[test]
+    fn a_dropped_merge_is_told_only_by_a_read_that_could_show_it() {
+        let arm = |seen_armed_at_ms| wt_core::MergeArm {
+            pr: 7,
+            head: None,
+            armed_at_ms: 1_000,
+            mechanism: wt_core::MergeMechanism::Queue,
+            seen_armed_at_ms,
+        };
+        let seen = arm(Some(2_000));
+        let late = 1_000 + MERGE_ARM_GRACE_MS;
+        assert_eq!(
+            merge_dropped(&seen, 7, false, Some(false), late),
+            Some(true)
+        );
+        assert_eq!(
+            merge_dropped(&seen, 7, false, Some(true), late),
+            Some(false)
+        );
+        assert_eq!(
+            merge_dropped(&seen, 7, true, Some(false), late),
+            Some(false)
+        );
+        assert_eq!(
+            merge_dropped(&seen, 8, false, Some(false), late),
+            Some(false)
+        );
+        // A page of the queue, a record GitHub never held, a read that may
+        // predate the arming: none can show a drop.
+        assert_eq!(merge_dropped(&seen, 7, false, None, late), None);
+        assert_eq!(merge_dropped(&arm(None), 7, false, Some(false), late), None);
+        assert_eq!(merge_dropped(&seen, 7, false, Some(false), late - 1), None);
+    }
+
     /// What the configured rules fire. wt's own wake for a due check has
     /// its own tests below.
     fn evaluate(
@@ -1577,6 +1681,55 @@ mod tests {
             1
         );
         row.busy = false;
+
+        // Never seen due: the store is asked to date it. No pull request
+        // says when it merged, so it is due since now.
+        context.now_ms = 9_000;
+        let newly = checks_newly_due(std::slice::from_ref(&row), &context);
+        assert_eq!(
+            newly,
+            [wt_core::CheckDue {
+                slug: "feature-1".into(),
+                created_at: row.created_at.clone(),
+                stage: VerifyStage::Staging,
+                steps: "1. open the page".into(),
+                since_ms: 9_000,
+                pr: None,
+            }]
+        );
+        // The same steps owed again after the check was closed are a new
+        // check: its date is part of the key, so its session is prompted
+        // again. Once dated as due it is not handed to the store again.
+        let dated = |due_pr: u64| {
+            wt_core::parse_work_status(&serde_json::json!({
+                "state": "ready", "at": "2026-01-02T00:00:00Z",
+                "checks": {"staging": {
+                    "steps": "1. open the page", "sinceMs": 7, "dueSinceMs": 8, "duePr": due_pr,
+                }},
+            }))
+        };
+        let mut again = row.clone();
+        again.work = dated(1);
+        again.pr = Some(crate::types::AutomationPr {
+            number: 1,
+            state: "MERGED".into(),
+            ..Default::default()
+        });
+        let fires = own_checks(&[], std::slice::from_ref(&again), &context);
+        assert_eq!(
+            fires[0].fire_keys,
+            [format!(
+                "wt.check:feature-1:2026-01-01T00:00:00Z:staging:{:016x}:s7",
+                stable_hash("1. open the page")
+            )]
+        );
+        assert_eq!(fires[0].check.as_ref().unwrap().due_since_ms, Some(8));
+        assert!(checks_newly_due(std::slice::from_ref(&again), &context).is_empty());
+        // Due for a later pull request of the same worktree: dated again.
+        again.pr.as_mut().unwrap().number = 2;
+        let newly = checks_newly_due(std::slice::from_ref(&again), &context);
+        assert_eq!((newly[0].pr, newly[0].since_ms), (Some(2), 9_000));
+        context.now_ms = 0;
 
         // A rule whose action prompts the row's own session owns the delivery.
         let configured = rule("verify", AutomationTrigger::StatusVerificationDue, "verify");

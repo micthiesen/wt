@@ -8,6 +8,7 @@ mod events;
 mod migrations;
 mod mutations;
 mod owed;
+mod stamps;
 mod store;
 mod titles;
 mod types;
@@ -25,8 +26,10 @@ pub use mutations::{
     verification_owed_at_removal, work_status_event,
 };
 pub use owed::{
-    CheckTargets, ChecksClosed, OwedClosed, RemovedChecksClosed, WakeCompletion, stored_owed,
+    CheckTargets, ChecksClosed, OwedClosed, RemovedChecksClosed, WakeCompletion,
+    removed_due_untold, removed_landing, removed_owed_items, stored_owed,
 };
+pub use stamps::{stored_pending_stamp, stored_stamp};
 pub use store::{Store, StoreError};
 pub use titles::{TitleSource, TitleWrite, sentence_case, stored_title};
 pub use types::{

@@ -1183,3 +1183,313 @@ fn a_restore_attaches_the_removal_records_steps_to_the_new_worktree() {
         .unwrap();
     assert_eq!(store.list_owed(None).unwrap().len(), 1);
 }
+
+fn assert_status(store: &mut Store, next: WorkStatusRecord) -> crate::WorkStatusWrite {
+    store
+        .update_slug_work_status("one", |previous| {
+            let mut next = next;
+            if let Some(previous) = previous {
+                next.carry_checks(previous);
+            }
+            Ok::<_, ()>(Some(next))
+        })
+        .unwrap()
+        .unwrap()
+}
+
+fn seen_due(pr: u64, since_ms: i64) -> wt_core::CheckDue {
+    wt_core::CheckDue {
+        slug: "one".into(),
+        created_at: Some(CREATED.into()),
+        stage: STAGING,
+        steps: "open the page".into(),
+        since_ms,
+        pr: Some(pr),
+    }
+}
+
+#[test]
+fn a_check_is_dated_when_first_seen_due_and_again_for_a_later_pull_request() {
+    let (_temp, mut store) = store();
+    assert_status(
+        &mut store,
+        status("ready").with_check(STAGING, "open the page"),
+    );
+    let began = stored(&mut store).open_check(STAGING).unwrap();
+    assert!(began.since_ms.is_some());
+    assert_eq!(began.due_since_ms, None);
+
+    // Another worktree's check with this slug is not this one's.
+    let mut other = seen_due(1, NOON - 1_000);
+    other.created_at = Some("2026-01-01T00:00:00Z".into());
+    assert_eq!(store.note_checks_due(&[other], NOON).unwrap(), 0);
+
+    assert_eq!(
+        store
+            .note_checks_due(&[seen_due(1, NOON - 1_000)], NOON)
+            .unwrap(),
+        1
+    );
+    let dated = stored(&mut store).open_check(STAGING).unwrap();
+    assert_eq!(dated.due_since_ms, Some(NOON - 1_000));
+    assert_eq!(dated.due_pr, Some(1));
+    assert_eq!(dated.since_ms, began.since_ms);
+    assert_eq!(
+        owed_events(&store, "one"),
+        ["due: staging check: open the page (wt done staging)"]
+    );
+    // Seen due again: nothing is written and nothing is said twice.
+    assert_eq!(
+        store
+            .note_checks_due(&[seen_due(1, NOON + 5_000)], NOON + 5_000)
+            .unwrap(),
+        0
+    );
+
+    // Asserting the status again, with the same steps, keeps the date: the
+    // overdue clock does not start over.
+    assert_status(
+        &mut store,
+        status("needs-human").with_check(STAGING, "open the page"),
+    );
+    assert_eq!(stored(&mut store).open_check(STAGING).unwrap(), dated);
+
+    // Due for a later pull request of the same worktree: a new round.
+    assert_eq!(
+        store
+            .note_checks_due(&[seen_due(2, NOON + 9_000)], NOON + 9_000)
+            .unwrap(),
+        1
+    );
+    let again = stored(&mut store).open_check(STAGING).unwrap();
+    assert_eq!(again.due_since_ms, Some(NOON + 9_000));
+    assert_eq!(again.since_ms, Some(NOON + 9_000));
+    assert_eq!(again.due_pr, Some(2));
+    assert_eq!(owed_events(&store, "one").len(), 2);
+
+    // Closed and owed again with the same steps: a new check, not yet due.
+    store
+        .close_checks("one", &CheckTargets::All, &status("verified"), None)
+        .unwrap();
+    assert_status(
+        &mut store,
+        status("ready").with_check(STAGING, "open the page"),
+    );
+    let renewed = stored(&mut store).open_check(STAGING).unwrap();
+    assert_eq!(renewed.due_since_ms, None);
+    assert!(
+        renewed
+            .since_ms
+            .is_some_and(|since| Some(since) != again.since_ms)
+    );
+}
+
+#[test]
+fn a_removed_row_that_reached_production_owes_its_production_check_now() {
+    let (_temp, mut store) = store();
+    assert_status(
+        &mut store,
+        status("ready").with_check(PRODUCTION, "watch the logs"),
+    );
+    store
+        .append_worktree_event(
+            "one",
+            u64::try_from(NOON).unwrap(),
+            &WorktreeEventKind::Landed {
+                on: wt_core::LandedOn::Production,
+            },
+        )
+        .unwrap();
+    store
+        .record_removed_worktrees(&[removal(true)], NOON)
+        .unwrap();
+    let entry = removed(&mut store);
+    assert_eq!(entry.extra["landedOn"], "production");
+    let (items, landing) = crate::removed_owed_items(&entry, true, NOON);
+    assert!(landing.production);
+    assert_eq!(items[0].state, wt_core::OwedState::Due);
+
+    // A record written before the landing was kept is healed from history.
+    write_raw(&mut store, |state| {
+        state["removed"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("landedOn");
+    });
+    assert_eq!(raw(&store)["removed"][0].get("landedOn"), None);
+    // Reading does not write.
+    assert!(!crate::removed_landing(&removed(&mut store), true).production);
+    assert_eq!(raw(&store)["removed"][0].get("landedOn"), None);
+    assert_eq!(store.heal_removed_landings().unwrap(), 1);
+    assert_eq!(store.heal_removed_landings().unwrap(), 0);
+    let healed = removed(&mut store);
+    assert!(crate::removed_landing(&healed, true).production);
+    assert_eq!(raw(&store)["removed"][0]["landedOn"], "production");
+
+    // Nobody is left to prompt, so the manager is told, once.
+    let untold = crate::removed_due_untold(&healed, true, NOON);
+    assert_eq!(untold.len(), 1);
+    assert_eq!(untold[0].0, "production");
+    assert!(
+        store
+            .mark_removed_due_told("one", &healed.removed_at, &[untold[0].0.clone()])
+            .unwrap()
+    );
+    assert!(crate::removed_due_untold(&removed(&mut store), true, NOON).is_empty());
+    // Put off and due again, it is told again.
+    store
+        .reap_wt_state(&std::collections::BTreeSet::new())
+        .unwrap();
+    store
+        .defer_check("one", PRODUCTION, NOON + 10, "at 12:00", None)
+        .unwrap()
+        .unwrap();
+    let entry = removed(&mut store);
+    assert!(crate::removed_due_untold(&entry, true, NOON).is_empty());
+    assert_eq!(crate::removed_due_untold(&entry, true, NOON + 20).len(), 1);
+
+    // A row that only reached base still waits.
+    let (_temp, mut store) = store_with_base_only();
+    let entry = removed(&mut store);
+    let (items, _) = crate::removed_owed_items(&entry, true, NOON);
+    assert_eq!(items[0].state, wt_core::OwedState::Waiting);
+}
+
+fn store_with_base_only() -> (TempDir, Store) {
+    let (temp, mut store) = store();
+    assert_status(
+        &mut store,
+        status("ready").with_check(PRODUCTION, "watch the logs"),
+    );
+    store
+        .record_removed_worktrees(&[removal(true)], NOON)
+        .unwrap();
+    (temp, store)
+}
+
+fn marks(store: &Store) -> Vec<String> {
+    store
+        .read_worktree_events("one", 500)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.event {
+            WorktreeEventKind::Mark { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_stamp_left_pending_for_over_a_day_is_ignored_and_dropped_by_the_next_status() {
+    let (_temp, mut store) = store();
+    let raw = |store: &mut Store| {
+        store.read_wt_state().unwrap()["slugs"]["one"][wt_core::STAMP_PENDING_KEY].clone()
+    };
+    let age = |store: &mut Store, hours: i64| {
+        let at = (time::OffsetDateTime::now_utc() - time::Duration::hours(hours))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        store
+            .mutate_wt_state(|state| {
+                state["slugs"]["one"][wt_core::STAMP_PENDING_KEY]["at"] = at.into();
+                Ok(((), true))
+            })
+            .unwrap();
+    };
+    let pending =
+        |store: &mut Store| crate::stored_pending_stamp(&store.read_wt_state().unwrap(), "one");
+
+    store.set_pending_stamp("one", "check", None).unwrap();
+    age(&mut store, 23);
+    assert_eq!(pending(&mut store).as_deref(), Some("check"));
+    age(&mut store, 25);
+    assert_eq!(pending(&mut store), None);
+    assert!(raw(&mut store).is_object());
+
+    // Even a status that would not have ended the round drops it.
+    assert_eq!(assert_status(&mut store, status("working")).stamped, None);
+    assert!(raw(&mut store).is_null());
+    assert_eq!(assert_status(&mut store, status("ready")).stamped, None);
+    assert_eq!(
+        crate::stored_stamp(&store.read_wt_state().unwrap(), "one"),
+        None
+    );
+}
+
+#[test]
+fn a_stamp_is_earned_by_the_status_that_ends_the_round_and_then_stays() {
+    let (_temp, mut store) = store();
+    let stamp = |store: &mut Store| crate::stored_stamp(&store.read_wt_state().unwrap(), "one");
+    let pending =
+        |store: &mut Store| crate::stored_pending_stamp(&store.read_wt_state().unwrap(), "one");
+    let at = |state: &str, sha: &str| WorkStatusRecord {
+        sha: Some(sha.into()),
+        ..status(state)
+    };
+
+    assert!(
+        store
+            .set_pending_stamp("one", "fable-review", Some("one"))
+            .unwrap()
+    );
+    // The round is still running: review and working earn nothing.
+    assert_eq!(assert_status(&mut store, at("review", "aaa")).stamped, None);
+    assert_eq!(
+        assert_status(&mut store, at("working", "bbb")).stamped,
+        None
+    );
+    assert_eq!(stamp(&mut store), None);
+
+    let earned = assert_status(&mut store, at("ready", "ccc"))
+        .stamped
+        .unwrap();
+    assert_eq!(
+        (earned.skill.as_str(), earned.sha.as_deref()),
+        ("fable-review", Some("ccc"))
+    );
+    assert_eq!(stamp(&mut store), Some(earned.clone()));
+    assert_eq!(pending(&mut store), None);
+    assert_eq!(marks(&store), ["stamped fable-review"]);
+
+    // Sticky: a later status, at a later head, carries it unchanged.
+    assert_eq!(
+        assert_status(&mut store, at("working", "ddd")).stamped,
+        None
+    );
+    assert_status(&mut store, at("ready", "eee"));
+    assert_eq!(stamp(&mut store), Some(earned.clone()));
+
+    // A new round replaces it, even when the status it ends on is the one
+    // already asserted.
+    store.set_pending_stamp("one", "check", None).unwrap();
+    let write = assert_status(&mut store, at("ready", "eee"));
+    assert!(!write.changed);
+    assert_eq!(write.stamped.unwrap().skill, "check");
+    assert_eq!(stamp(&mut store).unwrap().sha.as_deref(), Some("eee"));
+
+    // By hand, at once.
+    let by_hand = store
+        .stamp_now("one", "fable-review", Some("fff"), None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stamp(&mut store), Some(by_hand));
+    assert!(
+        store
+            .stamp_now("one", "not a name", None, None)
+            .unwrap()
+            .is_none()
+    );
+
+    // Clearing the status clears the stamp, and one not yet earned.
+    store.set_pending_stamp("one", "check", None).unwrap();
+    store.clear_slug_work_status("one", None).unwrap();
+    assert_eq!(stamp(&mut store), None);
+    assert_eq!(pending(&mut store), None);
+
+    // With no status to carry it, a stamp by hand waits for the next one.
+    assert_eq!(
+        store.stamp_now("one", "check", Some("fff"), None).unwrap(),
+        None
+    );
+    assert_eq!(pending(&mut store).as_deref(), Some("check"));
+}

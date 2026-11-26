@@ -27,6 +27,9 @@ use crate::removal_trace::{RemovalPhase, timed};
 /// Callers match it to report a stale request rather than a failure.
 pub const REMOVED_CHANGED: &str = "removed worktree changed after the history view was rendered";
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+/// `git worktree add` writes a whole checkout, and several creations at
+/// once on a large repository each take minutes of disk time.
+const WORKTREE_ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROCESS_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
 /// Bounded retries of `rm` on an already-verified quarantine. Only
 /// `Directory not empty` (entries created mid-deletion) is retried.
@@ -266,6 +269,9 @@ type BeforeRemoveHook = Arc<
 struct CreateProgress {
     checkout_created: bool,
     checkout_attempted: bool,
+    /// Nothing was at the target path just before `git worktree add` ran,
+    /// so whatever is there after a failed add is what that add left.
+    path_was_absent: bool,
     branch_created: bool,
     prior_state: Option<PriorSlugState>,
 }
@@ -1965,7 +1971,10 @@ impl LifecycleService {
         cancellation: &CancellationToken,
         operation: &'static str,
     ) -> Result<wt_platform::process::ProcessOutput, LifecycleError> {
-        let spec = git_spec(cwd, args);
+        let mut spec = git_spec(cwd, args);
+        if operation == "create Git worktree" {
+            spec.timeout = WORKTREE_ADD_TIMEOUT;
+        }
         let phase = match operation {
             "refresh copied Git index" => Some("copied-index-refresh"),
             "switch Rift clone branch" | "create branch in Rift clone" => {
@@ -2073,6 +2082,7 @@ impl LifecycleService {
         let backend = self.config.backend;
         match backend {
             BackendKind::GitWorktree => {
+                progress.path_was_absent = matches!(fs::try_exists(path).await, Ok(false));
                 progress.checkout_attempted = true;
                 let mut args: Vec<OsString> = vec!["worktree".into(), "add".into()];
                 if let Some(base) = base_ref {
@@ -2455,6 +2465,29 @@ impl LifecycleService {
             .map_err(|source| process_error("run package install", path, source))
     }
 
+    /// Why Git holds the worktree at `path` locked: `None` when it is not
+    /// locked, is not registered, or that could not be read.
+    async fn git_lock_reason(
+        &self,
+        path: &Path,
+        main: &Path,
+        cancellation: &CancellationToken,
+    ) -> Option<String> {
+        let listed = self
+            .run_git(
+                main,
+                ["worktree", "list", "--porcelain", "-z"],
+                cancellation,
+                "read Git worktree locks",
+            )
+            .await
+            .ok()?;
+        porcelain_lock_reason(&listed, path)
+    }
+
+    /// Undo a failed creation. Callers hold the slug's lock from before
+    /// `path_was_absent` was sampled, so no other wt operation made what
+    /// this removes.
     async fn rollback_create(
         &self,
         path: &Path,
@@ -2463,26 +2496,70 @@ impl LifecycleService {
         progress: CreateProgress,
         cancellation: &CancellationToken,
     ) -> Result<(), LifecycleError> {
+        // An interrupted `git worktree add` (timed out, so terminated and
+        // then killed) can leave two things an immediate retry trips over:
+        // a registration still locked as initializing, or, when Git began
+        // its own cleanup and was killed during it, a partial directory with
+        // no registration at all.
+        let mut interrupted_add = false;
+        let mut unregistered_leftover = false;
         let checkout_is_ours = if progress.checkout_created {
             true
         } else if progress.checkout_attempted {
             match self.config.backend {
-                BackendKind::GitWorktree => self
-                    .repository
-                    .inventory(cancellation)
-                    .await?
-                    .iter()
-                    .any(|record| {
-                        Path::new(&record.target.path) == path && record.target.branch == branch
-                    }),
+                BackendKind::GitWorktree => {
+                    let inventory = self.repository.inventory(cancellation).await?;
+                    let registered = inventory
+                        .iter()
+                        .find(|record| Path::new(&record.target.path) == path);
+                    interrupted_add = true;
+                    unregistered_leftover = registered.is_none() && progress.path_was_absent;
+                    registered.is_some_and(|record| {
+                        record.target.branch == branch || progress.path_was_absent
+                    })
+                }
                 BackendKind::Rift => fs::try_exists(path.join(".rift")).await.unwrap_or(false),
             }
         } else {
             false
         };
+        if unregistered_leftover && matches!(fs::try_exists(path).await, Ok(true)) {
+            fs::remove_dir_all(path)
+                .await
+                .map_err(|source| LifecycleError::Io {
+                    operation: "remove partial worktree after failed creation",
+                    path: path.to_owned(),
+                    source,
+                })?;
+            self.run_git(
+                main,
+                ["worktree", "prune"],
+                cancellation,
+                "prune Git worktree metadata after failed creation",
+            )
+            .await?;
+        }
         if checkout_is_ours {
             match self.backend_for(path).await.unwrap_or(self.config.backend) {
                 BackendKind::GitWorktree => {
+                    // Only the lock `git worktree add` holds while it runs
+                    // is this creation's to clear; any other is a person's.
+                    if interrupted_add
+                        && self
+                            .git_lock_reason(path, main, cancellation)
+                            .await
+                            .as_deref()
+                            == Some(GIT_ADD_LOCK_REASON)
+                    {
+                        let _ = self
+                            .run_git_vec_raw(
+                                main,
+                                vec!["worktree".into(), "unlock".into(), path.into()],
+                                cancellation,
+                                "unlock interrupted Git worktree",
+                            )
+                            .await;
+                    }
                     self.remove_git_worktree(path, main, true, cancellation)
                         .await?
                 }
@@ -3724,6 +3801,24 @@ impl LifecycleService {
             .map(|_| ())
             .map_err(|source| process_error(operation, cwd, source))
     }
+}
+
+/// The reason `git worktree add` locks a worktree with while creating it.
+const GIT_ADD_LOCK_REASON: &str = "initializing";
+
+/// The lock reason of the worktree at `path` in `git worktree list
+/// --porcelain -z` output. A lock with no reason reads as the empty string.
+fn porcelain_lock_reason(listed: &[u8], path: &Path) -> Option<String> {
+    let mut current = false;
+    for line in listed.split(|byte| *byte == 0) {
+        let line = String::from_utf8_lossy(line);
+        if let Some(listed_path) = line.strip_prefix("worktree ") {
+            current = Path::new(listed_path) == path;
+        } else if current && let Some(rest) = line.strip_prefix("locked") {
+            return Some(rest.trim_start().to_owned());
+        }
+    }
+    None
 }
 
 fn git_spec(cwd: &Path, args: Vec<OsString>) -> CommandSpec {
@@ -5461,6 +5556,154 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after, before);
+    }
+
+    /// A `git worktree add` that timed out is terminated and then killed.
+    /// It can leave its directory with no registration (Git was killed
+    /// during its own cleanup) or a registration still locked as
+    /// initializing. Rollback clears either, so the same create works at
+    /// once. A path that was there before the add is left alone.
+    #[tokio::test]
+    async fn rollback_clears_what_an_interrupted_worktree_add_left() {
+        let (_scratch, service, runner, main, root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let main = fs::canonicalize(&main).await.unwrap();
+        let root = fs::canonicalize(&root).await.unwrap();
+        let options = || CreateOptions {
+            base: Some("refs/heads/main".into()),
+            fetch_origin: false,
+            run_install: false,
+        };
+        let interrupted = |path_was_absent| CreateProgress {
+            checkout_attempted: true,
+            path_was_absent,
+            branch_created: true,
+            ..CreateProgress::default()
+        };
+
+        let unregistered = root.join("slow");
+        run(&runner, &main, &["branch", "michael/slow", "main"]).await;
+        fs::create_dir_all(unregistered.join("src")).await.unwrap();
+        fs::write(unregistered.join("src/half.txt"), "partial")
+            .await
+            .unwrap();
+        service
+            .rollback_create(
+                &unregistered,
+                &main,
+                "michael/slow",
+                interrupted(true),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(!unregistered.exists());
+        let retried = service
+            .create("michael/slow", options(), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(Path::new(&retried.target.path), unregistered);
+
+        let locked = root.join("locked");
+        let locked_path = locked.to_str().unwrap();
+        run(
+            &runner,
+            &main,
+            &["worktree", "add", "-b", "michael/locked", locked_path],
+        )
+        .await;
+        run(
+            &runner,
+            &main,
+            &["worktree", "lock", "--reason", "initializing", locked_path],
+        )
+        .await;
+        service
+            .rollback_create(
+                &locked,
+                &main,
+                "michael/locked",
+                interrupted(true),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(!locked.exists());
+        service
+            .create("michael/locked", options(), &cancellation)
+            .await
+            .unwrap();
+
+        // A lock a person set is never cleared, so their worktree stays.
+        let kept = root.join("kept");
+        let kept_path = kept.to_str().unwrap();
+        run(
+            &runner,
+            &main,
+            &["worktree", "add", "-b", "michael/kept", kept_path],
+        )
+        .await;
+        run(
+            &runner,
+            &main,
+            &["worktree", "lock", "--reason", "mine", kept_path],
+        )
+        .await;
+        assert_eq!(
+            service
+                .git_lock_reason(&kept, &main, &cancellation)
+                .await
+                .as_deref(),
+            Some("mine")
+        );
+        let _ = service
+            .rollback_create(
+                &kept,
+                &main,
+                "michael/kept",
+                interrupted(true),
+                &cancellation,
+            )
+            .await;
+        assert!(kept.join(".git").exists());
+        assert_eq!(
+            service
+                .git_lock_reason(&kept, &main, &cancellation)
+                .await
+                .as_deref(),
+            Some("mine")
+        );
+        assert_eq!(
+            porcelain_lock_reason(
+                b"worktree /a\0locked\0\0worktree /b\0HEAD x\0\0",
+                Path::new("/a")
+            ),
+            Some(String::new())
+        );
+        assert_eq!(
+            porcelain_lock_reason(
+                b"worktree /a\0locked\0\0worktree /b\0HEAD x\0\0",
+                Path::new("/b")
+            ),
+            None
+        );
+
+        let theirs = root.join("theirs");
+        fs::create_dir_all(&theirs).await.unwrap();
+        fs::write(theirs.join("keep.txt"), "not ours")
+            .await
+            .unwrap();
+        service
+            .rollback_create(
+                &theirs,
+                &main,
+                "michael/theirs",
+                interrupted(false),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(theirs.join("keep.txt").exists());
     }
 
     #[tokio::test]

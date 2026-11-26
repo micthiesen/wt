@@ -29,18 +29,41 @@ Before any command that writes, including `wt status`:
 
 ## The loop
 
-Each pass: read your row, do the one thing it calls for, wait, repeat.
-Re-read every pass; the bot, CI and the base all move.
+Each pass: read your row, do the one thing it calls for, wait for the next
+change, repeat until the PR has merged. Re-read every pass; the bot, CI and
+the base all move.
 
-To wait, say what brings you back and end the turn; never sleep or poll:
+Stay in the session the whole way. A CI run, a bot round and the merge queue
+each resolve in minutes, and a PR whose agent ended its turn is not being
+babysat. To wait, block on `wt wait`, never sleep or poll:
 
 ```bash
-wt wake 10m -m "babysit: next pass"        # a review or check still running
-wt wake green -m "babysit: next pass"      # only the checks are pending
+wt wait --any reviewed settled --timeout 30m        # the bot or the checks still running on this head
+wt wait --any merged evicted closed --timeout 30m   # armed: until it lands or is dropped
 ```
 
-If wt answers that nothing is evaluating watches (the wt TUI is closed), wait
-in the session instead, minutes not seconds.
+- Name only what has not happened yet: a condition that already holds
+  returns at once. `settled` is checks passed or failed, `reviewed` is the
+  bot finished the current head, `evicted` is the armed merge was dropped.
+  Without `--any`, all must hold.
+- Prefer a background command (the harness returns you when it exits). Where
+  the harness caps foreground commands (Claude Code caps them at 10 minutes),
+  pass `--timeout 9m` and run it again on exit 124. It judges the conditions
+  itself, so the wt TUI need not be open, and it stores nothing: no watch,
+  nothing owed.
+- It prints each condition's state. Exit 0: one held, so read the row and
+  act. Exit 124: timed out. Read the row after every exit 124, before waiting
+  again: a wait that starts over can take two GitHub reads to see an eviction
+  the row already shows. Wait again while the thing is still plausibly moving
+  (checks running, bot pending, a queue position advancing). Exit 1: it could
+  not tell and says why (GitHub unreachable, usually); fix that or wait a few
+  minutes in the session.
+- Hand the wait to `wt wake <condition> -m "babysit: next pass"` and end the
+  turn only when what remains is genuinely long: a queue or CI backed up for
+  hours, a bot out of budget until a known time, a human reviewer. A blocked
+  command dies with the session and a wake does not, but a wake depends on
+  the wt TUI being open and one delivered after the merge is owed, so it is
+  the fallback, not the pass.
 
 ```bash
 wt fleet "$WT_AGENT" --json | jq '.[0]'   # one row; the output is still an array
@@ -70,7 +93,7 @@ human sees.
 | bot `unresolved` | address the findings |
 | `clean` + `stale` | wait for the review of the current head |
 | `clean`, not stale, checks not failing, no threads | merge (see *Merging*) |
-| armed (queued or `auto_merge`), not merged | wait; it is not done yet |
+| armed (queued or `auto_merge`), not merged | wait for it; see *Until it lands* |
 | was armed, now neither, or queue `UNMERGEABLE` | evicted: see *Until it lands* |
 | `checks: fail` | read the failure first; see *Red review check* |
 | `mergeable: conflicting` | rebase onto the base and resolve; `wt restack` if stacked |
@@ -143,31 +166,42 @@ wt merge
 auto-merge from the PR's base branch, so checks still running are fine. Use `wt merge`, never
 `gh pr merge`: `--auto` fails on queue bases with a misleading "Auto merge is
 not allowed" error, and a queue sets its own merge method. Exit 75 means a
-required check has not reported yet: wait a pass and re-run, never escalate.
+required check has not reported yet: wait a few minutes in the session and re-run, never escalate.
 `wt merge --cancel` disarms and dequeues.
 
 ## Until it lands
 
 Armed is not merged. Queues evict PRs often: a queue run fails, an entry
 ahead conflicts, the base moves. GitHub also drops classic auto-merge on a
-conflict. GitHub tells nobody, so after `wt merge` set both and end the turn:
+conflict, and tells nobody.
 
-```bash
-wt wake merged -m "babysit: landed; do After it lands"
-wt wake 1h -m "babysit: not merged yet? read the row for an eviction"
-```
+So stay until it has merged. Set no wake for the landing: a wake delivered
+after the merge is an owed step you would then have to close. After
+`wt merge`:
 
-A repository with a `pr.merge_dropped` automation prompts you sooner. Each
-time you are woken unmerged, read the row and set the time wake again. A
-wake delivered after the PR merged stays owed, whichever one it is: once
-merged, cancel every babysit wake still pending (`wt watch cancel --mine`: the
-1h one and any `10m` or `green` pass), and close the `merged` one with
-`wt done <id> -m "<what you did>"` when the list below is done.
+1. Run `wt watch` and cancel any pass wake still pending
+   (`wt watch cancel <id>`); it would fire after the merge and be owed.
+2. Block on `wt wait --any merged evicted closed --timeout 30m`. After a
+   timeout (exit 124) read the row, then wait again while the queue or the
+   checks are still moving.
+3. `merged`: run `wt dev stop` unless you still plan to use the server, and
+   do any step you owe now that it merged. A step that needs a later event
+   is a wake whose message is the step itself
+   (`wt wake production -m "<the step>"`). A check is never a wake; wt wakes
+   you for it. Then end the turn and say it merged.
+4. `evicted`: see below. `closed`: someone closed the PR; stop and say so.
 
-When the PR is open and not draft but has no `.merge_queue` entry and
-`.pr.auto_merge` is false, or its queue entry reads `UNMERGEABLE`, it was
-evicted. Find out why before acting: the failed queue run
-(`gh pr checks`, then its log), a conflict, or a new requirement. Fix it
+A `pr.merge_dropped` rule may prompt this session about the same eviction
+(`wt automations` shows what runs); it is one eviction, not two. If you had
+to hand a long wait to a wake (see *The loop*), make it
+`wt wake 1h -m "babysit: not merged yet? read the row for an eviction"` and
+say the PR is armed, not merged. Woken unmerged, read the row and go back to
+step 2. Woken after the merge, close it: `wt done <id> -m "merged"`.
+
+When `wt wait` says `evicted`, or the PR is open and not draft but has no
+`.merge_queue` entry and `.pr.auto_merge` is false, or its queue entry reads
+`UNMERGEABLE`, it was evicted. Find out why before acting: the failed queue
+run (`gh pr checks`, then its log), a conflict, or a new requirement. Fix it
 through the normal loop (findings, push, review), then `wt merge` again.
 Never re-arm unchanged after a real failure; it fails the same way. A flaky
 queue run with no code cause may be re-armed once; a second failure is a
@@ -175,19 +209,22 @@ real one.
 
 ## After it lands
 
-- `wt owed` lists what the worktree still owes. A check
-  (`--verify-in-staging`, `--verify-in-production`; both may be owed) wakes
-  you when the change is deployed there; do not poll for it. Confirm the
-  deploy carries the change, run the steps, then
-  `wt done <stage> -m "<what you checked, where>"`.
-- Any other step you set a wake for comes back as a due step: do it, then
+Merging alone brings you back for nothing. What does:
+
+- A check (`--verify-in-staging`, `--verify-in-production`; both may be
+  owed): wt wakes you when the change is deployed there; do not poll for it.
+  Confirm the deploy carries the change, run the steps, then
+  `wt done <stage> -m "<what you checked, where>"`. If you cannot run it
+  yet, `wt done <stage> --again <time>`, never a separate `wt wake`.
+- A step you set a wake for comes back as a due step: do it, then
   `wt done <id> -m "<what you did and saw>"`, or `--again <condition>` to
   come back for another part.
 - Do not remove the worktree; merge cleanup archives it.
-- You are done only when `.pr.state` is `MERGED` and `wt owed` says the
-  worktree owes nothing, or when blocked on a human. An armed PR is still something to wait for:
-  never end a turn there without a wake set (`wt watch`). Never keep waiting
-  on a clean current-head review; merge it.
+
+Your part ends when the PR has merged and the steps in *Until it lands* are
+done, when a genuinely long wait was handed to a wake, or when blocked on a
+human. `wt owed` lists what still brings you
+back. Never keep waiting on a clean current-head review; merge it.
 
 ## Next PR from this worktree
 

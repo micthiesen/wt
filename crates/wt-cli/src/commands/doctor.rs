@@ -73,56 +73,7 @@ pub async fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<i32> {
             Err(error) => checks.push(check("working tree", CheckStatus::Err, error.to_string())),
         }
         let trunk = format!("origin/{}", ctx.config.branch.base);
-        let compare = ctx
-            .processes
-            .run(
-                CommandSpec::new("git")
-                    .args([
-                        "rev-list",
-                        "--left-right",
-                        "--count",
-                        trunk.as_str(),
-                        "HEAD",
-                    ])
-                    .cwd(&path),
-                &ctx.cancellation,
-            )
-            .await;
-        match compare {
-            Ok(output) if output.status.success() => {
-                let nums = output
-                    .stdout_text()
-                    .split_whitespace()
-                    .filter_map(|n| n.parse::<u64>().ok())
-                    .collect::<Vec<_>>();
-                let behind = nums.first().copied().unwrap_or(0);
-                let ahead = nums.get(1).copied().unwrap_or(0);
-                let status = if behind == 0 {
-                    CheckStatus::Ok
-                } else {
-                    CheckStatus::Warn
-                };
-                checks.push(check(
-                    "sync",
-                    status,
-                    if behind == 0 && ahead == 0 {
-                        "up to date".into()
-                    } else {
-                        format!("{ahead} ahead, {behind} behind {trunk}")
-                    },
-                ));
-            }
-            Ok(_) => checks.push(check(
-                "sync",
-                CheckStatus::Warn,
-                format!("cannot compare with {trunk}"),
-            )),
-            Err(error) => checks.push(check(
-                "sync",
-                CheckStatus::Warn,
-                format!("cannot compare with {trunk}: {error}"),
-            )),
-        }
+        checks.push(check_sync(ctx, &path, &trunk).await);
         if path.join("package.json").exists() {
             let installed = path.join("node_modules").is_dir();
             checks.push(check(
@@ -290,6 +241,57 @@ pub async fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<i32> {
             0
         },
     )
+}
+
+/// How far the checkout is ahead of and behind `trunk`.
+async fn check_sync(ctx: &AppContext, path: &Path, trunk: &str) -> Check {
+    // The symmetric difference counts each side's own commits. Two separate
+    // revisions would count everything reachable from either.
+    let range = format!("{trunk}...HEAD");
+    let compare = ctx
+        .processes
+        .run(
+            CommandSpec::new("git")
+                .args(["rev-list", "--left-right", "--count", range.as_str()])
+                .cwd(path),
+            &ctx.cancellation,
+        )
+        .await;
+    match compare {
+        Ok(output) if output.status.success() => {
+            let nums = output
+                .stdout_text()
+                .split_whitespace()
+                .filter_map(|n| n.parse::<u64>().ok())
+                .collect::<Vec<_>>();
+            let behind = nums.first().copied().unwrap_or(0);
+            let ahead = nums.get(1).copied().unwrap_or(0);
+            let status = if behind == 0 {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Warn
+            };
+            check(
+                "sync",
+                status,
+                if behind == 0 && ahead == 0 {
+                    "up to date".into()
+                } else {
+                    format!("{ahead} ahead, {behind} behind {trunk}")
+                },
+            )
+        }
+        Ok(_) => check(
+            "sync",
+            CheckStatus::Warn,
+            format!("cannot compare with {trunk}"),
+        ),
+        Err(error) => check(
+            "sync",
+            CheckStatus::Warn,
+            format!("cannot compare with {trunk}: {error}"),
+        ),
+    }
 }
 
 async fn print_banners(ctx: &AppContext) -> Result<()> {
@@ -556,6 +558,46 @@ mod tests {
             check_stage(&fixture.ctx, worktree, slug)[1].message,
             "not deployed"
         );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_counts_each_side_of_the_fork_not_all_of_history() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let worktree = fixture.ctx.cwd.clone();
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        // History both sides share, then one commit only the trunk has and
+        // two only the worktree has.
+        for message in ["shared one", "shared two"] {
+            git(&main, &["commit", "--allow-empty", "-m", message]);
+        }
+        git(&worktree, &["reset", "--hard", "main"]);
+        git(&main, &["update-ref", "refs/remotes/origin/main", "main"]);
+        let synced = check_sync(&fixture.ctx, &worktree, "origin/main").await;
+        assert_eq!(synced.message, "up to date");
+        assert!(matches!(synced.status, CheckStatus::Ok));
+
+        git(&main, &["commit", "--allow-empty", "-m", "trunk only"]);
+        git(&main, &["update-ref", "refs/remotes/origin/main", "main"]);
+        for message in ["mine one", "mine two"] {
+            git(&worktree, &["commit", "--allow-empty", "-m", message]);
+        }
+        let diverged = check_sync(&fixture.ctx, &worktree, "origin/main").await;
+        assert_eq!(diverged.message, "2 ahead, 1 behind origin/main");
+        assert!(matches!(diverged.status, CheckStatus::Warn));
+
+        let unknown = check_sync(&fixture.ctx, &worktree, "origin/absent").await;
+        assert_eq!(unknown.message, "cannot compare with origin/absent");
         fixture.close().await.unwrap();
     }
 

@@ -7,9 +7,9 @@ mod types;
 
 pub use evaluate::{
     CHECK_RULE_ID, CHECK_RUN, FLEET_SLUG, MERGE_ARM_GRACE_MS, WATCH_RULE_ID, WATCH_RUN, check_rule,
-    eligible, evaluate, evaluate_breaker_resets, finished_merge_arms, fire_identity, guide_owner,
-    is_check_wake, mcp_fire_key, mcp_subscription, observed_merge_arms, pending_mcp_events,
-    watch_rule,
+    checks_newly_due, eligible, evaluate, evaluate_breaker_resets, finished_merge_arms,
+    fire_identity, guide_owner, is_check_wake, mcp_fire_key, mcp_subscription, merge_dropped,
+    observed_merge_arms, pending_mcp_events, watch_rule,
 };
 pub use ledger::{
     AutomationLedger, BREAKER_LIMIT, BreakerState, DispatchClaim, DispatchClaimResult,

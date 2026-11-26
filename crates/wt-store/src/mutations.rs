@@ -300,13 +300,45 @@ impl Store {
 
     pub fn read_removed_worktrees(&mut self) -> Result<Vec<RemovedWorktree>, StoreError> {
         let state = self.read_wt_state()?;
-        Ok(state
+        let removed: Vec<RemovedWorktree> = state
             .get("removed")
             .and_then(Value::as_array)
             .into_iter()
             .flat_map(|items| items.iter())
             .filter_map(|item| serde_json::from_value(item.clone()).ok())
-            .collect())
+            .collect();
+        Ok(removed)
+    }
+
+    /// A row removed after it reached production was recorded as landed on
+    /// base only, so its production check never came due. Its history holds
+    /// the landing: keep it on the record. Only a row that still owes a
+    /// check is looked up, and only while the removal is the last thing its
+    /// slug's history holds: a later worktree with the slug has a history
+    /// of its own. Returns how many records changed. A write of its own,
+    /// run once when a process that acts on removed rows starts, never as
+    /// part of reading them.
+    pub fn heal_removed_landings(&mut self) -> Result<usize, StoreError> {
+        let removed = self.read_removed_worktrees()?;
+        let mut proven = Vec::new();
+        for entry in &removed {
+            let in_production = crate::removed_landing(entry, true).production;
+            if in_production || !is_merged_removal(entry) || entry.open_checks().is_empty() {
+                continue;
+            }
+            let landed = self.connection().is_some_and(|db| {
+                let log = crate::events::EventLog::new(db, &self.identity().id);
+                log.removed(&entry.slug).unwrap_or(false)
+                    && log.landed_in_production(&entry.slug).unwrap_or(false)
+            });
+            if landed {
+                proven.push((entry.slug.clone(), entry.removed_at.clone()));
+            }
+        }
+        if !proven.is_empty() {
+            self.record_removed_production_landings(&proven)?;
+        }
+        Ok(proven.len())
     }
 
     pub fn recently_removed_worktrees(
@@ -1251,8 +1283,9 @@ impl Store {
         self.mutate_wt_state_logged(|state, log| {
             let previous = stored_work_status(state, slug);
             let written = write_work_status(state, slug, previous.as_ref(), None)?;
-            let changed = written.changed;
-            if changed {
+            // The stamp goes with the status; one not yet earned goes too.
+            let changed = crate::stamps::clear_pending(state, slug) || written.changed;
+            if written.changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
                     crate::owed::log_checks_left(log, slug, previous.as_ref(), None, by)?;
@@ -1281,6 +1314,7 @@ impl Store {
             let record = match update(previous.as_ref()) {
                 Ok(record) => record.map(|mut record| {
                     record.normalize();
+                    crate::owed::begin_checks(&mut record, previous.as_ref());
                     record
                 }),
                 Err(refusal) => return Ok((Err(refusal), false)),
@@ -1306,14 +1340,20 @@ impl Store {
                     )
                 });
             }
+            let expired = crate::stamps::drop_expired_pending(state, slug);
+            let stamped = record
+                .as_ref()
+                .and_then(|record| crate::stamps::earn(state, log, slug, record));
+            let wrote = changed || stamped.is_some() || expired;
             Ok((
                 Ok(WorkStatusWrite {
                     previous,
                     record,
                     changed,
                     cancelled_watches: written.cancelled_watches,
+                    stamped,
                 }),
-                changed,
+                wrote,
             ))
         })
     }
@@ -1886,6 +1926,11 @@ impl Store {
                     } else {
                         next.remove("githubIssue");
                     }
+                }
+                // The removal's own verdict says base at most; the history
+                // knows whether the work had reached production.
+                if log.landed_in_production(&incoming.slug).unwrap_or(false) {
+                    next.insert(crate::owed::LANDED_ON.to_owned(), json!("production"));
                 }
                 // A removal can be recorded again while it is confirmed;
                 // it is one event.

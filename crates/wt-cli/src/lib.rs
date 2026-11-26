@@ -355,6 +355,14 @@ enum Command {
     /// `wt notify pr:3806:production`, `wt notify release:production+24h -m
     /// "soak is over"`, `wt notify 5pm -m "stand-up"`.
     Notify(commands::watch::NotifyArgs),
+    /// Block until conditions hold, then say which.
+    ///
+    /// For what resolves while you are still working: CI, a review bot's
+    /// pass, the merge queue. Nothing is stored and it works with the TUI
+    /// closed: `wt wait --any settled reviewed evicted merged closed`. Exit
+    /// 0 held, 124 timed out, 2 unreadable condition, 1 could not tell. A
+    /// wait that outlives the session is `wt wake`.
+    Wait(commands::wait::WaitArgs),
     /// List, cancel or check watches: what worktrees are waiting for.
     Watch(commands::watch::WatchArgs),
     /// Show what a worktree still owes: its merge gate, the checks owed
@@ -747,6 +755,7 @@ async fn dispatch_command(
         Command::Status(args) => commands::status::run(context, args).await,
         Command::Wake(args) => commands::watch::run_wake(context, args).await,
         Command::Notify(args) => commands::watch::run_notify(context, args).await,
+        Command::Wait(args) => commands::wait::run(context, args).await,
         Command::Watch(args) => commands::watch::run_watch(context, args).await,
         Command::Owed(args) => commands::owed::run_owed(context, args).await,
         Command::Done(args) => commands::owed::run_done(context, args).await,

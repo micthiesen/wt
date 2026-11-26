@@ -148,6 +148,14 @@ pub trait EventSource: Send + Sync + 'static {
         branches: Vec<String>,
         cancel: &'a CancellationToken,
     ) -> EventFuture<'a, Result<EventGithubData, String>>;
+    /// When GitHub's exhausted rate limit resets, in epoch milliseconds, if
+    /// that can be told. Asked only after a read failed with a rate limit.
+    fn rate_limit_reset<'a>(
+        &'a self,
+        _cancel: &'a CancellationToken,
+    ) -> EventFuture<'a, Option<u64>> {
+        Box::pin(async { None })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -249,6 +257,8 @@ pub async fn read_state(
 }
 
 mod daemon;
+
+pub use daemon::{backoff_interval_ms, failure_wait_ms, rate_limited};
 
 #[cfg(test)]
 mod tests {

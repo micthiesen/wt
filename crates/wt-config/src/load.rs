@@ -1097,6 +1097,12 @@ fn parse_actions(raw: &toml::Value, errors: &mut Vec<String>) -> Vec<ActionDef> 
             ));
             continue;
         }
+        if has_prompt && parsed.retry_on_failure.is_some() {
+            errors.push(format!(
+                "{tag}.retry_on_failure is only valid on a shell action: a prompt may have acted before it failed"
+            ));
+            continue;
+        }
         if parsed
             .label_extract
             .as_ref()
@@ -1122,6 +1128,7 @@ fn parse_actions(raw: &toml::Value, errors: &mut Vec<String>) -> Vec<ActionDef> 
             key: parsed.key,
             group: parsed.group,
             external: parsed.external.unwrap_or(false),
+            retry_on_failure: parsed.retry_on_failure.unwrap_or(false),
             arg_prompt: parsed
                 .arg_prompt
                 .filter(|value| !value.is_empty())
@@ -1380,10 +1387,22 @@ fn parse_history(raw: &toml::Value, errors: &mut Vec<String>) -> HistoryConfig {
             return HistoryConfig::default();
         }
     };
-    for name in &mut history.skills {
+    for name in history.skills.iter_mut().chain(&mut history.stamps) {
         if let Some(bare) = name.strip_prefix('/') {
             *name = bare.to_owned();
         }
+    }
+    // A stamp's name is drawn on the board, so it is held to what a skill
+    // name can be.
+    if history.stamps.iter().any(|name| {
+        name.is_empty()
+            || name.len() > 64
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '-'))
+    }) {
+        errors.push("history.stamps must be an array of skill or slash-command names (letters, digits, '_', ':', '.', '-')".into());
+        return HistoryConfig::default();
     }
     if history
         .skills
@@ -1996,6 +2015,7 @@ struct RawAction {
     key: Option<String>,
     group: Option<String>,
     external: Option<bool>,
+    retry_on_failure: Option<bool>,
     arg_prompt: Option<String>,
     label_extract: Option<String>,
 }

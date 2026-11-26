@@ -34,6 +34,7 @@ pub mod state;
 pub mod status;
 pub mod title;
 pub mod update;
+pub mod wait;
 pub mod watch;
 
 pub mod _action_worker;

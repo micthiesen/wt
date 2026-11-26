@@ -32,6 +32,7 @@ pub mod session_source;
 pub mod sources;
 pub mod titles;
 pub mod update_source;
+pub mod wait_facts;
 pub mod watch_board;
 pub mod watch_facts;
 pub mod work_presentation;

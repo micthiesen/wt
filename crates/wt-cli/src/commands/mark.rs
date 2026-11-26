@@ -18,16 +18,22 @@ pub struct MarkArgs {
     /// The note. Its first line is kept, cut to 160 characters.
     #[arg(
         value_name = "TEXT",
-        required_unless_present = "claude_hook",
-        conflicts_with = "claude_hook"
+        required_unless_present_any = ["claude_hook", "stamp"],
+        conflicts_with_all = ["claude_hook", "stamp"]
     )]
     pub text: Vec<String>,
+    /// Stamp the worktree as having been through a round of this skill, at
+    /// its current HEAD, in place of any stamp it has. For harnesses that
+    /// report no skill uses: `[history] stamps` does this by itself where
+    /// the Claude Code hook is installed.
+    #[arg(long, value_name = "NAME", conflicts_with = "claude_hook")]
+    pub stamp: Option<String>,
     /// The worktree to mark (default: the current one, then WT_AGENT).
     #[arg(long, value_name = "SLUG", conflicts_with = "claude_hook")]
     pub slug: Option<String>,
     /// Read one Claude Code hook event on stdin and record the skill use it
-    /// describes, when `[history] skills` lists that skill. Always exits 0
-    /// and prints nothing.
+    /// describes, when `[history] skills` or `stamps` lists that skill.
+    /// Always exits 0 and prints nothing.
     #[arg(long)]
     pub claude_hook: bool,
     /// What the hook event described, read before the application starts.
@@ -45,12 +51,14 @@ pub struct SkillUse {
     pub from_agent: bool,
     /// The session's directory, when the event named one.
     pub cwd: Option<PathBuf>,
+    /// The stamp a round of it leaves, as `[history] stamps` names it.
+    pub stamp: Option<String>,
 }
 
 /// The hook event waiting on stdin, when it is a skill use to record.
 /// Nothing is read while no skill is configured.
 pub fn read_hook(history: &HistoryConfig) -> Option<SkillUse> {
-    if history.skills.is_empty() {
+    if history.is_empty() {
         return None;
     }
     let mut input = String::new();
@@ -92,6 +100,7 @@ pub fn skill_use(event: &Value, history: &HistoryConfig) -> Option<SkillUse> {
         return None;
     }
     Some(SkillUse {
+        stamp: history.stamp_for(&name).map(str::to_owned),
         name,
         args: args
             .map(|args| wt_core::event_text(&wt_core::sanitize_terminal_lines(&args)))
@@ -112,6 +121,9 @@ pub async fn run(ctx: &AppContext, args: &MarkArgs) -> Result<i32> {
             record_skill(ctx, used, agent.as_deref()).await;
         }
         return Ok(0);
+    }
+    if let Some(name) = &args.stamp {
+        return stamp(ctx, name, args.slug.as_deref(), agent.as_deref()).await;
     }
     let text = wt_core::event_text(&wt_core::sanitize_terminal_text(&args.text.join(" ")));
     if text.is_empty() {
@@ -134,6 +146,54 @@ pub async fn run(ctx: &AppContext, args: &MarkArgs) -> Result<i32> {
         .call(move |store| Ok(store.append_worktree_event(&owner, at_ms, &event)?))
         .await?;
     println!("✓ marked {slug}: {text}");
+    Ok(0)
+}
+
+/// `wt mark --stamp`: stamp the worktree now, at its HEAD.
+async fn stamp(
+    ctx: &AppContext,
+    name: &str,
+    slug: Option<&str>,
+    agent: Option<&str>,
+) -> Result<i32> {
+    let name = name.strip_prefix('/').unwrap_or(name).to_owned();
+    if !wt_core::is_stamp_name(&name) {
+        eprintln!("a stamp is named like a skill: letters, digits, '_', ':', '.', '-'");
+        return Ok(2);
+    }
+    let slug = match target(ctx, slug, agent).await {
+        Ok(slug) => slug,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(1);
+        }
+    };
+    let head = ctx
+        .repository
+        .inventory(&ctx.cancellation)
+        .await?
+        .into_iter()
+        .find(|row| !row.is_main && row.target.slug() == slug)
+        .and_then(|row| row.head_sha);
+    let (owner, skill, by) = (slug.clone(), name.clone(), agent.map(str::to_owned));
+    let stamped = ctx
+        .database
+        .call(move |store| Ok(store.stamp_now(&owner, &skill, head.as_deref(), by.as_deref())?))
+        .await?;
+    match stamped {
+        Some(stamp) => println!(
+            "{} stamped {slug}: {name}{}",
+            wt_core::STAMP_CURRENT,
+            stamp
+                .sha
+                .as_deref()
+                .map(|sha| format!(" at {}", &sha[..sha.len().min(7)]))
+                .unwrap_or_default()
+        ),
+        None => println!(
+            "{slug} has no status to carry a stamp: {name} is pending and is earned by its next wt status"
+        ),
+    }
     Ok(0)
 }
 
@@ -167,6 +227,16 @@ async fn record_skill(ctx: &AppContext, used: &SkillUse, agent: Option<&str>) ->
         by: used.from_agent.then(|| agent.unwrap_or(&slug).to_owned()),
     };
     wt_app_core::worktree_history::record(ctx, &slug, event).await;
+    if let Some(stamp) = used.stamp.clone() {
+        let (owner, by) = (slug.clone(), agent.map(str::to_owned));
+        let pending = ctx
+            .database
+            .call(move |store| Ok(store.set_pending_stamp(&owner, &stamp, by.as_deref())?))
+            .await;
+        if let Err(error) = pending {
+            tracing::debug!(%error, "could not record a pending stamp");
+        }
+    }
     Some(slug)
 }
 
@@ -188,6 +258,7 @@ mod tests {
     fn listed(skills: &[&str]) -> HistoryConfig {
         HistoryConfig {
             skills: skills.iter().map(|skill| (*skill).to_owned()).collect(),
+            ..HistoryConfig::default()
         }
     }
 
@@ -394,6 +465,58 @@ mod tests {
         };
         assert_eq!(events(&ctx, "two").await, [by("two"), by("manager")]);
         assert_eq!(events(&ctx, "one").await.len(), 1);
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stamping_skill_leaves_a_stamp_for_the_next_status_to_earn() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut ctx = fixture.ctx.clone();
+        let mut config = (*ctx.config).clone();
+        // Listed as a stamp only: it is recorded all the same.
+        config.history = HistoryConfig {
+            stamps: vec!["fable-review".into()],
+            ..HistoryConfig::default()
+        };
+        ctx.config = Arc::new(config);
+        let root = ctx.config.paths.worktree_root.clone();
+        let event = json!({"hook_event_name": "UserPromptSubmit", "cwd": root.join("one"), "prompt": "/fable-review"});
+        let hook = MarkArgs {
+            claude_hook: true,
+            hook_use: skill_use(&event, &ctx.config.history),
+            ..MarkArgs::default()
+        };
+        assert_eq!(run(&ctx, &hook).await.unwrap(), 0);
+        assert_eq!(events(&ctx, "one").await.len(), 1);
+        let state = |ctx: &AppContext| {
+            let database = ctx.database.clone();
+            async move {
+                database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            wt_store::stored_pending_stamp(&state(&ctx).await, "one").as_deref(),
+            Some("fable-review")
+        );
+        assert_eq!(wt_store::stored_stamp(&state(&ctx).await, "one"), None);
+
+        // By hand, with no status yet: it waits for one too.
+        let by_hand = |name: &str| MarkArgs {
+            stamp: Some(name.into()),
+            slug: Some("two".into()),
+            ..MarkArgs::default()
+        };
+        assert_eq!(run(&ctx, &by_hand("/check")).await.unwrap(), 0);
+        assert_eq!(
+            wt_store::stored_pending_stamp(&state(&ctx).await, "two").as_deref(),
+            Some("check")
+        );
+        assert_eq!(run(&ctx, &by_hand("not a name")).await.unwrap(), 2);
         fixture.close().await.unwrap();
     }
 

@@ -120,9 +120,14 @@ impl WatchWants {
 /// The worktrees pending watches depend on, by slug: every watch's owner,
 /// and each worktree a condition names, with the stages asked about.
 pub fn watch_wants(state: &serde_json::Value) -> BTreeMap<String, WatchWants> {
+    wants_of(&wt_store::stored_watches(state))
+}
+
+/// [`watch_wants`] for watches the caller holds, stored or not.
+pub fn wants_of(watches: &[wt_core::watch::Watch]) -> BTreeMap<String, WatchWants> {
     use wt_core::watch::{Condition, RowState};
     let mut wants: BTreeMap<String, WatchWants> = BTreeMap::new();
-    for watch in wt_store::stored_watches(state) {
+    for watch in watches {
         if watch.owner_gone {
             continue;
         }
@@ -227,11 +232,22 @@ pub async fn plan_automation_facts(
 ) -> Result<AutomationLifecycleEvidence> {
     let empty = GithubData::default();
     let github = github.map_or(&empty, |github| &**github);
+    landing_facts(ctx, rows, state, github, &watch_wants(state)).await
+}
+
+/// [`plan_automation_facts`] over a GitHub read the caller made itself, for
+/// the worktrees and stages `wants` names.
+pub async fn landing_facts(
+    ctx: &AppContext,
+    rows: Vec<WorktreeRecord>,
+    state: &serde_json::Value,
+    github: &GithubData,
+    wants: &BTreeMap<String, WatchWants>,
+) -> Result<AutomationLifecycleEvidence> {
     let lifecycle = service(ctx)?;
     let mut published_bases = BTreeMap::new();
     let mut warning = None;
     let mut evidence = AutomationLifecycleEvidence::default();
-    let wants = watch_wants(state);
     for row in rows {
         if row.is_main {
             continue;

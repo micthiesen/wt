@@ -79,6 +79,7 @@ fn custom(surface: &ActionSurface) -> ActionDef {
         key: Some("c".into()),
         group: None,
         external: false,
+        retry_on_failure: false,
         arg_prompt: None,
         label_extract: None,
     }
@@ -150,6 +151,7 @@ fn review_bot(config: &Config) -> Vec<ActionDef> {
                 key: None,
                 group: None,
                 external: false,
+                retry_on_failure: false,
                 arg_prompt: None,
                 label_extract: None,
             }]
@@ -229,14 +231,14 @@ fn manager() -> Vec<ActionDef> {
             "manager",
         ),
     ];
-    values.push(ActionDef { kind: ActionKind::Claude, id: "manager-compact".into(), name: "Compact manager context".into(), prompt: Some("/compact Today is {{today}}. State that date verbatim in the summary you produce — a compaction summary is otherwise undated, and everything after it reasons from a stale one. Preserve: current fleet state (per-slug statuses, in-flight nudges, pending merge order, unresolved escalations) and any standing briefs from the config. You are the wt manager session; immediately after this compaction, re-run /manager to reload your playbook before doing anything else.".into()), shell: None, target: ActionTarget::Manager, affects: Some(Vec::new()), requires: Vec::new(), issue_status: None, key: Some("m".into()), group: Some("manager".into()), external: false, arg_prompt: None, label_extract: None });
+    values.push(ActionDef { kind: ActionKind::Claude, id: "manager-compact".into(), name: "Compact manager context".into(), prompt: Some("/compact Today is {{today}}. State that date verbatim in the summary you produce — a compaction summary is otherwise undated, and everything after it reasons from a stale one. Preserve: current fleet state (per-slug statuses, in-flight nudges, pending merge order, unresolved escalations) and any standing briefs from the config. You are the wt manager session; immediately after this compaction, re-run /manager to reload your playbook before doing anything else.".into()), shell: None, target: ActionTarget::Manager, affects: Some(Vec::new()), requires: Vec::new(), issue_status: None, key: Some("m".into()), group: Some("manager".into()), external: false, retry_on_failure: false, arg_prompt: None, label_extract: None });
     values
 }
 
 fn slot() -> Vec<ActionDef> {
     vec![
         prompt("slot-continue", "Continue current work", "Pick your current work back up and continue. Recheck actual state first (tree, git status, your own conversation context) rather than assuming; then do the next real unit of work. If nothing is pending, reply with one line saying so and stop.", ActionTarget::Slot, "g", ""),
-        ActionDef { kind: ActionKind::Claude, id: "slot-compact".into(), name: "Compact context".into(), prompt: Some("/compact Today is {{today}}. State that date verbatim in the summary you produce, so nothing after this compaction has to guess it.".into()), shell: None, target: ActionTarget::Slot, affects: Some(Vec::new()), requires: Vec::new(), issue_status: None, key: Some("m".into()), group: None, external: false, arg_prompt: None, label_extract: None },
+        ActionDef { kind: ActionKind::Claude, id: "slot-compact".into(), name: "Compact context".into(), prompt: Some("/compact Today is {{today}}. State that date verbatim in the summary you produce, so nothing after this compaction has to guess it.".into()), shell: None, target: ActionTarget::Slot, affects: Some(Vec::new()), requires: Vec::new(), issue_status: None, key: Some("m".into()), group: None, external: false, retry_on_failure: false, arg_prompt: None, label_extract: None },
     ]
 }
 
@@ -261,6 +263,7 @@ fn prompt(
         key: Some(key.into()),
         group: Some(group.into()),
         external: false,
+        retry_on_failure: false,
         arg_prompt: None,
         label_extract: None,
     }
@@ -287,6 +290,7 @@ fn shell(
         key: Some(key.into()),
         group: Some(group.into()),
         external: false,
+        retry_on_failure: false,
         arg_prompt: None,
         label_extract: None,
     }

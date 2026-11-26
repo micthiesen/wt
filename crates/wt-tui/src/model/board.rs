@@ -385,6 +385,10 @@ pub struct OwedView {
     /// How long until then while it lies ahead, such as `1d 21h`.
     #[serde(default)]
     pub due_in: Option<String>,
+    /// What the item waits on, as `wt_core::OwedBlock::of_item` files it
+    /// under `wt owed --all`. `None` from a host on an older build.
+    #[serde(default)]
+    pub block: Option<OwedBlock>,
 }
 
 impl OwedView {
@@ -416,6 +420,7 @@ impl OwedView {
             wakes: false,
             next_at_ms: None,
             due_in: None,
+            block: None,
         }
     }
 
@@ -439,12 +444,15 @@ impl OwedView {
     }
 }
 
-/// Key prefix of the blocks `[ui] owed_sections` derives for landed rows.
+/// Key prefix of a block `[ui] owed_sections` derives for landed rows.
 pub const OWED_BLOCK_PREFIX: &str = "\0owed:";
+/// The one block `[ui] owed_sections` draws landed rows in.
+pub const LANDED_SECTION: &str = "\0owed:landed";
+pub const LANDED_TITLE: &str = "Landed";
 /// The option's name as notices print it.
 pub const OWED_SECTIONS_OPTION: &str = "[ui] owed_sections";
 
-/// Why a row or block under a derived block cannot be moved. `title` is the
+/// Why the Landed block, or a row in it, cannot be moved. `title` is the
 /// block's.
 pub fn owed_block_refusal(title: &str) -> String {
     format!(
@@ -602,9 +610,8 @@ impl BoardSection {
         !self.rows.is_empty() || !self.key.starts_with('\0')
     }
 
-    /// A block `[ui] owed_sections` derives from what landed rows owe.
-    /// Nothing is filed in one: rows cannot be moved into, out of or inside
-    /// it.
+    /// The Landed block `[ui] owed_sections` derives. Nothing is filed
+    /// in it: rows cannot be moved into, out of or inside it.
     pub fn owed_block(&self) -> bool {
         self.key.starts_with(OWED_BLOCK_PREFIX)
     }
@@ -1074,7 +1081,7 @@ pub struct DisplayPolicy {
     pub trunk: String,
     /// The reviewer `E` requests when human reviewer requests are configured.
     pub default_reviewer: Option<String>,
-    /// `[ui] owed_sections`: landed rows are grouped by what they owe.
+    /// `[ui] owed_sections`: landed rows are drawn in one Landed block.
     pub owed_sections: bool,
     /// `[guides] enabled`: the details pane shows each row's change guide.
     pub guides: bool,
@@ -1139,7 +1146,7 @@ pub struct BoardRow {
     pub branch: String,
     pub base_branch: Option<String>,
     /// The named section the row is filed in, whatever it is drawn under:
-    /// a landed row under `[ui] owed_sections` is drawn in a derived block
+    /// a landed row under `[ui] owed_sections` is drawn in the Landed block
     /// and stays filed where it was. `None` for the Inbox, and for a row
     /// whose placement its host has not prepared here.
     #[serde(default)]
@@ -1237,7 +1244,7 @@ pub struct BoardRow {
     #[serde(default)]
     pub owed_phase: Option<wt_core::OwedPhase>,
     /// What a landed row is waiting on, as `wt_core::OwedBlock::of_row`
-    /// reads its list: the block `[ui] owed_sections` shows it in.
+    /// reads its list: the label it wears in the Landed block.
     #[serde(default)]
     pub owed_block: Option<OwedBlock>,
     /// The stored creation stamp of this worktree. A later worktree with the

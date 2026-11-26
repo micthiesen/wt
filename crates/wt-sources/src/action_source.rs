@@ -170,7 +170,14 @@ pub fn overlay(
         runs.view(),
         logs.view(),
     );
-    project(scope, board, runs.view(), logs.view(), targets)
+    let retrying = context
+        .config
+        .actions
+        .iter()
+        .filter(|action| action.retry_on_failure)
+        .map(|action| action.id.clone())
+        .collect();
+    project(scope, board, runs.view(), logs.view(), targets, retrying)
 }
 
 fn watch(
@@ -383,6 +390,7 @@ fn project(
     runs: SourceHandle<ActionHistory>,
     logs: SourceHandle<ActionLogs>,
     targets: RefreshTargets,
+    retrying: BTreeSet<String>,
 ) -> SourceHandle<Board> {
     let (output, mut publisher) = derived_channel(scope, "action-board");
     let cancel = scope.token();
@@ -393,6 +401,7 @@ fn project(
         let mut statuses = targets.issues.subscribe();
         boards.mark_changed(); updates.mark_changed(); log_updates.mark_changed(); statuses.mark_changed();
         let mut tracker = Tracker::new(epoch_ms());
+        tracker.retrying = retrying;
         let mut failures = wt_app_core::feeds::FailureClock::default();
         let mut last_runs = None;
         let mut last_error = None;
@@ -524,6 +533,9 @@ struct Tracker {
     running: BTreeMap<String, IssueExpectation>,
     settled: BTreeSet<String>,
     attention: VecDeque<wt_tui::AttentionLine>,
+    /// Ids of actions with `retry_on_failure`. An automation's failed run
+    /// of one is reported by the automation engine, once, when it gives up.
+    retrying: BTreeSet<String>,
 }
 
 impl Tracker {
@@ -539,6 +551,7 @@ impl Tracker {
             running: BTreeMap::new(),
             settled: BTreeSet::new(),
             attention: VecDeque::new(),
+            retrying: BTreeSet::new(),
         }
     }
 
@@ -560,6 +573,11 @@ impl Tracker {
             );
             let current = self.seen.contains(&meta.run_id) || meta.started_at >= self.boot_ms;
             if terminal && self.handled.insert(meta.run_id.clone()) && current {
+                let retried = meta.kind == wt_actions::ActionRunKind::Shell
+                    && meta.status == ActionRunStatus::Failed
+                    && meta.exit_code.is_some_and(|code| code != 0)
+                    && !meta.auto_fire_keys.is_empty()
+                    && self.retrying.contains(&meta.action_id);
                 let label = match meta.status {
                     ActionRunStatus::Succeeded => "succeeded",
                     ActionRunStatus::Failed => "failed",
@@ -584,12 +602,16 @@ impl Tracker {
                 let text = wt_core::sanitize_terminal_text(&line);
                 let at_ms = epoch_ms();
                 let source = wt_core::sanitize_terminal_text(&meta.slug);
-                tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
-                self.attention.push_back(wt_tui::AttentionLine {
-                    at_ms,
-                    source,
-                    text,
-                });
+                if retried {
+                    tracing::info!(slug = %source, %text, "failed automation run left to its retry");
+                } else {
+                    tracing::info!(target: "wt_attention", event_at_ms = at_ms, event_channel = "attention", event_source = %source, event_text = %text, "attention event");
+                    self.attention.push_back(wt_tui::AttentionLine {
+                        at_ms,
+                        source,
+                        text,
+                    });
+                }
                 while self.attention.len() > 10 {
                     self.attention.pop_front();
                 }
@@ -892,6 +914,29 @@ mod tests {
             "meta": {"version":1,"slug":"row","runId":id,"kind":"shell","actionId":"move","actionName":"Move issue","prompt":"","affects":["issue"],"startedAt":started,"status":status,"issueStatus":{"issueId":"ENG-1","status":"Review"}},
             "runDir":"/tmp/unused","command":[],"cwd":"/tmp/unused"
         })).unwrap()
+    }
+
+    #[test]
+    fn a_retrying_actions_failed_automation_run_stays_off_the_attention_feed() {
+        let failed = |keys: &[&str]| {
+            let mut run = run("new", "failed", 110);
+            run.meta.exit_code = Some(1);
+            run.meta.auto_fire_keys = keys.iter().map(|key| (*key).to_owned()).collect();
+            run
+        };
+        let now = tokio::time::Instant::now();
+        let mut tracker = Tracker::new(100);
+        tracker.retrying.insert("move".into());
+        assert_eq!(tracker.observe(&[failed(&["key"])], now).len(), 1);
+        assert!(tracker.attention.is_empty());
+        // A person's own run of the same action is reported as before.
+        let mut manual = Tracker::new(100);
+        manual.retrying.insert("move".into());
+        manual.observe(&[failed(&[])], now);
+        assert_eq!(manual.attention.len(), 1);
+        let mut plain = Tracker::new(100);
+        plain.observe(&[failed(&["key"])], now);
+        assert_eq!(plain.attention.len(), 1);
     }
 
     fn expected_runs(tracker: &Tracker) -> Vec<String> {

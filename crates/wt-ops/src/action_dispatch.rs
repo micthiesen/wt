@@ -360,6 +360,39 @@ pub async fn wake_session(
     }
 }
 
+/// Send a prompt of wt's own to the manager session, for what no worktree
+/// session is left to hear. A manager that cannot be reached defers: nothing
+/// was sent.
+pub async fn wake_manager(
+    context: &AppContext,
+    prompt: &str,
+) -> wt_app_core::automation_engine::AutomationOutcome {
+    use wt_app_core::automation_engine::{AutomationOutcome, DeliverySlot};
+    let delivery = deliver_prompt(
+        context,
+        "manager".into(),
+        context.config.paths.main_clone.clone(),
+        None,
+        Some("manager".into()),
+        prompt,
+        false,
+    )
+    .await;
+    match delivery {
+        PromptDelivery::Delivered => AutomationOutcome::Delivered {
+            slot: DeliverySlot::Manager,
+        },
+        PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous {
+            reason,
+            slot: DeliverySlot::Manager,
+        },
+        PromptDelivery::Unreachable(reason) => AutomationOutcome::Deferred {
+            reason: format!("cannot reach the manager: {reason}"),
+            frozen: Default::default(),
+        },
+    }
+}
+
 pub fn definitions(context: &AppContext, surface: &ActionSurface) -> Vec<ActionDef> {
     wt_app_core::action_builtins::definitions(&context.config, surface)
 }

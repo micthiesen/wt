@@ -48,6 +48,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
         .and_then(|tracker| tracker.status_command.clone());
     let prefix = tracker.as_ref().and_then(|tracker| tracker.prefix.clone());
     let enabled = command.is_some();
+    let unavailable = Arc::new(Unavailable::default());
     let statuses = start_skippable_source(scope, statuses_spec(context), {
         let context = context.clone();
         let board = board.clone();
@@ -55,6 +56,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
         move |cancel| {
             let context = context.clone();
             let command = command.clone();
+            let unavailable = unavailable.clone();
             // The id set comes from the derived board. Restored Git or
             // metadata may name issues that no longer exist, so the reader
             // waits for both to be live (rule E2); the board's next change
@@ -74,8 +76,15 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
                         observed,
                     )));
                 };
-                let statuses =
-                    read_with_fallback(&context, &command, &ids, READ_TIMEOUT, &cancel).await?;
+                let statuses = read_with_fallback(
+                    &context,
+                    &command,
+                    &ids,
+                    READ_TIMEOUT,
+                    &cancel,
+                    &unavailable,
+                )
+                .await?;
                 Ok(Some(Fetched::new(StatusBatch { statuses, ids }, observed)))
             }
         }
@@ -109,6 +118,48 @@ fn confirmed_ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Option<
 /// Bound on one run of the status command.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// What each unreadable issue last failed with. The reader runs on every
+/// board change, so an issue that stays unreadable is reported once per
+/// distinct error and once more when it reads again, not once per pass.
+#[derive(Default)]
+struct Unavailable(std::sync::Mutex<BTreeMap<String, String>>);
+
+impl Unavailable {
+    fn seen(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether this failure is news: the issue's first, or a different one.
+    fn failed(&self, id: &str, error: &str) -> bool {
+        let mut seen = self.seen();
+        if seen.get(id).is_some_and(|last| last == error) {
+            return false;
+        }
+        seen.insert(id.to_owned(), error.to_owned());
+        true
+    }
+
+    /// Whether the issue had been failing until this read.
+    fn read(&self, id: &str) -> bool {
+        self.seen().remove(id).is_some()
+    }
+
+    /// Forget issues the board no longer shows.
+    fn keep(&self, ids: &[String]) {
+        self.seen().retain(|id, _| ids.contains(id));
+    }
+
+    fn note_read<'a>(&self, ids: impl IntoIterator<Item = &'a String>) {
+        for id in ids {
+            if self.read(id) {
+                tracing::info!(issue = %id, "issue status available again");
+            }
+        }
+    }
+}
+
 /// Read every status in one batch. A tracker may refuse a whole batch over
 /// one id it cannot resolve; statuses are display-only, so the rest are then
 /// read one at a time and only that row stays blank. A run that does not
@@ -119,23 +170,32 @@ async fn read_with_fallback(
     ids: &[String],
     timeout: Duration,
     cancel: &tokio_util::sync::CancellationToken,
+    unavailable: &Unavailable,
 ) -> Result<BTreeMap<String, String>> {
+    unavailable.keep(ids);
     let batch = match read_statuses(context, command, ids, timeout, cancel).await {
-        Ok(statuses) => return Ok(statuses),
+        Ok(statuses) => {
+            unavailable.note_read(statuses.keys());
+            return Ok(statuses);
+        }
         Err(error) if ids.len() > 1 && !cancel.is_cancelled() && !incomplete(&error) => error,
         Err(error) => return Err(error),
     };
     let mut statuses = BTreeMap::new();
     for id in ids {
         match read_statuses(context, command, std::slice::from_ref(id), timeout, cancel).await {
-            Ok(one) => statuses.extend(one),
+            Ok(one) => {
+                unavailable.note_read(one.keys());
+                statuses.extend(one);
+            }
             Err(_) if cancel.is_cancelled() => return Err(batch),
             Err(error) if incomplete(&error) => return Err(error),
-            Err(error) => tracing::warn!(
-                issue = %id,
-                error = %format!("{error:#}"),
-                "issue status unavailable"
-            ),
+            Err(error) => {
+                let error = format!("{error:#}");
+                if unavailable.failed(id, &error) {
+                    tracing::warn!(issue = %id, %error, "issue status unavailable");
+                }
+            }
         }
     }
     if statuses.is_empty() {
@@ -281,9 +341,16 @@ mod tests {
         let command = vec![script.to_string_lossy().into_owned(), "{ids}".into()];
         let ids = ["COZ-1".to_owned(), "COZ-2".into(), "COZ-3".into()];
         let cancel = tokio_util::sync::CancellationToken::new();
-        let statuses = read_with_fallback(&fixture.ctx, &command, &ids, READ_TIMEOUT, &cancel)
-            .await
-            .unwrap();
+        let statuses = read_with_fallback(
+            &fixture.ctx,
+            &command,
+            &ids,
+            READ_TIMEOUT,
+            &cancel,
+            &Unavailable::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             statuses.keys().map(String::as_str).collect::<Vec<_>>(),
             ["COZ-1", "COZ-3"]
@@ -291,9 +358,16 @@ mod tests {
         // With nothing readable, the batch error stands.
         let only_bad = ["COZ-2".to_owned()];
         assert!(
-            read_with_fallback(&fixture.ctx, &command, &only_bad, READ_TIMEOUT, &cancel)
-                .await
-                .is_err()
+            read_with_fallback(
+                &fixture.ctx,
+                &command,
+                &only_bad,
+                READ_TIMEOUT,
+                &cancel,
+                &Unavailable::default(),
+            )
+            .await
+            .is_err()
         );
         fixture.close().await.unwrap();
     }
@@ -319,9 +393,16 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let timeout = Duration::from_millis(300);
         assert!(
-            read_with_fallback(&fixture.ctx, &command, &ids, timeout, &cancel)
-                .await
-                .is_err()
+            read_with_fallback(
+                &fixture.ctx,
+                &command,
+                &ids,
+                timeout,
+                &cancel,
+                &Unavailable::default(),
+            )
+            .await
+            .is_err()
         );
         assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 1);
         fixture.close().await.unwrap();
@@ -557,5 +638,21 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[test]
+    fn an_unreadable_issue_is_news_once_per_error_and_once_when_it_reads_again() {
+        let unavailable = Unavailable::default();
+        assert!(unavailable.failed("COZ-1", "not found"));
+        assert!(!unavailable.failed("COZ-1", "not found"));
+        assert!(unavailable.failed("COZ-2", "not found"));
+        assert!(unavailable.failed("COZ-1", "tracker is down"));
+        assert!(!unavailable.failed("COZ-1", "tracker is down"));
+        assert!(unavailable.read("COZ-1"));
+        assert!(!unavailable.read("COZ-1"));
+        assert!(unavailable.failed("COZ-1", "tracker is down"));
+        // An issue that left the board starts over if it returns.
+        unavailable.keep(&["COZ-1".to_owned()]);
+        assert!(unavailable.failed("COZ-2", "not found"));
     }
 }

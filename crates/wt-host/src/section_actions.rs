@@ -714,7 +714,7 @@ mod tests {
             &fixture.ctx.config.branch.base,
             fixture.ctx.config.ui.sort,
         );
-        let done = wt_tui::OwedBlock::Done.key().to_owned();
+        let done = wt_tui::LANDED_SECTION.to_owned();
         let refused = |error: anyhow::Error| {
             assert!(
                 error
@@ -724,7 +724,7 @@ mod tests {
             );
             assert_eq!(
                 error.to_string(),
-                "Done is derived from what landed rows owe; set [ui] owed_sections = false to file rows by hand"
+                "Landed is derived from what landed rows owe; set [ui] owed_sections = false to file rows by hand"
             );
         };
         // Out of the block, inside it, and the block itself.
@@ -935,7 +935,7 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(drawn("Batch"), ["two"]);
-        assert_eq!(drawn("Done"), ["one"]);
+        assert_eq!(drawn("Landed"), ["one"]);
         let seen = board.section_witness("Batch");
         assert_eq!(seen, ["one", "two"]);
         // Only what is drawn there is not what is stored there.

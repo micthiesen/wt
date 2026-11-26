@@ -441,6 +441,207 @@ impl Store {
     }
 }
 
+/// Date the checks a status begins to owe. A check the previous status
+/// already owed with the same steps is the same check and keeps its date;
+/// one owed again after it was closed is a new one, and is prompted for
+/// when it comes due even though its steps were prompted for before.
+pub(crate) fn begin_checks(record: &mut WorkStatusRecord, previous: Option<&WorkStatusRecord>) {
+    let mut checks = record.open_checks();
+    let mut began = false;
+    for (stage, check) in &mut checks {
+        let carried = previous
+            .and_then(|previous| previous.open_check(*stage))
+            .filter(|owed| owed.steps == check.steps);
+        match carried {
+            // A writer that rebuilt the check from its steps keeps the
+            // dates of the one it restates.
+            Some(owed) => {
+                if (check.since_ms, check.due_since_ms, check.due_pr)
+                    != (owed.since_ms, owed.due_since_ms, owed.due_pr)
+                    && check.due_since_ms.is_none()
+                {
+                    check.since_ms = owed.since_ms;
+                    check.due_since_ms = owed.due_since_ms;
+                    check.due_pr = owed.due_pr;
+                    began = true;
+                }
+            }
+            None if check.since_ms.is_none() => {
+                check.since_ms = Some(crate::store::now_ms());
+                began = true;
+            }
+            None => {}
+        }
+    }
+    if began {
+        record.set_checks(checks);
+    }
+}
+
+/// A removed row's landing as its record holds it: where its work was when
+/// it was removed, raised to production once that was proven since.
+pub fn removed_landing(entry: &RemovedWorktree, separate_production: bool) -> Landing {
+    let text = |key: &str| entry.extra.get(key).and_then(Value::as_str);
+    let in_production =
+        text(LANDED_ON) == Some("production") || text("landedOnAtRemoval") == Some("production");
+    Landing::new(
+        crate::is_merged_removal(entry),
+        in_production,
+        separate_production,
+    )
+}
+
+/// What a removed row still owes: the checks and due steps kept on its
+/// removal record, under [`removed_landing`]. Its deploys can no longer be
+/// read, so a check is due once its stage's branch has the work.
+pub fn removed_owed_items(
+    entry: &RemovedWorktree,
+    separate_production: bool,
+    now_ms: i64,
+) -> (Vec<wt_core::OwedItem>, Landing) {
+    let landing = removed_landing(entry, separate_production);
+    let record = entry.work_with_checks().and_then(|work| work.to_core());
+    let items = wt_core::owed_items(record.as_ref(), &landing, &[], &entry.owed(), now_ms);
+    (items, landing)
+}
+
+pub(crate) const LANDED_ON: &str = "landedOn";
+/// The removal record key naming what the manager was already told is due.
+const DUE_TOLD: &str = "dueTold";
+
+/// The due items of a removed row that nobody was told about: its session
+/// is gone, so the manager is told once. Each is what `wt done` takes (a
+/// stage or a step id) with the item.
+pub fn removed_due_untold(
+    entry: &RemovedWorktree,
+    separate_production: bool,
+    now_ms: i64,
+) -> Vec<(String, wt_core::OwedItem)> {
+    let told: Vec<&str> = entry
+        .extra
+        .get(DUE_TOLD)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    removed_owed_items(entry, separate_production, now_ms)
+        .0
+        .into_iter()
+        .filter(|item| item.state == wt_core::OwedState::Due)
+        .filter_map(|item| Some((told_key(&item)?, item)))
+        .filter(|(key, _)| !told.contains(&key.as_str()))
+        .collect()
+}
+
+/// A check put off and due again is told again: its not-before is part of
+/// what was told.
+fn told_key(item: &wt_core::OwedItem) -> Option<String> {
+    let target = item.done_target()?;
+    Some(match &item.when {
+        wt_core::OwedWhen::Stage {
+            not_before_ms: Some(at),
+            ..
+        } => format!("{target}:{at}"),
+        _ => target,
+    })
+}
+
+impl Store {
+    /// Record when each of these checks was first seen due, with a history
+    /// event. A check already dated is left alone, unless it is due for a
+    /// later pull request than the one it was dated for: then it is a new
+    /// round of the same check, dated again. Returns how many were dated.
+    pub fn note_checks_due(
+        &mut self,
+        due: &[wt_core::CheckDue],
+        now_ms: i64,
+    ) -> Result<usize, StoreError> {
+        if due.is_empty() {
+            return Ok(0);
+        }
+        self.mutate_wt_state_logged(|state, log| {
+            let mut dated = 0;
+            for seen in due {
+                if created_at(state, &seen.slug) != seen.created_at.as_deref() {
+                    continue;
+                }
+                let Some(previous) = stored_work_status(state, &seen.slug) else {
+                    continue;
+                };
+                let mut checks = previous.open_checks();
+                let Some((_, check)) = checks
+                    .iter_mut()
+                    .find(|(stage, check)| *stage == seen.stage && check.steps == seen.steps)
+                else {
+                    continue;
+                };
+                match (check.due_since_ms, check.due_pr, seen.pr) {
+                    (None, ..) => check.due_since_ms = Some(seen.since_ms.min(now_ms)),
+                    (Some(_), Some(was), Some(pr)) if was != pr => {
+                        check.due_since_ms = Some(now_ms);
+                        check.since_ms = Some(now_ms);
+                    }
+                    _ => continue,
+                }
+                check.due_pr = seen.pr.or(check.due_pr);
+                let check = check.clone();
+                let mut next = previous.clone();
+                next.set_checks(checks);
+                write_work_status(state, &seen.slug, Some(&previous), Some(&next))?;
+                dated += 1;
+                log.best_effort(|log| {
+                    log_incarnation(log, state, &seen.slug)?;
+                    record_check(
+                        log,
+                        &seen.slug,
+                        seen.stage,
+                        &check,
+                        OwedChange::Due,
+                        None,
+                        None,
+                        None,
+                    )
+                });
+            }
+            Ok((dated, dated > 0))
+        })
+    }
+
+    /// Record that the manager was told these due items of a removed row
+    /// (the keys [`removed_due_untold`] gave), so it is told once.
+    pub fn mark_removed_due_told(
+        &mut self,
+        slug: &str,
+        removed_at: &str,
+        keys: &[String],
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let Some(entry) = array_mut(state, "removed").iter_mut().find(|entry| {
+                text(entry, "slug") == Some(slug) && text(entry, "removedAt") == Some(removed_at)
+            }) else {
+                return Ok((false, false));
+            };
+            let mut told: Vec<Value> = entry
+                .get(DUE_TOLD)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let before = told.len();
+            for key in keys {
+                if !told.iter().any(|known| known.as_str() == Some(key)) {
+                    told.push(Value::String(key.clone()));
+                }
+            }
+            let changed = told.len() != before;
+            if changed {
+                entry[DUE_TOLD] = Value::Array(told);
+            }
+            Ok((changed, changed))
+        })
+    }
+}
+
 /// The checks of `slug`'s stored status that an older build discharged
 /// since this build last wrote it; see [`wt_core::normalize_checks`].
 pub(crate) fn discharged_by_an_older_build(

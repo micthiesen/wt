@@ -64,18 +64,16 @@ pub(crate) fn derive(state: &Value, slug: &str, read: RowLanding, now_ms: i64) -
 
 /// What a removed row still owes: the checks and due steps kept on its
 /// removal record. Its deploys can no longer be read, so a check stands by
-/// the landing recorded when the row was removed.
+/// the landing its record holds: where it was when removed, or production
+/// once that was proven since.
 pub(crate) fn derive_removed(
     entry: &RemovedWorktree,
     separate_production: bool,
     now_ms: i64,
 ) -> RowOwed {
-    let landed = wt_store::is_merged_removal(entry);
-    let landing = Landing::new(landed, false, separate_production);
-    let record = entry.work_with_checks().and_then(|work| work.to_core());
-    let items = wt_core::owed_items(record.as_ref(), &landing, &[], &entry.owed(), now_ms);
+    let (items, landing) = wt_store::removed_owed_items(entry, separate_production, now_ms);
     RowOwed {
-        phase: wt_core::owed_phase(&items, landed),
+        phase: wt_core::owed_phase(&items, landing.base),
         tells: 0,
         landing: RowLanding::known(landing),
         items,
@@ -213,6 +211,15 @@ fn item_line_from(
             line.push_str(&format!(" --slug {slug}"));
         }
         line.push_str(" -m \"<evidence>\"");
+        // Putting a check off is a form of the same command; a separate
+        // wake would leave the check due beside it.
+        if item.kind == OwedKind::Check {
+            line.push_str(&format!(" · not yet: wt done {target}"));
+            if away {
+                line.push_str(&format!(" --slug {slug}"));
+            }
+            line.push_str(" --again <time>");
+        }
     }
     line
 }
@@ -1182,7 +1189,7 @@ mod tests {
         assert_eq!(owed.phase, Some(OwedPhase::Due));
         assert_eq!(
             owed_text("This worktree", "one", &owed, clock()),
-            "This worktree owes:\n  due      check: 1. check staging (due in staging) · wt done staging -m \"<evidence>\""
+            "This worktree owes:\n  due      check: 1. check staging (due in staging) · wt done staging -m \"<evidence>\" · not yet: wt done staging --again <time>"
         );
         // One due: closed without naming it.
         assert_eq!(
@@ -1375,6 +1382,21 @@ mod tests {
         let owed = derive_removed(&entry().await, false, clock().now_ms);
         assert_eq!(owed.items.len(), 3);
         assert_eq!(owed.phase, Some(OwedPhase::Due));
+        // Behind a separate production branch the production check waits
+        // until the record says the work got there.
+        let production = |entry: &RemovedWorktree| {
+            derive_removed(entry, true, clock().now_ms)
+                .items
+                .iter()
+                .find(|item| item.stage == Some(VerifyStage::Production))
+                .map(|item| item.state)
+        };
+        let mut promoted = entry().await;
+        assert_eq!(production(&promoted), Some(OwedState::Waiting));
+        promoted
+            .extra
+            .insert("landedOn".into(), json!("production"));
+        assert_eq!(production(&promoted), Some(OwedState::Due));
         let gone = |targets: &[&str], message: Option<&str>| DoneArgs {
             slug: Some("gone".into()),
             ..done(targets, message)
@@ -1664,7 +1686,7 @@ mod tests {
         );
         assert_eq!(
             brief(Landing::new(true, true, true))[0],
-            "due      check: 1. check prod (due in production) · wt done production -m \"<evidence>\""
+            "due      check: 1. check prod (due in production) · wt done production -m \"<evidence>\" · not yet: wt done production --again <time>"
         );
 
         // This build writes: a fresh assertion that carries the check. The

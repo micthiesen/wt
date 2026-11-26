@@ -20,6 +20,7 @@ wt-runtime.workspace = true
 wt-core.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 wt-runtime = { workspace = true, features = ["testing"] }
 
 [lints]

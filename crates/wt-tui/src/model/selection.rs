@@ -168,7 +168,6 @@ impl Model {
         }
         if self.selected_row().map(|row| row.key.as_str()) != previous_key.as_deref() {
             self.details_scroll = 0;
-            self.reset_verification();
         }
         if !requested_selection {
             if let Some((host, url)) = previous_review {
@@ -377,14 +376,7 @@ impl Model {
         }
         self.selected = selected;
         self.details_scroll = 0;
-        self.reset_verification();
         InputResult::Draw
-    }
-
-    /// `V` is per row: the steps start hidden and hide again whenever the
-    /// cursor lands on another row.
-    pub(super) fn reset_verification(&mut self) {
-        self.show_verification = false;
     }
 
     /// Move the cursor one stop; at an edge, scroll the list to that edge

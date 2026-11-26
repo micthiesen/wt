@@ -357,6 +357,8 @@ pub struct WorkStatusWrite {
     /// Watches that were to clear the gate this write removed or replaced,
     /// cancelled with it.
     pub cancelled_watches: Vec<wt_core::watch::Watch>,
+    /// The review stamp this status earned; see `Store::set_pending_stamp`.
+    pub stamped: Option<wt_core::Stamp>,
 }
 
 /// One removed worktree, as `removed[]` keeps it.

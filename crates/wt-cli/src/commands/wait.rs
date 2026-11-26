@@ -1,0 +1,633 @@
+//! `wt wait`: block until conditions hold. The conditions are a watch's,
+//! read by the same helper `wt wake` uses and judged by the same
+//! evaluator, but in this process and against facts it reads itself, so it
+//! works while no TUI is evaluating watches. Nothing is stored: no watch,
+//! nothing owed, no history. The wait ends with the process.
+
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use clap::Args;
+use serde_json::{Value, json};
+use wt_app_core::context::AppContext;
+use wt_core::watch::{
+    Condition, Delay, LocalClock, Truth, Watch, WatchActions, WatchCondition, evaluate, needs,
+};
+use wt_sources::{
+    wait_facts::{RowReader, RowsRead},
+    watch_facts::{Externals, GIT_INTERVAL, facts},
+};
+
+use super::watch::{CONDITION_HELP, NO_CONDITIONS, author, clock, no_conditions, now_ms, owner};
+
+const TIMEOUT_DEFAULT: &str = "30m";
+const TIMEOUT_MAX_MS: i64 = 24 * 60 * 60 * 1_000;
+/// What `timeout(1)` exits with.
+const EXIT_TIMED_OUT: i32 = 124;
+const EXIT_INTERRUPTED: i32 = 130;
+
+#[derive(Debug, Clone, Args)]
+pub struct WaitArgs {
+    // Not required by the parser, for the reason `wt wake` gives.
+    #[arg(value_name = "CONDITION", help = CONDITION_HELP)]
+    pub conditions: Vec<String>,
+    /// Return when the first condition holds, instead of when all do.
+    #[arg(long)]
+    pub any: bool,
+    /// Give up after this long with exit 124: 45s, 20m, 2h, at most 24h.
+    #[arg(long, value_name = "DURATION", default_value = TIMEOUT_DEFAULT)]
+    pub timeout: String,
+    /// The worktree the conditions are about (default: the current one).
+    #[arg(long, value_name = "SLUG")]
+    pub slug: Option<String>,
+    /// Print one object: result (held, timed_out, unknown or interrupted),
+    /// any, held (the arguments that hold), waited_seconds, conditions
+    /// (arg, description, state: holds, not_yet or unknown, and reason).
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ended {
+    Held,
+    TimedOut,
+    Interrupted,
+}
+
+/// How a wait ended, with each condition's last truth.
+#[derive(Debug)]
+struct Outcome {
+    ended: Ended,
+    truths: Vec<Truth>,
+    /// The conditions as last judged: one may have been replaced by the
+    /// commit it came to follow.
+    when: Vec<WatchCondition>,
+    /// Why pull-request answers were missing at the end, when they were.
+    problem: Option<String>,
+    waited: Duration,
+}
+
+fn holds(truths: &[Truth], any: bool) -> bool {
+    let mut held = truths.iter().map(|truth| *truth == Truth::Holds);
+    !truths.is_empty()
+        && if any {
+            held.any(|held| held)
+        } else {
+            held.all(|held| held)
+        }
+}
+
+impl Outcome {
+    /// 0 held; 124 timed out; 1 timed out with nothing that still fails
+    /// ever having been told, which waiting longer may not fix.
+    fn exit_code(&self) -> i32 {
+        match self.ended {
+            Ended::Held => 0,
+            Ended::Interrupted => EXIT_INTERRUPTED,
+            Ended::TimedOut if self.untold() => 1,
+            Ended::TimedOut => EXIT_TIMED_OUT,
+        }
+    }
+
+    fn untold(&self) -> bool {
+        self.truths
+            .iter()
+            .filter(|truth| **truth != Truth::Holds)
+            .all(|truth| matches!(truth, Truth::Unknown(_)))
+    }
+
+    fn result(&self) -> &'static str {
+        match self.ended {
+            Ended::Held => "held",
+            Ended::Interrupted => "interrupted",
+            Ended::TimedOut if self.untold() => "unknown",
+            Ended::TimedOut => "timed_out",
+        }
+    }
+
+    /// Each condition's state word and reason.
+    fn state(&self, index: usize, now_ms: i64) -> (&'static str, Option<String>) {
+        let cond = &self.when[index];
+        match &self.truths[index] {
+            Truth::Holds => ("holds", None),
+            Truth::NotYet => (
+                "not_yet",
+                cond.delay
+                    .filter(|_| cond.first_held_at_ms.is_some_and(|since| since <= now_ms))
+                    .map(|delay| format!("holding, {delay} not yet over")),
+            ),
+            Truth::Unknown(reason) => {
+                let about_row = matches!(cond.cond, Condition::Own(_) | Condition::Worktree { .. });
+                let reason = self
+                    .problem
+                    .as_ref()
+                    .filter(|_| about_row)
+                    .unwrap_or(reason);
+                ("unknown", Some(reason.clone()))
+            }
+        }
+    }
+
+    fn headline(&self, args: &WaitArgs) -> String {
+        let waited = elapsed(self.waited);
+        let held = self.held(&args.conditions);
+        match self.ended {
+            Ended::Held if args.any => format!("held after {waited}: {}", held.join(", ")),
+            Ended::Held if held.len() == 1 => format!("held after {waited}: {}", held[0]),
+            Ended::Held => format!("all {} conditions hold after {waited}", held.len()),
+            Ended::Interrupted => format!("interrupted after {waited}"),
+            Ended::TimedOut if self.untold() => {
+                format!("could not tell after {waited}: see each condition's reason")
+            }
+            Ended::TimedOut if args.any => format!("timed out after {waited}: none holds"),
+            Ended::TimedOut => format!(
+                "timed out after {waited}: {} of {} still does not hold",
+                self.truths.len() - held.len(),
+                self.truths.len()
+            ),
+        }
+    }
+
+    fn held<'a>(&self, args: &'a [String]) -> Vec<&'a str> {
+        args.iter()
+            .zip(&self.truths)
+            .filter(|(_, truth)| **truth == Truth::Holds)
+            .map(|(arg, _)| arg.as_str())
+            .collect()
+    }
+
+    fn text(&self, args: &WaitArgs, clock: LocalClock) -> String {
+        let mut lines = vec![self.headline(args)];
+        for (index, arg) in args.conditions.iter().enumerate() {
+            let (state, reason) = self.state(index, clock.now_ms);
+            let state = state.replace('_', " ");
+            let described = self.when[index].describe(clock);
+            lines.push(match reason {
+                Some(reason) => format!("  {arg}: {described}: {state} ({reason})"),
+                None => format!("  {arg}: {described}: {state}"),
+            });
+        }
+        if self.ended == Ended::TimedOut {
+            lines.push(
+                "  still likely soon: run wt wait again. Longer than this session: wt wake <condition>... -m \"<what to do then>\" and end the turn"
+                    .into(),
+            );
+        }
+        lines.join("\n")
+    }
+
+    fn json(&self, args: &WaitArgs, clock: LocalClock) -> Value {
+        json!({
+            "result": self.result(),
+            "any": args.any,
+            "held": self.held(&args.conditions),
+            "waited_seconds": self.waited.as_secs(),
+            "conditions": args.conditions.iter().enumerate().map(|(index, arg)| {
+                let (state, reason) = self.state(index, clock.now_ms);
+                json!({
+                    "arg": arg,
+                    "description": self.when[index].describe(clock),
+                    "state": state,
+                    "reason": reason,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// `45s`, `12m`, `12m30s`, `2h05m`.
+fn elapsed(waited: Duration) -> String {
+    let seconds = waited.as_secs();
+    match (seconds / 3600, seconds / 60 % 60, seconds % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, 0) => format!("{minutes}m"),
+        (0, minutes, seconds) => format!("{minutes}m{seconds:02}s"),
+        (hours, minutes, _) => format!("{hours}h{minutes:02}m"),
+    }
+}
+
+/// The timeout in milliseconds, or what to write instead.
+fn timeout_ms(text: &str) -> Result<i64, String> {
+    Delay::parse(text.trim())
+        .map(Delay::as_ms)
+        .filter(|ms| *ms <= TIMEOUT_MAX_MS)
+        .ok_or_else(|| {
+            format!(
+                "--timeout takes a duration such as 45s, 20m or 2h, at most 24h, not `{text}`. A wait that outlives the session is wt wake <condition>... -m \"<what to do then>\""
+            )
+        })
+}
+
+/// A condition that cannot hold before the timeout, with what to do.
+fn outlasts(
+    arg: &str,
+    cond: &WatchCondition,
+    clock: LocalClock,
+    timeout_ms: i64,
+) -> Option<String> {
+    let deadline = clock.now_ms.saturating_add(timeout_ms);
+    let late = match cond.cond {
+        Condition::At { at_ms } => at_ms > deadline,
+        _ => cond.delay.is_some_and(|delay| delay.as_ms() > timeout_ms),
+    };
+    late.then(|| {
+        format!(
+            "`{arg}` cannot hold within the timeout: pass a longer --timeout (at most 24h), or wake the session then instead of holding it open: wt wake {arg} -m \"<what to do then>\""
+        )
+    })
+}
+
+/// Judge `watch` until it holds, the deadline passes or the process is
+/// told to stop. `Err` when the first read fails outright.
+async fn wait_until(
+    ctx: &AppContext,
+    mut watch: Watch,
+    any: bool,
+    timeout: Duration,
+) -> Result<Outcome, String> {
+    let started = Instant::now();
+    let mut reader = RowReader::default();
+    let mut externals = Externals::default();
+    let mut rows = RowsRead::default();
+    let mut rows_at: Option<Instant> = None;
+    let mut rows_known = false;
+    let mut problem = None;
+    let reads_rows = watch
+        .when
+        .iter()
+        .any(|cond| !matches!(cond.cond, Condition::At { .. }));
+    loop {
+        if reads_rows && rows_at.is_none_or(|at| at.elapsed() >= GIT_INTERVAL) {
+            match reader.read(ctx, std::slice::from_ref(&watch)).await {
+                Ok(read) => {
+                    problem.clone_from(&read.problem);
+                    rows = read;
+                    rows_known = true;
+                }
+                Err(_) if ctx.cancellation.is_cancelled() => {}
+                Err(error) if rows_at.is_none() => return Err(error),
+                // What was read before is no longer current.
+                Err(error) => {
+                    rows = RowsRead::default();
+                    rows_known = false;
+                    problem = Some(error);
+                }
+            }
+            rows_at = Some(Instant::now());
+        }
+        externals.request(ctx, &needs([&watch]), &rows.prs, &rows.branches);
+        let now = now_ms();
+        let known = facts(
+            std::slice::from_ref(&watch),
+            &rows.rows,
+            rows_known,
+            &rows.prs,
+            &externals,
+        );
+        let evaluation = evaluate(&watch, &known, now);
+        if let Some(stamps) = &evaluation.stamps {
+            stamps.apply(&mut watch);
+        }
+        let waited = started.elapsed();
+        let ended = if holds(&evaluation.truths, any) {
+            Some(Ended::Held)
+        } else if ctx.cancellation.is_cancelled() {
+            Some(Ended::Interrupted)
+        } else if waited >= timeout {
+            Some(Ended::TimedOut)
+        } else {
+            None
+        };
+        if let Some(ended) = ended {
+            return Ok(Outcome {
+                ended,
+                truths: evaluation.truths,
+                when: watch.when,
+                problem,
+                waited,
+            });
+        }
+        // The next moment something can change without a read: the
+        // deadline, a time, a delay running out.
+        let instants = watch
+            .when
+            .iter()
+            .filter_map(WatchCondition::known_at_ms)
+            .filter(|at| *at > now)
+            .map(|at| Duration::from_millis(u64::try_from(at - now).unwrap_or(0)));
+        let pause = instants
+            .chain(reads_rows.then_some(GIT_INTERVAL))
+            .chain([timeout.saturating_sub(waited)])
+            .min()
+            .unwrap_or(GIT_INTERVAL);
+        tokio::select! {
+            () = ctx.cancellation.cancelled() => {}
+            arrived = externals.arrived(), if externals.busy() => {
+                if let Some(arrived) = arrived {
+                    externals.absorb(arrived);
+                }
+            }
+            () = tokio::time::sleep(pause) => {}
+        }
+    }
+}
+
+/// The exit code, and how the wait ended unless it never started.
+async fn wait(ctx: &AppContext, args: &WaitArgs) -> Result<(i32, Option<Outcome>)> {
+    let refuse = |code: i32, message: String| {
+        eprintln!("{message}");
+        Ok((code, None))
+    };
+    if no_conditions(&args.conditions) {
+        return refuse(2, NO_CONDITIONS.into());
+    }
+    let timeout = match timeout_ms(&args.timeout) {
+        Ok(timeout) => timeout,
+        Err(message) => return refuse(2, message),
+    };
+    let clock = clock();
+    let read = match super::watch::read_conditions(ctx, &args.conditions, clock).await {
+        Ok(read) => read,
+        // The worktrees could not be listed: nothing was wrong with the
+        // conditions.
+        Err(super::watch::ConditionsError::Unreadable(message)) => return refuse(1, message),
+        Err(super::watch::ConditionsError::Invalid(message)) => return refuse(2, message),
+    };
+    if let Some(message) = args
+        .conditions
+        .iter()
+        .zip(&read.when)
+        .find_map(|(arg, cond)| outlasts(arg, cond, clock, timeout))
+    {
+        return refuse(2, message);
+    }
+    let about_owner = read
+        .when
+        .iter()
+        .any(|cond| matches!(cond.cond, Condition::Own(_) | Condition::Check { .. }));
+    let slug = match owner(ctx, args.slug.as_deref(), "a wait on this worktree").await {
+        Ok(slug) => slug,
+        // A time, a pull request or another worktree needs no owner.
+        Err(_) if !about_owner && args.slug.is_none() => String::new(),
+        Err(message) => return refuse(1, message),
+    };
+    let state = ctx
+        .database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await?;
+    let watch = Watch {
+        id: "wait".into(),
+        incarnation: state["slugs"][slug.as_str()]["createdAt"]
+            .as_str()
+            .map(str::to_owned),
+        slug,
+        by: author(),
+        created_at_ms: clock.now_ms,
+        utc_offset_minutes: clock.utc_offset_minutes,
+        when: read.when.clone(),
+        then: WatchActions::default(),
+        met_at_ms: None,
+        last_error: None,
+        owner_gone: false,
+        extra: serde_json::Map::new(),
+    };
+    if !args.json {
+        read.print();
+    }
+    let timeout = Duration::from_millis(u64::try_from(timeout).unwrap_or(0));
+    match wait_until(ctx, watch, args.any, timeout).await {
+        Ok(outcome) => Ok((outcome.exit_code(), Some(outcome))),
+        Err(message) => refuse(1, message),
+    }
+}
+
+pub async fn run(ctx: &AppContext, args: &WaitArgs) -> Result<i32> {
+    let (code, outcome) = wait(ctx, args).await?;
+    if let Some(outcome) = outcome {
+        let clock = clock();
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&outcome.json(args, clock))?
+            );
+        } else {
+            println!("{}", outcome.text(args, clock));
+        }
+    }
+    Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wt_app_core::test_support::CommandFixture;
+    use wt_core::watch::parse;
+
+    fn args(conditions: &[&str], any: bool, timeout: &str) -> WaitArgs {
+        WaitArgs {
+            conditions: conditions.iter().map(|arg| (*arg).to_owned()).collect(),
+            any,
+            timeout: timeout.into(),
+            slug: None,
+            json: false,
+        }
+    }
+
+    fn outcome(ended: Ended, conditions: &[&str], truths: Vec<Truth>) -> Outcome {
+        Outcome {
+            ended,
+            truths,
+            when: conditions
+                .iter()
+                .map(|arg| parse(arg, clock()).unwrap())
+                .collect(),
+            problem: None,
+            waited: Duration::from_secs(750),
+        }
+    }
+
+    #[test]
+    fn all_must_hold_unless_any_is_asked_for() {
+        let one = [Truth::Holds, Truth::NotYet, Truth::Unknown("why".into())];
+        assert!(holds(&one, true));
+        assert!(!holds(&one, false));
+        assert!(holds(&[Truth::Holds, Truth::Holds], false));
+        assert!(!holds(&[Truth::Unknown("why".into())], true));
+        assert!(!holds(&[], false) && !holds(&[], true));
+    }
+
+    #[test]
+    fn the_exit_code_tells_held_from_timed_out_from_could_not_tell() {
+        let conditions = ["settled", "reviewed"];
+        let unknown = || Truth::Unknown("no current data for this worktree".into());
+        let code = |ended, truths| outcome(ended, &conditions, truths).exit_code();
+        assert_eq!(code(Ended::Held, vec![Truth::Holds, Truth::NotYet]), 0);
+        assert_eq!(
+            code(Ended::TimedOut, vec![Truth::Holds, Truth::NotYet]),
+            124
+        );
+        assert_eq!(code(Ended::TimedOut, vec![Truth::NotYet, unknown()]), 124);
+        // Nothing that still fails was ever told: waiting again may not help.
+        assert_eq!(code(Ended::TimedOut, vec![Truth::Holds, unknown()]), 1);
+        assert_eq!(code(Ended::TimedOut, vec![unknown(), unknown()]), 1);
+        assert_eq!(
+            code(Ended::Interrupted, vec![Truth::NotYet, Truth::NotYet]),
+            130
+        );
+    }
+
+    #[test]
+    fn the_report_names_what_held_and_why_the_rest_did_not() {
+        let conditions = ["settled", "reviewed", "evicted"];
+        let mut ended = outcome(
+            Ended::Held,
+            &conditions,
+            vec![
+                Truth::NotYet,
+                Truth::Holds,
+                Truth::Unknown("not known whether this worktree is evicted".into()),
+            ],
+        );
+        ended.problem = Some("GitHub could not be read: timeout".into());
+        let args = args(&conditions, true, "30m");
+        assert_eq!(
+            ended.text(&args, clock()),
+            "held after 12m30s: reviewed\n  settled: PR checks settled: not yet\n  reviewed: bot review of the current head done: holds\n  evicted: merge dropped: unknown (GitHub could not be read: timeout)"
+        );
+        let json = ended.json(&args, clock());
+        assert_eq!(json["result"], "held");
+        assert_eq!(json["held"], json!(["reviewed"]));
+        assert_eq!(json["conditions"][0]["state"], "not_yet");
+        assert_eq!(
+            json["conditions"][2]["reason"],
+            "GitHub could not be read: timeout"
+        );
+
+        let timed_out = outcome(
+            Ended::TimedOut,
+            &["green", "merged"],
+            vec![Truth::Holds, Truth::NotYet],
+        );
+        let text = timed_out.text(
+            &super::tests::args(&["green", "merged"], false, "30m"),
+            clock(),
+        );
+        assert!(
+            text.starts_with("timed out after 12m30s: 1 of 2 still does not hold\n"),
+            "{text}"
+        );
+        assert!(text.contains("wt wake <condition>"), "{text}");
+        assert_eq!(elapsed(Duration::from_secs(45)), "45s");
+        assert_eq!(elapsed(Duration::from_secs(1200)), "20m");
+        assert_eq!(elapsed(Duration::from_secs(7500)), "2h05m");
+    }
+
+    #[test]
+    fn a_timeout_is_a_duration_of_at_most_a_day() {
+        assert_eq!(timeout_ms("30m"), Ok(1_800_000));
+        assert_eq!(timeout_ms("24h"), Ok(TIMEOUT_MAX_MS));
+        for refused in ["25h", "2d", "soon", "30", ""] {
+            assert!(
+                timeout_ms(refused).unwrap_err().contains("wt wake"),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_condition_that_cannot_hold_in_time_points_at_wake() {
+        let clock = clock();
+        let late = |arg: &str, timeout: &str| {
+            outlasts(
+                arg,
+                &parse(arg, clock).unwrap(),
+                clock,
+                timeout_ms(timeout).unwrap(),
+            )
+        };
+        assert!(late("2h", "30m").unwrap().contains("wt wake 2h -m"));
+        assert!(late("release:production+24h", "30m").is_some());
+        assert_eq!(late("10m", "30m"), None);
+        assert_eq!(late("green+5m", "30m"), None);
+        assert_eq!(late("merged", "30m"), None);
+    }
+
+    #[tokio::test]
+    async fn a_wait_blocks_until_its_conditions_hold_or_the_timeout_passes() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let ended = |(code, outcome): (i32, Option<Outcome>)| {
+            let outcome = outcome.unwrap();
+            (code, outcome.ended, outcome.truths)
+        };
+
+        // Usage: no condition, an unknown word, a time past the timeout.
+        for refused in [
+            args(&[], false, "30m"),
+            args(&["mergd"], false, "30m"),
+            args(&["2h"], false, "30m"),
+            args(&["merged"], false, "soon"),
+        ] {
+            let (code, outcome) = wait(ctx, &refused).await.unwrap();
+            assert_eq!((code, outcome.is_none()), (2, true), "{refused:?}");
+        }
+
+        // A worktree that is not there is gone already; nothing else holds.
+        let (code, how, truths) = ended(
+            wait(ctx, &args(&["ready", "wt:absent:gone"], true, "30m"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!((code, how), (0, Ended::Held));
+        assert_eq!(truths, [Truth::NotYet, Truth::Holds]);
+
+        // All must hold by default, so the same pair times out.
+        let (code, how, truths) = ended(
+            wait(ctx, &args(&["ready", "wt:absent:gone"], false, "1s"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!((code, how), (124, Ended::TimedOut));
+        assert_eq!(truths, [Truth::NotYet, Truth::Holds]);
+
+        // A time is waited out in the process.
+        let started = Instant::now();
+        let (code, how, _) = ended(wait(ctx, &args(&["1s"], false, "30m")).await.unwrap());
+        assert_eq!((code, how), (0, Ended::Held));
+        assert!(started.elapsed() >= Duration::from_millis(900));
+
+        // Becoming ready ends a wait that was already running.
+        let waiting = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { wait(&ctx, &args(&["wt:two:ready"], false, "30m")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let status = super::super::status::StatusArgs {
+            positionals: vec!["two".into(), "ready".into()],
+            risk: Some("low".into()),
+            ..Default::default()
+        };
+        assert_eq!(super::super::status::run(ctx, &status).await.unwrap(), 0);
+        let (code, how, _) = ended(waiting.await.unwrap().unwrap());
+        assert_eq!((code, how), (0, Ended::Held));
+
+        // Nothing was stored for any of it.
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(wt_store::stored_watches(&state).is_empty());
+
+        // An interrupt ends the wait at once.
+        let waiting = tokio::spawn({
+            let ctx = ctx.clone();
+            async move { wait(&ctx, &args(&["wt:two:verified"], false, "30m")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        ctx.cancellation.cancel();
+        let (code, how, _) = ended(waiting.await.unwrap().unwrap());
+        assert_eq!((code, how), (130, Ended::Interrupted));
+        fixture.close().await.unwrap();
+    }
+}

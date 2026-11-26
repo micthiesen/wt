@@ -510,20 +510,6 @@ impl Model {
                 self.output.cycle(key.code == KeyCode::Char(']'));
                 InputResult::Draw
             }
-            KeyCode::Char('V') if !control => {
-                let Some(row) = self.actionable_row() else {
-                    return self.notify("select a worktree first");
-                };
-                let has_steps = row
-                    .owes
-                    .iter()
-                    .any(|item| item.kind == wt_core::OwedKind::Check);
-                if !has_steps {
-                    return self.notify("no verify-after-merge steps on this row");
-                }
-                self.show_verification = !self.show_verification;
-                InputResult::Draw
-            }
             KeyCode::Char('M') if !control => InputResult::Action(UiAction::PrepareActions {
                 surface: crate::ActionSurface::Manager {
                     key: (!self.history.active)

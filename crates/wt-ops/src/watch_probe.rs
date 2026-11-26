@@ -207,6 +207,18 @@ pub async fn pull_requests(
         .collect())
 }
 
+/// When GitHub's exhausted rate limit resets, in epoch milliseconds, if it
+/// can be told. Asked after a read failed with a rate limit.
+pub async fn rate_limit_reset_ms(ctx: &AppContext, cancel: &CancellationToken) -> Option<u64> {
+    GithubClient::new(
+        ctx.processes.clone(),
+        ctx.config.paths.main_clone.clone(),
+        GithubOptions::from_config(&ctx.config, false),
+    )
+    .rate_limit_reset_ms(cancel)
+    .await
+}
+
 /// A pull request's state as a watch reads it. A state this build does not
 /// know stays unknown.
 pub fn pr_facts(state: &str, merge_oid: Option<String>) -> PrFacts {

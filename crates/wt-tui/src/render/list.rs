@@ -249,7 +249,7 @@ impl RowContext<'_> {
         }
         if rows.is_empty() {
             let item = positions.get(&VisualItem::Section(index)).copied();
-            // Rows filed here that `[ui] owed_sections` draws in a derived
+            // Rows filed here that `[ui] owed_sections` draws in the Landed
             // block: the section is not empty, only shown elsewhere.
             let landed = if section.key.starts_with('\0') {
                 0
@@ -269,11 +269,17 @@ impl RowContext<'_> {
             ));
             return;
         }
+        let landed = section.key == crate::LANDED_SECTION;
+        let members: Vec<&BoardRow> = rows.iter().map(|(_, row)| *row).collect();
+        let title = if landed {
+            landed_title(&section.title, &members)
+        } else {
+            section.title.clone()
+        };
         if section.folded {
             let item = positions.get(&VisualItem::Section(index)).copied();
-            let members: Vec<&BoardRow> = rows.iter().map(|(_, row)| *row).collect();
             let mut header = folded_header(
-                &section.title,
+                &title,
                 rows.len(),
                 &FoldSummary::of(&members, &self.model.board.display),
                 item.is_some() && item == self.model.selected,
@@ -292,10 +298,10 @@ impl RowContext<'_> {
             lines.push(header);
             return;
         }
-        lines.push(divider(&section.title, self.width));
+        lines.push(divider(&title, self.width));
         for (row, data) in rows {
             let item = positions.get(&VisualItem::Row(row)).copied();
-            lines.push(self.row(data, item));
+            lines.push(self.row_in(data, item, landed));
         }
     }
 
@@ -304,6 +310,12 @@ impl RowContext<'_> {
     }
 
     fn row(&self, row: &BoardRow, item: Option<usize>) -> ListLine {
+        self.row_in(row, item, false)
+    }
+
+    /// `landed`: the row is drawn in the Landed block, where it says on the
+    /// right what it waits for next.
+    fn row_in(&self, row: &BoardRow, item: Option<usize>, landed: bool) -> ListLine {
         let selected = item.is_some() && item == self.model.selected;
         let policy = &self.model.board.display;
         let mark = self.cleanup_mark(row);
@@ -330,9 +342,13 @@ impl RowContext<'_> {
             .saturating_sub(2 + self.gutter + 3 + remote_cells + cluster_width);
         // Shown where the title keeps its room, or is short enough not to
         // need it.
-        let due_at = scheduled_time(row, self.model)
-            .filter(|time| budget > MIN_LABEL_CELLS.min(row_label(row).width()) + time.width());
-        let budget = budget.saturating_sub(due_at.as_ref().map_or(0, |time| time.width() + 1));
+        let waits = landed
+            .then(|| waits_for(row, &self.model.board))
+            .flatten()
+            .filter(|(text, _)| {
+                budget > MIN_LABEL_CELLS.min(row_label(row).width()) + text.width()
+            });
+        let budget = budget.saturating_sub(waits.as_ref().map_or(0, |(text, _)| text.width() + 1));
         let reference_room =
             SECTION_REF_CELLS.min(budget.saturating_sub(MIN_LABEL_CELLS + REF_ARROW.width() + 1));
         let reference = row
@@ -390,8 +406,8 @@ impl RowContext<'_> {
             spans.push(Span::styled(reference, style(theme::FG_DIM)));
         }
         spans.push(Span::styled(" ".repeat(filler), style(theme::FG)));
-        if let Some(time) = due_at {
-            spans.push(Span::styled(format!(" {time}"), style(theme::FG_DIM)));
+        if let Some((text, color)) = waits {
+            spans.push(Span::styled(format!(" {text}"), style(color)));
         }
         if let Some((glyph, color)) = pending {
             spans.push(Span::styled(format!(" {glyph} "), style(color)));
@@ -417,22 +433,72 @@ impl RowContext<'_> {
     }
 }
 
-/// When the next thing a row under the Scheduled block owes comes due, in
-/// the controller's clock: `22:32`, `Fri 18:12`.
-fn scheduled_time(row: &BoardRow, model: &Model) -> Option<String> {
-    let board = &model.board;
-    if !board.display.owed_sections
-        || row.archived
-        || row.owed_block != Some(crate::OwedBlock::Scheduled)
-    {
-        return None;
+/// What a row in the Landed block waits for next, from the block
+/// `wt owed --all` lists it under: `due staging`, `production`, a time in
+/// the controller's clock (`22:32`, `Fri 18:12`), `other work`, `done`.
+fn waits_for(row: &BoardRow, board: &crate::Board) -> Option<(String, Color)> {
+    use crate::OwedBlock;
+    let text = match row.owed_block? {
+        OwedBlock::Due => {
+            let color = if row.owes.iter().any(|item| item.overdue) {
+                theme::ERR
+            } else {
+                theme::WARN
+            };
+            // The list is ordered most urgent first: due checks by stage,
+            // then due steps.
+            let stage = row.owes.iter().find(|item| item.due()).and_then(|item| {
+                (item.kind == wt_core::OwedKind::Check)
+                    .then_some(item.stage)
+                    .flatten()
+            });
+            let text = match stage {
+                Some(wt_core::VerifyStage::Staging) => "due staging",
+                Some(wt_core::VerifyStage::Production) => "due production",
+                None => "due",
+            };
+            return Some((text.to_owned(), color));
+        }
+        OwedBlock::WaitingStaging => "staging".to_owned(),
+        OwedBlock::WaitingProduction => "production".to_owned(),
+        OwedBlock::Scheduled => row
+            .owes
+            .iter()
+            .filter_map(|item| item.next_at_ms)
+            .min()
+            .and_then(|at_ms| board.history_times.get(&at_ms))
+            .map(|stamp| stamp.terse.clone())
+            .filter(|terse| !terse.is_empty())
+            .unwrap_or_else(|| "scheduled".to_owned()),
+        OwedBlock::WaitingOther => "other work".to_owned(),
+        OwedBlock::Done => "done".to_owned(),
+    };
+    Some((text, theme::FG_DIM))
+}
+
+/// The Landed block's header, open or folded: `Landed · 3 due · 24 waiting
+/// · 2 done`, without the counts that are zero.
+fn landed_title(title: &str, rows: &[&BoardRow]) -> String {
+    use crate::OwedBlock;
+    let count = |wanted: fn(OwedBlock) -> bool| {
+        rows.iter()
+            .filter(|row| row.owed_block.is_some_and(wanted))
+            .count()
+    };
+    let mut text = title.to_owned();
+    for (count, word) in [
+        (count(|block| block == OwedBlock::Due), "due"),
+        (
+            count(|block| !matches!(block, OwedBlock::Due | OwedBlock::Done)),
+            "waiting",
+        ),
+        (count(|block| block == OwedBlock::Done), "done"),
+    ] {
+        if count > 0 {
+            text.push_str(&format!(" · {count} {word}"));
+        }
     }
-    let at_ms = row.owes.iter().filter_map(|item| item.next_at_ms).min()?;
-    board
-        .history_times
-        .get(&at_ms)
-        .map(|stamp| stamp.terse.clone())
-        .filter(|terse| !terse.is_empty())
+    text
 }
 
 /// The row's title exactly as named. Issue identity, removal progress and
@@ -1093,19 +1159,85 @@ mod tests {
         assert_eq!(row_label(&plain), "Fix");
     }
 
-    #[test]
-    fn a_scheduled_row_shows_when_its_next_item_comes_due() {
-        let mut item =
-            crate::OwedView::new(wt_core::OwedKind::Step, wt_core::OwedState::Waiting, "x");
-        item.next_at_ms = Some(2_000);
-        let mut later = item.clone();
+    /// A landed row as the owed overlay files it.
+    fn landed_row(key: &str, block: crate::OwedBlock, owes: Vec<crate::OwedView>) -> BoardRow {
+        BoardRow {
+            key: key.into(),
+            slug: key.into(),
+            title: format!("Title of {key}"),
+            git: crate::GitPresentation {
+                landed_on: Some(crate::LandingKind::Base),
+                ..Default::default()
+            },
+            owed_phase: Some(match block {
+                crate::OwedBlock::Due => wt_core::OwedPhase::Due,
+                crate::OwedBlock::Done => wt_core::OwedPhase::Done,
+                _ => wt_core::OwedPhase::Waiting,
+            }),
+            owed_block: Some(block),
+            owes,
+            ..Default::default()
+        }
+    }
+
+    fn landed_board() -> crate::Board {
+        use crate::{OwedBlock, OwedView};
+        use wt_core::{OwedKind, OwedState, VerifyStage};
+        let item = |kind, state, stage: Option<VerifyStage>| {
+            let mut item = OwedView::new(kind, state, "x");
+            item.stage = stage;
+            item
+        };
+        let check = |state, stage| item(OwedKind::Check, state, Some(stage));
+        let mut timed = item(OwedKind::Step, OwedState::Waiting, None);
+        timed.next_at_ms = Some(2_000);
+        let mut later = timed.clone();
         later.next_at_ms = Some(9_000);
-        let row = BoardRow {
-            owes: vec![later, item],
-            owed_block: Some(crate::OwedBlock::Scheduled),
+        let mut overdue = check(OwedState::Due, VerifyStage::Production);
+        overdue.overdue = true;
+        let rows = vec![
+            landed_row(
+                "a",
+                OwedBlock::Due,
+                vec![
+                    check(OwedState::Due, VerifyStage::Staging),
+                    check(OwedState::Waiting, VerifyStage::Production),
+                ],
+            ),
+            landed_row("b", OwedBlock::Due, vec![overdue]),
+            landed_row(
+                "c",
+                OwedBlock::Due,
+                vec![item(OwedKind::Step, OwedState::Due, None)],
+            ),
+            landed_row(
+                "d",
+                OwedBlock::WaitingStaging,
+                vec![check(OwedState::Waiting, VerifyStage::Staging)],
+            ),
+            landed_row(
+                "e",
+                OwedBlock::WaitingProduction,
+                vec![check(OwedState::Waiting, VerifyStage::Production)],
+            ),
+            landed_row("f", OwedBlock::Scheduled, vec![later, timed]),
+            landed_row(
+                "g",
+                OwedBlock::WaitingOther,
+                vec![item(OwedKind::Step, OwedState::Waiting, None)],
+            ),
+            landed_row("h", OwedBlock::Done, Vec::new()),
+        ];
+        let mut board = crate::Board {
+            sections: vec![BoardSection {
+                key: crate::LANDED_SECTION.into(),
+                title: crate::LANDED_TITLE.into(),
+                rows: (0..rows.len()).collect(),
+                folded: false,
+            }],
+            rows,
             ..Default::default()
         };
-        let mut board = crate::Board::default();
         board.display.owed_sections = true;
         board.history_times.insert(
             2_000,
@@ -1114,20 +1246,104 @@ mod tests {
                 ..Default::default()
             },
         );
-        let model = |board: &crate::Board| Model {
-            board: std::sync::Arc::new(board.clone()),
-            ..Model::default()
-        };
-        assert_eq!(
-            scheduled_time(&row, &model(&board)).as_deref(),
-            Some("Fri 18:12")
+        board
+    }
+
+    fn drawn(board: &crate::Board, width: usize) -> Vec<ListLine> {
+        let mut model = Model::default();
+        model.apply(wt_runtime::SourceSnapshot::test_live(
+            Some(board.clone()),
+            wt_runtime::SourceState::Ready,
+            wt_core::Domain::Git,
+        ));
+        build(&model, width, 40)
+            .into_iter()
+            .filter(|line| !line.line.spans.is_empty())
+            .collect()
+    }
+
+    fn plain(line: &ListLine) -> String {
+        line.line.to_string().trim_end().to_owned()
+    }
+
+    #[test]
+    fn the_landed_block_counts_its_rows_and_each_says_what_it_waits_for() {
+        let board = landed_board();
+        for width in [50, 70, 120] {
+            let lines = drawn(&board, width);
+            let text: Vec<String> = lines.iter().map(plain).collect();
+            assert!(
+                text[0].starts_with(" ── Landed · 3 due · 4 waiting · 1 done ─"),
+                "{text:#?}"
+            );
+            let labels = [
+                "due staging",
+                "due production",
+                "due",
+                "staging",
+                "production",
+                "Fri 18:12",
+                "other work",
+                "done",
+            ];
+            for (line, label) in lines[1..].iter().zip(labels) {
+                let spans = &line.line.spans;
+                let at = spans
+                    .iter()
+                    .position(|span| span.content.trim() == label)
+                    .unwrap_or_else(|| panic!("{label}: {}", plain(line)));
+                // Right-aligned: only the glyph cluster and the margin follow.
+                assert!(spans[at - 1].content.trim().is_empty(), "{}", plain(line));
+                let color = match label {
+                    "due production" => theme::ERR,
+                    "due staging" | "due" => theme::WARN,
+                    _ => theme::FG_DIM,
+                };
+                assert_eq!(spans[at].style.fg, Some(color), "{label}");
+                assert!(line.line.width() <= width, "{}", plain(line));
+            }
+            // Every label ends in the same column.
+            let ends: std::collections::BTreeSet<usize> = lines[1..]
+                .iter()
+                .zip(labels)
+                .map(|(line, label)| {
+                    let text = line.line.to_string();
+                    text.find(label)
+                        .map(|at| text[..at].width() + label.width())
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(ends.len(), 1, "{text:#?}");
+        }
+        // A label gives way to a title that needs the room.
+        let narrow = drawn(&board, 24);
+        assert!(
+            !plain(&narrow[1]).contains("due staging"),
+            "{}",
+            plain(&narrow[1])
         );
-        // Only under the Scheduled block, and only while blocks are drawn.
-        let mut other = row.clone();
-        other.owed_block = Some(crate::OwedBlock::WaitingProduction);
-        assert_eq!(scheduled_time(&other, &model(&board)), None);
-        board.display.owed_sections = false;
-        assert_eq!(scheduled_time(&row, &model(&board)), None);
+        // Zero counts are left out.
+        let mut some = board.clone();
+        some.rows.truncate(3);
+        some.sections[0].rows = vec![0, 1, 2];
+        assert!(plain(&drawn(&some, 70)[0]).starts_with(" ── Landed · 3 due ─"));
+        // Folded, the header carries the same counts.
+        let mut folded = board.clone();
+        folded.sections[0].folded = true;
+        let lines = drawn(&folded, 70);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            plain(&lines[0]).starts_with(" [×08] Landed · 3 due · 4 waiting · 1 done"),
+            "{}",
+            plain(&lines[0])
+        );
+        // Outside the block a row says nothing of the kind.
+        let mut filed = board;
+        filed.sections[0].key = "Batch".into();
+        filed.sections[0].title = "Batch".into();
+        let lines = drawn(&filed, 70);
+        assert!(plain(&lines[0]).starts_with(" ── Batch ─"));
+        assert!(lines[1..].iter().all(|line| !plain(line).contains("due")));
     }
 
     #[test]

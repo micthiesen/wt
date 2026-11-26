@@ -191,12 +191,34 @@ pub(crate) fn owed_phase_badge(phase: wt_core::OwedPhase, overdue: bool) -> Opti
     }
 }
 
+/// The review stamp a row's status carries, with whether its head is still
+/// the stamped commit.
+pub(crate) fn stamp(row: &BoardRow) -> Option<(wt_core::Stamp, bool)> {
+    let stamp = wt_core::Stamp::of(row.work.as_ref()?.record.as_ref()?)?;
+    let current = stamp.current(row.git.head_sha.as_deref());
+    Some((stamp, current))
+}
+
+/// A stamped row's circle is a star: solid while its head is the stamped
+/// commit, hollow once it has moved. Only the circle gives way: a gated or
+/// dropped row keeps its slash and a verified one its merge shape.
+fn stamped(row: &BoardRow, work: Badge) -> Badge {
+    if !matches!(work.glyph, glyphs::DOT | glyphs::DOT_OUTLINE) {
+        return work;
+    }
+    match stamp(row) {
+        Some((_, true)) => badge(wt_core::STAMP_CURRENT, work.color),
+        Some((_, false)) => badge(wt_core::STAMP_MOVED, work.color),
+        None => work,
+    }
+}
+
 /// Leftmost glyph of a worktree row. With a production branch configured,
 /// release position owns the shape and work status owns the color. Without
 /// one, the loud mechanical states keep the slot. A landed row follows
 /// where it stands with what it owes instead of its asserted state.
 pub(crate) fn marker(row: &BoardRow, policy: &DisplayPolicy) -> Badge {
-    let work = work_status_badge(row.work.as_ref());
+    let work = stamped(row, work_status_badge(row.work.as_ref()));
     let owed = row
         .owed_phase
         .and_then(|phase| owed_phase_badge(phase, row.owes.iter().any(|item| item.overdue)));
@@ -944,6 +966,45 @@ mod tests {
             work_status_badge(Some(&work(WorkState::Verified))).glyph,
             glyphs::MERGE
         );
+    }
+
+    #[test]
+    fn a_stamped_rows_circle_is_a_star_that_goes_hollow_when_the_head_moves() {
+        let policy = DisplayPolicy::default();
+        let stamped_work = |state: WorkState| {
+            let mut work = work(state);
+            let mut record = wt_core::WorkStatusRecord::new(state, "t");
+            record.extra.insert(
+                wt_core::STAMP_KEY.into(),
+                serde_json::json!({"skill": "fable-review", "sha": "abc", "at": "t"}),
+            );
+            work.record = Some(record);
+            work
+        };
+        let mut row = row();
+        row.work = Some(stamped_work(WorkState::Ready));
+        row.git.head_sha = Some("abc".into());
+        let ready = work_state_color(WorkState::Ready);
+        assert_eq!(marker(&row, &policy), badge(wt_core::STAMP_CURRENT, ready));
+        // The stamp stays when the head moves; only its shape changes.
+        row.git.head_sha = Some("def".into());
+        assert_eq!(marker(&row, &policy), badge(wt_core::STAMP_MOVED, ready));
+        for glyph in [wt_core::STAMP_CURRENT, wt_core::STAMP_MOVED] {
+            assert_eq!(glyph.width(), 1, "{glyph}");
+        }
+
+        // A gate, the hourglass and a landed row's own marker come first.
+        row.work.as_mut().unwrap().blocked = true;
+        assert_eq!(marker(&row, &policy).glyph, glyphs::SLASH);
+        row.work.as_mut().unwrap().blocked = false;
+        row.installing = true;
+        assert_eq!(marker(&row, &policy), INITIALIZING);
+        row.installing = false;
+        row.git.landed_on = Some(LandingKind::Base);
+        assert_eq!(marker(&row, &policy), badge(glyphs::MERGE, theme::OK));
+        row.git.landed_on = None;
+        row.work = Some(stamped_work(WorkState::Dropped));
+        assert_eq!(marker(&row, &policy).glyph, glyphs::SLASH);
     }
 
     #[test]

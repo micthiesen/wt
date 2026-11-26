@@ -291,6 +291,7 @@ pub(crate) fn owed_view(
             .next_at_ms
             .filter(|at_ms| *at_ms > clock.now_ms)
             .map(|at_ms| wt_core::watch::countdown(at_ms - clock.now_ms)),
+        block: Some(wt_core::OwedBlock::of_item(item)),
     }
 }
 
@@ -598,6 +599,13 @@ mod tests {
                 ),
             ]
         );
+        // Each item carries what it waits on, as `wt owed --all` heads it.
+        assert!(
+            one.owes
+                .iter()
+                .all(|item| item.block == Some(OwedBlock::Scheduled))
+        );
+        assert_eq!(two.owes[0].block, Some(OwedBlock::WaitingProduction));
         // Another pull request's deploy is a deploy to wait for.
         assert_eq!(two.owed_block, Some(OwedBlock::WaitingProduction));
         assert_eq!(two.owes[0].conditions[0].label, "#3889 production");

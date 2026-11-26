@@ -24,14 +24,22 @@ use wt_core::{
 };
 
 /// GitHub is asked about pull requests outside the fleet at most this often.
-const PR_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const PR_INTERVAL: Duration = Duration::from_secs(60);
 /// Commit reach and release markers are local Git reads.
-const GIT_INTERVAL: Duration = Duration::from_secs(15);
+pub const GIT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_CHECKS_RUNNING: usize = 2;
+
+/// A pull-request read that failed.
+pub struct PrsFailed {
+    pub error: String,
+    /// When GitHub's exhausted rate limit resets, in epoch milliseconds,
+    /// for a rate-limited read where that could be told.
+    pub reset_at_ms: Option<u64>,
+}
 
 /// A read that finished.
 pub enum Arrived {
-    Prs(Result<BTreeMap<u64, PrFacts>, String>),
+    Prs(Result<BTreeMap<u64, PrFacts>, PrsFailed>),
     Git {
         commits: Vec<((String, VerifyStage), Option<bool>)>,
         releases: Vec<(VerifyStage, Option<String>)>,
@@ -53,6 +61,11 @@ pub struct Externals {
     prs: BTreeMap<u64, PrFacts>,
     prs_asked: Option<Instant>,
     prs_running: bool,
+    /// Consecutive failed pull-request reads, and the last one's error.
+    prs_failures: u32,
+    prs_error: Option<String>,
+    /// The wait before the next pull-request read while reads fail.
+    prs_backoff: Option<Duration>,
     commits: HashMap<(String, VerifyStage), bool>,
     releases: HashMap<VerifyStage, String>,
     git_asked: Option<Instant>,
@@ -93,9 +106,35 @@ impl Externals {
                 // read that produced it, so a failed read forgets it.
                 self.prs.retain(|_, pr| merged_for_good(pr));
                 match result {
-                    Ok(prs) => self.prs.extend(prs),
-                    Err(error) => {
-                        tracing::warn!(%error, "cannot read pull requests for watches");
+                    Ok(prs) => {
+                        self.prs.extend(prs);
+                        self.prs_failures = 0;
+                        self.prs_backoff = None;
+                        if self.prs_error.take().is_some() {
+                            tracing::info!("pull requests for watches read again");
+                        }
+                    }
+                    Err(PrsFailed { error, reset_at_ms }) => {
+                        // The spacing every GitHub poller uses: until the
+                        // rate limit resets when that is known, else doubling.
+                        self.prs_failures = self.prs_failures.saturating_add(1);
+                        let wait = Duration::from_millis(wt_events::failure_wait_ms(
+                            u64::try_from(PR_INTERVAL.as_millis()).unwrap_or(u64::MAX),
+                            self.prs_failures,
+                            wt_events::rate_limited(&error),
+                            reset_at_ms,
+                            epoch_ms(),
+                        ));
+                        self.prs_backoff = Some(wait);
+                        // The same failure repeats on every retry.
+                        if self.prs_error.as_deref() != Some(error.as_str()) {
+                            tracing::warn!(
+                                %error,
+                                retry_in_seconds = wait.as_secs(),
+                                "cannot read pull requests for watches"
+                            );
+                            self.prs_error = Some(error);
+                        }
                     }
                 }
             }
@@ -144,14 +183,27 @@ impl Externals {
                     && !self.prs.get(number).is_some_and(merged_for_good)
             })
             .collect::<Vec<_>>();
-        if !prs.is_empty() && !self.prs_running && due(self.prs_asked, PR_INTERVAL) {
+        if !prs.is_empty()
+            && !self.prs_running
+            && due(self.prs_asked, self.prs_backoff.unwrap_or(PR_INTERVAL))
+        {
             self.prs_asked = Some(Instant::now());
             self.prs_running = true;
             let ctx = ctx.clone();
             self.tasks.spawn(async move {
-                Arrived::Prs(
-                    wt_ops::watch_probe::pull_requests(&ctx, &prs, &ctx.cancellation).await,
-                )
+                let cancel = &ctx.cancellation;
+                let read = wt_ops::watch_probe::pull_requests(&ctx, &prs, cancel).await;
+                Arrived::Prs(match read {
+                    Ok(prs) => Ok(prs),
+                    Err(error) => {
+                        let reset_at_ms = if wt_events::rate_limited(&error) {
+                            wt_ops::watch_probe::rate_limit_reset_ms(&ctx, cancel).await
+                        } else {
+                            None
+                        };
+                        Err(PrsFailed { error, reset_at_ms })
+                    }
+                })
             });
         }
 
@@ -254,7 +306,15 @@ impl Externals {
     }
 }
 
-fn due(asked: Option<Instant>, interval: Duration) -> bool {
+pub(crate) fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+pub(crate) fn due(asked: Option<Instant>, interval: Duration) -> bool {
     asked.is_none_or(|asked| asked.elapsed() >= interval)
 }
 
@@ -774,7 +834,20 @@ mod tests {
             (1, pr(PrLife::Open, None)),
             (2, pr(PrLife::Merged, Some("abc"))),
         ]))));
-        externals.absorb(Arrived::Prs(Err("rate limited".into())));
+        let failed = |reset_at_ms| {
+            Arrived::Prs(Err(PrsFailed {
+                error: "API rate limit exceeded".into(),
+                reset_at_ms,
+            }))
+        };
+        externals.absorb(failed(None));
+        // Not asked again every minute while GitHub refuses: the shared
+        // rate-limit wait, or until the reset when GitHub names one.
+        assert_eq!(externals.prs_backoff, Some(Duration::from_secs(5 * 60)));
+        externals.absorb(failed(Some(epoch_ms() + 40 * 60 * 1000)));
+        assert!(externals.prs_backoff > Some(Duration::from_secs(39 * 60)));
+        assert!(externals.prs_backoff < Some(Duration::from_secs(41 * 60)));
+        assert_eq!(externals.prs_failures, 2);
         let mut known = WatchFacts::default();
         externals.fill(&mut known);
         assert_eq!(known.prs.keys().copied().collect::<Vec<_>>(), [2]);

@@ -33,7 +33,7 @@ six failing names and counts the rest in a final `+N more` entry.
 | `owed` | something the worktree [owes](owed.md) comes due, is closed with evidence, is put off, or is dropped | the store's owed and check writes |
 | `restack` | a restack replays the branch or stops on a conflict | `restack_action::record_outcome` |
 | `skill` | a skill or slash command listed in `[history] skills` is used in the worktree's Claude Code session | `wt mark --claude-hook`, run by a Claude Code hook |
-| `mark` | someone adds a note | `wt mark` |
+| `mark` | someone adds a note, or the worktree earns a review stamp (the line reads `stamped <skill>`) | `wt mark`; the store's stamp write (`wt mark --stamp`, or the status write that earns a pending stamp) |
 | `pr`, `checks`, `review`, `merge_queue`, `conflict`, `landed` | the fact is observed to change | the host's observer |
 | `status`, `status_cleared` (again) | a status was written by a build without the log | the host's observer |
 

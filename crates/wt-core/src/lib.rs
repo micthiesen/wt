@@ -9,6 +9,7 @@ mod merge_edges;
 pub mod owed;
 mod stack_layout;
 mod stage;
+mod stamp;
 mod time;
 pub use time::parse_iso_millis;
 pub mod watch;
@@ -28,6 +29,7 @@ pub use owed::{
 };
 pub use stack_layout::*;
 pub use stage::stage_name;
+pub use stamp::*;
 pub use work_status::*;
 pub use worktree_event::*;
 pub use worktree_ref::*;

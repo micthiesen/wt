@@ -223,6 +223,19 @@ pub struct Check {
     /// <stage> --again <time>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_before_ms: Option<i64>,
+    /// When this check began to be owed. Set when a status first owes it,
+    /// and again when it comes due for a later pull request of the same
+    /// worktree, so each is prompted for once. Absent on checks set before
+    /// wt recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<i64>,
+    /// When the check was first seen due. Asserting the status again keeps
+    /// it, so what is overdue is counted from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_since_ms: Option<i64>,
+    /// The merged pull request the check came due for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_pr: Option<u64>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -232,14 +245,39 @@ impl Check {
         Self {
             steps: steps.into(),
             not_before_ms: None,
+            since_ms: None,
+            due_since_ms: None,
+            due_pr: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// Since when the check has been due, where that was recorded: when it
+    /// was first seen due, or the time it was put off to when that is later.
+    pub fn due_at_ms(&self) -> Option<i64> {
+        let since = self.due_since_ms?;
+        Some(self.not_before_ms.map_or(since, |at| at.max(since)))
     }
 
     /// Whether the check was put off to a time that has not come.
     pub fn deferred(&self, now_ms: i64) -> bool {
         self.not_before_ms.is_some_and(|at| at > now_ms)
     }
+}
+
+/// A check seen due, for the store to record when it first was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckDue {
+    pub slug: String,
+    /// The owner's `createdAt`: a later worktree with the same slug owes
+    /// its own check.
+    pub created_at: Option<String>,
+    pub stage: VerifyStage,
+    pub steps: String,
+    /// Since when it has been due, as far as that can be told.
+    pub since_ms: i64,
+    /// The worktree's merged pull request.
+    pub pr: Option<u64>,
 }
 
 /// The post-merge checks a status record owes, at most one per stage. Stored
@@ -927,7 +965,8 @@ pub fn checks_overdue_with_days(
 /// promotion is nobody's lapse yet, and neither is one put off to a later
 /// time. Due here means the Git landing: a deploy probe that stopped
 /// answering must not hide a check that has been owed for days. The age
-/// runs from the status, or from the not-before when that is later.
+/// runs from when the check was first seen due (from the status where that
+/// was never recorded), or from the not-before when that is later.
 fn check_overdue(
     record: &WorkStatusRecord,
     check: &Check,
@@ -940,7 +979,7 @@ fn check_overdue(
     if !(landing.base && landing.reached(stage)) || check.deferred(now_ms) {
         return false;
     }
-    let Some(at) = parse_iso_millis(&record.at) else {
+    let Some(at) = check.due_since_ms.or_else(|| parse_iso_millis(&record.at)) else {
         return true;
     };
     let since = check
@@ -1803,6 +1842,58 @@ mod tests {
         });
         assert_eq!(checks_due(Some(&ready), waiting, now), [STAGING]);
         assert_eq!(checks_awaiting_deploy(Some(&ready), waiting), [PRODUCTION]);
+    }
+
+    #[test]
+    fn a_check_seen_due_is_overdue_from_then_however_late_the_status_is() {
+        let at = parse_iso_millis(AT).unwrap();
+        let two_days = 2 * 86_400_000;
+        let landed = Landing::new(true, false, true);
+        // First seen due at AT; the status was asserted again a day later.
+        let reasserted = parse_work_status(&serde_json::json!({
+            "state": "ready",
+            "at": "2026-08-21T12:00:00.000Z",
+            "checks": {"staging": {"steps": "open the page", "dueSinceMs": at}},
+        }))
+        .unwrap();
+        let check = reasserted.open_check(STAGING).unwrap();
+        assert_eq!(check.due_at_ms(), Some(at));
+        assert!(!verification_overdue(
+            Some(&reasserted),
+            landed,
+            at + two_days - 1
+        ));
+        assert!(verification_overdue(
+            Some(&reasserted),
+            landed,
+            at + two_days
+        ));
+        // The list says since when it has been due.
+        let items = crate::owed_items(Some(&reasserted), &landed, &[], &[], at + 1);
+        assert_eq!(items[0].due_at_ms, Some(at));
+        // The dates survive a write by a build that does not know them:
+        // the check as that build declared it, which keeps unknown keys.
+        #[derive(Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct OldCheck {
+            steps: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            not_before_ms: Option<i64>,
+            #[serde(flatten)]
+            extra: BTreeMap<String, Value>,
+        }
+        let mut dated = check.clone();
+        dated.since_ms = Some(at - 5);
+        dated.due_pr = Some(7);
+        let old: OldCheck = serde_json::from_value(serde_json::to_value(&dated).unwrap()).unwrap();
+        assert_eq!(old.steps, "open the page");
+        assert_eq!(old.not_before_ms, None);
+        let rewritten: Check = serde_json::from_value(serde_json::to_value(&old).unwrap()).unwrap();
+        assert_eq!(rewritten, dated);
+        assert_eq!(
+            (rewritten.due_since_ms, rewritten.since_ms, rewritten.due_pr),
+            (Some(at), Some(at - 5), Some(7))
+        );
     }
 
     #[test]

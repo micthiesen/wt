@@ -337,6 +337,7 @@ fn a_refusal_teaches_the_grammar() {
         "pr:3806:merged|staging|production|closed",
         "an unquoted # starts a shell comment",
         "wt:<slug>:merged",
+        "settled | reviewed | evicted",
         "release:staging | release:production",
         "check:<id>=<arg>",
         "+<duration>",
@@ -1097,4 +1098,61 @@ fn an_evaluation_is_recorded_at_first_and_then_hourly() {
     };
     assert!(!older.apply(&mut pending).changed);
     assert!(WatchStamps::new(&pending.id).is_empty());
+}
+
+#[test]
+fn a_pull_requests_progress_reads_as_states_of_its_worktree() {
+    for (arg, state, words) in [
+        ("settled", RowState::Settled, "PR checks settled"),
+        (
+            "reviewed",
+            RowState::Reviewed,
+            "bot review of the current head done",
+        ),
+        ("evicted", RowState::Evicted, "merge dropped"),
+    ] {
+        assert_eq!(cond(arg).cond, Condition::Own(state));
+        assert_eq!(cond(arg).describe(UTC), words);
+        assert_eq!(cond(arg).to_arg(0), arg);
+        assert_eq!(
+            cond(&format!("wt:two:{arg}")).cond,
+            Condition::Worktree {
+                slug: "two".into(),
+                state
+            }
+        );
+    }
+    assert_eq!(cond("wt:two:settled").describe(UTC), "two checks settled");
+    assert_eq!(cond("settled+5m").describe(UTC), "PR checks settled for 5m");
+    assert!(problem("pr:7:settled").contains("a pull request can be"));
+
+    let mut watch = watch(&["settled", "reviewed", "evicted"]);
+    // No read of the pull request yet: unknown, never "not yet".
+    let unread = pass(&mut watch, &own_row(|_| {}), NOON);
+    assert!(
+        unread
+            .truths
+            .iter()
+            .all(|truth| matches!(truth, Truth::Unknown(_)))
+    );
+    let running = own_row(|row| {
+        row.settled = Some(true);
+        row.reviewed = Some(false);
+        row.evicted = Some(false);
+    });
+    assert_eq!(
+        pass(&mut watch, &running, NOON).truths,
+        [Truth::Holds, Truth::NotYet, Truth::NotYet]
+    );
+    // A push starts the checks again: what held stops holding.
+    let pushed = own_row(|row| {
+        row.settled = Some(false);
+        row.reviewed = Some(true);
+        row.evicted = Some(true);
+    });
+    assert_eq!(
+        pass(&mut watch, &pushed, NOON + 1).truths,
+        [Truth::NotYet, Truth::Holds, Truth::Holds]
+    );
+    assert!(!watch.is_met());
 }

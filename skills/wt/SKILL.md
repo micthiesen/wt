@@ -32,12 +32,14 @@ wt restack [<branch>]
 wt restack prune-backups [--days <n>]   # delete old backup/restack-* branches
 wt merge [slug] [--cancel]             # arm merge-when-ready
 wt status ready --risk <r> --blocked-on "<why>" --until <cond>… [--then "<prompt>"]   # a gate that clears itself
-wt wake <cond>… -m "<what to do then>" # wake this session then; end the turn
+wt wait [--any] <cond>… [--timeout 30m] # block here until it holds: CI, a bot review, the merge queue
+wt wake <cond>… -m "<what to do then>" # for what outlives the session: wake it then; end the turn
 wt notify <cond>… [-m "<text>"]        # tell the person then
 wt watch [--all]                       # what is waiting; cancel <id>…, check <cond>…
 wt owed [--all]                        # what this worktree (or every one) still owes
 wt done [<id>|staging|production] -m "<evidence>"   # close it; --again <cond>… puts it off
 wt history [slug]                      # what happened to a row, removed ones too
+wt mark --stamp <name> [--slug <slug>] # give the row a review stamp by hand (a harness that reports no skill uses)
 wt next [branch] --title <outcome> [--issue <ID>|none] [--gh <n>|none]
 wt issue [slug] [--gh <n> | --clear-gh | --read]
 wt title [title…] [-w slug]          # show, or set any but a person's title
@@ -69,11 +71,22 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   enqueues on a merge-queue base, and gh's error there looks like a
   permission problem that isn't one.
 - **Waiting.** Never sleep, poll or set a harness timer for something wt can
-  observe: `wt wake` it and end the turn, `wt notify` it when the person
-  asked to be told, `--until` it when it is a merge gate. Conditions are one
+  observe. While you are driving something that resolves within about an
+  hour (CI, a review bot round, the merge queue, a dev server), stay in the
+  session and block on `wt wait <cond>…`: prefer a background command; where
+  the harness caps foreground commands (Claude Code caps them at 10 minutes),
+  pass `--timeout 9m` and run it again on exit 124. `--any` returns when the
+  first condition holds and says which; exit 0 held, 124 timed out
+  (`--timeout`, default 30m, at most 24h), 1 could not tell. It judges the conditions in its own process, so it works with
+  the TUI closed, and stores nothing. For what outlives the session (a
+  deploy, a release, a time hours or days away, another worktree's merge),
+  `wt wake` it and end the turn; `wt notify` it when the person asked to be
+  told, `--until` it when it is a merge gate. Conditions are one
   argument each and all must hold: a time (`17:00`, `5pm`, `3h`,
   `"tomorrow 09:00"`); this worktree (`merged`, `staging`, `production`,
-  `ready`, `green`, `verified`, `closed`); a pull request (`pr:3806`,
+  `ready`, `green`, `verified`, `closed`); its open PR (`settled`: checks
+  passed or failed, `reviewed`: the review bot finished the current head,
+  `evicted`: the armed merge was dropped); a pull request (`pr:3806`,
   `pr:3806:production`); another worktree (`wt:<slug>:merged`,
   `wt:<slug>:gone`); the next release (`release:production`); a configured
   probe (`check:<id>=<arg>`). All but a time take a delay that must hold
@@ -82,8 +95,8 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   what a condition means here before you set it; `staging` and `production`
   mean deployed only where the repository has a deploy probe, otherwise
   landed on that stage's branch. `--slug <slug>` sets one for another
-  worktree. The wt TUI evaluates watches, so nothing fires while it is
-  closed; the commands say when it is. A wake delivered after the worktree's
+  worktree. The wt TUI evaluates watches (`wt wake`, `wt notify`,
+  `--until`), so none fires while it is closed; the commands say when it is. A wake delivered after the worktree's
   own work landed stays owed until `wt done <id> -m "<evidence>"` closes it.
   `wt owed` lists what a worktree owes (gate, checks per stage, steps), and
   anything but a gate keeps it from cleanup; a notification about a landed
@@ -108,7 +121,7 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
 
 ## Index
 
-- Status and coordination: `status`, `owed`, `done`, `wake`, `notify`, `watch`, `history`,
+- Status and coordination: `status`, `owed`, `done`, `wait`, `wake`, `notify`, `watch`, `history`, `mark`,
   `fleet`, `manager`, `hold`, `edge`, `guide`, `automations`
 - Worktrees: `new`, `next`, `restack`, `merge`, `ls`, `rm`, `clean`,
   `archive`, `restore`, `open`, `doctor`, `logs`, `base`, `issue`, `section`

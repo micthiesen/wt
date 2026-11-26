@@ -219,7 +219,8 @@ pub struct OwedItem {
     pub awaiting_deploy: bool,
     /// A due step whose wake was sent without proof it arrived.
     pub unconfirmed: bool,
-    /// When a step came due.
+    /// When a step came due, or when a due check was first seen due where
+    /// that was recorded.
     pub due_at_ms: Option<i64>,
     /// When a waiting item comes due, where that is a known instant: a
     /// time, a check put off on a stage that has the change, or conditions
@@ -400,6 +401,7 @@ pub fn owed_items(
         owed.overdue = standing.overdue;
         owed.awaiting_deploy = standing.awaiting_deploy;
         if standing.due {
+            owed.due_at_ms = check.due_at_ms();
             items.push(owed);
         } else if let Some(at) = check
             .not_before_ms

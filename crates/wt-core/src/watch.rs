@@ -51,10 +51,18 @@ pub enum RowState {
     Verified,
     /// PR closed without merging.
     Closed,
+    /// An open PR whose checks finished on its current head, passed or
+    /// failed.
+    Settled,
+    /// An open PR whose review bot finished reviewing its current head.
+    Reviewed,
+    /// An open PR whose armed merge is gone: dropped from the merge queue,
+    /// or auto-merge switched off.
+    Evicted,
 }
 
 impl RowState {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 10] = [
         Self::Merged,
         Self::Staging,
         Self::Production,
@@ -62,6 +70,9 @@ impl RowState {
         Self::Green,
         Self::Verified,
         Self::Closed,
+        Self::Settled,
+        Self::Reviewed,
+        Self::Evicted,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -73,6 +84,9 @@ impl RowState {
             Self::Green => "green",
             Self::Verified => "verified",
             Self::Closed => "closed",
+            Self::Settled => "settled",
+            Self::Reviewed => "reviewed",
+            Self::Evicted => "evicted",
         }
     }
 
@@ -82,7 +96,10 @@ impl RowState {
 
     /// Whether the state can stop holding once it has held.
     const fn revocable(self) -> bool {
-        matches!(self, Self::Ready | Self::Green)
+        matches!(
+            self,
+            Self::Ready | Self::Green | Self::Settled | Self::Reviewed | Self::Evicted
+        )
     }
 
     fn phrase(self) -> &'static str {
@@ -94,6 +111,9 @@ impl RowState {
             Self::Green => "checks green",
             Self::Verified => "verified",
             Self::Closed => "closed",
+            Self::Settled => "checks settled",
+            Self::Reviewed => "bot review done",
+            Self::Evicted => "merge dropped",
         }
     }
 }
@@ -209,6 +229,8 @@ impl Condition {
             Self::At { at_ms } => local.describe(*at_ms),
             Self::Own(RowState::Green) => "PR checks green".into(),
             Self::Own(RowState::Closed) => "PR closed".into(),
+            Self::Own(RowState::Settled) => "PR checks settled".into(),
+            Self::Own(RowState::Reviewed) => "bot review of the current head done".into(),
             Self::Own(state) => state.phrase().into(),
             Self::Pr { number, goal } => match goal {
                 PrGoal::Merged => format!("#{number} merged"),
@@ -724,8 +746,11 @@ pub struct GrammarError {
 const GRAMMAR: &str = "A condition is one of:
   17:00 | 5pm | 5:30pm | 3h | 90m | 2d | \"tomorrow 09:00\" | 2030-01-15T09:00    a local time
   merged | staging | production | ready | green | verified | closed    this worktree
+  settled | reviewed | evicted    its open PR: checks finished (passed or failed),
+      the review bot finished the current head, the armed merge was dropped
   pr:3806 | pr:3806:merged|staging|production|closed    a pull request
-  wt:<slug>:merged|staging|production|ready|green|verified|closed|gone    another worktree
+  wt:<slug>:merged|staging|production|ready|green|verified|closed|settled|reviewed|evicted|gone
+      another worktree
       (<slug>:<state> reads the same unless the slug is a word of this grammar)
   release:staging | release:production    the next release there
   check:<id> | check:<id>=<arg>    a configured check
@@ -1060,7 +1085,8 @@ fn parse_untimed(text: &str, spelling: Spelling) -> Result<Condition, String> {
                 )
             });
     }
-    let states = "merged, staging, production, ready, green, verified or closed";
+    let states =
+        "merged, staging, production, ready, green, verified, closed, settled, reviewed or evicted";
     // `wt:` before `<slug>:<state>` names a worktree whatever its slug.
     // Before a state alone it is a worktree named `wt`.
     let explicit = text.strip_prefix("wt:").filter(|rest| rest.contains(':'));
@@ -1338,6 +1364,9 @@ pub struct RowFacts {
     pub green: Option<bool>,
     pub verified: Option<bool>,
     pub closed: Option<bool>,
+    pub settled: Option<bool>,
+    pub reviewed: Option<bool>,
+    pub evicted: Option<bool>,
 }
 
 impl RowFacts {
@@ -1350,6 +1379,9 @@ impl RowFacts {
             RowState::Green => self.green,
             RowState::Verified => self.verified,
             RowState::Closed => self.closed,
+            RowState::Settled => self.settled,
+            RowState::Reviewed => self.reviewed,
+            RowState::Evicted => self.evicted,
         }
     }
 }

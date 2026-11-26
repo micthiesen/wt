@@ -26,6 +26,12 @@ const DEFER_SLOW_RETRY_MS: i64 = 5 * 60 * 1000;
 const DEFER_SLOW_AFTER_MS: i64 = 10 * 60 * 1000;
 /// A fire still deferred this long is reported once on the attention feed.
 pub const DEFER_REPORT_AFTER_MS: i64 = 60 * 60 * 1000;
+/// How long after each failed run of a shell action the next one waits. A
+/// run that fails after the last of these ends the fire as failed.
+const RUN_RETRY_DELAYS_MS: [i64; 3] = [60 * 1000, 5 * 60 * 1000, 30 * 60 * 1000];
+/// A launched run whose end nobody reported for this long is no longer
+/// waited for; its fire stays delivered.
+const AWAIT_RUN_MAX_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorktreeQuiescence {
@@ -90,8 +96,9 @@ pub enum DeliverySlot {
 pub enum AutomationOutcome {
     /// Positive evidence that the dispatch path performed no durable write.
     NotStarted,
-    /// The action launched or completed. A reported action failure is still
-    /// delivered and must not be automatically replayed.
+    /// The action launched or completed. A failure a built-in or a session
+    /// reports is still delivered and is not replayed; only a launched shell
+    /// command's non-zero exit is, through [`AutomationEngine::run_ended`].
     Delivered { slot: DeliverySlot },
     /// A prompt may have been delivered but its acknowledgement was lost.
     Ambiguous { reason: String, slot: DeliverySlot },
@@ -190,6 +197,7 @@ struct ActiveFire {
     /// When its intent first queued; a deferral keeps the age.
     queued_at_ms: i64,
     settle_at_ms: i64,
+    retry_on_failure: bool,
 }
 
 /// Why a requeued fire is waiting, and whether its age was reported.
@@ -198,6 +206,45 @@ struct Deferral {
     reason: String,
     reported: bool,
     frozen: BTreeMap<String, String>,
+    /// Runs of this fire that exited non-zero so far.
+    failed_runs: u32,
+}
+
+/// A launched headless action whose exit decides whether its fire is done.
+#[derive(Clone, Debug)]
+struct AwaitedRun {
+    claim: DispatchClaim,
+    fire: AutomationFire,
+    queued_at_ms: i64,
+    delivered_at_ms: i64,
+    failed_runs: u32,
+    retry_on_failure: bool,
+}
+
+/// How a launched run ended, as its durable record shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// A shell command ran to its end and exited non-zero: a definite
+    /// failure, unlike a lost reply or a killed run.
+    ShellFailed {
+        exit_code: i32,
+    },
+    Other,
+}
+
+/// A fire whose shell action exited non-zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedRun {
+    pub slug: String,
+    pub rule: String,
+    pub exit_code: i32,
+    /// Failed runs of this fire so far, this one included.
+    pub runs: u32,
+    /// Whether its action retries; the action's own failure line is then
+    /// kept off the attention feed and this report is the only one.
+    pub retried: bool,
+    /// When it runs again; `None` when it has ended as failed.
+    pub retry_in_ms: Option<i64>,
 }
 
 /// Queue and ledger coordinator. The caller drives `tick` on source changes
@@ -217,6 +264,8 @@ pub struct AutomationEngine {
     recent: Vec<wt_automations::LedgerRecord>,
     /// Deferred fires by identity, while their intent is queued or running.
     deferrals: BTreeMap<String, Deferral>,
+    /// Delivered shell runs by fire identity, until their exit is reported.
+    awaited: BTreeMap<String, AwaitedRun>,
     /// Fires ended as skipped since the last [`AutomationEngine::take_skipped`].
     skipped: Vec<SkippedFire>,
     /// Quit arriving right after this many claims of one pass: timing alone
@@ -236,6 +285,7 @@ impl AutomationEngine {
             unmet: BTreeSet::new(),
             recent: Vec::new(),
             deferrals: BTreeMap::new(),
+            awaited: BTreeMap::new(),
             skipped: Vec::new(),
             #[cfg(test)]
             quit_after_claims: None,
@@ -362,6 +412,9 @@ impl AutomationEngine {
                     reason: record["reason"].as_str().unwrap_or_default().to_owned(),
                     reported: false,
                     frozen,
+                    failed_runs: record["failedRuns"]
+                        .as_u64()
+                        .map_or(0, |runs| u32::try_from(runs).unwrap_or(u32::MAX)),
                 },
             );
             self.intents.insert(
@@ -423,6 +476,8 @@ impl AutomationEngine {
         report: &mut AutomationTick,
     ) -> Result<()> {
         self.release_finished_slots(input.now_ms, input.activity);
+        self.awaited
+            .retain(|_, run| input.now_ms.saturating_sub(run.delivered_at_ms) <= AWAIT_RUN_MAX_MS);
         if !input.state_ready {
             // A transient store read failure must pause dispatch, not silently
             // discard the in-memory queue or pretend its cancellation persisted.
@@ -607,10 +662,20 @@ impl AutomationEngine {
         // longer does (cancelled, or held by a paused worktree) starts over
         // when it returns, so its stored deferral would only be restored at
         // each start and never cleared.
+        // A failed run's retry is dropped with its intent the same way
+        // (its condition cleared, or a guard skipped it).
+        let retries = self
+            .deferrals
+            .iter()
+            .filter(|(_, deferral)| deferral.failed_runs > 0)
+            .map(|(id, _)| id.clone());
         let stale = existing
             .iter()
             .filter(|intent| intent.fire.watch.is_some())
             .map(|intent| fire_identity(&intent.fire))
+            .chain(retries)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .filter(|id| {
                 self.deferrals.contains_key(id)
                     && !self.intents.contains_key(id)
@@ -621,7 +686,7 @@ impl AutomationEngine {
             self.ledger
                 .clear_deferred(&id, &self.cancellation)
                 .await
-                .context("clear a withdrawn watch fire's deferral")?;
+                .context("clear a withdrawn fire's deferral")?;
         }
         self.deferrals
             .retain(|id, _| self.intents.contains_key(id) || self.active.contains_key(id));
@@ -672,6 +737,18 @@ impl AutomationEngine {
                     traits.audience
                 });
             let breaker_exempt = breaker_exempt(&fire, manager_run);
+            // A retry continues a dispatch the breaker already counted, so
+            // three retries are not cut to one by a limit of two.
+            let uncounted = breaker_exempt
+                || self
+                    .deferrals
+                    .get(&id)
+                    .is_some_and(|deferral| deferral.failed_runs > 0);
+            let retry_on_failure = input
+                .context
+                .actions
+                .get(&rule.run)
+                .is_some_and(|traits| traits.shell && traits.retry_on_failure);
 
             if self.deferrals.contains_key(&id) && input.context.pauses.slugs.contains(&fire.slug) {
                 self.waiting.insert(id, "its worktree to be resumed".into());
@@ -732,7 +809,7 @@ impl AutomationEngine {
                 .await
                 .context("read automation ledger")?;
             let breaker = current_state.breaker_state(&rule.id, &pair, input.now_ms);
-            if !breaker_exempt && breaker.tripped_at.is_some() {
+            if !uncounted && breaker.tripped_at.is_some() {
                 self.ledger
                     .mark_skipped(
                         &fire.fire_keys,
@@ -797,7 +874,7 @@ impl AutomationEngine {
 
             let policy = DispatchPolicy {
                 cooldown_ms,
-                breaker_limit: (!breaker_exempt).then_some(wt_automations::BREAKER_LIMIT),
+                breaker_limit: (!uncounted).then_some(wt_automations::BREAKER_LIMIT),
                 owner_landing: fire
                     .watch
                     .as_ref()
@@ -871,6 +948,7 @@ impl AutomationEngine {
                             slot: SlotState::Dispatching,
                             queued_at_ms: intent.queued_at_ms,
                             settle_at_ms: intent.settle_at_ms,
+                            retry_on_failure,
                         },
                     );
                     report.claims.push(ClaimedFire { id, fire, claim });
@@ -1093,10 +1171,12 @@ impl AutomationEngine {
                 } else {
                     DEFER_SLOW_RETRY_MS
                 };
-                let reported = self
+                let (reported, failed_runs) = self
                     .deferrals
                     .get(&claim.id)
-                    .is_some_and(|deferral| deferral.reported);
+                    .map_or((false, 0), |deferral| {
+                        (deferral.reported, deferral.failed_runs)
+                    });
                 let report = !reported && age >= DEFER_REPORT_AFTER_MS;
                 if report {
                     notice = Some(format!(
@@ -1111,6 +1191,7 @@ impl AutomationEngine {
                         reason,
                         reported: reported || report,
                         frozen: carried,
+                        failed_runs,
                     },
                 );
                 self.intents.insert(
@@ -1127,7 +1208,27 @@ impl AutomationEngine {
                     .mark_delivered(&ledger_claim, now_ms, cancellation)
                     .await
                     .context("mark automation delivered")?;
+                let failed_runs = self
+                    .deferrals
+                    .get(&claim.id)
+                    .map_or(0, |deferral| deferral.failed_runs);
                 self.forget_deferral(&claim.id, cancellation).await?;
+                if slot == DeliverySlot::Headless
+                    && ledger_claim.kind() == DispatchKind::HeadlessAction
+                    && let Some(active) = self.active.get(&claim.id)
+                {
+                    self.awaited.insert(
+                        claim.id.clone(),
+                        AwaitedRun {
+                            claim: ledger_claim,
+                            fire: active.fire.clone(),
+                            queued_at_ms: active.queued_at_ms,
+                            delivered_at_ms: now_ms,
+                            failed_runs,
+                            retry_on_failure: active.retry_on_failure,
+                        },
+                    );
+                }
                 self.finish_slot(&claim.id, slot, now_ms);
             }
             AutomationOutcome::Ambiguous { reason, slot } => {
@@ -1140,6 +1241,118 @@ impl AutomationEngine {
             }
         }
         Ok(notice)
+    }
+
+    /// Whether any delivered shell run's exit is still unreported.
+    pub fn awaits_runs(&self) -> bool {
+        !self.awaited.is_empty()
+    }
+
+    /// Report how a launched run ended. `keys` and `started_at_ms` come
+    /// from the run's own record and pick the delivery it belongs to: a
+    /// retry reuses its fire's keys, so an earlier attempt's record, which
+    /// started before this claim, matches nothing. A shell command that
+    /// exited non-zero ends its fire as failed. When its action sets
+    /// `retry_on_failure` the fire first goes back to the queue on a
+    /// backoff, a bounded number of times. Every other end leaves the fire
+    /// delivered.
+    pub async fn run_ended(
+        &mut self,
+        keys: &[String],
+        started_at_ms: i64,
+        end: RunEnd,
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<FailedRun>> {
+        let Some(id) = self
+            .awaited
+            .iter()
+            .find(|(_, run)| {
+                run.fire.fire_keys == keys && started_at_ms >= run.claim.claimed_at_ms()
+            })
+            .map(|(id, _)| id.clone())
+        else {
+            return Ok(None);
+        };
+        let Some(run) = self.awaited.remove(&id) else {
+            return Ok(None);
+        };
+        let RunEnd::ShellFailed { exit_code } = end else {
+            return Ok(None);
+        };
+        let runs = run.failed_runs.saturating_add(1);
+        let failed = |retry_in_ms| FailedRun {
+            slug: run.fire.slug.clone(),
+            rule: run.fire.rule.id.clone(),
+            exit_code,
+            runs,
+            retried: run.retry_on_failure,
+            retry_in_ms,
+        };
+        let delay = run
+            .retry_on_failure
+            .then(|| RUN_RETRY_DELAYS_MS.get(run.failed_runs as usize).copied())
+            .flatten();
+        let Some(delay) = delay else {
+            self.ledger
+                .mark_failed(
+                    &run.claim,
+                    now_ms,
+                    &failed_reason(exit_code, runs),
+                    runs,
+                    cancellation,
+                )
+                .await
+                .context("mark automation failed")?;
+            return Ok(Some(failed(None)));
+        };
+        let reason = format!(
+            "retry {runs} of {} after exit {exit_code}",
+            RUN_RETRY_DELAYS_MS.len()
+        );
+        let record = serde_json::json!({
+            "fire": serde_json::to_value(&run.fire).context("encode failed fire")?,
+            "queuedAtMs": run.queued_at_ms,
+            "reason": reason,
+            "frozen": {},
+            "failedRuns": runs,
+        });
+        let released = self
+            .ledger
+            .release_failed(&run.claim, &id, record, cancellation)
+            .await
+            .context("requeue failed automation run")?;
+        if !released {
+            // Another writer ended the key (cancelled, or pruned).
+            return Ok(None);
+        }
+        let report = failed(Some(delay));
+        // The run has ended, so its slot holds nothing.
+        if self
+            .active
+            .get(&id)
+            .is_some_and(|active| active.slot != SlotState::Dispatching)
+        {
+            self.active.remove(&id);
+        }
+        self.deferrals.insert(
+            id.clone(),
+            Deferral {
+                reason,
+                reported: false,
+                frozen: BTreeMap::new(),
+                failed_runs: runs,
+            },
+        );
+        self.intents.insert(
+            id,
+            AutomationIntent {
+                fire: run.fire,
+                queued_at_ms: run.queued_at_ms,
+                settle_at_ms: now_ms.saturating_add(delay),
+            },
+        );
+        Ok(Some(report))
     }
 
     async fn forget_deferral(&mut self, id: &str, cancellation: &CancellationToken) -> Result<()> {
@@ -1225,6 +1438,15 @@ fn manager_bound(fire: &AutomationFire, context: &wt_automations::AutomationEval
         || (fire.mcp_event.is_some()
             && fire.slug == wt_automations::FLEET_SLUG
             && audience == Some(wt_automations::ActionAudience::Session))
+}
+
+/// How a fire that ended failed is described in the ledger and on the feed.
+pub fn failed_reason(exit_code: i32, runs: u32) -> String {
+    if runs > 1 {
+        format!("exit {exit_code} after {runs} runs")
+    } else {
+        format!("exit {exit_code}")
+    }
 }
 
 fn breaker_exempt(fire: &AutomationFire, manager_run: bool) -> bool {
@@ -2436,6 +2658,7 @@ mod tests {
                 shell: false,
                 external: false,
                 audience: wt_automations::ActionAudience::Session,
+                ..Default::default()
             },
         );
         let mut changed = rows[0].clone();
@@ -2986,6 +3209,258 @@ mod tests {
             .await
             .unwrap();
         assert!(ledger.deferred().await.unwrap().is_empty());
+    }
+
+    /// A shell action that exits non-zero is run again on a backoff, a
+    /// bounded number of times, and then ends as failed instead of
+    /// delivered. A retry survives a restart, and an earlier attempt's run
+    /// record does not end a later one.
+    #[tokio::test]
+    async fn a_failed_shell_run_is_retried_on_a_backoff_and_then_ends_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [AutomationDef {
+            on: AutomationTrigger::WtMerged,
+            ..rule("tracker", 0.0)
+        }];
+        let rows = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        let mut context = AutomationEvalContext::default();
+        // No frozen inputs: the fire is under the breaker, which counts
+        // the first dispatch and none of its retries.
+        context.actions.insert(
+            "tracker".into(),
+            wt_automations::ActionTraits {
+                shell: true,
+                external: false,
+                audience: wt_automations::ActionAudience::None,
+                retry_on_failure: true,
+            },
+        );
+        let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let cancel = CancellationToken::new();
+        let launched = AutomationOutcome::Delivered {
+            slot: DeliverySlot::Headless,
+        };
+        let failed = RunEnd::ShellFailed { exit_code: 7 };
+        let mut at = now_ms();
+        let pass = |at| {
+            input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+
+        let first = engine.tick(pass(at)).await.unwrap();
+        let claim = first.claims.first().unwrap().clone();
+        let keys = claim.fire().fire_keys.clone();
+        let first_started = at;
+        engine.finish(&claim, launched.clone(), at).await.unwrap();
+        assert!(engine.awaits_runs());
+        // A run that ended any other way leaves the fire delivered.
+        let mut other = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert_eq!(
+            other
+                .run_ended(&keys, at, failed, at, &cancel)
+                .await
+                .unwrap(),
+            None,
+            "only the engine that launched a run acts on its end"
+        );
+
+        for (attempt, delay) in RUN_RETRY_DELAYS_MS.into_iter().enumerate() {
+            let report = engine
+                .run_ended(&keys, at, failed, at + 1, &cancel)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.runs as usize, attempt + 1);
+            assert_eq!(report.retry_in_ms, Some(delay));
+            assert!(!engine.awaits_runs());
+            let snapshot = ledger.snapshot().await.unwrap();
+            assert!(keys.iter().all(|key| !snapshot.recorded(key)));
+
+            // A restart keeps the retry and its count.
+            engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+            assert_eq!(engine.restore_deferred(at + 1).await.unwrap(), 1);
+            let early = engine.tick(pass(at + 2)).await.unwrap();
+            assert!(early.claims.is_empty());
+            assert!(
+                engine.queued()[0].waiting_for.contains("after exit 7"),
+                "{:?}",
+                engine.queued()
+            );
+            // The restart's own re-check delay may be the longer one.
+            at += 1 + delay.max(DEFER_RETRY_MS);
+            let tick = engine.tick(pass(at)).await.unwrap();
+            let claim = tick.claims.first().unwrap().clone();
+            assert_eq!(claim.fire().fire_keys, keys);
+            engine.finish(&claim, launched.clone(), at).await.unwrap();
+            assert!(ledger.deferred().await.unwrap().is_empty());
+            // The first attempt's record is older than this claim.
+            assert_eq!(
+                engine
+                    .run_ended(&keys, first_started, failed, at, &cancel)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(engine.awaits_runs());
+        }
+
+        let last = engine
+            .run_ended(&keys, at, failed, at + 1, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.retry_in_ms, None);
+        assert_eq!(last.runs as usize, RUN_RETRY_DELAYS_MS.len() + 1);
+        let snapshot = ledger.snapshot().await.unwrap();
+        let record = snapshot.recent(1).remove(0);
+        assert_eq!(record.state, "failed");
+        assert_eq!(record.reason.as_deref(), Some("exit 7 after 4 runs"));
+        assert!(last.retried);
+        assert_eq!(snapshot.breaker_state("test", "worktree", at).count, 1);
+        // Failed is terminal: the still-true condition does not fire again.
+        let after = engine.tick(pass(at + 2)).await.unwrap();
+        assert!(after.claims.is_empty());
+        assert_eq!(engine.pending_count(), 0);
+    }
+
+    /// Without `retry_on_failure` a non-zero exit ends the fire as failed
+    /// at once, in a form a build from before failed fires reads as handled.
+    #[tokio::test]
+    async fn a_failed_shell_run_is_not_run_again_unless_its_action_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(&path);
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [rule("custom-action", 0.0)];
+        let rows = [row()];
+        let mut context = AutomationEvalContext::default();
+        context.actions.insert(
+            "custom-action".into(),
+            wt_automations::ActionTraits {
+                shell: true,
+                ..Default::default()
+            },
+        );
+        let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+        let (quiescence, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let cancel = CancellationToken::new();
+        let start = now_ms();
+        let pass = |at| {
+            input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+        let tick = engine.tick(pass(start)).await.unwrap();
+        let claim = tick.claims.first().unwrap().clone();
+        let keys = claim.fire().fire_keys.clone();
+        let launched = AutomationOutcome::Delivered {
+            slot: DeliverySlot::Headless,
+        };
+        engine.finish(&claim, launched, start).await.unwrap();
+        let failed = engine
+            .run_ended(
+                &keys,
+                start,
+                RunEnd::ShellFailed { exit_code: 3 },
+                start + 1,
+                &cancel,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((failed.runs, failed.retry_in_ms), (1, None));
+        assert!(!failed.retried);
+        assert!(ledger.deferred().await.unwrap().is_empty());
+        let snapshot = ledger.snapshot().await.unwrap();
+        let record = snapshot.recent(1).remove(0);
+        assert_eq!(record.state, "failed");
+        assert_eq!(record.reason.as_deref(), Some("exit 3"));
+        assert!(!snapshot.delivered(&keys[0]));
+        assert!(snapshot.has_handled(&keys[0], start + 2));
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let entry = &stored["fired"][&keys[0]];
+        assert_eq!(entry["state"], "delivered");
+        assert_eq!(
+            (&entry["failed"], &entry["failedRuns"]),
+            (&true.into(), &1.into())
+        );
+        let after = engine.tick(pass(start + 2)).await.unwrap();
+        assert!(after.claims.is_empty());
+        assert_eq!(engine.pending_count(), 0);
+    }
+
+    /// A run that succeeded, was killed, or is not a shell command leaves
+    /// its fire delivered.
+    #[tokio::test]
+    async fn a_run_that_did_not_exit_non_zero_stays_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [rule("custom-action", 0.0)];
+        let rows = [row()];
+        let context = AutomationEvalContext::default();
+        let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+        let (quiescence, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let tick = engine
+            .tick(input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        let claim = tick.claims.first().unwrap().clone();
+        let keys = claim.fire().fire_keys.clone();
+        engine
+            .finish(
+                &claim,
+                AutomationOutcome::Delivered {
+                    slot: DeliverySlot::Headless,
+                },
+                start,
+            )
+            .await
+            .unwrap();
+        let ended = engine
+            .run_ended(
+                &keys,
+                start,
+                RunEnd::Other,
+                start + 1,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ended, None);
+        assert!(!engine.awaits_runs());
+        assert!(ledger.snapshot().await.unwrap().delivered(&keys[0]));
     }
 
     /// Deferred fires written before watches existed still load, and one

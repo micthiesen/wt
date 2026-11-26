@@ -275,6 +275,34 @@ impl<'a> EventLog<'a> {
         }))
     }
 
+    /// Whether the slug's current incarnation was seen landed on production.
+    pub(crate) fn landed_in_production(&self, slug: &str) -> Result<bool, StoreError> {
+        let created: i64 = self.db.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM worktree_events WHERE repo_id = ?1 AND slug = ?2 \
+             AND kind = 'created'",
+            params![self.repo_id, slug],
+            |row| row.get(0),
+        )?;
+        let mut landed = self.db.prepare(
+            "SELECT data FROM worktree_events WHERE repo_id = ?1 AND slug = ?2 AND kind = 'landed' \
+             AND id > ?3",
+        )?;
+        let rows = landed.query_map(params![self.repo_id, slug, created], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for data in rows {
+            if matches!(
+                serde_json::from_str::<WorktreeEventKind>(&data?),
+                Ok(WorktreeEventKind::Landed {
+                    on: wt_core::LandedOn::Production
+                })
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether the slug's latest lifecycle event says it was removed.
     pub(crate) fn removed(&self, slug: &str) -> Result<bool, StoreError> {
         Ok(self.lifecycle(slug)?.is_some_and(|latest| latest.removed))

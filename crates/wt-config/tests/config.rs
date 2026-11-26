@@ -543,7 +543,7 @@ fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
         "\nbase='main'\nkeep_fresh=['release']\n\
          [[actions]]\nid='triage'\nname='Triage issue'\nshell='echo {{issue}}'\n\
          affects=['issue','issue']\nrequires=['issue.tracker','pr.ready']\n\
-         issue_status='Doing'\nkey='t'\ngroup='Issues'\nexternal=true\n\
+         issue_status='Doing'\nkey='t'\ngroup='Issues'\nexternal=true\nretry_on_failure=true\n\
          arg_prompt='Issue title'\nlabel_extract='^([A-Z]+-\\d+)'\n\
          [[automations]]\nid='legacy-review'\non='rabbit.unresolved'\nrun='triage'\n\
          [[automations]]\nid='needs-human'\non='status.needs-human'\nrun='builtin:notify'\n\
@@ -567,6 +567,18 @@ fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
     assert_eq!(action.arg_prompt.as_ref().unwrap().label, "Issue title");
     assert_eq!(action.label_extract.as_deref(), Some("^([A-Z]+-\\d+)"));
     assert!(action.external);
+    assert!(action.retry_on_failure);
+    let prompt = format!(
+        "{}\n[[actions]]\nid='p'\nname='P'\nprompt='go'\nretry_on_failure=true\n",
+        minimal_config(root.path())
+    );
+    let error = Config::from_raw(toml_value(&prompt), &options(root.path(), &home, &[]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("retry_on_failure is only valid on a shell action"),
+        "{error}"
+    );
 
     assert_eq!(config.automations.len(), 5);
     assert_eq!(
@@ -991,7 +1003,22 @@ fn history_lists_the_skills_it_records_by_name() {
     let every = load("\n[history]\nskills = ['*']\n").unwrap();
     assert!(every.history.records_skill("anything:at-all"));
 
+    let stamping = load("\n[history]\nstamps = ['/fable-review']\n").unwrap();
+    assert_eq!(stamping.history.stamps, ["fable-review"]);
+    // A stamping skill is recorded without being listed in skills.
+    assert!(stamping.history.records_skill("fable-review"));
+    assert_eq!(
+        stamping.history.stamp_for("tools:fable-review"),
+        Some("fable-review")
+    );
+    assert_eq!(stamping.history.stamp_for("check"), None);
+    assert!(!stamping.history.is_empty());
+
     for (extra, expected) in [
+        (
+            "\n[history]\nstamps = ['*']\n",
+            "history.stamps must be an array of skill or slash-command names",
+        ),
         ("\n[history]\nskills = 'check'\n", "history: "),
         (
             "\n[history]\nskills = ['check', '']\n",

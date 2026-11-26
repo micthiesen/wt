@@ -65,17 +65,17 @@ impl Family for LayoutChange {
                         .is_some_and(|section| board.sections[section].key == ARCHIVED_SECTION)
                     {
                         // A restored row returns to the Inbox, unless it has
-                        // landed and `[ui] owed_sections` draws it by what
-                        // it owes.
+                        // landed and `[ui] owed_sections` draws it in the
+                        // Landed block.
                         let row = &board.rows[index];
-                        let block = row.owed_block.filter(|_| {
-                            board.display.owed_sections
-                                && row.host.is_none()
-                                && row.git.landed_on.is_some()
-                        });
-                        match block {
-                            Some(block) => place(board, index, block.key(), block.title()),
-                            None => place(board, index, INBOX_SECTION, INBOX_TITLE),
+                        if board.display.owed_sections
+                            && row.host.is_none()
+                            && row.git.landed_on.is_some()
+                            && row.owed_block.is_some()
+                        {
+                            place(board, index, crate::LANDED_SECTION, crate::LANDED_TITLE);
+                        } else {
+                            place(board, index, INBOX_SECTION, INBOX_TITLE);
                         }
                     }
                 }

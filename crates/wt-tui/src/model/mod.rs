@@ -29,13 +29,14 @@ pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION, REMOVING_SECTION};
 pub use board::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
     AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
-    GitPresentation, GuideView, HostChoice, LandingKind, LiveSlotView, LocalStamp, LogView,
-    MergeQueueView, OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION, OwedBlock, OwedView, PerfGroupView,
-    PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup,
-    PreparedPalette, RemovalView, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView,
-    ReviewRequestRow, ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView,
-    TitleSource, UsageItem, WatchActionKind, WatchConditionView, WatchTruth, WatchView,
-    WorkPresentation, WorkRiskCount, WorkStateCount, owed_block_refusal,
+    GitPresentation, GuideView, HostChoice, LANDED_SECTION, LANDED_TITLE, LandingKind,
+    LiveSlotView, LocalStamp, LogView, MergeQueueView, OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION,
+    OwedBlock, OwedView, PerfGroupView, PerfProcessView, PerfTone, PerfView, PrCommentView,
+    PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView, RemovedHistoryRow,
+    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
+    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WatchActionKind,
+    WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount, WorkStateCount,
+    owed_block_refusal,
 };
 pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{
@@ -132,7 +133,6 @@ pub struct Model {
     pub(crate) help_max_scroll: usize,
     pub(crate) help_query: crate::LineEditor,
     pub(crate) help_searching: bool,
-    pub(crate) show_verification: bool,
     pub show_perf: bool,
     pub(crate) perf_continuous: bool,
     pub(crate) perf_scroll: usize,
@@ -217,7 +217,6 @@ impl Default for Model {
             help_max_scroll: 0,
             help_query: crate::LineEditor::default(),
             help_searching: false,
-            show_verification: false,
             show_perf: false,
             perf_continuous: false,
             perf_scroll: 0,

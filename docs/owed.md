@@ -35,12 +35,21 @@ state, `waiting` or `due`.
   item until then, and a step of its own after.
 - A check is `due` once the change is deployed to its stage (the landing
   reached the stage's branch and, where the stage has a deploy probe, the
-  probe reports it) and any not-before time has passed. It is `overdue`
-  after the configured days.
+  probe reports it) and any not-before time has passed. wt records when it
+  first saw the check due (`due_at` in JSON, an `owed` history event) and
+  the check is `overdue` the configured days after that, however often the
+  status is asserted again.
+- Each stage holds one check. A second check for the same stage (another
+  pull request of the same worktree) is a wake step: `wt wake pr:<n>:<stage>
+  -m "<steps>"`.
 - A pending wake is a `waiting` step, even when its conditions held and it is
   only waiting for delivery.
 - Watches that only tell the person (`wt notify`, `W`) are **not owed**. They
   never hold cleanup and are listed apart (`wt watch`).
+- A [`wt wait`](cli.md#wt-wait-condition---any---timeout-duration---slug-slug---json)
+  is not owed either: it blocks the session that runs it and stores nothing.
+  It is for what resolves while the session is still working; a wake is for
+  what outlives it.
 
 Order: due checks by stage, due steps oldest first, the gate, then waiting
 items by what they wait for: staging, production, anything else, a time.
@@ -62,8 +71,19 @@ A check works the same way. When it comes due wt wakes the row's session with
 the steps: the built-in rule `wt.check`, which needs no configuration, or a
 configured `status.verification_due` rule that prompts that session and so
 replaces it ([automations.md](automations.md#the-built-in-check-wake)). Being
-prompted closes nothing; `wt done <stage> --again <time>` keeps the check
-owed and not due before that time.
+prompted closes nothing.
+
+**A due check that cannot be run yet is put off with `wt done <stage>
+--again <time>`**: it stays owed and is not due before that time. A separate
+`wt wake` for it leaves the check due beside a second item, so `wt wake`
+warns when it is set for a stage the row already owes a check in, or with a
+prompt that reads like that check. The check's prompt and the `wt owed` line
+of a due check both print the `--again` form.
+
+A gate is cleared by exactly the conditions `--until` names. When those are
+a time alone, or the gate's text names more than they cover, `wt status`
+says so once: `this gate clears <when>; anything else it names is not
+checked`.
 
 ## Phase
 
@@ -94,7 +114,13 @@ neither does a notify-only watch. A landed row in phase `done` is cleanable.
 
 A removed worktree's checks and due steps move onto its removal record:
 `wt owed --slug <slug>` shows them, `wt done --slug <slug>` closes them
-there, and a restore carries back what is still open.
+there, and a restore carries back what is still open. Its deploys can no
+longer be read, so a check stands by the landing the record holds: base at
+removal, production (`landedOn`) when the row's history shows it had landed
+there or the history view proved it since. A production check on a removed
+row comes due once the record says production. Nobody is left to prompt for
+a removed row, so what comes due on one is sent to the manager session
+once ([automations.md](automations.md#the-built-in-check-wake)).
 
 ## Every change prints the list
 
@@ -114,19 +140,25 @@ list is empty.
 
 A stack member whose own work has landed is no longer a parent **for
 display**: it is drawn as a single row and members based on it become roots.
-So moving a merged head moves only that row, and derived blocks take only
+So moving a merged head moves only that row, and the Landed block takes only
 that row. Fork-base records are not rewritten; stack identity, the stack
 pause, `stack.parent_merged` and `wt restack` keep reading the full chain.
 
-## Derived blocks
+## The Landed block
 
 Sections are asserted by people and agents. With `[ui] owed_sections = true`
-(off by default) a landed, unarchived local row is instead shown under what
-it owes. One function, `wt_core::OwedBlock`, files both the board's rows and
-the items `wt owed --all` groups, so the two cannot disagree. A row is filed
-by its phase and, while it waits, by its open items, the first that applies:
+(off by default) the board instead draws every landed, unarchived local row
+in **one** derived block, **Landed** ([tui.md](tui.md)), in landing order.
+The board has no block per stage: each row in Landed carries a label saying
+what it waits for next.
 
-| block | the row is here when |
+The headings below exist only in `wt owed --all`, which groups every
+worktree's items under them. One function, `wt_core::OwedBlock`, gives both
+a row's label on the board and the heading its items are listed under, so
+the two cannot disagree. A row is filed by its phase and, while it waits, by
+its open items, the first that applies:
+
+| `wt owed --all` heading | the row is here when |
 |---|---|
 | **Due** | something is due |
 | **Waiting for staging** | an open item waits for a deploy to staging that has not happened: the row's own stage, another pull request's or commit's (`pr:N:staging`, `commit:<oid>:staging`), or the stage's next release |
@@ -135,18 +167,34 @@ by its phase and, while it waits, by its open items, the first that applies:
 | **Waiting on other work** | anything else: another pull request or worktree merging, a probe |
 | **Done** | nothing is open |
 
-Rows under Scheduled are drawn soonest first, and under Due oldest due step
-first. A landed row's only remaining meaning is what it owes,
-which is the one case where deriving its place is safe. The stored section is
+A landed row's only remaining meaning is what it owes, which is the one case
+where deriving its place is safe. The stored section is
 untouched, so turning the option off restores the layout; such a row cannot
 be moved or reordered while the option is on.
+
+## Review stamps
+
+A worktree that has been through a round of a stamping skill
+([`[history] stamps`](configuration.md#history-which-skill-uses-a-worktrees-history-records))
+carries a stamp. It is not owed and holds nothing; it lives here because it
+rides the status record (`work.stamp`: `skill`, `sha`, `at`, `by`), which
+every status write carries forward, older builds included. The skill
+starting leaves `stampPending` on the slug entry; the first status after it
+that is not `working` or `review` earns the stamp at that assertion's HEAD.
+A round takes hours at most: a `stampPending` older than 24 hours was left by
+a round that was abandoned, so it is ignored and the next status write of any
+state drops it.
+The stamp stays when the head moves (the marker goes from `✦` to `✧`) and
+when the status is asserted again. A new round replaces it;
+`wt status --clear` removes it with the status, and a pending one with it.
 
 ## Compatibility with older builds
 
 Sessions keep the build that started them for days and share the state.
 
 - **Checks.** The status record gains `checks` (per stage: `steps`, optional
-  `notBeforeMs`) and `checksMirror`. The legacy pair `verifyAfterMerge` /
+  `notBeforeMs`, `sinceMs`, `dueSinceMs`, `duePr`; an older build carries
+  the ones it does not know through its writes) and `checksMirror`. The legacy pair `verifyAfterMerge` /
   `verifyIn` stays and mirrors the first open check, staging before
   production. A pure normalize step runs wherever a record is read or
   written: legacy fields present set that stage's check (also the upgrade

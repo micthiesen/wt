@@ -41,7 +41,7 @@ pub async fn run(ctx: &AppContext, args: &SectionArgs) -> Result<i32> {
                 continue;
             };
             let owed = super::owed::derive(&state, slug, *landing, now_ms);
-            if let Some(hint) = block_hint(slug, owed.phase, &owed.items) {
+            if let Some(hint) = block_hint(slug, owed.phase) {
                 println!("{hint}");
             }
         }
@@ -50,17 +50,13 @@ pub async fn run(ctx: &AppContext, args: &SectionArgs) -> Result<i32> {
 }
 
 /// What a move of a landed row is told while `[ui] owed_sections` is on:
-/// the board draws it under a block derived from what it owes. `None` for
-/// a row that has not landed.
-fn block_hint(
-    slug: &str,
-    phase: Option<wt_core::OwedPhase>,
-    items: &[wt_core::OwedItem],
-) -> Option<String> {
-    let block = wt_core::OwedBlock::of_row(phase?, items);
+/// the board draws every landed row in its one derived block. `None` for a
+/// row that has not landed.
+fn block_hint(slug: &str, phase: Option<wt_core::OwedPhase>) -> Option<String> {
+    phase?;
     Some(format!(
         "  {slug} has landed: the board shows it under {} while {} is on, whatever section it is filed in",
-        block.title(),
+        wt_tui::LANDED_TITLE,
         wt_tui::OWED_SECTIONS_OPTION
     ))
 }
@@ -82,23 +78,16 @@ mod tests {
 
     #[test]
     fn moving_a_landed_row_says_where_the_board_shows_it() {
-        use wt_core::{OwedPhase, VerifyStage};
-        assert_eq!(block_hint("open", None, &[]), None);
-        assert_eq!(
-            block_hint("done", Some(OwedPhase::Done), &[]).as_deref(),
-            Some(
-                "  done has landed: the board shows it under Done while [ui] owed_sections is on, whatever section it is filed in"
-            )
-        );
-        let mut record = wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "t");
-        record.set_check(VerifyStage::Production, "watch the logs");
-        let landing = Landing::new(true, false, true);
-        let items = wt_core::owed_items(Some(&record), &landing, &[], &[], 0);
-        assert!(
-            block_hint("beta", Some(OwedPhase::Waiting), &items)
-                .unwrap()
-                .contains("under Waiting for production while")
-        );
+        use wt_core::OwedPhase;
+        assert_eq!(block_hint("open", None), None);
+        for phase in [OwedPhase::Done, OwedPhase::Waiting, OwedPhase::Due] {
+            assert_eq!(
+                block_hint("beta", Some(phase)).as_deref(),
+                Some(
+                    "  beta has landed: the board shows it under Landed while [ui] owed_sections is on, whatever section it is filed in"
+                )
+            );
+        }
     }
 
     #[test]

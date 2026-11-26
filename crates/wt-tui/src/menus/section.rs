@@ -16,8 +16,8 @@ pub(super) fn menu(board: &Board, key: &str) -> LocalMenu {
     if row.archived {
         return LocalMenu::Notice("restore the archived row before moving it to a section".into());
     }
-    // A landed row under `[ui] owed_sections` is drawn where what it owes
-    // puts it; filing it would change nothing on screen.
+    // A landed row under `[ui] owed_sections` is drawn in the Landed
+    // block; filing it would change nothing on screen.
     if let Some(block) = board
         .sections
         .iter()
@@ -79,8 +79,8 @@ pub(super) fn delete_confirm(board: &Board, name: &str) -> LocalMenu {
         return LocalMenu::Notice("section is no longer on the board".into());
     };
     let seen = board.section_witness(name);
-    // A landed row under `[ui] owed_sections` is filed here and drawn in a
-    // derived block: it moves too, so it is named with where to find it.
+    // A landed row under `[ui] owed_sections` is filed here and drawn in
+    // the Landed block: it moves too, so it is named with where to find it.
     let mut shown = Vec::new();
     let mut elsewhere = std::collections::BTreeMap::<&str, Vec<&str>>::new();
     for key in &seen {
@@ -297,8 +297,8 @@ mod tests {
             rows,
             ..Default::default()
         };
-        // "landed" and "waiting" are filed in Batch and drawn in the blocks
-        // that what they owe puts them in.
+        // "landed" and "waiting" are filed in Batch and drawn in the Landed
+        // block.
         let board = Board {
             rows: vec![
                 row("open", Some("Batch")),
@@ -309,12 +309,7 @@ mod tests {
             sections: vec![
                 section("Batch", "Batch", vec![0]),
                 section("Busy", "Busy", vec![3]),
-                section(
-                    crate::OwedBlock::WaitingOther.key(),
-                    "Waiting on other work",
-                    vec![2],
-                ),
-                section(crate::OwedBlock::Done.key(), "Done", vec![1]),
+                section(crate::LANDED_SECTION, "Landed", vec![1, 2]),
             ],
             section_order: vec!["Batch".into(), "Busy".into()],
             ..Default::default()
@@ -330,8 +325,7 @@ mod tests {
             [
                 "Its 3 worktrees move to the Inbox:",
                 "  open",
-                "also filed here, shown under Done: landed",
-                "also filed here, shown under Waiting on other work: waiting",
+                "also filed here, shown under Landed: landed, waiting",
             ]
         );
         assert_eq!(

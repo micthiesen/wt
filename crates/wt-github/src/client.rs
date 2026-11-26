@@ -410,6 +410,18 @@ impl GithubClient {
         }
     }
 
+    /// When the exhausted primary rate limit resets, in epoch milliseconds.
+    /// `None` when no primary limit is exhausted (a secondary limit names
+    /// no time) or the question itself fails. The endpoint is not counted
+    /// against any limit.
+    pub async fn rate_limit_reset_ms(&self, cancellation: &CancellationToken) -> Option<u64> {
+        let out = self.run(["api", "rate_limit"], cancellation).await.ok()?;
+        out.status
+            .success()
+            .then(|| exhausted_rate_limit_reset_ms(&out.stdout))
+            .flatten()
+    }
+
     /// Numbers of the open PRs whose BASE is `branch`. Deleting a branch by
     /// push or API makes GitHub close these (`base_ref_deleted`) rather than
     /// retarget them, and such a PR cannot be reopened. A failed request is
@@ -1281,6 +1293,19 @@ impl Drop for MergeGuard {
     }
 }
 
+/// The latest reset among the exhausted REST and GraphQL limits of a
+/// `rate_limit` reply.
+fn exhausted_rate_limit_reset_ms(bytes: &[u8]) -> Option<u64> {
+    let reply: Value = serde_json::from_slice(bytes).ok()?;
+    ["core", "graphql"]
+        .iter()
+        .filter_map(|name| reply.pointer(&format!("/resources/{name}")))
+        .filter(|limit| limit.get("remaining").and_then(Value::as_u64) == Some(0))
+        .filter_map(|limit| limit.get("reset").and_then(Value::as_u64))
+        .max()
+        .map(|seconds| seconds.saturating_mul(1000))
+}
+
 fn classify_output(output: &ProcessOutput) -> GithubError {
     let (message, transient) = output_failure(output);
     if is_rate_limit(&message) {
@@ -2141,6 +2166,28 @@ mod transport_tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).unwrap();
         path
+    }
+
+    #[test]
+    fn only_an_exhausted_primary_limit_names_a_reset() {
+        let reply = |core: u64, graphql: u64| {
+            serde_json::to_vec(&serde_json::json!({"resources": {
+                "core": {"remaining": core, "reset": 1_800_000_100u64},
+                "graphql": {"remaining": graphql, "reset": 1_800_000_200u64},
+                "search": {"remaining": 0, "reset": 1_800_009_999u64},
+            }}))
+            .unwrap()
+        };
+        assert_eq!(exhausted_rate_limit_reset_ms(&reply(10, 10)), None);
+        assert_eq!(
+            exhausted_rate_limit_reset_ms(&reply(10, 0)),
+            Some(1_800_000_200_000)
+        );
+        assert_eq!(
+            exhausted_rate_limit_reset_ms(&reply(0, 10)),
+            Some(1_800_000_100_000)
+        );
+        assert_eq!(exhausted_rate_limit_reset_ms(b"not json"), None);
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! `wt wake`, `wt notify` and `wt watch`: set, list and cancel watches. A
 //! watch names conditions and what happens once they all hold; the engine
-//! in the TUI's host evaluates and delivers them.
+//! in the TUI's host evaluates and delivers them. `wt wait` (wait.rs) reads
+//! the same conditions through [`read_conditions`] and judges them itself.
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
@@ -21,7 +22,7 @@ use wt_core::{
 use wt_ops::commands::resolve::resolve_worktree;
 use wt_store::{NewWatch, WatchRefusal, WatchSelector};
 
-const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, 5pm, 3h, \"tomorrow 09:00\", 2030-01-15T09:00), this worktree (merged, staging, production, ready, green, verified, closed), a pull request (pr:3806, pr:3806:production), another worktree (wt:<slug>:merged, wt:<slug>:gone; <slug>:merged also reads), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
+pub(crate) const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, 5pm, 3h, \"tomorrow 09:00\", 2030-01-15T09:00), this worktree (merged, staging, production, ready, green, verified, closed), its open PR (settled: checks passed or failed; reviewed: the review bot finished the current head; evicted: the armed merge was dropped), a pull request (pr:3806, pr:3806:production), another worktree (wt:<slug>:merged, wt:<slug>:gone; <slug>:merged also reads), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
 
 #[derive(Debug, Clone, Args)]
 pub struct WakeArgs {
@@ -218,7 +219,7 @@ fn config_fact(config: &Config, cond: &Condition) -> Result<Option<(String, bool
 /// the line as a comment, so the command arrives without them.
 pub(crate) const NO_CONDITIONS: &str = "name at least one condition, such as pr:3806:production, release:production+24h or 17:00.\nIf you wrote a pull request as #3806, the shell read # as the start of a comment and dropped it with the rest of the command: write pr:3806";
 
-fn no_conditions(args: &[String]) -> bool {
+pub(crate) fn no_conditions(args: &[String]) -> bool {
     args.is_empty() || args.iter().any(|arg| arg.trim().is_empty())
 }
 
@@ -270,6 +271,22 @@ async fn live_slugs(ctx: &AppContext) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Why condition arguments could not be read.
+#[derive(Debug)]
+pub(crate) enum ConditionsError {
+    /// The arguments are wrong; asking again changes nothing.
+    Invalid(String),
+    /// The worktrees could not be listed, whatever the arguments say.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for ConditionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Invalid(message) | Self::Unreadable(message)) = self;
+        f.write_str(message)
+    }
+}
+
 /// Read condition arguments for a watch about to be set. A release
 /// condition takes the stage's current release as its baseline when that is
 /// known now; otherwise the engine takes the first one it sees.
@@ -277,24 +294,25 @@ pub(crate) async fn read_conditions(
     ctx: &AppContext,
     args: &[String],
     clock: LocalClock,
-) -> Result<ReadConditions, String> {
+) -> Result<ReadConditions, ConditionsError> {
+    use ConditionsError::{Invalid, Unreadable};
     if no_conditions(args) {
-        return Err(NO_CONDITIONS.into());
+        return Err(Invalid(NO_CONDITIONS.into()));
     }
     let mut read = ReadConditions {
         when: Vec::new(),
         notes: Vec::new(),
         warnings: Vec::new(),
     };
-    let live = live_slugs(ctx).await?;
+    let live = live_slugs(ctx).await.map_err(Unreadable)?;
     for arg in args {
-        let mut cond = parse(arg, clock).map_err(|error| error.to_string())?;
+        let mut cond = parse(arg, clock).map_err(|error| Invalid(error.to_string()))?;
         if let Some(warning) = absent_worktree(&cond.cond, &live)
             && !read.warnings.contains(&warning)
         {
             read.warnings.push(warning);
         }
-        if let Some((note, true)) = config_fact(&ctx.config, &cond.cond)?
+        if let Some((note, true)) = config_fact(&ctx.config, &cond.cond).map_err(Invalid)?
             && !read.notes.contains(&note)
         {
             read.notes.push(note);
@@ -491,6 +509,14 @@ async fn set_and_report(
             report_set(ctx, &set, &does, &read).await;
             // A wake is owed by the worktree; telling the person is not.
             if wakes {
+                let state = ctx
+                    .database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await?;
+                let record = wt_core::parse_work_status(&state["slugs"][slug.as_str()]["work"]);
+                if let Some(warning) = duplicates_check(record.as_ref(), &set.watch) {
+                    println!("  warning: {warning}");
+                }
                 super::status::drop_ops_none(ctx, &slug).await?;
                 super::owed::print_list(ctx, &slug).await;
             }
@@ -501,6 +527,44 @@ async fn set_and_report(
             Ok(1)
         }
     }
+}
+
+/// The warning for a wake whose prompt says it runs a check the worktree
+/// already owes: it names verifying, or the owed check, or quotes the
+/// check's own first line. Such a wake leaves the check due beside it;
+/// putting the check off is `wt done <stage> --again <time>`. Waiting for
+/// the check's stage is not enough, since a second step there is ordinary.
+/// A warning only: the wake may still be a real second step.
+fn duplicates_check(record: Option<&wt_core::WorkStatusRecord>, wake: &Watch) -> Option<String> {
+    let prompt = wake.then.wake.as_deref()?.to_lowercase();
+    let words = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    // "verify-in" splits into words, so "verify" covers it.
+    let says_so = words.iter().enumerate().any(|(index, word)| match *word {
+        "verify" | "verification" => true,
+        "owed" => words[index + 1..]
+            .iter()
+            .take(3)
+            .any(|next| matches!(*next, "check" | "staging" | "production")),
+        _ => false,
+    });
+    let quotes = |steps: &str| {
+        let first = wt_core::watch::headline(steps).to_lowercase();
+        let first = first.trim();
+        first.chars().count() >= 12 && prompt.contains(first)
+    };
+    let checks = record?.open_checks();
+    let (stage, _) = checks
+        .iter()
+        .find(|(stage, check)| quotes(&check.steps) || (says_so && words.contains(&stage.as_str())))
+        .or_else(|| checks.first().filter(|_| says_so))?;
+    let stage = stage.as_str();
+    Some(format!(
+        "this worktree already owes a check in {stage}, which wt brings to the session when it is due. To run it later, put the check itself off: wt done {stage} --again <time>. This wake leaves the check due beside it (to drop it: wt watch cancel {})",
+        wake.id
+    ))
 }
 
 /// What cancelling a watch leaves behind that its setter may not expect.
@@ -873,6 +937,69 @@ mod tests {
     }
 
     #[test]
+    fn a_wake_that_stands_in_for_an_owed_check_is_warned_about() {
+        let owing = wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "t").with_check(
+            wt_core::VerifyStage::Production,
+            "Open /health and expect 200",
+        );
+        let wake = |conditions: &[&str], prompt: &str| {
+            let mut watch = stored(conditions);
+            watch.then.wake = Some(prompt.into());
+            watch
+        };
+        // The prompt says it runs the owed check, whatever it waits for.
+        let warning = duplicates_check(
+            Some(&owing),
+            &wake(&["3h"], "Run the verify-in-production steps"),
+        )
+        .unwrap();
+        assert!(
+            warning.contains("wt done production --again <time>"),
+            "{warning}"
+        );
+        assert!(warning.contains("wt watch cancel aaaaaa"), "{warning}");
+        for prompt in [
+            "VERIFY the deploy",
+            "do the verification",
+            "do the owed check now",
+            "run what is owed in production",
+            "the owed post-merge check",
+            "Open /health and expect 200",
+        ] {
+            assert!(
+                duplicates_check(Some(&owing), &wake(&["3h"], prompt)).is_some(),
+                "{prompt}"
+            );
+        }
+        // Naming the check's stage, or words that only contain the others,
+        // is a second step like any other.
+        for (when, prompt) in [
+            ("production", "rotate the old key"),
+            ("production", "look at the logs"),
+            ("3h", "run the checks again"),
+            ("3h", "clean the checkout"),
+            ("3h", "run the production check"),
+            ("3h", "see what the reverification did"),
+            (
+                "3h",
+                "the owed reply, then the long list of other things in production",
+            ),
+            ("staging", "tail the worker"),
+            ("3h", "rebase onto main"),
+        ] {
+            assert_eq!(
+                duplicates_check(Some(&owing), &wake(&[when], prompt)),
+                None,
+                "{prompt}"
+            );
+        }
+        assert_eq!(
+            duplicates_check(None, &wake(&["production"], "do the owed check")),
+            None
+        );
+    }
+
+    #[test]
     fn a_listed_condition_reads_from_its_stored_record() {
         let mut watch = stored(&["17:00", "merged", "green+1h", "check:secret=KEY", "#7"]);
         let state = |watch: &Watch, index: usize, now, evaluating| {
@@ -1071,6 +1198,7 @@ mod tests {
                 .await
                 .err()
                 .unwrap()
+                .to_string()
                 .contains("A condition is one of")
         );
         // With a probe and nothing deployed yet there is no baseline to take.
@@ -1131,6 +1259,7 @@ mod tests {
                     .await
                     .err()
                     .unwrap()
+                    .to_string()
                     .contains("write pr:3806")
             );
         }

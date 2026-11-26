@@ -186,6 +186,22 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut row_landings = std::collections::BTreeMap::<String, String>::new();
         // Armed merges already asked to be forgotten; the snapshot lags.
         let mut ended_arms = BTreeSet::new();
+        // Due checks already handed to the store to date; the snapshot lags.
+        let mut dated_checks = Vec::new();
+        // When removed rows were last looked over for something due, and
+        // the metadata revision they were read at.
+        let mut removed_due_seen: Option<(u64, i64)> = None;
+        let mut removed_due_told = BTreeSet::new();
+        // Records removed before a production landing was kept on them
+        // are completed from history, once, before anything reads them.
+        if let Err(error) = context
+            .database
+            .call(|store| Ok(store.heal_removed_landings()?))
+            .await
+        {
+            tracing::warn!(error = %format!("{error:#}"), "cannot complete removed worktrees' landings");
+        }
+        let mut last_run_check = None;
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -515,6 +531,40 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     Err(error) => latest_error = Some(format!("cannot record a merge seen armed: {error:#}")),
                 }
             }
+            if engine.awaits_runs()
+                && last_run_check.is_none_or(|at: Instant| at.elapsed() >= RUN_CHECK_INTERVAL)
+            {
+                last_run_check = Some(Instant::now());
+                if let Err(error) = settle_runs(&context, &accepted_context, &mut engine).await {
+                    latest_error = Some(format!("automation run results: {error:#}"));
+                }
+            }
+            // A check first seen due is dated: overdue counts from then,
+            // whatever is asserted later, and history says when.
+            let newly_due = if facts.state_ready { wt_automations::checks_newly_due(&facts.rows, &facts.context) } else { Vec::new() };
+            let due_keys = newly_due.iter().map(|due| (due.slug.clone(), due.stage, due.steps.clone(), due.pr)).collect::<Vec<_>>();
+            if !newly_due.is_empty() && due_keys != dated_checks {
+                let now = facts.context.now_ms;
+                match context.database.call(move |store| Ok(store.note_checks_due(&newly_due, now)?)).await {
+                    Ok(_) => dated_checks = due_keys,
+                    Err(error) => latest_error = Some(format!("cannot record when a check came due: {error:#}")),
+                }
+            }
+            // A removed row has no session to prompt: what it owes and is
+            // due goes to the manager, once. Not through the engine's queue,
+            // which holds fires for rows that exist.
+            let (now, revision) = (facts.context.now_ms, metadata.revision());
+            if facts.state_ready
+                && !facts.globally_paused
+                && std::env::var("WT_AUTOMATIONS").as_deref() != Ok("off")
+                && removed_due_seen.is_none_or(|(seen, again_at)| seen != revision || now >= again_at)
+            {
+                removed_due_seen = Some((revision, now.saturating_add(REMOVED_DUE_RECHECK_MS)));
+                let live = facts.rows.iter().map(|row| row.slug.clone()).collect::<BTreeSet<_>>();
+                if let Err(error) = tell_removed_due(&context, &live, now, &mut removed_due_told).await {
+                    latest_error = Some(format!("cannot tell the manager what a removed worktree owes: {error:#}"));
+                }
+            }
             let pass = pass_input(&context, facts, facts.context.now_ms);
             let tick = match engine.tick(pass).await {
                 Ok(tick) => tick,
@@ -606,8 +656,174 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     }
 }
 
+/// How often run records are read while a launched shell run is awaited.
+const RUN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Ended runs read per check; a launched run ends within the newest few.
+const RUN_CHECK_LIMIT: usize = 50;
+
+/// Tell the engine how the shell runs it launched ended, and report the
+/// failed ones: a retry in the log, a fire that ended failed in its
+/// worktree's history. The attention feed gets one line per failed fire: the
+/// action's own failure line, or this one for an action that retries, whose
+/// own lines the action board keeps off the feed.
+async fn settle_runs(
+    context: &AppContext,
+    accepted: &AppContext,
+    engine: &mut AutomationEngine,
+) -> Result<()> {
+    let runs = wt_app_core::actions::service(context)?
+        .list_runs_bounded(RUN_CHECK_LIMIT)
+        .await?;
+    for run in runs {
+        let meta = &run.meta;
+        if meta.auto_fire_keys.is_empty()
+            || matches!(
+                meta.status,
+                wt_actions::ActionRunStatus::Running | wt_actions::ActionRunStatus::Ambiguous
+            )
+        {
+            continue;
+        }
+        let failed = engine
+            .run_ended(
+                &meta.auto_fire_keys,
+                i64::try_from(meta.started_at).unwrap_or(i64::MAX),
+                run_end(meta),
+                now_ms(),
+                &accepted.cancellation,
+            )
+            .await?;
+        let Some(failed) = failed else { continue };
+        let Some(retry_in_ms) = failed.retry_in_ms else {
+            let reason =
+                wt_app_core::automation_engine::failed_reason(failed.exit_code, failed.runs);
+            if failed.retried {
+                tracing::warn!(
+                    target: "wt_attention",
+                    event_channel = "attention",
+                    event_source = %failed.slug,
+                    event_text = %format!("auto {}: failed, {reason}", failed.rule),
+                    "automation failed"
+                );
+            } else {
+                tracing::warn!(rule = %failed.rule, slug = %failed.slug, %reason, "automation failed");
+            }
+            if failed.slug != wt_automations::FLEET_SLUG {
+                let event = wt_core::WorktreeEventKind::Automation {
+                    rule: failed.rule,
+                    outcome: wt_core::AutomationOutcomeKind::Failed,
+                    reason: Some(wt_core::event_text(&reason)),
+                };
+                wt_app_core::worktree_history::record(context, &failed.slug, event).await;
+            }
+            continue;
+        };
+        tracing::warn!(
+            rule = %failed.rule,
+            slug = %failed.slug,
+            exit_code = failed.exit_code,
+            failed_runs = failed.runs,
+            retry_in_seconds = retry_in_ms / 1000,
+            "automation run failed; it will run again"
+        );
+    }
+    Ok(())
+}
+
+/// Only a shell command that ran to its end and exited non-zero is a
+/// definite failure. A killed run, one that never reported an exit code, and
+/// an agent run (which may have acted before it exited) are not.
+fn run_end(meta: &wt_actions::ActionMeta) -> wt_app_core::automation_engine::RunEnd {
+    use wt_app_core::automation_engine::RunEnd;
+    match (meta.kind, meta.status, meta.exit_code) {
+        (wt_actions::ActionRunKind::Shell, wt_actions::ActionRunStatus::Failed, Some(code))
+            if code != 0 =>
+        {
+            RunEnd::ShellFailed { exit_code: code }
+        }
+        _ => RunEnd::Other,
+    }
+}
+
 /// Record the fires the engine ended without running. A fleet fire has no
 /// worktree.
+/// How often removed rows are looked over again without a state change: a
+/// check put off comes due by the clock alone, and a manager that could not
+/// be reached is tried again.
+const REMOVED_DUE_RECHECK_MS: i64 = 5 * 60 * 1000;
+
+/// Prompt the manager for each removed row with something due that it was
+/// not told about, and record what it was told. `told` holds what this
+/// process sent, as `(slug, removed_at, key)`: a record that could not be
+/// written is written at a later look, and the manager is not asked twice.
+async fn tell_removed_due(
+    context: &AppContext,
+    live: &BTreeSet<String>,
+    now: i64,
+    told: &mut BTreeSet<(String, String, String)>,
+) -> anyhow::Result<()> {
+    let separate = context.config.branch.separate_production();
+    let removed = context
+        .database
+        .call(|store| Ok(store.read_removed_worktrees()?))
+        .await?;
+    for entry in removed {
+        if live.contains(&entry.slug) || entry.automations_paused == Some(true) {
+            continue;
+        }
+        let sent = |key: &str| {
+            told.contains(&(entry.slug.clone(), entry.removed_at.clone(), key.to_owned()))
+        };
+        let (unrecorded, untold): (Vec<_>, Vec<_>) =
+            wt_store::removed_due_untold(&entry, separate, now)
+                .into_iter()
+                .partition(|(key, _)| sent(key));
+        let mut keys = unrecorded
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        let lines = untold
+            .iter()
+            .filter_map(|(_, item)| {
+                let what = match item.stage.filter(|_| item.kind == wt_core::OwedKind::Check) {
+                    Some(stage) => format!("check in {}:\n{}", stage.as_str(), item.what),
+                    None => item.what.clone(),
+                };
+                Some((item.done_target()?, what))
+            })
+            .collect::<Vec<_>>();
+        if !lines.is_empty() {
+            let prompt = wt_ops::watch_actions::removed_due_prompt(&entry.slug, &lines);
+            match wt_ops::action_dispatch::wake_manager(context, &prompt).await {
+                AutomationOutcome::Delivered { .. } | AutomationOutcome::Ambiguous { .. } => {
+                    for (key, _) in untold {
+                        told.insert((entry.slug.clone(), entry.removed_at.clone(), key.clone()));
+                        keys.push(key);
+                    }
+                }
+                // Nothing was sent: the next look tries again.
+                _ => {}
+            }
+        }
+        if keys.is_empty() {
+            continue;
+        }
+        let (slug, removed_at) = (entry.slug.clone(), entry.removed_at.clone());
+        if let Err(error) = context
+            .database
+            .call(move |store| Ok(store.mark_removed_due_told(&slug, &removed_at, &keys)?))
+            .await
+        {
+            tracing::warn!(
+                slug = %entry.slug,
+                error = %format!("{error:#}"),
+                "cannot record what the manager was told a removed worktree owes"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn record_skipped(
     context: &AppContext,
     skipped: Vec<wt_app_core::automation_engine::SkippedFire>,

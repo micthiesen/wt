@@ -150,6 +150,10 @@ impl DispatchClaim {
     pub fn kind(&self) -> DispatchKind {
         self.kind
     }
+
+    pub fn claimed_at_ms(&self) -> i64 {
+        self.claimed_at_ms
+    }
 }
 
 /// One coherent, read-only ledger view for a whole evaluator pass.
@@ -233,6 +237,8 @@ impl LedgerSnapshot {
             .view
             .fired
             .iter()
+            // A note that a check's prompt was sent is not a fire to list.
+            .filter(|(key, _)| !key.starts_with("check-prompt:"))
             .filter_map(|(key, entry)| {
                 Some(LedgerRecord {
                     key: key.clone(),
@@ -242,11 +248,7 @@ impl LedgerSnapshot {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
-                    state: entry
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_owned(),
+                    state: entry_state(entry).unwrap_or("unknown").to_owned(),
                     at_ms: number(entry.get("at"))?,
                     reason: entry
                         .get("reason")
@@ -267,8 +269,10 @@ impl LedgerSnapshot {
         // Unknown or malformed persisted entries are claims until they can be
         // positively proven expired. Treating them as absent can duplicate an
         // external effect after a partial or forward-version write.
-        let state = entry.get("state").and_then(Value::as_str);
-        if !matches!(state, Some("delivered" | "skipped" | "cancelled")) {
+        if !matches!(
+            entry_state(entry),
+            Some("delivered" | "failed" | "skipped" | "cancelled")
+        ) {
             return true;
         }
         number(entry.get("at")).is_none_or(|at| now_ms.saturating_sub(at) <= RETENTION_MS)
@@ -290,7 +294,7 @@ impl LedgerSnapshot {
         self.view
             .fired
             .get(key)
-            .is_some_and(|entry| entry.get("state").and_then(Value::as_str) == Some("delivered"))
+            .is_some_and(|entry| entry_state(entry) == Some("delivered"))
     }
 
     /// The landing a wake's fire was claimed under; see
@@ -310,12 +314,10 @@ impl LedgerSnapshot {
 
     /// Whether `key`'s fire was sent to its target, proven or not.
     pub fn sent(&self, key: &str) -> bool {
-        self.view.fired.get(key).is_some_and(|entry| {
-            matches!(
-                entry.get("state").and_then(Value::as_str),
-                Some("delivered" | "ambiguous")
-            )
-        })
+        self.view
+            .fired
+            .get(key)
+            .is_some_and(|entry| matches!(entry_state(entry), Some("delivered" | "ambiguous")))
     }
 
     /// Whether the ledger holds any record of `key`, whatever its state.
@@ -697,6 +699,65 @@ impl AutomationLedger {
         .await
     }
 
+    /// Give back a delivered claim whose run ended in a definite failure
+    /// and, in the same write, record the fire as deferred under `id` so it
+    /// runs again. Returns false, recording nothing, when none of the keys
+    /// is still this claim's delivered entry.
+    pub async fn release_failed(
+        &self,
+        claim: &DispatchClaim,
+        id: &str,
+        record: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, LedgerError> {
+        let claim_id = claim.claim_id.clone();
+        let keys = claim.keys.clone();
+        self.mutate("retry failed dispatch", cancellation, move |root| {
+            let fired = ensure_object(root, "fired");
+            let mut released = false;
+            for key in &keys {
+                if delivered_by(fired, key, &claim_id) {
+                    fired.remove(key);
+                    released = true;
+                }
+            }
+            if released {
+                ensure_object(root, "deferred").insert(id.to_owned(), record);
+            }
+            released
+        })
+        .await
+    }
+
+    /// End a delivered claim as failed: its run exited non-zero and will not
+    /// be tried again. The key stays handled. The entry stays `delivered`
+    /// with `failed` beside it, because a build that does not know a state
+    /// holds its key as a claim forever; see [`entry_state`].
+    pub async fn mark_failed(
+        &self,
+        claim: &DispatchClaim,
+        now_ms: i64,
+        reason: &str,
+        failed_runs: u32,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.mutate("fail dispatch", cancellation, |root| {
+            let fired = ensure_object(root, "fired");
+            for key in &claim.keys {
+                if !delivered_by(fired, key, &claim.claim_id) {
+                    continue;
+                }
+                if let Some(entry) = fired.get_mut(key).and_then(Value::as_object_mut) {
+                    entry.insert("failed".into(), Value::Bool(true));
+                    entry.insert("failedRuns".into(), json!(failed_runs));
+                    entry.insert("at".into(), json!(now_ms));
+                    entry.insert("reason".into(), Value::String(reason.to_owned()));
+                }
+            }
+        })
+        .await
+    }
+
     /// Forget a deferred fire once it reached a terminal outcome.
     pub async fn clear_deferred(
         &self,
@@ -794,11 +855,14 @@ impl AutomationLedger {
         self.mutate("record check prompts", cancellation, |root| {
             let fired = ensure_object(root, "fired");
             for (key, slug) in prompted {
-                // No rule id: this is a note that the prompt was sent, not
-                // a fire of its own, and is listed as none.
-                fired
-                    .entry(key.clone())
-                    .or_insert_with(|| json!({"state":"delivered", "at":now_ms, "slug":slug}));
+                // A note that the prompt was sent, under the rule that owns
+                // check prompts whichever rule sent this one.
+                fired.entry(key.clone()).or_insert_with(|| {
+                    json!({
+                        "state":"delivered", "at":now_ms, "slug":slug,
+                        "ruleId":wt_config::CHECK_RULE_ID,
+                    })
+                });
             }
             for (keys, rule_id, slug) in repeats {
                 for key in keys {
@@ -1277,6 +1341,25 @@ fn set_last_dispatch_max(root: &mut Value, rule_id: &str, slug: &str, at_ms: i64
     last.insert(pair, json!(previous.max(at_ms)));
 }
 
+/// Whether `key` is the delivered entry of the claim `claim_id`.
+fn delivered_by(fired: &Map<String, Value>, key: &str, claim_id: &str) -> bool {
+    fired.get(key).is_some_and(|entry| {
+        entry_state(entry) == Some("delivered")
+            && entry.get("claimId").and_then(Value::as_str) == Some(claim_id)
+    })
+}
+
+/// An entry's state as this build reads it. A run that ended failed is
+/// stored as `delivered` with `failed: true`; `failed` as a state of its
+/// own is read too.
+fn entry_state(entry: &Value) -> Option<&str> {
+    let state = entry.get("state").and_then(Value::as_str);
+    if state == Some("delivered") && entry.get("failed").and_then(Value::as_bool) == Some(true) {
+        return Some("failed");
+    }
+    state
+}
+
 fn finalize_breaker(root: &mut Value, rule_id: &str, slug: &str, now_ms: i64) {
     let key = pair_key(rule_id, slug);
     let breaker = ensure_object(root, "breaker");
@@ -1311,8 +1394,10 @@ fn prune(root: &mut Value, now_ms: i64) {
     if let Some(fired) = root.get_mut("fired").and_then(Value::as_object_mut) {
         fired.retain(|_, entry| {
             let state = entry.get("state").and_then(Value::as_str);
-            !matches!(state, Some("delivered" | "skipped" | "cancelled"))
-                || number(entry.get("at")).is_none_or(|at| at >= cutoff)
+            !matches!(
+                state,
+                Some("delivered" | "failed" | "skipped" | "cancelled")
+            ) || number(entry.get("at")).is_none_or(|at| at >= cutoff)
         });
     }
     if let Some(breaker) = root.get_mut("breaker").and_then(Value::as_object_mut) {
@@ -1359,6 +1444,28 @@ mod tests {
             policy,
             now_ms,
         }
+    }
+
+    #[tokio::test]
+    async fn a_check_prompt_note_carries_the_built_in_rule_and_is_not_listed_as_a_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let ledger = AutomationLedger::new(&path);
+        let key = "check-prompt:one:2026-01-01T00:00:00Z:staging:abc".to_owned();
+        ledger
+            .record_check_prompts(
+                &[(key.clone(), "one".into())],
+                &[],
+                now_ms(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let stored: Value = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(stored["fired"][&key]["ruleId"], wt_config::CHECK_RULE_ID);
+        let snapshot = ledger.snapshot().await.unwrap();
+        assert!(snapshot.recorded(&key));
+        assert!(snapshot.recent(10).is_empty());
     }
 
     #[tokio::test]

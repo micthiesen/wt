@@ -352,6 +352,10 @@ pub async fn prepare(
                 pr: github.prs.get(&branch),
                 // GitHub read this branch just now: no PR is an answer.
                 pr_read: github_fresh && github_covered_branches.contains(&branch),
+                queue: github.merge_queue.get(&branch),
+                queue_complete: github.merge_queue_complete,
+                merge_arm: serde_json::from_value(stored["mergeArm"].clone()).ok(),
+                now_ms,
                 lifecycle: gathered,
                 separate_production: ctx.config.branch.separate_production(),
             }),
@@ -420,6 +424,7 @@ pub async fn prepare(
                     shell: definition.kind == ActionKind::Shell,
                     external: definition.external,
                     audience,
+                    retry_on_failure: definition.retry_on_failure,
                 },
             )
         })
@@ -578,20 +583,47 @@ pub async fn prepare(
     })
 }
 
-struct WatchRowInput<'a> {
-    created_at: Option<&'a str>,
-    work: Option<&'a WorkStatusRecord>,
-    pr: Option<&'a wt_github::PullRequest>,
-    pr_read: bool,
+pub(crate) struct WatchRowInput<'a> {
+    pub created_at: Option<&'a str>,
+    pub work: Option<&'a WorkStatusRecord>,
+    pub pr: Option<&'a wt_github::PullRequest>,
+    pub pr_read: bool,
+    /// The branch's merge-queue entry, and whether the read that looked for
+    /// it held the whole queue.
+    pub queue: Option<&'a wt_github::MergeQueueEntry>,
+    pub queue_complete: bool,
+    pub merge_arm: Option<wt_core::MergeArm>,
+    pub now_ms: i64,
     /// `None` when no landing evidence was gathered for the row.
-    lifecycle: Option<LifecycleFacts>,
-    separate_production: bool,
+    pub lifecycle: Option<LifecycleFacts>,
+    pub separate_production: bool,
 }
 
 /// One live worktree as watches see it, from the same landing the
 /// automations use. "Yes" needs proof; "no" needs both the local evidence
 /// and a fresh GitHub read of the branch, and is otherwise unknown.
-fn watch_row(input: WatchRowInput<'_>) -> wt_core::watch::RowFacts {
+pub(crate) fn watch_row(input: WatchRowInput<'_>) -> wt_core::watch::RowFacts {
+    let open = input.pr.filter(|pr| pr.state == "OPEN");
+    let evicted = match (open, &input.merge_arm) {
+        (Some(_), _)
+            if input
+                .queue
+                .is_some_and(|entry| entry.state == wt_github::MergeQueueState::Unmergeable) =>
+        {
+            Some(true)
+        }
+        (Some(pr), Some(arm)) => wt_automations::merge_dropped(
+            arm,
+            pr.number,
+            pr.auto_merge.is_some(),
+            input
+                .queue
+                .map(|_| true)
+                .or(input.queue_complete.then_some(false)),
+            input.now_ms,
+        ),
+        _ => Some(false),
+    };
     let pr_merged = input.pr_read && input.pr.is_some_and(|pr| pr.state == "MERGED");
     let lifecycle = input.lifecycle.unwrap_or_default();
     let base = lifecycle.local_merged == Some(true) || pr_merged;
@@ -623,6 +655,17 @@ fn watch_row(input: WatchRowInput<'_>) -> wt_core::watch::RowFacts {
         closed: input
             .pr_read
             .then(|| input.pr.is_some_and(|pr| pr.state == "CLOSED")),
+        settled: input
+            .pr_read
+            .then(|| open.is_some_and(|pr| matches!(pr.checks, PrChecks::Pass | PrChecks::Fail))),
+        // A verdict on an older head is not a review of this one.
+        reviewed: input.pr_read.then(|| {
+            open.and_then(|pr| pr.review_bot.as_ref())
+                .is_some_and(|bot| {
+                    matches!(bot.state.as_str(), "clean" | "unresolved") && bot.stale != Some(true)
+                })
+        }),
+        evicted: input.pr_read.then_some(evicted).flatten(),
     }
 }
 
@@ -1050,6 +1093,111 @@ mod tests {
     use wt_runtime::{
         Persistence, RefreshPolicy, SourceSnapshot, SourceSpec, TaskScope, leaf_channel,
     };
+
+    #[test]
+    fn a_rows_pull_request_says_whether_it_settled_was_reviewed_or_was_evicted() {
+        const ARMED: i64 = 1_000_000;
+        let pr = |state: &str, checks: &str, bot: serde_json::Value, auto_merge: bool| {
+            serde_json::from_value::<wt_github::PullRequest>(serde_json::json!({
+                "number": 7, "url": "https://github.com/o/r/pull/7",
+                "headRefName": "feature/one", "baseRefName": "main", "title": "A PR",
+                "isDraft": false, "state": state, "checks": checks, "failedChecks": [],
+                "review": "pending", "reviewRequests": 0, "requestedReviewers": [],
+                "suggestedReviewers": [], "comments": [], "unresolvedThreads": 0,
+                "unresolvedThreadsTotal": 0, "reviewBot": bot,
+                "autoMerge": if auto_merge {
+                    serde_json::json!({"enabledAt": "2026-11-01T00:00:00Z", "mergeMethod": "SQUASH"})
+                } else {
+                    serde_json::Value::Null
+                },
+            }))
+            .unwrap()
+        };
+        let bot = |state: &str, stale: Option<bool>| serde_json::json!({"state": state, "unresolved": 0, "stale": stale});
+        let entry = |state: &str| {
+            serde_json::from_value::<wt_github::MergeQueueEntry>(serde_json::json!({
+                "headRefName": "feature/one", "position": 1, "state": state,
+                "enqueuedAt": "2026-11-01T00:00:00Z", "estimatedTimeToMerge": null,
+            }))
+            .unwrap()
+        };
+        let arm = |seen: bool| wt_core::MergeArm {
+            pr: 7,
+            head: None,
+            armed_at_ms: ARMED,
+            mechanism: wt_core::MergeMechanism::Queue,
+            seen_armed_at_ms: seen.then_some(ARMED + 1),
+        };
+        let row = |pr: Option<&wt_github::PullRequest>,
+                   pr_read: bool,
+                   queue: Option<&wt_github::MergeQueueEntry>,
+                   queue_complete: bool,
+                   merge_arm: Option<wt_core::MergeArm>| {
+            let row = watch_row(WatchRowInput {
+                created_at: None,
+                work: None,
+                pr,
+                pr_read,
+                queue,
+                queue_complete,
+                merge_arm,
+                now_ms: ARMED + wt_automations::MERGE_ARM_GRACE_MS,
+                lifecycle: None,
+                separate_production: false,
+            });
+            (row.settled, row.reviewed, row.evicted)
+        };
+
+        // Checks settle either way; a verdict on an older head is no review.
+        let running = pr("OPEN", "pending", bot("pending", None), false);
+        assert_eq!(
+            row(Some(&running), true, None, true, None),
+            (Some(false), Some(false), Some(false))
+        );
+        let failed = pr("OPEN", "fail", bot("unresolved", Some(false)), false);
+        assert_eq!(
+            row(Some(&failed), true, None, true, None),
+            (Some(true), Some(true), Some(false))
+        );
+        let stale = pr("OPEN", "pass", bot("clean", Some(true)), false);
+        assert_eq!(
+            row(Some(&stale), true, None, true, None),
+            (Some(true), Some(false), Some(false))
+        );
+
+        // Evicted: armed and seen armed, now neither queued nor auto-merging.
+        let clean = pr("OPEN", "pass", bot("clean", None), false);
+        let evicted = |queue: Option<&wt_github::MergeQueueEntry>, complete, arm| {
+            row(Some(&clean), true, queue, complete, arm).2
+        };
+        assert_eq!(evicted(None, true, Some(arm(true))), Some(true));
+        assert_eq!(
+            evicted(Some(&entry("QUEUED")), true, Some(arm(true))),
+            Some(false)
+        );
+        assert_eq!(evicted(Some(&entry("UNMERGEABLE")), true, None), Some(true));
+        // One page of the queue, or a record GitHub never held, cannot say.
+        assert_eq!(evicted(None, false, Some(arm(true))), None);
+        assert_eq!(evicted(None, true, Some(arm(false))), None);
+        let auto = pr("OPEN", "pass", bot("clean", None), true);
+        assert_eq!(
+            row(Some(&auto), true, None, true, Some(arm(true))).2,
+            Some(false)
+        );
+
+        // No fresh read is unknown; a read that found no open PR is "no".
+        assert_eq!(
+            row(Some(&clean), false, None, true, None),
+            (None, None, None)
+        );
+        let merged = pr("MERGED", "pass", bot("none", None), false);
+        for pr in [None, Some(&merged)] {
+            assert_eq!(
+                row(pr, true, None, true, Some(arm(true))),
+                (Some(false), Some(false), Some(false))
+            );
+        }
+    }
 
     #[test]
     fn builtins_do_not_require_configured_actions_or_a_surviving_checkout() {

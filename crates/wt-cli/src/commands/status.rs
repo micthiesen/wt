@@ -859,6 +859,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 next,
                 wrote,
                 cancelled,
+                stamped,
             } = match write {
                 Ok(write) => write,
                 Err(refusal) => {
@@ -876,6 +877,9 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 work_state_name(work_state),
                 if wrote { "" } else { " (already asserted)" }
             );
+            if let Some(stamp) = &stamped {
+                println!("  {} stamped {}", wt_core::STAMP_CURRENT, stamp.skill);
+            }
             if let Some(line) = cleared_gate_line(
                 previous_gate.as_deref(),
                 next.blocked_on.as_deref(),
@@ -985,6 +989,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 next,
                 wrote,
                 cancelled,
+                stamped: _,
             } = match write {
                 Ok(write) => write,
                 Err(refusal) => {
@@ -1260,6 +1265,10 @@ async fn gate_watch(
         Ok(set) => {
             until.print();
             let watch = set.watch;
+            if let Some(note) = gate_note(written.blocked_on.as_deref().unwrap_or_default(), &watch)
+            {
+                println!("  {note}");
+            }
             if let Some(kept) = watch.then.wake.as_deref().filter(|_| !asked_to_wake) {
                 println!(
                     "  keeps the wake set with this gate earlier: {} (to drop it: wt watch cancel {}, then set --until again)",
@@ -1275,6 +1284,38 @@ async fn gate_watch(
             Ok(Err(1))
         }
     }
+}
+
+/// The note for a gate that clears on less than its text says: on a time
+/// alone, or on conditions while the text names something more (another
+/// pull request, or a second thing joined with "and", "then", "+" or ";").
+/// wt checks only the conditions.
+fn gate_note(gate: &str, watch: &wt_core::watch::Watch) -> Option<String> {
+    use wt_core::watch::Condition;
+    let summary = watch.when_summary();
+    let only_time = watch
+        .when
+        .iter()
+        .all(|cond| matches!(cond.cond, Condition::At { .. }));
+    let lower = gate.to_lowercase();
+    let numbers = |text: &str| -> Vec<String> {
+        text.split('#')
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter(|number| !number.is_empty())
+            .collect()
+    };
+    let watched = numbers(&summary);
+    let names_more = numbers(gate).iter().any(|number| !watched.contains(number))
+        || [" and ", " then ", " + ", ";", " & ", " plus "]
+            .iter()
+            .any(|joined| lower.contains(joined));
+    (only_time || names_more)
+        .then(|| format!("this gate clears {summary}; anything else it names is not checked"))
 }
 
 /// What clears a gate by itself, to follow "wt clears the gate": `at 17:00
@@ -1300,6 +1341,8 @@ struct StatusWrite {
     wrote: bool,
     /// Watches that were to clear the gate this write removed or replaced.
     cancelled: Vec<wt_core::watch::Watch>,
+    /// The review stamp this assertion earned.
+    stamped: Option<wt_core::Stamp>,
 }
 
 /// A status write that changes the gate cancels the watch that was to clear
@@ -1364,6 +1407,7 @@ async fn update_status(
                         next,
                         wrote: write.changed,
                         cancelled: write.cancelled_watches,
+                        stamped: write.stamped,
                     }))
                 }
                 Err(Refusal::Usage(message)) => Ok(Err(message)),
@@ -1778,8 +1822,11 @@ async fn live_json(
             Some(sha == head && old_base == base)
         }
     };
+    let stamp = work.as_ref().and_then(wt_core::Stamp::of).map(|stamp| {
+        json!({"skill": stamp.skill, "sha": stamp.sha, "at": stamp.at, "current": stamp.current(head.as_deref())})
+    });
     Ok(
-        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word(),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
+        json!({"stamp":stamp,"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word(),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
     )
 }
 
@@ -2245,6 +2292,49 @@ mod tests {
             1
         );
         fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_gate_that_clears_on_less_than_it_names_says_so() {
+        let clock = wt_core::watch::LocalClock {
+            now_ms: 1_795_521_600_000,
+            utc_offset_minutes: 0,
+        };
+        let watch = |conditions: &[&str]| wt_core::watch::Watch {
+            id: "abc234".into(),
+            slug: "one".into(),
+            incarnation: None,
+            by: "one".into(),
+            created_at_ms: clock.now_ms,
+            utc_offset_minutes: 0,
+            when: conditions
+                .iter()
+                .map(|arg| wt_core::watch::parse(arg, clock).unwrap())
+                .collect(),
+            then: Default::default(),
+            met_at_ms: None,
+            last_error: None,
+            owner_gone: false,
+            extra: Default::default(),
+        };
+        // A bare time checks nothing the text names.
+        let timed = gate_note("migration 0042 applied", &watch(&["3h"])).unwrap();
+        assert!(timed.starts_with("this gate clears at "), "{timed}");
+        assert!(timed.ends_with("; anything else it names is not checked"));
+        // The condition covers one of two things the text names.
+        assert!(
+            gate_note(
+                "#3806 in production and the flag flipped",
+                &watch(&["pr:3806:production"])
+            )
+            .is_some()
+        );
+        assert!(gate_note("needs #3806 and #3900", &watch(&["pr:3806:merged"])).is_some());
+        // The text names what the condition checks: nothing to add.
+        assert_eq!(
+            gate_note("needs #3806 in production", &watch(&["pr:3806:production"])),
+            None
+        );
     }
 
     #[test]

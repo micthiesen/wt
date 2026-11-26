@@ -4,14 +4,11 @@ In a wt-managed worktree you own the task's status, testing, and dev server.
 
 - Assert each transition with `wt status <state> [-m note]` (bare `wt status`
   lists the states): `working` when work begins, `review` when review begins.
-- Titles are set only on purpose. When work begins, and again if the outcome
-  changes, set it in sentence case, about the PR title:
-  `wt title "<outcome>"`. A person's title is final.
-- Testing is yours. `needs-testing` means you still owe verification, never
-  the human.
-- `needs-human` is only for an action outside the repository with no
-  defensible default, such as interactive auth or a human-only judgment. Keep
-  doing independent work meanwhile.
+- Set the title on purpose: `wt title "<outcome>"` when work begins and again if
+  the outcome changes (sentence case, about the PR title). A person's is final.
+- Testing is yours: `needs-testing` means you owe verification, not the human.
+- `needs-human` is only for an action outside the repository with no defensible
+  default (interactive auth, a human-only call). Keep doing independent work.
 - Decide reversible repository changes yourself. External messages, published
   artifacts, closed issues, and hosted writes need authorization.
 - An escalation note is about 300 characters and needs no other context:
@@ -27,13 +24,11 @@ In a wt-managed worktree you own the task's status, testing, and dev server.
   `wt dev start --wait`, read output with `wt dev logs`. Short-lived preview
   or watch runners may run directly. If wt reports `[dev_server] is not
   configured`, follow the project's own server instructions.
-- Exit 75 means every server slot is taken: queue with `--wait`
-  (`wt dev status --all` shows holders). Never stop or restart another
-  worktree's server; in a production emergency, notify the manager once and
-  stay queued.
-- Exit 0 means launched, not ready. Before environment-dependent tests, check
-  `wt dev status` for an unhealthy or pre-rebase server; `wt dev reset`
-  rebuilds it.
+- Exit 75 means every server slot is taken (`wt dev status --all` shows
+  holders): queue with `--wait`. Never stop or restart another worktree's
+  server; in a production emergency, notify the manager once and stay queued.
+- Exit 0 means launched, not ready: before environment-dependent tests, check
+  `wt dev status` for an unhealthy or pre-rebase server (`wt dev reset` fixes).
 - Before handoff, run `wt dev stop` unless you still plan to use the server.
   A PR or an idle moment is not disuse.
 - Logging in at each worktree's own browser origin is routine setup; script
@@ -47,20 +42,23 @@ The checkout is shared with other agents, the human, and hot-reloading servers.
 
 - Test a hypothesis against a copy, never with `git stash`, `checkout`,
   `restore`, or `reset`.
-- Announce any necessary change to shared tree state and restore it before
-  finishing.
+- Announce any needed change to shared tree state; restore it before finishing.
 - Put scratch files in the harness scratch area, never in the checkout.
 
 ### Waiting
 
-- When all that remains is waiting for a time or an event wt can observe, run
-  `wt wake <condition>... -m "<what to do then>"` and end the turn. Never
-  sleep, poll, or set a harness timer: those die with the session.
-- "Tell me when X" is `wt notify <condition>...`; do not stay open for it.
-- Conditions (all must hold): a time (`17:00`, `5pm`, `3h`); this worktree
-  (`merged`, `staging`, `production`, `green`); `pr:3806:production`;
-  `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a time
-  take a delay (`release:production+24h`). `wt watch` lists them.
+- While driving something that resolves within about an hour (CI, a review
+  bot, the merge queue), stay and block on `wt wait [--any] <condition>...`,
+  as a background command where the harness has them. Where it caps foreground
+  commands (Claude Code: 10 minutes), pass `--timeout 9m`; rerun on exit 124.
+- What outlives the session (a deploy, a release, a time hours away, another
+  worktree's merge) is `wt wake <condition>... -m "<what to do then>"`, then
+  end the turn; "tell me when X" is `wt notify`. Never sleep or poll. A wake
+  fires only while wt is running.
+- Conditions (all must hold; `wt watch` lists them): a time (`3h`); `merged`,
+  `production`, `green`, `settled`, `reviewed`, `evicted`; `pr:3806:merged`;
+  `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a
+  time take a delay (`release:production+24h`).
 
 ### What you still owe
 
@@ -84,12 +82,14 @@ nothing is finished; the note never holds owed work:
 
 - Any other step, never a check: `wt wake <condition> -m "<step>"`, with
   `--before-release` when it must precede the next production release.
+- Each stage holds one check; a second check for the same stage (another PR
+  of this worktree) is a wake step: `wt wake pr:<n>:<stage> -m "<steps>"`.
 - A due check, and a wake delivered after the work merged, stay owed (and hold
   off cleanup) until closed, even when moot: do it on a deploy that contains
   the change, then `wt done <id|staging|production> -m "<evidence>"`.
-- To change it: `wt done <target> --again <condition>` puts it off (a check
-  takes a time only), `wt watch cancel <id>` (or `--mine`) drops a pending wake,
-  `wt status --no-verify-in-<stage>` drops a check.
+- Put off a due check with `wt done <stage> --again <time>`, never a `wt wake`.
+- `wt done <id> --again <condition>` puts off a due step, `wt watch cancel <id>`
+  (or `--mine`) drops a wake, `wt status --no-verify-in-<stage>` drops a check.
 - Every op is yours: do it when due, asking approval where the action needs
   it, never handing it to the human. Prefer automation that ships with the
   change (a checked-in migration the normal deploy applies); a step the merge

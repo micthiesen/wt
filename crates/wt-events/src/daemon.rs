@@ -473,11 +473,7 @@ const MAX_FAILURE_BACKOFF_MS: u64 = 5 * 60 * 1000;
 /// The floor between reads after `failures` consecutive failed ones: the
 /// normal interval, doubled per failure up to [`MAX_FAILURE_BACKOFF_MS`]. A
 /// rate limit waits the longest at once; retrying sooner extends it.
-pub(super) fn backoff_interval_ms(
-    min_fetch_interval_ms: u64,
-    failures: u32,
-    rate_limited: bool,
-) -> u64 {
+pub fn backoff_interval_ms(min_fetch_interval_ms: u64, failures: u32, rate_limited: bool) -> u64 {
     if rate_limited {
         return MAX_FAILURE_BACKOFF_MS.max(min_fetch_interval_ms);
     }
@@ -488,6 +484,35 @@ pub(super) fn backoff_interval_ms(
         .saturating_mul(1u64 << failures.min(16))
         .min(MAX_FAILURE_BACKOFF_MS)
         .max(min_fetch_interval_ms)
+}
+
+/// Clocks differ; a read sent exactly at the reset can still be refused.
+const RESET_SLACK_MS: u64 = 5 * 1000;
+/// GitHub's primary limits reset within the hour. A reset further away than
+/// this is not believed.
+const MAX_RESET_WAIT_MS: u64 = 65 * 60 * 1000;
+
+/// How long to wait before the next GitHub read after a failed one. Every
+/// poller of GitHub spaces its retries with this. A rate limit whose reset
+/// time is known waits until just past it; otherwise
+/// [`backoff_interval_ms`] decides.
+pub fn failure_wait_ms(
+    min_fetch_interval_ms: u64,
+    failures: u32,
+    rate_limited: bool,
+    reset_at_ms: Option<u64>,
+    now_ms: u64,
+) -> u64 {
+    if rate_limited
+        && let Some(wait) = reset_at_ms
+            .and_then(|reset| reset.checked_sub(now_ms))
+            .filter(|wait| *wait > 0 && *wait <= MAX_RESET_WAIT_MS)
+    {
+        return wait
+            .saturating_add(RESET_SLACK_MS)
+            .max(min_fetch_interval_ms);
+    }
+    backoff_interval_ms(min_fetch_interval_ms, failures, rate_limited)
 }
 
 async fn scheduler(
@@ -598,7 +623,7 @@ async fn scheduler(
                         failures = failures.saturating_add(1);
                         fetch_interval_ms = backoff_interval_ms(config.min_fetch_interval_ms, failures, false);
                         pending_deadline = Some(now + Duration::from_millis(fetch_interval_ms));
-                        set_error(&durable, format!("local worktree inventory failed: {e}")).await;
+                        set_error(&durable, format!("local worktree inventory failed: {e}"), fetch_interval_ms).await;
                         continue;
                     }
                 };
@@ -681,12 +706,14 @@ async fn scheduler(
                     }
                     Some(message) => {
                         failures = failures.saturating_add(1);
-                        fetch_interval_ms = backoff_interval_ms(config.min_fetch_interval_ms, failures, rate_limited(&message));
+                        let limited = rate_limited(&message);
+                        let reset_at_ms = if limited { source.rate_limit_reset(&cancel).await } else { None };
+                        fetch_interval_ms = failure_wait_ms(config.min_fetch_interval_ms, failures, limited, reset_at_ms, now_millis());
                         // No webhook may follow the one this refresh served
                         // (or the startup read), so the retry is scheduled
                         // here, on the same floor an arriving event would get.
                         pending_deadline = Some(now + Duration::from_millis(fetch_interval_ms));
-                        set_error(&durable, message).await;
+                        set_error(&durable, bounded_error(&message), fetch_interval_ms).await;
                     }
                 }
             }
@@ -694,15 +721,73 @@ async fn scheduler(
     }
 }
 
-/// The event source reports errors as text; GitHub's rate-limit replies say so.
-fn rate_limited(error: &str) -> bool {
+/// GitHub read errors arrive as text; its rate-limit replies say so.
+pub fn rate_limited(error: &str) -> bool {
     let lower = error.to_lowercase();
-    lower.contains("rate limit") || lower.contains("abuse detection")
+    ["rate limit", "rate_limited", "abuse detection"]
+        .iter()
+        .any(|sign| lower.contains(sign))
 }
 
-async fn set_error(durable: &DurableState, message: String) {
-    error!(error = %message, "GitHub event refresh failed");
+const MAX_ERROR_CHARS: usize = 500;
+
+/// A refresh error fit to log and to keep in the state file. A failed
+/// GraphQL read can quote its whole reply, and one reply can repeat an
+/// error for every branch asked about: only the `errors[]` messages of a
+/// quoted reply are kept, each distinct line once, capped.
+fn bounded_error(message: &str) -> String {
+    let text = quoted_reply_errors(message).unwrap_or_else(|| message.to_owned());
+    let mut lines: Vec<&str> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if !line.is_empty() && !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    let joined = lines.join("; ");
+    match joined.char_indices().nth(MAX_ERROR_CHARS) {
+        Some((end, _)) => format!("{}...", &joined[..end]),
+        None => joined,
+    }
+}
+
+/// The text before a JSON reply quoted in `message`, then that reply's
+/// `errors[]` messages. `None` when `message` quotes no such reply.
+fn quoted_reply_errors(message: &str) -> Option<String> {
+    let start = message.find('{')?;
+    let reply: serde_json::Value = serde_json::from_str(message[start..].trim()).ok()?;
+    let errors = reply.get("errors")?.as_array()?;
+    let mut said: Vec<String> = Vec::new();
+    for error in errors {
+        let Some(text) = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| error.as_str())
+        else {
+            continue;
+        };
+        let line = match error.get("type").and_then(serde_json::Value::as_str) {
+            Some(kind) => format!("{kind}: {text}"),
+            None => text.to_owned(),
+        };
+        if !said.contains(&line) {
+            said.push(line);
+        }
+    }
+    Some(format!(
+        "{} {}",
+        message[..start].trim_end(),
+        said.join("\n")
+    ))
+}
+
+/// Record the failure, and log it when it is not the one already recorded:
+/// a rate limit or an outage fails every retry the same way.
+async fn set_error(durable: &DurableState, message: String, retry_in_ms: u64) {
     let mut state = durable.state.lock().await;
+    if state.last_error.as_deref() == Some(message.as_str()) {
+        return;
+    }
+    error!(error = %message, retry_in_seconds = retry_in_ms / 1000, "GitHub event refresh failed");
     state.last_error = Some(message);
     let _ = durable.write_state_locked(&state).await;
 }
@@ -1049,10 +1134,57 @@ mod tests {
             MAX_FAILURE_BACKOFF_MS
         );
         assert_eq!(backoff_interval_ms(10_000, 1, true), MAX_FAILURE_BACKOFF_MS);
+        // A known reset is waited out once, with slack.
+        let now = 1_000_000;
+        assert_eq!(
+            failure_wait_ms(10_000, 1, true, Some(now + 40 * 60_000), now),
+            40 * 60_000 + RESET_SLACK_MS
+        );
+        // Not for another kind of failure, a reset already past, or one too
+        // far off to be a rate-limit window.
+        assert_eq!(
+            failure_wait_ms(10_000, 1, false, Some(now + 40 * 60_000), now),
+            20_000
+        );
+        for reset in [None, Some(now - 1), Some(now + 3 * 60 * 60_000)] {
+            assert_eq!(
+                failure_wait_ms(10_000, 1, true, reset, now),
+                MAX_FAILURE_BACKOFF_MS
+            );
+        }
         assert!(rate_limited(
             "GitHub refresh failed: cannot resolve GitHub repository: HTTP 403: You have exceeded a secondary rate limit."
         ));
         assert!(!rate_limited("transient GitHub failure: gh: HTTP 504"));
+    }
+
+    #[test]
+    fn a_refresh_error_keeps_only_bounded_error_messages() {
+        let reply = serde_json::json!({
+            "data": {"repository": {"wt_0": {"nodes": [{"title": "x".repeat(70_000)}]}}},
+            "errors": (0..300)
+                .map(|alias| serde_json::json!({
+                    "type": "INTERNAL",
+                    "path": ["repository", format!("wt_{alias}")],
+                    "message": "Something went wrong while executing your query.",
+                }))
+                .collect::<Vec<_>>(),
+        });
+        assert_eq!(
+            bounded_error(&format!(
+                "GitHub refresh failed: GitHub command failed: {reply}"
+            )),
+            "GitHub refresh failed: GitHub command failed: INTERNAL: Something went wrong while executing your query."
+        );
+        // Messages already extracted, one per branch.
+        let repeated = vec!["Something went wrong"; 300].join("\n");
+        assert_eq!(
+            bounded_error(&format!("GitHub refresh failed: {repeated}")),
+            "GitHub refresh failed: Something went wrong; Something went wrong"
+        );
+        let long = bounded_error(&"é".repeat(2_000));
+        assert_eq!(long.chars().count(), MAX_ERROR_CHARS + 3);
+        assert_eq!(bounded_error("gh: HTTP 504"), "gh: HTTP 504");
     }
 
     #[test]

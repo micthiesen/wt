@@ -93,6 +93,8 @@ pub struct ActionTraits {
     pub shell: bool,
     pub external: bool,
     pub audience: ActionAudience,
+    /// A shell action whose non-zero exit runs its fire again.
+    pub retry_on_failure: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1068,7 +1068,7 @@ mod tests {
             "{}  A deliberately narrow title",
             glyphs::DOT_OUTLINE
         )));
-        let details = details::work_status_lines(&model.board.rows[0], false)
+        let details = details::work_status_lines(&model.board.rows[0])
             .into_iter()
             .flat_map(|line| line.spans)
             .map(|span| span.content.to_string())
