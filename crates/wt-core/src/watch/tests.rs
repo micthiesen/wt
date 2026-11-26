@@ -430,9 +430,30 @@ fn conditions_read_in_words() {
         ("other:gone", "other removed"),
         ("commit:0123abcdef:staging", "0123abc on staging"),
         ("merged+2h", "2h after merged"),
+        // The row's own stage reads "in production"; after a delay it is
+        // the moment it got there.
+        ("production", "in production"),
+        ("production+1m", "1m after it reaches production"),
+        ("staging+2h", "2h after it reaches staging"),
         ("closed", "PR closed"),
     ] {
         assert_eq!(cond(arg).describe(UTC), words, "{arg}");
+    }
+    // A headline names a check by what it proves: it stops at the first
+    // line break and before steps written inline.
+    for (text, line) in [
+        (
+            "Prod proves beta export. STEPS: 1. export an invoice 2. open the CSV",
+            "Prod proves beta export.",
+        ),
+        ("\n  Look.\nSTEPS: 1. open /health", "Look."),
+        (
+            "STEPS: 1. open /health 2. sign in",
+            "STEPS: 1. open /health 2. sign in",
+        ),
+        ("1. check prod 2. check logs", "1. check prod 2. check logs"),
+    ] {
+        assert_eq!(headline(text), line);
     }
     // Local 07:00: 01:00 UTC tomorrow is still today, 20:00 local.
     assert_eq!(cond("at:1795568400000").describe(WEST), "20:00");

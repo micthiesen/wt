@@ -166,8 +166,26 @@ fn state_word(item: &OwedItem) -> &'static str {
     }
 }
 
-/// One line of the list: state, headline, when, and what closes it.
+/// How the list names the worktree the command runs in.
+const OWN: &str = "This worktree";
+
+/// One line of the list as its own worktree reads it.
+#[cfg(test)]
 fn item_line(item: &OwedItem, slug: &str, clock: LocalClock) -> String {
+    item_line_from(item, slug, clock, false, false)
+}
+
+/// One line of the list: state, headline, when, and what closes it. The
+/// closing command must run as printed from where the reader is: `away`
+/// from the worktree (another directory, or a removed row) it names the
+/// slug.
+fn item_line_from(
+    item: &OwedItem,
+    slug: &str,
+    clock: LocalClock,
+    away: bool,
+    removed: bool,
+) -> String {
     let mut line = format!(
         "{:<8} {} ({})",
         state_word(item),
@@ -183,10 +201,16 @@ fn item_line(item: &OwedItem, slug: &str, clock: LocalClock) -> String {
     if let Some(by) = item.by.as_deref().filter(|by| *by != slug) {
         line.push_str(&format!(" · by {by}"));
     }
+    if removed {
+        line.push_str(" · removed row");
+    }
     if item.state == OwedState::Due
         && let Some(target) = item.done_target()
     {
         line.push_str(&format!(" · wt done {target}"));
+        if away {
+            line.push_str(&format!(" --slug {slug}"));
+        }
     }
     line
 }
@@ -200,7 +224,8 @@ pub(crate) fn owed_text(who: &str, slug: &str, owed: &RowOwed, clock: LocalClock
         format!("{who} owes:")
     };
     for item in &owed.items {
-        text.push_str(&format!("\n  {}", item_line(item, slug, clock)));
+        let line = item_line_from(item, slug, clock, who != OWN, false);
+        text.push_str(&format!("\n  {line}"));
     }
     if owed.landing.is_unknown() {
         text.push_str(&format!("\n  {LANDING_UNKNOWN}"));
@@ -223,7 +248,7 @@ async fn is_own(ctx: &AppContext, record: &WorktreeRecord) -> bool {
 /// How the list names the worktree it is about.
 pub(crate) async fn who(ctx: &AppContext, record: &WorktreeRecord) -> String {
     if is_own(ctx, record).await {
-        "This worktree".to_owned()
+        OWN.to_owned()
     } else {
         record.target.slug().to_owned()
     }
@@ -474,16 +499,8 @@ fn fleet_text(fleet: &[(String, &str, RowOwed)], clock: LocalClock) -> String {
                     .iter()
                     .filter(move |item| group(item) == index)
                     .map(move |item| {
-                        let mut line =
-                            format!("  {slug:<width$}  {}", item_line(item, slug, clock));
-                        if *kind == "removed" {
-                            line.push_str(" · removed row");
-                        }
-                        // Away from the worktree, closing takes its slug.
-                        if line.contains(" · wt done ") {
-                            line.push_str(&format!(" --slug {slug}"));
-                        }
-                        line
+                        let line = item_line_from(item, slug, clock, true, *kind == "removed");
+                        format!("  {slug:<width$}  {line}")
                     })
             })
             .collect::<Vec<_>>();
@@ -752,15 +769,16 @@ async fn close(
     if stages.is_empty() {
         return Ok(failed);
     }
+    let mut previous_note = None;
     if let Some(record) = record {
         let state = ctx
             .database
             .call(|store| Ok(store.read_wt_state()?))
             .await?;
         let landing = landing::read_one(ctx, record, &state, Want::Lists).await;
-        let owed = wt_core::parse_work_status(&state["slugs"][slug]["work"])
-            .map(|work| work.open_checks())
-            .unwrap_or_default();
+        let stored = wt_core::parse_work_status(&state["slugs"][slug]["work"]);
+        previous_note = stored.as_ref().and_then(|work| work.note.clone());
+        let owed = stored.map(|work| work.open_checks()).unwrap_or_default();
         let asked = stages
             .iter()
             .copied()
@@ -802,6 +820,14 @@ async fn close(
                 cancelled_watches,
             } => {
                 print_checks_closed(slug, &closed, &remaining, Some(&record.state), false);
+                // The last check closed: the evidence is the status note now.
+                if remaining.is_empty() {
+                    super::status::report_replaced_note(
+                        previous_note.as_deref(),
+                        record.note.as_deref(),
+                        false,
+                    );
+                }
                 super::status::report_cancelled_watches(&cancelled_watches);
                 failed |= closed.len() < stages.len();
             }
@@ -1468,7 +1494,7 @@ mod tests {
             (
                 &json!("check"),
                 &json!("production"),
-                &json!("once in production")
+                &json!("in production")
             )
         );
         assert_eq!(phase_json(owed.phase), Value::Null);
@@ -1477,14 +1503,15 @@ mod tests {
         let lines = text.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "one owes:");
         assert!(lines[1].starts_with("  due      confirm the logs (due since "));
-        assert!(lines[1].ends_with(&format!(" · before release · wt done {step}")));
+        // Read from elsewhere, the closing command names the worktree.
+        assert!(lines[1].ends_with(&format!(" · before release · wt done {step} --slug one")));
         // No GitHub answers here and Git shows no landing: the list says
         // the landing is unknown instead of calling the work unmerged.
         assert_eq!(
             lines[2..],
             [
                 "  gate     mobile release (until a person clears it)",
-                "  waiting  check: 1. check prod 2. check logs (once in production)",
+                "  waiting  check: 1. check prod 2. check logs (in production)",
                 &format!("  {LANDING_UNKNOWN}"),
             ]
         );
@@ -1640,7 +1667,7 @@ mod tests {
         assert_eq!(
             brief(Landing::NONE),
             [
-                "waiting  check: 1. check prod (once in production)",
+                "waiting  check: 1. check prod (in production)",
                 "waiting  retire the flag (when in production)",
             ]
         );

@@ -72,7 +72,9 @@ empty ones are hidden and they fold like sections. They cannot be renamed,
 deleted or used as a move target, and a row shown in one cannot be moved or
 reordered: the notice reads `Due is derived from what landed rows owe; set
 [ui] owed_sections = false to file rows by hand`. The row's stored section is
-untouched, so turning the option off restores the layout.
+untouched, so turning the option off restores the layout. A section whose
+rows are all drawn in blocks keeps its header, which says so: `Shipped · 1
+landed, shown below`.
 
 The details pane's border names the slug. It starts with the wrapped title
 and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
@@ -251,8 +253,8 @@ issue and PR glyphs, and a right-aligned age. Older records can be checked
 against a bounded local GitHub-merge and production-history scan while history
 is open. A landing only moves forward: once a removal is proven in
 production its record keeps that (`landedOn`), so a later refresh or restart
-never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
-what the record still owes (`owes`, one line an item, a due step with the id `wt done <id> --slug <slug>` takes), landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `H` opens the row's history modal as on the board, `p` opens the PR, `i` opens
+never shows it back at the base. The `removal record` pane shows removal time, host, where a landed row stands as `work` (`due`, `waiting` or `owes nothing`, in place of the state it asserted before merging; a row that never landed keeps its saved status),
+what the record still owes (`owes`, one line an item, each ending with the command that closes it there: `wt done <id> --slug <slug>` for a due step, `wt done <stage> --slug <slug>` for a check), landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `H` opens the row's history modal as on the board, `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
@@ -265,12 +267,12 @@ note, most urgent first, one line an item with the "when" column aligned.
 The lines below show every form; the gate is listed only until the row's own
 work lands, so a real row never shows it beside a landed header:
 
-    ● due · confirm prod logs, then open the PR retiring the old path · risk low · 2h ago
+    ● due · 1 due · 4 waiting · risk low · 2h ago
     owes
-      ●  due 11:36           confirm prod logs, then open the PR retiring...   93co6q
+      ●  due 11:36           confirm prod logs, then open the PR retiring...   wt done 93co6q
       ⊘  before merge        prod secret missing · clears when ○ #3806 in production
       ○  in staging          check · 5 steps · V expands
-      ○  in production +1h   check · 2 steps · V expands
+      ○  in production, not before 18:31   check · 2 steps · V expands
       ○  at Nov 27 18:12     rerun the renewal check · before release
       ?  when check vault=X  rotate the key · exited 2: vault sealed
 
@@ -279,28 +281,31 @@ work lands, so a real row never shows it beside a landed header:
   dim hollow dot while it waits.
 - **When.** `due 11:36` for a step that came due then, `due in staging` or
   `overdue in staging` for a check, `before merge` for the gate, `in
-  staging` for a check that waits (`in production +1h` when it was put off),
+  staging` for a check that waits (`in production, not before 18:31` when it
+  was put off, the words `wt owed` prints),
   `at 17:00 (in 2h10m)` for a lone time, and `when ...` for conditions, each
   marked `✓` holds, `○` not yet or `?` unknown.
 - **What.** A gate's text, then `clears when ...` (`clears at 17:00` for a
   time) and `, then wakes the session` when it has a `--then`. A check reads
   `check` and its step count, or its first line when it has no numbered
   steps, with `awaiting deploy` while its stage does not run the landing
-  yet; `V` expands or collapses its steps in place, and they start expanded
-  once the check is due. A step shows the first line of its prompt.
+  yet; `V` expands or collapses its steps in place (the `V expands` hint is
+  left off a line it would wrap), and they start expanded once the check is
+  due. A step shows the first line of its prompt.
 - **Tails.** `before release` for a step set with `--before-release`, `by
   <who>` for a setter that is neither the row's own agent nor you,
   `delivery not confirmed` for a wake sent without proof it arrived, `delivering` once
   the conditions held, `held: automations paused` while a pause holds the
   delivery, and the reason a condition cannot be read. A due step ends with
-  its id, the argument `wt done <id>` takes.
+  the command that closes it, dim: `wt done <id>`.
 
 The pane lists eight items and counts the rest as `+N more (wt owed)`. Times
 are in this machine's clock (`09:00 tomorrow`, `Mon 30 Nov 09:00`), and the
 countdown is refreshed at least every 30 seconds while anything waits.
 
 Once the row's own work has landed, the header reads from the list instead of
-the asserted state: `● due · <first line of the first due item>`, `◷ waiting
+the asserted state: `● due` when it owes one thing, else `● due · 2 due · 1
+waiting` (the lines below say what), `◷ waiting
 for staging · 2 owed` (or `for production`, `until 17:00`, `for <conditions>`),
 or `✓ done`, followed by risk and age as before. A landed row that owes
 nothing shows a single dim `owes nothing`; an unlanded row with nothing owed
@@ -311,7 +316,9 @@ In the list, the first slot of the badge cluster (`watch` in
 while something is due, with the count when more than one item is (`+` from
 ten), red when anything is overdue; a dim hollow dot while everything waits,
 yellow when a condition it waits for cannot be read. A gate only a person
-clears is the marker's slash already and adds no mark. A folded section's
+clears is the marker's slash already and adds no mark. Once the row's work
+has landed its marker on the left carries the phase, so the mark is shown
+only as the count of two or more things due. A folded section's
 header counts markers only, so it never shows a mark its rows would not, and
 its rollup in the details pane counts rows with something `due`, `owed,
 waiting` and `overdue`.
@@ -356,7 +363,9 @@ configured. Pausing holds deliveries; conditions keep being evaluated.
 `H` opens the selected row's history as a modal, for an archived row and, in
 the `h` view, a removed one too. Its header is the row's
 marker, title and slug, then one summary line built from the events, such as
-`created 3d ago · ready for 2h · 4 review rounds · 2 automations`, showing
+`created 3d ago · ready for 2h · 4 review rounds · 2 automations` (a landed
+row leads with its phase instead of its asserted state: `due · merged 3m
+ago`), showing
 only the parts the events support. Below a rule the timeline reads newest
 first under day headings. Each event is one line: a time, the glyph and
 color the board uses for the same fact (a status wears its work-status dot, a
@@ -546,7 +555,7 @@ names and reasons wrap below their own column.
 
 **Keeping lists only rows you could be surprised to see kept**: a row whose
 own work landed, whose status is `dropped`, or whose PR merged or closed, and
-that something still holds. The reasons are `still owes: <first line>` (with
+that something still holds. The reasons are `still owes: <first line> (<when>)` (with
 `(+N more)` when it owes more; a check, a pending wake or a due step, never
 a gate alone), `uncommitted changes`, `rebase or merge is in progress`,
 `operation in progress`, the unknowns (`checkout is unavailable`, `Git state

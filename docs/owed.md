@@ -104,7 +104,7 @@ sees the result instead of assuming it:
 
     This worktree owes:
       due      confirm the logs (due since 11:36) · wt done 93co6q
-      waiting  check: 1. check prod 2. check logs (once in production)
+      waiting  check: 1. check prod 2. check logs (in production)
 
 The ready note therefore carries no phased `OPS` lines: `wt status` refuses
 them and says where each kind goes. A note may say `OPS: none` only while the

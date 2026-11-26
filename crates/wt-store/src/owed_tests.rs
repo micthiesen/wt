@@ -623,6 +623,62 @@ fn a_status_that_stops_owing_a_check_records_what_became_of_it() {
 }
 
 #[test]
+fn a_status_names_every_stage_and_a_check_leaving_it_is_not_a_new_status() {
+    let (_temp, mut store) = store();
+    store.set_slug_work_status("one", Some(&both())).unwrap();
+    let statuses = |store: &Store| -> Vec<Option<String>> {
+        store
+            .read_worktree_events("one", 500)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                WorktreeEventKind::Status { verify_in, .. } => Some(verify_in),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        statuses(&store),
+        [Some("staging and production".to_owned())]
+    );
+    // Closed, put off or dropped: the check's own event says so, and the
+    // status was not asserted again.
+    store
+        .close_checks(
+            "one",
+            &CheckTargets::Stages(vec![STAGING]),
+            &status("verified"),
+            Some("saw it"),
+        )
+        .unwrap();
+    store
+        .defer_check("one", PRODUCTION, NOON + 3_600_000, "at 13:00", None)
+        .unwrap();
+    store.drop_check("one", PRODUCTION, None).unwrap();
+    assert_eq!(statuses(&store).len(), 1);
+    assert!(crate::only_checks_left(
+        Some("staging and production"),
+        None
+    ));
+    assert!(crate::only_checks_left(
+        Some("staging and production"),
+        Some("production")
+    ));
+    assert!(!crate::only_checks_left(
+        Some("staging"),
+        Some("production")
+    ));
+    // Owing a check again is an assertion.
+    let again = status("ready").with_check(PRODUCTION, "watch the logs");
+    store.set_slug_work_status("one", Some(&again)).unwrap();
+    assert_eq!(
+        statuses(&store).last(),
+        Some(&Some("production".to_owned()))
+    );
+    assert_eq!(statuses(&store).len(), 2);
+}
+
+#[test]
 fn recording_a_removal_again_brings_back_no_check_closed_since() {
     let (_temp, mut store) = store();
     store.set_slug_work_status("one", Some(&both())).unwrap();

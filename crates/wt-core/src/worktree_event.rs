@@ -329,14 +329,28 @@ pub fn fold_watch_history(events: &[WorktreeEvent]) -> Vec<HistoryLine<'_>> {
         _ => false,
     };
     let change = |index: usize| watch(index).map(|(_, change, ..)| change);
+    // A wake delivered after its worktree landed records that the step came
+    // due where another wake records "woken": that line says it held.
+    let came_due = |held: usize| {
+        let Some((Some(held_id), ..)) = watch(held) else {
+            return false;
+        };
+        events[held..].iter().any(|event| {
+            matches!(
+                &event.event,
+                Kind::Owed { id: Some(id), change: OwedChange::Due, .. } if id == held_id
+            )
+        })
+    };
     // A `held` that what wt did, or its giving up, says later.
     let mut folded: Vec<bool> = (0..events.len())
         .map(|held| {
             change(held) == Some(WatchChange::Held)
-                && (held + 1..events.len())
+                && ((held + 1..events.len())
                     .filter(|later| same(held, *later))
                     .map_while(|later| change(later).filter(|change| *change != WatchChange::Set))
                     .any(|change| change.is_action() || change == WatchChange::Dropped)
+                    || came_due(held))
         })
         .collect();
     let mut fired: Vec<Option<WatchFired<'_>>> = vec![None; events.len()];
@@ -833,6 +847,26 @@ mod tests {
     fn one_watch_folds_to_when_it_was_set_and_what_wt_did() {
         use WatchChange::{Cancelled, ClearedGate, Dropped, Held, Notified, Set, Woken};
         const HOUR: u64 = 3_600_000;
+        // A wake delivered after the work landed records the step that
+        // came due instead of "woken": that line says it held, here and
+        // in `wt history` alike. Another watch's `held` stands.
+        let due = WorktreeEventKind::Owed {
+            id: Some("a".into()),
+            change: OwedChange::Due,
+            what: "confirm prod logs".into(),
+            evidence: None,
+            by: None,
+            stage: None,
+            when: None,
+            unconfirmed: false,
+        };
+        let became_due = [
+            at(0, watch("a", Set, "merged")),
+            at(HOUR, watch("a", Held, "merged")),
+            at(HOUR + 1, due),
+            at(HOUR + 2, watch("b", Held, "17:00")),
+        ];
+        assert_eq!(shape(&became_due), "e-ee");
         // A wake as earlier builds recorded it: held, the prompt's own
         // message, then the wake.
         let wake = [

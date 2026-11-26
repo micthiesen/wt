@@ -249,8 +249,20 @@ impl RowContext<'_> {
         }
         if rows.is_empty() {
             let item = positions.get(&VisualItem::Section(index)).copied();
+            // Rows filed here that `[ui] owed_sections` draws in a derived
+            // block: the section is not empty, only shown elsewhere.
+            let landed = if section.key.starts_with('\0') {
+                0
+            } else {
+                self.model.board.section_members(&section.key).len()
+            };
+            let title = if landed == 0 {
+                section.title.clone()
+            } else {
+                format!("{} · {landed} landed, shown below", section.title)
+            };
             lines.push(empty_section(
-                &section.title,
+                &title,
                 item.is_some() && item == self.model.selected,
                 self.width,
                 item,
@@ -644,6 +656,40 @@ mod tests {
                 "{span:?}"
             );
         }
+        // Rows filed in it that `[ui] owed_sections` draws in a derived
+        // block: the header says they are there.
+        let mut filed = Model::default();
+        std::sync::Arc::make_mut(&mut filed.board).rows = vec![
+            BoardRow {
+                key: "one".into(),
+                filed_in: Some("Later".into()),
+                ..Default::default()
+            },
+            BoardRow {
+                key: "two".into(),
+                filed_in: Some("Elsewhere".into()),
+                ..Default::default()
+            },
+        ];
+        let context = RowContext {
+            model: &filed,
+            width: 60,
+            gutter: 0,
+            cleanup: None,
+        };
+        let mut lines = Vec::new();
+        context.section(&mut lines, 0, &named, &positions, false);
+        assert!(
+            text(&lines[0]).contains("── Later · 1 landed, shown below ─"),
+            "{}",
+            text(&lines[0])
+        );
+        let context = RowContext {
+            model: &model,
+            width: 60,
+            gutter: 0,
+            cleanup: None,
+        };
         // A derived group without rows (the Inbox) is not drawn.
         let inbox = BoardSection {
             key: "\0inbox".into(),

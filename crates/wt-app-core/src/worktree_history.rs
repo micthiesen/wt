@@ -274,7 +274,17 @@ pub fn status_transition(
     else {
         return None;
     };
-    if logged == Some((*to, *risk, blocked_on.clone(), verify_in.clone())) {
+    // Checks that only left the status were closed or dropped, each with
+    // its own event: the status itself was not asserted again.
+    if logged
+        .as_ref()
+        .is_some_and(|(state, was_risk, gate, stages)| {
+            state == to
+                && was_risk == risk
+                && gate == blocked_on
+                && wt_store::only_checks_left(stages.as_deref(), verify_in.as_deref())
+        })
+    {
         return None;
     }
     let at =

@@ -113,26 +113,6 @@ impl<'a> Known<'a> {
 pub(crate) fn collapse(events: &[WorktreeEvent]) -> Vec<Entry<'_>> {
     let mut standing = None;
     let mut known: Vec<Known<'_>> = Vec::new();
-    // A wake delivered after its worktree landed records that the step came
-    // due where another wake records "woken"; either line says it held.
-    let came_due = |held: &WorktreeEvent| {
-        let Kind::Watch {
-            id: Some(held_id),
-            change: wt_core::WatchChange::Held,
-            ..
-        } = &held.event
-        else {
-            return false;
-        };
-        events.iter().any(|event| {
-            event.at_ms >= held.at_ms
-                && matches!(
-                    &event.event,
-                    Kind::Owed { id: Some(id), change: wt_core::OwedChange::Due, .. }
-                        if id == held_id
-                )
-        })
-    };
     for line in wt_core::fold_watch_history(events) {
         let prev = standing;
         // A status folded into a watch's line still stands.
@@ -144,7 +124,6 @@ pub(crate) fn collapse(events: &[WorktreeEvent]) -> Vec<Entry<'_>> {
             }
         }
         match line {
-            wt_core::HistoryLine::Event(event) if came_due(event) => {}
             wt_core::HistoryLine::Event(event) if event.event != Kind::Unknown => {
                 known.push(Known {
                     at_ms: event.at_ms,
@@ -702,8 +681,15 @@ pub(crate) fn timeline(
 
 /// The one line that answers "how did this row get here": when it was
 /// created, where it stands and for how long, and the counts worth knowing.
-/// Only the parts the events support.
-pub(crate) fn summary(events: &[WorktreeEvent], now_ms: u64) -> Line<'static> {
+/// Only the parts the events support. `phase` is where a live row whose
+/// work has landed stands with what it owes, and whether anything of it is
+/// overdue: from then on that, not the state it asserted before merging,
+/// is where it stands.
+pub(crate) fn summary(
+    events: &[WorktreeEvent],
+    now_ms: u64,
+    phase: Option<(wt_core::OwedPhase, bool)>,
+) -> Line<'static> {
     let ago = |at_ms: u64| age(at_ms, now_ms);
     let mut parts: Vec<(String, Color)> = Vec::new();
     // A slug's history starts at its latest creation.
@@ -728,6 +714,14 @@ pub(crate) fn summary(events: &[WorktreeEvent], now_ms: u64) -> Line<'static> {
         .collect();
     if let Some(removed) = removed {
         parts.push((format!("removed {} ago", ago(removed.at_ms)), theme::FG_MID));
+    } else if let Some((phase, overdue)) = phase {
+        let color = match phase {
+            _ if overdue => theme::ERR,
+            wt_core::OwedPhase::Due => theme::WARN,
+            wt_core::OwedPhase::Waiting => theme::FG_MID,
+            wt_core::OwedPhase::Done => theme::OK,
+        };
+        parts.push((phase.as_str().to_owned(), color));
     } else if let Some(Kind::Status { to, blocked_on, .. }) =
         statuses.last().map(|event| &event.event)
     {
@@ -810,7 +804,11 @@ fn header(board: &Board, key: &str, events: &[WorktreeEvent], now_ms: u64) -> Ve
         spans
     };
     let mut spans = Vec::new();
+    let mut phase = None;
     if let Some(row) = board.rows.iter().find(|row| row.key == key) {
+        phase = row
+            .owed_phase
+            .map(|phase| (phase, row.owes.iter().any(|item| item.overdue)));
         let marker = badges::marker(row, &board.display);
         spans.push(Span::styled(
             format!("{}  ", marker.glyph),
@@ -824,7 +822,7 @@ fn header(board: &Board, key: &str, events: &[WorktreeEvent], now_ms: u64) -> Ve
         spans.extend(title("", key));
     }
     let mut lines = vec![Line::from(spans)];
-    let summary = summary(events, now_ms);
+    let summary = summary(events, now_ms, phase);
     if !summary.spans.is_empty() {
         lines.push(summary);
     }
@@ -956,7 +954,7 @@ pub(crate) fn record_block(board: &Board, key: &str, width: usize) -> Vec<Line<'
     if lines.is_empty() {
         return Vec::new();
     }
-    std::iter::once(summary(events, now))
+    std::iter::once(summary(events, now, None))
         .chain(std::iter::once(Line::default()))
         .chain(lines.into_iter().map(|line| line.line))
         .map(|line| Line::from(fit_spans(line.spans, width, Style::default())))
@@ -1747,7 +1745,7 @@ mod tests {
         assert_eq!(note.spans[1].style.fg, Some(theme::FG_MID), "glyph");
         assert_eq!(note.spans[3].content, "  handed to QA");
         assert_eq!(
-            text(&summary(&events, NOW)),
+            text(&summary(&events, NOW, None)),
             "created 5m ago · 3 skill runs"
         );
     }
@@ -1995,7 +1993,7 @@ mod tests {
 
     #[test]
     fn the_summary_says_where_the_row_stands_and_only_what_exists() {
-        assert!(summary(&[], NOW).spans.is_empty());
+        assert!(summary(&[], NOW, None).spans.is_empty());
         let mut ready = status(WorkState::Ready);
         let mut events = vec![
             at(NOW - 9 * DAY, Kind::Removed { landed: false }),
@@ -2010,7 +2008,7 @@ mod tests {
         }
         // The same state asserted again keeps its clock.
         events.push(at(NOW - HOUR, ready));
-        let line = summary(&events, NOW);
+        let line = summary(&events, NOW, None);
         assert_eq!(
             text(&line),
             "created 3d ago · ready for 2h · 2 review rounds"
@@ -2024,8 +2022,18 @@ mod tests {
             state.style.fg,
             Some(badges::work_state_color(WorkState::Ready))
         );
+        // Landed: what the row owes says where it stands, not the state it
+        // asserted before merging.
         assert_eq!(
-            text(&summary(&story(NOW), NOW)),
+            text(&summary(
+                &events,
+                NOW,
+                Some((wt_core::OwedPhase::Due, false))
+            )),
+            "created 3d ago · due · 2 review rounds"
+        );
+        assert_eq!(
+            text(&summary(&story(NOW), NOW, None)),
             "created 3d ago · removed 10m ago · in production 1h ago · 2 review rounds · 1 automation"
         );
     }

@@ -213,10 +213,7 @@ fn compose(
     };
     let mut prepared = existing.as_ref().clone();
     prepared.attention.extend(events.iter().cloned());
-    prepared.attention.sort_by_key(|event| event.at_ms);
-    prepared.attention.dedup_by(|left, right| {
-        left.at_ms == right.at_ms && left.source == right.source && left.text == right.text
-    });
+    merge_lines(&mut prepared.attention);
     if prepared.attention.len() > MAX_ATTENTION_FEED {
         prepared
             .attention
@@ -225,6 +222,16 @@ fn compose(
     prepared.attention_seen_ms = seen_ms;
     wt_app_core::feeds::bound_feeds(&mut prepared);
     board.with_data(Some(Arc::new(prepared)))
+}
+
+/// Order the feed by time and say each line once. The board may already
+/// carry lines this tracker holds, and several lines can share a
+/// millisecond (one state read narrates every change in it), so a repeat
+/// is not always next to its original.
+fn merge_lines(lines: &mut Vec<wt_tui::AttentionLine>) {
+    lines.sort_by_key(|event| event.at_ms);
+    let mut shown = BTreeSet::new();
+    lines.retain(|event| shown.insert((event.at_ms, event.source.clone(), event.text.clone())));
 }
 
 fn observe_metadata(tracker: &mut TransitionTracker, snapshot: &SourceSnapshot<Metadata>) {
@@ -537,9 +544,9 @@ fn describe_status(record: &Value) -> String {
                 .iter()
                 .map(|(stage, check)| {
                     format!(
-                        " [verify in {}: {}]",
+                        " [check owed in {}: {}]",
                         stage.as_str(),
-                        truncate(&check.steps, 100)
+                        wt_core::watch::headline(&check.steps)
                     )
                 })
                 .collect()
@@ -693,6 +700,34 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("moved to Review"))
         );
+
+        // A status names each check it owes by what it proves, not by its
+        // steps.
+        let owing = serde_json::json!({"state":"ready","risk":"low","at":"3","checks":{
+            "staging":{"steps":"Staging proves the retry. STEPS: 1. fail a webhook 2. watch it retry"},
+            "production":{"steps":"watch the logs"}}});
+        assert_eq!(
+            describe_status(&owing),
+            "ready to merge (risk: low) [check owed in staging: Staging proves the retry.] [check owed in production: watch the logs]"
+        );
+        // Lines the board already carries are not said twice, even when
+        // several share a millisecond and the repeats are not adjacent.
+        let line = |at_ms, source: &str, text: &str| wt_tui::AttentionLine {
+            at_ms,
+            source: source.into(),
+            text: text.into(),
+        };
+        let block = [
+            line(5, "clean", "ready to merge"),
+            line(5, "drop", "dropped, will not land"),
+            line(5, "work", "→ working"),
+        ];
+        let mut feed = vec![line(9, "later", "x"), line(5, "child", "→ working")];
+        feed.extend(block.iter().cloned());
+        feed.extend(block.iter().cloned());
+        merge_lines(&mut feed);
+        assert_eq!(feed.len(), 5);
+        assert_eq!(feed[4].source, "later");
 
         // The same move made by this process stays off attention.
         let mut tracker = TransitionTracker::default();

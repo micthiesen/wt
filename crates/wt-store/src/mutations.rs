@@ -2528,9 +2528,27 @@ fn work_state(record: &WorkStatusRecord) -> Option<wt_core::WorkState> {
 
 /// Where the record's first post-merge check is owed, if it has one: the
 /// one stage a status event names.
+/// The stages the record names a check in, as a status event says them:
+/// `staging`, `production`, or `staging and production`.
 fn owed_stage(record: &WorkStatusRecord) -> Option<String> {
-    let (stage, _) = record.all_checks().iter().next()?;
-    Some(stage.as_str().to_owned())
+    let stages = record
+        .all_checks()
+        .iter()
+        .map(|(stage, _)| stage.as_str())
+        .collect::<Vec<_>>();
+    (!stages.is_empty()).then(|| stages.join(" and "))
+}
+
+/// Whether going from the stages `previous` names to those `next` names
+/// only stopped owing checks. That is not a new assertion: each check that
+/// left has its own event saying whether it was done or dropped.
+pub fn only_checks_left(previous: Option<&str>, next: Option<&str>) -> bool {
+    fn stages(text: Option<&str>) -> Vec<&str> {
+        text.map(|text| text.split(" and ").collect())
+            .unwrap_or_default()
+    }
+    let previous = stages(previous);
+    stages(next).iter().all(|stage| previous.contains(stage))
 }
 
 /// The person is recorded as no author.
@@ -2567,7 +2585,10 @@ pub(crate) fn log_status(
         previous.state == record.state
             && previous.risk == record.risk
             && previous.blocked_on == record.blocked_on
-            && owed_stage(previous) == owed_stage(record)
+            && only_checks_left(
+                owed_stage(previous).as_deref(),
+                owed_stage(record).as_deref(),
+            )
     }) {
         return Ok(());
     }

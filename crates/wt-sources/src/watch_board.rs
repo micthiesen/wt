@@ -502,8 +502,8 @@ mod tests {
                     OwedState::Waiting,
                     "clears when #3806 in production"
                 ),
-                (OwedKind::Check, OwedState::Waiting, "once in staging"),
-                (OwedKind::Check, OwedState::Waiting, "once in production"),
+                (OwedKind::Check, OwedState::Waiting, "in staging"),
+                (OwedKind::Check, OwedState::Waiting, "in production"),
                 (OwedKind::Step, OwedState::Waiting, "at 14:10"),
             ]
         );
@@ -517,7 +517,8 @@ mod tests {
         assert!(gate.wakes && !gate.met);
         assert_eq!(gate.conditions[0].text, "#3806 in production");
         assert_eq!(staging.stage, Some(wt_core::VerifyStage::Staging));
-        assert_eq!(staging.headline, "check: Look. STEPS: 1. open /health");
+        // Named by what it proves; its inline steps are not the headline.
+        assert_eq!(staging.headline, "check: Look.");
         assert_eq!(step.what, "Run it then say so");
         assert_eq!(step.headline, "Run it");
         assert_eq!(step.by.as_deref(), Some("manager"));
@@ -581,7 +582,7 @@ mod tests {
             [
                 (OwedKind::Check, OwedState::Due, "due in staging"),
                 (OwedKind::Step, OwedState::Due, "due since 11:36"),
-                (OwedKind::Check, OwedState::Waiting, "once in production"),
+                (OwedKind::Check, OwedState::Waiting, "in production"),
             ]
         );
         let step = &one.owes[1];
@@ -601,11 +602,11 @@ mod tests {
         assert_eq!(
             kinds(one),
             [
-                (OwedKind::Check, OwedState::Waiting, "once in production"),
+                (OwedKind::Check, OwedState::Waiting, "in production"),
                 (
                     OwedKind::Check,
                     OwedState::Waiting,
-                    "once in staging, not before 13:00"
+                    "in staging, not before 13:00"
                 ),
             ]
         );

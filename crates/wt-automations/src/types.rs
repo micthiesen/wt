@@ -51,6 +51,8 @@ pub struct AutomationPr {
     /// `None` when the read did not hold the whole queue: a missing entry
     /// then proves nothing.
     pub merge_queued: Option<bool>,
+    /// When the pull request merged.
+    pub merged_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +170,18 @@ fn unknown_landing() -> OwnerLanding {
 pub struct CheckFire {
     pub stage: VerifyStage,
     pub steps: String,
+    /// Set when the fire prompts the row's own session for the check: the
+    /// same value for wt's own wake and for a configured session rule, so
+    /// whichever delivers it first is the only one that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_key: Option<String>,
+    /// Since when the check has been due, where that can be told: the
+    /// pull request's merge, the status that owes it and a not-before,
+    /// whichever is latest. `None` where the moment is not recorded (a
+    /// deploy a probe reported, a promotion, a merge without a pull
+    /// request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due_since_ms: Option<i64>,
 }
 
 /// An action a newer build added fails to read, so the deferred fire that

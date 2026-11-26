@@ -118,8 +118,8 @@ fn the_list_is_ordered_due_then_gate_then_waiting_by_what_it_waits_for() {
             "due step confirm prod logs (due since 10:00)",
             "due step open the follow-up PR (due since 11:00)",
             "waiting gate the prod secret is missing (clears when #3806 in production)",
-            "waiting check check: open the page (once in staging)",
-            "waiting check check: watch the logs (once in production)",
+            "waiting check check: open the page (in staging)",
+            "waiting check check: watch the logs (in production)",
             "waiting step retire the flag (when in production)",
             "waiting step rotate the key (when check vault=X)",
             "waiting step look at the queue (at 13:00)",
@@ -146,7 +146,7 @@ fn the_list_is_ordered_due_then_gate_then_waiting_by_what_it_waits_for() {
             "due check check: open the page (due in staging)",
             "due step confirm prod logs (due since 10:00)",
             "due step open the follow-up PR (due since 11:00)",
-            "waiting check check: watch the logs (once in production)",
+            "waiting check check: watch the logs (in production)",
             "waiting step retire the flag (when in production)",
             "waiting step rotate the key (when check vault=X)",
             "waiting step merge it (when #3806 in production)",
@@ -212,7 +212,7 @@ fn a_check_reads_by_where_it_stands() {
     // Not landed: owed, dormant.
     assert_eq!(
         words(Landing::NONE, &record, NOON),
-        ["once in staging", "once in production"]
+        ["in staging", "in production"]
     );
     let probed = Landing::new(true, true, true).with_deploys(StageDeploys {
         staging: Some(false),
@@ -234,8 +234,8 @@ fn a_check_reads_by_where_it_stands() {
     assert_eq!(
         brief(&items),
         [
-            "waiting check check: watch the logs (once in production)",
-            "waiting check check: open the page (once in staging, not before 18:00 tomorrow)",
+            "waiting check check: watch the logs (in production)",
+            "waiting check check: open the page (in staging, not before 18:00 tomorrow)",
         ]
     );
     assert_eq!(owed_phase(&items, true), Some(OwedPhase::Waiting));
@@ -253,9 +253,7 @@ fn cleanup_is_held_by_checks_pending_wakes_and_due_steps_alike() {
     assert_eq!(
         owed_hazards(Some(&check), &waking, &due, UTC),
         [
-            "still owes: open the follow-up PR (due since 11:00)",
-            "still owes: check: watch the logs (in production)",
-            "still owes: rerun the renewal check (at 17:00)",
+            "still owes: open the follow-up PR (due since 11:00); check: watch the logs (in production); rerun the renewal check (at 17:00)"
         ]
     );
     let mut later = check.clone();

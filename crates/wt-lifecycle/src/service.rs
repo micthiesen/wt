@@ -5134,14 +5134,13 @@ mod tests {
             .filter(|hazard| hazard.starts_with(wt_core::OWED_HAZARD))
             .map(String::as_str)
             .collect();
-        assert_eq!(owed.len(), 3, "{hazards:?}");
+        // One line, in the order the list has them: what is due first.
+        assert_eq!(owed.len(), 1, "{hazards:?}");
         assert!(owed[0].starts_with("still owes: Open the follow-up PR. (due since "));
-        assert_eq!(
-            owed[1..],
-            [
-                "still owes: check: verify prod (in staging)",
-                "still owes: check: watch prod (in production)",
-            ]
+        assert!(
+            owed[0]
+                .ends_with("); check: verify prod (in staging); check: watch prod (in production)"),
+            "{hazards:?}"
         );
         let kept = service
             .remove(&created.target, RemoveOptions::default(), &cancellation)

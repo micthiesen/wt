@@ -377,6 +377,8 @@ mod tests {
             check_prompt(&CheckFire {
                 stage: wt_core::VerifyStage::Production,
                 steps: "1. Open /health\x1b[31m\n2. Expect 200".into(),
+                prompt_key: None,
+                due_since_ms: None,
             }),
             "[wt] The check this worktree owes in production is due: the change is deployed there.\n\
              1. Open /health\n2. Expect 200\n\

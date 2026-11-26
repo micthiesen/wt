@@ -483,32 +483,80 @@ impl AutomationEngine {
             .snapshot()
             .await
             .context("read automation ledger")?;
-        // A check that was due before wt began waking sessions for due
-        // checks is not prompted for: after an upgrade that would be every
-        // long-merged row a person is already handling.
-        if ledger.seeding_check_wakes(input.now_ms) {
-            let due = current
-                .iter()
-                .filter(|fire| wt_automations::is_check_wake(fire))
-                .filter(|fire| !fire.fire_keys.iter().all(|key| ledger.recorded(key)))
-                .map(|fire| (fire.fire_keys.clone(), fire.slug.clone()))
-                .collect::<Vec<_>>();
-            if !due.is_empty() || !ledger.check_wakes_begun() {
-                self.ledger
-                    .seed_check_wakes(
-                        &due,
-                        wt_automations::CHECK_RULE_ID,
-                        input.now_ms,
-                        &self.cancellation,
-                    )
-                    .await
-                    .context("record the checks already due")?;
-                ledger = self
-                    .ledger
-                    .snapshot()
-                    .await
-                    .context("read automation ledger")?;
+        // A check that was already due when wt began waking sessions for
+        // due checks is not prompted for: after an upgrade that would be
+        // every long-merged row a person is already handling. Everything
+        // due on the pass that records the beginning was due before it.
+        // Later, a check is passed over only where its record shows it came
+        // due before then; where that cannot be told its session is woken,
+        // since a second prompt costs less than a missed one.
+        let began = ledger.check_wakes_from();
+        let before = current
+            .iter()
+            .filter(|fire| wt_automations::is_check_wake(fire))
+            .filter(|fire| !fire.fire_keys.iter().all(|key| ledger.recorded(key)))
+            .filter(|fire| match began {
+                None => true,
+                Some(began) => fire
+                    .check
+                    .as_ref()
+                    .and_then(|check| check.due_since_ms)
+                    .is_some_and(|since| since < began),
+            })
+            .map(|fire| (fire.fire_keys.clone(), fire.slug.clone()))
+            .collect::<Vec<_>>();
+        if began.is_none() || !before.is_empty() {
+            self.ledger
+                .seed_check_wakes(
+                    &before,
+                    wt_automations::CHECK_RULE_ID,
+                    input.now_ms,
+                    &self.cancellation,
+                )
+                .await
+                .context("record the checks already due")?;
+            ledger = self
+                .ledger
+                .snapshot()
+                .await
+                .context("read automation ledger")?;
+        }
+        // One prompt per check for a session, whichever rule sends it: wt's
+        // own wake, or a configured rule that was added or removed since.
+        let mut prompted = Vec::new();
+        let mut repeats = Vec::new();
+        for fire in &current {
+            let Some(prompt) = fire
+                .check
+                .as_ref()
+                .and_then(|check| check.prompt_key.as_ref())
+            else {
+                continue;
+            };
+            if fire.fire_keys.iter().all(|key| ledger.sent(key)) {
+                if !ledger.recorded(prompt) {
+                    prompted.push((prompt.clone(), fire.slug.clone()));
+                }
+            } else if ledger.recorded(prompt)
+                && !fire.fire_keys.iter().any(|key| ledger.recorded(key))
+            {
+                repeats.push((
+                    fire.fire_keys.clone(),
+                    fire.rule.id.clone(),
+                    fire.slug.clone(),
+                ));
             }
+        }
+        if !prompted.is_empty() || !repeats.is_empty() {
+            self.ledger
+                .record_check_prompts(&prompted, &repeats, input.now_ms, &self.cancellation)
+                .await
+                .context("record prompted checks")?;
+            ledger = self
+                .ledger
+                .snapshot()
+                .await
+                .context("read automation ledger")?;
         }
         self.recent = ledger.recent(RECENT_HISTORY);
         let handled = QueueIntentsInput::handled_keys(
@@ -2265,39 +2313,48 @@ mod tests {
         assert_eq!(tick.claims[0].fire().quiesce_slugs, ["worktree"]);
     }
 
-    /// The first passes of a build that wakes sessions for due checks find
-    /// every check that was already due, on rows a person is handling.
-    /// Those are not prompted for; a check that comes due later is.
+    /// A build that wakes sessions for due checks first finds every check
+    /// that was already due, on rows a person is handling. Those are not
+    /// prompted for. One that comes due afterwards is, and so is one whose
+    /// record cannot say when it came due.
     #[tokio::test]
     async fn a_check_already_due_when_wt_first_looks_wakes_nobody() {
         let dir = tempfile::tempdir().unwrap();
         let ledger = AutomationLedger::new(dir.path().join("automations.json"));
         let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
-        let owing = |slug: &str, landed: bool| {
+        let start = now_ms();
+        let at = |ms: i64| {
+            time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        // Each owes a staging check asserted an hour ago. `merged` is when
+        // its pull request merged; none means Git alone shows the landing.
+        let owing = |slug: &str, landed: bool, merged: Option<i64>| {
             let mut owing = row();
             owing.slug = slug.into();
             owing.local_merged = landed.then_some(true);
-            let mut work = wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "t");
+            owing.pr = merged.map(|merged_at_ms| wt_automations::AutomationPr {
+                number: 7,
+                state: "MERGED".into(),
+                merged_at_ms: Some(merged_at_ms),
+                ..Default::default()
+            });
+            let mut work =
+                wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, at(start - 3_600_000));
             work.set_check(wt_core::VerifyStage::Staging, "1. open the page");
             owing.work = Some(work);
             owing
         };
-        let context = AutomationEvalContext::default();
+        let context = AutomationEvalContext {
+            github_fresh: true,
+            ..AutomationEvalContext::default()
+        };
         let (requirements, idle, activity) =
             (BTreeMap::new(), BTreeMap::new(), RuntimeActivity::default());
-        let start = now_ms();
-        let window = wt_automations::CHECK_WAKE_SEED_WINDOW_MS;
-        // The landing of "late" is not known on the first pass and arrives
-        // on the next: it was due all along too.
-        let first = [
-            owing("old", true),
-            owing("late", false),
-            owing("new", false),
-        ];
-        let second = [owing("old", true), owing("late", true), owing("new", false)];
-        let third = [owing("old", true), owing("late", true), owing("new", true)];
         let mut pass = async |rows: &[AutomationRow], at| {
-            engine
+            let mut woken = engine
                 .tick(input(
                     &[],
                     rows,
@@ -2312,16 +2369,185 @@ mod tests {
                 .claims
                 .iter()
                 .map(|claim| claim.fire().slug.clone())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            woken.sort();
+            woken
         };
+        // The first pass: "old" is due and was before wt began.
+        let first = [
+            owing("old", true, None),
+            owing("late", false, None),
+            owing("new", false, None),
+            owing("plain", false, None),
+        ];
         assert!(pass(&first, start).await.is_empty());
-        assert!(pass(&second, start + 30_000).await.is_empty());
-        // Nothing passed over comes back once the window has closed.
-        assert!(pass(&second, start + window).await.is_empty());
-        // A check that comes due after that wakes its session.
-        assert_eq!(pass(&third, start + window + 1).await, ["new"]);
-        let snapshot = ledger.snapshot().await.unwrap();
-        assert!(!snapshot.seeding_check_wakes(start + window));
+        // Next pass, seconds later, GitHub's answer has arrived. "late"
+        // merged before wt began: passed over, with no window to wait out.
+        // "new" merged since: woken. "plain" landed with no pull request to
+        // date it: woken, since a second prompt beats a missed one.
+        let second = [
+            owing("old", true, None),
+            owing("late", false, Some(start - 60_000)),
+            owing("new", false, Some(start + 1_000)),
+            owing("plain", true, None),
+        ];
+        assert_eq!(pass(&second, start + 2_000).await, ["new", "plain"]);
+        assert_eq!(
+            ledger.snapshot().await.unwrap().check_wakes_from(),
+            Some(start)
+        );
+    }
+
+    /// A session is prompted once for a check, whichever rule sends it:
+    /// adding a rule for due checks does not prompt again for one wt's own
+    /// wake delivered, and removing the rule does not either.
+    #[tokio::test]
+    async fn a_rule_added_later_does_not_prompt_again_for_a_delivered_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let start = now_ms();
+        ledger
+            .seed_check_wakes(
+                &[],
+                wt_automations::CHECK_RULE_ID,
+                start - 1,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let mut owing = row();
+        owing.local_merged = Some(true);
+        let mut work = wt_core::WorkStatusRecord::new(wt_core::WorkState::Ready, "t");
+        work.set_check(wt_core::VerifyStage::Staging, "1. open the page");
+        owing.work = Some(work);
+        let rows = [owing];
+        let rule = AutomationDef {
+            id: "verify".into(),
+            on: wt_config::AutomationTrigger::StatusVerificationDue,
+            run: "verify-deployed".into(),
+            settle_seconds: 0.0,
+            ..AutomationDef::default()
+        };
+        let mut context = AutomationEvalContext::default();
+        context.actions.insert(
+            "verify-deployed".into(),
+            wt_automations::ActionTraits {
+                shell: false,
+                external: false,
+                audience: wt_automations::ActionAudience::Session,
+            },
+        );
+        let mut changed = rows[0].clone();
+        changed
+            .work
+            .as_mut()
+            .unwrap()
+            .set_check(wt_core::VerifyStage::Staging, "1. open the other page");
+        let changed = [changed];
+        let identity = evaluate(std::slice::from_ref(&rule), &changed, &context)
+            .iter()
+            .find(|fire| fire.rule.id == "verify")
+            .map(fire_identity)
+            .unwrap();
+        let requirements = BTreeMap::from([(identity, RequirementState::Ready)]);
+        let (idle, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        // wt's own wake delivers the check.
+        let tick = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        assert!(wt_automations::is_check_wake(tick.claims[0].fire()));
+        engine
+            .finish(&tick.claims[0], DONE, start + 1)
+            .await
+            .unwrap();
+        let noted = engine
+            .tick(input(
+                &[],
+                &rows,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 2,
+            ))
+            .await
+            .unwrap();
+        assert!(noted.claims.is_empty());
+        // The rule is added: it owns delivery from here, and has nothing
+        // left to deliver for this check.
+        let rules = [rule];
+        for at in [start + 3, start + 4] {
+            let tick = engine
+                .tick(input(
+                    &rules,
+                    &rows,
+                    &context,
+                    &requirements,
+                    &idle,
+                    &activity,
+                    at,
+                ))
+                .await
+                .unwrap();
+            assert!(tick.claims.is_empty(), "{:?}", tick.claims);
+        }
+        assert!(engine.queued().is_empty());
+        // New steps are a new check: the rule delivers that one.
+        let tick = engine
+            .tick(input(
+                &rules,
+                &changed,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 5,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(tick.claims.len(), 1);
+        assert_eq!(tick.claims[0].fire().rule.id, "verify");
+        engine
+            .finish(&tick.claims[0], DONE, start + 6)
+            .await
+            .unwrap();
+        engine
+            .tick(input(
+                &rules,
+                &changed,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 7,
+            ))
+            .await
+            .unwrap();
+        // The rule is removed: wt's own wake has nothing to add.
+        let tick = engine
+            .tick(input(
+                &[],
+                &changed,
+                &context,
+                &requirements,
+                &idle,
+                &activity,
+                start + 8,
+            ))
+            .await
+            .unwrap();
+        assert!(tick.claims.is_empty(), "{:?}", tick.claims);
     }
 
     /// wt's own wake for a due check needs no rule and behaves like a wake:
@@ -2344,7 +2570,7 @@ mod tests {
         let start = now_ms();
         // wt has been waking sessions for due checks for a while: this
         // check came due since.
-        let began = start - wt_automations::CHECK_WAKE_SEED_WINDOW_MS;
+        let began = start - 1;
         ledger
             .seed_check_wakes(
                 &[],

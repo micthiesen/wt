@@ -22,9 +22,7 @@ use wt_platform::lock::{FileLock, LockError};
 const RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// When this ledger first met a build that wakes sessions for due checks.
 const CHECK_WAKES_FROM: &str = "checkWakesFrom";
-/// How long after that a check found due is taken as due all along. Landing
-/// and deploy facts arrive over the first passes, so one pass cannot tell.
-pub const CHECK_WAKE_SEED_WINDOW_MS: i64 = 10 * 60 * 1000;
+
 pub const BREAKER_LIMIT: u64 = 2;
 /// Coarsest file timestamp wt can meet (FAT stores two-second mtimes).
 const STAMP_SETTLE_SECS: i64 = 2;
@@ -303,24 +301,26 @@ impl LedgerSnapshot {
         serde_json::from_value(self.view.fired.get(key)?.get("ownerLanding")?.clone()).ok()
     }
 
-    /// Whether a check found due at `now_ms` was due before wt began waking
-    /// sessions for due checks: its session is not prompted for it. True
-    /// until the ledger has recorded that beginning, and for
-    /// [`CHECK_WAKE_SEED_WINDOW_MS`] after it.
-    pub fn seeding_check_wakes(&self, now_ms: i64) -> bool {
-        self.view
-            .check_wakes_from
-            .is_none_or(|from| now_ms.saturating_sub(from) < CHECK_WAKE_SEED_WINDOW_MS)
+    /// When wt began waking sessions for due checks, as this ledger first
+    /// recorded it. A check that was due before then is one a person was
+    /// already handling, and its session is not prompted for it.
+    pub fn check_wakes_from(&self) -> Option<i64> {
+        self.view.check_wakes_from
+    }
+
+    /// Whether `key`'s fire was sent to its target, proven or not.
+    pub fn sent(&self, key: &str) -> bool {
+        self.view.fired.get(key).is_some_and(|entry| {
+            matches!(
+                entry.get("state").and_then(Value::as_str),
+                Some("delivered" | "ambiguous")
+            )
+        })
     }
 
     /// Whether the ledger holds any record of `key`, whatever its state.
     pub fn recorded(&self, key: &str) -> bool {
         self.view.fired.contains_key(key)
-    }
-
-    /// Whether [`AutomationLedger::seed_check_wakes`] has run at all.
-    pub fn check_wakes_begun(&self) -> bool {
-        self.view.check_wakes_from.is_some()
     }
 
     /// Whether `key` was recorded no longer than `window_ms` ago. An entry
@@ -774,6 +774,40 @@ impl AutomationLedger {
                             }),
                         );
                     }
+                }
+            }
+        })
+        .await
+    }
+
+    /// Keep two rules from prompting one session for one check. `prompted`
+    /// are the prompt keys of checks whose session has now been prompted
+    /// (see `CheckFire::prompt_key`); `repeats` are the fires (keys, rule,
+    /// slug) of another rule for a check already prompted, marked skipped.
+    pub async fn record_check_prompts(
+        &self,
+        prompted: &[(String, String)],
+        repeats: &[(Vec<String>, String, String)],
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.mutate("record check prompts", cancellation, |root| {
+            let fired = ensure_object(root, "fired");
+            for (key, slug) in prompted {
+                // No rule id: this is a note that the prompt was sent, not
+                // a fire of its own, and is listed as none.
+                fired
+                    .entry(key.clone())
+                    .or_insert_with(|| json!({"state":"delivered", "at":now_ms, "slug":slug}));
+            }
+            for (keys, rule_id, slug) in repeats {
+                for key in keys {
+                    fired.entry(key.clone()).or_insert_with(|| {
+                        json!({
+                            "state":"skipped", "at":now_ms, "ruleId":rule_id, "slug":slug,
+                            "reason":"its session was already prompted for this check",
+                        })
+                    });
                 }
             }
         })

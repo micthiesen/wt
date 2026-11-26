@@ -235,8 +235,8 @@ impl OwedItem {
 
     /// When the item is due or cleared, in words for a reader now:
     /// `due since 11:36`, `at 17:00`, `when #3806 in production`,
-    /// `due in staging`, `awaiting production deploy`, `once in
-    /// production, not before Nov 27 18:12`, `until a person clears it`.
+    /// `due in staging`, `awaiting production deploy`, `in production, not
+    /// before Nov 27 18:12`, `until a person clears it`.
     pub fn when_words(&self, clock: LocalClock) -> String {
         match &self.when {
             OwedWhen::Person => "until a person clears it".into(),
@@ -259,7 +259,7 @@ impl OwedItem {
                 let waits = if self.awaiting_deploy {
                     format!("awaiting {stage} deploy")
                 } else {
-                    format!("once in {stage}")
+                    format!("in {stage}")
                 };
                 match not_before_ms.filter(|at| *at > clock.now_ms) {
                     Some(at) => {
@@ -497,9 +497,10 @@ pub fn owes_anything(
         || !due.is_empty()
 }
 
-/// One removal hazard per thing [`owes_anything`] counts, each reading
-/// `still owes: <headline> (<when in words>)`. Empty exactly when
-/// [`owes_anything`] is false. The only source of that text.
+/// The removal hazard for what [`owes_anything`] counts: one line,
+/// `still owes: <headline> (<when in words>); <headline> (...)`, in the
+/// order of [`owed_items`], with the words every other surface uses. Empty
+/// exactly when [`owes_anything`] is false. The only source of that text.
 ///
 /// A hazard says what removal would lose, not how urgent it is: a check
 /// reads `in staging` wherever its landing stands, so the text a removal
@@ -510,7 +511,7 @@ pub fn owed_hazards(
     due: &[OwedRecord],
     clock: LocalClock,
 ) -> Vec<String> {
-    owed_items(record, &Landing::NONE, watches, due, clock.now_ms)
+    let items = owed_items(record, &Landing::NONE, watches, due, clock.now_ms)
         .iter()
         .filter_map(|item| {
             if item.kind == OwedKind::Gate {
@@ -521,22 +522,19 @@ pub fn owed_hazards(
                     Some(watch.id.as_str()) == item.id.as_deref() && watch.wakes_owner()
                 })?;
                 return Some(format!(
-                    "{OWED_HAZARD}: {} ({})",
+                    "{} ({})",
                     watch::headline(watch.then.wake.as_deref()?),
                     watch::when_described(&watch.when, clock)
                 ));
             }
-            let when = match (&item.when, item.stage) {
-                (OwedWhen::Stage { .. }, Some(stage)) => item.when_words(clock).replacen(
-                    &format!("once in {}", stage.as_str()),
-                    &format!("in {}", stage.as_str()),
-                    1,
-                ),
-                _ => item.when_words(clock),
-            };
-            Some(format!("{OWED_HAZARD}: {} ({when})", item.headline()))
+            Some(format!("{} ({})", item.headline(), item.when_words(clock)))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("{OWED_HAZARD}: {}", items.join("; "))]
+    }
 }
 
 #[cfg(test)]

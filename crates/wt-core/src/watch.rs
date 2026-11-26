@@ -344,7 +344,17 @@ impl WatchCondition {
         let phrase = self.cond.phrase(local);
         match self.delay {
             Some(delay) if self.cond.revocable() => format!("{phrase} for {delay}"),
-            Some(delay) => format!("{delay} after {phrase}"),
+            // The row's own stage reads "in production" or "on staging" on
+            // its own; after a delay it is the moment it got there.
+            Some(delay) => match phrase
+                .strip_prefix("in ")
+                .or_else(|| phrase.strip_prefix("on "))
+            {
+                Some(stage) if matches!(self.cond, Condition::Own(_)) => {
+                    format!("{delay} after it reaches {stage}")
+                }
+                _ => format!("{delay} after {phrase}"),
+            },
             None => phrase,
         }
     }
@@ -1157,14 +1167,20 @@ pub fn when_phrase(what: &str) -> String {
     }
 }
 
-/// The first line with anything on it of a prompt or a notification text,
-/// cut to 80 cells.
+/// The first line with anything on it of a prompt, a notification text or a
+/// check's steps, cut to 80 cells. Stored text is often one line with its
+/// numbered steps inline after ` STEPS:`; the headline stops before them,
+/// so every surface names a check by what it proves.
 pub fn headline(text: &str) -> String {
     let line = text
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
+    let line = match line.find(" STEPS:") {
+        Some(at) if !line[..at].trim().is_empty() => line[..at].trim_end(),
+        _ => line,
+    };
     if line.chars().count() > 80 {
         format!("{}…", line.chars().take(79).collect::<String>())
     } else {

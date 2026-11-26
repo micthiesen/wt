@@ -132,13 +132,62 @@ fn evaluate_checks_due(
                 key,
                 &format!("verify in {}: {}", stage.as_str(), check.steps),
             );
+            let rest = fire.fire_keys[0]
+                .strip_prefix(&format!("{}:verify:{}:", rule.id, row.slug))
+                .unwrap_or_default()
+                .to_owned();
+            let prompts_session = rule.id == CHECK_RULE_ID
+                || action_traits(rule, context)
+                    .is_some_and(|traits| traits.audience == ActionAudience::Session);
             fire.check = Some(CheckFire {
                 stage,
+                prompt_key: prompts_session.then(|| {
+                    format!(
+                        "check-prompt:{}:{}:{rest}",
+                        row.slug,
+                        row.created_at.as_deref().unwrap_or_default()
+                    )
+                }),
+                due_since_ms: check_due_since(row, context, stage, &check),
                 steps: check.steps,
             });
             fire
         })
         .collect()
+}
+
+/// Since when a due check has been due, where that is recorded. A stage
+/// with a deploy probe came due when the probe reported the deploy, and a
+/// production check behind a separate production branch when the landing
+/// was promoted; neither moment is kept. Without those the check came due
+/// when its pull request merged, or later if the status owing it or its
+/// not-before is later.
+fn check_due_since(
+    row: &AutomationRow,
+    context: &AutomationEvalContext,
+    stage: wt_core::VerifyStage,
+    check: &wt_core::Check,
+) -> Option<i64> {
+    let probed = match stage {
+        wt_core::VerifyStage::Staging => row.deploys.staging.is_some(),
+        wt_core::VerifyStage::Production => row.deploys.production.is_some(),
+    };
+    if probed || (stage == wt_core::VerifyStage::Production && context.separate_production) {
+        return None;
+    }
+    let merged = row
+        .pr
+        .as_ref()
+        .filter(|pr| pr.state == "MERGED")
+        .and_then(|pr| pr.merged_at_ms)?;
+    let asserted = row
+        .work
+        .as_ref()
+        .and_then(|work| wt_core::parse_iso_millis(&work.at));
+    [Some(merged), asserted, check.not_before_ms]
+        .into_iter()
+        .flatten()
+        .max()
 }
 
 /// wt's own wake for each due check, where no configured rule already
@@ -1382,7 +1431,9 @@ mod tests {
             fires[0].check,
             Some(CheckFire {
                 stage: VerifyStage::Staging,
-                steps: "check staging".into()
+                steps: "check staging".into(),
+                prompt_key: None,
+                due_since_ms: None,
             })
         );
         let staging_key = fires[0].fire_keys[0].clone();
@@ -1662,6 +1713,7 @@ mod tests {
                 changes_requested: true,
                 auto_merge: false,
                 merge_queued: None,
+                merged_at_ms: None,
             }),
             ..AutomationRow::default()
         }

@@ -210,20 +210,23 @@ fn surprising(row: &BoardRow, reason: &str) -> bool {
 }
 
 /// The one reason a row that still owes something is kept:
-/// `still owes: <headline>`, counting what else it owes. A merge gate alone
+/// `still owes: <headline> (<when>)`, counting what else it owes. A merge gate alone
 /// holds nothing.
 fn owed_reason(row: &BoardRow) -> Option<String> {
     let mut holding = row.owes.iter().filter(|item| item.holds_cleanup());
     let first = holding.next()?;
     let more = holding.count();
-    Some(if more == 0 {
-        format!("{}: {}", wt_core::OWED_HAZARD, first.headline)
+    // The words the removal hazard uses, so the review and the refusal
+    // read alike.
+    let what = if first.when.trim().is_empty() {
+        first.headline.clone()
     } else {
-        format!(
-            "{}: {} (+{more} more)",
-            wt_core::OWED_HAZARD,
-            first.headline
-        )
+        format!("{} ({})", first.headline, first.when)
+    };
+    Some(if more == 0 {
+        format!("{}: {what}", wt_core::OWED_HAZARD)
+    } else {
+        format!("{}: {what} (+{more} more)", wt_core::OWED_HAZARD)
     })
 }
 

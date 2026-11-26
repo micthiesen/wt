@@ -302,6 +302,7 @@ pub async fn prepare(
             } else {
                 github.merge_queue_complete.then_some(false)
             },
+            merged_at_ms: pr.merged_at.as_deref().and_then(wt_core::parse_iso_millis),
         });
         let conflict = github.prs.get(&branch).and_then(|pr| {
             pr.mergeable.as_ref().map(|mergeable| AutomationConflict {

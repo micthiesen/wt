@@ -1218,10 +1218,11 @@ async fn verify_checks(
     };
     super::owed::print_checks_closed(&slug, &closed, &remaining, Some(&written.state), false);
     report_cancelled_watches(&cancelled_watches);
-    if remaining.is_empty()
-        && let Some(note) = &written.note
-    {
-        println!("  note: {note}");
+    if remaining.is_empty() {
+        report_replaced_note(previous.note.as_deref(), written.note.as_deref(), append);
+        if let Some(note) = &written.note {
+            println!("  note: {note}");
+        }
     }
     let owed = super::owed::read(ctx, record).await?;
     print_owed(ctx, record, &owed).await;
@@ -1555,7 +1556,7 @@ fn cleared_gate_line(
     })
 }
 
-fn report_replaced_note(previous: Option<&str>, current: Option<&str>, append: bool) {
+pub(crate) fn report_replaced_note(previous: Option<&str>, current: Option<&str>, append: bool) {
     if !append && previous.is_some() && previous != current {
         println!(
             "  previous note (now gone): {}",

@@ -45,7 +45,10 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
     let now = now_ms();
     // The PR column is the only network read of the table; it overlaps the
     // local reads instead of following them.
-    let wants_prs = !args.json && !live.is_empty();
+    // With GitHub switched off nothing is read from it, and nothing is said
+    // of a read that was never made.
+    let github_off = std::env::var("WT_GITHUB").as_deref() == Ok("off");
+    let wants_prs = !args.json && !live.is_empty() && !github_off;
     let (stored, locks, prs) = tokio::join!(
         ctx.database.call(move |store| {
             Ok((

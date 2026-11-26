@@ -168,7 +168,18 @@ or 30 when both stages have deploy probes). Configuration cannot use the id.
   row), that rule owns the delivery and `wt.check` stays silent, so no check
   is prompted twice. A rule that tells the person (`builtin:notify`), briefs
   the manager, or does not accept the row leaves the session unprompted, so
-  `wt.check` still fires there.
+  `wt.check` still fires there. Whichever of the two prompted a session for
+  a check is the only one that does: adding or removing such a rule later
+  does not prompt again for the same slug, worktree, stage, steps and
+  not-before (the ledger keeps a `check-prompt:` note of it).
+- **Not for checks that were already due when wt began doing this.** The
+  ledger records once when this build first ran (`checkWakesFrom`). Every
+  check due on that pass is passed over, and so is one found due later whose
+  pull request merged, status was asserted and not-before all fall before
+  that moment. Where the moment a check came due is not recorded (a stage
+  with a deploy probe, a promotion to a separate production branch, a merge
+  with no pull request) its session is woken: a second prompt costs less
+  than a missed one.
 
 ## Built-in runs
 

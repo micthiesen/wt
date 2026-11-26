@@ -702,8 +702,12 @@ pub(crate) fn cluster(row: &BoardRow, policy: &DisplayPolicy) -> Vec<ClusterSlot
                     4,
                 );
             }
-            Some((mark, _)) => push(mark.glyph, dim.unwrap_or(mark.color), 2),
-            None => {}
+            // A landed row's marker already wears its phase; saying it
+            // again here would be one signal twice.
+            Some((mark, _)) if row.owed_phase.is_none() => {
+                push(mark.glyph, dim.unwrap_or(mark.color), 2);
+            }
+            Some(_) | None => {}
         }
         if let Some(watch) = watch_badge(&row.watches) {
             push(watch.glyph, dim.unwrap_or(watch.color), 2);
@@ -1142,6 +1146,19 @@ mod tests {
             ..Default::default()
         };
         assert!(cluster(&row, &hidden).is_empty());
+        // Once landed the marker on the left carries the phase: the mark
+        // stays only as the count of several things due.
+        row.watches.clear();
+        row.owed_phase = Some(wt_core::OwedPhase::Due);
+        assert_eq!(shown(&row), [(format!("{} 2", glyphs::DOT), theme::ERR)]);
+        row.owes.truncate(1);
+        assert!(shown(&row).is_empty());
+        row.owes = vec![OwedView::new(OwedKind::Step, OwedState::Waiting, "rerun")];
+        row.owes[0].conditions = vec![crate::WatchConditionView::default()];
+        row.owed_phase = Some(wt_core::OwedPhase::Waiting);
+        assert!(shown(&row).is_empty());
+        row.owed_phase = None;
+        assert_eq!(shown(&row).len(), 1);
     }
 
     #[test]

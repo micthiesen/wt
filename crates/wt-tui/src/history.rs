@@ -263,6 +263,23 @@ pub(crate) fn work_state(value: &str) -> Option<WorkState> {
 /// The row marker, mirroring the live list: proven landings take the
 /// release shape in the work-status hue; otherwise the outcome the record
 /// captured (merged, closed, dropped, gone, still open), else a dim trash.
+/// Where a removed row stands with what its record still owes: due,
+/// waiting, or nothing.
+fn owed_standing(owes: &[crate::OwedView]) -> (&'static str, &'static str, Color) {
+    if owes.iter().any(|item| item.due()) {
+        let overdue = owes.iter().any(|item| item.overdue);
+        (
+            glyphs::OWED_DUE,
+            "due",
+            if overdue { theme::ERR } else { theme::WARN },
+        )
+    } else if owes.is_empty() {
+        (glyphs::OWED_DONE, "owes nothing", theme::OK)
+    } else {
+        (glyphs::OWED_CLOCK, "waiting", theme::FG_MID)
+    }
+}
+
 fn status_badge(row: &crate::RemovedHistoryRow) -> Badge {
     let outcome = outcome(row);
     // Finished work (verified, dropped) is gray in the list, but a landed
@@ -511,7 +528,12 @@ fn record_lines(
             theme::WARN,
         );
     }
-    if let Some(state) = &row.work_state {
+    // A landed row stands where what it still owes puts it; the state it
+    // asserted before merging is in the history below.
+    if row.landed_on.is_some() || !row.owes.is_empty() {
+        let (glyph, text, color) = owed_standing(&row.owes);
+        field(&mut lines, "work", &format!("{glyph}  {text}"), color);
+    } else if let Some(state) = &row.work_state {
         let parsed = work_state(state);
         field(
             &mut lines,
@@ -527,17 +549,20 @@ fn record_lines(
         field(&mut lines, "blocked", what, theme::WARN);
     }
     for (index, item) in row.owes.iter().enumerate() {
-        // A step that came due is closed by its id: `wt done <id> --slug`.
-        let id = item
-            .id
-            .as_deref()
-            .filter(|_| item.due() && item.kind == wt_core::OwedKind::Step)
-            .map(|id| format!(" · {id}"))
+        // The worktree is gone, so closing names it: a due step by its id
+        // and a check, due or not, by its stage.
+        let target = match item.kind {
+            wt_core::OwedKind::Step if item.due() => item.id.clone(),
+            wt_core::OwedKind::Check => item.stage.map(|stage| stage.as_str().to_owned()),
+            _ => None,
+        };
+        let close = target
+            .map(|target| format!(" · wt done {target} --slug {}", row.slug))
             .unwrap_or_default();
         field(
             &mut lines,
             if index == 0 { "owes" } else { "" },
-            &format!("{} ({}){id}", item.headline, item.when),
+            &format!("{} ({}){close}", item.headline, item.when),
             if item.due() { theme::WARN } else { theme::FG },
         );
     }
@@ -634,9 +659,12 @@ mod tests {
         assert_eq!(lines[5].spans[1].content, format!("{}  ", glyphs::TRASH));
 
         let record = record_lines(&rows[0], Vec::new(), 60);
+        // Landed with nothing left on its record: that is where it stands,
+        // not the state it asserted before merging.
+        assert!(!record.iter().any(|line| text(line).contains("ready")));
         let work = record
             .iter()
-            .find(|line| text(line).contains("ready"))
+            .find(|line| text(line).contains("owes nothing"))
             .unwrap();
         assert_eq!(work.spans[1].style.fg, Some(theme::OK));
     }

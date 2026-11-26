@@ -485,20 +485,18 @@ impl OwedBlock {
     /// Where a landed row with this phase and list belongs. A waiting row is
     /// filed by the first thing removal would lose.
     pub fn of(phase: wt_core::OwedPhase, owes: &[OwedView]) -> Self {
-        match phase {
-            wt_core::OwedPhase::Due => Self::Due,
-            wt_core::OwedPhase::Done => Self::Done,
-            wt_core::OwedPhase::Waiting => {
-                match owes
-                    .iter()
-                    .find(|item| item.holds_cleanup())
-                    .and_then(|item| item.stage)
-                {
-                    Some(wt_core::VerifyStage::Staging) => Self::WaitingStaging,
-                    Some(wt_core::VerifyStage::Production) => Self::WaitingProduction,
-                    None => Self::Waiting,
-                }
-            }
+        let first = owes.iter().find(|item| item.holds_cleanup());
+        Self::placed(phase, first.and_then(|item| item.stage))
+    }
+
+    /// [`Self::of`] from the stage of the first thing removal would lose.
+    pub fn placed(phase: wt_core::OwedPhase, first_stage: Option<wt_core::VerifyStage>) -> Self {
+        match (phase, first_stage) {
+            (wt_core::OwedPhase::Due, _) => Self::Due,
+            (wt_core::OwedPhase::Done, _) => Self::Done,
+            (_, Some(wt_core::VerifyStage::Staging)) => Self::WaitingStaging,
+            (_, Some(wt_core::VerifyStage::Production)) => Self::WaitingProduction,
+            (_, None) => Self::Waiting,
         }
     }
 }

@@ -1085,8 +1085,8 @@ fn status_header(row: &BoardRow, times: &Times) -> Option<(Spans, ratatui::style
     Some((header, color))
 }
 
-/// A landed row's header: the first thing due, what it waits for and how
-/// much it owes, or that it is done.
+/// A landed row's header: that something is due and how much, what it
+/// waits for and how much it owes, or that it is done.
 fn phase_header(
     phase: wt_core::OwedPhase,
     owes: &[OwedView],
@@ -1094,15 +1094,18 @@ fn phase_header(
 ) -> (&'static str, String, ratatui::style::Color) {
     let overdue = owes.iter().any(|item| item.overdue);
     match phase {
+        // The list right below says what is due; the header counts.
         wt_core::OwedPhase::Due => {
-            let headline = owes
-                .iter()
-                .find(|item| item.due())
-                .map(|item| item.headline.trim())
-                .filter(|headline| !headline.is_empty());
+            let due = owes.iter().filter(|item| item.due()).count();
+            let waiting = owes.len() - due;
+            let text = match (owes.len(), waiting) {
+                (0 | 1, _) => "due".to_owned(),
+                (_, 0) => format!("due · {due} due"),
+                _ => format!("due · {due} due · {waiting} waiting"),
+            };
             (
                 glyphs::OWED_DUE,
-                headline.map_or_else(|| "due".to_owned(), |headline| format!("due · {headline}")),
+                text,
                 if overdue { theme::ERR } else { theme::WARN },
             )
         }
@@ -1278,8 +1281,10 @@ fn owed_when(item: &OwedView, times: &Times) -> Spans {
         wt_core::OwedKind::Gate => plain("before merge".to_owned(), color),
         wt_core::OwedKind::Check if item.overdue => plain(format!("overdue in {stage}"), color),
         wt_core::OwedKind::Check if item.due() => plain(format!("due in {stage}"), color),
+        // Put off: the host's words, the same ones `wt owed` prints.
         wt_core::OwedKind::Check => plain(
             match &item.not_before_in {
+                Some(_) if !item.when.trim().is_empty() => item.when.clone(),
                 Some(wait) => format!("in {stage} +{wait}"),
                 None => format!("in {stage}"),
             },
@@ -1394,6 +1399,10 @@ fn owed_text(
                     color,
                 ));
             }
+            // The hint is the first thing to go when the line would wrap.
+            if used + spans_width(&spans) + spans_width(&suffix) > width {
+                suffix.remove(0);
+            }
             spans.extend(suffix);
         }
         wt_core::OwedKind::Step => {
@@ -1426,7 +1435,7 @@ fn owed_text(
             // What `wt done` takes.
             if let Some(id) = item.id.as_deref().filter(|_| item.due()) {
                 suffix.push(Span::raw("\u{a0}\u{a0} "));
-                suffix.push(Span::styled(id.to_owned(), theme::fg(theme::FG)));
+                suffix.push(Span::styled(format!("wt done {id}"), theme::dim()));
             }
             // The first line, as its host prepared it.
             let headline = item.headline.as_str();
@@ -2849,10 +2858,10 @@ mod tests {
         assert_eq!(
             lines[..5],
             [
-                "● due · confirm prod logs, then open the PR retiring the old path · risk low · 2h ago"
+                "● due · 1 due · 1 waiting · risk low · 2h ago"
                     .to_owned(),
                 "owes".to_owned(),
-                "  ●  due 11:36      confirm prod logs, then open the PR retiring the old path   93co6q"
+                "  ●  due 11:36      confirm prod logs, then open the PR retiring the old path   wt done 93co6q"
                     .to_owned(),
                 "  ○  in production  check · 2 steps · V expands".to_owned(),
                 format!("{bell}  tells you when ○ in production"),
@@ -2883,8 +2892,9 @@ mod tests {
         row.owes[0].overdue = true;
         let styled = work_status_block(&row, false, &Times::new(), 200);
         let lines = plain(&styled);
+        // The header counts; the lines below it say what.
         assert!(
-            lines[0].starts_with("● due · check: open /health"),
+            lines[0].starts_with("● due · 2 due · 1 waiting · "),
             "{}",
             lines[0]
         );
@@ -3040,7 +3050,7 @@ mod tests {
             lines[1..10],
             [
                 "owes".to_owned(),
-                "  ●  due                  confirm the dashboard · delivery not confirmed   abc234"
+                "  ●  due                  confirm the dashboard · delivery not confirmed   wt done abc234"
                     .to_owned(),
                 "  ●  due in staging       check · open /health · V expands".to_owned(),
                 format!(
@@ -3096,6 +3106,26 @@ mod tests {
                 format!("  {slash}  before merge  QA sign-off · clears when ✓ merged · delivering"),
             ]
         );
+    }
+
+    #[test]
+    fn the_expand_hint_is_dropped_before_a_check_line_wraps() {
+        let mut row = landed(
+            OwedPhase::Due,
+            vec![check(
+                VerifyStage::Production,
+                OwedState::Due,
+                "1. export an invoice\n2. open the CSV",
+            )],
+        );
+        row.owes[0].awaiting_deploy = false;
+        let line = |width| block(&row, width)[2].clone();
+        assert_eq!(
+            line(200),
+            "  ●  due in production  check · 2 steps · V expands"
+        );
+        // Too narrow for the hint: the line stays one line without it.
+        assert_eq!(line(44), "  ●  due in production  check · 2 steps");
     }
 
     #[test]
@@ -3178,7 +3208,7 @@ mod tests {
         // A long prompt is cut so its line keeps the id in sight.
         row.owes[0].what = "x".repeat(300);
         let lines = block(&row, 200);
-        assert!(lines[2].ends_with("   93co6q") && lines[2].width() < 130);
+        assert!(lines[2].ends_with("   wt done 93co6q") && lines[2].width() < 130);
     }
 
     #[test]
