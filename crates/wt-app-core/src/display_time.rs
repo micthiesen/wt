@@ -152,12 +152,24 @@ fn history_timestamps(board: &Board) -> BTreeSet<u64> {
         .flat_map(|row| &row.watches)
         .flat_map(|watch| &watch.conditions)
         .filter_map(|cond| cond.at_ms);
+    // What a row owes: the time a step came due and the instants it waits for.
+    let owed = board
+        .rows
+        .iter()
+        .flat_map(|row| &row.owes)
+        .flat_map(|item| {
+            item.conditions
+                .iter()
+                .filter_map(|cond| cond.at_ms)
+                .chain(item.due_at_ms)
+        });
     let mut timestamps: BTreeSet<u64> = board
         .row_history
         .values()
         .flatten()
         .map(|event| event.at_ms)
         .chain(waited_for)
+        .chain(owed)
         .filter(|timestamp| *timestamp > 0)
         .collect();
     while timestamps.len() > MAX_HISTORY_TIMESTAMPS {
@@ -338,6 +350,27 @@ mod tests {
                     ],
                     ..Default::default()
                 }],
+                owes: vec![
+                    wt_tui::OwedView {
+                        due_at_ms: Some(1_750_000_000_000),
+                        ..wt_tui::OwedView::new(
+                            wt_core::OwedKind::Step,
+                            wt_core::OwedState::Due,
+                            "confirm the logs",
+                        )
+                    },
+                    wt_tui::OwedView {
+                        conditions: vec![wt_tui::WatchConditionView {
+                            at_ms: Some(1_850_000_000_000),
+                            ..Default::default()
+                        }],
+                        ..wt_tui::OwedView::new(
+                            wt_core::OwedKind::Step,
+                            wt_core::OwedState::Waiting,
+                            "rerun the check",
+                        )
+                    },
+                ],
                 ..Default::default()
             }],
             row_history: [(
@@ -354,7 +387,12 @@ mod tests {
             super::history_timestamps(&board)
                 .into_iter()
                 .collect::<Vec<_>>(),
-            [1_700_000_000_000, 1_800_000_000_000]
+            [
+                1_700_000_000_000,
+                1_750_000_000_000,
+                1_800_000_000_000,
+                1_850_000_000_000
+            ]
         );
     }
 

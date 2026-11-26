@@ -109,14 +109,16 @@ fn the_list_is_ordered_due_then_gate_then_waiting_by_what_it_waits_for() {
             NOON - 2 * HOUR_MS,
         ),
     ];
-    let items = owed_items(Some(&record), &STAGED, &watches, &due, NOON);
+    // Before the row's own work lands: nothing of a check is due, and the
+    // gate still holds the merge.
+    let items = owed_items(Some(&record), &Landing::NONE, &watches, &due, NOON);
     assert_eq!(
         brief(&items),
         [
-            "due check check: open the page (due in staging)",
             "due step confirm prod logs (due since 10:00)",
             "due step open the follow-up PR (due since 11:00)",
             "waiting gate the prod secret is missing (clears when #3806 in production)",
+            "waiting check check: open the page (once in staging)",
             "waiting check check: watch the logs (once in production)",
             "waiting step retire the flag (when in production)",
             "waiting step rotate the key (when check vault=X)",
@@ -124,28 +126,46 @@ fn the_list_is_ordered_due_then_gate_then_waiting_by_what_it_waits_for() {
             "waiting step rerun the renewal check (at 17:00)",
         ]
     );
-    assert_eq!(owed_phase(&items, true), Some(OwedPhase::Due));
     assert_eq!(owed_phase(&items, false), None);
-    // What wt done takes: a stage for a check, an id for a due step.
-    assert_eq!(items[0].done_target().as_deref(), Some("staging"));
-    assert_eq!(items[1].done_target().as_deref(), Some("erly22"));
-    assert_eq!(items[3].done_target(), None);
-    assert_eq!(items[5].done_target(), None);
-    assert_eq!(items[3].id.as_deref(), Some("gate22"));
-    assert_eq!(items[5].stage, Some(VerifyStage::Production));
-    assert_eq!(items[1].by.as_deref(), Some("one"));
+    assert_eq!(items[2].done_target(), None);
+    assert_eq!(items[2].id.as_deref(), Some("gate22"));
     // The wake that follows the gate is the gate's item, not a step.
-    assert!(
-        items
-            .iter()
-            .all(|item| item.id.as_deref() != Some("tell22"))
-    );
     assert_eq!(
         items
             .iter()
             .filter(|item| item.id.as_deref() == Some("gate22"))
             .count(),
         1
+    );
+    // Landed: the staging check is due, and the gate is no longer owed.
+    // The wake set to follow it is the step that remains of it.
+    let items = owed_items(Some(&record), &STAGED, &watches, &due, NOON);
+    assert_eq!(
+        brief(&items),
+        [
+            "due check check: open the page (due in staging)",
+            "due step confirm prod logs (due since 10:00)",
+            "due step open the follow-up PR (due since 11:00)",
+            "waiting check check: watch the logs (once in production)",
+            "waiting step retire the flag (when in production)",
+            "waiting step rotate the key (when check vault=X)",
+            "waiting step merge it (when #3806 in production)",
+            "waiting step look at the queue (at 13:00)",
+            "waiting step rerun the renewal check (at 17:00)",
+        ]
+    );
+    assert_eq!(owed_phase(&items, true), Some(OwedPhase::Due));
+    // What wt done takes: a stage for a check, an id for a due step.
+    assert_eq!(items[0].done_target().as_deref(), Some("staging"));
+    assert_eq!(items[1].done_target().as_deref(), Some("erly22"));
+    assert_eq!(items[4].done_target(), None);
+    assert_eq!(items[4].stage, Some(VerifyStage::Production));
+    assert_eq!(items[1].by.as_deref(), Some("one"));
+    // A watch that only tells the person is not owed.
+    assert!(
+        items
+            .iter()
+            .all(|item| item.id.as_deref() != Some("tell22"))
     );
 }
 
@@ -161,7 +181,11 @@ fn a_gate_nobody_watches_waits_for_a_person_and_holds_no_cleanup() {
     assert_eq!(items[0].when, OwedWhen::Person);
     assert!(!owes_anything(Some(&record), &[], &[]));
     assert!(owed_hazards(Some(&record), &[], &[], UTC).is_empty());
-    assert_eq!(owed_phase(&items, true), Some(OwedPhase::Waiting));
+    // Once the row's own work has landed the merge it held back has
+    // happened: the gate is not owed, and the phase agrees with cleanup.
+    let landed = owed_items(Some(&record), &STAGED, &[], &[], NOON);
+    assert_eq!(landed, []);
+    assert_eq!(owed_phase(&landed, true), Some(OwedPhase::Done));
     // A verified or dropped record has no gate and owes no check.
     record.state = WorkState::Verified;
     record.checks.set(VerifyStage::Staging, Check::new("stale"));
@@ -260,10 +284,49 @@ fn cleanup_is_held_by_checks_pending_wakes_and_due_steps_alike() {
         std::slice::from_ref(&gate),
         &[]
     ));
+    // Removal would lose the wake, so the hazard names it; the gate holds
+    // nothing. The text is the same before and after landing.
     assert_eq!(
-        owed_hazards(Some(&gated), &[gate], &[], UTC),
-        ["still owes: the release (clears when next production release)"]
+        owed_hazards(Some(&gated), std::slice::from_ref(&gate), &[], UTC),
+        ["still owes: ship it (when next production release)"]
     );
+    // Before landing the wake is part of the gate's item. After it the gate
+    // is gone from the list and the wake is the step that is left, so a
+    // landed row is cleanable exactly when its list is empty.
+    let before = owed_items(
+        Some(&gated),
+        &Landing::NONE,
+        std::slice::from_ref(&gate),
+        &[],
+        NOON,
+    );
+    assert_eq!(
+        brief(&before),
+        ["waiting gate the release (clears when next production release)"]
+    );
+    let after = owed_items(
+        Some(&gated),
+        &STAGED,
+        std::slice::from_ref(&gate),
+        &[],
+        NOON,
+    );
+    assert_eq!(
+        brief(&after),
+        ["waiting step ship it (when next production release)"]
+    );
+    assert_eq!(owed_phase(&after, true), Some(OwedPhase::Waiting));
+    // A gate watch that wakes nobody holds nothing once the row landed.
+    gate.then.wake = None;
+    let after = owed_items(
+        Some(&gated),
+        &STAGED,
+        std::slice::from_ref(&gate),
+        &[],
+        NOON,
+    );
+    assert_eq!(after, []);
+    assert!(!owes_anything(Some(&gated), &[gate], &[]));
 }
 
 #[test]
@@ -271,11 +334,6 @@ fn only_a_wake_delivered_before_landing_closes_on_delivery() {
     assert!(OwnerLanding::Landed.owes());
     assert!(OwnerLanding::Unknown.owes());
     assert!(!OwnerLanding::NotLanded.owes());
-    assert_eq!(OwnerLanding::from_base(None), OwnerLanding::Unknown);
-    assert_eq!(
-        OwnerLanding::from_base(Some(false)),
-        OwnerLanding::NotLanded
-    );
 }
 
 #[test]

@@ -267,13 +267,6 @@ impl Store {
         Ok(self.finish_action(id, action, false, None)? != WakeCompletion::NotOwed)
     }
 
-    /// [`Self::complete_action`] for a wake that was sent without proof it
-    /// reached the session. It is not sent again, and its history says so.
-    /// Like [`Self::complete_action`], it closes the wake on delivery.
-    pub fn complete_unconfirmed_wake(&mut self, id: &str) -> Result<bool, StoreError> {
-        Ok(self.finish_action(id, WatchAction::Wake, true, None)? != WakeCompletion::NotOwed)
-    }
-
     /// Record that a watch's wake was delivered. Delivery is not
     /// completion: when the worktree's own work had landed (or may have:
     /// `landing` unknown), the wake becomes a due step that stays owed

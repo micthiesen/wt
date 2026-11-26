@@ -17,7 +17,10 @@ use wt_ops::commands::resolve::resolve_worktree;
 use wt_store::{CheckTargets, ChecksClosed, RemovedChecksClosed, RemovedWorktree};
 use wt_vcs::WorktreeRecord;
 
-use super::watch::{agent, author, clock};
+use super::{
+    landing::{self, RowLanding, Want},
+    watch::{agent, author, clock},
+};
 
 /// One row's owed list, as every surface of the CLI shows it.
 pub(crate) struct RowOwed {
@@ -26,11 +29,18 @@ pub(crate) struct RowOwed {
     pub phase: Option<OwedPhase>,
     /// Watches that only tell the person: not owed by the row.
     pub tells: usize,
+    /// The landing the list was derived under.
+    pub landing: RowLanding,
 }
 
 /// What the live worktree `slug` owes under `landing`, from one state
 /// snapshot.
-pub(crate) fn derive(state: &Value, slug: &str, landing: Landing, now_ms: i64) -> RowOwed {
+///
+/// A row whose landing is unknown is listed as not landed and has no phase:
+/// its reader is told the landing is unknown instead of a phase that may
+/// be wrong.
+pub(crate) fn derive(state: &Value, slug: &str, read: RowLanding, now_ms: i64) -> RowOwed {
+    let landing = read.shown();
     let stored = &state["slugs"][slug];
     let record = wt_core::parse_work_status(&stored["work"]);
     let created_at = stored["createdAt"].as_str();
@@ -38,7 +48,8 @@ pub(crate) fn derive(state: &Value, slug: &str, landing: Landing, now_ms: i64) -
     let due = wt_core::owed::row_due(&wt_store::stored_owed(state), slug, created_at);
     let items = wt_core::owed_items(record.as_ref(), &landing, &watches, &due, now_ms);
     RowOwed {
-        phase: wt_core::owed_phase(&items, landing.base),
+        phase: wt_core::owed_phase(&items, landing.base).filter(|_| !read.is_unknown()),
+        landing: read,
         tells: watches
             .iter()
             .filter(|watch| {
@@ -66,6 +77,7 @@ pub(crate) fn derive_removed(
     RowOwed {
         phase: wt_core::owed_phase(&items, landed),
         tells: 0,
+        landing: RowLanding::known(landing),
         items,
     }
 }
@@ -145,15 +157,23 @@ fn item_line(item: &OwedItem, slug: &str, clock: LocalClock) -> String {
 /// The list as every list-changing command prints it. `who` is "This
 /// worktree" or the slug of another one.
 pub(crate) fn owed_text(who: &str, slug: &str, owed: &RowOwed, clock: LocalClock) -> String {
-    if owed.items.is_empty() {
-        return format!("{who} owes nothing.");
-    }
-    let mut text = format!("{who} owes:");
+    let mut text = if owed.items.is_empty() {
+        format!("{who} owes nothing.")
+    } else {
+        format!("{who} owes:")
+    };
     for item in &owed.items {
         text.push_str(&format!("\n  {}", item_line(item, slug, clock)));
     }
+    if owed.landing.is_unknown() {
+        text.push_str(&format!("\n  {LANDING_UNKNOWN}"));
+    }
     text
 }
+
+/// What a list says when the row's landing could not be read: what is
+/// listed as waiting for a stage may already be due there.
+pub(crate) const LANDING_UNKNOWN: &str = "landing unknown: GitHub could not be read, so whether this work has merged is not known and what waits for a stage may already be due";
 
 /// Whether the command runs inside this worktree: the list then reads
 /// "This worktree owes".
@@ -172,20 +192,13 @@ pub(crate) async fn who(ctx: &AppContext, record: &WorktreeRecord) -> String {
     }
 }
 
-async fn landing_of(ctx: &AppContext, record: &WorktreeRecord, state: &Value) -> Landing {
-    wt_ops::lifecycle_ops::row_landings(ctx, std::slice::from_ref(record), state, None)
-        .await
-        .remove(record.target.slug())
-        .unwrap_or(Landing::NONE)
-}
-
 /// What the live worktree owes right now, read fresh.
 pub(crate) async fn read(ctx: &AppContext, record: &WorktreeRecord) -> Result<RowOwed> {
     let state = ctx
         .database
         .call(|store| Ok(store.read_wt_state()?))
         .await?;
-    let landing = landing_of(ctx, record, &state).await;
+    let landing = landing::read_one(ctx, record, &state, Want::Lists).await;
     Ok(derive(
         &state,
         record.target.slug(),
@@ -227,7 +240,7 @@ pub struct OwedArgs {
     pub all: bool,
     /// Print JSON: an array of items (id, kind, state, stage, when, what,
     /// before_release, overdue, due_at), or with --all an array of
-    /// worktrees (slug, kind, owed_phase, owes).
+    /// worktrees (slug, kind, landing, owed_phase, owes).
     #[arg(long)]
     pub json: bool,
     /// The worktree whose list to show (default: the current one). A
@@ -327,12 +340,17 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
         .database
         .call(|store| Ok(store.read_wt_state()?))
         .await?;
-    let landings = wt_ops::lifecycle_ops::row_landings(ctx, &rows, &state, None).await;
+    // The JSON reports every row's phase; the text only what is listed.
+    let want = if args.json { Want::Phases } else { Want::Lists };
+    let landings = landing::read(ctx, &rows, &state, want).await;
     let mut fleet = rows
         .iter()
         .map(|row| {
             let slug = row.target.slug();
-            let landing = landings.get(slug).copied().unwrap_or(Landing::NONE);
+            let landing = landings
+                .get(slug)
+                .copied()
+                .unwrap_or(RowLanding::known(Landing::NONE));
             (
                 slug.to_owned(),
                 "live",
@@ -358,6 +376,7 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
                 json!({
                     "slug": slug,
                     "kind": kind,
+                    "landing": owed.landing.word(),
                     "owed_phase": phase_json(owed.phase),
                     "owes": owes_json(&owed.items, clock),
                 })
@@ -371,6 +390,14 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
         println!("no worktree owes anything");
     } else {
         println!("{text}");
+    }
+    let unknown = fleet
+        .iter()
+        .filter(|(.., owed)| owed.landing.is_unknown())
+        .map(|(slug, ..)| slug.as_str())
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        println!("\n{LANDING_UNKNOWN}: {}", unknown.join(", "));
     }
     Ok(0)
 }
@@ -491,14 +518,6 @@ pub(crate) fn verified_record(
     serde_json::from_value(serde_json::to_value(&verified)?).context("encode status record")
 }
 
-fn stage_names(checks: &[(VerifyStage, wt_core::Check)]) -> String {
-    checks
-        .iter()
-        .map(|(stage, _)| stage.as_str())
-        .collect::<Vec<_>>()
-        .join(" and ")
-}
-
 /// What closing checks did, as wt status verified and wt done both say it.
 pub(crate) fn print_checks_closed(
     slug: &str,
@@ -507,24 +526,10 @@ pub(crate) fn print_checks_closed(
     kept_state: Option<&str>,
     removed: bool,
 ) {
-    let row = if removed { " (removed row)" } else { "" };
-    for (stage, check) in closed {
-        println!(
-            "✓ {slug} closed the check in {}{row}: {}",
-            stage.as_str(),
-            wt_app_core::watch_view::headline(&check.steps)
-        );
-    }
-    if remaining.is_empty() {
-        println!("✓ {slug} verified{row}");
-    } else {
-        println!(
-            "  still owes the check in {}{}",
-            stage_names(remaining),
-            kept_state
-                .map(|state| format!(": the status stays {state} until it is closed"))
-                .unwrap_or_default()
-        );
+    for line in
+        wt_ops::status_checks::checks_closed_lines(slug, closed, remaining, kept_state, removed)
+    {
+        println!("{line}");
     }
 }
 
@@ -1417,11 +1422,14 @@ mod tests {
         assert_eq!(lines[0], "one owes:");
         assert!(lines[1].starts_with("  due      confirm the logs (due since "));
         assert!(lines[1].ends_with(&format!(" · before release · wt done {step}")));
+        // No GitHub answers here and Git shows no landing: the list says
+        // the landing is unknown instead of calling the work unmerged.
         assert_eq!(
             lines[2..],
             [
                 "  gate     mobile release (until a person clears it)",
-                "  waiting  check: 1. check prod 2. check logs (once in production)"
+                "  waiting  check: 1. check prod 2. check logs (once in production)",
+                &format!("  {LANDING_UNKNOWN}"),
             ]
         );
         // The fleet view groups by what is due and what each item waits for.
@@ -1471,6 +1479,213 @@ mod tests {
             .await
             .unwrap(),
             1
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// A status write by v0.1.74: it writes the fields it knows and
+    /// carries every other key of the stored record over.
+    async fn previous_release_writes(ctx: &AppContext, legacy: Value) {
+        const KNOWN: [&str; 9] = [
+            "state",
+            "at",
+            "note",
+            "risk",
+            "sha",
+            "by",
+            "blockedOn",
+            "verifyAfterMerge",
+            "verifyIn",
+        ];
+        ctx.database
+            .call(move |store| {
+                let mut state: Value =
+                    serde_json::from_str(&store.read_repository_state_json()?.unwrap())?;
+                let mut next = legacy;
+                for (key, value) in state["slugs"]["one"]["work"]
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    if !KNOWN.contains(&key.as_str()) {
+                        next[key] = value;
+                    }
+                }
+                state["slugs"]["one"]["work"] = next;
+                store.write_repository_state_json(&state.to_string())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn raw(ctx: &AppContext) -> Value {
+        ctx.database
+            .call(|store| {
+                Ok(serde_json::from_str(
+                    &store.read_repository_state_json()?.unwrap(),
+                )?)
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn state_from_the_previous_release_is_read_and_stays_readable_by_it() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let clock = clock();
+        // As v0.1.74 left it: one check in the two fields it knows, a wake
+        // still waiting among the watches, and neither "checks" nor "owed".
+        let wake = ctx
+            .database
+            .call(move |store| {
+                let watch = store
+                    .add_watch(
+                        wt_store::NewWatch {
+                            slug: "one".into(),
+                            by: "one".into(),
+                            utc_offset_minutes: clock.utc_offset_minutes,
+                            when: vec![wt_core::watch::parse("production", clock).unwrap()],
+                            then: wt_core::watch::WatchActions {
+                                wake: Some("retire the flag".into()),
+                                ..Default::default()
+                            },
+                            before_release: false,
+                        },
+                        clock.now_ms,
+                    )?
+                    .unwrap();
+                Ok(watch.id)
+            })
+            .await
+            .unwrap();
+        previous_release_writes(
+            ctx,
+            json!({
+                "state": "ready", "at": now_iso(), "by": "one", "risk": "low",
+                "verifyAfterMerge": "1. check prod", "verifyIn": "production",
+            }),
+        )
+        .await;
+        let before = raw(ctx).await;
+        assert!(before.get("owed").is_none(), "{before}");
+        assert!(before["slugs"]["one"]["work"].get("checks").is_none());
+        assert_eq!(before["watches"].as_array().unwrap().len(), 1);
+
+        // This build shows the right list from it, before writing anything.
+        let brief = |landing: Landing| {
+            derive(&before, "one", RowLanding::known(landing), clock.now_ms)
+                .items
+                .iter()
+                .map(|item| item_line(item, "one", clock))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            brief(Landing::NONE),
+            [
+                "waiting  check: 1. check prod (once in production)",
+                "waiting  retire the flag (when in production)",
+            ]
+        );
+        assert_eq!(
+            brief(Landing::new(true, true, true))[0],
+            "due      check: 1. check prod (due in production) · wt done production"
+        );
+
+        // This build writes: a fresh assertion that carries the check. The
+        // fields the previous release reads still say what it owes, and the
+        // wake it would deliver is untouched.
+        let working = StatusArgs {
+            positionals: vec!["working".into()],
+            ..Default::default()
+        };
+        assert_eq!(status(ctx, &working).await.unwrap(), 0);
+        let after = raw(ctx).await;
+        let stored = &after["slugs"]["one"]["work"];
+        assert_eq!(stored["state"], "working");
+        assert_eq!(stored["verifyAfterMerge"], "1. check prod");
+        assert_eq!(stored["verifyIn"], "production");
+        assert_eq!(
+            stored["checks"],
+            json!({"production": {"steps": "1. check prod"}})
+        );
+        assert_eq!(stored["checksMirror"], "production");
+        assert_eq!(after["watches"], before["watches"]);
+
+        // A second check, which the previous release cannot hold: its two
+        // fields name the first one still owed.
+        assert_eq!(
+            status(ctx, &owing(Some("1. check staging"), None))
+                .await
+                .unwrap(),
+            0
+        );
+        let stored = work(ctx).await;
+        assert_eq!(stored["verifyAfterMerge"], "1. check staging");
+        assert_eq!(stored["verifyIn"], "staging");
+        assert_eq!(stored["checks"]["production"]["steps"], "1. check prod");
+
+        // The previous release asserts a status: it carries the one check
+        // it sees. Both are still owed here.
+        previous_release_writes(
+            ctx,
+            json!({
+                "state": "review", "at": now_iso(), "by": "one",
+                "verifyAfterMerge": "1. check staging", "verifyIn": "staging",
+            }),
+        )
+        .await;
+        let record = resolve_worktree(ctx, None).await.unwrap();
+        let listed = |owed: &RowOwed| {
+            owed.items
+                .iter()
+                .filter(|item| item.kind == OwedKind::Check)
+                .filter_map(|item| item.stage)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(&read(ctx, &record).await.unwrap()),
+            [VerifyStage::Staging, VerifyStage::Production]
+        );
+        // It discharges the check it sees without verifying the row: only
+        // that stage goes, and its fields then name the other.
+        previous_release_writes(
+            ctx,
+            json!({"state": "review", "at": now_iso(), "by": "one"}),
+        )
+        .await;
+        assert_eq!(
+            listed(&read(ctx, &record).await.unwrap()),
+            [VerifyStage::Production]
+        );
+        assert_eq!(status(ctx, &working).await.unwrap(), 0);
+        let stored = work(ctx).await;
+        assert_eq!(stored["verifyAfterMerge"], "1. check prod");
+        assert_eq!(stored["verifyIn"], "production");
+        assert_eq!(
+            stored["checks"],
+            json!({"production": {"steps": "1. check prod"}})
+        );
+
+        // Its wake, delivered by this build after the work landed, leaves
+        // the watches as the previous release would have left them and
+        // stays owed under a key it does not read.
+        ctx.database
+            .call(move |store| {
+                store.complete_wake(&wake, OwnerLanding::Landed, false, clock.now_ms)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let after = raw(ctx).await;
+        assert_eq!(after["watches"], json!([]));
+        assert_eq!(after["owed"][0]["what"], "retire the flag");
+        let owed = read(ctx, &record).await.unwrap();
+        assert!(
+            owed.items
+                .iter()
+                .any(|item| item.kind == OwedKind::Step && item.state == OwedState::Due)
         );
         fixture.close().await.unwrap();
     }

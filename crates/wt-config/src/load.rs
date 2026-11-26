@@ -1460,6 +1460,10 @@ fn parse_automations(
             errors.push(format!("{tag}.id is required"));
             continue;
         }
+        if RESERVED_AUTOMATION_IDS.contains(&input.id.as_str()) {
+            errors.push(format!("{tag}.id \"{}\" is reserved for a rule wt runs itself (watches and due checks): choose another id", input.id));
+            continue;
+        }
         if !ids.insert(input.id.clone()) {
             errors.push(format!("{tag}.id \"{}\" is duplicated", input.id));
             continue;
@@ -1699,6 +1703,13 @@ const KNOWN_TRIGGERS: &str = "pr.checks.failed, review_bot.unresolved, review.ch
 /// The implicit watch rule's trigger. `parse_trigger` does not know it, so
 /// no `[[automations]]` rule can carry it.
 const WATCH_TRIGGER: &str = "watch.met";
+/// The rule wt itself runs for a met watch.
+pub const WATCH_RULE_ID: &str = "wt.watch";
+/// The rule wt itself runs to wake a session whose check came due.
+pub const CHECK_RULE_ID: &str = "wt.check";
+/// Ids configuration cannot use: their fire keys and history belong to
+/// wt's own rules.
+const RESERVED_AUTOMATION_IDS: [&str; 2] = [WATCH_RULE_ID, CHECK_RULE_ID];
 
 fn parse_trigger(value: &str) -> Option<AutomationTrigger> {
     let value = match value {
@@ -1750,6 +1761,21 @@ fn trigger_name(value: AutomationTrigger) -> &'static str {
         AutomationTrigger::WatchMet => WATCH_TRIGGER,
     }
 }
+/// The default settle of `status.verification_due`, which wt's own wake
+/// for a due check shares. With a deploy probe for both stages the trigger
+/// itself waits for the deploy and the settle only lets the new release
+/// start serving. One probe is not enough even without a separate
+/// production branch: a production check then comes due on the Git landing.
+/// Otherwise deploys lag merges, and a run that starts once the deploy has
+/// likely finished checks it once instead of polling for it.
+pub fn verification_due_settle_seconds(environments: &EnvironmentsConfig) -> f64 {
+    if environments.staging.is_some() && environments.production.is_some() {
+        30.0
+    } else {
+        600.0
+    }
+}
+
 fn default_settle(on: AutomationTrigger, environments: &EnvironmentsConfig) -> f64 {
     match on {
         AutomationTrigger::WtCreated
@@ -1760,18 +1786,7 @@ fn default_settle(on: AutomationTrigger, environments: &EnvironmentsConfig) -> f
         | AutomationTrigger::StatusVerificationOverdue
         | AutomationTrigger::McpEvent
         | AutomationTrigger::WatchMet => 0.0,
-        // With a deploy probe for both stages, the trigger itself waits for
-        // the deploy and the settle only lets the new release start serving.
-        // One probe is not enough even without a separate production
-        // branch: a production check then comes due on the Git landing.
-        AutomationTrigger::StatusVerificationDue
-            if environments.staging.is_some() && environments.production.is_some() =>
-        {
-            30.0
-        }
-        // Deploys lag merges; a run that starts once the deploy has likely
-        // finished checks it once instead of polling for it.
-        AutomationTrigger::StatusVerificationDue => 600.0,
+        AutomationTrigger::StatusVerificationDue => verification_due_settle_seconds(environments),
         AutomationTrigger::WtMerged
         | AutomationTrigger::StackParentMerged
         | AutomationTrigger::BranchAdvanced

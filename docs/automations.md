@@ -24,8 +24,8 @@ Fire keys embed the PR's head SHA where relevant: a new push produces a new key 
 | `pr.merge_dropped` | wt armed the PR's merge ([`wt merge`](cli.md#wt-merge-slug--wt-merge---cancel-slug), the TUI's arm or ship, or the retry that arms once checks report) and GitHub no longer holds it: the PR is still OPEN with no auto-merge request and no merge-queue entry. The queue evicted it or GitHub turned auto-merge off (a failed check, a conflict, a new push), which GitHub tells nobody. Needs fresh GitHub data whose merge-queue read was complete; a partial queue read is not proof that the PR left it. It also needs GitHub to have been seen holding the merge once, in a read made after the arming (auto-merge requested or the PR in the queue); wt records that sighting on the arming, and an arming never seen held does not fire. Builds older than v0.1.73 cancel a merge without clearing wt's record of it, and sessions stay pinned to the build that started them, so **an arm cancelled by such a build may fire once**. The record of the arming is cleared by `wt merge --cancel` or the TUI's disarm, when the branch lands, when the PR closes and when the worktree is removed, so none of those fire. The fire key carries the arming's timestamp: **one arming fires at most once**, and arming again is a new merge that may be dropped again. The detail says what was observed (`#123 left the merge queue` / `auto-merge was dropped on #123`) and the likely cause when the row already shows one (failing checks, a conflict, commits pushed after the arming). The arm reply can arrive before GitHub's read shows the queue entry, so wt ignores GitHub's answer for the first 90 seconds after an arming, and the default 120-second settle rides out the rest; a lower `settle_seconds` does not shorten the 90 seconds. Not evaluated for a worktree on a [remote worker](remote.md) armed from the controller's TUI: the record lives where the merge was armed |
 | `wt.merged` | a non-stacked worktree's branch landed (merged / upstream gone / PR merged — the same set the `c` clean sweep uses). A branch with no commits of its own never counts as landed, however contained it looks — see the landed-work guard in the lifecycle service. Rules running `builtin:close-issue`, `builtin:delete-branch`, or a shell action declared `external = true` also evaluate stack members — those runs never touch the worktree, so the clean-vs-restack race the exclusion protects against doesn't apply. An `external = true` shell action also fires for a worktree that is retained rather than cleanable (an owed `--verify-in-*` check, local changes) once fresh GitHub data shows its PR merged: a tracker update is about the landing, not the checkout |
 | `stack.parent_merged` | a stack (worktrees chained by their recorded fork bases — see [stacked-prs.md](stacked-prs.md)) has a merged member with open members stacked on it |
-| `status.verification_due` | an owed [post-merge check](cli.md#the-check-that-can-only-run-once-it-ships) has come due: a `--verify-in-staging` check once the branch lands on base, a `--verify-in-production` check once the landing reaches `[branch] production` (proved from Git: HEAD, or the exact merge commit of the PR merged at HEAD, is contained in the production branch; without a separate production branch, the base landing). When the check's stage has an [`[environments]` deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes), it comes due only once that stage is also running the landing: the same commit is contained in the commit the probe last reported. A stage whose probe has not answered yet is not deployed. Fires **once per obligation**: the key is the worktree, the stage and a hash of the steps, not the assertion time, so the run's own `needs-human` or `needs-testing` re-assertion after a failure does not rerun it; new steps are a new check. Re-owing identical steps on the same worktree does not fire again while the ledger remembers the key (30 days); after that an obligation still owed fires once more. Settle defaults to **600 seconds**, the delay before the run starts: deploys lag merges, and a run that starts after the deploy has likely finished confirms it once instead of polling for it. With a deploy probe for both stages (`[environments.staging]` and `[environments.production]`) the trigger already waited for the deploy, so the default is **30 seconds**; with one probe or none it stays 600. Set `settle_seconds` to tune it. The PR-merged leg of "landed" is gated on GitHub freshness. Pair it with a session action whose prompt confirms the deploy for the stage before running the steps |
-| `status.verification_overdue` | the branch has LANDED, still owes a [`--verify-in-*`](cli.md#the-check-that-can-only-run-once-it-ships) check that has come due (a production check waits for its promotion, as above), and has owed it for longer than the rule's `after_days` (default 2). Due here means the Git landing alone, even with a deploy probe: a probe that stopped answering must not hide a check owed for days. **The one trigger here that fires repeatedly**: its fire key carries the local day, so it re-fires once a day until someone asserts `verified`. That is deliberate and is not the echo problem the `by` stamp exists for — a daily reminder is only noise when the recipient can clear it by writing something, and nothing clears this except the check actually happening. Mostly local (state database + merged/gone), but the PR-merged leg of "landed" is gated on GitHub freshness so a boot-stale cache cannot nag about a merge it has not confirmed. Settle defaults to 0: the condition is days old by the time it holds, so a window measured in minutes would only delay a reminder that is already late |
+| `status.verification_due` | an owed [post-merge check](cli.md#the-check-that-can-only-run-once-it-ships) has come due: a `--verify-in-staging` check once the branch lands on base, a `--verify-in-production` check once the landing reaches `[branch] production` (proved from Git: HEAD, or the exact merge commit of the PR merged at HEAD, is contained in the production branch; without a separate production branch, the base landing). When the check's stage has an [`[environments]` deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes), it comes due only once that stage is also running the landing: the same commit is contained in the commit the probe last reported. A stage whose probe has not answered yet is not deployed. A worktree can owe a check in each stage, and each fires on its own. Fires **once per obligation**: the key is `<rule>:verify:<slug>:<stage>:<hash of the steps>`, with the check's not-before time appended only when it has one (so a check put off with `wt done <stage> --again <time>` fires again then, and checks delivered before that existed do not), not the assertion time, so the run's own `needs-human` or `needs-testing` re-assertion after a failure does not rerun it; new steps are a new check. Re-owing identical steps on the same worktree does not fire again while the ledger remembers the key (30 days); after that an obligation still owed fires once more. Settle defaults to **600 seconds**, the delay before the run starts: deploys lag merges, and a run that starts after the deploy has likely finished confirms it once instead of polling for it. With a deploy probe for both stages (`[environments.staging]` and `[environments.production]`) the trigger already waited for the deploy, so the default is **30 seconds**; with one probe or none it stays 600. Set `settle_seconds` to tune it. The PR-merged leg of "landed" is gated on GitHub freshness. Pair it with a session action whose prompt confirms the deploy for the stage before running the steps |
+| `status.verification_overdue` | the branch has LANDED, still owes a [`--verify-in-*`](cli.md#the-check-that-can-only-run-once-it-ships) check that has come due (a production check waits for its promotion, as above), and has owed it for longer than the rule's `after_days` (default 2). Due here means the Git landing alone, even with a deploy probe: a probe that stopped answering must not hide a check owed for days. **The one trigger here that fires repeatedly**: its fire key carries the local day, so it re-fires once a day until the check is closed (`wt done <stage> -m`, `wt status verified -m`). It is judged per stage, and a check put off with `--again` is not overdue before its time. That is deliberate and is not the echo problem the `by` stamp exists for — a daily reminder is only noise when the recipient can clear it by writing something, and nothing clears this except the check actually happening. Mostly local (state database + merged/gone), but the PR-merged leg of "landed" is gated on GitHub freshness so a boot-stale cache cannot nag about a merge it has not confirmed. Settle defaults to 0: the condition is days old by the time it holds, so a window measured in minutes would only delay a reminder that is already late |
 | `branch.advanced` | a watched branch's tip MOVED. **Fleet-level: it targets no worktree**, which is the whole point — by the time a release branch advances, the worktrees whose work is in that range have been swept, so there is no row to key a per-row condition against. Requires `branch = "<name>"`, which must be `[branch] base` or in `[branch] keep_fresh` (the loader refuses otherwise: nothing else advances a local head, so watching one wt never fetches is a rule that can never fire, and a rule that never fires is indistinguishable from a working one). The run launches in the **main clone** with `{{branch}}`, `{{from}}` and `{{to}}`; walking the range is the run's job. Its action's `requires` are judged against no worktree, so a row requirement such as `pr` or `issue.tracker` can never hold there and skips the fire. **First sight fires nothing** — with no recorded tip there is no range, and reading an absent watermark as "everything up to here" would fire once across the branch's entire history. wt records the tip and waits for the next move. The watermark advances only on DISPATCH, so a declined launch keeps its range instead of dropping it. The per-worktree breaker does not apply to this fleet trigger: each tip is a distinct event, and no worktree condition can clear its breaker |
 | `stage.deployed` | a stage's [deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes) reported a NEW commit. **Fleet-level, like `branch.advanced`**, and for the same reason: it is about a release, not a worktree. Requires `stage = "staging"` or `"production"`, and that stage must have a probe (the loader refuses otherwise: nothing would report a deploy, so the rule could never fire). The run launches in the **main clone** with `{{stage}}`, `{{from}}` and `{{to}}`, the previously seen and newly deployed commits; `{{branch}}` is the ref wt records the deploy in, `refs/wt/deployed/<stage>`. Its action's `requires` are judged against no worktree. **First sight fires nothing**: wt records the deployed commit and waits for the next one. The watermark is kept with the branch tips and advances only on DISPATCH, so a declined launch keeps its range. A rollback is a new commit and fires too, with `{{to}}` behind `{{from}}`. The fire key is `<rule>:deployed:<stage>:<from>:<to>`, the move rather than the commit, so a stage that returns to a commit it ran before (A, B, A, B) fires for each deploy. The per-worktree breaker does not apply. Settle defaults to 10 seconds |
 | `mcp.event` | an [MCP Events](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/3415) (SEP-3415, draft) event arrived from a remote MCP server: one fire per event. **Edge-triggered, unlike every other trigger**, so it runs as described in [MCP events](#mcp-events) below. Settle defaults to 0 |
@@ -84,14 +84,14 @@ run    = "answer-guide"
 
 ## Watches
 
-A [watch](cli.md#wt-wake-condition--m-prompt---slug-slug) is a worktree waiting
+A [watch](cli.md#wt-wake-condition--m-prompt---before-release---slug-slug) is a worktree waiting
 for conditions and owing up to three actions once they all hold: clear its
 merge gate (`wt status --until`), tell the person (`wt notify`), wake its
 session (`wt wake`, `--then`). Watches are not a second scheduler. They run
 through this engine under one implicit rule, id `wt.watch`, trigger
 `watch.met`, run `builtin:watch`, settle 0. The rule always exists, so the
 engine runs with no `[[automations]]` at all, and configuration cannot declare
-the trigger or the run.
+the trigger, the run or the id.
 
 - **Evaluation.** Each pass judges every pending watch against the same
   confirmed rows the rules see, plus facts the board does not carry: pull
@@ -117,8 +117,18 @@ the trigger or the run.
   the attention feed names the worktree and the note once. A wake's prompt
   is recorded by its watch, not as a separate message event. While a wake is
   pending its worktree is not cleaned up: it is a removal hazard
-  (`pending wake-up: <note> (<conditions>)`) for `builtin:clean`, `wt clean`
-  and the `c` sweep.
+  (`still owes: <note> (<when>)`) for `builtin:clean`, `wt clean` and the `c`
+  sweep.
+- **Delivery is not completion.** When a wake's fire is evaluated, the engine
+  decides whether the owner's own work has landed: landed, not landed, or
+  unknown (a PR exists, GitHub data is stale and nothing local proves it).
+  That answer travels with the fire and with the heal path, so both hand it
+  to the store. Not landed, the wake closes on delivery as before. Landed or
+  unknown, the store removes the wake and records a **due step** in the same
+  transaction ([owed.md](owed.md)); the prompt gains a last line, `To close
+  it: wt done <id> -m "<what you did and what you saw>"`, and the history
+  records `due: <what>` instead of `woke the session`. The step holds
+  cleanup until `wt done` closes it or sets it again.
 - **Exempt from the breaker and from cancellation.** A global pause, a
   paused worktree and `Ctrl+Shift+A` hold watch fires and never consume their
   keys: the watch delivers when the pause ends. Evaluation continues while
@@ -131,6 +141,34 @@ the trigger or the run.
 
 In the queue (`Q`, `wt automations`) a watch fire shows as rule `watch` with
 the action and what held as its detail.
+
+## The built-in check wake
+
+A worktree that owes a `--verify-in-staging` or `--verify-in-production`
+check is woken when the check comes due, with no configuration. It is a
+second implicit rule beside `wt.watch`: id `wt.check`, run `builtin:check`,
+the condition and settle default of `status.verification_due` (600 seconds,
+or 30 when both stages have deploy probes). Configuration cannot use the id.
+
+- **What it sends.** One prompt to the row's session per due check:
+  `[wt] The check this worktree owes in <stage> is due: the change is
+  deployed there.`, the steps, then `To close it: wt done <stage> -m "<what
+  you checked and where>"`. Being prompted closes nothing: the check stays
+  owed until it is closed.
+- **Once per check.** The key is `wt.check:<slug>:<worktree creation
+  time>:<stage>:<hash of the steps>`, with the not-before time appended when
+  the check has one. New steps, a check put off with `wt done <stage> --again
+  <time>`, and a later worktree reusing the slug each fire again.
+- **Like a wake.** It waits for the session to be idle and resumes a stopped
+  one, is held (not consumed) while the worktree or everything is paused, and
+  skips archived rows.
+- **A configured rule replaces it, per row.** Where a configured
+  `status.verification_due` rule would bring the check to the row's own
+  session (its action targets the session and its `requires` accept the
+  row), that rule owns the delivery and `wt.check` stays silent, so no check
+  is prompted twice. A rule that tells the person (`builtin:notify`), briefs
+  the manager, or does not accept the row leaves the session unprompted, so
+  `wt.check` still fires there.
 
 ## Built-in runs
 

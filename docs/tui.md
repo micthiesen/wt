@@ -20,7 +20,7 @@ section by a blank line. A row shows, left to right: the stack rail (tinted per
 stack lane), the work-status marker, the title exactly as named (issue
 identity appears in details, never as a title prefix), a dim `→ Section` when a stack member sits apart
 from its parent's section, and a right-aligned glyph cluster. The cluster's
-fixed order is waiting (the bell, see [Waiting rows](#waiting-rows)), action
+fixed order is what the row owes and its bell (see [What a row owes](#what-a-row-owes)), action
 running, dirty, rebase or conflict, deploy, AI session
 state, review bot, review decision, PR state or merge-queue position, and CI
 checks. `[ui].hidden_badges` removes slots by name (`watch`, `action`, `dirty`,
@@ -37,7 +37,7 @@ differs from the current observed HEAD, and overdue post-merge verification is
 red. A yellow hourglass replaces the marker while a
 worktree initializes: from the creation request until its checkout exists, and
 then while the dependency install that creation started is still running. The
-ordinary marker returns when the worktree is ready for a session. A landed branch without a newer status shows the green merge glyph. Landed
+ordinary marker returns when the worktree is ready for a session. A landed row's marker follows what it still owes, not its asserted state: a yellow dot while something is due (red once anything is overdue), a dim dot while everything it owes waits, and the green merge glyph when it owes nothing. Landed
 means the branch's own commits reached the base: its PR merged, or its HEAD is
 in the base and was either merged in or committed on the branch itself. A
 worktree only fast-forwarded (or reset) to a base commit is never landed, even
@@ -59,23 +59,31 @@ shows exactly the glyphs you would see expanded (dim markers such as todo,
 finished and archived are left out), plus conflicts and failing checks. Selecting it shows the full rollup and blocker notes in the
 details pane. `[ui].sort = "status"` orders rows by work status; manual section
 placement remains separate. Within a section, rows without a manual order sort
-first, and a stack sorts as one unit under its root's identity.
+first, and a stack sorts as one unit under its root's identity. A stack member
+whose own work has landed is drawn as a single row and its children as roots,
+so moving a merged head (`l`, `J`/`K`) moves only that row.
+
+With `[ui] owed_sections = true` (off by default) a landed, unarchived local
+row is drawn in a derived block instead of its section, by what it still
+owes: **Due**, **Waiting for staging**, **Waiting for production**,
+**Waiting** (anything else) and **Done**. The blocks sit after the manual
+sections and the Inbox and before the rows being removed and the archive;
+empty ones are hidden and they fold like sections. They cannot be renamed,
+deleted or used as a move target, and a row shown in one cannot be moved or
+reordered: the notice reads `Due is derived from what landed rows owe; set
+[ui] owed_sections = false to file rows by hand`. The row's stored section is
+untouched, so turning the option off restores the layout.
 
 The details pane's border names the slug. It starts with the wrapped title
 and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
-The work-status block follows when a status is saved: state,
-risk, age, and commits since the status, then the gate and the note behind a
-rail in the state's color. `OPS`, `REVERT`, `IF WRONG`, and `UNTESTED` note
-fields align under a hanging indent; a phased `OPS BEFORE MERGE`-style label
-sits on its own line above its step, which is indented two cells under it. A post-merge obligation shows its stage
-(`verify in staging` / `verify in production`) and step count with a two-line
-preview; `V` expands or collapses the steps, and they start expanded once the
-check is due. A production check on a branch that has only reached base reads
-`awaiting production` and does not ask for attention. With a
-[deploy probe](configuration.md#environmentsstaging-and-environmentsproduction-optional-deploy-probes)
-for the check's stage, a landing that stage is not running yet reads
-`awaiting staging deploy` or `awaiting production deploy`, as quietly.
-What the row waits for comes next: see [Waiting rows](#waiting-rows).
+The work-status block follows: a header line, the list of what the row owes
+(see [What a row owes](#what-a-row-owes)), the watches that only tell you,
+then the note behind a rail in the state's color. Until the row's own work
+lands the header is the asserted state (`blocked · ready` with the gate's
+slash while a gate is set), risk, age, and `commits since` when the status
+predates HEAD. `REVERT`, `IF WRONG`, `UNTESTED` and `OPS: none` note fields
+align under a hanging indent; any other `OPS` text is prose like the rest,
+because what a worktree owes is in its list, not its note.
 
 Labeled rows follow, with dim right-aligned labels. `[ui].rows` controls their
 order and visibility: `branch` (with its landing base), `issue` (also
@@ -244,48 +252,82 @@ against a bounded local GitHub-merge and production-history scan while history
 is open. A landing only moves forward: once a removal is proven in
 production its record keeps that (`landedOn`), so a later refresh or restart
 never shows it back at the base. The `removal record` pane shows removal time, host, saved status,
-verification, landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `H` opens the row's history modal as on the board, `p` opens the PR, `i` opens
+what the record still owes (`owes`, one line an item, a due step with the id `wt done <id> --slug <slug>` takes), landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `H` opens the row's history modal as on the board, `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
 
+### What a row owes
+
+A worktree has one list of what it still owes ([owed.md](owed.md)): its
+merge gate, the check owed in each stage, and the steps it comes back for.
+The details pane shows it as one `owes` block between the header and the
+note, most urgent first, one line an item with the "when" column aligned.
+The lines below show every form; the gate is listed only until the row's own
+work lands, so a real row never shows it beside a landed header:
+
+    ● due · confirm prod logs, then open the PR retiring the old path · risk low · 2h ago
+    owes
+      ●  due 11:36           confirm prod logs, then open the PR retiring...   93co6q
+      ⊘  before merge        prod secret missing · clears when ○ #3806 in production
+      ○  in staging          check · 5 steps · V expands
+      ○  in production +1h   check · 2 steps · V expands
+      ○  at Nov 27 18:12     rerun the renewal check · before release
+      ?  when check vault=X  rotate the key · exited 2: vault sealed
+
+- **Mark.** A filled dot in yellow once the item is due (red when overdue),
+  the gate's slash, `?` while a condition it waits for cannot be read, and a
+  dim hollow dot while it waits.
+- **When.** `due 11:36` for a step that came due then, `due in staging` or
+  `overdue in staging` for a check, `before merge` for the gate, `in
+  staging` for a check that waits (`in production +1h` when it was put off),
+  `at 17:00 (in 2h10m)` for a lone time, and `when ...` for conditions, each
+  marked `✓` holds, `○` not yet or `?` unknown.
+- **What.** A gate's text, then `clears when ...` (`clears at 17:00` for a
+  time) and `, then wakes the session` when it has a `--then`. A check reads
+  `check` and its step count, or its first line when it has no numbered
+  steps, with `awaiting deploy` while its stage does not run the landing
+  yet; `V` expands or collapses its steps in place, and they start expanded
+  once the check is due. A step shows the first line of its prompt.
+- **Tails.** `before release` for a step set with `--before-release`, `by
+  <who>` for a setter that is neither the row's own agent nor you,
+  `unconfirmed` for a wake sent without proof it arrived, `delivering` once
+  the conditions held, `held: automations paused` while a pause holds the
+  delivery, and the reason a condition cannot be read. A due step ends with
+  its id, the argument `wt done <id>` takes.
+
+The pane lists eight items and counts the rest as `+N more (wt owed)`. Times
+are in this machine's clock (`09:00 tomorrow`, `Mon 30 Nov 09:00`), and the
+countdown is refreshed at least every 30 seconds while anything waits.
+
+Once the row's own work has landed, the header reads from the list instead of
+the asserted state: `● due · <first line of the first due item>`, `◷ waiting
+for staging · 2 owed` (or `for production`, `until 17:00`, `for <conditions>`),
+or `✓ done`, followed by risk and age as before. A landed row that owes
+nothing shows a single dim `owes nothing`; an unlanded row with nothing owed
+shows no block.
+
+In the list, the first slot of the badge cluster (`watch` in
+`[ui].hidden_badges`) carries one mark for what the row owes: a filled dot
+while something is due, with the count when more than one item is (`+` from
+ten), red when anything is overdue; a dim hollow dot while everything waits,
+yellow when a condition it waits for cannot be read. A gate only a person
+clears is the marker's slash already and adds no mark. A folded section's
+header counts markers only, so it never shows a mark its rows would not, and
+its rollup in the details pane counts rows with something `due`, `owed,
+waiting` and `overdue`.
+
 ### Waiting rows
 
-A row waits when wt will act for it later: clear its merge gate
-(`wt status --blocked-on ... --until`), wake its session (`wt wake`), or tell
-you (`wt notify`, or `W` on the row). Such a row wears a bell at the left of
-its badge cluster: teal while it waits, yellow when a condition cannot be read
-right now (a probe that fails, a pull request GitHub will not show), since
-that watch may never fire, and green once everything it waited for held and wt
-is delivering. While automations are paused, for the row or everywhere, a
-watch whose conditions held is not delivered: its bell stays teal and its
-line reads `held: automations paused` instead of `delivering`. The bell is not the gate's yellow circle-slash: a gate asks
-for someone, a watch does not. A folded section's header counts markers only,
-so it never shows a bell its rows would not.
-
-In the details pane a gate that clears itself says so under its
-`blocked on:` line, each condition marked `✓` holds, `○` not yet, or `?`
-unknown with the reason dim beside it:
-
-    blocked on: prod secret missing
-    clears when ✓ #3806 in production and ? check secret=API_KEY (exited 2:
-    vault sealed), then wakes the session · Deploy the fix
-
-Once wt has cleared the gate, what that watch still owes (its wake) moves to
-a line of its own until it is delivered.
-
-Every other watch is one line below the status block, wrapped like it on a
-narrow pane with the continuation under the words after the bell:
-`wakes at 17:00 (in 2h10m) · Run the smoke test` for a wake at a time,
-`wakes when ○ PR checks green · ...` for one on a condition, and `tells you
-when ○ merged` for a notification. A gate that waits only for a time reads
-`clears at 17:00`. A wake's prompt or a notification's
-text follows, cut to its first line that says anything; `by <who>` names a
-setter that is neither the row's own agent nor you; `delivering` marks one
-whose conditions held. A long condition wraps with the line rather than being
-cut. The pane lists six watches per row and counts the rest as
-`+N more (wt watch)`.
-Times are in this machine's clock (`09:00 tomorrow`, `Mon 30 Nov 09:00`), and
-the countdown is refreshed at least every 30 seconds while anything waits.
+A watch that only tells you (`wt notify`, or `W` on the row) is not owed by
+the row, so it is shown apart: the row wears a bell in the same badge slot,
+after the owes mark: teal while it waits, yellow when a condition cannot be
+read right now (a probe that fails, a pull request GitHub will not show),
+since that watch may never fire, and green once everything it waited for held
+and wt is telling you. In the details pane each is
+one dim line after the `owes` block: `tells you when ○ merged`, `tells you at
+17:00 (in 2h10m) · time to cut the release · by manager`, with `delivering`
+or `held: automations paused` as above. The pane lists six and counts the
+rest as `+N more (wt watch)`.
 
 `W` opens **Notify me when `<slug>` is…** from the board on screen: `r`
 ready, `c` checks green, `m` merged, `s` on staging, `p` in production.
@@ -358,6 +400,16 @@ conditions already held within ten seconds of the watch being set, its set
 line folds in too and the line ends `as soon as it was set`. `stopped
 waiting  for <what>` (dim) is a cancel, and `gave up waiting  for <what> ·
 <why>` (yellow) is a watch wt dropped.
+
+What the row owes reads as one line a change. `due: <what>` (yellow dot)
+when a wake was delivered after the row's work landed, with `wt done <id>`
+dim beside it; it stands in for that wake's `woke the session` line, and
+`wake sent, delivery not confirmed` follows when nothing proved the delivery.
+`done: <what>` (green) carries the evidence dim beside it, `again <when>:
+<what>` (hollow dot) is an item put off with `--again`, and `dropped:
+<what>` (dim) one that was let go. A check is named by its stage: `done:
+staging check: <first line>`. `by <who>` follows unless that was the row's
+own agent.
 `wt history` says the same in sentences: `will wake the session at 23:08`,
 `gate clears when <what>, then wakes the session (set by manager)`, `woke the
 session: check flag=go held`, `told you: merged`, `cleared the gate: <what>`,
@@ -433,14 +485,14 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `Ctrl+N` | Create on a chosen host; toasts when `[remote]` is not configured. Managed hosts that owe a sign-in say so |
 | `o` | Open the selected worktree in the configured editor |
 | `d` | Remove the selected worktree after confirmation |
-| `c` | Open cleanup review from background results, including archived rows. A landed row whose session has a pending wake-up is kept |
+| `c` | Open cleanup review from background results, including archived rows. A landed row that still owes something is kept; rows whose work is simply unfinished are left out |
 | `a` | Archive / restore the selected row; restore returns it to Inbox. A locked row is refused |
 | `t` | Rename the worktree. A rename is final: no agent or tracker title replaces it, until `wt next` starts new work there |
 | `#` | Set or clear the worktree's issue identity |
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
-| `V` | Show or hide this row's post-merge verification steps (open by default when the check is due) |
+| `V` | Show or hide the steps of the checks this row owes (open by default when a check is due) |
 | `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note) |
 | `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
@@ -488,18 +540,33 @@ removal.
 
 The `c` menu opens at once from the prepared background board. It does not wait
 for Git, GitHub, or SSH. It also requests the same background refresh as `r`.
-With no candidates, the overlay stays open and shows
-why each row is kept. Candidates appear first with green trash glyphs; kept
-worktrees and their reasons follow under a separate count. Long names and
-reasons wrap below their own column, including in the no-candidates view.
+Candidates appear first under `Ready to remove` with green trash glyphs; kept
+worktrees and their reasons follow under `Keeping` with their own count. Long
+names and reasons wrap below their own column.
+
+**Keeping lists only rows you could be surprised to see kept**: a row whose
+own work landed, whose status is `dropped`, or whose PR merged or closed, and
+that something still holds. The reasons are `still owes: <first line>` (with
+`(+N more)` when it owes more; a check, a pending wake or a due step, never
+a gate alone), `uncommitted changes`, `rebase or merge is in progress`,
+`operation in progress`, the unknowns (`checkout is unavailable`, `Git state
+is unavailable`, `checkout changes are still loading`, `host is
+unavailable`), and `landing of its own work is not proven` for a dropped
+branch or a closed PR. Work that is simply unfinished or not started (that
+last reason with no dropped status and no merged or closed PR, or `work is
+still in progress` for a status of working or needs-human) is not cleanup's
+business and is left out of the menu entirely. With no candidates the overlay
+stays open, starts with `Nothing is ready to clean.` and lists the kept rows,
+if any.
 
 While the menu is open the worktree list shows the same decision, so rows the
 modal does not cover still read. Rows it will clean fill with green, and a
-folded section holding one takes the same fill. Everything else recedes to dim
-with only its title colored by why it stays: yellow when the work landed but
-something still holds the checkout (uncommitted changes, owed verification,
-work in progress), purple when wt cannot tell yet (loading, busy, unavailable),
-and dim when the work has not landed. The menu's reasons use the same colors.
+folded section holding one takes the same fill. A row the menu lists as kept
+recedes to dim with only its title colored by why it stays: yellow when
+something still holds the checkout (it still owes something, uncommitted
+changes), purple when wt cannot tell yet (loading, busy, unavailable), and
+dim when its work never landed. A row the menu leaves out wears no mark at
+all and reads as it does on the board. The menu's reasons use the same colors.
 
 Press `c` or `Esc` to close it. Reopen it to use newer
 background results. Confirmation checks only the displayed candidate identities

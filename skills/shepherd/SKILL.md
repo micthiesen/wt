@@ -41,9 +41,10 @@ A recurring action on a simple row condition belongs in wt's rule engine,
 it re-derives conditions every pass, keeps a once-only ledger, waits out a
 settle window, trips a per-rule circuit breaker, and paces dispatches. If the
 request is really a few row conditions, propose automations instead.
-`pr.merge_dropped` (a merge wt armed is no longer armed) and
-`status.verification_due` (an owed post-merge check has come due) are such
-conditions: with rules that prompt the owner, neither needs a sweep.
+`pr.merge_dropped` (a merge wt armed is no longer armed) is such a
+condition: with a rule that prompts the owner it needs no sweep. An owed
+post-merge check needs no rule at all: wt wakes the owner when it is due, and
+`wt owed --all` lists what every worktree still owes.
 
 A one-off wait is not a loop either. "Do Y when X" for one row is
 `wt wake --slug <slug> <condition> -m "<Y>"`, "tell me when X" is

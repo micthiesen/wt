@@ -6,6 +6,11 @@
 //! removal hazards and command output all read [`owed_items`]; nothing else
 //! decides what a row owes.
 //!
+//! A merge gate is owed only until the row's own work lands: the merge it
+//! held back has then happened, so the gate is not an item of a landed row
+//! and never holds its phase or its cleanup. A wake set to follow the gate
+//! (`--then`) is still owed, as the step it is.
+//!
 //! A wake that is delivered after its worktree's own work landed does not
 //! vanish: it becomes a due step, kept as an [`OwedRecord`] until it is
 //! closed with evidence. Watches that only tell the person are not owed by
@@ -104,15 +109,6 @@ impl OwnerLanding {
     /// Whether a wake delivered under this landing becomes a due step.
     pub const fn owes(self) -> bool {
         !matches!(self, Self::NotLanded)
-    }
-
-    /// From what is known of the base landing; `None` is unknown.
-    pub const fn from_base(landed: Option<bool>) -> Self {
-        match landed {
-            Some(true) => Self::Landed,
-            Some(false) => Self::NotLanded,
-            None => Self::Unknown,
-        }
     }
 }
 
@@ -330,6 +326,8 @@ fn own_stage(watch: &Watch) -> Option<VerifyStage> {
 /// Order: what is due first (checks by stage, then steps, oldest first),
 /// then the gate, then what waits: for staging, for production, for
 /// anything else, and last for a time, soonest first.
+///
+/// The gate is listed only while the row's own work has not landed.
 pub fn owed_items(
     record: Option<&WorkStatusRecord>,
     landing: &Landing,
@@ -406,8 +404,11 @@ pub fn owed_items(
         owed.due_at_ms = Some(step.due_at_ms);
         items.push(owed);
     }
+    // A landed row's gate is moot: what it held back has happened. Its
+    // watch, if one remains, still clears the stored text when its
+    // conditions hold and goes with the worktree otherwise.
     let gate = record
-        .filter(|record| !record.is_terminal())
+        .filter(|record| !landing.base && !record.is_terminal())
         .and_then(|record| record.blocked_on.as_deref())
         .filter(|gate| !gate.is_empty());
     let clears_gate = |watch: &Watch| {
@@ -433,7 +434,8 @@ pub fn owed_items(
         let Some(prompt) = watch.then.wake.as_deref().filter(|_| watch.wakes_owner()) else {
             continue;
         };
-        // The wake that follows a gate is part of the gate's item.
+        // The wake that follows a gate is part of the gate's item. Once the
+        // row has landed there is no gate item, and the wake is a step.
         if clears_gate(watch) {
             continue;
         }
@@ -482,7 +484,8 @@ pub fn owed_phase(items: &[OwedItem], landed: bool) -> Option<OwedPhase> {
 /// Whether removing the worktree would lose something it owes: a check not
 /// yet discharged (due or not), a wake still owed to its session, or a step
 /// that came due and was not closed. This is the one cleanup predicate. A
-/// merge gate alone is not owed after landing and holds nothing.
+/// merge gate alone is not owed after landing and holds nothing, so for a
+/// landed row this is exactly "[`owed_items`] is not empty".
 /// `watches` and `due` must be this worktree's own.
 pub fn owes_anything(
     record: Option<&WorkStatusRecord>,
@@ -507,15 +510,22 @@ pub fn owed_hazards(
     due: &[OwedRecord],
     clock: LocalClock,
 ) -> Vec<String> {
-    let wakes = |id: Option<&str>| {
-        watches
-            .iter()
-            .any(|watch| Some(watch.id.as_str()) == id && watch.wakes_owner())
-    };
     owed_items(record, &Landing::NONE, watches, due, clock.now_ms)
         .iter()
-        .filter(|item| item.kind != OwedKind::Gate || wakes(item.id.as_deref()))
-        .map(|item| {
+        .filter_map(|item| {
+            if item.kind == OwedKind::Gate {
+                // Removal loses the wake that follows the gate, never the
+                // gate itself: name the wake, as the list of a landed row
+                // does.
+                let watch = watches.iter().find(|watch| {
+                    Some(watch.id.as_str()) == item.id.as_deref() && watch.wakes_owner()
+                })?;
+                return Some(format!(
+                    "{OWED_HAZARD}: {} ({})",
+                    watch::headline(watch.then.wake.as_deref()?),
+                    watch::when_described(&watch.when, clock)
+                ));
+            }
             let when = match (&item.when, item.stage) {
                 (OwedWhen::Stage { .. }, Some(stage)) => item.when_words(clock).replacen(
                     &format!("once in {}", stage.as_str()),
@@ -524,7 +534,7 @@ pub fn owed_hazards(
                 ),
                 _ => item.when_words(clock),
             };
-            format!("{OWED_HAZARD}: {} ({when})", item.headline())
+            Some(format!("{OWED_HAZARD}: {} ({when})", item.headline()))
         })
         .collect()
 }

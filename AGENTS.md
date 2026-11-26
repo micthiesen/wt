@@ -22,8 +22,8 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
 - Keep the source of truth current: `docs/configuration.md` mirrors
   `wt-config`; `docs/tui.md` mirrors keybindings and panes; `docs/cli.md`
   mirrors Clap commands and flags. Feature semantics live in
-  `docs/automations.md`, `docs/github-events.md`, `docs/stacked-prs.md`, and
-  `docs/manager.md`.
+  `docs/automations.md`, `docs/github-events.md`, `docs/stacked-prs.md`,
+  `docs/owed.md` (what a worktree still owes), and `docs/manager.md`.
 - Changes to update/recovery, skills distribution, backends, or Discord
   integration also update `docs/updates.md`, `docs/skills.md`,
   `docs/backends.md`, or `docs/discord.md`, respectively. Bundled skills are

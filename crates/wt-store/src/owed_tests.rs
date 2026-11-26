@@ -583,6 +583,63 @@ fn removal_keeps_the_checks_beside_the_status_where_an_older_settle_leaves_them(
 }
 
 #[test]
+fn recording_a_removal_again_brings_back_no_check_closed_since() {
+    let (_temp, mut store) = store();
+    store.set_slug_work_status("one", Some(&both())).unwrap();
+    store
+        .record_removed_worktrees(&[removal(true)], NOON + 2_000)
+        .unwrap();
+    let verified = status("verified");
+    // Closed on the record: the live slug's status still names it.
+    store
+        .close_removed_checks(
+            "one",
+            &CheckTargets::Stages(vec![STAGING]),
+            &verified,
+            Some("saw it"),
+        )
+        .unwrap();
+    assert_eq!(work(&store)["verifyAfterMerge"], "open the page");
+    store
+        .record_removed_worktrees(&[removal(true)], NOON + 3_000)
+        .unwrap();
+    assert_eq!(
+        stages(&removed(&mut store).open_checks()),
+        [(PRODUCTION, "watch the logs")]
+    );
+    assert_eq!(
+        raw(&store)["removed"][0]["work"]["verifyAfterMerge"],
+        "watch the logs"
+    );
+    // Closed on the live row: the record still names it.
+    let closed = store
+        .close_checks(
+            "one",
+            &CheckTargets::Stages(vec![PRODUCTION]),
+            &verified,
+            None,
+        )
+        .unwrap();
+    assert!(matches!(closed, ChecksClosed::Closed { .. }), "{closed:?}");
+    store
+        .record_removed_worktrees(&[removal(true)], NOON + 4_000)
+        .unwrap();
+    assert!(!removed(&mut store).owes_anything());
+    // A status asserted after the recording is a fresh claim: it replaces
+    // what was recorded.
+    let mut fresh = status("ready").with_check(PRODUCTION, "rerun the export");
+    fresh.at = "2026-11-24T12:00:05Z".into();
+    store.set_slug_work_status("one", Some(&fresh)).unwrap();
+    store
+        .record_removed_worktrees(&[removal(true)], NOON + 6_000)
+        .unwrap();
+    assert_eq!(
+        stages(&removed(&mut store).open_checks()),
+        [(PRODUCTION, "rerun the export")]
+    );
+}
+
+#[test]
 fn a_removed_row_settles_stage_by_stage_through_the_one_outcome_call() {
     let (_temp, mut store) = store();
     store.set_slug_work_status("one", Some(&both())).unwrap();
@@ -814,8 +871,13 @@ fn a_wake_with_more_to_do_keeps_its_watch_and_the_existing_calls_still_close_on_
             .unwrap()
     );
     let unsure = wake(&mut store, &["staging"], "old unsure path", false);
-    assert!(store.complete_unconfirmed_wake(&unsure).unwrap());
-    assert!(!store.complete_unconfirmed_wake(&unsure).unwrap());
+    let deliver = |store: &mut Store| {
+        store
+            .complete_wake(&unsure, OwnerLanding::NotLanded, true, NOON)
+            .unwrap()
+    };
+    assert_eq!(deliver(&mut store), WakeCompletion::Closed);
+    assert_eq!(deliver(&mut store), WakeCompletion::NotOwed);
     assert_eq!(store.list_owed(None).unwrap().len(), 1);
 }
 

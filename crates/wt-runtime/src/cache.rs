@@ -115,6 +115,14 @@ impl<T> DiskCache<T> {
         self.slot.clone()
     }
 
+    /// The slot `name` as another process last saved it, with when it was
+    /// saved, for a reader that does not own the slot: unlike a restore, a
+    /// file this build or configuration cannot use is left where it is.
+    /// What comes back is as unconfirmed as any restored data.
+    pub fn peek(&self, name: &str) -> Option<(T, u64)> {
+        self.slot.peek(name).ok()
+    }
+
     #[cfg(test)]
     fn read(&self, name: &str) -> Result<(T, u64), Rejected> {
         self.slot.read(name)
@@ -137,13 +145,19 @@ struct SerdeSlot<T> {
 /// Erased read/write so the generic source code needs no serde bounds.
 pub(crate) trait CacheSlot<T>: Send + Sync {
     fn read(&self, name: &str) -> Result<(T, u64), Rejected>;
+    /// [`Self::read`] without discarding a file that is rejected.
+    fn peek(&self, name: &str) -> Result<(T, u64), Rejected>;
     fn write(&self, name: &str, data: &T) -> std::io::Result<()>;
 }
 
 impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T> for SerdeSlot<T> {
+    fn peek(&self, name: &str) -> Result<(T, u64), Rejected> {
+        read_envelope(&self.store.path(name), name, self.store.scope(), now_ms())
+    }
+
     fn read(&self, name: &str) -> Result<(T, u64), Rejected> {
         let path = self.store.path(name);
-        let result = read_envelope(&path, name, self.store.scope(), now_ms());
+        let result = self.peek(name);
         if let Err(reason) = &result
             && *reason != Rejected::Missing
         {
@@ -309,6 +323,12 @@ mod tests {
         let (data, saved) = cache.read("git").unwrap();
         assert_eq!(data, vec!["row".to_owned()]);
         assert!(saved <= now_ms());
+
+        // A reader that does not own the slot sees the same data, and
+        // leaves a file it cannot use for the process that can.
+        assert_eq!(cache.peek("git").unwrap().0, vec!["row".to_owned()]);
+        assert!(store(directory.path(), "scope-b").peek("git").is_none());
+        assert!(directory.path().join("git.json").exists());
 
         // Another configuration or build cannot read it, and discards it.
         assert_eq!(

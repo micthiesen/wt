@@ -158,7 +158,10 @@ wt wake 1h -m "babysit: not merged yet? read the row for an eviction"
 ```
 
 A repository with a `pr.merge_dropped` automation prompts you sooner. Each
-time you are woken unmerged, read the row and set the time wake again.
+time you are woken unmerged, read the row and set the time wake again. A
+wake delivered after the PR merged stays owed: once merged, cancel the
+leftover time wake (`wt watch cancel <id>`), and close the `merged` one with
+`wt done <id> -m "<what you did>"` when the list below is done.
 
 When the PR is open and not draft but has no `.merge_queue` entry and
 `.pr.auto_merge` is false, or its queue entry reads `UNMERGEABLE`, it was
@@ -171,16 +174,17 @@ real one.
 
 ## After it lands
 
-- `verifyAfterMerge` set: `verifyIn` names the environment. Come back when
-  the change is there, `wt wake staging -m "run the owed check"` or
-  `wt wake production -m …`, not by polling. Then confirm its deploy carries
-  the change, run the steps, and `wt status verified -m "<what you checked,
-  where>"`.
-- A later-phase op in your note (`OPS AFTER MERGE`, `OPS AFTER RELEASE`)
-  gets the same wake.
+- `wt owed` lists what the worktree still owes. A check
+  (`--verify-in-staging`, `--verify-in-production`; both may be owed) wakes
+  you when the change is deployed there; do not poll for it. Confirm the
+  deploy carries the change, run the steps, then
+  `wt done <stage> -m "<what you checked, where>"`.
+- Any other step you set a wake for comes back as a due step: do it, then
+  `wt done <id> -m "<what you did and saw>"`, or `--again <condition>` to
+  come back for another part.
 - Do not remove the worktree; merge cleanup archives it.
-- You are done only when `.pr.state` is `MERGED` and verification is done,
-  or when blocked on a human. An armed PR is still something to wait for:
+- You are done only when `.pr.state` is `MERGED` and `wt owed` says the
+  worktree owes nothing, or when blocked on a human. An armed PR is still something to wait for:
   never end a turn there without a wake set (`wt watch`). Never keep waiting
   on a clean current-head review; merge it.
 

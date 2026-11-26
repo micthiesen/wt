@@ -552,7 +552,7 @@ pub async fn execute_with_shutdown(
             }
             if revisions.is_empty() {
                 return Ok(message(format!(
-                    "Nothing safe to clean. {}",
+                    "Nothing is ready to clean. {}",
                     lines.join("; ")
                 )));
             }
@@ -622,7 +622,16 @@ pub async fn execute_with_shutdown(
             verify_after_merge,
             verify_in,
             seen,
-        } => set_status(ctx, &key, state, note, verify_after_merge, verify_in, seen).await,
+        } => {
+            let status = SetStatus {
+                state,
+                note,
+                verify: verify_after_merge,
+                verify_in,
+                seen,
+            };
+            set_status(ctx, board, &key, status).await
+        }
         UiAction::SetBase { key, base, seen } => set_base(ctx, &key, base, seen).await,
         UiAction::SetNotify { key, change, seen } => {
             crate::watch_actions::set_notify(ctx, &key, change, seen.0).await
@@ -861,15 +870,48 @@ async fn start_install(ctx: &AppContext, target: &wt_core::WorktreeTarget) -> Re
         .map(|_| ())
 }
 
-async fn set_status(
-    ctx: &AppContext,
-    key: &str,
+/// What the status menu committed.
+struct SetStatus {
     state: Option<String>,
     note: Option<String>,
     verify: Option<String>,
     verify_in: Option<wt_core::VerifyStage>,
     seen: Option<wt_tui::Seen<Option<wt_tui::StatusClaim>>>,
+}
+
+/// The claim a status menu shows of a stored status.
+fn status_claim(work: &wt_store::WorkStatusRecord) -> wt_tui::StatusClaim {
+    wt_tui::StatusClaim {
+        state: work.state.clone(),
+        note: work.note.clone(),
+        verify_after_merge: work.verify_after_merge.clone(),
+        verify_in: work
+            .verify_in
+            .as_deref()
+            .and_then(wt_core::VerifyStage::parse),
+    }
+}
+
+fn stale_status(current: Option<wt_tui::StatusClaim>) -> anyhow::Error {
+    wt_app_core::host_errors::stale(format!(
+        "status is now {}",
+        current.map_or("unset".into(), |claim| claim.state)
+    ))
+}
+
+async fn set_status(
+    ctx: &AppContext,
+    board: Option<&Board>,
+    key: &str,
+    status: SetStatus,
 ) -> Result<UiReply> {
+    let SetStatus {
+        state,
+        note,
+        verify,
+        verify_in,
+        seen,
+    } = status;
     if verify
         .as_deref()
         .is_some_and(|steps| !steps.trim().is_empty())
@@ -892,7 +934,82 @@ async fn set_status(
     .stdout_text()
     .trim()
     .to_owned();
-    let at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    let now = OffsetDateTime::now_utc();
+    let at = now.format(&Rfc3339)?;
+    // Verified on a row that owes checks closes them by the rule `wt status
+    // verified` follows, through the same call: what is due where the board
+    // shows the work has landed, else the earliest. The status changes only
+    // once none remains.
+    if state == Some(wt_core::WorkState::Verified) {
+        let landing = board
+            .and_then(|board| board.rows.iter().find(|row| row.key == key))
+            .map_or(wt_core::Landing::NONE, |row| {
+                wt_sources::watch_board::row_landing(row, ctx.config.branch.separate_production())
+            });
+        let mut verified = wt_core::WorkStatusRecord::new(wt_core::WorkState::Verified, at.clone());
+        verified.note = note
+            .as_deref()
+            .map(wt_core::sanitize_work_note)
+            .filter(|text| !text.is_empty());
+        verified.sha = Some(head.clone());
+        verified.by = Some("human".into());
+        let evidence = verified.note.clone();
+        let verified = serde_json::to_value(&verified)
+            .and_then(serde_json::from_value::<wt_store::WorkStatusRecord>)
+            .context("encode status record")?;
+        let now_ms = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX);
+        let (owner, witness) = (slug.clone(), seen.clone());
+        let (closed, current) = ctx
+            .database
+            .call(move |store| {
+                let mut current = None;
+                let closed = wt_ops::status_checks::close_verified(
+                    store,
+                    &owner,
+                    landing,
+                    now_ms,
+                    &verified,
+                    evidence.as_deref(),
+                    |work| {
+                        current = work.map(status_claim);
+                        witness
+                            .as_ref()
+                            .is_none_or(|wt_tui::Seen(seen)| current == *seen)
+                    },
+                )?;
+                Ok((closed, current))
+            })
+            .await?;
+        match closed {
+            None => return Err(stale_status(current)),
+            Some(wt_store::ChecksClosed::Closed {
+                closed,
+                remaining,
+                record,
+                ..
+            }) => {
+                if remaining.is_empty() {
+                    return Ok(message("Work status updated"));
+                }
+                let lines = wt_ops::status_checks::checks_closed_lines(
+                    &slug,
+                    &closed,
+                    &remaining,
+                    Some(&record.state),
+                    false,
+                );
+                return Ok(message(
+                    lines
+                        .iter()
+                        .map(|line| line.trim())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ));
+            }
+            // No check is owed: an ordinary assertion, witnessed again below.
+            Some(wt_store::ChecksClosed::Missing | wt_store::ChecksClosed::NotOwed) => {}
+        }
+    }
     ctx.database
         .call(move |store| {
             // The compare and the carry-over read the record under the
@@ -904,20 +1021,9 @@ async fn set_status(
                 // The note and owed check are carried into the new claim, so a
                 // change to either is as unseen as a change of state.
                 if let Some(wt_tui::Seen(seen)) = &seen {
-                    let current = previous.map(|work| wt_tui::StatusClaim {
-                        state: work.state.clone(),
-                        note: work.note.clone(),
-                        verify_after_merge: work.verify_after_merge.clone(),
-                        verify_in: work
-                            .verify_in
-                            .as_deref()
-                            .and_then(wt_core::VerifyStage::parse),
-                    });
+                    let current = previous.map(status_claim);
                     if current != *seen {
-                        return Err(wt_app_core::host_errors::stale(format!(
-                            "status is now {}",
-                            current.map_or("unset".into(), |claim| claim.state)
-                        )));
+                        return Err(stale_status(current));
                     }
                 }
                 let Some(state) = state else {
@@ -1040,13 +1146,13 @@ mod tests {
                 &[
                     "uncommitted changes".into(),
                     "1 unpushed commit".into(),
-                    "post-merge verification still owed".into(),
+                    "still owes: check: open the page (in staging)".into(),
                 ],
                 None,
             ),
             [
                 "Uncommitted changes, 1 unpushed commit will be lost.",
-                "Post-merge verification still owed.",
+                "Still owes: check: open the page (in staging).",
             ]
         );
         assert_eq!(
@@ -1057,6 +1163,22 @@ mod tests {
             removal_hazard_lines(&["uncommitted changes".into()], Some(1)),
             ["1 uncommitted change will be lost."]
         );
+    }
+
+    fn status(
+        state: Option<String>,
+        note: Option<String>,
+        verify: Option<String>,
+        verify_in: Option<wt_core::VerifyStage>,
+        seen: Option<wt_tui::Seen<Option<wt_tui::StatusClaim>>>,
+    ) -> SetStatus {
+        SetStatus {
+            state,
+            note,
+            verify,
+            verify_in,
+            seen,
+        }
     }
 
     #[tokio::test]
@@ -1070,29 +1192,35 @@ mod tests {
         let key = wt_core::worktree_target_key(&row.target);
         set_status(
             &fixture.ctx,
-            &key,
-            Some("ready".into()),
-            Some("checked locally".into()),
-            Some("STEPS: check deployed version".into()),
-            Some(wt_core::VerifyStage::Production),
             None,
+            &key,
+            status(
+                Some("ready".into()),
+                Some("checked locally".into()),
+                Some("STEPS: check deployed version".into()),
+                Some(wt_core::VerifyStage::Production),
+                None,
+            ),
         )
         .await
         .unwrap();
         // A menu that showed an older claim is refused without writing.
         let error = set_status(
             &fixture.ctx,
+            None,
             &key,
-            Some("working".into()),
-            None,
-            None,
-            None,
-            Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
-                state: "review".into(),
-                note: None,
-                verify_after_merge: None,
-                verify_in: None,
-            }))),
+            status(
+                Some("working".into()),
+                None,
+                None,
+                None,
+                Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
+                    state: "review".into(),
+                    note: None,
+                    verify_after_merge: None,
+                    verify_in: None,
+                }))),
+            ),
         )
         .await
         .unwrap_err();
@@ -1100,34 +1228,40 @@ mod tests {
         // Same state, but the owed check changed since: still unseen.
         let error = set_status(
             &fixture.ctx,
+            None,
             &key,
-            Some("working".into()),
-            None,
-            None,
-            None,
-            Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
-                state: "ready".into(),
-                note: Some("checked locally".into()),
-                verify_after_merge: Some("STEPS: older steps".into()),
-                verify_in: None,
-            }))),
+            status(
+                Some("working".into()),
+                None,
+                None,
+                None,
+                Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
+                    state: "ready".into(),
+                    note: Some("checked locally".into()),
+                    verify_after_merge: Some("STEPS: older steps".into()),
+                    verify_in: None,
+                }))),
+            ),
         )
         .await
         .unwrap_err();
         assert!(wt_app_core::host_errors::error_reply(&error).stale);
         set_status(
             &fixture.ctx,
+            None,
             &key,
-            Some("working".into()),
-            None,
-            None,
-            None,
-            Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
-                state: "ready".into(),
-                note: Some("checked locally".into()),
-                verify_after_merge: Some("STEPS: check deployed version".into()),
-                verify_in: Some(wt_core::VerifyStage::Production),
-            }))),
+            status(
+                Some("working".into()),
+                None,
+                None,
+                None,
+                Some(wt_tui::Seen(Some(wt_tui::StatusClaim {
+                    state: "ready".into(),
+                    note: Some("checked locally".into()),
+                    verify_after_merge: Some("STEPS: check deployed version".into()),
+                    verify_in: Some(wt_core::VerifyStage::Production),
+                }))),
+            ),
         )
         .await
         .unwrap();
@@ -1146,24 +1280,24 @@ mod tests {
         assert!(
             set_status(
                 &fixture.ctx,
+                None,
                 &key,
-                Some("ready".into()),
-                None,
-                Some("other steps".into()),
-                None,
-                None,
+                status(
+                    Some("ready".into()),
+                    None,
+                    Some("other steps".into()),
+                    None,
+                    None,
+                ),
             )
             .await
             .is_err()
         );
         set_status(
             &fixture.ctx,
+            None,
             &key,
-            Some("ready".into()),
-            None,
-            Some(String::new()),
-            None,
-            None,
+            status(Some("ready".into()), None, Some(String::new()), None, None),
         )
         .await
         .unwrap();
@@ -1185,12 +1319,15 @@ mod tests {
             async move {
                 set_status(
                     ctx,
+                    None,
                     &key,
-                    Some(state.into()),
-                    None,
-                    steps.map(str::to_owned),
-                    stage,
-                    None,
+                    status(
+                        Some(state.into()),
+                        None,
+                        steps.map(str::to_owned),
+                        stage,
+                        None,
+                    ),
                 )
                 .await
                 .unwrap();
@@ -1221,6 +1358,81 @@ mod tests {
         assert!(left.get("staging").is_none(), "{left}");
         assert_eq!(left["production"]["steps"], "1. production");
         assert_eq!(set("verified", None, None).await, serde_json::json!({}));
+
+        // Verified follows the rule `wt status verified` does. Nothing is
+        // due while the work has not landed, so the earliest check closes
+        // and the state stays until none remains.
+        let work = || async {
+            fixture
+                .ctx
+                .database
+                .call(|store| Ok(store.read_wt_state()?))
+                .await
+                .unwrap()["slugs"]["one"]["work"]
+                .clone()
+        };
+        let owe_both = || async {
+            set(
+                "ready",
+                Some("1. staging"),
+                Some(wt_core::VerifyStage::Staging),
+            )
+            .await;
+            set(
+                "ready",
+                Some("1. production"),
+                Some(wt_core::VerifyStage::Production),
+            )
+            .await;
+        };
+        let verified = |note: &'static str, seen| {
+            status(Some("verified".into()), Some(note.into()), None, None, seen)
+        };
+        owe_both().await;
+        let reply = set_status(&fixture.ctx, None, &key, verified("saw staging", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.message,
+            "✓ one closed the check in staging: 1. staging; still owes the check in production: the status stays ready until it is closed"
+        );
+        let left = work().await;
+        assert_eq!(left["state"], "ready");
+        assert!(left["checks"].get("staging").is_none(), "{left}");
+        assert_eq!(left["checks"]["production"]["steps"], "1. production");
+        // A menu that showed another claim closes nothing.
+        let unseen = wt_tui::Seen(Some(wt_tui::StatusClaim {
+            state: "review".into(),
+            note: None,
+            verify_after_merge: None,
+            verify_in: None,
+        }));
+        let error = set_status(&fixture.ctx, None, &key, verified("unseen", Some(unseen)))
+            .await
+            .unwrap_err();
+        assert!(wt_app_core::host_errors::error_reply(&error).stale);
+        assert_eq!(work().await, left);
+        // Where the board shows the work in production both checks are
+        // due: both close, and only then is the row verified.
+        owe_both().await;
+        let board = Board {
+            rows: vec![wt_tui::BoardRow {
+                key: key.clone(),
+                git: wt_tui::GitPresentation {
+                    landed_on: Some(wt_tui::LandingKind::Production),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Board::default()
+        };
+        set_status(&fixture.ctx, Some(&board), &key, verified("saw both", None))
+            .await
+            .unwrap();
+        let done = work().await;
+        assert_eq!(done["state"], "verified");
+        assert_eq!(done["note"], "saw both");
+        assert_eq!(done["checks"], serde_json::json!({}));
         fixture.close().await.unwrap();
     }
 

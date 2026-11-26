@@ -35,6 +35,8 @@ wt status ready --risk <r> --blocked-on "<why>" --until <cond>… [--then "<prom
 wt wake <cond>… -m "<what to do then>" # wake this session then; end the turn
 wt notify <cond>… [-m "<text>"]        # tell the person then
 wt watch [--all]                       # what is waiting; cancel <id>…, check <cond>…
+wt owed [--all]                        # what this worktree (or every one) still owes
+wt done [<id>|staging|production] -m "<evidence>"   # close it; --again <cond>… puts it off
 wt history [slug]                      # what happened to a row, removed ones too
 wt next [branch] --title <outcome> [--issue <ID>|none] [--gh <n>|none]
 wt issue [slug] [--gh <n> | --clear-gh | --read]
@@ -81,9 +83,11 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   mean deployed only where the repository has a deploy probe, otherwise
   landed on that stage's branch. `--slug <slug>` sets one for another
   worktree. The wt TUI evaluates watches, so nothing fires while it is
-  closed; the commands say when it is. A pending wake keeps its worktree
-  from cleanup until it is delivered or cancelled; a notification about a
-  landed worktree outlives it.
+  closed; the commands say when it is. A wake delivered after the worktree's
+  own work landed stays owed until `wt done <id> -m "<evidence>"` closes it.
+  `wt owed` lists what a worktree owes (gate, checks per stage, steps), and
+  anything but a gate keeps it from cleanup; a notification about a landed
+  worktree outlives it.
 - **Another PR in the same worktree.** After its PR merged, run
   `wt next --title "<outcome>"` there instead of a new worktree or a hand
   reset, then push as below. `--issue <ID>` alone takes the tracker's title.
@@ -104,7 +108,7 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
 
 ## Index
 
-- Status and coordination: `status`, `wake`, `notify`, `watch`, `history`,
+- Status and coordination: `status`, `owed`, `done`, `wake`, `notify`, `watch`, `history`,
   `fleet`, `manager`, `hold`, `edge`, `guide`, `automations`
 - Worktrees: `new`, `next`, `restack`, `merge`, `ls`, `rm`, `clean`,
   `archive`, `restore`, `open`, `doctor`, `logs`, `base`, `issue`, `section`

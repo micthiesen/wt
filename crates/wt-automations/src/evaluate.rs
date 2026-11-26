@@ -10,9 +10,8 @@ use crate::types::{
 };
 
 pub const FLEET_SLUG: &str = "_fleet";
-pub const WATCH_RULE_ID: &str = "wt.watch";
+pub use wt_config::{CHECK_RULE_ID, WATCH_RULE_ID};
 pub const WATCH_RUN: &str = "builtin:watch";
-pub const CHECK_RULE_ID: &str = "wt.check";
 pub const CHECK_RUN: &str = "builtin:check";
 /// GitHub's answer about a merge armed more recently than this may predate
 /// the arming, so it is not yet evidence that the merge was dropped. It is
@@ -575,7 +574,7 @@ fn evaluate_row(
                 .filter_map(|stage| {
                     let check = work.open_check(stage)?;
                     Some(format!(
-                        "in {}, verification still owed — {}",
+                        "still owes the check in {}: {}",
                         stage.as_str(),
                         check.steps
                     ))
@@ -1479,7 +1478,7 @@ mod tests {
         assert_eq!(fires.len(), 1);
         assert_eq!(
             fires[0].detail,
-            "in staging, verification still owed — check staging; in production, verification still owed — check prod"
+            "still owes the check in staging: check staging; still owes the check in production: check prod"
         );
         assert_eq!(fires[0].fire_keys, ["nag:unverified:feature-1:2026-01-05"]);
         // A check put off is nobody's lapse until its time has passed.

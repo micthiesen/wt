@@ -20,6 +20,8 @@ use wt_vcs::WorktreeRecord;
 use wt_app_core::{context::AppContext, database::Database};
 use wt_ops::commands::resolve::resolve_worktree;
 
+use super::landing::{self, RowLanding};
+
 const VOCAB: &str = "states: todo, working, review, needs-testing, needs-human, ready, verified, dropped\nUse unique prefixes; `nh` and `nt` are aliases. Ready requires --risk. --blocked-on gates ready/todo, and --until <condition> clears the gate by itself once the condition holds (e.g. --until pr:3806:production; see `wt watch check`); --verify-in-staging / --verify-in-production record a check owed once the change deploys there (both may be given; --no-verify-in-<stage> drops one). `wt owed` lists what the worktree owes and `wt done` closes it.";
 
 #[derive(Debug, Clone, Args, Default)]
@@ -598,13 +600,13 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             let now = now_ms();
             if wants_json {
                 let rows = worktrees.iter().map(|w| (*w).clone()).collect::<Vec<_>>();
-                let landings = wt_ops::lifecycle_ops::row_landings(ctx, &rows, &state, None).await;
+                let landings = landing::read(ctx, &rows, &state, landing::Want::Phases).await;
                 let mut entries = Vec::with_capacity(worktrees.len());
                 for w in &worktrees {
                     let landing = landings
                         .get(w.target.slug())
                         .copied()
-                        .unwrap_or(wt_core::Landing::NONE);
+                        .unwrap_or(RowLanding::known(wt_core::Landing::NONE));
                     entries.push(live_json(ctx, &state, w, landing).await?);
                 }
                 let live = worktrees
@@ -675,15 +677,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             if wants_json {
-                let landing = wt_ops::lifecycle_ops::row_landings(
-                    ctx,
-                    std::slice::from_ref(&record),
-                    &state,
-                    None,
-                )
-                .await
-                .remove(record.target.slug())
-                .unwrap_or(wt_core::Landing::NONE);
+                let landing = landing::read_one(ctx, &record, &state, landing::Want::Phases).await;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&live_json(ctx, &state, &record, landing).await?)?
@@ -1135,30 +1129,34 @@ async fn verify_checks(
         );
         return Ok(Some(2));
     }
-    let landing =
-        wt_ops::lifecycle_ops::row_landings(ctx, std::slice::from_ref(record), state, None)
-            .await
-            .remove(&slug)
-            .unwrap_or(wt_core::Landing::NONE);
+    // Under a landing that cannot be read nothing is known to be due, so
+    // only the earliest check closes: never more than was asserted.
+    let landing = landing::read_one(ctx, record, state, landing::Want::Lists)
+        .await
+        .shown();
     let merged = merge_note(previous.note.as_deref(), note.as_deref(), append, false);
     let verified = super::owed::verified_record(record.head_sha.as_deref(), merged)?;
-    let targets = wt_store::CheckTargets::Verified {
-        landing,
-        now_ms: now_ms(),
-    };
     let (owner, evidence) = (slug.clone(), note.clone());
     let closed = ctx
         .database
         .call(move |store| {
-            Ok(store.close_checks(&owner, &targets, &verified, evidence.as_deref())?)
+            Ok(wt_ops::status_checks::close_verified(
+                store,
+                &owner,
+                landing,
+                now_ms(),
+                &verified,
+                evidence.as_deref(),
+                |_| true,
+            )?)
         })
         .await?;
-    let wt_store::ChecksClosed::Closed {
+    let Some(wt_store::ChecksClosed::Closed {
         closed,
         remaining,
         record: written,
         cancelled_watches,
-    } = closed
+    }) = closed
     else {
         // Closed by someone else since the state was read.
         return Ok(None);
@@ -1557,7 +1555,7 @@ fn print_guidance(state: WorkState, blocked_on: Option<&str>, clears: Option<&st
             "the note should say what you need and what you already tried; keep working on unblocked parts"
         }
         WorkState::Ready => "leave the PR ready for the human to merge; do not merge it yourself",
-        WorkState::Verified => "deployed verification is complete",
+        WorkState::Verified => "every check owed after merging is closed",
         WorkState::Dropped => {
             "close any open PR and explain why; leave worktree removal to the human"
         }
@@ -1689,7 +1687,7 @@ async fn live_json(
     ctx: &AppContext,
     state: &Value,
     w: &WorktreeRecord,
-    landing: wt_core::Landing,
+    landing: RowLanding,
 ) -> Result<Value> {
     let slug = w.target.slug();
     let clock = super::watch::clock();
@@ -1721,7 +1719,7 @@ async fn live_json(
         }
     };
     Ok(
-        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
+        json!({"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word(),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
     )
 }
 
@@ -1731,7 +1729,7 @@ fn removed_json(entry: wt_store::RemovedWorktree, separate_production: bool) -> 
     let work_state = entry.work.as_ref().map(|work| work.state.as_str());
     let verification_owed = wt_store::verification_owed_at_removal(&entry);
     let merged = wt_store::is_merged_removal(&entry);
-    json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_in":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_ref().map(|_|VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),"verify_after_merge":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_deref()),"verification_owed":verification_owed,"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase)})
+    json!({"slug":entry.slug,"branch":entry.branch,"kind":if merged {"merged"} else {"removed"},"pr":entry.extra.get("prNumber").cloned().unwrap_or(Value::Null),"pr_url":entry.extra.get("prUrl").cloned().unwrap_or(Value::Null),"title":entry.extra.get("title").cloned().unwrap_or(Value::Null),"archived_at":entry.removed_at,"work_state":work_state,"verify_in":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_ref().map(|_|VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),"verify_after_merge":entry.work.as_ref().and_then(|work|work.verify_after_merge.as_deref()),"verification_owed":verification_owed,"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word()})
 }
 
 #[cfg(test)]
@@ -2019,9 +2017,14 @@ mod tests {
             .unwrap();
         let one = records.iter().find(|w| w.target.slug() == "one").unwrap();
         let state = read_state(&fixture.ctx.database).await.unwrap();
-        let entry = live_json(&fixture.ctx, &state, one, wt_core::Landing::NONE)
-            .await
-            .unwrap();
+        let entry = live_json(
+            &fixture.ctx,
+            &state,
+            one,
+            RowLanding::known(wt_core::Landing::NONE),
+        )
+        .await
+        .unwrap();
         assert_eq!(entry["slug"], "one");
         assert_eq!(entry["state"], "todo");
         assert_eq!(entry["blocked_on"], "release train lands");
@@ -2324,9 +2327,14 @@ mod tests {
         // The row's JSON carries it.
         let state = read_state(&fixture.ctx.database).await.unwrap();
         let record = resolve_worktree(&fixture.ctx, Some("one")).await.unwrap();
-        let row = live_json(&fixture.ctx, &state, &record, wt_core::Landing::NONE)
-            .await
-            .unwrap();
+        let row = live_json(
+            &fixture.ctx,
+            &state,
+            &record,
+            RowLanding::known(wt_core::Landing::NONE),
+        )
+        .await
+        .unwrap();
         assert_eq!(row["watches"][0]["id"], set[0].id.as_str());
         assert_eq!(row["watches"][0]["when"][0]["arg"], "pr:7:production");
         assert_eq!(row["watches"][0]["then"]["unblock"], "#7 ships");

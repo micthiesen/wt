@@ -1884,7 +1884,10 @@ impl Store {
                             .is_ok_and(|entry| is_merged_removal(&entry));
                     log.append(&incoming.slug, &WorktreeEventKind::Removed { landed })
                 });
-                crate::owed::settle_removed_checks(&mut next);
+                crate::owed::settle_removed_checks(
+                    &mut next,
+                    previous.filter(|_| incoming.work.is_none()),
+                );
                 crate::owed::move_to_removed(state, &mut next);
                 crate::watches::owner_removed(state, &next, now_ms);
                 by_slug.insert(incoming.slug.clone(), Value::Object(next));

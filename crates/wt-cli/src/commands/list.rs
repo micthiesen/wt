@@ -80,36 +80,36 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
             .iter()
             .map(|snapshot| snapshot.worktree.clone())
             .collect::<Vec<_>>();
-        // Local evidence only: this listing reads no PR data.
-        let landings = wt_ops::lifecycle_ops::row_landings(ctx, &records, &state, None).await;
+        // A squash merge is proven only by its pull request: see `landing`.
+        let landings =
+            super::landing::read(ctx, &records, &state, super::landing::Want::Phases).await;
         let separate_production = ctx.config.branch.separate_production();
-        let mut rows = live
-            .iter()
-            .map(|snapshot| {
-                let slug = snapshot.worktree.target.slug();
-                live_json(
-                    ctx,
-                    &state,
-                    snapshot,
-                    LiveFacts {
-                        remote_url: remote_url.as_deref(),
-                        push: pushes.get(slug).copied().unwrap_or_default(),
-                        lock: locks.get(slug).and_then(|lock| lock.as_ref()),
-                        dev: dev.get(slug).and_then(|row| row.status.as_ref()),
-                        dev_error: dev.get(slug).and_then(|row| row.error.as_deref()),
-                        landing: landings
-                            .get(slug)
-                            .copied()
-                            .unwrap_or(wt_core::Landing::NONE),
-                    },
+        let mut rows =
+            live.iter()
+                .map(|snapshot| {
+                    let slug = snapshot.worktree.target.slug();
+                    live_json(
+                        ctx,
+                        &state,
+                        snapshot,
+                        LiveFacts {
+                            remote_url: remote_url.as_deref(),
+                            push: pushes.get(slug).copied().unwrap_or_default(),
+                            lock: locks.get(slug).and_then(|lock| lock.as_ref()),
+                            dev: dev.get(slug).and_then(|row| row.status.as_ref()),
+                            dev_error: dev.get(slug).and_then(|row| row.error.as_deref()),
+                            landing: landings.get(slug).copied().unwrap_or(
+                                super::landing::RowLanding::known(wt_core::Landing::NONE),
+                            ),
+                        },
+                    )
+                })
+                .chain(
+                    removed
+                        .iter()
+                        .map(|entry| removed_json(entry, separate_production)),
                 )
-            })
-            .chain(
-                removed
-                    .iter()
-                    .map(|entry| removed_json(entry, separate_production)),
-            )
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
         if args.all {
             for row in &mut rows {
                 row["host"] = json!("local");
@@ -409,8 +409,9 @@ struct LiveFacts<'a> {
     lock: Option<&'a OperationLock>,
     dev: Option<&'a DevServerStatus>,
     dev_error: Option<&'a str>,
-    /// What this process can prove of the row's landing, for what it owes.
-    landing: wt_core::Landing,
+    /// What this command could establish of the row's landing, for what it
+    /// owes.
+    landing: super::landing::RowLanding,
 }
 
 fn live_json(
@@ -491,6 +492,7 @@ fn live_json(
         "work_at": work.as_ref().map(|work| work.at.as_str()),
         "owes": super::owed::owes_json(&owed.items, clock),
         "owed_phase": super::owed::phase_json(owed.phase),
+        "landing": owed.landing.word(),
         "inventory_error": snapshot.error,
     })
 }
@@ -530,6 +532,7 @@ fn removed_json(entry: &RemovedWorktree, separate_production: bool) -> Value {
         "verification_owed": verification_owed,
         "owes": super::owed::owes_json(&owed.items, clock),
         "owed_phase": super::owed::phase_json(owed.phase),
+        "landing": owed.landing.word(),
     })
 }
 

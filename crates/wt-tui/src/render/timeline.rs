@@ -389,7 +389,7 @@ fn show_event(
             if let Some(stage) = verify_in.as_deref()
                 && verify_was != Some(stage)
             {
-                meta.push(format!("verify in {stage}"));
+                meta.push(format!("check owed in {stage}"));
             }
             meta.extend(named(by));
             body = note.clone();
@@ -1912,16 +1912,16 @@ mod tests {
             lines,
             [
                 "working",
-                "ready  blocked on API deploy 4.2 · verify in staging",
+                "ready  blocked on API deploy 4.2 · check owed in staging",
                 "conflicts with its base",
                 // Compared with the status before it, not the line above.
                 "needs-human",
                 "ready  blocked on QA sign-off",
-                "ready  gate cleared · verify in production",
+                "ready  gate cleared · check owed in production",
                 "review",
                 "status cleared",
                 // A cleared status carried nothing forward.
-                "ready  verify in production",
+                "ready  check owed in production",
             ]
         );
     }

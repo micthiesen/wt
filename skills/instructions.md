@@ -61,7 +61,39 @@ The checkout is shared with other agents, the human, and hot-reloading servers.
   (`merged`, `staging`, `production`, `green`); `pr:3806:production`;
   `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a time
   take a delay (`release:production+24h`). `wt watch` lists them;
-  `wt watch cancel <id>` cancels. A pending wake holds off cleanup.
+  `wt watch cancel <id>` cancels.
+
+### What you still owe
+
+`wt owed` shows what this worktree owes, as does every command below; a row
+that owes nothing is finished. Never leave owed work only in the note:
+
+- A prerequisite before merging is `--blocked-on "<gate>"`, only when merging
+  now would make things worse until it happens (a manual deploy or follow-up
+  that leaves the status quo unchanged is a step). `--until <condition>`
+  clears the gate once wt observes the prerequisite; `--then "<prompt>"` acts
+  then. Only a person's decision stays a bare gate (`wt status --unblock`).
+- A check only a deployed environment can run is `--verify-in-staging` and/or
+  `--verify-in-production` (both may be owed), set as soon as you know it. It
+  never blocks merging; the row returns as `needs-testing` once the change is
+  there. While a follow-up fix is unmerged, stay `ready --verify-in-<stage>`:
+  a carried check never shows an earlier one passed. Write it as:
+
+      <one line: what only the deployed environment can prove>
+      <why a local run cannot, when that is not obvious>
+      STEPS: 1. <exact step: literal values, expected output> 2. ...
+
+- Any other step, never a check: `wt wake <condition> -m "<step>"`, with
+  `--before-release` when it must precede the next production release.
+- When woken for something owed, confirm the deploy contains the change, do
+  it, then `wt done <id|staging|production> -m "<evidence>"`, or
+  `wt done ... --again <condition>` to come back for another part
+  (`wt status verified -m` also closes due checks). Being woken closes
+  nothing; what is still owed holds off cleanup.
+- Every op is yours: do it when due, asking approval where the action needs
+  it, and never hand it to the human. Prefer automation that ships with the
+  change, such as a checked-in migration the normal deploy applies; a step the
+  merge and deploy flow already performs is not owed.
 
 ### Completion status
 
@@ -82,43 +114,11 @@ with `wt merge`, never `gh pr merge --auto`.
 The ready note is about 400 characters of fragments:
 
     <one line: what changes, in user terms>
-    OPS BEFORE MERGE:   <step that must happen before this merges>
-    OPS AFTER MERGE:    <step once it is deployed to staging>
-    OPS BEFORE RELEASE: <step before the production release that carries it>
-    OPS AFTER RELEASE:  <step once it is in production>
     REVERT:   <"safe", or "no:" + the shortest true reason>
     IF WRONG: <where it shows + the symptom>
     UNTESTED: <checks nobody ran, creating no obligation; omit when none>
 
-- Write an `OPS` line only for a phase that has a step, and `OPS: none` when
-  none does. Every op is yours: perform it at its phase, asking approval where
-  the action needs it, and never hand it to the human. Prefer automation that
-  ships with the change, such as a checked-in migration the normal deploy
-  applies; a step the merge and deploy flow already performs is not an op.
-- An `OPS BEFORE MERGE` step still undone means the branch must not merge:
-  pair it with `--blocked-on`. A later op is one you come back for. A check of
-  the deployed change is always `--verify-in-<stage>`, which shows it as owed;
-  a `wt wake` (`staging`, `production`) is for any other step, never a check.
-- `--blocked-on "<gate>"` only when merging now would make things worse until
-  an external prerequisite happens, never only in the note. A manual deploy or
-  follow-up that leaves the status quo unchanged is not a gate; it goes in an
-  `OPS AFTER` line. Add `--until <condition>` when wt can observe the
-  prerequisite, so the gate clears itself, and `--then "<prompt>"` to act
-  then. Only a person's decision stays a bare gate (`wt status --unblock`).
-- `--verify-in-staging` or `--verify-in-production` as soon as you know a
-  specific check can only run once deployed there. It does not block merging;
-  when the change reaches that stage the row returns as `needs-testing`.
-  Write it as:
-
-      <one line: what only the deployed environment can prove>
-      <why a local run cannot, when that is not obvious>
-      STEPS: 1. <exact step: literal values, expected output> 2. ...
-
-  Confirm that environment's deploy contains the change, run the steps, then
-  `wt status verified -m "<what was checked and where>"`. While the follow-up
-  fix for a carried obligation is unmerged, keep that change
-  `ready --verify-in-<stage>`; carrying an obligation never shows an earlier
-  check passed.
+- Write `OPS: none` only when nothing is owed; wt refuses `OPS` phase lines.
 - A branch that will never land: close its PR, then
   `wt status dropped -m "<why>"`.
 

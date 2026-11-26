@@ -1409,7 +1409,10 @@ fn owed_text(
                 suffix.push(Span::styled(format!(" ·\u{a0}by\u{a0}{by}"), theme::dim()));
             }
             if item.unconfirmed {
-                suffix.push(Span::styled(" ·\u{a0}unconfirmed", theme::fg(theme::WARN)));
+                suffix.push(Span::styled(
+                    " ·\u{a0}delivery not confirmed",
+                    theme::fg(theme::WARN),
+                ));
             }
             for reason in item
                 .conditions
@@ -3037,7 +3040,8 @@ mod tests {
             lines[1..10],
             [
                 "owes".to_owned(),
-                "  ●  due                  confirm the dashboard · unconfirmed   abc234".to_owned(),
+                "  ●  due                  confirm the dashboard · delivery not confirmed   abc234"
+                    .to_owned(),
                 "  ●  due in staging       check · open /health · V expands".to_owned(),
                 format!(
                     "  {slash}  before merge         QA sign-off · clears when ✓ merged, then wakes the session · held: automations paused"
@@ -3052,7 +3056,10 @@ mod tests {
             ]
         );
         assert_eq!(color_of(&styled[8..9], "?"), Some(theme::WARN));
-        assert_eq!(color_of(&styled[2..3], "unconfirmed"), Some(theme::WARN));
+        assert_eq!(
+            color_of(&styled[2..3], "delivery not confirmed"),
+            Some(theme::WARN)
+        );
         // The reason recedes: it explains, it does not ask.
         assert_eq!(color_of(&styled[8..9], "vault sealed"), Some(theme::FG_DIM));
         assert_eq!(color_of(&styled[4..5], "held"), Some(theme::WARN));

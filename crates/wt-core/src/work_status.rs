@@ -876,42 +876,6 @@ pub fn verification_due_at(
     !checks_due(record, landing, now_ms).is_empty()
 }
 
-/// [`verification_due_at`] for a caller without a clock: a check that was
-/// put off counts as not due. Prefer [`verification_due_at`].
-pub fn verification_due(record: Option<&WorkStatusRecord>, landing: Landing) -> bool {
-    verification_due_at(record, landing, i64::MIN)
-}
-
-/// The stages whose owed check waits on a deploy: the landing is in Git and
-/// the stage's probe has not shown it deployed.
-pub fn checks_awaiting_deploy(
-    record: Option<&WorkStatusRecord>,
-    landing: Landing,
-) -> Vec<VerifyStage> {
-    check_standings(record, landing, i64::MAX)
-        .into_iter()
-        .filter_map(|(_, standing)| standing.awaiting_deploy.then_some(standing.stage))
-        .collect()
-}
-
-/// The first stage of [`checks_awaiting_deploy`].
-pub fn verification_awaiting_deploy(
-    record: Option<&WorkStatusRecord>,
-    landing: Landing,
-) -> Option<VerifyStage> {
-    checks_awaiting_deploy(record, landing).into_iter().next()
-}
-
-/// [`effective_work_state_at`] for a caller without a clock: a check that
-/// was put off counts as not due.
-pub fn effective_work_state(
-    record: Option<&WorkStatusRecord>,
-    session_state: Option<DerivedState>,
-    landing: Landing,
-) -> Option<EffectiveWorkState> {
-    effective_work_state_at(record, session_state, landing, i64::MIN)
-}
-
 /// The state a row shows: needs-human while its session asks, needs-testing
 /// while any owed check is due, else the asserted state.
 pub fn effective_work_state_at(
@@ -939,25 +903,6 @@ pub fn effective_work_state_at(
         derived: false,
         blocked: is_gated(Some(record)),
     })
-}
-
-/// Whether any owed check is overdue.
-pub fn verification_overdue(
-    record: Option<&WorkStatusRecord>,
-    landing: Landing,
-    now_ms: i64,
-) -> bool {
-    verification_overdue_with_days(record, landing, now_ms, VERIFY_OVERDUE_DAYS as f64)
-}
-
-/// [`verification_overdue`] with the age that counts as overdue.
-pub fn verification_overdue_with_days(
-    record: Option<&WorkStatusRecord>,
-    landing: Landing,
-    now_ms: i64,
-    days: f64,
-) -> bool {
-    !checks_overdue_with_days(record, landing, now_ms, days).is_empty()
 }
 
 /// The stages whose owed check has been due for `days`, staging first.
@@ -1263,6 +1208,54 @@ fn clamp_for_line(text: &str, max: usize, sentence_floor: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Shorthands for the assertions below: the single-answer and clockless
+    // readings of the per-stage functions.
+    fn verification_due(record: Option<&WorkStatusRecord>, landing: Landing) -> bool {
+        verification_due_at(record, landing, i64::MIN)
+    }
+
+    fn checks_awaiting_deploy(
+        record: Option<&WorkStatusRecord>,
+        landing: Landing,
+    ) -> Vec<VerifyStage> {
+        check_standings(record, landing, i64::MAX)
+            .into_iter()
+            .filter_map(|(_, standing)| standing.awaiting_deploy.then_some(standing.stage))
+            .collect()
+    }
+
+    fn verification_awaiting_deploy(
+        record: Option<&WorkStatusRecord>,
+        landing: Landing,
+    ) -> Option<VerifyStage> {
+        checks_awaiting_deploy(record, landing).into_iter().next()
+    }
+
+    fn effective_work_state(
+        record: Option<&WorkStatusRecord>,
+        session_state: Option<DerivedState>,
+        landing: Landing,
+    ) -> Option<EffectiveWorkState> {
+        effective_work_state_at(record, session_state, landing, i64::MIN)
+    }
+
+    fn verification_overdue(
+        record: Option<&WorkStatusRecord>,
+        landing: Landing,
+        now_ms: i64,
+    ) -> bool {
+        verification_overdue_with_days(record, landing, now_ms, VERIFY_OVERDUE_DAYS as f64)
+    }
+
+    fn verification_overdue_with_days(
+        record: Option<&WorkStatusRecord>,
+        landing: Landing,
+        now_ms: i64,
+        days: f64,
+    ) -> bool {
+        !checks_overdue_with_days(record, landing, now_ms, days).is_empty()
+    }
     use serde_json::json;
 
     const AT: &str = "2026-08-20T12:00:00.000Z";

@@ -15,6 +15,7 @@ pub mod guide;
 pub mod history;
 pub mod init;
 pub mod install;
+mod landing;
 pub mod list;
 pub mod mark;
 pub mod merge;

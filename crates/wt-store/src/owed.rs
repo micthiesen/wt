@@ -248,52 +248,30 @@ impl Store {
         verified: &WorkStatusRecord,
         evidence: Option<&str>,
     ) -> Result<ChecksClosed, StoreError> {
+        let closed = self.close_checks_seen(slug, targets, verified, evidence, |_| true)?;
+        Ok(closed.unwrap_or(ChecksClosed::Missing))
+    }
+
+    /// [`Self::close_checks`] for a caller that showed someone the status
+    /// first. `admit` is asked about the status as it stands (`None` when
+    /// the worktree has none), under the write's own transaction; when it
+    /// refuses, nothing is written and `None` comes back.
+    pub fn close_checks_seen(
+        &mut self,
+        slug: &str,
+        targets: &CheckTargets,
+        verified: &WorkStatusRecord,
+        evidence: Option<&str>,
+        admit: impl FnOnce(Option<&WorkStatusRecord>) -> bool,
+    ) -> Result<Option<ChecksClosed>, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
-            let Some(previous) = stored_work_status(state, slug) else {
-                return Ok((ChecksClosed::Missing, false));
-            };
-            let mut next = previous.clone();
-            let closed: Vec<(VerifyStage, Check)> = targets
-                .resolve(&previous)
-                .into_iter()
-                .filter_map(|stage| Some((stage, next.drop_check(stage)?)))
-                .collect();
-            if closed.is_empty() {
-                return Ok((ChecksClosed::NotOwed, false));
+            let previous = stored_work_status(state, slug);
+            if !admit(previous.as_ref()) {
+                return Ok((None, false));
             }
-            let remaining = next.open_checks();
-            if remaining.is_empty() {
-                next = verified.clone();
-                next.clear_checks();
-            }
-            let written = write_work_status(state, slug, Some(&previous), Some(&next))?;
-            let by = verified.by.as_deref();
-            log.best_effort(|log| {
-                log_incarnation(log, state, slug)?;
-                for (stage, check) in &closed {
-                    record_check(
-                        log,
-                        slug,
-                        *stage,
-                        check,
-                        OwedChange::Done,
-                        evidence,
-                        by,
-                        None,
-                    )?;
-                }
-                log_status(log, slug, Some(&previous), Some(&next), None)?;
-                crate::watches::log_cancelled(log, &written.cancelled_watches, by)
-            });
-            Ok((
-                ChecksClosed::Closed {
-                    closed,
-                    remaining,
-                    record: Box::new(next),
-                    cancelled_watches: written.cancelled_watches,
-                },
-                true,
-            ))
+            let closed = close_in(state, log, slug, previous, targets, verified, evidence)?;
+            let changed = matches!(closed, ChecksClosed::Closed { .. });
+            Ok((Some(closed), changed))
         })
     }
 
@@ -490,14 +468,95 @@ pub(crate) fn log_discharged(
     })
 }
 
+/// The body of [`Store::close_checks`], inside its transaction.
+fn close_in(
+    state: &mut WtState,
+    log: &EventLog<'_>,
+    slug: &str,
+    previous: Option<WorkStatusRecord>,
+    targets: &CheckTargets,
+    verified: &WorkStatusRecord,
+    evidence: Option<&str>,
+) -> Result<ChecksClosed, StoreError> {
+    let Some(previous) = previous else {
+        return Ok(ChecksClosed::Missing);
+    };
+    let mut next = previous.clone();
+    let closed: Vec<(VerifyStage, Check)> = targets
+        .resolve(&previous)
+        .into_iter()
+        .filter_map(|stage| Some((stage, next.drop_check(stage)?)))
+        .collect();
+    if closed.is_empty() {
+        return Ok(ChecksClosed::NotOwed);
+    }
+    let remaining = next.open_checks();
+    if remaining.is_empty() {
+        next = verified.clone();
+        next.clear_checks();
+    }
+    let written = write_work_status(state, slug, Some(&previous), Some(&next))?;
+    let by = verified.by.as_deref();
+    log.best_effort(|log| {
+        log_incarnation(log, state, slug)?;
+        for (stage, check) in &closed {
+            record_check(
+                log,
+                slug,
+                *stage,
+                check,
+                OwedChange::Done,
+                evidence,
+                by,
+                None,
+            )?;
+        }
+        log_status(log, slug, Some(&previous), Some(&next), None)?;
+        crate::watches::log_cancelled(log, &written.cancelled_watches, by)
+    });
+    Ok(ChecksClosed::Closed {
+        closed,
+        remaining,
+        record: Box::new(next),
+        cancelled_watches: written.cancelled_watches,
+    })
+}
+
 /// A removal is being recorded as `next`. Its status came from the live
 /// row with its checks inside; they move beside it, where an older build
 /// settling the row leaves them. Recording the same removal again changes
 /// nothing.
-pub(crate) fn settle_removed_checks(next: &mut Map<String, Value>) {
+///
+/// `recorded` is the slug's earlier removal record when the status in
+/// `next` was read from the live slug. Creating a worktree clears its
+/// slug's removal record, so that record is this same worktree's: from the
+/// first recording on a check may be closed on either copy, and neither
+/// copy learns of the other's. A status not written since then therefore
+/// owes only what both still owe; without this the stale copy's legacy
+/// fields would bring a closed check back (normalize rule a). A status
+/// written since is a fresh assertion and replaces what was recorded.
+pub(crate) fn settle_removed_checks(next: &mut Map<String, Value>, recorded: Option<&Value>) {
     let Ok(parsed) = serde_json::from_value::<RemovedWorktree>(Value::Object(next.clone())) else {
         return;
     };
+    let recorded = recorded
+        .and_then(|entry| serde_json::from_value::<RemovedWorktree>(entry.clone()).ok())
+        .filter(|recorded| recorded.extra.contains_key(CHECKS));
+    if let (Some(recorded), Some(mut live)) = (recorded, parsed.work.clone()) {
+        let written = |at: &str| wt_core::parse_iso_millis(at);
+        if written(&live.at) > written(&recorded.removed_at) {
+            next.remove(CHECKS);
+            next.remove(crate::types::CHECKS_MIRROR);
+            return settle_removed_checks(next, None);
+        }
+        live.normalize();
+        let still: Vec<VerifyStage> = live.open_checks().iter().map(|(stage, _)| *stage).collect();
+        let mut kept = recorded.open_checks();
+        kept.retain(|(stage, _)| still.contains(stage));
+        live.set_checks(kept);
+        write_removed(next, live);
+        return;
+    }
     let Some(work) = parsed.work_with_checks() else {
         return;
     };

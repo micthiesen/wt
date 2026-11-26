@@ -2,7 +2,8 @@
 //! both write statuses; this is the one rule for what happens to the
 //! post-merge checks when they do.
 
-use wt_core::{VerifyStage, WorkStatusRecord};
+use wt_core::{Check, Landing, VerifyStage, WorkStatusRecord};
+use wt_store::{CheckTargets, ChecksClosed, Store, StoreError};
 
 /// What an assertion says about the check owed in one stage.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +38,71 @@ pub fn assert_checks(
             }
         }
     }
+}
+
+/// `verified` asserted for a worktree that owes checks: close every check
+/// that is due under `landing`, or the earliest stage's when none is (who
+/// asserts it may have confirmed the deploy themselves). The status becomes
+/// `verified` only once no check remains; until then state, note and time
+/// stay as they were. `wt status verified` and the board's status menu both
+/// close through here.
+///
+/// `admit` is asked about the status as it stands, under the write's own
+/// transaction; `None` comes back, with nothing written, when it refuses.
+pub fn close_verified(
+    store: &mut Store,
+    slug: &str,
+    landing: Landing,
+    now_ms: i64,
+    verified: &wt_store::WorkStatusRecord,
+    evidence: Option<&str>,
+    admit: impl FnOnce(Option<&wt_store::WorkStatusRecord>) -> bool,
+) -> Result<Option<ChecksClosed>, StoreError> {
+    let targets = CheckTargets::Verified { landing, now_ms };
+    store.close_checks_seen(slug, &targets, verified, evidence, admit)
+}
+
+fn stage_names(checks: &[(VerifyStage, Check)]) -> String {
+    checks
+        .iter()
+        .map(|(stage, _)| stage.as_str())
+        .collect::<Vec<_>>()
+        .join(" and ")
+}
+
+/// What closing checks did, one line per closed check and one for where
+/// the worktree stands now. `kept_state` is the state a live row keeps
+/// while a check remains.
+pub fn checks_closed_lines(
+    slug: &str,
+    closed: &[(VerifyStage, Check)],
+    remaining: &[(VerifyStage, Check)],
+    kept_state: Option<&str>,
+    removed: bool,
+) -> Vec<String> {
+    let row = if removed { " (removed row)" } else { "" };
+    let mut lines: Vec<String> = closed
+        .iter()
+        .map(|(stage, check)| {
+            format!(
+                "✓ {slug} closed the check in {}{row}: {}",
+                stage.as_str(),
+                wt_core::watch::headline(&check.steps)
+            )
+        })
+        .collect();
+    lines.push(if remaining.is_empty() {
+        format!("✓ {slug} verified{row}")
+    } else {
+        format!(
+            "  still owes the check in {}{}",
+            stage_names(remaining),
+            kept_state
+                .map(|state| format!(": the status stays {state} until it is closed"))
+                .unwrap_or_default()
+        )
+    });
+    lines
 }
 
 #[cfg(test)]

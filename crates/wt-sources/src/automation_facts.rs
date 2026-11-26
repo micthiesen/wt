@@ -423,45 +423,16 @@ pub async fn prepare(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    // The default `status.verification_due` settle of wt-config: with a
-    // deploy probe for both stages the trigger itself waits for the deploy.
-    let check_settle_seconds = if ctx.config.environments.staging.is_some()
-        && ctx.config.environments.production.is_some()
-    {
-        30.0
-    } else {
-        600.0
-    };
-    let unmet_requirements = ctx
-        .config
-        .automations
-        .iter()
-        .filter(|rule| rule.on == wt_config::AutomationTrigger::StatusVerificationDue)
-        .filter_map(|rule| {
-            ctx.config
-                .actions
-                .iter()
-                .find(|action| action.id == rule.run && !action.requires.is_empty())
-        })
-        .flat_map(|definition| {
-            rows.iter().filter_map(|row| {
-                let deployed = input
-                    .board
-                    .and_then(|board| board.rows.iter().find(|shown| shown.slug == row.slug))
-                    .is_some_and(|shown| shown.stage_url.is_some());
-                let (unmet, pr_unknown) = row_requirements(
-                    definition,
-                    ctx.config.issue_tracker.as_ref(),
-                    row,
-                    deployed,
-                    github_fresh,
-                    &github_covered_branches,
-                );
-                // A PR GitHub has not confirmed yet is not a refusal.
-                (unmet.is_some() && !pr_unknown).then(|| (definition.id.clone(), row.slug.clone()))
-            })
-        })
-        .collect::<BTreeSet<_>>();
+    let check_settle_seconds = wt_config::verification_due_settle_seconds(&ctx.config.environments);
+    let unmet_requirements = unmet_requirements(
+        &ctx.config.automations,
+        &ctx.config.actions,
+        ctx.config.issue_tracker.as_ref(),
+        &rows,
+        input.board,
+        github_fresh,
+        &github_covered_branches,
+    );
     let row_vars = rows
         .iter()
         .filter_map(|row| {
@@ -943,6 +914,46 @@ fn requirement_state(
     }
 }
 
+/// The (action, slug) pairs where a configured `status.verification_due`
+/// rule's action refuses the row: there the rule does not own the delivery
+/// and wt's own wake for a due check prompts the session instead. A PR
+/// GitHub has not confirmed yet is not a refusal.
+fn unmet_requirements(
+    automations: &[wt_config::AutomationDef],
+    actions: &[wt_config::ActionDef],
+    issue_tracker: Option<&wt_config::IssueTrackerConfig>,
+    rows: &[AutomationRow],
+    board: Option<&wt_tui::Board>,
+    github_fresh: bool,
+    github_covered_branches: &BTreeSet<String>,
+) -> BTreeSet<(String, String)> {
+    automations
+        .iter()
+        .filter(|rule| rule.on == wt_config::AutomationTrigger::StatusVerificationDue)
+        .filter_map(|rule| {
+            actions
+                .iter()
+                .find(|action| action.id == rule.run && !action.requires.is_empty())
+        })
+        .flat_map(|definition| {
+            rows.iter().filter_map(|row| {
+                let deployed = board
+                    .and_then(|board| board.rows.iter().find(|shown| shown.slug == row.slug))
+                    .is_some_and(|shown| shown.stage_url.is_some());
+                let (unmet, pr_unknown) = row_requirements(
+                    definition,
+                    issue_tracker,
+                    row,
+                    deployed,
+                    github_fresh,
+                    github_covered_branches,
+                );
+                (unmet.is_some() && !pr_unknown).then(|| (definition.id.clone(), row.slug.clone()))
+            })
+        })
+        .collect()
+}
+
 /// Why the row does not meet the action's `requires`, if it does not, and
 /// whether that is only because GitHub has not confirmed the row's PR yet.
 fn row_requirements(
@@ -1122,6 +1133,63 @@ mod tests {
             requirement_state(&actions, None, &fire, &[], false, false, &BTreeSet::new()),
             RequirementState::Ready,
         );
+    }
+
+    #[test]
+    fn a_due_check_rule_owns_delivery_only_for_rows_its_action_accepts() {
+        let rule = |id: &str, on, run: &str| wt_config::AutomationDef {
+            id: id.into(),
+            on,
+            run: run.into(),
+            ..Default::default()
+        };
+        let due = wt_config::AutomationTrigger::StatusVerificationDue;
+        let automations = [
+            rule("verify", due, "needs-pr"),
+            rule("plain", due, "no-requirements"),
+            rule("builtin", due, "builtin:notify"),
+            // Another trigger's requirements say nothing about due checks.
+            rule(
+                "ready",
+                wt_config::AutomationTrigger::StatusReady,
+                "needs-deploy",
+            ),
+        ];
+        let action = |id: &str, requires: Vec<wt_config::RequireTag>| wt_config::ActionDef {
+            id: id.into(),
+            requires,
+            ..Default::default()
+        };
+        let actions = [
+            action("needs-pr", vec![wt_config::RequireTag::Pr]),
+            action("no-requirements", Vec::new()),
+            action("needs-deploy", vec![wt_config::RequireTag::Deployed]),
+        ];
+        let row = |slug: &str, pr: bool| AutomationRow {
+            slug: slug.into(),
+            branch: format!("feature/{slug}"),
+            pr: pr.then(|| wt_automations::AutomationPr {
+                number: 7,
+                state: "OPEN".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rows = [row("with-pr", true), row("without-pr", false)];
+        let covered: BTreeSet<String> = rows.iter().map(|row| row.branch.clone()).collect();
+        let unmet = |fresh: bool, covered: &BTreeSet<String>| {
+            unmet_requirements(&automations, &actions, None, &rows, None, fresh, covered)
+        };
+        // GitHub confirms one row has no PR: only there does the rule's
+        // action refuse, so only there wt's own wake prompts the session.
+        assert_eq!(
+            unmet(true, &covered),
+            BTreeSet::from([("needs-pr".to_owned(), "without-pr".to_owned())])
+        );
+        // A PR GitHub has not confirmed yet is not a refusal: stale data, or
+        // a read that did not cover the branch.
+        assert!(unmet(false, &covered).is_empty());
+        assert!(unmet(true, &BTreeSet::new()).is_empty());
     }
 
     #[tokio::test]

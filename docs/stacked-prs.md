@@ -11,6 +11,8 @@ Sections own the vertical axis; a stack is a **relationship between rows inside 
 
 Members therefore keep their own `section` record and a stack sorts as one contiguous **unit**, slotted by its most urgent member so `sort = "status"` can't interleave unrelated rows through a spine. `J`/`K` from any member moves the whole block (the unit's slot is the root's manual order), and filing a member via `l` — or `wt section mv` — moves the whole stack unless `--only`.
 
+**A landed head is detached, for display only.** A member whose own work has landed is no longer a parent on the board: it is drawn as a single row, and members based on it become roots (still shown as needing a restack onto trunk). So moving a merged head moves only that row, moving its children leaves it behind, and with [`[ui] owed_sections`](configuration.md#ui) only the landed row goes to a derived block. The TUI move and `wt section mv` agree on this, and both leave archived rows out. Nothing stored changes: fork-base records are not rewritten (`baseSha` stays the replay anchor), and stack identity, `stack.parent_merged`, the stack pause and `wt restack` keep reading the full chain. See [owed.md](owed.md#stacks).
+
 ## The rail
 
 The stack rail is the `tree(1)` / `git log --graph` idiom, and each of its three dimensions answers exactly one question:
@@ -68,14 +70,14 @@ with no patch-id guessing.
 ## Inferred stacks
 
 A worktree whose recorded base names another live worktree's branch is stacked
-on it. Chains of records form a stack: the TUI groups the members into one
-section (tree spine in the gutter), and each member diffs/syncs against its
+on it. Chains of records form a stack: the TUI draws the members as one
+contiguous unit inside their section (tree spine in the gutter), and each member diffs/syncs against its
 parent instead of trunk. Forks are fine — two worktrees based on
 the same parent render as parallel lanes.
 
 Stack identity is the root member's branch. When the root lands and its
-worktree is cleaned, the first child re-roots the stack; section folding and
-automation pauses keyed to the old root start fresh.
+worktree is cleaned, the first child re-roots the stack; automation pauses
+keyed to the old root start fresh.
 
 ## Restacking
 

@@ -937,6 +937,19 @@ fn checks_and_notify_are_argv_and_the_watch_trigger_is_reserved() {
             "\n[[automations]]\nid = 'w'\non = 'status.ready'\nrun = 'builtin:watch'\n",
             "automations[0].run \"builtin:watch\" is neither",
         ),
+        (
+            "\n[[automations]]\nid = 'w'\non = 'status.ready'\nrun = 'builtin:check'\n",
+            "automations[0].run \"builtin:check\" is neither",
+        ),
+        // Fire keys and history under these ids belong to wt's own rules.
+        (
+            "\n[[automations]]\nid = 'wt.watch'\non = 'status.ready'\nrun = 'builtin:notify'\n",
+            "automations[0].id \"wt.watch\" is reserved for a rule wt runs itself",
+        ),
+        (
+            "\n[[automations]]\nid = 'wt.check'\non = 'status.verification_due'\nrun = 'builtin:notify'\n",
+            "automations[0].id \"wt.check\" is reserved for a rule wt runs itself",
+        ),
     ] {
         let error = load(extra).unwrap_err().to_string();
         assert!(error.contains(expected), "{extra}: {error}");

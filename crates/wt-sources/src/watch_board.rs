@@ -124,12 +124,7 @@ fn attach(
         // The stored record, read as every other reader of the owed list
         // reads it: a gate is matched to its watch by its text.
         let record = wt_core::parse_work_status(&state["slugs"][&row.slug]["work"]);
-        let landing = wt_core::Landing::new(
-            row.git.landed_on.is_some(),
-            row.git.landed_on == Some(wt_tui::LandingKind::Production),
-            separate_production,
-        )
-        .with_deploys(row.git.deploys);
+        let landing = row_landing(row, separate_production);
         let items = wt_core::owed_items(
             record.as_ref(),
             &landing,
@@ -168,6 +163,17 @@ fn attach(
         base.with_data(Some(Arc::new(board))).with_input(metadata),
         next,
     )
+}
+
+/// How far the row's own work has landed, as the board shows it. Every
+/// reading of what a board row owes takes its landing from here.
+pub fn row_landing(row: &BoardRow, separate_production: bool) -> wt_core::Landing {
+    wt_core::Landing::new(
+        row.git.landed_on.is_some(),
+        row.git.landed_on == Some(wt_tui::LandingKind::Production),
+        separate_production,
+    )
+    .with_deploys(row.git.deploys)
 }
 
 fn local_worktree(row: &BoardRow) -> bool {

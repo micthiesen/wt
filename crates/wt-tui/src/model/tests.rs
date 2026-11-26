@@ -2113,10 +2113,10 @@ fn a_menu_reply_message_survives_dropped_typeahead() {
     model.reply(UiReply {
         operation_id: Some(5),
         ui_generation: Some(generation),
-        ..UiReply::message("Nothing safe to clean")
+        ..UiReply::message("Nothing is ready to clean.")
     });
     let (text, _) = model.toast.clone().unwrap();
-    assert!(text.starts_with("Nothing safe to clean"), "{text}");
+    assert!(text.starts_with("Nothing is ready to clean."), "{text}");
 }
 
 #[test]

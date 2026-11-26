@@ -30,11 +30,27 @@ six failing names and counts the rest in a final `+N more` entry.
 | `message` | a message is sent to the worktree's agent | `AppHarness::send_recorded` |
 | `automation` | a fire finishes or is skipped for good | the automation source |
 | `watch` | a watch is set, holds, clears its gate, tells the person, wakes the session, is cancelled or is dropped | the store's watch writes |
+| `owed` | something the worktree [owes](owed.md) comes due, is closed with evidence, is put off, or is dropped | the store's owed and check writes |
 | `restack` | a restack replays the branch or stops on a conflict | `restack_action::record_outcome` |
 | `skill` | a skill or slash command listed in `[history] skills` is used in the worktree's Claude Code session | `wt mark --claude-hook`, run by a Claude Code hook |
 | `mark` | someone adds a note | `wt mark` |
 | `pr`, `checks`, `review`, `merge_queue`, `conflict`, `landed` | the fact is observed to change | the host's observer |
 | `status`, `status_cleared` (again) | a status was written by a build without the log | the host's observer |
+
+An `owed` event carries `change` (`due`, `done`, `again`, `dropped`), `what`
+(the step's prompt or the check's steps, first line), and where they apply
+`id` (a step's id), `stage` (a check's), `evidence` (what `wt done -m` or
+`wt status verified -m` supplied), `when` (what an item put off with
+`--again` now waits for), `by` and `unconfirmed`. A wake delivered after the
+worktree's work landed records `owed` with `due` **instead of** the watch's
+`woken` event, in the transaction that stores the due step; a wake that
+closes on delivery still records `woken`. Closing a check records `done`
+with its stage, one event per check. When an older build discharges a check
+(it clears the legacy fields and knows no `owed` event), the next status
+write by a current build records `done` for that stage once, with no
+evidence. A step dropped because its worktree is gone with no removal record
+to keep it, or evicted past 20 per worktree, records `dropped`. Older builds
+read the kind as unknown.
 
 A status event is written in the same transaction as the status, by the one
 function every status write passes through (`wt status`, the TUI's `u` menu,
@@ -169,8 +185,8 @@ written for, which is how a later write tells this incarnation's creation
 from an earlier one's. A creation that fails records no `created`; anything
 recorded during it stays on the slug's previous history.
 
-The outcome of a removed row's post-merge check (`wt status verified` on a
-removed slug) is recorded only while that removal is still the slug's last
+The outcome of what a removed row still owed (`wt status verified` or
+`wt done --slug` on a removed slug) is recorded only while that removal is still the slug's last
 incarnation. If the slug names a new worktree by then, nothing is recorded.
 
 Status writes that replace a whole slug entry are not status assertions and

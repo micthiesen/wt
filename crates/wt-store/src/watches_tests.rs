@@ -465,9 +465,14 @@ fn a_finished_action_is_no_longer_owed_and_the_last_one_ends_the_watch() {
 fn an_unconfirmed_wake_ends_the_watch_and_its_history_says_so() {
     let (_temp, mut store) = store();
     let watch = add(&mut store, "one", &["merged"], wake());
-    assert!(store.complete_unconfirmed_wake(&watch.id).unwrap());
+    let deliver = |store: &mut Store| {
+        store
+            .complete_wake(&watch.id, wt_core::OwnerLanding::NotLanded, true, NOON)
+            .unwrap()
+    };
+    assert_eq!(deliver(&mut store), crate::WakeCompletion::Closed);
     assert_eq!(store.list_watches(None).unwrap(), []);
-    assert!(!store.complete_unconfirmed_wake(&watch.id).unwrap());
+    assert_eq!(deliver(&mut store), crate::WakeCompletion::NotOwed);
     let woken: Vec<bool> = store
         .read_worktree_events("one", 500)
         .unwrap()

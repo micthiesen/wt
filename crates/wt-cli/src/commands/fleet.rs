@@ -163,7 +163,16 @@ fn add_snake_case_aliases(work: &mut serde_json::Map<String, Value>) {
     work.insert("verify_in".into(), stage.unwrap_or(Value::Null));
 }
 
-pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
+/// What `wt fleet` reports: one object per worktree, and why a source
+/// that failed for all of them did.
+struct Fleet {
+    reports: Vec<Value>,
+    pr_note: Option<String>,
+    session_note: Option<String>,
+}
+
+/// The fleet report, or the exit code after saying why there is none.
+async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>> {
     let (rows, head_by_slug) = match select_rows(ctx, &args.slugs).await? {
         Ok(selected) => selected,
         Err(unknown) => {
@@ -171,7 +180,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
                 "no such worktree: {} (see `wt fleet` for the live slugs)",
                 unknown.join(", ")
             );
-            return Ok(1);
+            return Ok(Err(1));
         }
     };
     let selected = !args.slugs.is_empty();
@@ -215,8 +224,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         .map(|row| row.worktree.clone())
         .collect::<Vec<_>>();
     // This command's own GitHub read, when it succeeded, proves PR landings.
-    let landings =
-        wt_ops::lifecycle_ops::row_landings(ctx, &records, &state, fetched.as_ref().ok()).await;
+    let landings = super::landing::read_with(ctx, &records, &state, fetched.as_ref().ok()).await;
     let separate_production = ctx.config.branch.separate_production();
     let (prs, queue, pr_note) = match fetched {
         Ok(data) => (Some(data.prs), Some(data.merge_queue), None),
@@ -366,7 +374,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             landings
                 .get(&slug)
                 .copied()
-                .unwrap_or(wt_core::Landing::NONE),
+                .unwrap_or(super::landing::RowLanding::known(wt_core::Landing::NONE)),
             clock.now_ms,
         );
         let report = json!({
@@ -377,6 +385,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             "watches":super::watch::watches_json(&watches, &slug, clock),
             "owes":super::owed::owes_json(&owed.items, clock),
             "owed_phase":super::owed::phase_json(owed.phase),
+            "landing":owed.landing.word(),
             "dirty":row.status.as_ref().map(|status| status.dirty),
             "session":{"alive":alive,"busy":busy,"last_activity":last_activity}, "session_note":session_note,
             "operation":operation,"operation_note":operation_note,
@@ -394,8 +403,24 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         }
         let verification_owed = wt_store::verification_owed_at_removal(&entry);
         let owed = super::owed::derive_removed(&entry, separate_production, clock.now_ms);
-        reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_in":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| wt_core::VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),"verify_after_merge":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_deref()),"verification_owed":verification_owed,"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase)}));
+        reports.push(json!({"kind":if merged {"merged"} else {"removed"},"slug":entry.slug,"branch":entry.branch,"path":Value::Null,"head":Value::Null,"base":Value::Null,"section":Value::Null,"work":work,"dirty":Value::Null,"session":Value::Null,"session_note":Value::Null,"pr":entry.extra.get("prNumber").filter(|number| !number.is_null()).map(|number| json!({"number":number,"url":entry.extra.get("prUrl"),"title":entry.extra.get("title")})),"pr_note":Value::Null,"archived_at":entry.removed_at,"verify_in":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_ref().map(|_| wt_core::VerifyStage::of_stored(work.verify_in.as_deref()).as_str())),"verify_after_merge":entry.work.as_ref().and_then(|work| work.verify_after_merge.as_deref()),"verification_owed":verification_owed,"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word()}));
     }
+    Ok(Ok(Fleet {
+        reports,
+        pr_note,
+        session_note,
+    }))
+}
+
+pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
+    let Fleet {
+        reports,
+        pr_note,
+        session_note,
+    } = match fleet(ctx, args).await? {
+        Ok(fleet) => fleet,
+        Err(code) => return Ok(code),
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
@@ -437,27 +462,20 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
 }
 
 /// The human WORK column. A merge gate overrides the state (`blocked/ready`
-/// must never read as mergeable), and a landed row still owing its
-/// post-merge check reads `unverified/<state>`.
+/// must never read as mergeable). A landed row stands where what it owes
+/// puts it: `due/<state>` or `waiting/<state>` until nothing is left, read
+/// from the same `owed_phase` the JSON reports.
 fn work_label(row: &Value) -> String {
     let work = &row["work"];
     let Some(state) = work["state"].as_str() else {
         return "—".into();
     };
-    let landed = row["kind"] == "merged" || row["pr"]["state"] == "MERGED";
-    let owed = row["verification_owed"].as_bool().unwrap_or_else(|| {
-        landed
-            && work["verifyAfterMerge"]
-                .as_str()
-                .is_some_and(|steps| !steps.is_empty())
-            && !matches!(state, "verified" | "dropped")
-    });
-    if work["blockedOn"].is_string() {
-        format!("blocked/{state}")
-    } else if owed {
-        format!("unverified/{state}")
-    } else {
-        state.to_owned()
+    match row["owed_phase"].as_str() {
+        Some(phase @ ("due" | "waiting")) => format!("{phase}/{state}"),
+        // Landed with nothing left: its gate held back a merge that happened.
+        Some(_) => state.to_owned(),
+        None if work["blockedOn"].is_string() => format!("blocked/{state}"),
+        None => state.to_owned(),
     }
 }
 
@@ -614,33 +632,149 @@ mod tests {
     }
 
     #[test]
-    fn work_column_never_shows_a_gated_or_unverified_row_as_plain_state() {
-        let row = |work: Value, pr: Value, kind: &str| json!({"kind":kind,"work":work,"pr":pr});
+    fn work_column_never_shows_a_gated_or_owing_row_as_plain_state() {
+        let row = |work: Value, phase: Value| json!({"work":work,"owed_phase":phase});
         let ready = json!({"state":"ready"});
+        assert_eq!(work_label(&row(ready.clone(), Value::Null)), "ready");
+        let gated = json!({"state":"ready","blockedOn":"mobile release"});
         assert_eq!(
-            work_label(&row(ready.clone(), Value::Null, "live")),
-            "ready"
-        );
-        assert_eq!(
-            work_label(&row(
-                json!({"state":"ready","blockedOn":"mobile release"}),
-                Value::Null,
-                "live"
-            )),
+            work_label(&row(gated.clone(), Value::Null)),
             "blocked/ready"
         );
-        let owing = json!({"state":"ready","verifyAfterMerge":"1. check prod"});
+        // Landed: the phase says where the row stands, and a gate is moot.
+        assert_eq!(work_label(&row(ready.clone(), json!("due"))), "due/ready");
         assert_eq!(
-            work_label(&row(owing.clone(), json!({"state":"OPEN"}), "live")),
-            "ready"
+            work_label(&row(ready.clone(), json!("waiting"))),
+            "waiting/ready"
         );
-        assert_eq!(
-            work_label(&row(owing, json!({"state":"MERGED"}), "live")),
-            "unverified/ready"
-        );
-        let mut removed = row(ready, Value::Null, "merged");
-        removed["verification_owed"] = json!(true);
-        assert_eq!(work_label(&removed), "unverified/ready");
+        assert_eq!(work_label(&row(gated, json!("done"))), "ready");
+        assert_eq!(work_label(&row(ready, json!("done"))), "ready");
         assert_eq!(work_label(&json!({"work":null})), "—");
+    }
+
+    #[tokio::test]
+    async fn every_row_reports_what_it_owes_and_its_phase() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let git = |args: Vec<String>| async move {
+            let output = wt_ops::commands::resolve::run_git(ctx, &ctx.cwd, args)
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout_text().trim().to_owned()
+        };
+        // Land "one" where Git alone proves it: its commit is on the base
+        // branch the origin advertises.
+        let origin = fixture._root.path().join("origin.git");
+        let origin = origin.to_str().unwrap().to_owned();
+        git(vec!["init".into(), "--bare".into(), origin.clone()]).await;
+        git(vec!["remote".into(), "add".into(), "origin".into(), origin]).await;
+        let anchor = git(vec!["rev-parse".into(), "HEAD".into()]).await;
+        std::fs::write(ctx.cwd.join("work.txt"), "landed work\n").unwrap();
+        git(vec!["add".into(), "work.txt".into()]).await;
+        git(vec!["commit".into(), "-m".into(), "feature work".into()]).await;
+        git(vec![
+            "push".into(),
+            "origin".into(),
+            "HEAD:refs/heads/main".into(),
+        ])
+        .await;
+        let clock = super::super::watch::clock();
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                let owing = wt_core::WorkStatusRecord::new(
+                    wt_core::WorkState::Ready,
+                    "2026-11-24T12:00:00Z",
+                )
+                .with_check(wt_core::VerifyStage::Staging, "1. open the page");
+                let stored: wt_store::WorkStatusRecord =
+                    serde_json::from_value(serde_json::to_value(&owing)?)?;
+                store.set_slug_work_status("one", Some(&stored))?;
+                store
+                    .add_watch(
+                        wt_store::NewWatch {
+                            slug: "one".into(),
+                            by: "one".into(),
+                            utc_offset_minutes: 0,
+                            when: vec![wt_core::watch::parse("production", clock).unwrap()],
+                            then: wt_core::watch::WatchActions {
+                                wake: Some("retire the flag".into()),
+                                ..Default::default()
+                            },
+                            before_release: true,
+                        },
+                        clock.now_ms,
+                    )?
+                    .unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let args = FleetArgs {
+            slugs: vec!["one".into(), "two".into()],
+            json: true,
+        };
+        let reports = fleet(ctx, &args).await.unwrap().unwrap().reports;
+        let report = |slug: &str| {
+            reports
+                .iter()
+                .find(|row| row["slug"] == slug)
+                .unwrap_or_else(|| panic!("{slug} is reported"))
+        };
+        let one = report("one");
+        assert_eq!(one["landing"], "landed");
+        assert_eq!(one["owed_phase"], "due");
+        let owes = one["owes"].as_array().unwrap();
+        assert_eq!(owes.len(), 2, "{owes:?}");
+        // Every item has every key, whatever its kind.
+        for item in owes {
+            let mut keys = item
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>();
+            keys.sort();
+            assert_eq!(
+                keys,
+                [
+                    "before_release",
+                    "due_at",
+                    "id",
+                    "kind",
+                    "overdue",
+                    "stage",
+                    "state",
+                    "what",
+                    "when"
+                ]
+            );
+        }
+        assert_eq!(
+            owes[0],
+            json!({
+                "id": null, "kind": "check", "state": "due", "stage": "staging",
+                "when": "due in staging", "what": "1. open the page",
+                "before_release": false, "overdue": false, "due_at": null,
+            })
+        );
+        assert_eq!(owes[1]["kind"], "step");
+        assert_eq!(owes[1]["state"], "waiting");
+        assert_eq!(owes[1]["stage"], "production");
+        assert_eq!(owes[1]["what"], "retire the flag");
+        assert_eq!(owes[1]["before_release"], true);
+        assert!(owes[1]["id"].is_string());
+        // The legacy keys still mirror the first check.
+        assert_eq!(one["work"]["verify_in"], "staging");
+        // A row that owes nothing reports an empty list. Its GitHub read
+        // failed here, so its landing is unknown and it has no phase.
+        let two = report("two");
+        assert_eq!(two["owes"], json!([]));
+        assert_eq!(two["landing"], "unknown");
+        assert!(two["owed_phase"].is_null());
+        fixture.close().await.unwrap();
     }
 }

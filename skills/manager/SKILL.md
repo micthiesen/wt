@@ -30,7 +30,7 @@ message is about; a row you notice in passing is not a reason to act on it.
   `--steer` only for a time-bounded instruction to a busy Codex worker. Never
   edit another worktree. From the main clone you only read.
 - **Never stop another worktree's dev server** or remove a worktree that still
-  owes a post-merge check.
+  owes anything (`wt owed --slug <slug>`).
 
 ## Mandate: cross-worktree facts
 
@@ -70,7 +70,8 @@ your whole mandate until they change it; with none, the fleet is.
 - Coordination the human authorized for the set (such as serializing host-wide
   checks) stays in force; it grants no new approvals or holds.
 - Finish when every target PR is merged with its owed closure done
-  (post-merge checks, a requested report), or only a human block remains.
+  (nothing left in `wt owed --all` for the set, a requested report), or only
+  a human block remains.
   Report once and stop.
 
 ## Read from wt, not memory
@@ -119,7 +120,7 @@ it expires on its own:
 | deliberately not started, because X | `wt status <slug> todo --blocked-on "X"` |
 | finished but must not merge yet | `wt status <slug> ready --risk <r> --blocked-on "X"` |
 | the gate waits on something wt can observe | add `--until <condition>` (`pr:3806:production`, `wt:<slug>:merged`, `release:production`), or `wt status <slug> --until <condition>` on a gate already set; it clears itself |
-| a worker must act when something happens | `wt wake --slug <slug> <condition> -m "<what to do then>"` |
+| a worker must act when something happens | `wt wake --slug <slug> <condition> -m "<what to do then>"` (after its work landed, it stays owed until the worker runs `wt done`) |
 | the human asked to be told | `wt notify --slug <slug> <condition> [-m "<text>"]` |
 | looked, nothing to do | `wt status <slug> --examined "<verdict>"` (void once the branch moves) |
 | A merges before B | `wt edge A before B [--blocks] -m "<why>"` |
@@ -161,14 +162,14 @@ evidence; label theories, and verify a destructive remedy before proposing it.
   human can act, give one short numbered ask. Sharpen the needs-human note
   last; wt won't brief you on your own write. An alert repeated with nothing
   changed gets a silent `--examined` verdict: no second ask, no nudge.
-- **Merged but unverified** (`unverified/<state>` in `wt fleet`; in JSON,
-  `.work.verifyAfterMerge` on a landed live row, `verification_owed` on a
-  merged one): the worktree is kept alive for a post-merge check, so it is not
-  a cleanup candidate. `.work.verifyIn` says where it runs; a `production`
-  check waits for the promotion, and a row reading `awaiting <stage> deploy`
-  waits for the deploy; both need nothing before then. The owning session runs the check and asserts
-  `verified`; nudge it once it is due. A red, overdue one gets a digest line, not a second
-  reminder.
+- **Merged and still owing** (`wt owed --all`; in JSON, `owed_phase` of
+  `due` or `waiting` and the `owes` array, on live and removed rows;
+  `unverified/<state>` in `wt fleet` for a check): the worktree is kept alive
+  for what it owes, so it is not a cleanup candidate. Each item says what it
+  waits for; a check waits for its stage's deploy and wt wakes the owner when
+  it is due, so a `waiting` row needs nothing. The owning session does the
+  work and closes it with `wt done`; nudge it once an item is due. A red,
+  overdue one gets a digest line, not a second reminder.
 - **Removing a worktree:** if `wt guide <slug> --json` shows a recorded
   guide, retire it first the way your instructions say.
 - **Digest** ("where are we?"): one line per live worktree, by slug, ordered ready →
@@ -189,6 +190,7 @@ evidence; label theories, and verify a destructive remedy before proposing it.
   `wt notify --slug`, never a timer
 - what every worktree waits for → `wt watch --all`; `wt watch cancel <id>`
   cancels anyone's
+- what every worktree still owes → `wt owed --all`
 - why a row is in its state, removed rows included → `wt history <slug>`
 - a loop that keeps the fleet moving → the `shepherd` skill
 - addressable targets and harnesses → `wt agent ls`

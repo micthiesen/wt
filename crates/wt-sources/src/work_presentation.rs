@@ -113,12 +113,7 @@ fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
     // Only the Git facts lane may establish landing after checking the
     // non-vacuous own-commit and advertised-base proof.
     let landed = row.git.landed_on.is_some();
-    let landing = wt_core::Landing::new(
-        landed,
-        row.git.landed_on == Some(wt_tui::LandingKind::Production),
-        separate_production,
-    )
-    .with_deploys(row.git.deploys);
+    let landing = crate::watch_board::row_landing(row, separate_production);
     let session_state = asking.then_some(DerivedState::Asking);
     let effective = wt_core::effective_work_state_at(record, session_state, landing, now_ms);
     // A landed check waiting on promotion has nothing for anyone to do yet.
