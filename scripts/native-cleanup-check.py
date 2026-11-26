@@ -118,7 +118,7 @@ def main() -> None:
         assert any(row["slug"] == "landed" and row["kind"] == "merged" for row in rows), rows
         assert "Confirm fixture environment" in run(str(binary), "status", "verification")
         output = run(str(binary), "clean", "--yes", "--foreground", "--no-destroy-stage")
-        assert "Nothing to clean" in output, output
+        assert "Nothing is ready to clean." in output, output
         print(json.dumps({"merged_removed": True, "dirty_preserved": True,
                           "verification_preserved": True, "empty_branch_preserved": True,
                           "unlanded_preserved": True, "history_retained": True,
