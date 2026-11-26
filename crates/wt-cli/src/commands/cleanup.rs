@@ -5,6 +5,7 @@ use clap::Args;
 use wt_lifecycle::RemoveOptions;
 
 use wt_app_core::context::AppContext;
+use wt_core::cleanup_review::KeptRow;
 use wt_ops::{commands::resolve::run_git, lifecycle_ops};
 
 #[derive(Debug, Clone, Args, Default)]
@@ -45,28 +46,39 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
     if let Some(warning) = plans.warning {
         eprintln!("warning: {warning}");
     }
+    let state = ctx
+        .database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await?;
     let mut candidates = Vec::new();
     for mut plan in plans.rows {
-        if !plan.landed {
-            println!(
-                "Keeping {}: landing of its own work is not proven",
-                plan.row.target.slug()
-            );
-            continue;
+        let slug = plan.row.target.slug();
+        let stored = &state["slugs"][slug];
+        let kept = KeptRow {
+            landed: plan.landed,
+            dropped: wt_core::parse_work_status(&stored["work"])
+                .is_some_and(|work| work.state == wt_core::WorkState::Dropped),
+            pr_state: plan
+                .removed_snapshot
+                .extra
+                .get("prState")
+                .and_then(serde_json::Value::as_str),
+        };
+        let base = stored["baseBranch"]
+            .as_str()
+            .unwrap_or(&ctx.config.branch.base);
+        match keeping(slug, kept, &plan.hazards, base) {
+            Kept::Listed(line) => println!("{line}"),
+            Kept::Unlisted => {}
+            Kept::No => {
+                plan.destroy_stage =
+                    !args.no_destroy_stage && (args.destroy_stage || plan.destroy_stage);
+                candidates.push(plan);
+            }
         }
-        if !plan.hazards.is_empty() {
-            println!(
-                "Keeping {}: {}",
-                plan.row.target.slug(),
-                plan.hazards.join(", ")
-            );
-            continue;
-        }
-        plan.destroy_stage = !args.no_destroy_stage && (args.destroy_stage || plan.destroy_stage);
-        candidates.push(plan);
     }
     if candidates.is_empty() {
-        println!("Nothing to clean.");
+        println!("Nothing is ready to clean.");
         return Ok(0);
     }
     println!("Cleanup candidates:");
@@ -171,10 +183,89 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
     Ok(i32::from(failed))
 }
 
+/// What the review does with one worktree.
+#[derive(Debug, PartialEq, Eq)]
+enum Kept {
+    /// Kept, and a person could be surprised it is: say why.
+    Listed(String),
+    /// Kept because its work is unfinished or unstarted: not cleanup's
+    /// business, so nothing is said.
+    Unlisted,
+    /// A candidate for removal.
+    No,
+}
+
+/// The board's cleanup review lists the same rows for the same reasons
+/// (`wt_core::cleanup_review`). Nothing here loosens what is removed: a row
+/// is a candidate only when its work landed and no hazard holds it.
+fn keeping(slug: &str, kept: KeptRow<'_>, hazards: &[String], base: &str) -> Kept {
+    let reason = if !kept.landed {
+        kept.unlanded_reason(base, &format!("wt rm {slug}"))
+    } else if hazards.is_empty() {
+        return Kept::No;
+    } else {
+        hazards.join(", ")
+    };
+    if kept.surprising() {
+        Kept::Listed(format!("Keeping {slug}: {reason}"))
+    } else {
+        Kept::Unlisted
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CleanupArgs;
+    use super::{CleanupArgs, Kept, KeptRow, keeping};
     use clap::Args;
+
+    #[test]
+    fn the_review_lists_only_kept_rows_a_person_expects_gone() {
+        let row = |landed, dropped, pr_state| KeptRow {
+            landed,
+            dropped,
+            pr_state,
+        };
+        let held = ["still owes: check: open /health (in staging)".to_owned()];
+        // Unfinished or unstarted work is kept without a word, hazards or not.
+        assert_eq!(
+            keeping("one", row(false, false, None), &[], "main"),
+            Kept::Unlisted
+        );
+        assert_eq!(
+            keeping("one", row(false, false, Some("OPEN")), &held, "main"),
+            Kept::Unlisted
+        );
+        // Landed: removed when nothing holds it, listed with why otherwise.
+        assert_eq!(
+            keeping("one", row(true, false, None), &[], "main"),
+            Kept::No
+        );
+        assert_eq!(
+            keeping("one", row(true, false, Some("MERGED")), &held, "main"),
+            Kept::Listed("Keeping one: still owes: check: open /health (in staging)".into())
+        );
+        // A branch that will never land is never a candidate; the line says
+        // how to remove it on purpose.
+        assert_eq!(
+            keeping("one", row(false, true, None), &[], "main"),
+            Kept::Listed(
+                "Keeping one: dropped, but its commits are not on main: remove it with wt rm one"
+                    .into()
+            )
+        );
+        assert_eq!(
+            keeping("one", row(false, false, Some("CLOSED")), &[], "develop"),
+            Kept::Listed(
+                "Keeping one: its PR was closed unmerged, and its commits are not on develop: remove it with wt rm one"
+                    .into()
+            )
+        );
+        // Commits made since a merged pull request may still land.
+        assert_eq!(
+            keeping("one", row(false, false, Some("MERGED")), &[], "main"),
+            Kept::Listed("Keeping one: landing of its own work is not proven".into())
+        );
+    }
 
     #[test]
     fn clean_rejects_force_and_conflicting_stage_flags() {

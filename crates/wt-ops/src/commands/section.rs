@@ -49,7 +49,12 @@ pub enum SectionCommand {
     },
 }
 
-pub async fn run(ctx: &AppContext, args: &SectionArgs) -> Result<i32> {
+/// `landed` names the worktrees whose own work is known to have landed.
+/// A move takes a stack as the board draws it, and there a landed row is a
+/// unit of its own; the caller resolves landing (a squash merge is proven
+/// only by its pull request, which this crate does not read). A worktree
+/// not named, its landing unknown included, moves with its stack.
+pub async fn run(ctx: &AppContext, args: &SectionArgs, landed: &BTreeSet<String>) -> Result<i32> {
     if ctx.config.instance.role == InstanceRole::Worker {
         eprintln!("sections are controller-owned; run this command on the controller");
         return Ok(1);
@@ -62,7 +67,7 @@ pub async fn run(ctx: &AppContext, args: &SectionArgs) -> Result<i32> {
         None => list(ctx, &state, args.json).await,
         Some(SectionCommand::List { json }) => list(ctx, &state, *json || args.json).await,
         Some(SectionCommand::Mv { positionals, only }) => {
-            move_members(ctx, &state, positionals, *only).await
+            move_members(ctx, &state, positionals, *only, landed).await
         }
         Some(SectionCommand::Rename { old, new }) => rename(ctx, &state, old, new).await,
         Some(SectionCommand::Rm { name }) => remove(ctx, &state, name).await,
@@ -160,6 +165,7 @@ async fn move_members(
     state: &Value,
     positionals: &[String],
     only: bool,
+    landed: &BTreeSet<String>,
 ) -> Result<i32> {
     let section_arg = positionals
         .last()
@@ -183,16 +189,6 @@ async fn move_members(
     // The stacks as the board draws them, so a move here and one in the TUI
     // take the same rows along: an archived row is in no stack, and a row
     // whose own work has landed is a unit of its own.
-    let landed = if only {
-        BTreeSet::new()
-    } else {
-        let live = worktrees.iter().map(|w| (*w).clone()).collect::<Vec<_>>();
-        crate::lifecycle_ops::row_landings(ctx, &live, state, None)
-            .await
-            .into_iter()
-            .filter_map(|(slug, landing)| landing.base.then_some(slug))
-            .collect::<BTreeSet<_>>()
-    };
     let members = worktrees
         .iter()
         .filter(|w| !archived.contains(&wt_core::worktree_target_key(&w.target)))
@@ -405,7 +401,8 @@ mod tests {
                 only: false,
             }),
         };
-        assert_eq!(run(&fixture.ctx, &move_stack).await.unwrap(), 0);
+        let none = BTreeSet::new();
+        assert_eq!(run(&fixture.ctx, &move_stack, &none).await.unwrap(), 0);
         let state = fixture
             .ctx
             .database
@@ -422,7 +419,7 @@ mod tests {
                 only: true,
             }),
         };
-        assert_eq!(run(&fixture.ctx, &split).await.unwrap(), 0);
+        assert_eq!(run(&fixture.ctx, &split, &none).await.unwrap(), 0);
         let state = fixture
             .ctx
             .database
@@ -476,7 +473,8 @@ mod tests {
             .call(move |store| Ok(store.toggle_archived_seen(&archived, None, "Archived")?))
             .await
             .unwrap();
-        assert_eq!(run(ctx, &mv("Release")).await.unwrap(), 0);
+        let none = BTreeSet::new();
+        assert_eq!(run(ctx, &mv("Release"), &none).await.unwrap(), 0);
         assert_eq!(section("one").await, "Release");
         assert!(section("two").await.is_null());
         ctx.database
@@ -484,35 +482,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Land "one": its commit is on the base branch the origin advertises.
-        let git = |args: Vec<String>| async move {
-            let output = crate::commands::resolve::run_git(ctx, &ctx.cwd, args.iter())
-                .await
-                .unwrap();
-            assert!(output.status.success(), "git {args:?}");
-            output.stdout_text().trim().to_owned()
-        };
-        let words = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let origin = fixture._root.path().join("origin.git");
-        let origin = origin.to_string_lossy();
-        git(words(&["init", "--bare", &origin])).await;
-        git(words(&["remote", "add", "origin", &origin])).await;
-        let anchor = git(words(&["rev-parse", "HEAD"])).await;
-        ctx.database
-            .call(move |store| {
-                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        std::fs::write(ctx.cwd.join("work.txt"), "landed work\n").unwrap();
-        git(words(&["add", "work.txt"])).await;
-        git(words(&["commit", "-m", "feature work"])).await;
-        // Not landed yet: the stack moves together.
-        assert_eq!(run(ctx, &mv("Soon")).await.unwrap(), 0);
+        // Not known to have landed (unknown counts): the stack moves together.
+        assert_eq!(run(ctx, &mv("Soon"), &none).await.unwrap(), 0);
         assert_eq!(section("two").await, "Soon");
-        git(words(&["push", "origin", "HEAD:refs/heads/main"])).await;
-        assert_eq!(run(ctx, &mv("Done")).await.unwrap(), 0);
+        // The caller found "one" landed, as only a pull request can show
+        // of a squash merge: it moves alone.
+        let landed = BTreeSet::from(["one".to_owned()]);
+        assert_eq!(run(ctx, &mv("Done"), &landed).await.unwrap(), 0);
         assert_eq!(section("one").await, "Done");
         assert_eq!(section("two").await, "Soon");
         fixture.close().await.unwrap();

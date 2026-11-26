@@ -164,7 +164,7 @@ evidence; label theories, and verify a destructive remedy before proposing it.
   changed gets a silent `--examined` verdict: no second ask, no nudge.
 - **Merged and still owing** (`wt owed --all`; in JSON, `owed_phase` of
   `due` or `waiting` and the `owes` array, on live and removed rows;
-  `unverified/<state>` in `wt fleet` for a check): the worktree is kept alive
+  `due/<state>` or `waiting/<state>` in `wt fleet`): the worktree is kept alive
   for what it owes, so it is not a cleanup candidate. Each item says what it
   waits for; a check waits for its stage's deploy and wt wakes the owner when
   it is due, so a `waiting` row needs nothing. The owning session does the

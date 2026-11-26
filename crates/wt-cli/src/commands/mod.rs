@@ -27,6 +27,7 @@ pub mod remote;
 pub mod restack;
 pub mod restore;
 pub mod rollback;
+pub mod section;
 pub mod skills;
 pub mod stages;
 pub mod state;

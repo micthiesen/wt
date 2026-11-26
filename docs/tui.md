@@ -290,7 +290,7 @@ work lands, so a real row never shows it beside a landed header:
   once the check is due. A step shows the first line of its prompt.
 - **Tails.** `before release` for a step set with `--before-release`, `by
   <who>` for a setter that is neither the row's own agent nor you,
-  `unconfirmed` for a wake sent without proof it arrived, `delivering` once
+  `delivery not confirmed` for a wake sent without proof it arrived, `delivering` once
   the conditions held, `held: automations paused` while a pause holds the
   delivery, and the reason a condition cannot be read. A due step ends with
   its id, the argument `wt done <id>` takes.
@@ -368,7 +368,7 @@ lines are cut with an ellipsis, never wrapped.
 A status line says only what is new. `by <who>` names whoever asserted it
 unless that was the row's own agent, and is left out when no one was
 recorded. A gate and an owed post-merge check are carried by every later
-status, so `blocked on <gate>` and `verify in <stage>` appear only on the
+status, so `blocked on <gate>` and `check owed in <stage>` appear only on the
 status where they first appear or change, compared with the status before
 it; a status that drops the gate says `gate cleared` once. A gated status
 keeps its warn circle-slash on every line.
@@ -493,7 +493,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
 | `V` | Show or hide the steps of the checks this row owes (open by default when a check is due) |
-| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note) |
+| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
 | `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
 | `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists every section in board order with its size |
@@ -551,11 +551,15 @@ that something still holds. The reasons are `still owes: <first line>` (with
 a gate alone), `uncommitted changes`, `rebase or merge is in progress`,
 `operation in progress`, the unknowns (`checkout is unavailable`, `Git state
 is unavailable`, `checkout changes are still loading`, `host is
-unavailable`), and `landing of its own work is not proven` for a dropped
-branch or a closed PR. Work that is simply unfinished or not started (that
-last reason with no dropped status and no merged or closed PR, or `work is
-still in progress` for a status of working or needs-human) is not cleanup's
-business and is left out of the menu entirely. With no candidates the overlay
+unavailable`). A branch that will never land is still never removed by
+cleanup, because its commits exist nowhere else, and its reason says how to
+remove it deliberately: `dropped, but its commits are not on <base>: remove
+it with d`, or `its PR was closed unmerged, and its commits are not on
+<base>: remove it with d`. A row whose PR merged but whose landing wt cannot
+prove reads `landing of its own work is not proven`. Work that is simply
+unfinished or not started (not landed, not dropped, no merged or closed PR,
+or a status of working or needs-human) is not cleanup's business and is left
+out of the menu entirely. `wt clean` lists the same rows for the same reasons. With no candidates the overlay
 stays open, starts with `Nothing is ready to clean.` and lists the kept rows,
 if any.
 
@@ -564,8 +568,10 @@ modal does not cover still read. Rows it will clean fill with green, and a
 folded section holding one takes the same fill. A row the menu lists as kept
 recedes to dim with only its title colored by why it stays: yellow when
 something still holds the checkout (it still owes something, uncommitted
-changes), purple when wt cannot tell yet (loading, busy, unavailable), and
-dim when its work never landed. A row the menu leaves out wears no mark at
+changes), the theme's info color (a muted purple, as review status uses) when
+wt cannot tell yet (the host, checkout or Git state is unavailable, an
+operation is in progress, changes are still loading), and
+dim for `landing of its own work is not proven`. A row the menu leaves out wears no mark at
 all and reads as it does on the board. The menu's reasons use the same colors.
 
 Press `c` or `Esc` to close it. Reopen it to use newer

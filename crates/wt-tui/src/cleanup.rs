@@ -7,7 +7,7 @@ use crate::{Board, BoardRow, CleanupTarget, ConfirmAction, UiModal, theme};
 
 /// Title of the overlay shown when nothing can be cleaned.
 pub(crate) const LOG_TITLE: &str = "Clean worktrees";
-const NOT_LANDED: &str = "landing of its own work is not proven";
+const NOT_LANDED: &str = wt_core::cleanup_review::NOT_LANDED;
 const HOST_UNAVAILABLE: &str = "host is unavailable";
 const CHECKOUT_UNAVAILABLE: &str = "checkout is unavailable";
 const OPERATION_IN_PROGRESS: &str = "operation in progress";
@@ -178,28 +178,35 @@ fn hold_reason(board: &Board, row: &BoardRow) -> Option<String> {
 }
 
 fn keep_reason(row: &BoardRow) -> Option<String> {
-    checkout_hold_reason(row, true)
+    let reason = checkout_hold_reason(row, true)?;
+    Some(if reason == NOT_LANDED {
+        let base = row.base_branch.as_deref().unwrap_or("its base branch");
+        kept(row).unlanded_reason(base, "d")
+    } else {
+        reason
+    })
 }
 
-/// Whether a kept row belongs in the review: one a person could be
-/// surprised to see kept, because its work landed, was dropped, or its PR
-/// merged or closed, and something still holds the checkout. Work that is
-/// simply unfinished or not started is not cleanup's business and is left
-/// out of the list and unmarked behind it.
+/// The row as the shared cleanup review rule reads it.
+fn kept(row: &BoardRow) -> wt_core::cleanup_review::KeptRow<'_> {
+    wt_core::cleanup_review::KeptRow {
+        landed: row.git.landed_on.is_some(),
+        dropped: row.work.as_ref().is_some_and(|work| {
+            work.record
+                .as_ref()
+                .map(|record| record.state)
+                .or(work.effective_state)
+                == Some(wt_core::WorkState::Dropped)
+        }),
+        pr_state: row.pr.as_ref().and_then(|pr| pr.state.as_deref()),
+    }
+}
+
+/// Whether a kept row belongs in the review (see
+/// [`wt_core::cleanup_review::KeptRow::surprising`]). A row left out is
+/// also unmarked in the list behind the menu.
 fn surprising(row: &BoardRow, reason: &str) -> bool {
-    let dropped = row.work.as_ref().is_some_and(|work| {
-        work.record
-            .as_ref()
-            .map(|record| record.state)
-            .or(work.effective_state)
-            == Some(wt_core::WorkState::Dropped)
-    });
-    let pr_over = row
-        .pr
-        .as_ref()
-        .and_then(|pr| pr.state.as_deref())
-        .is_some_and(|state| matches!(state, "MERGED" | "CLOSED"));
-    reason != WORK_IN_PROGRESS && (row.git.landed_on.is_some() || dropped || pr_over)
+    reason != WORK_IN_PROGRESS && kept(row).surprising()
 }
 
 /// The one reason a row that still owes something is kept:
@@ -332,7 +339,8 @@ mod tests {
         let mark = |row: &BoardRow| preview.mark(&board, row);
         assert_eq!(mark(&target), Some(CleanupMark::Remove));
         assert_eq!(mark(&dirty), Some(CleanupMark::Held));
-        assert_eq!(mark(&dropped), Some(CleanupMark::Unlanded));
+        // It will never land: removing it is the person's move.
+        assert_eq!(mark(&dropped), Some(CleanupMark::Held));
         assert_eq!(mark(&loading), Some(CleanupMark::Unknown));
         assert_eq!(mark(&down), Some(CleanupMark::Unknown));
         assert_eq!(mark(&fresh), Some(CleanupMark::Unknown));
@@ -356,6 +364,7 @@ mod tests {
         // These a person could expect gone: say why they stay.
         let mut dropped = unlanded("dropped");
         dropped.work = status(WorkState::Dropped);
+        dropped.base_branch = Some("main".into());
         let mut closed = unlanded("closed");
         closed.pr = pr("CLOSED");
         let mut merged = unlanded("merged");
@@ -383,8 +392,8 @@ mod tests {
                 "From background results. Removal checks current state again.",
                 "",
                 "Keeping · 4",
-                "Keep dropped: landing of its own work is not proven",
-                "Keep closed: landing of its own work is not proven",
+                "Keep dropped: dropped, but its commits are not on main: remove it with d",
+                "Keep closed: its PR was closed unmerged, and its commits are not on its base branch: remove it with d",
                 "Keep merged: landing of its own work is not proven",
                 "Keep owing: still owes: check: open /health",
             ]
@@ -403,8 +412,8 @@ mod tests {
                 None,
                 None,
                 None,
-                Some(CleanupMark::Unlanded),
-                Some(CleanupMark::Unlanded),
+                Some(CleanupMark::Held),
+                Some(CleanupMark::Held),
                 Some(CleanupMark::Unlanded),
                 Some(CleanupMark::Held),
             ]

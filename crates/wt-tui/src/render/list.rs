@@ -849,7 +849,8 @@ mod tests {
         let (held, style) = title(1);
         assert_eq!(style.fg, Some(theme::WARN));
         assert!(held.spans.iter().all(|span| span.style.bg.is_none()));
-        assert_eq!(title(3).1.fg, Some(theme::FG_DIM));
+        // It will never land, so removing it is the person's move.
+        assert_eq!(title(3).1.fg, Some(theme::WARN));
         // Left out of the menu, so drawn as it is with no menu open.
         let plain = RowContext {
             model: &model,

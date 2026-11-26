@@ -60,19 +60,18 @@ The checkout is shared with other agents, the human, and hot-reloading servers.
 - Conditions (all must hold): a time (`17:00`, `5pm`, `3h`); this worktree
   (`merged`, `staging`, `production`, `green`); `pr:3806:production`;
   `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a time
-  take a delay (`release:production+24h`). `wt watch` lists them;
-  `wt watch cancel <id>` cancels.
+  take a delay (`release:production+24h`). `wt watch` lists them.
 
 ### What you still owe
 
-`wt owed` shows what this worktree owes, as does every command below; a row
-that owes nothing is finished. Never leave owed work only in the note:
+`wt owed`, like every command below, lists what this worktree owes and what
+closes it. A row owing nothing is finished; the note never holds owed work:
 
 - A prerequisite before merging is `--blocked-on "<gate>"`, only when merging
   now would make things worse until it happens (a manual deploy or follow-up
   that leaves the status quo unchanged is a step). `--until <condition>`
-  clears the gate once wt observes the prerequisite; `--then "<prompt>"` acts
-  then. Only a person's decision stays a bare gate (`wt status --unblock`).
+  clears it once wt observes the prerequisite, `--then "<prompt>"` acts then;
+  only a person's decision stays a bare gate (`wt status --unblock`).
 - A check only a deployed environment can run is `--verify-in-staging` and/or
   `--verify-in-production` (both may be owed), set as soon as you know it. It
   never blocks merging; the row returns as `needs-testing` once the change is
@@ -85,15 +84,16 @@ that owes nothing is finished. Never leave owed work only in the note:
 
 - Any other step, never a check: `wt wake <condition> -m "<step>"`, with
   `--before-release` when it must precede the next production release.
-- When woken for something owed, confirm the deploy contains the change, do
-  it, then `wt done <id|staging|production> -m "<evidence>"`, or
-  `wt done ... --again <condition>` to come back for another part
-  (`wt status verified -m` also closes due checks). Being woken closes
-  nothing; what is still owed holds off cleanup.
+- A due check, and a wake delivered after the work merged, stay owed (and hold
+  off cleanup) until closed, even when moot: do it on a deploy that contains
+  the change, then `wt done <id|staging|production> -m "<evidence>"`.
+- To change it: `wt done <target> --again <condition>` puts it off,
+  `wt watch cancel <id>` (or `--mine`) drops a pending wake,
+  `wt status --no-verify-in-<stage>` drops a check.
 - Every op is yours: do it when due, asking approval where the action needs
-  it, and never hand it to the human. Prefer automation that ships with the
-  change, such as a checked-in migration the normal deploy applies; a step the
-  merge and deploy flow already performs is not owed.
+  it, never handing it to the human. Prefer automation that ships with the
+  change (a checked-in migration the normal deploy applies); a step the merge
+  and deploy flow already performs is not owed.
 
 ### Completion status
 

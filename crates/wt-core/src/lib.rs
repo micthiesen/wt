@@ -1,5 +1,6 @@
 //! Pure domain types and transforms shared by wt's Rust application.
 
+pub mod cleanup_review;
 mod domain;
 mod fork_base;
 mod harness;

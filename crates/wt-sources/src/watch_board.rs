@@ -133,6 +133,12 @@ fn attach(
             clock.now_ms,
         );
         row.owed_phase = wt_core::owed_phase(&items, landing.base);
+        // Something due is something to do now, whichever kind it is. A due
+        // check already shows as needs-testing; a step that came due has no
+        // state of its own to show it.
+        row.needs_attention |= items
+            .iter()
+            .any(|item| item.state == wt_core::OwedState::Due);
         row.owes = items
             .iter()
             .map(|item| owed_view(item, &own, clock, idle, held))
@@ -604,6 +610,7 @@ mod tests {
             ]
         );
         assert_eq!(one.owes[1].not_before_in.as_deref(), Some("1h"));
+        assert!(!one.needs_attention, "nothing is due yet");
         assert_eq!(next, Some(REFRESH));
         // A probed stage that is not running the change yet.
         let mut awaiting = base();
@@ -620,6 +627,21 @@ mod tests {
             true,
         );
         assert!(board.rows[0].owes.iter().all(OwedView::due));
+        // A step that came due asks for attention by itself, as a due check
+        // does through its state.
+        let (board, _) = prepared_state(
+            vec![base()],
+            json!({
+                "slugs": { "one": { "createdAt": CREATED } },
+                "owed": [{
+                    "id": "93co6q", "slug": "one", "incarnation": CREATED, "by": "one",
+                    "what": "confirm prod logs", "whenText": "in production", "dueAtMs": NOON,
+                }],
+            }),
+            true,
+        );
+        assert_eq!(board.rows[0].owed_phase, Some(OwedPhase::Due));
+        assert!(board.rows[0].needs_attention);
         // Landed and nothing open: done, which is what cleanup removes.
         let (board, _) = prepared_state(
             vec![base()],

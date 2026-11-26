@@ -751,7 +751,7 @@ async fn dispatch_command(
         Command::Owed(args) => commands::owed::run_owed(context, args).await,
         Command::Done(args) => commands::owed::run_done(context, args).await,
         Command::Base(args) => commands::base::run(context, args).await,
-        Command::Section(args) => wt_ops::commands::section::run(context, args).await,
+        Command::Section(args) => commands::section::run(context, args).await,
         Command::Edge(args) => commands::edge::run(context, args).await,
         Command::Guide(args) => commands::guide::run(context, args).await,
         Command::History(args) => commands::history::run(context, args).await,

@@ -36,7 +36,7 @@ impl RowLanding {
         }
     }
 
-    const fn unknown(landing: Landing) -> Self {
+    pub(super) const fn unknown(landing: Landing) -> Self {
         Self {
             landing,
             known: false,
@@ -54,6 +54,11 @@ impl RowLanding {
     /// reader is told the landing is unknown.
     pub(crate) const fn shown(self) -> Landing {
         self.landing
+    }
+
+    /// Whether the row's own work is known to have landed.
+    pub(crate) const fn is_landed(self) -> bool {
+        self.known && self.landing.base
     }
 
     /// The `landing` value of the JSON surfaces.

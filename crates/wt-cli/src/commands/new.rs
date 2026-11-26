@@ -221,6 +221,8 @@ async fn section(ctx: &AppContext, created: &Created, name: &str) -> Result<i32>
                 only: true,
             }),
         },
+        // Only the new worktree moves: no stack to split.
+        &std::collections::BTreeSet::new(),
     )
     .await
 }

@@ -17,8 +17,7 @@ could promise a step nothing tracked.
 
 Now nothing but the pure derivation `wt_core::owed` decides what a row owes.
 The board, the details pane, badges, cleanup, removal hazards, JSON and CLI
-output all read `owed_items`. A new surface reads it too; it never
-re-derives from the status record or the watches.
+output all read `owed_items`, and a new surface must too.
 
 ## Items
 
@@ -53,8 +52,8 @@ the worktree's own work had landed when it fired:
 
 - **Not landed:** the wake closes on delivery, as coordination does (rebase
   when a parent merges, test at 17:00).
-- **Landed, or landing unknown** (a PR exists, GitHub data is stale and there
-  is no local proof): the wake becomes a **due step**. It stays owed until
+- **Landed, or unknown to the engine** (a PR exists, GitHub data is stale and
+  there is no local proof): the wake becomes a **due step**. It stays owed until
   `wt done <id> -m "<what you did and what you saw>"` closes it with
   evidence, or `wt done <id> --again <condition>...` turns it back into a
   wake for another part. The prompt ends with the command that closes it.
@@ -77,10 +76,13 @@ After landing, the row's **phase** is derived, never asserted:
 | `waiting` | something is open, nothing is due |
 | `done` | nothing is open |
 
-No work state was added for this, because an older build reads an unknown
-state as no status. The effective state still reads `needs-testing` while
-any check is due, so existing automations and sorts keep their meaning; a due
-step does not change it. `verified` is written only when no check remains.
+A command that cannot establish the landing ([how it is
+read](cli.md#wt-owed---all---json---slug-slug)) reports it as `unknown`:
+nothing is called due and the phase is null. No work state was added for
+phases, because an older build reads an unknown state as no status. The
+effective state still reads `needs-testing` while any check is due, so
+automations and sorts keep their meaning; a due step does not change it.
+`verified` is written only when no check remains.
 
 ## What holds cleanup
 
@@ -88,8 +90,7 @@ One predicate, `owes_anything`: any open check (due or not), any pending
 wake of the row, any due step. Cleanup, `wt clean`, `builtin:clean` and the
 `c` review keep such a worktree and say `still owes: <headline> (<when>)`;
 `wt rm` refuses without `--force`. A merge gate alone holds nothing, and
-neither does a notify-only watch. For a landed row the predicate is exactly
-"its list is not empty", so a landed row in phase `done` is cleanable.
+neither does a notify-only watch. A landed row in phase `done` is cleanable.
 
 A removed worktree's checks and due steps move onto its removal record:
 `wt owed --slug <slug>` shows them, `wt done --slug <slug>` closes them
@@ -103,7 +104,6 @@ sees the result instead of assuming it:
 
     This worktree owes:
       due      confirm the logs (due since 11:36) · wt done 93co6q
-      gate     mobile release (until a person clears it)
       waiting  check: 1. check prod 2. check logs (once in production)
 
 The ready note therefore carries no phased `OPS` lines: `wt status` refuses
