@@ -342,15 +342,33 @@ pub fn fold_watch_history(events: &[WorktreeEvent]) -> Vec<HistoryLine<'_>> {
             )
         })
     };
+    // A step set again is a new wake: the line that says "again at 17:00"
+    // says the wake was set, so the set itself is not another line.
+    let set_again = |set: usize| {
+        let Some((_, WatchChange::Set, what, _)) = watch(set) else {
+            return false;
+        };
+        events.iter().any(|event| {
+            event.at_ms.abs_diff(events[set].at_ms) <= WATCH_IMMEDIATE_MS
+                && matches!(
+                    &event.event,
+                    Kind::Owed { change: OwedChange::Again, when: Some(when), .. }
+                        if when.strip_prefix("at ").or(when.strip_prefix("when ")) == Some(what)
+                )
+        })
+    };
     // A `held` that what wt did, or its giving up, says later.
     let mut folded: Vec<bool> = (0..events.len())
         .map(|held| {
-            change(held) == Some(WatchChange::Held)
-                && ((held + 1..events.len())
-                    .filter(|later| same(held, *later))
-                    .map_while(|later| change(later).filter(|change| *change != WatchChange::Set))
-                    .any(|change| change.is_action() || change == WatchChange::Dropped)
-                    || came_due(held))
+            set_again(held)
+                || change(held) == Some(WatchChange::Held)
+                    && ((held + 1..events.len())
+                        .filter(|later| same(held, *later))
+                        .map_while(|later| {
+                            change(later).filter(|change| *change != WatchChange::Set)
+                        })
+                        .any(|change| change.is_action() || change == WatchChange::Dropped)
+                        || came_due(held))
         })
         .collect();
     let mut fired: Vec<Option<WatchFired<'_>>> = vec![None; events.len()];
@@ -867,6 +885,24 @@ mod tests {
             at(HOUR + 2, watch("b", Held, "17:00")),
         ];
         assert_eq!(shape(&became_due), "e-ee");
+        // Set again: one line, "again at 17:00", stands for the new wake's
+        // "will wake the session" too. A wake set by hand still shows.
+        let again = WorktreeEventKind::Owed {
+            id: Some("a".into()),
+            change: OwedChange::Again,
+            what: "confirm prod logs".into(),
+            evidence: None,
+            by: None,
+            stage: None,
+            when: Some("at 17:00".into()),
+            unconfirmed: false,
+        };
+        let rearmed = [
+            at(0, watch("c", Set, "17:00")),
+            at(1, again),
+            at(2 * HOUR, watch("d", Set, "17:00")),
+        ];
+        assert_eq!(shape(&rearmed), "-ee");
         // A wake as earlier builds recorded it: held, the prompt's own
         // message, then the wake.
         let wake = [

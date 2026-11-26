@@ -199,7 +199,15 @@ enum Kept {
 /// (`wt_core::cleanup_review`). Nothing here loosens what is removed: a row
 /// is a candidate only when its work landed and no hazard holds it.
 fn keeping(slug: &str, kept: KeptRow<'_>, hazards: &[String], base: &str) -> Kept {
-    let reason = if !kept.landed {
+    // Removing a row is refused while it owes something, so that is the
+    // reason given: the advice to remove a branch that will never land must
+    // work when followed.
+    let owed = hazards
+        .iter()
+        .find(|hazard| hazard.starts_with(wt_core::OWED_HAZARD));
+    let reason = if let (false, Some(owed)) = (kept.landed, owed) {
+        owed.clone()
+    } else if !kept.landed {
         kept.unlanded_reason(base, &format!("wt rm {slug}"))
     } else if hazards.is_empty() {
         return Kept::No;
@@ -259,6 +267,12 @@ mod tests {
                 "Keeping one: its PR was closed unmerged, and its commits are not on develop: remove it with wt rm one"
                     .into()
             )
+        );
+        // While it still owes something `wt rm` would be refused: that is
+        // what holds it, and what the line says.
+        assert_eq!(
+            keeping("one", row(false, true, None), &held, "main"),
+            Kept::Listed("Keeping one: still owes: check: open /health (in staging)".into())
         );
         // Commits made since a merged pull request may still land.
         assert_eq!(

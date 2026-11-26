@@ -207,10 +207,12 @@ fn item_line_from(
     if item.state == OwedState::Due
         && let Some(target) = item.done_target()
     {
+        // Runs as printed, with only the evidence to fill in.
         line.push_str(&format!(" · wt done {target}"));
         if away {
             line.push_str(&format!(" --slug {slug}"));
         }
+        line.push_str(" -m \"<evidence>\"");
     }
     line
 }
@@ -1197,7 +1199,7 @@ mod tests {
         assert_eq!(owed.phase, Some(OwedPhase::Due));
         assert_eq!(
             owed_text("This worktree", "one", &owed, clock()),
-            "This worktree owes:\n  due      check: 1. check staging (due in staging) · wt done staging"
+            "This worktree owes:\n  due      check: 1. check staging (due in staging) · wt done staging -m \"<evidence>\""
         );
         // One due: closed without naming it.
         assert_eq!(
@@ -1231,8 +1233,9 @@ mod tests {
         assert_eq!(left.items.len(), 1);
         assert_eq!(left.items[0].id.as_deref(), Some(second.as_str()));
         assert!(
-            item_line(&left.items[0], "one", clock())
-                .ends_with(&format!(") · before release · wt done {second}")),
+            item_line(&left.items[0], "one", clock()).ends_with(&format!(
+                ") · before release · wt done {second} -m \"<evidence>\""
+            )),
             "{}",
             item_line(&left.items[0], "one", clock())
         );
@@ -1504,7 +1507,9 @@ mod tests {
         assert_eq!(lines[0], "one owes:");
         assert!(lines[1].starts_with("  due      confirm the logs (due since "));
         // Read from elsewhere, the closing command names the worktree.
-        assert!(lines[1].ends_with(&format!(" · before release · wt done {step} --slug one")));
+        assert!(lines[1].ends_with(&format!(
+            " · before release · wt done {step} --slug one -m \"<evidence>\""
+        )));
         // No GitHub answers here and Git shows no landing: the list says
         // the landing is unknown instead of calling the work unmerged.
         assert_eq!(
@@ -1523,7 +1528,7 @@ mod tests {
             .filter(|line| !line.starts_with(' ') && !line.is_empty())
             .collect::<Vec<_>>();
         assert_eq!(titles, ["Due now", "Waiting for production", "Waiting"]);
-        assert!(grouped.contains(&format!(" · wt done {step} --slug one")));
+        assert!(grouped.contains(&format!(" · wt done {step} --slug one -m \"<evidence>\"")));
         assert_eq!(
             run_owed(
                 ctx,
@@ -1673,7 +1678,7 @@ mod tests {
         );
         assert_eq!(
             brief(Landing::new(true, true, true))[0],
-            "due      check: 1. check prod (due in production) · wt done production"
+            "due      check: 1. check prod (due in production) · wt done production -m \"<evidence>\""
         );
 
         // This build writes: a fresh assertion that carries the check. The

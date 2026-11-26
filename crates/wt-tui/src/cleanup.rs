@@ -180,6 +180,11 @@ fn hold_reason(board: &Board, row: &BoardRow) -> Option<String> {
 fn keep_reason(row: &BoardRow) -> Option<String> {
     let reason = checkout_hold_reason(row, true)?;
     Some(if reason == NOT_LANDED {
+        // Removing it is refused while it owes something, so that comes
+        // first: the advice to remove it must work when followed.
+        if let Some(owed) = owed_reason(row) {
+            return Some(owed);
+        }
         let base = row.base_branch.as_deref().unwrap_or("its base branch");
         kept(row).unlanded_reason(base, "d")
     } else {
@@ -420,6 +425,29 @@ mod tests {
                 Some(CleanupMark::Unlanded),
                 Some(CleanupMark::Held),
             ]
+        );
+    }
+
+    #[test]
+    fn an_abandoned_row_that_still_owes_something_is_kept_for_that() {
+        // Removing it would be refused for what it owes, so that is the
+        // reason: "remove it with d" is said only once it would work.
+        let mut dropped = unlanded("dropped");
+        dropped.work = status(WorkState::Dropped);
+        dropped.base_branch = Some("main".into());
+        dropped.owes = vec![OwedView::new(
+            OwedKind::Step,
+            OwedState::Due,
+            "confirm logs",
+        )];
+        assert_eq!(
+            keep_reason(&dropped).as_deref(),
+            Some("still owes: confirm logs")
+        );
+        dropped.owes.clear();
+        assert_eq!(
+            keep_reason(&dropped).as_deref(),
+            Some("dropped, but its commits are not on main: remove it with d")
         );
     }
 

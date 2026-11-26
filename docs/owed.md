@@ -103,7 +103,7 @@ Each command that changes the list (`wt status` with a gate or check flag,
 sees the result instead of assuming it:
 
     This worktree owes:
-      due      confirm the logs (due since 11:36) · wt done 93co6q
+      due      confirm the logs (due since 11:36) · wt done 93co6q -m "<evidence>"
       waiting  check: 1. check prod 2. check logs (in production)
 
 The ready note therefore carries no phased `OPS` lines: `wt status` refuses

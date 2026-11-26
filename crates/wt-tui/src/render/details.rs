@@ -1098,10 +1098,11 @@ fn phase_header(
         wt_core::OwedPhase::Due => {
             let due = owes.iter().filter(|item| item.due()).count();
             let waiting = owes.len() - due;
-            let text = match (owes.len(), waiting) {
-                (0 | 1, _) => "due".to_owned(),
-                (_, 0) => format!("due · {due} due"),
-                _ => format!("due · {due} due · {waiting} waiting"),
+            let text = match (due, waiting) {
+                (0 | 1, 0) => "due".to_owned(),
+                (0 | 1, _) => format!("due · {waiting} waiting"),
+                (_, 0) => format!("{due} due"),
+                _ => format!("{due} due · {waiting} waiting"),
             };
             (
                 glyphs::OWED_DUE,
@@ -1271,7 +1272,8 @@ fn owed_mark(item: &OwedView) -> (&'static str, ratatui::style::Color) {
     }
 }
 
-/// The "when" column of an owed item: `due 11:36`, `before merge`, `in staging`,
+/// The "when" column of an owed item: `due since 11:36`, `before merge`,
+/// `in staging`,
 /// `at 17:00 (in 2h)`, `when #3806 in production`.
 fn owed_when(item: &OwedView, times: &Times) -> Spans {
     let (_, color) = owed_mark(item);
@@ -1296,7 +1298,7 @@ fn owed_when(item: &OwedView, times: &Times) -> Spans {
                 .and_then(|at_ms| stamp_text(at_ms, times))
                 .or_else(|| item.due_at.clone());
             plain(
-                at.map_or_else(|| "due".to_owned(), |at| format!("due {at}")),
+                at.map_or_else(|| "due".to_owned(), |at| format!("due since {at}")),
                 color,
             )
         }
@@ -1432,10 +1434,17 @@ fn owed_text(
                 suffix.push(Span::styled(format!(" · {reason}"), theme::dim()));
             }
             suffix.extend(delivery_tail(item.met, item.held));
-            // What `wt done` takes.
+            // A pointer to what closes it, never wrapped mid-command: on
+            // the item's own line, or left out where that line has no room
+            // for it beside a headline.
             if let Some(id) = item.id.as_deref().filter(|_| item.due()) {
-                suffix.push(Span::raw("\u{a0}\u{a0} "));
-                suffix.push(Span::styled(format!("wt done {id}"), theme::dim()));
+                let command = format!("wt\u{a0}done\u{a0}{id}");
+                let needed =
+                    used + OWED_HEADLINE_MIN_CELLS + spans_width(&suffix) + 3 + command.width();
+                if needed <= width {
+                    suffix.push(Span::raw("\u{a0}\u{a0} "));
+                    suffix.push(Span::styled(command, theme::dim()));
+                }
             }
             // The first line, as its host prepared it.
             let headline = item.headline.as_str();
@@ -2858,12 +2867,12 @@ mod tests {
         assert_eq!(
             lines[..5],
             [
-                "● due · 1 due · 1 waiting · risk low · 2h ago"
+                "● due · 1 waiting · risk low · 2h ago"
                     .to_owned(),
                 "owes".to_owned(),
-                "  ●  due 11:36      confirm prod logs, then open the PR retiring the old path   wt done 93co6q"
+                "  ●  due since 11:36  confirm prod logs, then open the PR retiring the old path   wt done 93co6q"
                     .to_owned(),
-                "  ○  in production  check · 2 steps · V expands".to_owned(),
+                "  ○  in production    check · 2 steps · V expands".to_owned(),
                 format!("{bell}  tells you when ○ in production"),
             ]
         );
@@ -2883,7 +2892,11 @@ mod tests {
         )]
         .into();
         let local = plain(&work_status_block(&row, false, &times, 200));
-        assert!(local[2].starts_with("  ●  due 12:36  "), "{}", local[2]);
+        assert!(
+            local[2].starts_with("  ●  due since 12:36  "),
+            "{}",
+            local[2]
+        );
         // An overdue check turns the header and its own line red.
         row.owes.insert(
             0,
@@ -2894,7 +2907,7 @@ mod tests {
         let lines = plain(&styled);
         // The header counts; the lines below it say what.
         assert!(
-            lines[0].starts_with("● due · 2 due · 1 waiting · "),
+            lines[0].starts_with("● 2 due · 1 waiting · "),
             "{}",
             lines[0]
         );
@@ -3178,11 +3191,22 @@ mod tests {
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                // Wrapped, never cut: the id, the condition and the hint
-                // survive every width.
-                for needle in ["93co6q", "○ next production release", "tells you when"] {
+                // Wrapped, never cut: the condition and the hint survive
+                // every width.
+                for needle in ["○ next production release", "tells you when"] {
                     assert!(said.contains(needle), "{width}: {needle}: {said}");
                 }
+                // The closing command is a pointer: whole on one line, or
+                // left out where the line has no room for it.
+                let command = "wt done 93co6q";
+                let whole = plain(&lines).iter().any(|line| line.contains(command));
+                assert_eq!(
+                    said.contains("93co6q"),
+                    whole,
+                    "{width}: {:?}",
+                    plain(&lines)
+                );
+                assert_eq!(whole, width >= 80, "{width}: {said}");
             }
         }
         // Wide: one line an item, the text column aligned.
@@ -3198,9 +3222,12 @@ mod tests {
         assert!(narrow.len() > wide.len());
         let first = narrow
             .iter()
-            .position(|line| line.contains("due 11:36"))
+            .position(|line| line.contains("due since 11:36"))
             .unwrap();
-        assert!(narrow[first].starts_with("  ●  due 11:36"), "{narrow:?}");
+        assert!(
+            narrow[first].starts_with("  ●  due since 11:36"),
+            "{narrow:?}"
+        );
         assert!(
             narrow[first + 1].starts_with("     ") && !narrow[first + 1][5..].starts_with(' '),
             "{narrow:?}"

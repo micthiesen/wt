@@ -267,9 +267,9 @@ note, most urgent first, one line an item with the "when" column aligned.
 The lines below show every form; the gate is listed only until the row's own
 work lands, so a real row never shows it beside a landed header:
 
-    ● due · 1 due · 4 waiting · risk low · 2h ago
+    ● due · 4 waiting · risk low · 2h ago
     owes
-      ●  due 11:36           confirm prod logs, then open the PR retiring...   wt done 93co6q
+      ●  due since 11:36     confirm prod logs, then open the PR retiring...   wt done 93co6q
       ⊘  before merge        prod secret missing · clears when ○ #3806 in production
       ○  in staging          check · 5 steps · V expands
       ○  in production, not before 18:31   check · 2 steps · V expands
@@ -279,7 +279,7 @@ work lands, so a real row never shows it beside a landed header:
 - **Mark.** A filled dot in yellow once the item is due (red when overdue),
   the gate's slash, `?` while a condition it waits for cannot be read, and a
   dim hollow dot while it waits.
-- **When.** `due 11:36` for a step that came due then, `due in staging` or
+- **When.** `due since 11:36` for a step that came due then, `due in staging` or
   `overdue in staging` for a check, `before merge` for the gate, `in
   staging` for a check that waits (`in production, not before 18:31` when it
   was put off, the words `wt owed` prints),
@@ -297,15 +297,16 @@ work lands, so a real row never shows it beside a landed header:
   `delivery not confirmed` for a wake sent without proof it arrived, `delivering` once
   the conditions held, `held: automations paused` while a pause holds the
   delivery, and the reason a condition cannot be read. A due step ends with
-  the command that closes it, dim: `wt done <id>`.
+  the command that closes it, dim: `wt done <id>` (a pointer: the command also
+  takes `-m`). It is never wrapped; a line with no room for it leaves it out.
 
 The pane lists eight items and counts the rest as `+N more (wt owed)`. Times
 are in this machine's clock (`09:00 tomorrow`, `Mon 30 Nov 09:00`), and the
 countdown is refreshed at least every 30 seconds while anything waits.
 
 Once the row's own work has landed, the header reads from the list instead of
-the asserted state: `● due` when it owes one thing, else `● due · 2 due · 1
-waiting` (the lines below say what), `◷ waiting
+the asserted state: `● due` for one thing due, `● due · 1 waiting` when more
+waits behind it, `● 2 due · 1 waiting` for several (the lines below say what), `◷ waiting
 for staging · 2 owed` (or `for production`, `until 17:00`, `for <conditions>`),
 or `✓ done`, followed by risk and age as before. A landed row that owes
 nothing shows a single dim `owes nothing`; an unlanded row with nothing owed

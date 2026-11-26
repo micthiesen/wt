@@ -203,8 +203,8 @@ fn describe(event: &WorktreeEventKind) -> Option<String> {
             "no longer conflicts with its base".into()
         }
         WorktreeEventKind::Landed { on } => match on {
-            LandedOn::Base => "landed on base".into(),
-            LandedOn::Production => "landed on production".into(),
+            LandedOn::Base => "merged".into(),
+            LandedOn::Production => "in production".into(),
         },
         WorktreeEventKind::Automation {
             rule,

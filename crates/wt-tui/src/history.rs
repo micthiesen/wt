@@ -556,15 +556,25 @@ fn record_lines(
             wt_core::OwedKind::Check => item.stage.map(|stage| stage.as_str().to_owned()),
             _ => None,
         };
-        let close = target
-            .map(|target| format!(" · wt done {target} --slug {}", row.slug))
-            .unwrap_or_default();
-        field(
-            &mut lines,
-            if index == 0 { "owes" } else { "" },
-            &format!("{} ({}){close}", item.headline, item.when),
-            if item.due() { theme::WARN } else { theme::FG },
-        );
+        // A pointer, kept whole: beside the item where it fits, on its own
+        // line where only that fits, and left out otherwise.
+        let close = target.map(|target| format!("wt done {target} --slug {}", row.slug));
+        let what = format!("{} ({})", item.headline, item.when);
+        let name = if index == 0 { "owes" } else { "" };
+        let color = if item.due() { theme::WARN } else { theme::FG };
+        match close {
+            Some(close) if what.width() + 3 + close.width() <= value_width => {
+                field(&mut lines, name, &format!("{what} · {close}"), color);
+            }
+            Some(close) if close.width() <= value_width => {
+                field(&mut lines, name, &what, color);
+                lines.push(Line::from(vec![
+                    keyed("", 0),
+                    Span::styled(close, theme::dim()),
+                ]));
+            }
+            _ => field(&mut lines, name, &what, color),
+        }
     }
     if let Some(landed) = row.landed_on {
         field(
