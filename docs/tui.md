@@ -66,7 +66,11 @@ so moving a merged head (`l`, `J`/`K`) moves only that row.
 With `[ui] owed_sections = true` (off by default) a landed, unarchived local
 row is drawn in a derived block instead of its section, by what it still
 owes: **Due**, **Waiting for staging**, **Waiting for production**,
-**Waiting** (anything else) and **Done**. The blocks sit after the manual
+**Scheduled** (its next item comes due at a known time), **Waiting on other
+work** and **Done** ([how a row is filed](owed.md#derived-blocks)). Rows
+under Due are drawn oldest due step first. Rows under Scheduled are drawn
+soonest first, each with that time dim at the right edge of its row (`22:32`,
+`Fri 18:12`) where its title leaves room. The blocks sit after the manual
 sections and the Inbox and before the rows being removed and the archive;
 empty ones are hidden and they fold like sections. They cannot be renamed,
 deleted or used as a move target, and a row shown in one cannot be moved or
@@ -80,7 +84,9 @@ The details pane's border names the slug. It starts with the wrapped title
 and a dim tag naming its source (see [Worktree titles](#worktree-titles)).
 The work-status block follows: a header line, the list of what the row owes
 (see [What a row owes](#what-a-row-owes)), the watches that only tell you,
-then the note behind a rail in the state's color. Until the row's own work
+then the note behind a rail in the state's color. Every mark in it (the
+header's, each item's, the bell, the rail) is in the pane's first column and
+all its text starts two cells in. Until the row's own work
 lands the header is the asserted state (`blocked · ready` with the gate's
 slash while a gate is set), risk, age, and `commits since` when the status
 predates HEAD. `REVERT`, `IF WRONG`, `UNTESTED` and `OPS: none` note fields
@@ -262,55 +268,79 @@ opens the main clone as it does on the board.
 
 A worktree has one list of what it still owes ([owed.md](owed.md)): its
 merge gate, the check owed in each stage, and the steps it comes back for.
-The details pane shows it as one `owes` block between the header and the
-note, most urgent first, one line an item with the "when" column aligned.
-The lines below show every form; the gate is listed only until the row's own
-work lands, so a real row never shows it beside a landed header:
+The details pane lists it between the header and the note, most urgent
+first, one line an item in three columns: when, what, and one detail at the
+right edge. The lines below show every form; the gate is listed only until
+the row's own work lands, so a real row never shows it beside a landed
+header:
 
-    ● due · 4 waiting · risk low · 2h ago
-    owes
-      ●  due since 11:36     confirm prod logs, then open the PR retiring...   wt done 93co6q
-      ⊘  before merge        prod secret missing · clears when ○ #3806 in production
-      ○  in staging          check · 5 steps · V expands
-      ○  in production, not before 18:31   check · 2 steps · V expands
-      ○  at Nov 27 18:12     rerun the renewal check · before release
-      ?  when check vault=X  rotate the key · exited 2: vault sealed
+    ● due · 4 waiting
+    ● since 11:36     confirm prod logs, then open the PR retiring…   wt done 93co6q
+    ⊘ before merge    prod secret missing
+                      clears when ○ #3806 in production
+    ○ staging         Worker crons fire and renewal moves the expiry…        5 steps
+    ○ production +7d  retire the Edge function fallback                        in 6d
+    ○ Fri 18:12       rerun the renewal check · before release             in 1d 21h
+    ? check vault     rotate the key · exited 2: vault sealed
+      V shows steps
 
 - **Mark.** A filled dot in yellow once the item is due (red when overdue),
   the gate's slash, `?` while a condition it waits for cannot be read, and a
-  dim hollow dot while it waits.
-- **When.** `due since 11:36` for a step that came due then, `due in staging` or
-  `overdue in staging` for a check, `before merge` for the gate, `in
-  staging` for a check that waits (`in production, not before 18:31` when it
-  was put off, the words `wt owed` prints),
-  `at 17:00 (in 2h10m)` for a lone time, and `when ...` for conditions, each
-  marked `✓` holds, `○` not yet or `?` unknown.
-- **What.** A gate's text, then `clears when ...` (`clears at 17:00` for a
-  time) and `, then wakes the session` when it has a `--then`. A check reads
-  `check` and its step count, or its first line when it has no numbered
-  steps, with `awaiting deploy` while its stage does not run the landing
-  yet; `V` expands or collapses its steps in place (the `V expands` hint is
-  left off a line it would wrap), and they start expanded once the check is
-  due. A step shows the first line of its prompt.
-- **Tails.** `before release` for a step set with `--before-release`, `by
-  <who>` for a setter that is neither the row's own agent nor you,
-  `delivery not confirmed` for a wake sent without proof it arrived, `delivering` once
-  the conditions held, `held: automations paused` while a pause holds the
-  delivery, and the reason a condition cannot be read. A due step ends with
-  the command that closes it, dim: `wt done <id>` (a pointer: the command also
-  takes `-m`). It is never wrapped; a line with no room for it leaves it out.
+  dim hollow dot while it waits. That an item is due is its mark and the
+  color of its "when", never a word.
+- **When.** As few words as place it, in a column as wide as the row's
+  longest (22 cells at most, a longer one is cut with an ellipsis). A check,
+  or a step waiting for the row's own stage, is the stage: `staging`,
+  `production`, with a delay `production +7d`. A condition on another pull
+  request or commit is `#3889 production`, `#3889 merged`, `be228d9
+  production`; on another worktree `<slug> merged` with a long slug cut; on a
+  release `production release`; on a probe `check <id>`. A time is `22:32`
+  today, `Fri 18:12` within six days, `Dec 2 09:24` beyond. Several
+  conditions are joined with `&`. A due step reads `since 19:34` and the gate
+  `before merge`.
+- **What.** One line: what a check proves (the first line of its text, or
+  its first step when it is only steps), the first line of a step's prompt,
+  the gate's text. It is cut with an ellipsis to leave the detail its room.
+  The gate's text is never cut; what clears it is a dim line of its own
+  under it, `clears when ○ #3806 in production` (`clears at 17:00` for a
+  time, `, then wakes the session` with a `--then`), or `a person clears
+  it`.
+- **Detail.** One thing, dim, right-aligned to the pane, the first of:
+  `overdue` (red), `awaiting deploy` while a check's stage does not run the
+  landing yet, `wt done <id>` for a due step (a pointer: the command also
+  takes `-m`), a countdown for anything whose time is known (`in 6d`, `in 1d
+  21h`, `in 40m`: a time, a check put off, a delay that is already running),
+  and `N steps` for a check.
+- **Tails.** Short dim words after the description: `before release` for a
+  step set with `--before-release`, `by <who>` for a setter that is neither
+  the row's own agent nor you, `delivery not confirmed` for a wake sent
+  without proof it arrived, `delivering` once the conditions held, `held:
+  automations paused` while a pause holds the delivery, and the reason a
+  condition cannot be read.
+- **Steps.** `V` shows or hides the steps of every check the row owes at
+  once, each list under its check from the description's column, and an open
+  check says all of what it proves. They start hidden, also when a check is
+  due. The dim `V shows steps` / `V hides steps` line follows the list while
+  a check has steps.
+
+A pane too narrow for all three columns gives up the tails first, then the
+detail, and then wraps the description under itself, to two lines. Narrower
+still, the "when" takes a line of its own and the rest starts under the
+header's text.
 
 The pane lists eight items and counts the rest as `+N more (wt owed)`. Times
-are in this machine's clock (`09:00 tomorrow`, `Mon 30 Nov 09:00`), and the
-countdown is refreshed at least every 30 seconds while anything waits.
+are in this machine's clock, and countdowns are refreshed at least every 30
+seconds while anything waits.
 
 Once the row's own work has landed, the header reads from the list instead of
-the asserted state: `● due` for one thing due, `● due · 1 waiting` when more
-waits behind it, `● 2 due · 1 waiting` for several (the lines below say what), `◷ waiting
-for staging · 2 owed` (or `for production`, `until 17:00`, `for <conditions>`),
-or `✓ done`, followed by risk and age as before. A landed row that owes
-nothing shows a single dim `owes nothing`; an unlanded row with nothing owed
-shows no block.
+the asserted state, and says nothing else: `● due` for one thing due, `● due
+· 1 waiting` when more waits behind it, `● 2 due · 1 waiting` for several
+(the lines below say what), `◷ waiting for staging · 2 owed` (or `waiting for
+production`, `scheduled`, `waiting on other work`, as the
+[derived blocks](owed.md#derived-blocks) name them), or `✓ done`. The claim's
+risk and age are not repeated: they were about a merge that has happened. A
+state that still asks for someone follows the phase (`· working`, `·
+review`, `· needs-human`). A row with nothing owed lists nothing.
 
 In the list, the first slot of the badge cluster (`watch` in
 `[ui].hidden_badges`) carries one mark for what the row owes: a filled dot
@@ -332,7 +362,7 @@ after the owes mark: teal while it waits, yellow when a condition cannot be
 read right now (a probe that fails, a pull request GitHub will not show),
 since that watch may never fire, and green once everything it waited for held
 and wt is telling you. In the details pane each is
-one dim line after the `owes` block: `tells you when ○ merged`, `tells you at
+one dim line after the owed list, its bell in the first column: `tells you when ○ merged`, `tells you at
 17:00 (in 2h10m) · time to cut the release · by manager`, with `delivering`
 or `held: automations paused` as above. The pane lists six and counts the
 rest as `+N more (wt watch)`.
@@ -502,7 +532,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
-| `V` | Show or hide the steps of the checks this row owes (open by default when a check is due) |
+| `V` | Show or hide the steps of every check this row owes (hidden until asked, also when a check is due) |
 | `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
 | `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |

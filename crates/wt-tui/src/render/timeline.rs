@@ -1960,6 +1960,7 @@ mod tests {
         let stamp = |day: &str, clock: &str| LocalStamp {
             day: day.into(),
             clock: clock.into(),
+            ..Default::default()
         };
         let mut times: BTreeMap<u64, LocalStamp> = [
             (NOW - 2 * DAY, stamp("Sat 21 Nov", "09:05")),
@@ -2088,6 +2089,7 @@ mod tests {
                         days => format!("{days} Nov"),
                     },
                     clock: format!("{:02}:{:02}", minutes / 60, minutes % 60),
+                    ..Default::default()
                 };
                 (event.at_ms, stamp)
             })

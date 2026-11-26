@@ -221,6 +221,11 @@ pub struct OwedItem {
     pub unconfirmed: bool,
     /// When a step came due.
     pub due_at_ms: Option<i64>,
+    /// When a waiting item comes due, where that is a known instant: a
+    /// time, a check put off on a stage that has the change, or conditions
+    /// that all hold and are waiting out a delay.
+    #[serde(default)]
+    pub next_at_ms: Option<i64>,
 }
 
 impl OwedItem {
@@ -272,6 +277,25 @@ impl OwedItem {
                 Some(at) => format!("due since {}", watch::describe_instant(at, clock)),
                 None => "due".into(),
             },
+        }
+    }
+
+    /// The stage whose deploy the item still waits for: a check's stage
+    /// until the change is running there, or a stage one of its conditions
+    /// names that has not been reached.
+    pub fn awaits_stage(&self) -> Option<VerifyStage> {
+        if self.state == OwedState::Due {
+            return None;
+        }
+        match &self.when {
+            OwedWhen::Stage { stage, .. } => self.next_at_ms.is_none().then_some(*stage),
+            OwedWhen::Conditions { when } => {
+                // Staging comes first: a change reaches it first.
+                when.iter()
+                    .filter_map(WatchCondition::awaits_stage)
+                    .min_by_key(|stage| *stage == VerifyStage::Production)
+            }
+            OwedWhen::Person | OwedWhen::Held { .. } => None,
         }
     }
 
@@ -348,6 +372,7 @@ pub fn owed_items(
         awaiting_deploy: false,
         unconfirmed: false,
         due_at_ms: None,
+        next_at_ms: None,
     };
     let mut items = Vec::new();
     // Each waiting item with what it sorts by: what it waits for, then when.
@@ -381,6 +406,7 @@ pub fn owed_items(
             .filter(|_| standing.deferred && landing.base && landing.reached(standing.stage))
         {
             // Its stage has the change: only the time holds it back.
+            owed.next_at_ms = Some(at);
             waiting.push(((3, at), owed));
         } else {
             waiting.push(((stage_rank(owed.stage), 0), owed));
@@ -428,6 +454,7 @@ pub fn owed_items(
             },
         );
         owed.id = watch.map(|watch| watch.id.clone());
+        owed.next_at_ms = watch.and_then(|watch| known_at_ms(&watch.when));
         items.push(owed);
     }
     for watch in watches {
@@ -451,6 +478,7 @@ pub fn owed_items(
         owed.stage = own_stage(watch);
         owed.by = Some(watch.by.clone());
         owed.before_release = watch.before_release();
+        owed.next_at_ms = known_at_ms(&watch.when);
         let times = watch.when.iter().map(|cond| match cond.cond {
             Condition::At { at_ms } => Some(at_ms),
             _ => None,
@@ -464,6 +492,98 @@ pub fn owed_items(
     waiting.sort_by_key(|(rank, _)| *rank);
     items.extend(waiting.into_iter().map(|(_, owed)| owed));
     items
+}
+
+/// When conditions that must all hold will, where every one of them names
+/// a known instant.
+fn known_at_ms(when: &[WatchCondition]) -> Option<i64> {
+    when.iter()
+        .map(WatchCondition::known_at_ms)
+        .collect::<Option<Vec<i64>>>()?
+        .into_iter()
+        .max()
+}
+
+/// What an open item is waiting on, and the block a landed row is shown in
+/// under `[ui] owed_sections`. The board's blocks and the headings of
+/// `wt owed --all` both come from here. Ordered most urgent first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwedBlock {
+    Due,
+    WaitingStaging,
+    WaitingProduction,
+    /// Comes due at a known time.
+    Scheduled,
+    /// Waits for something else: another change merging, a probe, a person.
+    WaitingOther,
+    Done,
+}
+
+impl OwedBlock {
+    pub const ALL: [Self; 6] = [
+        Self::Due,
+        Self::WaitingStaging,
+        Self::WaitingProduction,
+        Self::Scheduled,
+        Self::WaitingOther,
+        Self::Done,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Due => "\0owed:due",
+            Self::WaitingStaging => "\0owed:staging",
+            Self::WaitingProduction => "\0owed:production",
+            Self::Scheduled => "\0owed:scheduled",
+            Self::WaitingOther => "\0owed:other",
+            Self::Done => "\0owed:done",
+        }
+    }
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Due => "Due",
+            Self::WaitingStaging => "Waiting for staging",
+            Self::WaitingProduction => "Waiting for production",
+            Self::Scheduled => "Scheduled",
+            Self::WaitingOther => "Waiting on other work",
+            Self::Done => "Done",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|block| block.key() == key)
+    }
+
+    /// What one open item is waiting on. A deploy that has not happened
+    /// comes before a known time: the time may be all that is left after
+    /// it, or run from it.
+    pub fn of_item(item: &OwedItem) -> Self {
+        if item.state == OwedState::Due {
+            return Self::Due;
+        }
+        match item.awaits_stage() {
+            Some(VerifyStage::Staging) => Self::WaitingStaging,
+            Some(VerifyStage::Production) => Self::WaitingProduction,
+            None if item.next_at_ms.is_some() => Self::Scheduled,
+            None => Self::WaitingOther,
+        }
+    }
+
+    /// Where a landed row in `phase` belongs: under the most urgent thing
+    /// any of its open items waits on.
+    pub fn of_row(phase: OwedPhase, items: &[OwedItem]) -> Self {
+        match phase {
+            OwedPhase::Due => Self::Due,
+            OwedPhase::Done => Self::Done,
+            OwedPhase::Waiting => items
+                .iter()
+                .map(Self::of_item)
+                .min()
+                .unwrap_or(Self::WaitingOther),
+        }
+    }
 }
 
 /// Where a row stands with what it owes. `None` while its own work has not

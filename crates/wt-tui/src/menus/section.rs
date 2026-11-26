@@ -309,7 +309,11 @@ mod tests {
             sections: vec![
                 section("Batch", "Batch", vec![0]),
                 section("Busy", "Busy", vec![3]),
-                section(crate::OwedBlock::Waiting.key(), "Waiting", vec![2]),
+                section(
+                    crate::OwedBlock::WaitingOther.key(),
+                    "Waiting on other work",
+                    vec![2],
+                ),
                 section(crate::OwedBlock::Done.key(), "Done", vec![1]),
             ],
             section_order: vec!["Batch".into(), "Busy".into()],
@@ -327,7 +331,7 @@ mod tests {
                 "Its 3 worktrees move to the Inbox:",
                 "  open",
                 "also filed here, shown under Done: landed",
-                "also filed here, shown under Waiting: waiting",
+                "also filed here, shown under Waiting on other work: waiting",
             ]
         );
         assert_eq!(

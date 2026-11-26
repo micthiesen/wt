@@ -23,8 +23,8 @@ pub use harness::HarnessId;
 pub use merge_arm::*;
 pub use merge_edges::*;
 pub use owed::{
-    OWED_HAZARD, OWED_PER_SLUG_MAX, OwedItem, OwedKind, OwedPhase, OwedRecord, OwedState, OwedWhen,
-    OwnerLanding, owed_hazards, owed_items, owed_phase, owes_anything,
+    OWED_HAZARD, OWED_PER_SLUG_MAX, OwedBlock, OwedItem, OwedKind, OwedPhase, OwedRecord,
+    OwedState, OwedWhen, OwnerLanding, owed_hazards, owed_items, owed_phase, owes_anything,
 };
 pub use stack_layout::*;
 pub use stage::stage_name;

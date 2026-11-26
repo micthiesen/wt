@@ -59,7 +59,21 @@ fn owed_block(board: &Board, row: &BoardRow) -> Option<OwedBlock> {
     {
         return None;
     }
-    row.owed_phase.map(|phase| OwedBlock::of(phase, &row.owes))
+    row.owed_block
+}
+
+/// What orders rows inside a derived block: the soonest known time under
+/// Scheduled, the oldest due step under Due. Elsewhere, and for a row with
+/// no such time, nothing.
+fn block_order(block: Option<OwedBlock>, row: &BoardRow) -> u64 {
+    let soonest = |times: &mut dyn Iterator<Item = u64>| times.min().unwrap_or(u64::MAX);
+    match block {
+        Some(OwedBlock::Scheduled) => {
+            soonest(&mut row.owes.iter().filter_map(|item| item.next_at_ms))
+        }
+        Some(OwedBlock::Due) => soonest(&mut row.owes.iter().filter_map(|item| item.due_at_ms)),
+        _ => 0,
+    }
 }
 
 /// Lay the board out from the stored placement. With
@@ -219,6 +233,10 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         // as in the TS sorter, so tied units stay contiguous.
         let identity = node_of(anchor).map_or(slug, |entry| entry.node.stack_id.as_str());
         (
+            block_order(
+                OwedBlock::from_key(&section_keys[index]),
+                &board.rows[index],
+            ),
             status,
             order,
             identity,
@@ -230,9 +248,10 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             let a = unit(a);
             let b = unit(b);
             a.0.cmp(&b.0)
-                .then_with(|| a.1.total_cmp(&b.1))
-                .then_with(|| a.2.cmp(b.2))
-                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.total_cmp(&b.2))
+                .then_with(|| a.3.cmp(b.3))
+                .then_with(|| a.4.cmp(&b.4))
         });
         // Apply a creation anchor to whole stack units. A child cannot be
         // emitted before a root that has moved below its own anchor.
@@ -572,6 +591,22 @@ mod tests {
             item.stage = stage;
             row.owes = vec![item];
         }
+        // As the owed overlay files it.
+        row.owed_block = Some(match (phase, stage) {
+            (wt_core::OwedPhase::Due, _) => OwedBlock::Due,
+            (wt_core::OwedPhase::Done, _) => OwedBlock::Done,
+            (_, Some(wt_core::VerifyStage::Staging)) => OwedBlock::WaitingStaging,
+            (_, Some(wt_core::VerifyStage::Production)) => OwedBlock::WaitingProduction,
+            (_, None) => OwedBlock::WaitingOther,
+        });
+        row
+    }
+
+    /// A landed row under Scheduled whose next item comes due at `at_ms`.
+    fn scheduled(slug: &str, at_ms: u64) -> BoardRow {
+        let mut row = owing(slug, wt_core::OwedPhase::Waiting, None);
+        row.owes[0].next_at_ms = Some(at_ms);
+        row.owed_block = Some(OwedBlock::Scheduled);
         row
     }
 
@@ -624,6 +659,8 @@ mod tests {
                     Some(VerifyStage::Staging),
                 ),
                 owing("due", OwedPhase::Due, Some(VerifyStage::Staging)),
+                scheduled("later", 2_000),
+                scheduled("sooner", 1_000),
                 archived,
                 remote,
                 removing,
@@ -668,6 +705,8 @@ mod tests {
                     "Inbox",
                     &[
                         "@remote/builder/remote",
+                        "later",
+                        "sooner",
                         "unprepared",
                         "wait-other",
                         "wait-prod"
@@ -693,7 +732,9 @@ mod tests {
                 ("Due", &["due"]),
                 ("Waiting for staging", &["wait-staging"]),
                 ("Waiting for production", &["wait-prod"]),
-                ("Waiting", &["wait-other"]),
+                // Soonest first, whatever order the rows hold.
+                ("Scheduled", &["sooner", "later"]),
+                ("Waiting on other work", &["wait-other"]),
                 ("Done", &["done"]),
                 ("Removing", &["removing"]),
                 ("Archived", &["archived"]),
@@ -737,6 +778,36 @@ mod tests {
                 ("Done", &["done"]),
             ])
         );
+    }
+
+    #[test]
+    fn due_rows_are_drawn_oldest_first() {
+        let due = |slug: &str, at_ms: Option<u64>| {
+            let mut row = owing(slug, wt_core::OwedPhase::Due, None);
+            row.owes[0].due_at_ms = at_ms;
+            row
+        };
+        let mut board = Board {
+            // A due check has no time of its own: it follows the steps.
+            rows: vec![
+                due("check", None),
+                due("newer", Some(2_000)),
+                due("older", Some(1_000)),
+            ],
+            ..Board::default()
+        };
+        board.display.owed_sections = true;
+        prepare(&mut board, &json!({}), "main", UiSort::Manual);
+        let drawn: Vec<&str> = board
+            .sections
+            .iter()
+            .find(|section| section.key == OwedBlock::Due.key())
+            .unwrap()
+            .rows
+            .iter()
+            .map(|&index| board.rows[index].key.as_str())
+            .collect();
+        assert_eq!(drawn, ["older", "newer", "check"]);
     }
 
     #[test]
@@ -787,6 +858,7 @@ mod tests {
         // Grouped by what it owes, only the landed head leaves the section.
         board.display.owed_sections = true;
         board.rows[2].owed_phase = Some(wt_core::OwedPhase::Done);
+        board.rows[2].owed_block = Some(wt_tui::OwedBlock::Done);
         prepare(&mut board, &state, "main", UiSort::Manual);
         assert_eq!(
             section_rows(&board, "Batch"),

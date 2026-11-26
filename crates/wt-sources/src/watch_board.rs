@@ -133,6 +133,9 @@ fn attach(
             clock.now_ms,
         );
         row.owed_phase = wt_core::owed_phase(&items, landing.base);
+        row.owed_block = row
+            .owed_phase
+            .map(|phase| wt_core::OwedBlock::of_row(phase, &items));
         // Something due is something to do now, whichever kind it is. A due
         // check already shows as needs-testing; a step that came due has no
         // state of its own to show it.
@@ -267,7 +270,7 @@ pub(crate) fn owed_view(
         due_at_ms: item.due_at_ms.and_then(|at_ms| u64::try_from(at_ms).ok()),
         due_at: item
             .due_at_ms
-            .map(|at_ms| sanitize_terminal_text(&wt_core::watch::describe_instant(at_ms, clock))),
+            .map(|at_ms| sanitize_terminal_text(&wt_core::watch::terse_instant(at_ms, clock))),
         not_before_in: match item.when {
             OwedWhen::Stage {
                 not_before_ms: Some(at_ms),
@@ -283,6 +286,11 @@ pub(crate) fn owed_view(
         met: watch.is_some_and(Watch::is_met),
         held: paused,
         wakes: item.kind == OwedKind::Gate && watch.is_some_and(Watch::wakes_owner),
+        next_at_ms: item.next_at_ms.and_then(|at_ms| u64::try_from(at_ms).ok()),
+        due_in: item
+            .next_at_ms
+            .filter(|at_ms| *at_ms > clock.now_ms)
+            .map(|at_ms| wt_core::watch::countdown(at_ms - clock.now_ms)),
     }
 }
 
@@ -303,6 +311,7 @@ fn condition(
     let at_ms = instant(&cond.cond);
     WatchConditionView {
         key: sanitize_terminal_text(&cond.cond.to_string()),
+        label: sanitize_terminal_text(&cond.label(clock)),
         text: sanitize_terminal_text(&cond.describe(clock)),
         state,
         reason: reason.map(|reason| sanitize_terminal_text(&reason)),
@@ -531,6 +540,74 @@ mod tests {
                 .iter()
                 .any(|item| item.id.as_deref() == Some("tell44"))
         );
+    }
+
+    #[test]
+    fn a_landed_row_is_filed_by_what_it_waits_for_with_a_label_and_a_countdown() {
+        use wt_core::OwedBlock;
+        const DAY_MS: i64 = 86_400_000;
+        // Production has had the change for a day: the delay is running.
+        let mut running = watch(
+            "run22",
+            "one",
+            "one",
+            &["production+7d"],
+            wake("Retire it."),
+        );
+        running.when[0].first_held_at_ms = Some(NOON - DAY_MS);
+        let timed = watch("time22", "one", "one", &["+130m"], wake("Run it."));
+        let pull = watch(
+            "pull22",
+            "two",
+            "two",
+            &["pr:3889:production"],
+            wake("Drop the shim."),
+        );
+        let rows = vec![
+            landed("one", wt_tui::LandingKind::Base),
+            landed("two", wt_tui::LandingKind::Base),
+        ];
+        let (board, _) = prepared(rows, &[running, timed, pull], None);
+        let [one, two] = board.rows.as_slice() else {
+            panic!("{:?}", board.rows)
+        };
+        assert_eq!(one.owed_block, Some(OwedBlock::Scheduled));
+        let shown: Vec<_> = one
+            .owes
+            .iter()
+            .map(|item| {
+                (
+                    item.conditions[0].label.as_str(),
+                    item.due_in.as_deref(),
+                    item.next_at_ms,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                (
+                    "production +7d",
+                    Some("6d"),
+                    u64::try_from(NOON + 6 * DAY_MS).ok()
+                ),
+                (
+                    "14:10",
+                    Some("2h 10m"),
+                    u64::try_from(NOON + 130 * 60_000).ok()
+                ),
+            ]
+        );
+        // Another pull request's deploy is a deploy to wait for.
+        assert_eq!(two.owed_block, Some(OwedBlock::WaitingProduction));
+        assert_eq!(two.owes[0].conditions[0].label, "#3889 production");
+        assert_eq!(
+            (two.owes[0].due_in.as_deref(), two.owes[0].next_at_ms),
+            (None, None)
+        );
+        // Unlanded rows are not filed.
+        let (board, _) = prepared(vec![row("one")], &[], None);
+        assert_eq!(board.rows[0].owed_block, None);
     }
 
     #[test]

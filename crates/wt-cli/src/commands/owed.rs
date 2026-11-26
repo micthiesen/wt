@@ -466,25 +466,6 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
     Ok(0)
 }
 
-/// The group an item is listed under in the fleet view.
-fn group(item: &OwedItem) -> usize {
-    match (item.state, item.before_release, item.stage) {
-        (OwedState::Due, ..) => 0,
-        (_, true, _) => 1,
-        (_, _, Some(VerifyStage::Staging)) => 2,
-        (_, _, Some(VerifyStage::Production)) => 3,
-        _ => 4,
-    }
-}
-
-const GROUPS: [&str; 5] = [
-    "Due now",
-    "Before the next production release",
-    "Waiting for staging",
-    "Waiting for production",
-    "Waiting",
-];
-
 fn fleet_text(fleet: &[(String, &str, RowOwed)], clock: LocalClock) -> String {
     let width = fleet
         .iter()
@@ -493,13 +474,15 @@ fn fleet_text(fleet: &[(String, &str, RowOwed)], clock: LocalClock) -> String {
         .max()
         .unwrap_or(0);
     let mut sections = Vec::new();
-    for (index, title) in GROUPS.iter().enumerate() {
+    // The board's blocks, by the same reading of each item.
+    for block in wt_core::OwedBlock::ALL {
+        let title = block.title();
         let lines = fleet
             .iter()
             .flat_map(|(slug, kind, owed)| {
                 owed.items
                     .iter()
-                    .filter(move |item| group(item) == index)
+                    .filter(move |item| wt_core::OwedBlock::of_item(item) == block)
                     .map(move |item| {
                         let line = item_line_from(item, slug, clock, true, *kind == "removed");
                         format!("  {slug:<width$}  {line}")
@@ -1527,7 +1510,10 @@ mod tests {
             .lines()
             .filter(|line| !line.starts_with(' ') && !line.is_empty())
             .collect::<Vec<_>>();
-        assert_eq!(titles, ["Due now", "Waiting for production", "Waiting"]);
+        assert_eq!(
+            titles,
+            ["Due", "Waiting for production", "Waiting on other work"]
+        );
         assert!(grouped.contains(&format!(" · wt done {step} --slug one -m \"<evidence>\"")));
         assert_eq!(
             run_owed(

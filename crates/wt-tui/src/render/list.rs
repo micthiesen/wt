@@ -328,6 +328,11 @@ impl RowContext<'_> {
         let budget = self
             .width
             .saturating_sub(2 + self.gutter + 3 + remote_cells + cluster_width);
+        // Shown where the title keeps its room, or is short enough not to
+        // need it.
+        let due_at = scheduled_time(row, self.model)
+            .filter(|time| budget > MIN_LABEL_CELLS.min(row_label(row).width()) + time.width());
+        let budget = budget.saturating_sub(due_at.as_ref().map_or(0, |time| time.width() + 1));
         let reference_room =
             SECTION_REF_CELLS.min(budget.saturating_sub(MIN_LABEL_CELLS + REF_ARROW.width() + 1));
         let reference = row
@@ -385,6 +390,9 @@ impl RowContext<'_> {
             spans.push(Span::styled(reference, style(theme::FG_DIM)));
         }
         spans.push(Span::styled(" ".repeat(filler), style(theme::FG)));
+        if let Some(time) = due_at {
+            spans.push(Span::styled(format!(" {time}"), style(theme::FG_DIM)));
+        }
         if let Some((glyph, color)) = pending {
             spans.push(Span::styled(format!(" {glyph} "), style(color)));
         }
@@ -407,6 +415,24 @@ impl RowContext<'_> {
             item,
         }
     }
+}
+
+/// When the next thing a row under the Scheduled block owes comes due, in
+/// the controller's clock: `22:32`, `Fri 18:12`.
+fn scheduled_time(row: &BoardRow, model: &Model) -> Option<String> {
+    let board = &model.board;
+    if !board.display.owed_sections
+        || row.archived
+        || row.owed_block != Some(crate::OwedBlock::Scheduled)
+    {
+        return None;
+    }
+    let at_ms = row.owes.iter().filter_map(|item| item.next_at_ms).min()?;
+    board
+        .history_times
+        .get(&at_ms)
+        .map(|stamp| stamp.terse.clone())
+        .filter(|terse| !terse.is_empty())
 }
 
 /// The row's title exactly as named. Issue identity, removal progress and
@@ -1065,6 +1091,43 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(row_label(&plain), "Fix");
+    }
+
+    #[test]
+    fn a_scheduled_row_shows_when_its_next_item_comes_due() {
+        let mut item =
+            crate::OwedView::new(wt_core::OwedKind::Step, wt_core::OwedState::Waiting, "x");
+        item.next_at_ms = Some(2_000);
+        let mut later = item.clone();
+        later.next_at_ms = Some(9_000);
+        let row = BoardRow {
+            owes: vec![later, item],
+            owed_block: Some(crate::OwedBlock::Scheduled),
+            ..Default::default()
+        };
+        let mut board = crate::Board::default();
+        board.display.owed_sections = true;
+        board.history_times.insert(
+            2_000,
+            crate::LocalStamp {
+                terse: "Fri 18:12".into(),
+                ..Default::default()
+            },
+        );
+        let model = |board: &crate::Board| Model {
+            board: std::sync::Arc::new(board.clone()),
+            ..Model::default()
+        };
+        assert_eq!(
+            scheduled_time(&row, &model(&board)).as_deref(),
+            Some("Fri 18:12")
+        );
+        // Only under the Scheduled block, and only while blocks are drawn.
+        let mut other = row.clone();
+        other.owed_block = Some(crate::OwedBlock::WaitingProduction);
+        assert_eq!(scheduled_time(&other, &model(&board)), None);
+        board.display.owed_sections = false;
+        assert_eq!(scheduled_time(&row, &model(&board)), None);
     }
 
     #[test]

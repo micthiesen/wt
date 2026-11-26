@@ -315,6 +315,10 @@ pub struct WatchConditionView {
     pub at_ms: Option<u64>,
     /// How long until a time condition comes due, such as `2h10m`.
     pub due_in: Option<String>,
+    /// The condition in the fewest words that name it (`production +7d`,
+    /// `#3889 merged`), with a time in the host's local clock. Empty from
+    /// a host that does not prepare it.
+    pub label: String,
 }
 
 /// One thing a worktree owes, prepared by the host that stores it from
@@ -374,6 +378,13 @@ pub struct OwedView {
     /// Its watch also wakes the row's session: a gate set with `--then`.
     #[serde(default)]
     pub wakes: bool,
+    /// When a waiting item comes due, where that is a known instant, UTC
+    /// epoch milliseconds: a time, a check put off, a delay that is running.
+    #[serde(default)]
+    pub next_at_ms: Option<u64>,
+    /// How long until then while it lies ahead, such as `1d 21h`.
+    #[serde(default)]
+    pub due_in: Option<String>,
 }
 
 impl OwedView {
@@ -403,6 +414,8 @@ impl OwedView {
             met: false,
             held: false,
             wakes: false,
+            next_at_ms: None,
+            due_in: None,
         }
     }
 
@@ -439,67 +452,7 @@ pub fn owed_block_refusal(title: &str) -> String {
     )
 }
 
-/// The derived block a landed row is shown in under `[ui] owed_sections`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum OwedBlock {
-    Due,
-    WaitingStaging,
-    WaitingProduction,
-    Waiting,
-    Done,
-}
-
-impl OwedBlock {
-    pub const ALL: [Self; 5] = [
-        Self::Due,
-        Self::WaitingStaging,
-        Self::WaitingProduction,
-        Self::Waiting,
-        Self::Done,
-    ];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Due => "\0owed:due",
-            Self::WaitingStaging => "\0owed:staging",
-            Self::WaitingProduction => "\0owed:production",
-            Self::Waiting => "\0owed:waiting",
-            Self::Done => "\0owed:done",
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Due => "Due",
-            Self::WaitingStaging => "Waiting for staging",
-            Self::WaitingProduction => "Waiting for production",
-            Self::Waiting => "Waiting",
-            Self::Done => "Done",
-        }
-    }
-
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|block| block.key() == key)
-    }
-
-    /// Where a landed row with this phase and list belongs. A waiting row is
-    /// filed by the first thing removal would lose.
-    pub fn of(phase: wt_core::OwedPhase, owes: &[OwedView]) -> Self {
-        let first = owes.iter().find(|item| item.holds_cleanup());
-        Self::placed(phase, first.and_then(|item| item.stage))
-    }
-
-    /// [`Self::of`] from the stage of the first thing removal would lose.
-    pub fn placed(phase: wt_core::OwedPhase, first_stage: Option<wt_core::VerifyStage>) -> Self {
-        match (phase, first_stage) {
-            (wt_core::OwedPhase::Due, _) => Self::Due,
-            (wt_core::OwedPhase::Done, _) => Self::Done,
-            (_, Some(wt_core::VerifyStage::Staging)) => Self::WaitingStaging,
-            (_, Some(wt_core::VerifyStage::Production)) => Self::WaitingProduction,
-            (_, None) => Self::Waiting,
-        }
-    }
-}
+pub use wt_core::OwedBlock;
 
 /// A condition's truth as the engine last recorded it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -521,6 +474,9 @@ pub struct LocalStamp {
     pub day: String,
     /// The clock time, `14:32`.
     pub clock: String,
+    /// The fewest words that place it: `14:32` today, `Fri 18:12` within
+    /// six days either way, else `Dec 2 09:24`.
+    pub terse: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1280,6 +1236,10 @@ pub struct BoardRow {
     /// work has landed.
     #[serde(default)]
     pub owed_phase: Option<wt_core::OwedPhase>,
+    /// What a landed row is waiting on, as `wt_core::OwedBlock::of_row`
+    /// reads its list: the block `[ui] owed_sections` shows it in.
+    #[serde(default)]
+    pub owed_block: Option<OwedBlock>,
     /// The stored creation stamp of this worktree. A later worktree with the
     /// same slug has another, so a menu commit carries it as its witness.
     #[serde(default)]

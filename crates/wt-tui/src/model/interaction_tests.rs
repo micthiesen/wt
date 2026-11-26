@@ -556,14 +556,14 @@ fn a_row_wt_regroups_by_what_it_owes_keeps_the_cursor() {
     let mut first = board(&["a", "b", "c"]);
     first.sections = vec![
         section("One", vec![0, 1], false),
-        owed_section(OwedBlock::Waiting, vec![2], false),
+        owed_section(OwedBlock::WaitingOther, vec![2], false),
     ];
     model.apply(ready(first.clone()));
     // It lands: nobody filed it, so the cursor goes with it.
     model.select(model.row_position("a").unwrap());
     first.sections = vec![
         section("One", vec![1], false),
-        owed_section(OwedBlock::Waiting, vec![0, 2], false),
+        owed_section(OwedBlock::WaitingOther, vec![0, 2], false),
     ];
     model.apply(ready(first.clone()));
     assert_eq!(model.selected_row().unwrap().key, "a");
@@ -571,7 +571,7 @@ fn a_row_wt_regroups_by_what_it_owes_keeps_the_cursor() {
     first.sections = vec![
         section("One", vec![1], false),
         owed_section(OwedBlock::Due, vec![0], false),
-        owed_section(OwedBlock::Waiting, vec![2], false),
+        owed_section(OwedBlock::WaitingOther, vec![2], false),
     ];
     model.apply(ready(first.clone()));
     assert_eq!(model.selected_row().unwrap().key, "a");
@@ -579,7 +579,7 @@ fn a_row_wt_regroups_by_what_it_owes_keeps_the_cursor() {
     // Into a folded block, its header stands for the row.
     first.sections = vec![
         section("One", vec![1], false),
-        owed_section(OwedBlock::Waiting, vec![2], false),
+        owed_section(OwedBlock::WaitingOther, vec![2], false),
         owed_section(OwedBlock::Done, vec![0], true),
     ];
     model.apply(ready(first.clone()));
@@ -590,7 +590,7 @@ fn a_row_wt_regroups_by_what_it_owes_keeps_the_cursor() {
     first.sections = vec![
         section("One", vec![], false),
         section("Two", vec![1], false),
-        owed_section(OwedBlock::Waiting, vec![2], false),
+        owed_section(OwedBlock::WaitingOther, vec![2], false),
         owed_section(OwedBlock::Done, vec![0], true),
     ];
     model.apply(ready(first));
@@ -893,7 +893,7 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
     value.rows[0].owes = vec![crate::OwedView::new(
         wt_core::OwedKind::Check,
         wt_core::OwedState::Due,
-        "check prod",
+        "Prod serves it. STEPS: 1. check prod",
     )];
     value.rows[0].owed_phase = Some(wt_core::OwedPhase::Due);
     value.rows[0].work = Some(WorkPresentation {
@@ -907,9 +907,9 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
     });
     let mut model = Model::default();
     model.apply(ready(value));
-    assert!(model.show_verification, "owed steps start open");
+    assert!(!model.show_verification, "a due check starts closed too");
     ch(&mut model, 'V');
-    assert!(!model.show_verification);
+    assert!(model.show_verification);
     ch(&mut model, 'j');
     assert!(!model.show_verification);
     assert_eq!(ch(&mut model, 'V'), InputResult::Draw);
@@ -918,7 +918,8 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
         Some("no verify-after-merge steps on this row")
     );
     ch(&mut model, 'k');
-    assert!(model.show_verification, "returning resets to the default");
+    assert!(!model.show_verification, "returning resets to closed");
+    ch(&mut model, 'V');
     let rendered = crate::render::details::work_status_lines(
         model.selected_row().unwrap(),
         model.show_verification,
@@ -932,7 +933,7 @@ fn verification_steps_are_per_row_and_toast_when_absent() {
     })
     .collect::<Vec<_>>()
     .join("\n");
-    assert!(rendered.contains("V collapses"), "{rendered}");
+    assert!(rendered.contains("V hides steps"), "{rendered}");
 }
 
 #[test]

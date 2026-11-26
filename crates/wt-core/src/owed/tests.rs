@@ -3,7 +3,7 @@ use serde_json::json;
 use super::*;
 use crate::{
     Check, StageDeploys, WorkState,
-    watch::{WatchActions, parse},
+    watch::{Delay, WatchActions, parse},
 };
 
 /// 2026-11-24 12:00:00 UTC.
@@ -364,4 +364,168 @@ fn a_due_step_keeps_what_its_wake_said_and_keys_it_does_not_know() {
     assert_eq!(row_due(&rows, "one", Some(BORN)).len(), 2);
     assert!(row_due(&rows, "one", Some("2026-11-20T00:00:00Z")).is_empty());
     assert!(row_due(&rows, "two", Some(BORN)).is_empty());
+}
+
+#[test]
+fn an_item_and_a_landed_row_are_filed_by_what_they_wait_for() {
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    let record = ready()
+        .with_check(VerifyStage::Staging, "open the page")
+        .with_check(VerifyStage::Production, "watch the logs");
+    // Its stage holds, so its delay is running: a known time.
+    let mut running = wake("run22", &["production+7d"], "retire the old path");
+    running.when[0].first_held_at_ms = Some(NOON - DAY_MS);
+    let mut commit = wake("comm22", &["merged"], "compare error rates");
+    commit.when = vec![WatchCondition::new(
+        Condition::Commit {
+            oid: "0123456789abcdef".into(),
+            stage: VerifyStage::Production,
+        },
+        Delay::parse("1h"),
+    )];
+    let watches = [
+        wake("time22", &["17:00"], "rerun the renewal check"),
+        running,
+        wake("prod22", &["production"], "retire the flag"),
+        wake("pull22", &["pr:3889:production"], "drop the shim"),
+        commit,
+        wake("rels22", &["release:staging"], "smoke the release"),
+        wake("mrge22", &["pr:12:merged"], "rebase"),
+        wake(
+            "wtre22",
+            &["wt:a-rather-long-worktree-slug:merged"],
+            "rebase again",
+        ),
+        wake("prob22", &["check:vault=X"], "rotate the key"),
+    ];
+    let due = [due_step("late22", "open the follow-up PR", NOON - HOUR_MS)];
+    let items = owed_items(Some(&record), &STAGED, &watches, &due, NOON);
+    let filed = |id: &str| {
+        let item = items
+            .iter()
+            .find(|item| item.id.as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("{id}"));
+        (OwedBlock::of_item(item), item.next_at_ms)
+    };
+    assert_eq!(OwedBlock::of_item(&items[0]), OwedBlock::Due);
+    assert_eq!(filed("late22"), (OwedBlock::Due, None));
+    // A deploy that has not happened: the row's own stage, another pull
+    // request's or commit's, the stage's next release.
+    let production_check = items
+        .iter()
+        .find(|item| item.kind == OwedKind::Check && item.state == OwedState::Waiting)
+        .unwrap();
+    assert_eq!(
+        OwedBlock::of_item(production_check),
+        OwedBlock::WaitingProduction
+    );
+    for id in ["prod22", "pull22", "comm22"] {
+        assert_eq!(filed(id), (OwedBlock::WaitingProduction, None), "{id}");
+    }
+    assert_eq!(filed("rels22"), (OwedBlock::WaitingStaging, None));
+    // A known time: a time, or a delay running on a condition that holds.
+    assert_eq!(
+        filed("time22"),
+        (OwedBlock::Scheduled, Some(NOON + 5 * HOUR_MS))
+    );
+    assert_eq!(
+        filed("run22"),
+        (OwedBlock::Scheduled, Some(NOON + 6 * DAY_MS))
+    );
+    for id in ["mrge22", "wtre22", "prob22"] {
+        assert_eq!(filed(id), (OwedBlock::WaitingOther, None), "{id}");
+    }
+    // A check put off on a stage that has the change is a known time too.
+    let mut put_off = ready();
+    put_off.set_check(VerifyStage::Staging, "open the page");
+    assert!(put_off.defer_check(VerifyStage::Staging, Some(NOON + HOUR_MS)));
+    let deferred = owed_items(Some(&put_off), &STAGED, &[], &[], NOON);
+    assert_eq!(OwedBlock::of_item(&deferred[0]), OwedBlock::Scheduled);
+    assert_eq!(deferred[0].next_at_ms, Some(NOON + HOUR_MS));
+    // A row is filed under the most urgent thing any open item waits on.
+    let row = |ids: &[&str]| {
+        let own: Vec<Watch> = watches
+            .iter()
+            .filter(|watch| ids.contains(&watch.id.as_str()))
+            .cloned()
+            .collect();
+        let items = owed_items(None, &STAGED, &own, &[], NOON);
+        OwedBlock::of_row(owed_phase(&items, true).unwrap(), &items)
+    };
+    assert_eq!(row(&[]), OwedBlock::Done);
+    assert_eq!(row(&["time22"]), OwedBlock::Scheduled);
+    assert_eq!(row(&["time22", "prob22"]), OwedBlock::Scheduled);
+    assert_eq!(row(&["time22", "pull22"]), OwedBlock::WaitingProduction);
+    assert_eq!(row(&["pull22", "rels22"]), OwedBlock::WaitingStaging);
+    assert_eq!(row(&["mrge22"]), OwedBlock::WaitingOther);
+    assert_eq!(OwedBlock::of_row(OwedPhase::Due, &items), OwedBlock::Due);
+    // Every block has its own key and reads back from it.
+    for block in OwedBlock::ALL {
+        assert_eq!(OwedBlock::from_key(block.key()), Some(block));
+        assert!(block.key().starts_with("\0owed:"));
+    }
+    assert_eq!(
+        OwedBlock::ALL.map(OwedBlock::title),
+        [
+            "Due",
+            "Waiting for staging",
+            "Waiting for production",
+            "Scheduled",
+            "Waiting on other work",
+            "Done"
+        ]
+    );
+    // The fewest words that name each condition.
+    let labels: Vec<String> = watches
+        .iter()
+        .map(|watch| watch.when[0].label(UTC))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "17:00",
+            "production +7d",
+            "production",
+            "#3889 production",
+            "0123456 production +1h",
+            "staging release",
+            "#12 merged",
+            "a-rather-lo… merged",
+            "check vault",
+        ]
+    );
+}
+
+#[test]
+fn an_instant_and_a_countdown_read_in_the_fewest_words() {
+    use crate::watch::{countdown, terse_instant};
+    const DAY_MS: i64 = 24 * HOUR_MS;
+    // NOON is a Tuesday.
+    for (at_ms, expected) in [
+        (NOON + 5 * HOUR_MS, "17:00"),
+        (NOON - 2 * HOUR_MS, "10:00"),
+        (NOON + 2 * DAY_MS + 6 * HOUR_MS + 12 * 60_000, "Thu 18:12"),
+        (NOON - DAY_MS, "Mon 12:00"),
+        (NOON + 6 * DAY_MS, "Mon 12:00"),
+        (NOON + 8 * DAY_MS - 3 * HOUR_MS + 24 * 60_000, "Dec 2 09:24"),
+    ] {
+        assert_eq!(terse_instant(at_ms, UTC), expected);
+    }
+    // The reader's day, not UTC's.
+    let tokyo = LocalClock {
+        now_ms: NOON,
+        utc_offset_minutes: 9 * 60,
+    };
+    assert_eq!(terse_instant(NOON + 4 * HOUR_MS, tokyo), "Wed 01:00");
+    for (ms, expected) in [
+        (6 * DAY_MS + 23 * HOUR_MS, "6d"),
+        (DAY_MS + 21 * HOUR_MS + 5 * 60_000, "1d 21h"),
+        (2 * DAY_MS, "2d"),
+        (2 * HOUR_MS + 5 * 60_000, "2h 5m"),
+        (3 * HOUR_MS, "3h"),
+        (40 * 60_000, "40m"),
+        (20_000, "under 1m"),
+    ] {
+        assert_eq!(countdown(ms), expected);
+    }
 }

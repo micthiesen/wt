@@ -162,6 +162,7 @@ fn history_timestamps(board: &Board) -> BTreeSet<u64> {
                 .iter()
                 .filter_map(|cond| cond.at_ms)
                 .chain(item.due_at_ms)
+                .chain(item.next_at_ms)
         });
     let mut timestamps: BTreeSet<u64> = board
         .row_history
@@ -187,7 +188,8 @@ fn local_day(timestamp_ms: u64) -> Option<i64> {
 }
 
 /// Day and clock labels for a worktree's history: `today`, `yesterday` or a
-/// date such as `Mon 23 Nov`, and `14:32`.
+/// date such as `Mon 23 Nov`, and `14:32`; and the terse label a narrow
+/// column takes, as `wt_core::watch::terse_instant` words it.
 fn history_stamps(timestamps: Vec<u64>, today: i64) -> BTreeMap<u64, wt_tui::LocalStamp> {
     timestamps
         .into_iter()
@@ -195,7 +197,14 @@ fn history_stamps(timestamps: Vec<u64>, today: i64) -> BTreeMap<u64, wt_tui::Loc
             let (year, month, day, hour, minute, _) = local_time_components(timestamp_ms)?;
             let month = time::Month::try_from(month).ok()?;
             let date = time::Date::from_calendar_date(year, month, day).ok()?;
-            let day = match today - i64::from(date.to_julian_day()) {
+            let ago = today - i64::from(date.to_julian_day());
+            let clock = format!("{hour:02}:{minute:02}");
+            let terse = match ago {
+                0 => clock.clone(),
+                -6..=6 => format!("{} {clock}", &date.weekday().to_string()[..3]),
+                _ => format!("{} {day} {clock}", &month.to_string()[..3]),
+            };
+            let day = match ago {
                 0 => "today".to_owned(),
                 1 => "yesterday".to_owned(),
                 // Only a time a row waits for lies ahead.
@@ -206,13 +215,7 @@ fn history_stamps(timestamps: Vec<u64>, today: i64) -> BTreeMap<u64, wt_tui::Loc
                     format!("{} {day} {}", &weekday[..3], &month[..3])
                 }
             };
-            Some((
-                timestamp_ms,
-                wt_tui::LocalStamp {
-                    day,
-                    clock: format!("{hour:02}:{minute:02}"),
-                },
-            ))
+            Some((timestamp_ms, wt_tui::LocalStamp { day, clock, terse }))
         })
         .collect()
 }
@@ -334,6 +337,16 @@ mod tests {
             history_stamps(vec![noon + DAY_MS], today)[&(noon + DAY_MS)].day,
             "tomorrow"
         );
+        // The terse label: the clock today, the weekday within six days,
+        // the date beyond.
+        assert_eq!(stamps[&noon].terse, "12:00");
+        let near = &stamps[&(noon - DAY_MS)].terse;
+        assert!(near.len() == 9 && near.ends_with(" 12:00"), "{near}");
+        let far = stamps[&(noon - 9 * DAY_MS)]
+            .terse
+            .split(' ')
+            .collect::<Vec<_>>();
+        assert_eq!((far[0], far[1], far[2]), (earlier[2], earlier[1], "12:00"));
     }
 
     #[test]
@@ -360,6 +373,7 @@ mod tests {
                         )
                     },
                     wt_tui::OwedView {
+                        next_at_ms: Some(1_860_000_000_000),
                         conditions: vec![wt_tui::WatchConditionView {
                             at_ms: Some(1_850_000_000_000),
                             ..Default::default()
@@ -391,7 +405,8 @@ mod tests {
                 1_700_000_000_000,
                 1_750_000_000_000,
                 1_800_000_000_000,
-                1_850_000_000_000
+                1_850_000_000_000,
+                1_860_000_000_000
             ]
         );
     }

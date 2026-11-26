@@ -272,7 +272,7 @@ fn compose(
                     watch.id = wt_core::sanitize_terminal_text(&watch.id);
                     watch.by = wt_core::sanitize_terminal_text(&watch.by);
                     for cond in &mut watch.conditions {
-                        for value in [&mut cond.key, &mut cond.text] {
+                        for value in [&mut cond.key, &mut cond.text, &mut cond.label] {
                             *value = wt_core::sanitize_terminal_text(value);
                         }
                         for value in [&mut cond.reason, &mut cond.due_in].into_iter().flatten() {
@@ -461,6 +461,7 @@ fn sanitize_owed(item: &mut wt_tui::OwedView) {
         &mut item.id,
         &mut item.due_at,
         &mut item.not_before_in,
+        &mut item.due_in,
         &mut item.by,
     ]
     .into_iter()
@@ -469,7 +470,7 @@ fn sanitize_owed(item: &mut wt_tui::OwedView) {
         *value = wt_core::sanitize_terminal_text(value);
     }
     for cond in &mut item.conditions {
-        for value in [&mut cond.key, &mut cond.text] {
+        for value in [&mut cond.key, &mut cond.text, &mut cond.label] {
             *value = wt_core::sanitize_terminal_text(value);
         }
         for value in [&mut cond.reason, &mut cond.due_in].into_iter().flatten() {
@@ -617,6 +618,7 @@ mod tests {
                 reason: Some("exited 2: \u{1b}[31mboom".into()),
                 at_ms: None,
                 due_in: None,
+                label: "check [31mprobe".into(),
             }],
             actions: vec![wt_tui::WatchActionKind::Wake],
             headline: Some("run \u{1b}[31mit".into()),

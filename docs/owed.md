@@ -122,8 +122,21 @@ pause, `stack.parent_merged` and `wt restack` keep reading the full chain.
 
 Sections are asserted by people and agents. With `[ui] owed_sections = true`
 (off by default) a landed, unarchived local row is instead shown under what
-it owes: **Due**, **Waiting for staging**, **Waiting for production**,
-**Waiting**, **Done**. A landed row's only remaining meaning is what it owes,
+it owes. One function, `wt_core::OwedBlock`, files both the board's rows and
+the items `wt owed --all` groups, so the two cannot disagree. A row is filed
+by its phase and, while it waits, by its open items, the first that applies:
+
+| block | the row is here when |
+|---|---|
+| **Due** | something is due |
+| **Waiting for staging** | an open item waits for a deploy to staging that has not happened: the row's own stage, another pull request's or commit's (`pr:N:staging`, `commit:<oid>:staging`), or the stage's next release |
+| **Waiting for production** | the same for production, when nothing waits for staging |
+| **Scheduled** | its next item comes due at a known time: a time condition, a check put off on a stage that has the change, or a delay already running on conditions that hold |
+| **Waiting on other work** | anything else: another pull request or worktree merging, a probe |
+| **Done** | nothing is open |
+
+Rows under Scheduled are drawn soonest first, and under Due oldest due step
+first. A landed row's only remaining meaning is what it owes,
 which is the one case where deriving its place is safe. The stored section is
 untouched, so turning the option off restores the layout; such a row cannot
 be moved or reordered while the option is on.

@@ -700,6 +700,7 @@ mod tests {
         let head = board.rows.iter().position(|row| row.key == "one").unwrap();
         board.rows[head].git.landed_on = Some(wt_tui::LandingKind::Base);
         board.rows[head].owed_phase = Some(wt_core::OwedPhase::Done);
+        board.rows[head].owed_block = Some(wt_core::OwedBlock::Done);
         board.display.owed_sections = true;
         let state = fixture
             .ctx
@@ -912,6 +913,7 @@ mod tests {
         let one = board.rows.iter().position(|row| row.key == "one").unwrap();
         board.rows[one].git.landed_on = Some(wt_tui::LandingKind::Base);
         board.rows[one].owed_phase = Some(wt_core::OwedPhase::Done);
+        board.rows[one].owed_block = Some(wt_core::OwedBlock::Done);
         wt_sources::board_layout::prepare(
             &mut board,
             &state,

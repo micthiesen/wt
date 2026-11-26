@@ -57,7 +57,7 @@ fn block_hint(
     phase: Option<wt_core::OwedPhase>,
     items: &[wt_core::OwedItem],
 ) -> Option<String> {
-    let block = wt_tui::OwedBlock::placed(phase?, items.first().and_then(|item| item.stage));
+    let block = wt_core::OwedBlock::of_row(phase?, items);
     Some(format!(
         "  {slug} has landed: the board shows it under {} while {} is on, whatever section it is filed in",
         block.title(),

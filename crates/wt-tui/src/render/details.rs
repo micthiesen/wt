@@ -45,11 +45,16 @@ const OWED_HEADLINE_CELLS: usize = 80;
 /// Fewest worth showing on the item's own line; with less left the line
 /// wraps and the text takes the most.
 const OWED_HEADLINE_MIN_CELLS: usize = 16;
-/// Widest "when" that sets the owes block's column; a longer one runs into
-/// its own text instead of pushing every other item's text right.
+/// Fewest cells of an item's description kept beside its tails and its
+/// detail; with less, those go and the description takes the line.
+const OWED_DESCRIPTION_MIN_CELLS: usize = 28;
+/// Lines a step's or a closed check's description may wrap to.
+const OWED_DESCRIPTION_LINES: usize = 2;
+/// Widest the owed list's "when" column grows; a longer one is cut.
 const OWED_WHEN_CELLS: usize = 22;
-/// Cells before an owed item's "when": the indent, its mark and the gap.
-const OWED_LEAD_CELLS: usize = 5;
+/// Cells before an owed item's "when": its mark and the gap, the header's
+/// mark and the note's rail.
+const OWED_LEAD_CELLS: usize = 2;
 /// Items the pane lists for one row; `wt owed` lists the rest.
 const OWES_LINES_MAX: usize = 8;
 /// Notifications the pane lists for one row; `wt watch` lists the rest.
@@ -996,7 +1001,7 @@ fn work_status_block(
     times: &Times,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let header = status_header(row, times);
+    let header = status_header(row);
     let mut lines = header
         .as_ref()
         .map(|(spans, _)| wrap_spans(spans.clone(), width))
@@ -1018,19 +1023,19 @@ fn work_status_block(
 /// The banner's first line and its color. A landed row reads from where it
 /// stands with what it owes; until then the asserted state and the gate
 /// say where the row is.
-fn status_header(row: &BoardRow, times: &Times) -> Option<(Spans, ratatui::style::Color)> {
+fn status_header(row: &BoardRow) -> Option<(Spans, ratatui::style::Color)> {
     let work = row.work.as_ref();
     let record = work.and_then(|work| work.record.as_ref());
     let effective = work.and_then(|work| work.effective_state);
     let derived = work.is_some_and(|work| work.derived);
     let (glyph, text, color) = match row.owed_phase {
-        Some(phase) => phase_header(phase, &row.owes, times),
+        Some(phase) => phase_header(phase, row.owed_block, &row.owes),
         None => {
             let (work, effective) = (work?, effective?);
             if work.blocked {
                 let state = record.map_or(effective, |record| record.state);
                 (
-                    glyphs::SLASH,
+                    glyphs::OWED_GATE,
                     format!("blocked · {}", state.as_str()),
                     theme::WARN,
                 )
@@ -1049,10 +1054,8 @@ fn status_header(row: &BoardRow, times: &Times) -> Option<(Spans, ratatui::style
             }
         }
     };
-    // A Nerd Font glyph draws into two cells (see `glyphs`).
-    let gap = if glyph == glyphs::SLASH { "  " } else { " " };
     let mut header = vec![
-        Span::styled(format!("{glyph}{gap}"), theme::fg(color)),
+        Span::styled(format!("{glyph} "), theme::fg(color)),
         Span::styled(text, theme::bold(color)),
     ];
     // Someone is still at work on a landed row, or is asked something.
@@ -1065,6 +1068,11 @@ fn status_header(row: &BoardRow, times: &Times) -> Option<(Spans, ratatui::style
             state.as_str(),
             theme::fg(badges::work_state_color(state)),
         ));
+    }
+    // What a landed row owes is all it has left to say: the claim's risk
+    // and age were about a merge that has happened.
+    if row.owed_phase.is_some() {
+        return Some((header, color));
     }
     if let Some(risk) = record.and_then(|record| record.risk) {
         header.push(Span::styled(" · risk ", theme::dim()));
@@ -1086,11 +1094,11 @@ fn status_header(row: &BoardRow, times: &Times) -> Option<(Spans, ratatui::style
 }
 
 /// A landed row's header: that something is due and how much, what it
-/// waits for and how much it owes, or that it is done.
+/// waits on and how much it owes, or that it is done.
 fn phase_header(
     phase: wt_core::OwedPhase,
+    block: Option<crate::OwedBlock>,
     owes: &[OwedView],
-    times: &Times,
 ) -> (&'static str, String, ratatui::style::Color) {
     let overdue = owes.iter().any(|item| item.overdue);
     match phase {
@@ -1111,42 +1119,22 @@ fn phase_header(
             )
         }
         wt_core::OwedPhase::Waiting => {
-            let first = owes
-                .iter()
-                .find(|item| item.holds_cleanup())
-                .or(owes.first());
-            let what = first
-                .map(|item| waiting_for(item, times))
-                .filter(|what| !what.trim().is_empty())
-                .map(|what| format!(" {what}"))
-                .unwrap_or_default();
+            // What it waits on, as the list's blocks name it; the items
+            // below say the rest.
+            let what = match block {
+                Some(crate::OwedBlock::WaitingStaging) => "waiting for staging",
+                Some(crate::OwedBlock::WaitingProduction) => "waiting for production",
+                Some(crate::OwedBlock::Scheduled) => "scheduled",
+                Some(crate::OwedBlock::WaitingOther) => "waiting on other work",
+                _ => "waiting",
+            };
             (
                 glyphs::OWED_CLOCK,
-                format!("waiting{what} · {} owed", owes.len()),
+                format!("{what} · {} owed", owes.len()),
                 if overdue { theme::ERR } else { theme::FG_MID },
             )
         }
         wt_core::OwedPhase::Done => (glyphs::OWED_DONE, "done".to_owned(), theme::OK),
-    }
-}
-
-/// What a waiting item waits for, after the word `waiting`: a stage, a
-/// time, or its conditions.
-fn waiting_for(item: &OwedView, times: &Times) -> String {
-    if let Some(stage) = item.stage {
-        return format!("for {}", stage.as_str());
-    }
-    match item.conditions.as_slice() {
-        [] => item.when.clone(),
-        [only] if only.at_ms.is_some() => format!("until {}", instant_text(only, times)),
-        conditions => format!(
-            "for {}",
-            conditions
-                .iter()
-                .map(|cond| instant_text(cond, times))
-                .collect::<Vec<_>>()
-                .join(" and ")
-        ),
     }
 }
 
@@ -1266,274 +1254,457 @@ fn owed_mark(item: &OwedView) -> (&'static str, ratatui::style::Color) {
     } else if item.unreadable() {
         (glyphs::OWED_UNKNOWN, theme::WARN)
     } else if item.kind == wt_core::OwedKind::Gate {
-        (glyphs::SLASH, theme::WARN)
+        (glyphs::OWED_GATE, theme::WARN)
     } else {
         (glyphs::OWED_WAITING, theme::FG_DIM)
     }
 }
 
-/// The "when" column of an owed item: `due since 11:36`, `before merge`,
-/// `in staging`,
-/// `at 17:00 (in 2h)`, `when #3806 in production`.
-fn owed_when(item: &OwedView, times: &Times) -> Spans {
-    let (_, color) = owed_mark(item);
-    let stage = item.stage.map_or("", wt_core::VerifyStage::as_str);
-    let plain = |text: String, color| vec![Span::styled(text, theme::fg(color))];
+/// The "when" column of an owed item, in as few words as place it:
+/// `staging`, `production +7d`, `#3889 merged`, `Fri 18:12`, `since 19:34`,
+/// `before merge`. That an item is due is its mark and color, not a word.
+fn owed_label(item: &OwedView, times: &Times) -> String {
+    let terse = |at_ms: u64| {
+        times
+            .get(&at_ms)
+            .map(|stamp| stamp.terse.clone())
+            .filter(|terse| !terse.is_empty())
+    };
     match item.kind {
-        wt_core::OwedKind::Gate => plain("before merge".to_owned(), color),
-        wt_core::OwedKind::Check if item.overdue => plain(format!("overdue in {stage}"), color),
-        wt_core::OwedKind::Check if item.due() => plain(format!("due in {stage}"), color),
-        // Put off: the host's words, the same ones `wt owed` prints.
-        wt_core::OwedKind::Check => plain(
-            match &item.not_before_in {
-                Some(_) if !item.when.trim().is_empty() => item.when.clone(),
-                Some(wait) => format!("in {stage} +{wait}"),
-                None => format!("in {stage}"),
-            },
-            theme::FG_DIM,
+        wt_core::OwedKind::Gate => "before merge".to_owned(),
+        wt_core::OwedKind::Check => item
+            .stage
+            .map_or("check", wt_core::VerifyStage::as_str)
+            .to_owned(),
+        wt_core::OwedKind::Step if item.due() => item
+            .due_at_ms
+            .and_then(terse)
+            .or_else(|| item.due_at.clone())
+            .map_or_else(|| "due".to_owned(), |at| format!("since {at}")),
+        wt_core::OwedKind::Step if item.conditions.is_empty() => item.when.clone(),
+        wt_core::OwedKind::Step => item
+            .conditions
+            .iter()
+            .map(|cond| {
+                cond.at_ms
+                    .and_then(terse)
+                    .or_else(|| (!cond.label.is_empty()).then(|| cond.label.clone()))
+                    .unwrap_or_else(|| cond.text.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(" & "),
+    }
+}
+
+/// What an owed item is, in one line: what a check proves, a step's first
+/// line, the gate's text. `full` is all a check says before its steps,
+/// for one whose steps are open.
+fn owed_description(item: &OwedView, full: bool) -> (String, ratatui::style::Color) {
+    let color = if item.due() { theme::FG } else { theme::FG_MID };
+    match item.kind {
+        wt_core::OwedKind::Gate => (
+            item.what.split_whitespace().collect::<Vec<_>>().join(" "),
+            theme::WARN,
         ),
-        wt_core::OwedKind::Step if item.due() => {
-            let at = item
-                .due_at_ms
-                .and_then(|at_ms| stamp_text(at_ms, times))
-                .or_else(|| item.due_at.clone());
-            plain(
-                at.map_or_else(|| "due".to_owned(), |at| format!("due since {at}")),
+        wt_core::OwedKind::Check => {
+            // What it proves; a check that is only steps is named by its
+            // first.
+            let (preamble, steps) = parse_verify_steps(&item.what);
+            let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let line = match steps.first() {
+                Some(first) if preamble.trim().is_empty() => first.clone(),
+                Some(_) if full => flat(&preamble),
+                Some(_) => uncut(&wt_core::watch::headline(&preamble), &preamble),
+                None if full => flat(&item.what),
+                None => uncut(&wt_core::watch::headline(&item.what), &item.what),
+            };
+            (
+                if line.trim().is_empty() {
+                    "check".to_owned()
+                } else {
+                    line
+                },
                 color,
             )
         }
-        wt_core::OwedKind::Step if item.conditions.is_empty() => {
-            plain(item.when.clone(), theme::FG_DIM)
-        }
-        wt_core::OwedKind::Step => {
-            let lone = timed(&item.conditions);
-            let mut spans = vec![Span::styled(
-                if lone { "at " } else { "when " },
-                theme::dim(),
-            )];
-            // One condition's truth is the item's own mark.
-            let marked = item.conditions.len() > 1;
-            for (index, cond) in item.conditions.iter().enumerate() {
-                if index > 0 {
-                    spans.push(Span::styled(" and ", theme::dim()));
-                }
-                spans.extend(condition_words(cond, times, marked));
-            }
-            spans
-        }
+        wt_core::OwedKind::Step => (uncut(item.headline.trim(), &item.what), color),
     }
 }
 
-/// What follows the "when" column: the gate and what clears it, a check
-/// and how many steps it has, or a step's headline, then who set it and
-/// how its delivery stands. `used` is the cells the line already holds.
-fn owed_text(
-    item: &OwedView,
-    own: &str,
-    expanded: bool,
-    used: usize,
-    width: usize,
-    times: &Times,
-) -> Spans {
-    let mut spans = Vec::new();
-    match item.kind {
-        wt_core::OwedKind::Gate => {
-            spans.push(Span::styled(
-                item.what.split_whitespace().collect::<Vec<_>>().join(" "),
-                theme::fg(theme::WARN),
-            ));
-            if !item.conditions.is_empty() {
-                let lone = timed(&item.conditions);
-                spans.push(Span::styled(
-                    if lone {
-                        " · clears at "
-                    } else {
-                        " · clears when "
-                    },
-                    theme::dim(),
-                ));
-                spans.extend(conditions_spans(&item.conditions, times, !lone));
-            }
-            if item.wakes {
-                spans.push(Span::styled(", then wakes the session", theme::dim()));
-            }
-            spans.extend(delivery_tail(item.met, item.held));
-        }
-        wt_core::OwedKind::Check => {
-            let (preamble, steps) = parse_verify_steps(&item.what);
-            let color = if item.due() {
-                theme::FG_MID
-            } else {
-                theme::FG_DIM
-            };
-            spans.push(Span::styled("check", theme::fg(color)));
-            let mut suffix = vec![Span::styled(
-                if expanded {
-                    " · V collapses"
-                } else {
-                    " · V expands"
-                },
-                theme::dim(),
-            )];
-            // Overdue is the one state such a check shows: the deploy it
-            // waits for has been owed for days.
-            if item.awaiting_deploy && !item.overdue && !item.due() {
-                suffix.push(Span::styled(" · awaiting deploy", theme::dim()));
-            }
-            if !steps.is_empty() {
-                spans.push(Span::styled(
-                    format!(
-                        " · {} step{}",
-                        steps.len(),
-                        if steps.len() == 1 { "" } else { "s" }
-                    ),
-                    theme::dim(),
-                ));
-            } else if let Some(first) = preamble.lines().map(str::trim).find(|l| !l.is_empty()) {
-                let separator = " · ";
-                spans.push(Span::styled(separator, theme::dim()));
-                let used = used + "check".width() + separator.width();
-                spans.push(headline_span(
-                    first,
-                    used,
-                    spans_width(&suffix),
-                    width,
-                    color,
-                ));
-            }
-            // The hint is the first thing to go when the line would wrap.
-            if used + spans_width(&spans) + spans_width(&suffix) > width {
-                suffix.remove(0);
-            }
-            spans.extend(suffix);
-        }
-        wt_core::OwedKind::Step => {
-            let mut suffix = Vec::new();
-            if item.before_release {
-                suffix.push(Span::styled(" ·\u{a0}before\u{a0}release", theme::dim()));
-            }
-            if let Some(by) = item
-                .by
-                .as_deref()
-                .filter(|by| !by.is_empty() && *by != own && *by != "human")
-            {
-                suffix.push(Span::styled(format!(" ·\u{a0}by\u{a0}{by}"), theme::dim()));
-            }
-            if item.unconfirmed {
-                suffix.push(Span::styled(
-                    " ·\u{a0}delivery not confirmed",
-                    theme::fg(theme::WARN),
-                ));
-            }
-            for reason in item
-                .conditions
-                .iter()
-                .filter_map(|cond| cond.reason.as_deref())
-                .filter(|reason| !reason.is_empty())
-            {
-                suffix.push(Span::styled(format!(" · {reason}"), theme::dim()));
-            }
-            suffix.extend(delivery_tail(item.met, item.held));
-            // A pointer to what closes it, never wrapped mid-command: on
-            // the item's own line, or left out where that line has no room
-            // for it beside a headline.
-            if let Some(id) = item.id.as_deref().filter(|_| item.due()) {
-                let command = format!("wt\u{a0}done\u{a0}{id}");
-                let needed =
-                    used + OWED_HEADLINE_MIN_CELLS + spans_width(&suffix) + 3 + command.width();
-                if needed <= width {
-                    suffix.push(Span::raw("\u{a0}\u{a0} "));
-                    suffix.push(Span::styled(command, theme::dim()));
-                }
-            }
-            // The first line, as its host prepared it.
-            let headline = item.headline.as_str();
-            if !headline.trim().is_empty() {
-                let color = if item.due() { theme::FG } else { theme::FG_MID };
-                spans.push(headline_span(
-                    headline.trim(),
-                    used,
-                    spans_width(&suffix),
-                    width,
-                    color,
-                ));
-            }
-            spans.extend(suffix);
+/// A headline with what its 80-cell cut left out, read back from the text
+/// it heads: the line is cut to the room it has here instead.
+fn uncut(headline: &str, text: &str) -> String {
+    let whole = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match headline.strip_suffix('…') {
+        Some(start) if whole.starts_with(start) => whole,
+        _ => headline.to_owned(),
+    }
+}
+
+/// The one thing the right edge says about an item: that it is overdue,
+/// that its deploy is awaited, what closes a due step, how long until a
+/// known time, or how many steps a check has.
+fn owed_detail(item: &OwedView) -> Option<(String, ratatui::style::Color)> {
+    let dim = |text: String| Some((text, theme::FG_DIM));
+    if item.kind == wt_core::OwedKind::Gate {
+        // Its own line says what clears it and when.
+        return None;
+    }
+    if item.overdue {
+        return Some(("overdue".to_owned(), theme::ERR));
+    }
+    if item.awaiting_deploy && !item.due() {
+        return dim("awaiting deploy".to_owned());
+    }
+    if item.due() && item.kind == wt_core::OwedKind::Step {
+        return item
+            .id
+            .as_deref()
+            .and_then(|id| dim(format!("wt done {id}")));
+    }
+    let until = item.due_in.as_deref().or(item.not_before_in.as_deref()).or(
+        match item.conditions.as_slice() {
+            [only] => only.due_in.as_deref(),
+            _ => None,
+        },
+    );
+    if let Some(until) = until.filter(|_| !item.due()) {
+        return dim(format!("in {until}"));
+    }
+    if item.kind == wt_core::OwedKind::Check {
+        let steps = parse_verify_steps(&item.what).1.len();
+        if steps > 0 {
+            return dim(format!("{steps} step{}", if steps == 1 { "" } else { "s" }));
         }
     }
+    None
+}
+
+/// What else is worth a few dim words after an item's description: who set
+/// it when not the row itself, and how its delivery stands.
+fn owed_tails(item: &OwedView, own: &str) -> Spans {
+    let mut tails = Vec::new();
+    if item.kind != wt_core::OwedKind::Step {
+        return tails;
+    }
+    if item.before_release {
+        tails.push(Span::styled(" ·\u{a0}before\u{a0}release", theme::dim()));
+    }
+    if let Some(by) = item
+        .by
+        .as_deref()
+        .filter(|by| !by.is_empty() && *by != own && *by != "human")
+    {
+        tails.push(Span::styled(format!(" ·\u{a0}by\u{a0}{by}"), theme::dim()));
+    }
+    if item.unconfirmed {
+        tails.push(Span::styled(
+            " ·\u{a0}delivery not confirmed",
+            theme::fg(theme::WARN),
+        ));
+    }
+    // Why a condition cannot be read. What a holding one still waits out
+    // is the countdown at the right edge.
+    for reason in item
+        .conditions
+        .iter()
+        .filter(|cond| cond.state == WatchTruth::Unknown)
+        .filter_map(|cond| cond.reason.as_deref())
+        .filter(|reason| !reason.is_empty())
+    {
+        tails.push(Span::styled(format!(" · {reason}"), theme::dim()));
+    }
+    tails.extend(delivery_tail(item.met, item.held));
+    tails
+}
+
+/// What clears a gate, as its own line under the gate's text.
+fn gate_clears(item: &OwedView, times: &Times) -> Spans {
+    let mut spans = Vec::new();
+    if item.conditions.is_empty() {
+        spans.push(Span::styled("a person clears it", theme::dim()));
+        return spans;
+    }
+    let lone = timed(&item.conditions);
+    spans.push(Span::styled(
+        if lone { "clears at " } else { "clears when " },
+        theme::dim(),
+    ));
+    spans.extend(conditions_spans(&item.conditions, times, !lone));
+    if item.wakes {
+        spans.push(Span::styled(", then wakes the session", theme::dim()));
+    }
+    spans.extend(delivery_tail(item.met, item.held));
     spans
 }
 
-/// The one list of what the row owes, most urgent first, one line an item
-/// with the "when" column aligned. A landed row that owes nothing says so;
-/// before landing, nothing owed is nothing to say.
-fn owes_lines(row: &BoardRow, expanded: bool, times: &Times, width: usize) -> Vec<Line<'static>> {
-    if row.owes.is_empty() {
-        return if row.owed_phase.is_some() {
-            vec![Line::styled("owes nothing", theme::dim())]
+/// One owed item: its mark, its "when" padded to `column`, its description
+/// and, at the right edge, its one detail. Too narrow for the detail it
+/// goes first; then the description wraps under itself.
+fn owed_item_lines(
+    item: &OwedView,
+    label: &str,
+    column: usize,
+    own: &str,
+    full: bool,
+    width: usize,
+    times: &Times,
+) -> Vec<Line<'static>> {
+    let (glyph, mark_color) = owed_mark(item);
+    let label_color = if item.due() || item.kind == wt_core::OwedKind::Gate {
+        mark_color
+    } else {
+        theme::FG_MID
+    };
+    let mark = Span::styled(format!("{glyph} "), theme::fg(mark_color));
+    let (description, color) = owed_description(item, full);
+    let described = |line: String| Span::styled(line, theme::fg(color));
+    let gate = item.kind == wt_core::OwedKind::Gate;
+    let lead = OWED_LEAD_CELLS + column + 2;
+    let room = width.saturating_sub(lead);
+    let mut lines = Vec::new();
+    if room < OWED_HEADLINE_MIN_CELLS {
+        // No room for two columns: the "when" takes a line of its own.
+        let inner = width.saturating_sub(OWED_LEAD_CELLS).max(1);
+        lines.push(Line::from(vec![
+            mark,
+            Span::styled(truncate_end(label, inner), theme::fg(label_color)),
+        ]));
+        let indent = || Span::raw(" ".repeat(OWED_LEAD_CELLS));
+        let most = if gate || full {
+            usize::MAX
         } else {
-            Vec::new()
+            OWED_DESCRIPTION_LINES
         };
+        for line in clip_lines(&description, inner, most) {
+            lines.push(Line::from(vec![indent(), described(line)]));
+        }
+        if gate {
+            for line in wrap_at_hyphens(gate_clears(item, times), inner) {
+                let mut spans = vec![indent()];
+                spans.extend(line.spans);
+                lines.push(Line::from(spans));
+            }
+        }
+        return lines;
     }
+    let cells = label.width().min(column);
+    let mut head = vec![
+        mark,
+        Span::styled(truncate_end(label, column), theme::fg(label_color)),
+        Span::raw(" ".repeat(column - cells + 2)),
+    ];
+    let indent = || Span::raw(" ".repeat(lead));
+    if gate {
+        for line in wrap(&description, room) {
+            let mut spans = std::mem::take(&mut head);
+            if spans.is_empty() {
+                spans.push(indent());
+            }
+            spans.push(described(line));
+            lines.push(Line::from(spans));
+        }
+        for line in wrap_at_hyphens(gate_clears(item, times), room) {
+            let mut spans = vec![indent()];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
+        }
+        return lines;
+    }
+    let detail = owed_detail(item);
+    let detail_cells = detail.as_ref().map_or(0, |(text, _)| text.width() + 2);
+    let mut tails = owed_tails(item, own);
+    let wanted = description.width();
+    // The tails go before the detail does, and both before the description
+    // is cut short of what is worth reading.
+    let fits = |extra: usize| wanted + extra <= room || room >= extra + OWED_DESCRIPTION_MIN_CELLS;
+    if !fits(spans_width(&tails) + detail_cells) {
+        tails.clear();
+    }
+    let detail = detail.filter(|_| fits(detail_cells));
+    let detail_cells = detail.as_ref().map_or(0, |(text, _)| text.width() + 2);
+    let beside = spans_width(&tails) + detail_cells;
+    if wanted + beside > room && (detail.is_none() || full) {
+        // Nothing beside it to keep it to one line, or its steps are open
+        // under it: it wraps under itself, the detail on its first line.
+        let most = if full {
+            usize::MAX
+        } else {
+            OWED_DESCRIPTION_LINES
+        };
+        let inner = room.saturating_sub(detail_cells).max(1);
+        for line in clip_lines(&description, inner, most) {
+            let mut spans = std::mem::take(&mut head);
+            if spans.is_empty() {
+                spans.push(indent());
+            }
+            let used = line.width();
+            spans.push(described(line));
+            if let Some((text, color)) = detail.clone().filter(|_| lines.is_empty()) {
+                spans.push(Span::raw(
+                    " ".repeat(room.saturating_sub(used + text.width())),
+                ));
+                spans.push(Span::styled(text, theme::fg(color)));
+            }
+            lines.push(Line::from(spans));
+        }
+        return lines;
+    }
+    let shown = truncate_end(&description, room.saturating_sub(beside));
+    let used = shown.width() + spans_width(&tails);
+    head.push(described(shown));
+    head.extend(tails);
+    if let Some((text, color)) = detail {
+        let pad = room.saturating_sub(used + text.width());
+        head.push(Span::raw(" ".repeat(pad)));
+        head.push(Span::styled(text, theme::fg(color)));
+    }
+    lines.push(Line::from(head));
+    lines
+}
+
+/// The one list of what the row owes, most urgent first: one line an item,
+/// its mark under the header's and its "when" under the header's text.
+/// Nothing owed is nothing to list; a landed row's header says it is done.
+fn owes_lines(row: &BoardRow, expanded: bool, times: &Times, width: usize) -> Vec<Line<'static>> {
     let shown = &row.owes[..row.owes.len().min(OWES_LINES_MAX)];
-    let labels: Vec<Spans> = shown.iter().map(|item| owed_when(item, times)).collect();
+    let labels: Vec<String> = shown.iter().map(|item| owed_label(item, times)).collect();
     let column = labels
         .iter()
-        .map(|label| spans_width(label))
-        .filter(|cells| *cells <= OWED_WHEN_CELLS)
+        .map(|label| label.width())
         .max()
-        .unwrap_or(0);
-    // Too narrow for two columns: each item wraps under its own mark.
-    let aligned = width >= OWED_LEAD_CELLS + column + 2 + OWED_HEADLINE_MIN_CELLS;
-    let mut lines = vec![Line::styled("owes", theme::dim())];
-    for (item, label) in shown.iter().zip(labels) {
-        let (glyph, color) = owed_mark(item);
-        let mut prefix = vec![Span::styled(format!("  {glyph}  "), theme::fg(color))];
-        let cells = spans_width(&label);
-        let mut text = Vec::new();
-        if aligned && cells <= column {
-            prefix.extend(label);
-            prefix.push(Span::raw(" ".repeat(column - cells + 2)));
-        } else {
-            text.extend(label);
-            text.push(Span::raw("  "));
-        }
-        let used = spans_width(&prefix) + spans_width(&text);
-        text.extend(owed_text(item, &row.slug, expanded, used, width, times));
-        lines.extend(wrap_under(prefix, text, width));
+        .unwrap_or(0)
+        .min(OWED_WHEN_CELLS);
+    let stacked = width < OWED_LEAD_CELLS + column + 2 + OWED_HEADLINE_MIN_CELLS;
+    let mut lines = Vec::new();
+    for (item, label) in shown.iter().zip(&labels) {
+        // An open check says all of what it proves, then its steps.
+        let full = expanded && item.kind == wt_core::OwedKind::Check;
+        lines.extend(owed_item_lines(
+            item, label, column, &row.slug, full, width, times,
+        ));
         if expanded && item.kind == wt_core::OwedKind::Check {
-            lines.extend(check_lines(&item.what, item.due(), width));
+            let indent = if stacked {
+                OWED_LEAD_CELLS
+            } else {
+                OWED_LEAD_CELLS + column + 2
+            };
+            lines.extend(check_lines(&item.what, item.due(), indent, width));
         }
     }
+    let aside = |text: String| {
+        Line::from(vec![
+            Span::raw(" ".repeat(OWED_LEAD_CELLS)),
+            Span::styled(
+                truncate_end(&text, width.saturating_sub(OWED_LEAD_CELLS)),
+                theme::dim(),
+            ),
+        ])
+    };
     if row.owes.len() > shown.len() {
-        lines.push(Line::styled(
-            format!("  +{} more (wt owed)", row.owes.len() - shown.len()),
-            theme::dim(),
+        lines.push(aside(format!(
+            "+{} more (wt owed)",
+            row.owes.len() - shown.len()
+        )));
+    }
+    // Only where V has more to show: steps, or text past the first line.
+    if shown.iter().any(|item| {
+        item.kind == wt_core::OwedKind::Check
+            && (!parse_verify_steps(&item.what).1.is_empty()
+                || owed_description(item, true).0 != owed_description(item, false).0)
+    }) {
+        lines.push(aside(
+            if expanded {
+                "V hides steps"
+            } else {
+                "V shows steps"
+            }
+            .to_owned(),
         ));
     }
     lines
 }
 
-/// A check's text under its line: the preamble, then its numbered steps.
-fn check_lines(text: &str, due: bool, width: usize) -> Vec<Line<'static>> {
-    let (preamble, steps) = parse_verify_steps(text);
+/// [`wrap_spans`] for a line that names things by slug: a long word that
+/// does not fit where it falls breaks after a hyphen, instead of leaving
+/// the line before it short or being cut.
+fn wrap_at_hyphens(spans: Spans, width: usize) -> Vec<Line<'static>> {
+    /// Shortest word worth breaking inside.
+    const LONG: usize = 16;
+    if spans_width(&spans) <= width {
+        return vec![Line::from(spans)];
+    }
+    // Words as wrap_spans reads them: split at spaces, with adjacent spans
+    // (a mark and its words) one word.
+    let mut words: Vec<Spans> = Vec::new();
+    for span in spans {
+        for (index, word) in span.content.split(' ').enumerate() {
+            if index > 0 || words.is_empty() {
+                words.push(Vec::new());
+            }
+            if !word.is_empty()
+                && let Some(fragments) = words.last_mut()
+            {
+                fragments.push(Span::styled(word.to_owned(), span.style));
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    let mut current: Spans = Vec::new();
+    let mut used = 0;
+    for word in words {
+        let cells = spans_width(&word);
+        let gap = usize::from(used > 0);
+        let pieces: Spans = if used + gap + cells <= width || cells < LONG {
+            word
+        } else {
+            word.iter()
+                .flat_map(|fragment| {
+                    fragment
+                        .content
+                        .split_inclusive('-')
+                        .map(|piece| Span::styled(piece.to_owned(), fragment.style))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let whole = pieces.len() == 1 || used + gap + cells <= width;
+        for (part, piece) in pieces.into_iter().enumerate() {
+            let gap = usize::from(part == 0 && used > 0);
+            let needed = if whole && part == 0 {
+                cells
+            } else {
+                piece.content.width()
+            };
+            if used + gap + needed > width && used > 0 {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
+            } else if gap == 1 {
+                current.push(Span::raw(" "));
+                used += 1;
+            }
+            let text = truncate_end(&piece.content, width.saturating_sub(used));
+            used += text.width();
+            current.push(Span::styled(text, piece.style));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+/// A check's numbered steps under its line, from `indent`. The line above
+/// says what it proves, in full while the steps are open.
+fn check_lines(text: &str, due: bool, indent: usize, width: usize) -> Vec<Line<'static>> {
+    let (_, steps) = parse_verify_steps(text);
     let (head_color, body_color) = if due {
         (theme::WARN, theme::FG_MID)
     } else {
         (theme::FG_DIM, theme::FG_DIM)
     };
-    let indent = OWED_LEAD_CELLS;
     let inner = width.saturating_sub(indent).max(1);
-    let mut lines: Vec<Line<'static>> = wrap(&preamble, inner)
-        .into_iter()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            Line::from(vec![
-                Span::raw(" ".repeat(indent)),
-                Span::styled(line, theme::fg(body_color)),
-            ])
-        })
-        .collect();
+    let mut lines = Vec::new();
     let gutter = steps.len().max(1).to_string().len() + 2;
     for (index, step) in steps.iter().enumerate() {
         for (part, line) in wrap(step, inner.saturating_sub(gutter).max(1))
@@ -1578,7 +1749,8 @@ fn notify_lines(row: &BoardRow, times: &Times, width: usize) -> Vec<Line<'static
         let Some(badge) = badges::watch_badge(std::slice::from_ref(*watch)) else {
             continue;
         };
-        let bell = Span::styled(format!("{}  ", badge.glyph), theme::fg(badge.color));
+        // One cell after the bell, so its text starts under the header's.
+        let bell = Span::styled(format!("{} ", badge.glyph), theme::fg(badge.color));
         let lone = timed(&watch.conditions);
         let mut spans = vec![Span::styled(
             if lone {
@@ -1619,7 +1791,7 @@ fn notify_lines(row: &BoardRow, times: &Times, width: usize) -> Vec<Line<'static
     }
     if told.len() > WATCH_LINES_MAX {
         lines.push(Line::styled(
-            format!("+{} more (wt watch)", told.len() - WATCH_LINES_MAX),
+            format!("  +{} more (wt watch)", told.len() - WATCH_LINES_MAX),
             theme::dim(),
         ));
     }
@@ -2771,8 +2943,29 @@ mod tests {
             .and_then(|span| span.style.fg)
     }
 
+    /// A line with every run of three or more spaces read as a column
+    /// break, so a test says what a line holds without counting its padding.
+    fn columns(line: &str) -> String {
+        let mut out = String::new();
+        let mut spaces = 0;
+        for ch in line.trim_end().chars() {
+            if ch == ' ' {
+                spaces += 1;
+                continue;
+            }
+            match spaces {
+                0 => {}
+                1 | 2 => out.push_str(&" ".repeat(spaces)),
+                _ => out.push_str(" | "),
+            }
+            spaces = 0;
+            out.push(ch);
+        }
+        out
+    }
+
     #[test]
-    fn a_ready_row_lists_its_gate_and_both_checks_in_one_owes_block() {
+    fn a_ready_row_lists_its_gate_and_both_checks_under_its_header() {
         let mut ready = row();
         let work = ready.work.as_mut().unwrap();
         work.blocked = true;
@@ -2794,44 +2987,45 @@ mod tests {
             check(
                 VerifyStage::Production,
                 OwedState::Waiting,
-                "STEPS: 1. a 2. b",
+                "STEPS: 1. curl the endpoint 2. b",
             ),
         ];
-        let slash = glyphs::SLASH;
-        let lines = block(&ready, 200);
+        let lines = block(&ready, 80);
         assert_eq!(
-            lines[..5],
+            lines[..7],
             [
-                format!("{slash}  blocked · ready · risk low · 2h ago"),
-                "owes".to_owned(),
-                format!(
-                    "  {slash}  before merge   prod secret missing · clears when ○ #3806 in production"
-                ),
-                "  ○  in staging     check · 5 steps · V expands".to_owned(),
-                "  ○  in production  check · 2 steps · V expands".to_owned(),
+                "⊘ blocked · ready · risk low · 2h ago".to_owned(),
+                "⊘ before merge  prod secret missing".to_owned(),
+                "                clears when ○ #3806 in production".to_owned(),
+                format!("○ staging       Check the worker.{:>47}", "5 steps"),
+                format!("○ production    curl the endpoint{:>47}", "2 steps"),
+                "  V shows steps".to_owned(),
+                "│ Lead sentence.".to_owned(),
             ]
         );
-        // The note follows what is tracked.
-        assert_eq!(lines[5], "│ Lead sentence.");
-        let styled = work_status_block(&ready, false, &Times::new(), 200);
-        assert_eq!(color_of(&styled[2..3], slash), Some(theme::WARN));
+        assert!(lines[3..5].iter().all(|line| line.width() == 80));
+        let styled = work_status_block(&ready, false, &Times::new(), 80);
+        assert_eq!(color_of(&styled[1..2], "⊘"), Some(theme::WARN));
         assert_eq!(color_of(&styled[3..4], "○"), Some(theme::FG_DIM));
-        // V opens every check in place, under its own line.
-        let open = plain(&work_status_block(&ready, true, &Times::new(), 200));
+        assert_eq!(color_of(&styled[3..4], "5 steps"), Some(theme::FG_DIM));
+        // V opens every check in place, its steps under its description.
+        let open = plain(&work_status_block(&ready, true, &Times::new(), 80));
         assert_eq!(
-            open[3..7],
+            open[3..6],
             [
-                "  ○  in staging     check · 5 steps · V collapses",
-                "     Check the worker.",
-                "     1. open /health",
-                "     2. b",
+                format!("○ staging       Check the worker.{:>47}", "5 steps"),
+                "                1. open /health".to_owned(),
+                "                2. b".to_owned(),
             ]
         );
-        assert!(open.contains(&"     2. b".to_owned()));
-        assert_eq!(open.len(), lines.len() + 8);
-        // Nothing is said twice: no gate line, no verify block.
+        assert!(open.contains(&"                1. curl the endpoint".to_owned()));
+        assert!(open.contains(&"  V hides steps".to_owned()));
+        assert_eq!(open.len(), lines.len() + 7);
+        // Nothing is said twice or labelled: no "owes", no gate line, no
+        // verify block.
         let said = lines.join("\n");
-        assert!(!said.contains("blocked on:") && !said.contains("verify in"));
+        assert!(!said.contains("owes") && !said.contains("blocked on:"));
+        assert!(!said.contains("verify in") && !said.contains("expands"));
     }
 
     #[test]
@@ -2851,7 +3045,7 @@ mod tests {
                 check(
                     VerifyStage::Production,
                     OwedState::Waiting,
-                    "STEPS: 1. a 2. b",
+                    "Prod serves it. STEPS: 1. a 2. b",
                 ),
             ],
         );
@@ -2863,23 +3057,27 @@ mod tests {
             ..Default::default()
         }];
         let bell = glyphs::WATCH;
-        let lines = block(&row, 200);
+        let lines = block(&row, 120);
         assert_eq!(
-            lines[..5],
+            lines.iter().map(|line| columns(line)).collect::<Vec<_>>()[..6],
             [
-                "● due · 1 waiting · risk low · 2h ago"
+                // The phase and the counts: the claim's risk and age were
+                // about a merge that has happened.
+                "● due · 1 waiting".to_owned(),
+                "● since 11:36  confirm prod logs, then open the PR retiring the old path | wt done 93co6q"
                     .to_owned(),
-                "owes".to_owned(),
-                "  ●  due since 11:36  confirm prod logs, then open the PR retiring the old path   wt done 93co6q"
-                    .to_owned(),
-                "  ○  in production    check · 2 steps · V expands".to_owned(),
-                format!("{bell}  tells you when ○ in production"),
+                "○ production | Prod serves it. | 2 steps".to_owned(),
+                "  V shows steps".to_owned(),
+                format!("{bell} tells you when ○ in production"),
+                "│ Lead sentence.".to_owned(),
             ]
         );
-        assert_eq!(lines[5], "│ Lead sentence.");
-        let styled = work_status_block(&row, false, &Times::new(), 200);
+        let styled = work_status_block(&row, false, &Times::new(), 120);
         assert_eq!(styled[0].spans[1].style.fg, Some(theme::WARN));
-        assert_eq!(color_of(&styled[2..3], "●"), Some(theme::WARN));
+        assert_eq!(color_of(&styled[1..2], "●"), Some(theme::WARN));
+        // Due is the mark and the color of the "when", not a word.
+        assert_eq!(color_of(&styled[1..2], "since 11:36"), Some(theme::WARN));
+        assert_eq!(color_of(&styled[2..3], "production"), Some(theme::FG_MID));
         // What the person is told is not owed: it reads dim.
         assert_eq!(color_of(&styled[4..5], "tells you"), Some(theme::FG_DIM));
         // The controller's clock for the instant; without one, the host's.
@@ -2888,52 +3086,34 @@ mod tests {
             LocalStamp {
                 day: "today".into(),
                 clock: "12:36".into(),
+                terse: "12:36".into(),
             },
         )]
         .into();
-        let local = plain(&work_status_block(&row, false, &times, 200));
-        assert!(
-            local[2].starts_with("  ●  due since 12:36  "),
-            "{}",
-            local[2]
-        );
+        let local = plain(&work_status_block(&row, false, &times, 120));
+        assert!(local[1].starts_with("● since 12:36  "), "{}", local[1]);
         // An overdue check turns the header and its own line red.
         row.owes.insert(
             0,
             check(VerifyStage::Staging, OwedState::Due, "open /health"),
         );
         row.owes[0].overdue = true;
-        let styled = work_status_block(&row, false, &Times::new(), 200);
+        let styled = work_status_block(&row, false, &Times::new(), 120);
         let lines = plain(&styled);
         // The header counts; the lines below it say what.
-        assert!(
-            lines[0].starts_with("● 2 due · 1 waiting · "),
-            "{}",
-            lines[0]
-        );
-        assert_eq!(
-            lines[2],
-            "  ●  overdue in staging  check · open /health · V expands"
-        );
+        assert_eq!(lines[0], "● 2 due · 1 waiting");
+        assert_eq!(columns(&lines[1]), "● staging | open /health | overdue");
         assert_eq!(styled[0].spans[1].style.fg, Some(theme::ERR));
-        assert_eq!(color_of(&styled[2..3], "overdue"), Some(theme::ERR));
+        assert_eq!(color_of(&styled[1..2], "overdue"), Some(theme::ERR));
+        assert_eq!(color_of(&styled[1..2], "staging"), Some(theme::ERR));
     }
 
     #[test]
-    fn a_landed_row_that_owes_nothing_says_so_and_an_unlanded_one_says_nothing() {
+    fn a_landed_row_that_owes_nothing_is_done_and_an_unlanded_one_says_nothing() {
         let done = landed(OwedPhase::Done, Vec::new());
         let styled = work_status_block(&done, false, &Times::new(), 200);
-        let lines = plain(&styled);
-        assert_eq!(
-            lines[..3],
-            [
-                "✓ done · risk low · 2h ago",
-                "owes nothing",
-                "│ Lead sentence."
-            ]
-        );
+        assert_eq!(plain(&styled)[..2], ["✓ done", "│ Lead sentence."]);
         assert_eq!(styled[0].spans[1].style.fg, Some(theme::OK));
-        assert_eq!(styled[1].style.fg, Some(theme::FG_DIM));
         // Before landing the asserted state heads the row, and a row that
         // owes nothing has no block at all.
         let lines = block(&row(), 200);
@@ -2950,10 +3130,7 @@ mod tests {
         assert!(block(&bare, 200).is_empty());
         bare.owes = vec![step(OwedState::Waiting, "rebase onto main")];
         bare.owes[0].conditions = vec![waits("#12", "#12 merged", WatchTruth::NotYet)];
-        assert_eq!(
-            block(&bare, 200),
-            ["owes", "  ○  when #12 merged  rebase onto main"]
-        );
+        assert_eq!(block(&bare, 200), ["○ #12 merged  rebase onto main"]);
     }
 
     #[test]
@@ -2972,25 +3149,29 @@ mod tests {
         for (owes, expected) in [
             (
                 vec![check(VerifyStage::Staging, OwedState::Waiting, "a")],
-                "◷ waiting for staging · 1 owed · risk low · 2h ago",
+                "◷ waiting for staging · 1 owed",
             ),
             (
                 vec![
                     check(VerifyStage::Production, OwedState::Waiting, "a"),
                     timed.clone(),
                 ],
-                "◷ waiting for production · 2 owed · risk low · 2h ago",
+                "◷ waiting for production · 2 owed",
             ),
-            (
-                vec![timed.clone()],
-                "◷ waiting until 17:00 · 1 owed · risk low · 2h ago",
-            ),
+            (vec![timed.clone()], "◷ scheduled · 1 owed"),
             (
                 vec![conditional.clone()],
-                "◷ waiting for #3806 in production and merged · 1 owed · risk low · 2h ago",
+                "◷ waiting on other work · 1 owed",
             ),
         ] {
-            let row = landed(OwedPhase::Waiting, owes);
+            let mut row = landed(OwedPhase::Waiting, owes);
+            // As its host files it.
+            row.owed_block = Some(match (row.owes[0].stage, row.owes[0].kind) {
+                (Some(VerifyStage::Staging), _) => crate::OwedBlock::WaitingStaging,
+                (Some(VerifyStage::Production), _) => crate::OwedBlock::WaitingProduction,
+                _ if row.owes[0].conditions.len() == 1 => crate::OwedBlock::Scheduled,
+                _ => crate::OwedBlock::WaitingOther,
+            });
             let styled = work_status_block(&row, false, &Times::new(), 200);
             assert_eq!(plain(&styled)[0], expected);
             // Nothing is asked of anyone yet.
@@ -2999,157 +3180,160 @@ mod tests {
         // Someone still at work on a landed row is not hidden by its phase.
         let mut busy = landed(OwedPhase::Waiting, vec![timed]);
         busy.work.as_mut().unwrap().effective_state = Some(WorkState::Working);
-        assert!(
-            block(&busy, 200)[0].starts_with("◷ waiting until 17:00 · 1 owed · working · risk"),
-            "{:?}",
-            block(&busy, 200)
-        );
+        // A host that does not file its rows still says it waits.
+        assert_eq!(block(&busy, 200)[0], "◷ waiting · 1 owed · working");
     }
 
     #[test]
-    fn every_kind_of_owed_line_reads_as_one_aligned_line() {
-        let at_ms = 1_800_000_000_000;
-        let mut soon = waits("at:1800000000000", "17:00", WatchTruth::NotYet);
-        soon.at_ms = Some(at_ms);
+    fn every_kind_of_owed_item_is_a_when_a_description_and_one_detail() {
+        let labelled = |key: &str, text: &str, label: &str, state| WatchConditionView {
+            label: label.into(),
+            ..waits(key, text, state)
+        };
+        let mut soon = labelled("at:1800000000000", "17:00", "17:00", WatchTruth::NotYet);
+        soon.at_ms = Some(1_800_000_000_000);
         soon.due_in = Some("2h10m".into());
         let mut timed = step(OwedState::Waiting, "Run the smoke test against staging");
         timed.by = Some("manager".into());
         timed.conditions = vec![soon];
-        let mut later = waits("at:1", "Nov 27 18:12", WatchTruth::Holds);
-        later.at_ms = Some(1);
+        timed.due_in = Some("2h 10m".into());
         let mut before_release = step(OwedState::Waiting, "rerun the renewal check");
         before_release.before_release = true;
-        before_release.conditions = vec![later];
-        let mut sealed = waits("check:vault=X", "check vault=X", WatchTruth::Unknown);
+        before_release.stage = Some(VerifyStage::Staging);
+        before_release.conditions = vec![labelled(
+            "staging",
+            "on staging",
+            "staging",
+            WatchTruth::NotYet,
+        )];
+        let mut sealed = labelled(
+            "check:vault=X",
+            "check vault=X",
+            "check vault",
+            WatchTruth::Unknown,
+        );
         sealed.reason = Some("exited 2: vault sealed".into());
         let mut unknown = step(OwedState::Waiting, "rotate the key");
         unknown.conditions = vec![sealed];
         let mut both = step(OwedState::Waiting, "retire the flag");
         both.conditions = vec![
-            waits("#3806:production", "#3806 in production", WatchTruth::Holds),
-            waits("merged", "merged", WatchTruth::NotYet),
+            labelled(
+                "#38:staging",
+                "#38 on staging",
+                "#38 staging",
+                WatchTruth::Holds,
+            ),
+            labelled("merged", "merged", "merged", WatchTruth::NotYet),
         ];
+        // A delay that is running: the countdown says what the engine's
+        // "holding, 7d not yet over" did.
+        let mut running = labelled(
+            "production",
+            "7d after it reaches production",
+            "production +7d",
+            WatchTruth::NotYet,
+        );
+        running.reason = Some("holding, 7d not yet over".into());
+        let mut delayed = step(OwedState::Waiting, "retire the Edge function");
+        delayed.conditions = vec![running];
+        delayed.due_in = Some("6d".into());
         let mut unsure = step(OwedState::Due, "confirm the dashboard");
         unsure.id = Some("abc234".into());
         unsure.unconfirmed = true;
         let mut deferred = check(
             VerifyStage::Production,
             OwedState::Waiting,
-            "STEPS: 1. a 2. b",
+            "Prod renews. STEPS: 1. a 2. b",
         );
-        deferred.not_before_in = Some("1h".into());
+        deferred.due_in = Some("1h".into());
         let mut awaiting = check(VerifyStage::Staging, OwedState::Waiting, "open /health");
         awaiting.awaiting_deploy = true;
-        let mut wakes = gate("QA sign-off");
-        wakes.conditions = vec![waits("merged", "merged", WatchTruth::Holds)];
-        wakes.wakes = true;
-        wakes.met = true;
-        wakes.held = true;
-        let mut row = row();
-        row.owes = vec![
-            unsure,
-            check(VerifyStage::Staging, OwedState::Due, "open /health"),
-            wakes,
-            awaiting,
-            deferred,
-            both,
-            unknown,
-            timed,
-        ];
-        let slash = glyphs::SLASH;
-        let styled = work_status_block(&row, false, &Times::new(), 200);
-        let lines = plain(&styled);
+        let mut row = landed(
+            OwedPhase::Due,
+            vec![
+                unsure,
+                awaiting,
+                deferred,
+                before_release,
+                delayed,
+                both,
+                unknown,
+                timed,
+            ],
+        );
+        let lines = block(&row, 120);
         assert_eq!(
-            lines[1..10],
+            lines[1..10]
+                .iter()
+                .map(|line| columns(line))
+                .collect::<Vec<_>>(),
             [
-                "owes".to_owned(),
-                "  ●  due                  confirm the dashboard · delivery not confirmed   wt done abc234"
-                    .to_owned(),
-                "  ●  due in staging       check · open /health · V expands".to_owned(),
-                format!(
-                    "  {slash}  before merge         QA sign-off · clears when ✓ merged, then wakes the session · held: automations paused"
-                ),
-                "  ○  in staging           check · open /health · V expands · awaiting deploy"
-                    .to_owned(),
-                "  ○  in production +1h    check · 2 steps · V expands".to_owned(),
-                "  ○  when ✓ #3806 in production and ○ merged  retire the flag".to_owned(),
-                "  ?  when check vault=X   rotate the key · exited 2: vault sealed".to_owned(),
-                "  ○  at 17:00 (in 2h10m)  Run the smoke test against staging · by manager"
-                    .to_owned(),
+                "● due | confirm the dashboard · delivery not confirmed | wt done abc234",
+                "○ staging | open /health | awaiting deploy",
+                "○ production | Prod renews. | in 1h",
+                "○ staging | rerun the renewal check · before release",
+                "○ production +7d | retire the Edge function | in 6d",
+                "○ #38 staging & merged  retire the flag",
+                "? check vault | rotate the key · exited 2: vault sealed",
+                "○ 17:00 | Run the smoke test against staging · by manager | in 2h 10m",
+                "  V shows steps",
             ]
         );
-        assert_eq!(color_of(&styled[8..9], "?"), Some(theme::WARN));
+        // One column for every description, one right edge for every detail.
+        let at = |line: &str, needle: &str| line.find(needle).map(|at| line[..at].width());
+        let column = at(&lines[1], "confirm the");
+        assert_eq!(column, Some(2 + "#38 staging & merged".len() + 2));
+        for (line, needle) in [(2, "open /health"), (6, "retire the flag"), (8, "Run the")] {
+            assert_eq!(at(&lines[line], needle), column, "{}", lines[line]);
+        }
+        for line in [1, 2, 3, 5, 8] {
+            assert_eq!(lines[line].width(), 120, "{}", lines[line]);
+        }
+        // Every mark is in the header's column, every "when" under its text.
+        assert!(lines[1..9].iter().all(|line| {
+            let mut chars = line.chars();
+            chars.next() != Some(' ') && chars.next() == Some(' ') && chars.next() != Some(' ')
+        }));
+        // A "when" past the column's cap is cut; the column stops there.
+        row.owes[5].conditions[1].label = "a-very-long-worktree-slug merged".into();
+        let lines = block(&row, 120);
         assert_eq!(
-            color_of(&styled[2..3], "delivery not confirmed"),
-            Some(theme::WARN)
+            columns(&lines[6]),
+            "○ #38 staging & a-very-…  retire the flag"
         );
-        // The reason recedes: it explains, it does not ask.
-        assert_eq!(color_of(&styled[8..9], "vault sealed"), Some(theme::FG_DIM));
-        assert_eq!(color_of(&styled[4..5], "held"), Some(theme::WARN));
-        // Eight are listed; the rest are counted.
-        row.owes.push(before_release.clone());
-        row.owes.push(before_release.clone());
-        let lines = block(&row, 200);
-        assert_eq!(lines[10], "  +2 more (wt owed)");
-        // Overdue is one state: an overdue check awaiting its deploy does
-        // not also say so.
-        let mut overdue = check(VerifyStage::Staging, OwedState::Waiting, "open /health");
-        overdue.overdue = true;
-        overdue.awaiting_deploy = true;
-        row.owes = vec![overdue, before_release];
-        let styled = work_status_block(&row, false, &Times::new(), 200);
-        assert_eq!(
-            plain(&styled)[2..4],
-            [
-                "  ●  overdue in staging  check · open /health · V expands",
-                "  ○  at Nov 27 18:12     rerun the renewal check · before release",
-            ]
-        );
-        assert_eq!(color_of(&styled[2..3], "●"), Some(theme::ERR));
-        // A gate only a person clears says nothing more; one that is being
-        // cleared says it is delivering.
+        assert_eq!(at(&lines[1], "confirm the"), Some(2 + OWED_WHEN_CELLS + 2));
+        // Eight are listed; wt owed lists the rest.
+        row.owes.push(row.owes[7].clone());
+        row.owes.push(row.owes[7].clone());
+        let lines = block(&row, 120);
+        assert_eq!(lines[9..11], ["  +2 more (wt owed)", "  V shows steps"]);
+        // A gate says what clears it on a line of its own.
+        let mut gated = self::row();
         let mut clearing = gate("QA sign-off");
         clearing.conditions = vec![waits("merged", "merged", WatchTruth::Holds)];
         clearing.met = true;
-        row.owes = vec![gate("QA sign-off"), clearing];
+        clearing.wakes = true;
+        gated.owes = vec![gate("QA sign-off"), clearing];
         assert_eq!(
-            block(&row, 200)[2..4],
+            block(&gated, 120)[1..5],
             [
-                format!("  {slash}  before merge  QA sign-off"),
-                format!("  {slash}  before merge  QA sign-off · clears when ✓ merged · delivering"),
+                "⊘ before merge  QA sign-off",
+                "                a person clears it",
+                "⊘ before merge  QA sign-off",
+                "                clears when ✓ merged, then wakes the session · delivering",
             ]
         );
     }
 
     #[test]
-    fn the_expand_hint_is_dropped_before_a_check_line_wraps() {
-        let mut row = landed(
-            OwedPhase::Due,
-            vec![check(
-                VerifyStage::Production,
-                OwedState::Due,
-                "1. export an invoice\n2. open the CSV",
-            )],
-        );
-        row.owes[0].awaiting_deploy = false;
-        let line = |width| block(&row, width)[2].clone();
-        assert_eq!(
-            line(200),
-            "  ●  due in production  check · 2 steps · V expands"
-        );
-        // Too narrow for the hint: the line stays one line without it.
-        assert_eq!(line(44), "  ●  due in production  check · 2 steps");
-    }
-
-    #[test]
-    fn the_owes_block_fits_narrow_and_wide_panes() {
+    fn the_owed_list_fits_narrow_and_wide_panes() {
         let mut due = step(
             OwedState::Due,
             "confirm prod logs, then open the PR retiring the old path",
         );
         due.id = Some("93co6q".into());
         due.due_at = Some("11:36".into());
-        let mut clears = gate("prod secret missing");
+        let mut clears = gate("prod secret missing from the vault the worker reads");
         clears.conditions = vec![
             waits("#3806:production", "#3806 in production", WatchTruth::Holds),
             waits(
@@ -3158,18 +3342,16 @@ mod tests {
                 WatchTruth::NotYet,
             ),
         ];
-        let mut row = landed(
-            OwedPhase::Due,
-            vec![
-                due,
-                clears,
-                check(
-                    VerifyStage::Staging,
-                    OwedState::Waiting,
-                    "Check the worker after the deploy. STEPS: 1. open /health and wait 2. b",
-                ),
-            ],
-        );
+        let mut row = row();
+        row.owes = vec![
+            due,
+            clears,
+            check(
+                VerifyStage::Staging,
+                OwedState::Waiting,
+                "Check the worker after the deploy. STEPS: 1. open /health and wait 2. b",
+            ),
+        ];
         row.watches = vec![WatchView {
             id: "tell44".into(),
             by: "human".into(),
@@ -3179,7 +3361,7 @@ mod tests {
             ..Default::default()
         }];
         for expanded in [false, true] {
-            for width in [18, 30, 44, 80, 200] {
+            for width in [18, 30, 44, 60, 80, 120, 200] {
                 let lines = work_status_block(&row, expanded, &Times::new(), width);
                 assert!(
                     lines.iter().all(|line| line.width() <= width),
@@ -3191,51 +3373,80 @@ mod tests {
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ");
-                // Wrapped, never cut: the condition and the hint survive
-                // every width.
-                for needle in ["○ next production release", "tells you when"] {
+                // Wrapped, never cut: what clears the gate and what the
+                // person is told survive every width.
+                for needle in ["○ next production release", "tells you when", "the vault"] {
                     assert!(said.contains(needle), "{width}: {needle}: {said}");
                 }
-                // The closing command is a pointer: whole on one line, or
-                // left out where the line has no room for it.
+                // The detail is whole at the right edge, or left out where
+                // the description needs the line.
                 let command = "wt done 93co6q";
-                let whole = plain(&lines).iter().any(|line| line.contains(command));
-                assert_eq!(
-                    said.contains("93co6q"),
-                    whole,
-                    "{width}: {:?}",
-                    plain(&lines)
-                );
-                assert_eq!(whole, width >= 80, "{width}: {said}");
+                let whole = plain(&lines).iter().any(|line| line.ends_with(command));
+                assert_eq!(said.contains("93co6q"), whole, "{width}: {said}");
+                assert_eq!(whole, width >= 60, "{width}: {said}");
+                let hint = if expanded {
+                    "V hides steps"
+                } else {
+                    "V shows steps"
+                };
+                assert!(said.contains(hint), "{width}: {said}");
             }
         }
-        // Wide: one line an item, the text column aligned.
+        // Wide: the step and the check are a line each, in one column.
         let wide = block(&row, 200);
-        assert_eq!(wide.iter().filter(|line| line.starts_with("  ")).count(), 3);
-        let column = |line: &str, needle: &str| line.find(needle).unwrap();
+        let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].width();
         assert_eq!(
-            column(&wide[2], "confirm prod"),
-            column(&wide[4], "check ·")
+            column(&wide[1], "confirm prod"),
+            column(&wide[4], "Check the worker")
         );
-        // Narrow: an item wraps under its own words, not under its mark.
-        let narrow = block(&row, 30);
-        assert!(narrow.len() > wide.len());
-        let first = narrow
+        assert_eq!(
+            column(&wide[1], "confirm prod"),
+            column(&wide[3], "clears when")
+        );
+        // Without room for the detail the description takes the line and
+        // wraps under itself.
+        let narrow = block(&row, 44);
+        assert_eq!(
+            narrow[1..4],
+            [
+                "● since 11:36   confirm prod logs, then open",
+                "                the PR retiring the old path",
+                "⊘ before merge  prod secret missing from the",
+            ]
+        );
+        // A slug too long for the line breaks after a hyphen, its mark
+        // with it, and is never cut.
+        let mut slugged = self::row();
+        let mut until = gate("COZ-4702 merged");
+        until.conditions = vec![waits(
+            "wt:coz-4702-r2-retained-buckets-off-supabase:merged",
+            "coz-4702-r2-retained-buckets-off-supabase merged",
+            WatchTruth::NotYet,
+        )];
+        slugged.owes = vec![until];
+        assert_eq!(
+            block(&slugged, 64)[2..4],
+            [
+                "                clears when ○ coz-4702-r2-retained-buckets-off-",
+                "                supabase merged",
+            ]
+        );
+        // Too narrow for two columns: the "when" takes its own line and
+        // everything else starts under the header's text.
+        let stacked = block(&row, 18);
+        let first = stacked
             .iter()
-            .position(|line| line.contains("due since 11:36"))
+            .position(|line| line == "● since 11:36")
             .unwrap();
-        assert!(
-            narrow[first].starts_with("  ●  due since 11:36"),
-            "{narrow:?}"
-        );
-        assert!(
-            narrow[first + 1].starts_with("     ") && !narrow[first + 1][5..].starts_with(' '),
-            "{narrow:?}"
-        );
-        // A long prompt is cut so its line keeps the id in sight.
-        row.owes[0].what = "x".repeat(300);
-        let lines = block(&row, 200);
-        assert!(lines[2].ends_with("   wt done 93co6q") && lines[2].width() < 130);
+        assert_eq!(stacked[first + 1], "  confirm prod");
+        // A long prompt is cut so its line keeps the detail in sight.
+        row.owes[0].what = format!("{} and the rest", "x".repeat(300));
+        row.owes[0].headline = format!("{}…", "x".repeat(79));
+        let lines = block(&row, 80);
+        assert!(lines[1].ends_with("…  wt done 93co6q") && lines[1].width() == 80);
+        // The host cut its headline at 80 cells; a wider pane reads on.
+        let wide = block(&row, 400);
+        assert!(wide[1].contains("xxx and the rest"), "{}", wide[1]);
     }
 
     #[test]
@@ -3275,9 +3486,9 @@ mod tests {
         assert_eq!(
             plain(&styled),
             [
-                format!("{bell}  tells you when ○ merged"),
+                format!("{bell} tells you when ○ merged"),
                 format!(
-                    "{bell}  tells you at 17:00 (in 2h10m) · time to cut the release · by manager"
+                    "{bell} tells you at 17:00 (in 2h10m) · time to cut the release · by manager"
                 ),
             ]
         );
@@ -3291,7 +3502,7 @@ mod tests {
         assert_eq!(
             plain(&notify_lines(&held, &Times::new(), 200)),
             [format!(
-                "{bell}  tells you when ✓ merged · held: automations paused"
+                "{bell} tells you when ✓ merged · held: automations paused"
             )]
         );
         held.watches[0].held = false;
@@ -3305,7 +3516,7 @@ mod tests {
         let styled = notify_lines(&held, &Times::new(), 200);
         assert_eq!(
             plain(&styled),
-            [format!("{bell}  tells you when ? merged (no current data)")]
+            [format!("{bell} tells you when ? merged (no current data)")]
         );
         assert_eq!(styled[0].spans[0].style.fg, Some(theme::WARN));
         let mut busy = row.clone();
@@ -3319,12 +3530,12 @@ mod tests {
             .collect();
         let lines = plain(&notify_lines(&busy, &Times::new(), 200));
         assert_eq!(lines.len(), 7);
-        assert_eq!(lines[6], "+2 more (wt watch)");
+        assert_eq!(lines[6], "  +2 more (wt watch)");
         // Narrow panes wrap under the words, not under the bell.
         let narrow = notify_lines(&row, &Times::new(), 30);
         assert!(narrow.iter().all(|line| line.width() <= 30), "{narrow:?}");
         let narrow = plain(&narrow);
-        let hang = " ".repeat(bell.width() + 2);
+        let hang = " ".repeat(bell.width() + 1);
         assert!(narrow.len() > 2);
         assert!(
             narrow[2].starts_with(&hang) && !narrow[2][hang.len()..].starts_with(' '),
@@ -3338,7 +3549,7 @@ mod tests {
         waiting.owes = vec![check(
             VerifyStage::Staging,
             OwedState::Waiting,
-            "open /health",
+            "Look. STEPS: 1. open /health",
         )];
         waiting.watches = vec![WatchView {
             id: "tell44".into(),
@@ -3356,8 +3567,8 @@ mod tests {
         };
         let order = [
             at("● ready"),
-            at("owes"),
-            at("in staging"),
+            at("○ staging"),
+            at("V shows steps"),
             at("tells you when"),
             at("REVERT"),
             at("feature/eng-12"),

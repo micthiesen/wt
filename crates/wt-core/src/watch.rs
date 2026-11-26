@@ -340,6 +340,64 @@ impl WatchCondition {
         })
     }
 
+    /// The condition in as few words as name it, for a narrow column:
+    /// `production`, `production +7d`, `#3889 merged`, `Fri 18:12`.
+    pub fn label(&self, clock: LocalClock) -> String {
+        let stage_of = |stage: VerifyStage| stage.as_str();
+        let label = match &self.cond {
+            Condition::At { at_ms } => terse_instant(*at_ms, clock),
+            Condition::Own(RowState::Green) => "checks green".into(),
+            Condition::Own(RowState::Closed) => "PR closed".into(),
+            Condition::Own(state) => state.as_str().into(),
+            Condition::Pr { number, goal } => format!("#{number} {}", goal.as_str()),
+            Condition::Worktree { slug, state } => {
+                format!("{} {}", clipped(slug, LABEL_SLUG_CHARS), state.as_str())
+            }
+            Condition::Gone { slug } => format!("{} removed", clipped(slug, LABEL_SLUG_CHARS)),
+            Condition::Release(stage) => format!("{} release", stage_of(*stage)),
+            Condition::Check { id, .. } => format!("check {id}"),
+            Condition::Commit { oid, stage } => format!("{} {}", short(oid), stage_of(*stage)),
+            Condition::Unknown(text) => text.clone(),
+        };
+        match self.delay {
+            Some(delay) => format!("{label} +{delay}"),
+            None => label,
+        }
+    }
+
+    /// The stage this condition waits for a deploy to, while that deploy
+    /// has not happened: the row's own stage, another pull request's or
+    /// commit's, or the stage's next release.
+    pub fn awaits_stage(&self) -> Option<VerifyStage> {
+        if self.latched || self.first_held_at_ms.is_some() {
+            return None;
+        }
+        match self.cond {
+            Condition::Own(RowState::Staging) => Some(VerifyStage::Staging),
+            Condition::Own(RowState::Production) => Some(VerifyStage::Production),
+            Condition::Pr {
+                goal: PrGoal::Reached(stage),
+                ..
+            }
+            | Condition::Commit { stage, .. }
+            | Condition::Release(stage) => Some(stage),
+            _ => None,
+        }
+    }
+
+    /// When the condition is satisfied, where that is a known instant: a
+    /// time, or a condition that already holds and is waiting out its
+    /// delay (or has none left to wait out).
+    pub fn known_at_ms(&self) -> Option<i64> {
+        let delay = self.delay.map_or(0, Delay::as_ms);
+        match self.cond {
+            Condition::At { at_ms } => Some(at_ms.saturating_add(delay)),
+            _ => self
+                .first_held_at_ms
+                .map(|since| since.saturating_add(delay)),
+        }
+    }
+
     fn describe_in(&self, local: Local) -> String {
         let phrase = self.cond.phrase(local);
         match self.delay {
@@ -1099,6 +1157,62 @@ impl Local {
             Some(now_ms) if civil_from_days(day(now_ms)).0 == year => dated,
             _ => format!("{dated}, {year}"),
         }
+    }
+}
+
+/// Most characters of another worktree's slug in a condition's label.
+const LABEL_SLUG_CHARS: usize = 12;
+
+fn clipped(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max - 1).collect::<String>())
+    } else {
+        text.to_owned()
+    }
+}
+
+/// An instant in the fewest words that place it for a reader now: `22:32`
+/// today, `Fri 18:12` within six days either way, else `Dec 2 09:24`.
+pub fn terse_instant(at_ms: i64, clock: LocalClock) -> String {
+    let local = Local {
+        utc_offset_minutes: clock.utc_offset_minutes,
+        now_ms: Some(clock.now_ms),
+    };
+    let day = |ms| local.local(ms).div_euclid(DAY_MS);
+    let time = local.clock(at_ms);
+    match day(at_ms) - day(clock.now_ms) {
+        0 => time,
+        -6..=6 => format!(
+            "{} {time}",
+            // 1970-01-01 was a Thursday.
+            ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][day(at_ms).rem_euclid(7) as usize]
+        ),
+        _ => {
+            let (_, month, date) = civil_from_days(day(at_ms));
+            format!(
+                "{} {date} {time}",
+                MONTHS[(month - 1).clamp(0, 11) as usize]
+            )
+        }
+    }
+}
+
+/// A countdown in its two coarsest units, one from three days out: `6d`,
+/// `1d 21h`, `2h 5m`, `40m`.
+pub fn countdown(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    let (days, hours, minutes) = (
+        seconds / 86_400,
+        seconds % 86_400 / 3600,
+        seconds % 3600 / 60,
+    );
+    match (days, hours, minutes) {
+        (3.., _, _) | (1.., 0, _) => format!("{days}d"),
+        (1.., _, _) => format!("{days}d {hours}h"),
+        (0, 1.., 0) => format!("{hours}h"),
+        (0, 1.., _) => format!("{hours}h {minutes}m"),
+        (0, 0, 0) => "under 1m".to_owned(),
+        _ => format!("{minutes}m"),
     }
 }
 

@@ -381,14 +381,10 @@ impl Model {
         InputResult::Draw
     }
 
-    /// `V` is per row: it starts open once the post-merge check is due and
-    /// resets whenever the cursor lands on another row.
+    /// `V` is per row: the steps start hidden and hide again whenever the
+    /// cursor lands on another row.
     pub(super) fn reset_verification(&mut self) {
-        self.show_verification = self.selected_row().is_some_and(|row| {
-            row.owes
-                .iter()
-                .any(|item| item.kind == wt_core::OwedKind::Check && item.due())
-        });
+        self.show_verification = false;
     }
 
     /// Move the cursor one stop; at an edge, scroll the list to that edge

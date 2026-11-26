@@ -77,6 +77,9 @@ pub(crate) const NOTE: &str = "\u{F249}"; // sticky note: a mark someone added
 pub(crate) const OWED_DUE: &str = "●";
 pub(crate) const OWED_WAITING: &str = "○";
 pub(crate) const OWED_UNKNOWN: &str = "?";
+// Base font, unlike SLASH: one cell, so the text after it starts in the
+// column the other marks' text does.
+pub(crate) const OWED_GATE: &str = "⊘"; // the merge gate
 pub(crate) const OWED_CLOCK: &str = "◷"; // a landed row with nothing due yet
 pub(crate) const OWED_DONE: &str = "✓"; // a landed row that owes nothing
 
