@@ -26,7 +26,7 @@ pub use actions::{
     LiveSessionIdentity, NotifyChange, PickerAction, PickerOption, PrPin, RemovalRevision,
     RemovalSeen, ReplyOutcome, ReviewerOption, Seen, SessionMode, SessionSelection, SessionTarget,
     StatusClaim, TerminalHandoff, TextAction, UiAction, UiActions, UiModal, UiReply, UiRequest,
-    UrlKind, action_channel,
+    UrlKind, ViewState, action_channel,
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;

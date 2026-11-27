@@ -6,6 +6,10 @@
 //! corrupt a concurrent writer. Use metadata-only polling there, and keep
 //! `compare_contents(false)` so polling never opens those files. Other platforms
 //! keep notify's native backend.
+//!
+//! The Git and state watch set (`wt-sources::freshness`) does not use this
+//! poller on macOS: it already samples the same paths' metadata itself, and a
+//! second poller would walk the tree twice a second for nothing.
 
 #[cfg(target_os = "macos")]
 use std::time::Duration;

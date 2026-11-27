@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use tokio_util::sync::CancellationToken;
 use wt_github::GithubClient;
@@ -7,7 +11,7 @@ use wt_vcs::backup_owner;
 
 use crate::{
     chain::{RestackChain, StackStep},
-    git::{checked_git, git_sha, is_ancestor, process_message, run_git},
+    git::{checked_git, git_sha, is_ancestor, process_message, run_git, run_git_plain},
     service::{StackConfig, StackError, StackEvent, StackService},
 };
 
@@ -488,7 +492,7 @@ async fn replay_one(
     let mut last_error = String::new();
     let mut succeeded = false;
     for attempt in 1..=5_u64 {
-        let result = run_git(
+        let result = run_git_plain(
             runner,
             cwd,
             ["rebase", "--onto", &new_base_sha, anchor, &step.branch],
@@ -530,6 +534,30 @@ async fn replay_one(
                 .filter(|value| !value.is_empty())
                 .map(|value| String::from_utf8_lossy(value).into_owned())
                 .collect::<Vec<_>>();
+            if !names.is_empty() {
+                let stopped = format!("{}\n{}", output.stdout_text(), output.stderr_text());
+                // A failed or cancelled read must not leave the rebase stopped.
+                let reused = match continue_with_recorded_resolutions(
+                    runner,
+                    cwd,
+                    step,
+                    stopped,
+                    cancellation,
+                    on_event,
+                )
+                .await
+                {
+                    Ok(reused) => reused,
+                    Err(error) => {
+                        abort_rebase(runner, cwd).await;
+                        return Err(error);
+                    }
+                };
+                if reused {
+                    succeeded = true;
+                    break;
+                }
+            }
             let aborted = abort_rebase(runner, cwd).await;
             if !aborted {
                 return Ok(Err(ReplayFailure::Error(format!(
@@ -724,6 +752,114 @@ async fn local_branch_had(
             .stdout_text()
             .lines()
             .any(|entry| entry.trim() == remote_tip))
+}
+
+/// The most stops one replay continues through on recorded resolutions.
+const RECORDED_RESOLUTION_STOPS: usize = 64;
+
+/// The paths Git said it settled from a recording when a rebase stopped:
+/// `Resolved '<path>' using previous resolution.`, or `Staged` with
+/// `rerere.autoupdate`. A name Git had to quote does not match its plain
+/// form, which reads as not settled.
+fn settled_from_recordings(stopped: &str) -> BTreeSet<&str> {
+    stopped
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line
+                .strip_prefix("Resolved '")
+                .or_else(|| line.strip_prefix("Staged '"))?;
+            rest.strip_suffix("' using previous resolution.")
+        })
+        .collect()
+}
+
+/// Carry a stopped rebase on while Git's recorded resolutions settle every
+/// conflict of each stop. Only where the repository has `rerere.enabled`: a
+/// conflict someone already resolved by hand, met again unchanged (the base
+/// moved again mid-resolution, or each member of a stack hits it), then
+/// replays without a second person.
+///
+/// Every conflicted path needs Git's own word that a recording settled it.
+/// An empty `rerere remaining` is not that: rerere does not track a
+/// conflict without markers (a binary file both sides changed), and adding
+/// such a path would keep one side and drop the other. `stopped` is what
+/// the rebase printed when it stopped. `false` leaves the rebase in
+/// progress for the caller to abort, which restores the branch whole.
+async fn continue_with_recorded_resolutions(
+    runner: &ProcessRunner,
+    cwd: &Path,
+    step: &StackStep,
+    stopped: String,
+    cancellation: &CancellationToken,
+    on_event: &mut (dyn FnMut(StackEvent) + Send),
+) -> Result<bool, StackError> {
+    let enabled = run_git(
+        runner,
+        cwd,
+        ["config", "--type=bool", "--get", "rerere.enabled"],
+        cancellation,
+    )
+    .await?;
+    if !enabled.status.success() || enabled.stdout_text().trim() != "true" {
+        return Ok(false);
+    }
+    let mut stopped = stopped;
+    for _ in 0..RECORDED_RESOLUTION_STOPS {
+        let unmerged = run_git(
+            runner,
+            cwd,
+            ["diff", "--name-only", "--diff-filter=U", "-z"],
+            cancellation,
+        )
+        .await?;
+        let names = unmerged
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|value| !value.is_empty())
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect::<Vec<_>>();
+        if !unmerged.status.success() || names.is_empty() {
+            return Ok(false);
+        }
+        let settled = settled_from_recordings(&stopped);
+        if !names.iter().all(|name| settled.contains(name.as_str())) {
+            return Ok(false);
+        }
+        let remaining = run_git(runner, cwd, ["rerere", "remaining"], cancellation).await?;
+        if !remaining.status.success() || !remaining.stdout_text().trim().is_empty() {
+            return Ok(false);
+        }
+        let mut add = vec!["add".to_owned(), "--".to_owned()];
+        add.extend(names.iter().cloned());
+        if !run_git(runner, cwd, add, cancellation)
+            .await?
+            .status
+            .success()
+        {
+            return Ok(false);
+        }
+        on_event(StackEvent::Log(format!(
+            "{}: reused recorded resolutions for {}",
+            step.branch,
+            names.join(", ")
+        )));
+        let continued = run_git_plain(
+            runner,
+            cwd,
+            ["-c", "core.editor=true", "rebase", "--continue"],
+            cancellation,
+        )
+        .await?;
+        if continued.status.success() {
+            return Ok(true);
+        }
+        if !rebase_in_progress(runner, step, cancellation).await? {
+            return Ok(false);
+        }
+        stopped = format!("{}\n{}", continued.stdout_text(), continued.stderr_text());
+    }
+    Ok(false)
 }
 
 async fn abort_rebase(runner: &ProcessRunner, cwd: &Path) -> bool {

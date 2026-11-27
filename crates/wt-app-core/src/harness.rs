@@ -139,15 +139,26 @@ pub struct PreparedSession {
     pub cwd: PathBuf,
 }
 
-/// Session keys keep the same worktree while the board is suspended.
-/// Retain the selected agent identity and use the normal resume checks.
+/// Session keys keep the same worktree while the board is suspended. The
+/// worktree is resolved once for the handoff and the selected agent identity
+/// is retained; each key then needs only the normal tmux resume checks.
 pub struct SessionNavigation<'a> {
     context: &'a AppContext,
+    app: AppHarness,
     key: Option<String>,
+    worktree: Option<AgentTarget>,
     agent: Option<wt_tui::SessionSelection>,
+    /// The attached agent slot and the tmux listing taken at attach, kept
+    /// until the worktree is known and `agent` can be built from them.
+    attached: Option<(String, Vec<SessionInfo>)>,
 }
 
 impl<'a> SessionNavigation<'a> {
+    /// Navigation for an attach prepared elsewhere. One tmux listing records
+    /// which slot was attached; the worktree is read from Git only if a
+    /// session key is pressed. [`enter_session`] and
+    /// [`enter_selected_session`] need neither read: they build it from the
+    /// request's own.
     pub async fn new(
         context: &'a AppContext,
         key: Option<String>,
@@ -156,65 +167,104 @@ impl<'a> SessionNavigation<'a> {
     ) -> Result<Self> {
         let mut navigation = Self {
             context,
+            app: AppHarness::new(context),
             key,
+            worktree: None,
             agent: None,
+            attached: None,
         };
-        // Switching is a convenience: the first attach is already prepared
-        // and must not be refused because its identity cannot be retained.
-        // Without a retained agent the session keys return to the board, so
-        // a later F12 can never land on a different agent. Re-entry through
-        // `next` stays fail-closed.
-        if target == SessionTarget::Harness
-            && navigation.key.is_some()
-            && let Err(error) = navigation.retain_agent(prepared).await
-        {
-            tracing::warn!(error = %format!("{error:#}"), "session switching disabled for this attach");
-            navigation.agent = None;
-            navigation.key = None;
+        if target == SessionTarget::Harness && navigation.key.is_some() {
+            match navigation.attached_slot(prepared).await {
+                Ok(attached) => navigation.attached = Some(attached),
+                Err(error) => navigation.disable(&error),
+            }
         }
         Ok(navigation)
     }
 
-    async fn retain_agent(&mut self, prepared: &PreparedSession) -> Result<()> {
-        let app = AppHarness::new(self.context);
-        let agent = session_commands::resolve_target(
-            self.context,
-            self.key.as_deref(),
-            SessionTarget::Harness,
+    /// Navigation from what the session request already resolved: the target
+    /// and, for an agent, the attached slot with the tmux listing it was in.
+    fn begin(
+        context: &'a AppContext,
+        app: AppHarness,
+        key: Option<String>,
+        target: SessionTarget,
+        agent: AgentTarget,
+        slot: Option<(String, Vec<SessionInfo>)>,
+    ) -> Self {
+        let worktree = matches!(
+            target,
+            SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff
         )
-        .await?;
-        let live = app.session_inventory(self.context).await?;
+        .then_some(agent);
+        let mut navigation = Self {
+            context,
+            app,
+            key,
+            worktree,
+            agent: None,
+            attached: None,
+        };
+        if target == SessionTarget::Harness && navigation.key.is_some() {
+            let retained = match (&navigation.worktree, &slot) {
+                (Some(worktree), Some((slot, live))) => {
+                    retained_agent(worktree, navigation.key.clone(), live, slot)
+                }
+                _ => Err(anyhow::anyhow!("agent session ended before attachment")),
+            };
+            match retained {
+                Ok(agent) => navigation.agent = Some(agent),
+                Err(error) => navigation.disable(&error),
+            }
+        }
+        navigation
+    }
+
+    // Switching is a convenience: the first attach is already prepared and
+    // must not be refused because its identity cannot be retained. Without a
+    // retained agent the session keys return to the board, so a later F12
+    // can never land on a different agent. Re-entry through `next` stays
+    // fail-closed.
+    fn disable(&mut self, error: &anyhow::Error) {
+        tracing::warn!(error = %format!("{error:#}"), "session switching disabled for this attach");
+        self.agent = None;
+        self.attached = None;
+        self.key = None;
+    }
+
+    async fn attached_slot(
+        &self,
+        prepared: &PreparedSession,
+    ) -> Result<(String, Vec<SessionInfo>)> {
         let attached = prepared
             .args
             .last()
             .and_then(|arg| arg.to_str())
             .and_then(|arg| arg.strip_prefix('='))
             .context("agent attachment has no exact tmux target")?;
+        let live = self.app.session_inventory(self.context).await?;
         let slot = live
             .iter()
             .find(|slot| slot.id == attached || slot.name == attached)
-            .context("agent session ended before attachment")?;
-        self.agent = session_commands::picker_entries(
-            &HarnessId::ALL,
-            &agent,
-            self.key.clone(),
-            SessionTarget::Harness,
-            &[],
-            &live,
-        )
-        .into_iter()
-        .find(|entry| {
-            entry
-                .selection
-                .live_slot
-                .as_ref()
-                .is_some_and(|identity| identity.id == slot.id)
-        })
-        .map(|entry| entry.selection);
-        if self.agent.is_none() {
-            bail!("agent attachment does not belong to the selected worktree");
+            .context("agent session ended before attachment")?
+            .id
+            .clone();
+        Ok((slot, live))
+    }
+
+    /// The handoff's worktree, read from Git the first time it is needed.
+    async fn worktree(&mut self) -> Result<AgentTarget> {
+        if let Some(worktree) = &self.worktree {
+            return Ok(worktree.clone());
         }
-        Ok(())
+        let worktree = session_commands::resolve_target(
+            self.context,
+            self.key.as_deref(),
+            SessionTarget::Harness,
+        )
+        .await?;
+        self.worktree = Some(worktree.clone());
+        Ok(worktree)
     }
 
     pub async fn next(&mut self, code: Option<i32>) -> Result<Option<PreparedSession>> {
@@ -225,20 +275,92 @@ impl<'a> SessionNavigation<'a> {
             _ => return Ok(None),
         };
         // Special slots have no worktree key. Keep their board-return behavior.
-        if self.key.is_none() {
+        let Some(key) = self.key.clone() else {
             return Ok(None);
+        };
+        let worktree = self.worktree().await?;
+        // The board cannot remove this checkout during its own handoff, but
+        // `wt rm` from another process can, and tmux would start a session
+        // for a missing directory somewhere else.
+        if !worktree.cwd.is_dir() {
+            bail!("selected worktree no longer exists");
         }
-        if target == SessionTarget::Harness
-            && let Some(agent) = &self.agent
+        if target != SessionTarget::Harness {
+            return terminal_session(self.context, &self.app, &worktree, target)
+                .await
+                .map(Some);
+        }
+        // The identity comes from the listing taken at attach, so a slot
+        // replaced since then fails the witness check below.
+        if self.agent.is_none()
+            && let Some((slot, live)) = self.attached.take()
         {
-            return prepare_session(self.context, agent).await.map(Some);
+            match retained_agent(&worktree, Some(key.clone()), &live, &slot) {
+                Ok(agent) => self.agent = Some(agent),
+                // Without the attached agent's identity a later key must
+                // not pick an agent afresh.
+                Err(error) => {
+                    self.key = None;
+                    return Err(error);
+                }
+            }
         }
-        let prepared = ui_session(self.context, self.key.clone(), target).await?;
-        if target == SessionTarget::Harness {
-            self.retain_agent(&prepared).await?;
+        if let Some(agent) = &self.agent {
+            let attached =
+                session_commands::prepare_selected(self.context, &self.app, worktree, agent, None)
+                    .await?;
+            return Ok(Some(attached.prepared));
         }
-        Ok(Some(prepared))
+        let attached = agent_session(
+            self.context,
+            &self.app,
+            &worktree,
+            Some(key.clone()),
+            target,
+            None,
+            None,
+        )
+        .await?;
+        let slot = attached
+            .slot
+            .as_deref()
+            .context("agent session ended before attachment")?;
+        self.agent = Some(retained_agent(&worktree, Some(key), &attached.live, slot)?);
+        Ok(Some(attached.prepared))
     }
+}
+
+/// The picker selection for the agent slot a handoff attached, found by its
+/// tmux id or name in `live`. It carries the slot's identity witness, so a
+/// later switch back refuses a slot that was replaced meanwhile.
+fn retained_agent(
+    worktree: &AgentTarget,
+    key: Option<String>,
+    live: &[SessionInfo],
+    attached: &str,
+) -> Result<wt_tui::SessionSelection> {
+    let slot = live
+        .iter()
+        .find(|slot| slot.id == attached || slot.name == attached)
+        .context("agent session ended before attachment")?;
+    session_commands::picker_entries(
+        &HarnessId::ALL,
+        worktree,
+        key,
+        SessionTarget::Harness,
+        &[],
+        live,
+    )
+    .into_iter()
+    .find(|entry| {
+        entry
+            .selection
+            .live_slot
+            .as_ref()
+            .is_some_and(|identity| identity.id == slot.id)
+    })
+    .map(|entry| entry.selection)
+    .context("agent attachment does not belong to the selected worktree")
 }
 
 fn harness_session_environment(
@@ -531,6 +653,18 @@ impl AppHarness {
         self
     }
 
+    /// Bound a Claude send from this harness, for a caller that cannot wait
+    /// out a person: `human` is how long the session may keep waiting on
+    /// one, `queue` how long the send queues behind another delivery.
+    pub fn with_claude_turn_limits(
+        mut self,
+        human: std::time::Duration,
+        queue: std::time::Duration,
+    ) -> Self {
+        self.service = self.service.with_claude_turn_limits(human, queue);
+        self
+    }
+
     pub async fn session_inventory(&self, context: &AppContext) -> Result<Vec<SessionInfo>> {
         self.tmux
             .list_sessions(&context.cancellation)
@@ -617,23 +751,28 @@ impl AppHarness {
 
     pub async fn routes(&self, context: &AppContext) -> Result<Vec<AgentRoute>> {
         let records = context.repository.inventory(&context.cancellation).await?;
+        let sessions = self.tmux.list_sessions(&context.cancellation).await.ok();
+        Ok(self.routes_from(&records, sessions.as_deref()))
+    }
+
+    /// Routes for an inventory and a tmux listing the caller already holds.
+    /// `None` is a listing that could not be read, never an empty server.
+    fn routes_from(
+        &self,
+        records: &[wt_vcs::WorktreeRecord],
+        sessions: Option<&[SessionInfo]>,
+    ) -> Vec<AgentRoute> {
         let targets = self.targets_from_records(records.iter());
-        let sessions = self.tmux.list_sessions(&context.cancellation).await;
-        let (names, ids) = match sessions {
-            Ok(sessions) => (
-                Some(
-                    sessions
-                        .iter()
-                        .map(|s| s.name.clone())
-                        .collect::<BTreeSet<_>>(),
-                ),
-                sessions,
-            ),
-            Err(_) => (None, Vec::new()),
-        };
+        let names = sessions.map(|sessions| {
+            sessions
+                .iter()
+                .map(|s| s.name.clone())
+                .collect::<BTreeSet<_>>()
+        });
+        let ids = sessions.unwrap_or_default();
         let known = targets.iter().map(|target| target.slug.clone()).collect();
         let primary = self.primary();
-        Ok(targets
+        targets
             .into_iter()
             .map(|target| {
                 let choice = match &names {
@@ -648,13 +787,13 @@ impl AppHarness {
                         live: None,
                     },
                     Some(names) => {
-                        let live = live_harnesses(&target.slug, names, &known, &ids);
+                        let live = live_harnesses(&target.slug, names, &known, ids);
                         select_harness(self.pinned(&target.slug, target.kind), primary, live)
                     }
                 };
                 AgentRoute { target, choice }
             })
-            .collect())
+            .collect()
     }
 
     /// The slot agents a session picker can name, with the same checks as
@@ -673,25 +812,12 @@ impl AppHarness {
 
     /// The agent for one slot target, or `None` when its checkout is absent.
     pub fn slot_agent(&self, target: wt_tui::SessionTarget) -> Option<AgentTarget> {
-        use wt_tui::SessionTarget as Slot;
-        match target {
-            Slot::Manager => Some(special_target(
-                "manager",
-                self.main_clone.clone(),
-                Some("manager".into()),
-            )),
-            Slot::Main => Some(special_target("main", self.main_clone.clone(), None)),
-            Slot::WtSource => self
-                .wt_source
-                .as_ref()
-                .filter(|path| path.is_dir())
-                .map(|path| special_target("wt", path.clone(), None)),
-            Slot::Dotfiles => self
-                .dotfiles
-                .is_dir()
-                .then(|| special_target("dotfiles", self.dotfiles.clone(), None)),
-            Slot::Harness | Slot::Shell | Slot::Diff => None,
-        }
+        slot_agent_at(
+            &self.main_clone,
+            &self.dotfiles,
+            self.wt_source.as_deref(),
+            target,
+        )
     }
 
     pub fn targets(&self, snapshots: &[wt_vcs::WorktreeSnapshot]) -> Vec<AgentTarget> {
@@ -1026,6 +1152,29 @@ fn special_target(slug: &str, cwd: PathBuf, managed_name: Option<String>) -> Age
         remote: false,
     }
 }
+fn slot_agent_at(
+    main_clone: &Path,
+    dotfiles: &Path,
+    wt_source: Option<&Path>,
+    target: SessionTarget,
+) -> Option<AgentTarget> {
+    use SessionTarget as Slot;
+    match target {
+        Slot::Manager => Some(special_target(
+            "manager",
+            main_clone.to_owned(),
+            Some("manager".into()),
+        )),
+        Slot::Main => Some(special_target("main", main_clone.to_owned(), None)),
+        Slot::WtSource => wt_source
+            .filter(|path| path.is_dir())
+            .map(|path| special_target("wt", path.to_owned(), None)),
+        Slot::Dotfiles => dotfiles
+            .is_dir()
+            .then(|| special_target("dotfiles", dotfiles.to_owned(), None)),
+        Slot::Harness | Slot::Shell | Slot::Diff => None,
+    }
+}
 
 /// Prepare a tmux client ticket for the UI controller. This function may
 /// create/resume the detached session but never takes terminal ownership.
@@ -1047,46 +1196,127 @@ pub async fn ui_session_with_harness(
     selected_harness: Option<HarnessId>,
 ) -> Result<PreparedSession> {
     let app = AppHarness::new(context);
-    let default_diff_base = format!("origin/{}", context.config.branch.base);
-    let (slug, cwd, managed_name, kind, diff_base) = match target {
+    Ok(enter(context, &app, key, target, selected_harness, None)
+        .await?
+        .prepared)
+}
+
+/// Prepare a session together with the switch-key state for its handoff.
+/// Both come from one resolution of the target: one worktree inventory and
+/// one tmux listing decide what is attached and whose identity is retained.
+pub async fn enter_session<'a>(
+    context: &'a AppContext,
+    key: Option<String>,
+    target: SessionTarget,
+    selected_harness: Option<HarnessId>,
+) -> Result<(PreparedSession, SessionNavigation<'a>)> {
+    let app = AppHarness::new(context);
+    let entered = enter(context, &app, key.clone(), target, selected_harness, None).await?;
+    let navigation =
+        SessionNavigation::begin(context, app, key, target, entered.agent, entered.slot);
+    Ok((entered.prepared, navigation))
+}
+
+/// [`enter_session`] for a caller that names a worktree by slug, as the
+/// remote worker's command line does. The slug is found in the same inventory
+/// the session is prepared from. Slot targets have no slug and ignore it.
+pub async fn enter_session_by_slug<'a>(
+    context: &'a AppContext,
+    slug: &str,
+    target: SessionTarget,
+    selected_harness: Option<HarnessId>,
+) -> Result<(PreparedSession, SessionNavigation<'a>)> {
+    if !matches!(
+        target,
+        SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff
+    ) {
+        return enter_session(context, None, target, selected_harness).await;
+    }
+    let records = context.repository.inventory(&context.cancellation).await?;
+    let key = records
+        .iter()
+        .find(|record| !record.is_main && record.target.slug() == slug)
+        .map(|record| wt_core::worktree_target_key(&record.target))
+        .with_context(|| format!("worktree not found on this host: {slug}"))?;
+    let app = AppHarness::new(context);
+    let entered = enter(
+        context,
+        &app,
+        Some(key.clone()),
+        target,
+        selected_harness,
+        Some(records),
+    )
+    .await?;
+    let navigation =
+        SessionNavigation::begin(context, app, Some(key), target, entered.agent, entered.slot);
+    Ok((entered.prepared, navigation))
+}
+
+/// [`prepare_session`] together with the switch-key state for its handoff,
+/// from the same single resolution as [`enter_session`].
+pub async fn enter_selected_session<'a>(
+    context: &'a AppContext,
+    selection: &wt_tui::SessionSelection,
+) -> Result<(PreparedSession, SessionNavigation<'a>)> {
+    session_commands::ensure_harness_selection(selection.target)?;
+    let app = AppHarness::new(context);
+    let agent =
+        session_commands::resolve_target(context, selection.key.as_deref(), selection.target)
+            .await?;
+    let attached =
+        session_commands::prepare_selected(context, &app, agent.clone(), selection, None).await?;
+    let slot = attached.slot.map(|slot| (slot, attached.live));
+    let navigation = SessionNavigation::begin(
+        context,
+        app,
+        selection.key.clone(),
+        selection.target,
+        agent,
+        slot,
+    );
+    Ok((attached.prepared, navigation))
+}
+
+/// What one session request resolved and attached.
+struct Entered {
+    prepared: PreparedSession,
+    agent: AgentTarget,
+    /// The agent slot's tmux id and the listing it was found in.
+    slot: Option<(String, Vec<SessionInfo>)>,
+}
+
+async fn enter(
+    context: &AppContext,
+    app: &AppHarness,
+    key: Option<String>,
+    target: SessionTarget,
+    selected_harness: Option<HarnessId>,
+    records: Option<Vec<wt_vcs::WorktreeRecord>>,
+) -> Result<Entered> {
+    let (agent, records) = match target {
         SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
             let key = key
                 .as_deref()
                 .context("worktree session requires a worktree key")?;
-            let selected = session_commands::resolve_target(context, Some(key), target).await?;
-            let slug = selected.slug;
-            let saved_base = if target == SessionTarget::Diff {
-                let state = context
-                    .database
-                    .call(|store| Ok(store.read_wt_state()?))
-                    .await?;
-                state
-                    .get("slugs")
-                    .and_then(|slugs| slugs.get(&slug))
-                    .and_then(|entry| entry.get("baseBranch"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            } else {
-                None
+            let records = match records {
+                Some(records) => records,
+                None => context.repository.inventory(&context.cancellation).await?,
             };
-            let diff_base = saved_base
-                .map(|base| format!("origin/{base}"))
-                .unwrap_or_else(|| default_diff_base.clone());
-            (slug, selected.cwd, None, target, diff_base)
+            let agent = session_commands::worktree_target(&records, key)?;
+            (agent, Some(records))
         }
         SessionTarget::Manager => (
-            "manager".into(),
-            context.config.paths.main_clone.clone(),
-            Some("manager".into()),
-            target,
-            default_diff_base.clone(),
+            special_target(
+                "manager",
+                context.config.paths.main_clone.clone(),
+                Some("manager".into()),
+            ),
+            None,
         ),
         SessionTarget::Main => (
-            "main".into(),
-            context.config.paths.main_clone.clone(),
+            special_target("main", context.config.paths.main_clone.clone(), None),
             None,
-            target,
-            default_diff_base.clone(),
         ),
         SessionTarget::WtSource => {
             let path = context
@@ -1096,13 +1326,7 @@ pub async fn ui_session_with_harness(
                 .as_ref()
                 .filter(|path| path.is_dir())
                 .context(unavailable_source_message())?;
-            (
-                "wt".into(),
-                path.clone(),
-                None,
-                target,
-                default_diff_base.clone(),
-            )
+            (special_target("wt", path.clone(), None), None)
         }
         SessionTarget::Dotfiles => {
             let path = &context.config.paths.dotfiles;
@@ -1112,148 +1336,186 @@ pub async fn ui_session_with_harness(
                     path.display()
                 );
             }
-            (
-                "dotfiles".into(),
-                path.clone(),
-                None,
-                target,
-                default_diff_base.clone(),
-            )
+            (special_target("dotfiles", path.clone(), None), None)
         }
     };
-    let session = match kind {
-        SessionTarget::Shell => {
-            let name = format!("{slug}-shell");
-            if !app
-                .tmux
-                .session_exists(&name, &context.cancellation)
-                .await?
-            {
-                let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-                app.tmux
-                    .create_session(
-                        &CreateSession {
-                            name: name.clone(),
-                            cwd: cwd.clone(),
-                            command: vec![shell.to_string_lossy().into_owned()],
-                            width: None,
-                            height: None,
-                        },
-                        &context.cancellation,
-                    )
-                    .await?;
-            }
-            name
-        }
-        SessionTarget::Diff => {
-            let name = format!("{slug}-diff");
-            if !app
-                .tmux
-                .session_exists(&name, &context.cancellation)
-                .await?
-            {
-                let command = resolve_diff_command(&context.config.diff.command, &diff_base);
-                app.tmux
-                    .create_session(
-                        &CreateSession {
-                            name: name.clone(),
-                            cwd: cwd.clone(),
-                            command: vec!["/bin/sh".into(), "-lc".into(), command],
-                            width: None,
-                            height: None,
-                        },
-                        &context.cancellation,
-                    )
-                    .await?;
-            }
-            name
-        }
-        SessionTarget::Harness
-        | SessionTarget::Manager
-        | SessionTarget::Main
-        | SessionTarget::WtSource
-        | SessionTarget::Dotfiles => {
-            let harness_id = match selected_harness {
-                Some(id) => id,
-                None => app
-                    .routes(context)
-                    .await?
-                    .into_iter()
-                    .find(|route| route.target.slug == slug)
-                    .context("selected session target is unavailable")?
-                    .choice
-                    .selected
-                    .context("could not inspect wt's tmux sessions; no session was started")?,
-            };
-            if selected_harness.is_none()
-                && let Some(prepared) =
-                    session_commands::prepare_live_session(context, key.clone(), target, harness_id)
-                        .await?
-            {
-                return Ok(prepared);
-            }
-            let request = HarnessSpawnRequest {
-                worktree_path: cwd.clone(),
-                slug: slug.clone(),
-                managed_name: managed_name.clone(),
-                resume_session_id: None,
-                display_label: None,
-            };
-            let tmux_name = slot_name(&slug, managed_name.as_deref(), harness_id);
-            if !app
-                .tmux
-                .session_exists(&tmux_name, &context.cancellation)
-                .await?
-            {
-                let discovered = app
-                    .service
-                    .discover(
-                        harness_id,
-                        &DiscoveryRequest {
-                            slug: slug.clone(),
-                            worktree_path: cwd.clone(),
-                            live_session_id: None,
-                        },
-                        &[],
-                        &context.cancellation,
-                    )
-                    .await?;
-                let resume = if harness_id == HarnessId::Claude {
-                    None
-                } else {
-                    // Special targets can share a checkout (manager and main).
-                    // History's directory match cannot establish slot ownership.
-                    let owned: BTreeSet<String> = app
-                        .session_inventory(context)
-                        .await?
-                        .into_iter()
-                        .filter(|slot| slot.name != tmux_name)
-                        .filter_map(|slot| slot.harness_session_id)
-                        .collect();
-                    primary_single_slot_session(&discovered, &owned)
-                        .map(|entry| entry.session_id.clone())
-                };
-                app.ensure_started(
-                    harness_id,
-                    &HarnessSpawnRequest {
-                        resume_session_id: resume,
-                        ..request
-                    },
-                    context,
-                )
+    if matches!(target, SessionTarget::Shell | SessionTarget::Diff) {
+        let prepared = terminal_session(context, app, &agent, target).await?;
+        return Ok(Entered {
+            prepared,
+            agent,
+            slot: None,
+        });
+    }
+    let attached =
+        agent_session(context, app, &agent, key, target, selected_harness, records).await?;
+    Ok(Entered {
+        prepared: attached.prepared,
+        agent,
+        slot: attached.slot.map(|slot| (slot, attached.live)),
+    })
+}
+
+/// Attach to a worktree's shell or diff session, creating it when absent.
+async fn terminal_session(
+    context: &AppContext,
+    app: &AppHarness,
+    agent: &AgentTarget,
+    target: SessionTarget,
+) -> Result<PreparedSession> {
+    let (name, shortcut) = match target {
+        SessionTarget::Shell => (format!("{}-shell", agent.slug), SessionShortcut::Shell),
+        SessionTarget::Diff => (format!("{}-diff", agent.slug), SessionShortcut::Diff),
+        _ => bail!("not a shell or diff session target"),
+    };
+    if !app
+        .tmux
+        .session_exists(&name, &context.cancellation)
+        .await?
+    {
+        let command = if target == SessionTarget::Shell {
+            let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+            vec![shell.to_string_lossy().into_owned()]
+        } else {
+            let slug = agent.slug.clone();
+            let state = context
+                .database
+                .call(|store| Ok(store.read_wt_state()?))
                 .await?;
-            } else if harness_id == HarnessId::Pi {
-                app.validate_live_pi(&request, context).await?;
-            }
-            tmux_name
+            let base = state
+                .get("slugs")
+                .and_then(|slugs| slugs.get(&slug))
+                .and_then(|entry| entry.get("baseBranch"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&context.config.branch.base);
+            let command =
+                resolve_diff_command(&context.config.diff.command, &format!("origin/{base}"));
+            vec!["/bin/sh".into(), "-lc".into(), command]
+        };
+        app.tmux
+            .create_session(
+                &CreateSession {
+                    name: name.clone(),
+                    cwd: agent.cwd.clone(),
+                    command,
+                    width: None,
+                    height: None,
+                },
+                &context.cancellation,
+            )
+            .await?;
+    }
+    Ok(app.attach_command_as(&name, &agent.cwd, shortcut))
+}
+
+/// Attach to the target's agent, resuming its live slot or starting one.
+/// One tmux listing decides the harness, the slot and its identity witness;
+/// `records` is the request's worktree inventory when it already took one.
+async fn agent_session(
+    context: &AppContext,
+    app: &AppHarness,
+    agent: &AgentTarget,
+    key: Option<String>,
+    target: SessionTarget,
+    selected_harness: Option<HarnessId>,
+    records: Option<Vec<wt_vcs::WorktreeRecord>>,
+) -> Result<session_commands::Attached> {
+    let live = app
+        .tmux
+        .list_sessions(&context.cancellation)
+        .await
+        .context("could not inspect wt's tmux sessions; no session was started")?;
+    let harness_id = match selected_harness {
+        Some(id) => id,
+        None => {
+            // Another worktree's slug can equal one of this target's slot
+            // names, so the choice needs every slug, not only this one.
+            let records = match records {
+                Some(records) => records,
+                None => context.repository.inventory(&context.cancellation).await?,
+            };
+            app.routes_from(&records, Some(&live))
+                .into_iter()
+                .find(|route| route.target.slug == agent.slug)
+                .context("selected session target is unavailable")?
+                .choice
+                .selected
+                .context("could not inspect wt's tmux sessions; no session was started")?
         }
     };
-    let shortcut = match kind {
-        SessionTarget::Shell => SessionShortcut::Shell,
-        SessionTarget::Diff => SessionShortcut::Diff,
-        _ => SessionShortcut::Harness,
+    if selected_harness.is_none()
+        && let Some(attached) = session_commands::prepare_live_session(
+            context, app, agent, key, target, harness_id, &live,
+        )
+        .await?
+    {
+        return Ok(attached);
+    }
+    let request = HarnessSpawnRequest {
+        worktree_path: agent.cwd.clone(),
+        slug: agent.slug.clone(),
+        managed_name: agent.managed_name.clone(),
+        resume_session_id: None,
+        display_label: None,
     };
-    Ok(app.attach_command_as(&session, &cwd, shortcut))
+    let tmux_name = slot_name(&agent.slug, agent.managed_name.as_deref(), harness_id);
+    let prepared = app.attach_command(&tmux_name, &agent.cwd);
+    if let Some(slot) = live.iter().find(|slot| slot.name == tmux_name) {
+        if harness_id == HarnessId::Pi {
+            app.validate_live_pi(&request, context).await?;
+        }
+        return Ok(session_commands::Attached {
+            prepared,
+            slot: Some(slot.id.clone()),
+            live,
+        });
+    }
+    // Claude's slot is its checkout and name; only the single-slot harnesses
+    // pick a conversation to resume from their history.
+    let resume = if harness_id == HarnessId::Claude {
+        None
+    } else {
+        let discovered = app
+            .service
+            .discover(
+                harness_id,
+                &DiscoveryRequest {
+                    slug: agent.slug.clone(),
+                    worktree_path: agent.cwd.clone(),
+                    live_session_id: None,
+                },
+                &[],
+                &context.cancellation,
+            )
+            .await?;
+        // Special targets can share a checkout (manager and main).
+        // History's directory match cannot establish slot ownership.
+        let owned: BTreeSet<String> = live
+            .iter()
+            .filter(|slot| slot.name != tmux_name)
+            .filter_map(|slot| slot.harness_session_id.clone())
+            .collect();
+        primary_single_slot_session(&discovered, &owned).map(|entry| entry.session_id.clone())
+    };
+    app.ensure_started(
+        harness_id,
+        &HarnessSpawnRequest {
+            resume_session_id: resume,
+            ..request
+        },
+        context,
+    )
+    .await?;
+    let live = app.session_inventory(context).await?;
+    let slot = live
+        .iter()
+        .find(|slot| slot.name == tmux_name)
+        .map(|slot| slot.id.clone());
+    Ok(session_commands::Attached {
+        prepared,
+        slot,
+        live,
+    })
 }
 
 fn primary_single_slot_session<'a>(
@@ -1515,6 +1777,7 @@ mod tests {
             .await
             .unwrap();
             assert!(navigation.agent.is_none());
+            assert!(navigation.attached.is_none());
             assert!(navigation.key.is_none());
             // Every session key returns to the board.
             for code in [110, 111, 112] {
@@ -1577,19 +1840,20 @@ mod tests {
             let shell = navigation.next(Some(110)).await?.unwrap();
             assert_eq!(shell.cwd, agent.cwd);
             assert_eq!(shell.args.last().unwrap(), "=one-shell");
-            let selected = navigation
-                .agent
-                .as_ref()
-                .unwrap()
-                .live_slot
-                .as_ref()
-                .unwrap()
-                .id
-                .clone();
             let resumed = navigation.next(Some(112)).await?.unwrap();
             assert_eq!(
                 resumed.args.last().unwrap().to_string_lossy(),
-                format!("={selected}")
+                format!("={}", codex.id)
+            );
+            assert_eq!(
+                navigation
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.live_slot.clone()),
+                Some(wt_tui::LiveSessionIdentity {
+                    id: codex.id.clone(),
+                    created_at: codex.created_at,
+                })
             );
             app.tmux
                 .kill_session("one-codex", &fixture.ctx.cancellation)
@@ -1601,6 +1865,252 @@ mod tests {
             assert!(
                 error.to_string().contains("live session changed"),
                 "{error:#}"
+            );
+            Ok(())
+        }
+        .await;
+        app.tmux
+            .kill_server(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+        result.unwrap();
+    }
+
+    /// A handoff resolves its worktree and agent once. Its switch keys work
+    /// from that resolution: they do not list worktrees again, and they do
+    /// not follow a checkout that another process removed.
+    #[tokio::test]
+    async fn a_handoff_keeps_its_resolution_for_every_switch_key() {
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-handoff-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy(),
+        );
+        let app = AppHarness::new(&fixture.ctx);
+        let agent =
+            session_commands::resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+                .await
+                .unwrap();
+        app.tmux
+            .create_session(
+                &CreateSession {
+                    name: "one-codex".into(),
+                    cwd: agent.cwd.clone(),
+                    command: vec!["sleep".into(), "30".into()],
+                    width: None,
+                    height: None,
+                },
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        let result: Result<()> = async {
+            let slot = app
+                .session_inventory(&fixture.ctx)
+                .await?
+                .into_iter()
+                .find(|slot| slot.name == "one-codex")
+                .context("fixture slot")?;
+            let (prepared, mut navigation) = enter_session(
+                &fixture.ctx,
+                Some("one".into()),
+                SessionTarget::Harness,
+                None,
+            )
+            .await?;
+            assert_eq!(
+                prepared.args.last().unwrap().to_string_lossy(),
+                format!("={}", slot.id)
+            );
+            assert_eq!(
+                navigation
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.live_slot.clone()),
+                Some(wt_tui::LiveSessionIdentity {
+                    id: slot.id.clone(),
+                    created_at: slot.created_at,
+                })
+            );
+            // Git can no longer list this repository's worktrees.
+            let git = fixture.ctx.config.paths.main_clone.join(".git");
+            let moved = fixture.ctx.config.paths.main_clone.join("git-moved");
+            fs::rename(&git, &moved)?;
+            let lost =
+                session_commands::resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+                    .await;
+            let shell = navigation.next(Some(110)).await;
+            let back = navigation.next(Some(112)).await;
+            fs::rename(&moved, &git)?;
+            assert!(lost.is_err(), "the fixture still lists worktrees");
+            let shell = shell?.context("shell key returned to the board")?;
+            assert_eq!(shell.cwd, agent.cwd);
+            assert_eq!(shell.args.last().unwrap(), "=one-shell");
+            let back = back?.context("agent key returned to the board")?;
+            assert_eq!(
+                back.args.last().unwrap().to_string_lossy(),
+                format!("={}", slot.id)
+            );
+            let gone = agent.cwd.with_extension("gone");
+            fs::rename(&agent.cwd, &gone)?;
+            let removed = navigation.next(Some(111)).await;
+            fs::rename(&gone, &agent.cwd)?;
+            let error = removed.err().context("a removed checkout got a session")?;
+            assert!(error.to_string().contains("no longer exists"), "{error:#}");
+            assert!(
+                !app.tmux
+                    .session_exists("one-diff", &fixture.ctx.cancellation)
+                    .await?
+            );
+            Ok(())
+        }
+        .await;
+        app.tmux
+            .kill_server(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+        result.unwrap();
+    }
+
+    /// The remote worker names its worktree by slug. Entry resolves it in the
+    /// one inventory the session is prepared from and keeps it for the keys.
+    #[tokio::test]
+    async fn a_worker_enters_by_slug_and_switches_without_listing_worktrees_again() {
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-by-slug-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy(),
+        );
+        let app = AppHarness::new(&fixture.ctx);
+        let agent =
+            session_commands::resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+                .await
+                .unwrap();
+        app.tmux
+            .create_session(
+                &CreateSession {
+                    name: "one-codex".into(),
+                    cwd: agent.cwd.clone(),
+                    command: vec!["sleep".into(), "30".into()],
+                    width: None,
+                    height: None,
+                },
+                &fixture.ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        let result: Result<()> = async {
+            let slot = app
+                .session_inventory(&fixture.ctx)
+                .await?
+                .into_iter()
+                .find(|slot| slot.name == "one-codex")
+                .context("fixture slot")?;
+            let missing =
+                enter_session_by_slug(&fixture.ctx, "absent", SessionTarget::Harness, None).await;
+            assert!(
+                missing
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("absent"))
+            );
+            let (prepared, mut navigation) =
+                enter_session_by_slug(&fixture.ctx, "one", SessionTarget::Harness, None).await?;
+            assert_eq!(
+                prepared.args.last().unwrap().to_string_lossy(),
+                format!("={}", slot.id)
+            );
+            let git = fixture.ctx.config.paths.main_clone.join(".git");
+            let moved = fixture.ctx.config.paths.main_clone.join("git-moved");
+            fs::rename(&git, &moved)?;
+            let shell = navigation.next(Some(110)).await;
+            let back = navigation.next(Some(112)).await;
+            fs::rename(&moved, &git)?;
+            assert_eq!(
+                shell?.context("shell key")?.args.last().unwrap(),
+                "=one-shell"
+            );
+            assert_eq!(
+                back?
+                    .context("agent key")?
+                    .args
+                    .last()
+                    .unwrap()
+                    .to_string_lossy(),
+                format!("={}", slot.id)
+            );
+            Ok(())
+        }
+        .await;
+        app.tmux
+            .kill_server(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+        result.unwrap();
+    }
+
+    /// Entering a cold Claude session returns once its tmux slot exists. A
+    /// Claude stopped at a startup prompt never registers, and the person
+    /// attached to the pane is the one who can answer it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entering_a_cold_claude_session_does_not_wait_for_it_to_register() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-cold-claude-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy(),
+        );
+        let bin = fixture._root.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("claude"), "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        fs::set_permissions(bin.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut app = AppHarness::new(&fixture.ctx);
+        app.service = app
+            .service
+            .clone()
+            .with_spawn_path(format!("{}:/usr/bin:/bin", bin.display()));
+        let agent =
+            session_commands::resolve_target(&fixture.ctx, Some("one"), SessionTarget::Harness)
+                .await
+                .unwrap();
+        let result: Result<()> = async {
+            let attached = agent_session(
+                &fixture.ctx,
+                &app,
+                &agent,
+                Some("one".into()),
+                SessionTarget::Harness,
+                Some(HarnessId::Claude),
+                None,
+            )
+            .await?;
+            assert_eq!(attached.prepared.args.last().unwrap(), "=one");
+            let slot = attached.slot.clone().context("the started slot")?;
+            // The unregistered slot is still the one the session keys return to.
+            let navigation = SessionNavigation::begin(
+                &fixture.ctx,
+                app.clone(),
+                Some("one".into()),
+                SessionTarget::Harness,
+                agent.clone(),
+                Some((slot.clone(), attached.live)),
+            );
+            assert_eq!(
+                navigation
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.live_slot.as_ref())
+                    .map(|identity| identity.id.clone()),
+                Some(slot)
             );
             Ok(())
         }

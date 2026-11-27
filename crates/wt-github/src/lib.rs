@@ -6,6 +6,7 @@
 mod checks;
 mod client;
 mod mutations;
+mod transport;
 mod types;
 
 pub use checks::{
@@ -16,6 +17,7 @@ pub use client::{GithubClient, GithubOptions, ROLES};
 pub use mutations::{
     AsyncMergeEndpoint, AsyncMergeOutcome, merge_arm_kind, parse_async_merge_response,
 };
+pub use transport::set_user_agent_version;
 pub use types::*;
 
 /// Route an ordinary GitHub pull request URL to Linear Reviews when selected.

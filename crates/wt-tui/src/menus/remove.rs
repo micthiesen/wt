@@ -158,6 +158,7 @@ mod tests {
             error: Some("delete /q/one manually".into()),
             job_id: "1-a".into(),
             checkout_absent: true,
+            ..Default::default()
         });
         let mut board = Board {
             rows: vec![row],
@@ -194,6 +195,7 @@ mod tests {
             error: Some("denied".into()),
             job_id: "1-a".into(),
             checkout_absent: false,
+            ..Default::default()
         });
         assert!(matches!(
             confirm(menu(&board, "one")).2,

@@ -660,6 +660,7 @@ mod tests {
             unresolved_threads_more: false,
             merged_at: None,
             closed_at: None,
+            queue_removal: None,
         }
     }
 

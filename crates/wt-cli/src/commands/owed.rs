@@ -13,7 +13,7 @@ use wt_core::{
     Landing, OwedItem, OwedKind, OwedPhase, OwedState, VerifyStage, WorkState, WorkStatusRecord,
     watch::{Condition, LocalClock},
 };
-use wt_ops::commands::resolve::resolve_worktree;
+use wt_ops::commands::resolve::Inventory;
 use wt_store::{CheckTargets, ChecksClosed, RemovedChecksClosed, RemovedWorktree};
 use wt_vcs::WorktreeRecord;
 
@@ -246,17 +246,13 @@ pub(crate) fn owed_text(who: &str, slug: &str, owed: &RowOwed, clock: LocalClock
 /// listed as waiting for a stage may already be due there.
 pub(crate) const LANDING_UNKNOWN: &str = "landing unknown: GitHub could not be read, so whether this work has merged is not known and what waits for a stage may already be due";
 
-/// Whether the command runs inside this worktree: the list then reads
-/// "This worktree owes".
-async fn is_own(ctx: &AppContext, record: &WorktreeRecord) -> bool {
-    resolve_worktree(ctx, None)
-        .await
-        .is_ok_and(|own| !own.is_main && own.target.slug() == record.target.slug())
-}
-
-/// How the list names the worktree it is about.
-pub(crate) async fn who(ctx: &AppContext, record: &WorktreeRecord) -> String {
-    if is_own(ctx, record).await {
+/// How the list names the worktree it is about: "This worktree" when the
+/// command runs inside it.
+pub(crate) fn who(inventory: &Inventory, record: &WorktreeRecord) -> String {
+    let own = inventory
+        .current()
+        .is_some_and(|own| !own.is_main && own.target.slug() == record.target.slug());
+    if own {
         OWN.to_owned()
     } else {
         record.target.slug().to_owned()
@@ -271,41 +267,72 @@ pub(crate) async fn read(ctx: &AppContext, record: &WorktreeRecord) -> Result<Ro
 /// [`read`] for a surface that also reports the row's phase, which needs
 /// the landing of a row that owes nothing too.
 async fn read_for(ctx: &AppContext, record: &WorktreeRecord, want: Want) -> Result<RowOwed> {
+    Ok(read_with_state(ctx, record, want).await?.1)
+}
+
+/// [`read_for`], with the state it was read from: a command that goes on to
+/// decide from that state does not parse it a second time.
+async fn read_with_state(
+    ctx: &AppContext,
+    record: &WorktreeRecord,
+    want: Want,
+) -> Result<(Value, RowOwed)> {
     let state = ctx
         .database
         .call(|store| Ok(store.read_wt_state()?))
         .await?;
-    let landing = landing::read_one(ctx, record, &state, want).await;
-    Ok(derive(
-        &state,
-        record.target.slug(),
-        landing,
-        super::watch::now_ms(),
-    ))
+    let owed = read_from(ctx, record, &state, want).await;
+    Ok((state, owed))
+}
+
+async fn read_from(
+    ctx: &AppContext,
+    record: &WorktreeRecord,
+    state: &Value,
+    want: Want,
+) -> RowOwed {
+    let landing = landing::read_one(ctx, record, state, want).await;
+    derive(state, record.target.slug(), landing, super::watch::now_ms())
+}
+
+/// [`print_list`] from a state the command read after its last write to
+/// what the list is derived from.
+pub(crate) async fn print_list_from(
+    ctx: &AppContext,
+    inventory: &Inventory,
+    slug: &str,
+    state: &Value,
+) {
+    let Some(record) = inventory.worktree(slug) else {
+        return;
+    };
+    let owed = read_from(ctx, record, state, Want::Lists).await;
+    println!(
+        "{}",
+        owed_text(&who(inventory, record), slug, &owed, clock())
+    );
 }
 
 /// Print what `slug` owes: how every command that changed the list ends.
 /// A worktree that is gone, or a list that cannot be read, prints nothing:
 /// the command's own result stands.
-pub(crate) async fn print_list(ctx: &AppContext, slug: &str) {
-    let Ok(rows) = ctx.repository.inventory(&ctx.cancellation).await else {
+pub(crate) async fn print_list(ctx: &AppContext, inventory: &Inventory, slug: &str) {
+    let Some(record) = inventory.worktree(slug) else {
         return;
     };
-    let Some(record) = rows
-        .into_iter()
-        .find(|row| !row.is_main && row.target.slug() == slug)
-    else {
-        return;
-    };
-    print_record_list(ctx, &record).await;
+    print_record_list(ctx, inventory, record).await;
 }
 
-pub(crate) async fn print_record_list(ctx: &AppContext, record: &WorktreeRecord) {
+pub(crate) async fn print_record_list(
+    ctx: &AppContext,
+    inventory: &Inventory,
+    record: &WorktreeRecord,
+) {
     let Ok(owed) = read(ctx, record).await else {
         return;
     };
     let slug = record.target.slug();
-    let who = who(ctx, record).await;
+    let who = who(inventory, record);
     println!("{}", owed_text(&who, slug, &owed, clock()));
 }
 
@@ -347,11 +374,16 @@ async fn removed_entry(ctx: &AppContext, slug: &str) -> Result<Option<RemovedWor
 
 pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
     let clock = clock();
+    let inventory = Inventory::read(ctx).await;
     // Outside a worktree there is no "this worktree": show them all.
     let record = if args.all {
         None
     } else {
-        match resolve_worktree(ctx, args.slug.as_deref()).await {
+        let resolved = match &inventory {
+            Ok(inventory) => inventory.resolve(args.slug.as_deref()),
+            Err(error) => Err(anyhow::anyhow!("{error:#}")),
+        };
+        match resolved {
             Ok(record) if !record.is_main => Some(record),
             Ok(_) | Err(_) if args.slug.is_none() => None,
             Ok(_) => {
@@ -397,7 +429,7 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
             return Ok(0);
         }
         let owed = read(ctx, &record).await?;
-        let who = who(ctx, &record).await;
+        let who = who(&inventory?, &record);
         println!("{}", owed_text(&who, slug, &owed, clock));
         if owed.tells > 0 {
             println!(
@@ -410,11 +442,7 @@ pub async fn run_owed(ctx: &AppContext, args: &OwedArgs) -> Result<i32> {
         }
         return Ok(0);
     }
-    let rows = ctx.repository.inventory(&ctx.cancellation).await?;
-    let rows = rows
-        .into_iter()
-        .filter(|row| !row.is_main)
-        .collect::<Vec<_>>();
+    let rows = inventory?.worktrees().cloned().collect::<Vec<_>>();
     let state = ctx
         .database
         .call(|store| Ok(store.read_wt_state()?))
@@ -599,7 +627,8 @@ pub async fn run_done(ctx: &AppContext, args: &DoneArgs) -> Result<i32> {
         return Ok(2);
     }
     let clock = clock();
-    let record = match resolve_worktree(ctx, args.slug.as_deref()).await {
+    let inventory = Inventory::read(ctx).await?;
+    let record = match inventory.resolve(args.slug.as_deref()) {
         Ok(record) if !record.is_main => Some(record),
         Ok(_) => {
             eprintln!("the main clone is not a worktree and owes nothing: pass --slug <slug>");
@@ -622,8 +651,13 @@ pub async fn run_done(ctx: &AppContext, args: &DoneArgs) -> Result<i32> {
         Some(record) => record.target.slug().to_owned(),
         None => args.slug.clone().unwrap_or_default(),
     };
+    let mut seen = None;
     let owed = match &record {
-        Some(record) => read(ctx, record).await?,
+        Some(record) => {
+            let (state, owed) = read_with_state(ctx, record, Want::Lists).await?;
+            seen = Some(state);
+            owed
+        }
         None => {
             let entry = removed_entry(ctx, &slug)
                 .await?
@@ -636,7 +670,7 @@ pub async fn run_done(ctx: &AppContext, args: &DoneArgs) -> Result<i32> {
         }
     };
     let who = match &record {
-        Some(record) => who(ctx, record).await,
+        Some(record) => who(&inventory, record),
         None => format!("{slug} (removed)"),
     };
     let targets = if args.targets.is_empty() {
@@ -675,7 +709,16 @@ pub async fn run_done(ctx: &AppContext, args: &DoneArgs) -> Result<i32> {
         targets
     };
     let failed = if again {
-        put_off(ctx, &slug, record.is_some(), &targets, &args.again, clock).await?
+        put_off(
+            ctx,
+            &inventory,
+            &slug,
+            record.is_some(),
+            &targets,
+            &args.again,
+            clock,
+        )
+        .await?
     } else {
         close(
             ctx,
@@ -683,11 +726,12 @@ pub async fn run_done(ctx: &AppContext, args: &DoneArgs) -> Result<i32> {
             record.as_ref(),
             &targets,
             evidence.unwrap_or_default(),
+            seen,
         )
         .await?
     };
     match &record {
-        Some(record) => print_record_list(ctx, record).await,
+        Some(record) => print_record_list(ctx, &inventory, record).await,
         None => {
             if let Some(entry) = removed_entry(ctx, &slug).await? {
                 let owed = derive_removed(
@@ -727,8 +771,10 @@ async fn close(
     record: Option<&WorktreeRecord>,
     targets: &[Target],
     evidence: String,
+    seen: Option<Value>,
 ) -> Result<bool> {
     let mut failed = false;
+    let mut wrote = false;
     let by = agent();
     for target in targets {
         let Target::Step(id) = target else {
@@ -740,11 +786,14 @@ async fn close(
             .call(move |store| Ok(store.close_owed(&owner, &step, &text, who.as_deref())?))
             .await?;
         match closed {
-            Some(closed) => println!(
-                "✓ {slug} closed {id}{}: {}",
-                if closed.removed { " (removed row)" } else { "" },
-                wt_app_core::watch_view::headline(&closed.step.what)
-            ),
+            Some(closed) => {
+                wrote = true;
+                println!(
+                    "✓ {slug} closed {id}{}: {}",
+                    if closed.removed { " (removed row)" } else { "" },
+                    wt_app_core::watch_view::headline(&closed.step.what)
+                );
+            }
             None => {
                 eprintln!("{}", missing_step(ctx, slug, id).await);
                 failed = true;
@@ -763,10 +812,16 @@ async fn close(
     }
     let mut previous_note = None;
     if let Some(record) = record {
-        let state = ctx
-            .database
-            .call(|store| Ok(store.read_wt_state()?))
-            .await?;
+        // The state the command began from still stands unless a step was
+        // closed since; the close below compares again under its own write.
+        let state = match seen.filter(|_| !wrote) {
+            Some(state) => state,
+            None => {
+                ctx.database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await?
+            }
+        };
         let landing = landing::read_one_live(ctx, record, &state, Want::Lists).await;
         let stored = wt_core::parse_work_status(&state["slugs"][slug]["work"]);
         previous_note = stored.as_ref().and_then(|work| work.note.clone());
@@ -853,13 +908,14 @@ async fn close(
 /// be.
 async fn put_off(
     ctx: &AppContext,
+    inventory: &Inventory,
     slug: &str,
     live: bool,
     targets: &[Target],
     conditions: &[String],
     clock: LocalClock,
 ) -> Result<bool> {
-    let read = match super::watch::read_conditions(ctx, conditions, clock).await {
+    let read = match super::watch::read_conditions(ctx, inventory, conditions, clock).await {
         Ok(read) => read,
         Err(message) => {
             eprintln!("{message}");
@@ -960,6 +1016,7 @@ mod tests {
     use crate::commands::status::{StatusArgs, run as status};
     use wt_app_core::test_support::CommandFixture;
     use wt_core::OwnerLanding;
+    use wt_ops::commands::resolve::resolve_worktree;
 
     async fn git(ctx: &AppContext, args: &[&str]) -> String {
         let output = wt_ops::commands::resolve::run_git(ctx, &ctx.cwd, args.iter().copied())
@@ -1201,7 +1258,8 @@ mod tests {
         let stored = work(ctx).await;
         assert_eq!(stored["state"], "verified");
         assert_eq!(stored["note"], "opened the page, 200");
-        let owed = read(ctx, &record).await.unwrap();
+        // The phase of a row that owes nothing is read only where asked for.
+        let owed = read_for(ctx, &record, Want::Phases).await.unwrap();
         assert_eq!(owed.phase, Some(OwedPhase::Done));
         assert_eq!(
             owed_text("This worktree", "one", &owed, clock()),

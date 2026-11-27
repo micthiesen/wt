@@ -7,6 +7,15 @@ use sha2::{Digest, Sha256};
 use wt_config::Config;
 use wt_runtime::CacheStore;
 
+/// What the data of every leaf saved in the query cache means. Restored data
+/// is shown and never confirmed, and saved merges are final, so a release
+/// reads what another release saved while both mean the same by it: a
+/// session keeps the build that started it, and would otherwise lose the
+/// cache at every update. Bump this whenever a field of a type a
+/// `Persistence::Disk` leaf publishes changes meaning, is removed or renamed;
+/// a shape the reader cannot parse is already rejected as corrupt.
+const QUERY_CACHE_SCHEMA: u32 = 1;
+
 /// One store per configuration; its directory is inside the repository's
 /// cache root, and its scope fingerprints everything restored data depends on.
 pub fn store(config: &Config) -> CacheStore {
@@ -50,15 +59,17 @@ fn store_for_build(config: &Config, build: &str, executable: Option<String>) -> 
     let main_clone = std::fs::canonicalize(&config.paths.main_clone)
         .unwrap_or_else(|_| config.paths.main_clone.clone());
     let mut parts = vec![
-        ("build", fingerprint(build)),
+        ("schema", QUERY_CACHE_SCHEMA.to_string()),
         ("main-clone", fingerprint(&main_clone.to_string_lossy())),
     ];
-    // Development builds share one build id across rebuilds; the binary's
-    // size and modification time tell them apart.
-    if build.starts_with("dev-")
-        && let Some(executable) = executable
-    {
-        parts.push(("binary", fingerprint(&executable)));
+    // A development build may change what a leaf means without a schema
+    // bump, and shares one build id across rebuilds: the binary's size and
+    // modification time tell them apart.
+    if build.starts_with("dev-") {
+        parts.push(("build", fingerprint(build)));
+        if let Some(executable) = executable {
+            parts.push(("binary", fingerprint(&executable)));
+        }
     }
     parts.extend(config_parts(config));
     CacheStore::from_parts(config.paths.cache_root.join("query"), parts)
@@ -174,10 +185,6 @@ mod tests {
             ..Default::default()
         };
         let scope = remote_store(&config, &endpoint).scope().to_owned();
-        assert_ne!(
-            store_for_build(&config, "old-build", None).scope(),
-            store_for_build(&config, "new-build", None).scope()
-        );
         config.branch.base = "develop".into();
         config.harness.primary = wt_core::HarnessId::Opencode;
         assert_eq!(remote_store(&config, &endpoint).scope(), scope);
@@ -200,8 +207,12 @@ mod tests {
         let fixture = crate::test_support::CommandFixture::new().await.unwrap();
         let config = (*fixture.ctx.config).clone();
         let base = store_for_build(&config, "v1", None);
-        assert_eq!(base.scope(), store_for_build(&config, "v1", None).scope());
-        assert_ne!(base.scope(), store_for_build(&config, "v2", None).scope());
+        // A session on an older release reads what a newer one saved.
+        assert_eq!(base.scope(), store_for_build(&config, "v2", None).scope());
+        assert_ne!(
+            base.scope(),
+            store_for_build(&config, "dev-1", None).scope()
+        );
         let mut other = config.clone();
         other.repo_id = "another".into();
         assert_ne!(base.scope(), store_for_build(&other, "v1", None).scope());
@@ -278,7 +289,7 @@ mod tests {
                 )
                 .scope()
             ),
-            "branch,build"
+            "branch"
         );
     }
 }

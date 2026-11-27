@@ -202,7 +202,8 @@ fn spawn_overlay(
         let mut origin_updates = origin.subscribe();
         board_updates.mark_changed();
         origin_updates.mark_changed();
-        let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         trigger.request(&origin, "startup");
         let mut failures = wt_app_core::feeds::FailureClock::default();
@@ -219,7 +220,13 @@ fn spawn_overlay(
                 }
                 changed = origin_updates.changed() => {
                     if changed.is_err() { break; }
-                    if matches!(origin_updates.borrow_and_update().state(), SourceState::Ready) { local.refresh(); }
+                    // A fetch moves refs, which the watcher routes to the
+                    // checkouts tracking them. What it cannot route (a
+                    // branch no checkout is on) only needs the listing, not
+                    // a status of every checkout.
+                    if matches!(origin_updates.borrow_and_update().state(), SourceState::Ready) {
+                        local.request_keys(wt_runtime::Request::Recheck, Vec::<String>::new());
+                    }
                 }
                 _ = interval.tick() => { trigger.request(&origin, "backstop"); continue; }
             }
@@ -275,7 +282,7 @@ mod tests {
     async fn origin_fetches_name_their_trigger() {
         let scope = TaskScope::new();
         let (board, mut board_requests) = leaf_channel::<Board>(&scope, spec("board", Domain::Git));
-        let (local, _local_requests) = leaf_channel::<Board>(&scope, spec("local", Domain::Git));
+        let (local, mut local_requests) = leaf_channel::<Board>(&scope, spec("local", Domain::Git));
         let (origin, mut origin_requests) =
             leaf_channel::<FetchOriginReport>(&scope, spec("origin", Domain::Origin));
         let trigger = Trigger::default();
@@ -298,6 +305,16 @@ mod tests {
         tokio::time::advance(backstop).await;
         assert_eq!(origin_requests.requested().await, Some(()));
         assert_eq!(trigger.take(), "backstop");
+        // A finished fetch asks for the checkout listing again, not for a
+        // status of every checkout: the refs it moved are routed to the
+        // checkouts that track them.
+        origin_requests.publish_live(FetchOriginReport::default(), wt_runtime::Stamp::now());
+        assert_eq!(local_requests.requested().await, Some(()));
+        let demand = local_requests.take_demand();
+        assert_eq!(
+            (demand.whole, demand.index, demand.keys.len()),
+            (None, Some(wt_runtime::Request::Recheck), 0)
+        );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

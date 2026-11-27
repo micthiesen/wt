@@ -56,6 +56,23 @@ pub fn assert_checks(
     }
 }
 
+/// Give `next`, a status about to replace `previous`, its merge gate. A gate
+/// is a prerequisite of merging, not a claim of one assertion: a status
+/// change that does not mention it keeps it, and with it the watch that
+/// clears it. `asked` replaces it. Verified and dropped end the work the
+/// gate held back, so neither carries one. Clearing a gate is its own write.
+pub fn assert_gate(
+    next: &mut WorkStatusRecord,
+    previous: Option<&WorkStatusRecord>,
+    asked: Option<String>,
+) {
+    next.blocked_on = if next.is_terminal() {
+        None
+    } else {
+        asked.or_else(|| previous.and_then(|previous| previous.blocked_on.clone()))
+    };
+}
+
 /// `verified` asserted for a worktree that owes checks: close every check
 /// that is due under `landing`, or the earliest stage's when none is (who
 /// asserts it may have confirmed the deploy themselves). The status becomes

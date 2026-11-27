@@ -341,9 +341,14 @@ pub fn missing_workflow_scope(error: &str) -> bool {
 }
 
 pub(crate) fn output_failure(output: &ProcessOutput) -> (String, bool) {
-    let stderr = output.stderr_text();
-    let stdout = output.stdout_text();
-    let stdout = response_errors(&stdout).unwrap_or(stdout);
+    text_failure(&output.stderr_text(), &output.stdout_text())
+}
+
+/// [`output_failure`] for a reply that did not come from a subprocess:
+/// `stderr` is what the transport said beside the body.
+pub(crate) fn text_failure(stderr: &str, stdout: &str) -> (String, bool) {
+    let stderr = stderr.to_owned();
+    let stdout = response_errors(stdout).unwrap_or_else(|| stdout.to_owned());
     let transient = is_transient_failure(&stderr, &stdout, false);
     let combined = format!("{stderr}\n{stdout}");
     let special = combined.lines().find(|line| {

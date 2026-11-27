@@ -292,6 +292,45 @@ async fn check_mutation<T, M>(
     // the change (an older value equal to the target), cannot settle it.
     pending.settle(&after, |_, _| Some(stale), Instant::now());
     assert_eq!(pending.len(), 1, "{label}: an older fetch cannot settle it");
+    // Where a domain is read row by row, the change names the rows whose
+    // reads confirm it. They are on the host that made the change, they
+    // include the row it targets, and a change aimed at one row never waits
+    // for the whole domain.
+    let confirming = mutation.confirming();
+    let target = mutation.target();
+    assert!(
+        !confirming.is_empty(),
+        "{label}: names the rows that confirm it"
+    );
+    assert!(
+        confirming.iter().all(|row| row.host == target.host),
+        "{label}: is confirmed on the host that made it"
+    );
+    if target.key.is_some() {
+        assert!(
+            confirming.contains(&target),
+            "{label}: its own row confirms it"
+        );
+        assert!(
+            confirming.iter().all(|row| row.key.is_some()),
+            "{label}: a row change does not wait for the whole domain"
+        );
+    }
+    // Every one of them is needed: with any single one still read before
+    // the write, newer reads of all the others, and of every row the change
+    // does not name, cannot settle it.
+    for behind in &confirming {
+        pending.settle(
+            &after,
+            |row, _| Some(if row == behind { stale } else { Stamp::now() }),
+            Instant::now(),
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "{label}: settled without a read of {behind:?}"
+        );
+    }
     // Fresh fetches that still show the old value do not revert it.
     for _ in 0..10 {
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -309,8 +348,19 @@ async fn check_mutation<T, M>(
             "{label}: progress remains visible"
         );
     }
-    // A fetch that started after acceptance and shows it settles it.
-    pending.settle(&after, |_, _| Some(Stamp::now()), Instant::now());
+    // A fetch of its own rows that started after acceptance and shows it
+    // settles it, even while the rest of the domain is older.
+    pending.settle(
+        &after,
+        |target, _| {
+            Some(if confirming.contains(target) {
+                Stamp::now()
+            } else {
+                stale
+            })
+        },
+        Instant::now(),
+    );
     assert!(pending.is_empty(), "{label}: settled by a confirming fetch");
 
     // Failure stops showing it at once.

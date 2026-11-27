@@ -763,6 +763,11 @@ async fn scheduler(
     // arriving meanwhile wait for it instead of waking the scheduler early.
     let mut full_hold: Option<Instant> = None;
     let mut windows = BudgetWindows::default();
+    // Origin is fetched beside the GitHub read, one fetch at a time: what
+    // GitHub answers does not depend on local refs, and a slow fetch must
+    // not hold a snapshot back.
+    let (origin_done_tx, mut origin_done_rx) = mpsc::channel::<OriginFetched>(1);
+    let mut origin_fetch: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let sleep = async {
             match pending_deadline {
@@ -844,6 +849,18 @@ async fn scheduler(
                 }
                 pending_deadline = held_deadline(pending_deadline, full_hold);
             }
+            Some(done) = origin_done_rx.recv() => {
+                origin_fetch = None;
+                match done.failed {
+                    // Keep the request so the next refresh retries it.
+                    Some(request) => { origin_trigger.get_or_insert(request); }
+                    // A delivery that arrived while this fetch ran may name
+                    // refs it was too early to see.
+                    None => if let Some((trigger, branch)) = origin_trigger.take() {
+                        origin_fetch = Some(spawn_origin_fetch(source.clone(), cancel.clone(), origin_done_tx.clone(), trigger, branch));
+                    },
+                }
+            }
             _ = sleep => {
                 pending_deadline = None;
                 let now = Instant::now();
@@ -919,20 +936,11 @@ async fn scheduler(
                 full_hold = None;
                 full_asked = false;
                 named_branches.clear();
-                if let Some((trigger, branch)) = origin_trigger.take() {
-                    let branch_name = branch.as_deref().unwrap_or("");
-                    let origin_started = Instant::now();
-                    let result = source.fetch_origin(&cancel).await;
-                    let elapsed_ms = origin_started.elapsed().as_millis() as u64;
-                    match result {
-                        // The fetch itself logs its trigger and duration at info.
-                        Ok(()) => debug!(event = %trigger, branch = branch_name, elapsed_ms, "fetched origin before GitHub refresh"),
-                        Err(e) => {
-                            warn!(event = %trigger, branch = branch_name, elapsed_ms, error = %e, "git fetch origin failed before GitHub refresh");
-                            // Keep the request so the next refresh retries it.
-                            origin_trigger.get_or_insert((trigger, branch));
-                        }
-                    }
+                // A fetch still running keeps the request; its end starts the next.
+                if origin_fetch.is_none()
+                    && let Some((trigger, branch)) = origin_trigger.take()
+                {
+                    origin_fetch = Some(spawn_origin_fetch(source.clone(), cancel.clone(), origin_done_tx.clone(), trigger, branch));
                 }
                 // Readers order this observation by when the GitHub read
                 // began: a write accepted after this moment may be missing.
@@ -963,6 +971,8 @@ async fn scheduler(
                                     merge_queue: data.merge_queue, rate_limit: budget, rate_windows,
                                     next_fetch_at_ms: Some(fetch_started_at_ms.saturating_add(paced_ms)),
                                     writer_sha: config.writer_sha.clone(),
+                                    schema: Some(crate::SNAPSHOT_SCHEMA),
+                                    schema_writer_sha: config.writer_sha.clone(),
                                     repository: config.repository.clone(),
                                     extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
                                 })
@@ -1035,6 +1045,48 @@ async fn scheduler(
             }
         }
     }
+    // Shutdown cancels the fetch; wait for it like every other owned task.
+    if let Some(fetch) = origin_fetch {
+        let _ = fetch.await;
+    }
+}
+
+/// How one origin fetch ended: the request it served, when it failed.
+struct OriginFetched {
+    failed: Option<(String, Option<String>)>,
+}
+
+fn spawn_origin_fetch(
+    source: Arc<dyn EventSource>,
+    cancel: CancellationToken,
+    done: mpsc::Sender<OriginFetched>,
+    trigger: String,
+    branch: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        use futures_util::FutureExt;
+        let branch_name = branch.as_deref().unwrap_or("");
+        let started = Instant::now();
+        // A fetch that panics must still report its end: the scheduler
+        // starts no other fetch while it believes this one is running.
+        let result = std::panic::AssertUnwindSafe(source.fetch_origin(&cancel))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| Err("origin fetch panicked".into()));
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let failed = match result {
+            // The fetch itself logs its trigger and duration at info.
+            Ok(()) => {
+                debug!(event = %trigger, branch = branch_name, elapsed_ms, "fetched origin beside GitHub refresh");
+                None
+            }
+            Err(e) => {
+                warn!(event = %trigger, branch = branch_name, elapsed_ms, error = %e, "git fetch origin failed beside GitHub refresh");
+                Some((trigger, branch))
+            }
+        };
+        let _ = done.send(OriginFetched { failed }).await;
+    })
 }
 
 /// GitHub read errors arrive as text; its rate-limit replies say so.
@@ -1218,6 +1270,10 @@ mod tests {
         fetches: AtomicUsize,
         local_calls: AtomicUsize,
         origin_fetches: AtomicUsize,
+        /// The origin fetch waits for this before it returns.
+        origin_gate: Option<Arc<tokio::sync::Semaphore>>,
+        origin_fails: AtomicBool,
+        origin_panics: AtomicBool,
         remote_calls: AtomicUsize,
         remote_failure_after: Option<usize>,
     }
@@ -1251,7 +1307,19 @@ mod tests {
             _: &'a CancellationToken,
         ) -> EventFuture<'a, Result<(), String>> {
             self.origin_fetches.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
+            let gate = self.origin_gate.clone();
+            let fails = self.origin_fails.load(Ordering::SeqCst);
+            let panics = self.origin_panics.load(Ordering::SeqCst);
+            Box::pin(async move {
+                assert!(!panics, "fixture origin panic");
+                if let Some(gate) = gate {
+                    gate.acquire().await.expect("the gate stays open").forget();
+                }
+                if fails {
+                    return Err("fixture origin failure".into());
+                }
+                Ok(())
+            })
         }
         fn fetch_github<'a>(
             &'a self,
@@ -1728,6 +1796,16 @@ mod tests {
             body,
         )
         .await
+    }
+
+    async fn wait_for_origin_fetches(source: &MockSource, count: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while source.origin_fetches.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("origin fetch ran");
     }
 
     async fn wait_for_fetches(source: &MockSource, count: usize) {
@@ -2271,17 +2349,87 @@ mod tests {
             .await
             .unwrap();
         wait_for_fetches(&source, 1).await;
-        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
+        wait_for_origin_fetches(&source, 1).await;
 
         let check = br#"{"check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
         assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
         wait_for_fetches(&source, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
 
         let push = br#"{"ref":"refs/heads/feature-x"}"#;
         assert_eq!(signed(daemon.local_addr(), "push", push).await, 200);
         wait_for_fetches(&source, 3).await;
+        wait_for_origin_fetches(&source, 2).await;
         assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// An origin fetch that panics is a failed fetch: the next refresh that
+    /// wants origin fetches it again instead of waiting on a task that is gone.
+    #[tokio::test]
+    async fn a_panicked_origin_fetch_does_not_end_origin_fetching() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        source.origin_panics.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        wait_for_fetches(&source, 1).await;
+        wait_for_origin_fetches(&source, 1).await;
+        source.origin_panics.store(false, Ordering::SeqCst);
+        let check = br#"{"check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        wait_for_fetches(&source, 2).await;
+        wait_for_origin_fetches(&source, 2).await;
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// GitHub's answer does not depend on local refs: a slow origin fetch
+    /// holds neither the snapshot nor the next read back. One fetch runs at
+    /// a time, a delivery that arrives meanwhile gets a fetch of its own
+    /// when it ends, and a failed fetch is retried by the next refresh.
+    #[tokio::test]
+    async fn a_slow_origin_fetch_does_not_hold_the_snapshot_back() {
+        let dir = TempDir::new().unwrap();
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let source = Arc::new(MockSource {
+            origin_gate: Some(gate.clone()),
+            ..MockSource::default()
+        });
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        // The startup fetch is still running when the snapshot lands.
+        let snapshot = wait_for_snapshot(&dir, |_| true).await;
+        assert!(snapshot.schema_current());
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
+
+        // A push while it runs is read from GitHub at once and waits its
+        // turn for origin.
+        let push = br#"{"ref":"refs/heads/feature-x"}"#;
+        assert_eq!(signed(daemon.local_addr(), "push", push).await, 200);
+        wait_for_fetches(&source, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 1);
+        source.origin_fails.store(true, Ordering::SeqCst);
+        gate.add_permits(1);
+        wait_for_origin_fetches(&source, 2).await;
+
+        // That second fetch fails: nothing retries it until a refresh does.
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
+        source.origin_fails.store(false, Ordering::SeqCst);
+        gate.add_permits(8);
+        let check = br#"{"check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        wait_for_fetches(&source, 3).await;
+        wait_for_origin_fetches(&source, 3).await;
         cancel.cancel();
         daemon.shutdown().await;
     }
@@ -2488,6 +2636,7 @@ mod tests {
             200
         );
         wait_for_fetches(&source, 2).await;
+        wait_for_origin_fetches(&source, 2).await;
         assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
 
         let local_base = pr("theirs", "feature-x");

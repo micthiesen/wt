@@ -77,16 +77,65 @@ pub enum Provenance {
     },
 }
 
+/// Fetch-start stamps of a leaf that reads its rows independently: one for
+/// the listing of its keys and one per listed key.
+///
+/// The listing stamp answers for every key the listing did not contain: such
+/// a key was absent from a listing that started then. That is what lets a
+/// removal settle on the listing alone, and it is why a key from another key
+/// space reads as "absent", never as "fresh".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyedStamps {
+    index: Stamp,
+    rows: BTreeMap<String, Stamp>,
+}
+
+impl KeyedStamps {
+    pub fn new(index: Stamp, rows: BTreeMap<String, Stamp>) -> Self {
+        Self { index, rows }
+    }
+
+    /// Start of the listing that produced the key set.
+    pub fn index(&self) -> Stamp {
+        self.index
+    }
+
+    /// Start of the read behind what is known about `key`.
+    pub fn get(&self, key: &str) -> Stamp {
+        self.rows.get(key).copied().unwrap_or(self.index)
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.rows.keys().map(String::as_str)
+    }
+
+    /// The stamp the whole domain can claim: nothing in it was read earlier.
+    pub fn oldest(&self) -> Stamp {
+        self.rows
+            .values()
+            .fold(self.index, |oldest, stamp| oldest.earliest(*stamp))
+    }
+}
+
 /// One domain's provenance, fetch-start stamp and lane state.
 ///
-/// Equality ignores `observed`: a fetch that returns the same data must not
-/// count as a visible change, so idle boards stay still. Pending mutations
-/// read the stamp directly.
+/// Equality ignores `observed` and `keyed`: a fetch that returns the same
+/// data must not count as a visible change, so idle boards stay still.
+/// Pending mutations read the stamps directly.
+///
+/// Invariant: `observed` is never later than any stamp in `keyed`. Everything
+/// a snapshot shows for the domain was read by a fetch that started at or
+/// after `observed`, whether the leaf reads the domain whole or row by row,
+/// so `Confirmed` and every reader of the domain stamp keep their meaning. A
+/// keyed stamp only ever says more about one row: a change to that row may
+/// settle on it without waiting for the oldest row to be read again.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DomainMeta {
     provenance: Provenance,
     observed: Stamp,
     state: SourceState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keyed: Option<Arc<KeyedStamps>>,
 }
 
 impl PartialEq for DomainMeta {
@@ -103,6 +152,17 @@ impl DomainMeta {
             provenance: Provenance::Live,
             observed,
             state,
+            keyed: None,
+        }
+    }
+
+    /// Live rows read at different moments. The domain stamp is the oldest.
+    pub(crate) fn live_keyed(keyed: KeyedStamps, state: SourceState) -> Self {
+        Self {
+            provenance: Provenance::Live,
+            observed: keyed.oldest(),
+            state,
+            keyed: Some(Arc::new(keyed)),
         }
     }
 
@@ -111,6 +171,7 @@ impl DomainMeta {
             provenance: Provenance::Restored { saved_at_ms },
             observed: Stamp::unordered(),
             state: SourceState::Refreshing,
+            keyed: None,
         }
     }
 
@@ -129,6 +190,18 @@ impl DomainMeta {
         self.observed
     }
 
+    /// Start of the read behind what the domain shows for `key`. A domain
+    /// read whole answers with its one stamp.
+    pub fn observed_for(&self, key: &str) -> Stamp {
+        self.keyed
+            .as_ref()
+            .map_or(self.observed, |keyed| keyed.get(key))
+    }
+
+    pub fn keyed(&self) -> Option<&KeyedStamps> {
+        self.keyed.as_deref()
+    }
+
     pub fn state(&self) -> &SourceState {
         &self.state
     }
@@ -138,7 +211,36 @@ impl DomainMeta {
     }
 
     /// Restored is sticky, the stamp is the earliest, the state the worst.
+    /// Keyed stamps merge key by key, an unkeyed side answering for every key
+    /// with its one stamp, so the merge is never fresher than either input.
     fn merge(&mut self, other: &DomainMeta) {
+        let keyed = match (&self.keyed, &other.keyed) {
+            (None, None) => None,
+            (Some(mine), Some(theirs)) if Arc::ptr_eq(mine, theirs) => Some(mine.clone()),
+            (mine, theirs) => {
+                let index = |meta: &DomainMeta| {
+                    meta.keyed
+                        .as_ref()
+                        .map_or(meta.observed, |keyed| keyed.index)
+                };
+                let rows = mine
+                    .iter()
+                    .chain(theirs)
+                    .flat_map(|keyed| keyed.rows.keys())
+                    .map(|key| {
+                        (
+                            key.clone(),
+                            self.observed_for(key).earliest(other.observed_for(key)),
+                        )
+                    })
+                    .collect();
+                Some(Arc::new(KeyedStamps {
+                    index: index(self).earliest(index(other)),
+                    rows,
+                }))
+            }
+        };
+        self.keyed = keyed;
         self.provenance = match (self.provenance, other.provenance) {
             (Provenance::Live, Provenance::Live) => Provenance::Live,
             (Provenance::Restored { saved_at_ms: a }, Provenance::Restored { saved_at_ms: b }) => {
@@ -300,6 +402,14 @@ impl<T> SourceSnapshot<T> {
         self
     }
 
+    /// Test fixtures only: `domain` read live row by row, with these stamps.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_keyed(mut self, domain: Domain, stamps: KeyedStamps) -> Self {
+        let state = self.state.clone();
+        self.set_meta(domain, DomainMeta::live_keyed(stamps, state));
+        self
+    }
+
     /// Test fixtures only: edit the data in place.
     #[cfg(any(test, feature = "testing"))]
     pub fn test_data_mut(&mut self) -> &mut T
@@ -344,6 +454,7 @@ impl<T> SourceSnapshot<T> {
 pub struct Confirmed<T> {
     data: Arc<T>,
     observed: Stamp,
+    keyed: Option<Arc<KeyedStamps>>,
 }
 
 impl<T> Clone for Confirmed<T> {
@@ -351,6 +462,7 @@ impl<T> Clone for Confirmed<T> {
         Self {
             data: self.data.clone(),
             observed: self.observed,
+            keyed: self.keyed.clone(),
         }
     }
 }
@@ -363,13 +475,37 @@ impl<T> Deref for Confirmed<T> {
 }
 
 impl<T> Confirmed<T> {
+    #[cfg(test)]
     pub(crate) fn new(data: Arc<T>, observed: Stamp) -> Self {
-        Self { data, observed }
+        Self {
+            data,
+            observed,
+            keyed: None,
+        }
     }
 
-    /// Start of the fetch that produced this data.
+    /// Live data with the stamps its leaf published for it.
+    pub(crate) fn from_meta(data: Arc<T>, meta: &DomainMeta) -> Self {
+        Self {
+            data,
+            observed: meta.observed,
+            keyed: meta.keyed.clone(),
+        }
+    }
+
+    /// Start of the oldest fetch behind this data.
     pub fn observed(&self) -> Stamp {
         self.observed
+    }
+
+    /// Start of the fetch behind what this data says about `key`, never
+    /// earlier than `observed`. A domain read whole answers with its one
+    /// stamp. A decision about one row may bound its age by this; a decision
+    /// about the whole domain uses `observed`.
+    pub fn observed_for(&self, key: &str) -> Stamp {
+        self.keyed
+            .as_ref()
+            .map_or(self.observed, |keyed| keyed.get(key))
     }
 
     /// Time since the fetch started; `None` for observations whose start is
@@ -394,6 +530,7 @@ impl<T> Confirmed<T> {
         Confirmed {
             data: Arc::new(f(&self.data)),
             observed: self.observed,
+            keyed: self.keyed.clone(),
         }
     }
 
@@ -403,6 +540,7 @@ impl<T> Confirmed<T> {
         Self {
             data: Arc::new(data),
             observed: Stamp::now(),
+            keyed: None,
         }
     }
 }
@@ -432,11 +570,13 @@ pub fn settling() -> bool {
     now_ms() < SETTLE_UNTIL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether any domain's fetch-start stamp differs between two maps.
+/// Whether any domain's fetch-start stamp, whole or for one key, differs
+/// between two maps.
 pub fn stamps_advanced(old: &DomainMap, new: &DomainMap) -> bool {
     new.iter().any(|(domain, meta)| {
-        old.get(domain)
-            .is_some_and(|previous| previous.observed != meta.observed)
+        old.get(domain).is_some_and(|previous| {
+            previous.observed != meta.observed || previous.keyed != meta.keyed
+        })
     })
 }
 
@@ -478,5 +618,69 @@ mod tests {
         // An observation with no known start is never fresh.
         let unordered = Confirmed::new(Arc::new(1u8), Stamp::unordered());
         assert!(!unordered.fresh_within(Duration::from_secs(600)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn keyed_stamps_never_make_a_domain_or_a_merge_fresher() {
+        let old = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let listed = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let new = Stamp::now();
+        let keyed = |a: Stamp, b: Stamp| {
+            DomainMeta::live_keyed(
+                KeyedStamps::new(listed, [("a".to_owned(), a), ("b".to_owned(), b)].into()),
+                SourceState::Ready,
+            )
+        };
+        let meta = keyed(new, old);
+        // The domain stamp is the oldest row, so whole-domain readers and
+        // `Confirmed` see nothing fresher than before.
+        assert_eq!(meta.observed(), old);
+        assert_eq!(meta.observed_for("a"), new);
+        assert_eq!(meta.observed_for("b"), old);
+        // A key that is not listed was absent from the listing.
+        assert_eq!(meta.observed_for("gone"), listed);
+
+        // Two versions of the same leaf merge key by key to the earlier.
+        let mut merged = keyed(new, old);
+        merged.merge(&keyed(old, new));
+        assert_eq!(merged.observed_for("a"), old);
+        assert_eq!(merged.observed_for("b"), old);
+        assert_eq!(merged.observed(), old);
+
+        // An input that read the domain whole answers for every key.
+        let mut clamped = keyed(new, new);
+        clamped.merge(&DomainMeta::live(old, SourceState::Ready));
+        assert_eq!(clamped.observed_for("a"), old);
+        assert_eq!(clamped.observed_for("gone"), old);
+        let mut whole = DomainMeta::live(new, SourceState::Ready);
+        whole.merge(&keyed(old, new));
+        assert_eq!(whole.observed_for("a"), old);
+        assert_eq!(whole.observed_for("b"), new);
+        assert_eq!(whole.observed(), old);
+
+        // Restored or foreign data orders against nothing, per key too.
+        let mut restored = keyed(new, new);
+        restored.merge(&DomainMeta::restored(1));
+        assert!(!restored.is_live());
+        assert!(!restored.observed_for("a").is_ordered());
+
+        // A stamp that moved for one row alone still counts as an advance.
+        let before = DomainMap::from([(Domain::Git, keyed(old, old))]);
+        let after = DomainMap::from([(Domain::Git, keyed(new, old))]);
+        assert_eq!(before, after, "stamps are not a visible change");
+        assert!(stamps_advanced(&before, &after));
+        assert!(!stamps_advanced(&before, &before.clone()));
+
+        // The wire form round-trips, and a peer that sends no keyed stamps
+        // reads as a domain read whole.
+        let json = serde_json::to_value(&meta).unwrap();
+        let back: DomainMeta = serde_json::from_value(json).unwrap();
+        assert_eq!(back.observed_for("a"), new);
+        let plain = serde_json::to_value(DomainMeta::live(old, SourceState::Ready)).unwrap();
+        assert!(plain.get("keyed").is_none());
+        let back: DomainMeta = serde_json::from_value(plain).unwrap();
+        assert_eq!(back.observed_for("a"), old);
     }
 }

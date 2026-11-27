@@ -18,7 +18,7 @@ use wt_store::WorkStatusRecord as StoredWorkStatusRecord;
 use wt_vcs::WorktreeRecord;
 
 use wt_app_core::{context::AppContext, database::Database};
-use wt_ops::commands::resolve::resolve_worktree;
+use wt_ops::commands::resolve::{Inventory, may_be_inside_a_worktree};
 
 use super::landing::{self, RowLanding};
 
@@ -537,15 +537,12 @@ fn parse_status_action(args: &StatusArgs) -> Action {
         return fail("--risk only applies to ready");
     }
     if args.unblock {
-        return fail("a new assertion clears any old gate; drop --unblock");
+        return fail(
+            "--unblock clears the gate on its own, and a status change keeps it: run wt status --unblock, then assert the state",
+        );
     }
     if gate.is_some() && !matches!(state, WorkState::Ready | WorkState::Todo) {
         return fail("--blocked-on applies only to ready and todo");
-    }
-    if !args.until.is_empty() && gate.is_none() {
-        return fail(
-            "--until says when a gate clears; a new assertion has none: add --blocked-on \"<why>\"",
-        );
     }
     if state == WorkState::Ready && risk.is_none() {
         return fail("ready requires --risk low|medium|high");
@@ -561,6 +558,11 @@ fn parse_status_action(args: &StatusArgs) -> Action {
     }
     if state == WorkState::Verified && note.is_none() {
         return fail("verified requires -m explaining what you checked and where");
+    }
+    if !args.until.is_empty() && matches!(state, WorkState::Verified | WorkState::Dropped) {
+        return fail(
+            "--until says when a gate clears, and verified and dropped hold no gate: drop --until",
+        );
     }
     if checks_touched && matches!(state, WorkState::Verified | WorkState::Dropped) {
         return fail(
@@ -585,16 +587,28 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
         eprintln!("{message}\n{VOCAB}");
         return Ok(2);
     }
-    let records = ctx.repository.inventory(&ctx.cancellation).await?;
-    let worktrees = records.iter().filter(|w| !w.is_main).collect::<Vec<_>>();
-    let state = read_state(&ctx.database).await?;
+    // Outside every worktree a bare `wt status` can only print what the
+    // words mean: that needs neither the worktrees nor the state.
+    if matches!(
+        &action,
+        Action::Show {
+            target: None,
+            json: false
+        }
+    ) && args.until.is_empty()
+        && !may_be_inside_a_worktree(ctx)
+    {
+        println!("{VOCAB}");
+        return Ok(0);
+    }
+    let inventory = Inventory::read(ctx).await?;
     // Read before anything is written: a condition that cannot be read
     // must not leave a gate behind that nothing clears.
     let clock = super::watch::clock();
     let until = if args.until.is_empty() {
         None
     } else {
-        match super::watch::read_conditions(ctx, &args.until, clock).await {
+        match super::watch::read_conditions(ctx, &inventory, &args.until, clock).await {
             Ok(read) => Some(read),
             Err(message) => {
                 eprintln!("{message}");
@@ -605,6 +619,8 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
     let then = args.then.as_deref().and_then(super::watch::clean_prompt);
     match action {
         Action::All { json: wants_json } => {
+            let worktrees = inventory.worktrees().collect::<Vec<_>>();
+            let state = read_state(&ctx.database).await?;
             let now = now_ms();
             if wants_json {
                 let rows = worktrees.iter().map(|w| (*w).clone()).collect::<Vec<_>>();
@@ -664,7 +680,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             let outside = |error: &anyhow::Error| {
                 target.is_none() && error.to_string().starts_with("not inside")
             };
-            let record = match resolve_worktree(ctx, target.as_deref()).await {
+            let record = match inventory.resolve(target.as_deref()) {
                 Ok(record) if !record.is_main => record,
                 // JSON has no vocabulary to fall back to: a reader would
                 // parse the text as a status.
@@ -693,6 +709,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                     return Ok(1);
                 }
             };
+            let state = read_state(&ctx.database).await?;
             if wants_json {
                 let mut state = state.clone();
                 wt_ops::other_branches::refresh(
@@ -730,7 +747,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             Ok(0)
         }
         Action::Clear(target) => {
-            let record = match resolve_worktree(ctx, target.as_deref()).await {
+            let record = match inventory.resolve(target.as_deref()) {
                 Ok(w) if !w.is_main => w,
                 Ok(_) => {
                     eprintln!("not inside a worktree");
@@ -765,7 +782,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             Ok(0)
         }
         Action::Examine { target, verdict } => {
-            let record = match resolve_worktree(ctx, target.as_deref()).await {
+            let record = match inventory.resolve(target.as_deref()) {
                 Ok(w) if !w.is_main => w,
                 Ok(_) => {
                     eprintln!("not inside a worktree");
@@ -781,6 +798,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 return Ok(2);
             };
             let slug = record.target.slug().to_owned();
+            let state = read_state(&ctx.database).await?;
             let branch = state
                 .get("slugs")
                 .and_then(|s| s.get(&slug))
@@ -821,7 +839,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             unverify,
             append,
         } => {
-            let record = match resolve_worktree(ctx, target.as_deref()).await {
+            let record = match inventory.resolve(target.as_deref()) {
                 Ok(w) if !w.is_main => w,
                 Ok(_) => {
                     eprintln!("not inside a worktree");
@@ -840,10 +858,19 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
+            let state = read_state(&ctx.database).await?;
             let steps_owed = steps_owed(&state, &slug);
             if work_state == WorkState::Verified
-                && let Some(code) =
-                    verify_checks(ctx, &record, &state, note.clone(), append, steps_owed).await?
+                && let Some(code) = verify_checks(
+                    ctx,
+                    &inventory,
+                    &record,
+                    &state,
+                    note.clone(),
+                    append,
+                    steps_owed,
+                )
+                .await?
             {
                 return Ok(code);
             }
@@ -854,9 +881,10 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty());
             next.risk = risk;
-            next.blocked_on = blocked;
-            let list_asked =
-                !verify.is_empty() || !unverify.is_empty() || next.blocked_on.is_some();
+            let gate_asked = blocked.is_some();
+            let list_asked = !verify.is_empty() || !unverify.is_empty() || gate_asked;
+            let needs_gate = until.is_some();
+            let gate_owner = slug.clone();
             // A dropped check goes in the same write as the rest, so a
             // command that is refused drops nothing.
             let drops = unverify.clone();
@@ -867,6 +895,12 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                     append,
                     false,
                 );
+                wt_ops::status_checks::assert_gate(&mut next, previous.as_ref(), blocked);
+                if needs_gate && next.blocked_on.is_none() {
+                    return Err(format!(
+                        "{gate_owner} has no gate for --until to clear: add --blocked-on \"<why>\""
+                    ));
+                }
                 wt_ops::status_checks::assert_checks(
                     &mut next,
                     previous.as_ref(),
@@ -907,10 +941,10 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             if let Some(stamp) = &stamped {
                 println!("  {} stamped {}", wt_core::STAMP_CURRENT, stamp.skill);
             }
-            if let Some(line) = cleared_gate_line(
+            if let Some(line) = gate_line(
                 previous_gate.as_deref(),
                 next.blocked_on.as_deref(),
-                work_state,
+                gate_asked,
             ) {
                 println!("{line}");
             }
@@ -926,16 +960,16 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 Err(code) => return Ok(code),
             };
             print_guidance(work_state, next.blocked_on.as_deref(), clears.as_deref());
-            let owed = super::owed::read(ctx, &record).await?;
             // A plain assertion does not change the list; `ready` repeats
             // it, since that is where what is owed gets handed over.
             let ended = matches!(work_state, WorkState::Verified | WorkState::Dropped);
-            if list_asked
-                || clears.is_some()
-                || previous_gate != next.blocked_on
-                || ((work_state == WorkState::Ready || ended) && !owed.items.is_empty())
-            {
-                print_owed(ctx, &record, &owed).await;
+            let changed = list_asked || clears.is_some() || previous_gate != next.blocked_on;
+            if !reads_list(work_state, changed) {
+                return Ok(0);
+            }
+            let owed = super::owed::read(ctx, &record).await?;
+            if changed || !owed.items.is_empty() {
+                print_owed(&inventory, &record, &owed);
                 if ended && !owed.items.is_empty() {
                     println!("{STILL_HOLDS}");
                 }
@@ -962,7 +996,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             unverify,
             append,
         } => {
-            let record = match resolve_worktree(ctx, target.as_deref()).await {
+            let record = match inventory.resolve(target.as_deref()) {
                 Ok(w) if !w.is_main => w,
                 Ok(_) => {
                     eprintln!("not inside a worktree");
@@ -974,6 +1008,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             let slug = record.target.slug().to_owned();
+            let state = read_state(&ctx.database).await?;
             let steps_owed = steps_owed(&state, &slug);
             // Dropping a check is the whole amendment when nothing else was
             // asked for.
@@ -985,7 +1020,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 && until.is_none()
             {
                 let dropped = drop_checks(ctx, &slug, &unverify).await?;
-                print_owed(ctx, &record, &super::owed::read(ctx, &record).await?).await;
+                print_owed(&inventory, &record, &super::owed::read(ctx, &record).await?);
                 return Ok(i32::from(!dropped));
             }
             // Otherwise it goes in the same write as the rest, so an
@@ -1068,7 +1103,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 print_guidance(next.state, next.blocked_on.as_deref(), clears.as_deref());
             }
             if list_changed {
-                print_owed(ctx, &record, &super::owed::read(ctx, &record).await?).await;
+                print_owed(&inventory, &record, &super::owed::read(ctx, &record).await?);
             }
             Ok(0)
         }
@@ -1122,12 +1157,24 @@ fn steps_owed(state: &Value, slug: &str) -> bool {
     )
 }
 
+/// Whether asserting `state` ends with the owed list: when the command
+/// `changed` it, and at `ready` or an ending, where what is owed is handed
+/// over. Reading the list reads the row's landing (Git, and GitHub for a row
+/// that owes a check), which the assertions agents make all day skip.
+fn reads_list(state: WorkState, changed: bool) -> bool {
+    changed
+        || matches!(
+            state,
+            WorkState::Ready | WorkState::Verified | WorkState::Dropped
+        )
+}
+
 /// The list, as every command that changed it ends.
-async fn print_owed(ctx: &AppContext, record: &WorktreeRecord, owed: &super::owed::RowOwed) {
+fn print_owed(inventory: &Inventory, record: &WorktreeRecord, owed: &super::owed::RowOwed) {
     println!(
         "{}",
         super::owed::owed_text(
-            &super::owed::who(ctx, record).await,
+            &super::owed::who(inventory, record),
             record.target.slug(),
             owed,
             super::watch::clock()
@@ -1190,6 +1237,7 @@ async fn drop_checks(ctx: &AppContext, slug: &str, stages: &[VerifyStage]) -> Re
 /// ordinary one.
 async fn verify_checks(
     ctx: &AppContext,
+    inventory: &Inventory,
     record: &WorktreeRecord,
     state: &Value,
     note: Option<String>,
@@ -1260,7 +1308,7 @@ async fn verify_checks(
         }
     }
     let owed = super::owed::read(ctx, record).await?;
-    print_owed(ctx, record, &owed).await;
+    print_owed(inventory, record, &owed);
     if remaining.is_empty() && !owed.items.is_empty() {
         println!("{STILL_HOLDS}");
     }
@@ -1637,19 +1685,18 @@ fn merge_note(
     }
 }
 
-/// A new assertion replaces the whole record, so one made without
-/// `--blocked-on` drops a merge gate the previous record carried.
-fn cleared_gate_line(
-    previous: Option<&str>,
-    current: Option<&str>,
-    state: WorkState,
-) -> Option<String> {
-    let gate = previous.filter(|_| current.is_none())?;
-    Some(if matches!(state, WorkState::Ready | WorkState::Todo) {
-        format!("  gate cleared (was: {gate}); re-add with --blocked-on if it still holds")
-    } else {
-        format!("  gate cleared (was: {gate})")
-    })
+/// What an assertion did with the gate the previous status held, where the
+/// command did not say: a status change keeps it, and an ending (verified
+/// or dropped) clears it. Both are said, so neither happens unseen.
+fn gate_line(previous: Option<&str>, current: Option<&str>, asked: bool) -> Option<String> {
+    let gate = previous?;
+    match current {
+        None => Some(format!("  gate cleared (was: {gate})")),
+        Some(kept) if kept == gate && !asked => Some(format!(
+            "  still blocked on: {gate} (a status change keeps the gate; wt status --unblock clears it)"
+        )),
+        Some(_) => None,
+    }
 }
 
 pub(crate) fn report_replaced_note(previous: Option<&str>, current: Option<&str>, append: bool) {
@@ -2005,7 +2052,8 @@ mod tests {
         };
         assert_eq!(run(&fixture.ctx, &gated).await.unwrap(), 0);
         // `--unblock` was valid against the gated `todo` its caller saw, but
-        // the worktree's agent has asked for a human since.
+        // the worktree's agent has asked for a human and the gate has been
+        // cleared since.
         let claim = StatusArgs {
             positionals: vec!["needs-human".into()],
             note: Some("approve the migration".into()),
@@ -2013,6 +2061,11 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run(&fixture.ctx, &claim).await.unwrap(), 0);
+        let unblock = StatusArgs {
+            unblock: true,
+            ..Default::default()
+        };
+        assert_eq!(run(&fixture.ctx, &unblock).await.unwrap(), 0);
         let refused = update_status(&fixture.ctx.database, "one", |previous| {
             amend_record("one", previous, None, None, Some(None), Vec::new(), false)
         })
@@ -2207,23 +2260,129 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_gate_is_reported_and_a_kept_one_is_not() {
+    fn a_gate_kept_or_cleared_without_being_asked_is_said() {
         assert_eq!(
-            cleared_gate_line(Some("mobile release"), None, WorkState::Ready).as_deref(),
-            Some(
-                "  gate cleared (was: mobile release); re-add with --blocked-on if it still holds"
-            )
-        );
-        // --blocked-on does not apply to working, so the hint would mislead.
-        assert_eq!(
-            cleared_gate_line(Some("mobile release"), None, WorkState::Working).as_deref(),
+            gate_line(Some("mobile release"), None, false).as_deref(),
             Some("  gate cleared (was: mobile release)")
         );
-        assert_eq!(
-            cleared_gate_line(Some("old"), Some("new"), WorkState::Ready),
-            None
+        assert!(
+            gate_line(Some("mobile release"), Some("mobile release"), false)
+                .unwrap()
+                .starts_with("  still blocked on: mobile release")
         );
-        assert_eq!(cleared_gate_line(None, None, WorkState::Ready), None);
+        // The command named the gate itself: nothing to add.
+        assert_eq!(gate_line(Some("old"), Some("new"), true), None);
+        assert_eq!(gate_line(Some("same"), Some("same"), true), None);
+        assert_eq!(gate_line(None, Some("new"), true), None);
+        assert_eq!(gate_line(None, None, false), None);
+    }
+
+    #[tokio::test]
+    async fn a_status_change_keeps_the_gate_and_the_watch_that_clears_it() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let stated = |positionals: &[&str], extra: StatusArgs| StatusArgs {
+            positionals: positionals.iter().map(|word| (*word).to_owned()).collect(),
+            ..extra
+        };
+        let ready = || StatusArgs {
+            risk: Some("low".into()),
+            ..Default::default()
+        };
+        let gated = StatusArgs {
+            blocked_on: Some("the mobile release".into()),
+            until: vec!["3h".into()],
+            ..ready()
+        };
+        assert_eq!(run(ctx, &stated(&["ready"], gated)).await.unwrap(), 0);
+        let gate = || async {
+            let state = read_state(&ctx.database).await.unwrap();
+            let clears = wt_store::stored_watches(&state)
+                .iter()
+                .filter(|watch| watch.slug == "one")
+                .filter_map(|watch| watch.then.unblock.clone())
+                .collect::<Vec<_>>();
+            (
+                state["slugs"]["one"]["work"]["blockedOn"]
+                    .as_str()
+                    .map(str::to_owned),
+                clears,
+            )
+        };
+        let held = (
+            Some("the mobile release".to_owned()),
+            vec!["the mobile release".to_owned()],
+        );
+        assert_eq!(gate().await, held);
+
+        // A review round, and the ready that follows it, say nothing of the
+        // gate: it is a prerequisite of merging, not a claim of one status.
+        for next in [
+            stated(&["review"], StatusArgs::default()),
+            stated(&["working"], StatusArgs::default()),
+            stated(&["ready"], ready()),
+        ] {
+            assert_eq!(run(ctx, &next).await.unwrap(), 0, "{next:?}");
+            assert_eq!(gate().await, held, "{next:?}");
+        }
+
+        // --until on a later assertion attaches to the gate that is there,
+        // and is refused where there is none, with nothing written.
+        let later = StatusArgs {
+            until: vec!["4h".into()],
+            ..ready()
+        };
+        // One watch still clears the gate, and it is the later one.
+        let clears_at = || async {
+            let state = read_state(&ctx.database).await.unwrap();
+            wt_store::stored_watches(&state)
+                .iter()
+                .filter(|watch| watch.then.unblock.as_deref() == held.0.as_deref())
+                .map(|watch| {
+                    watch
+                        .when
+                        .iter()
+                        .filter_map(wt_core::watch::WatchCondition::known_at_ms)
+                        .max()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = clears_at().await;
+        assert_eq!(
+            run(ctx, &stated(&["ready"], later.clone())).await.unwrap(),
+            0
+        );
+        assert_eq!(gate().await, held);
+        let after = clears_at().await;
+        assert_eq!((before.len(), after.len()), (1, 1));
+        assert!(after[0] > before[0], "{before:?} {after:?}");
+        assert_eq!(
+            run(ctx, &stated(&["two", "ready"], later)).await.unwrap(),
+            2
+        );
+        let state = read_state(&ctx.database).await.unwrap();
+        assert!(state["slugs"]["two"]["work"].is_null());
+
+        // A new gate replaces it and cancels the watch set for the old text.
+        let replaced = StatusArgs {
+            blocked_on: Some("the web release".into()),
+            ..ready()
+        };
+        assert_eq!(run(ctx, &stated(&["ready"], replaced)).await.unwrap(), 0);
+        assert_eq!(
+            gate().await,
+            (Some("the web release".to_owned()), Vec::new())
+        );
+
+        // Dropping the work ends what the gate held back.
+        let dropped = StatusArgs {
+            note: Some("superseded".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &stated(&["dropped"], dropped)).await.unwrap(), 0);
+        assert_eq!(gate().await, (None, Vec::new()));
+        fixture.close().await.unwrap();
     }
 
     #[test]
@@ -2417,14 +2576,28 @@ mod tests {
                 ..
             }
         ));
-        assert!(
-            error(StatusArgs {
+        // An ending holds no gate, so there is none to add one to.
+        for ending in ["verified", "dropped"] {
+            let refusal = error(StatusArgs {
+                positionals: vec![ending.into()],
+                note: Some("done".into()),
+                ..base()
+            });
+            assert!(
+                refusal.contains("hold no gate") && !refusal.contains("add --blocked-on"),
+                "{refusal}"
+            );
+        }
+        // With a state too: a status change keeps the gate, so whether one
+        // is there is known only at the write.
+        assert!(matches!(
+            parse_status_args(&StatusArgs {
                 positionals: vec!["ready".into()],
                 risk: Some("low".into()),
                 ..base()
-            })
-            .contains("add --blocked-on")
-        );
+            }),
+            Action::Set { blocked: None, .. }
+        ));
         assert!(
             error(StatusArgs {
                 then: Some("verify it".into()),
@@ -2528,7 +2701,9 @@ mod tests {
 
         // The row's JSON carries it.
         let state = read_state(&fixture.ctx.database).await.unwrap();
-        let record = resolve_worktree(&fixture.ctx, Some("one")).await.unwrap();
+        let record = wt_ops::commands::resolve::resolve_worktree(&fixture.ctx, Some("one"))
+            .await
+            .unwrap();
         let row = live_json(
             &fixture.ctx,
             &state,
@@ -2848,6 +3023,44 @@ mod tests {
             .filter(|line| line == "dropped: staging check: 1. check")
             .count();
         assert!(dropped >= 1);
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn only_an_assertion_that_ends_with_the_list_reads_it() {
+        for state in [
+            WorkState::Todo,
+            WorkState::Working,
+            WorkState::Review,
+            WorkState::NeedsTesting,
+            WorkState::NeedsHuman,
+        ] {
+            assert!(!reads_list(state, false), "{state:?}");
+            assert!(reads_list(state, true), "{state:?}");
+        }
+        for state in [WorkState::Ready, WorkState::Verified, WorkState::Dropped] {
+            assert!(reads_list(state, false), "{state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_status_outside_every_worktree_lists_nothing() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let mut ctx = fixture.ctx.clone();
+        // A cancelled listing fails, as the one inside a worktree shows.
+        ctx.cancellation = ctx.cancellation.child_token();
+        ctx.cancellation.cancel();
+        assert!(run(&ctx, &StatusArgs::default()).await.is_err());
+        // Outside the worktree root the words need no listing at all.
+        ctx.cwd = fixture._root.path().to_path_buf();
+        assert_eq!(run(&ctx, &StatusArgs::default()).await.unwrap(), 0);
+        // Naming a worktree from there still needs one.
+        let named = StatusArgs {
+            positionals: vec!["one".into()],
+            ..Default::default()
+        };
+        assert!(run(&ctx, &named).await.is_err());
         fixture.close().await.unwrap();
     }
 }

@@ -11,20 +11,25 @@ use clap::Args;
 use serde_json::{Value, json};
 use wt_app_core::context::AppContext;
 use wt_core::watch::{
-    Condition, Delay, LocalClock, Truth, Watch, WatchActions, WatchCondition, evaluate, needs,
+    Condition, Delay, LocalClock, RowState, Truth, Watch, WatchActions, WatchCondition, evaluate,
+    needs,
 };
 use wt_sources::{
-    wait_facts::{RowReader, RowsRead},
+    wait_facts::{Changed, RowReader, RowsRead, Signals},
     watch_facts::{Externals, GIT_INTERVAL, facts},
 };
 
-use super::watch::{CONDITION_HELP, NO_CONDITIONS, author, clock, no_conditions, now_ms, owner};
+use super::watch::{CONDITION_HELP, NO_CONDITIONS, author, clock, no_conditions, now_ms, owner_in};
 
 const TIMEOUT_DEFAULT: &str = "30m";
 const TIMEOUT_MAX_MS: i64 = 24 * 60 * 60 * 1_000;
 /// What `timeout(1)` exits with.
 const EXIT_TIMED_OUT: i32 = 124;
 const EXIT_INTERRUPTED: i32 = 130;
+/// A change on disk is acted on at once, and the next one no sooner than
+/// this: a busy fleet writes its state many times a second, and each look
+/// parses that state and may run Git.
+const SIGNAL_FLOOR: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Args)]
 pub struct WaitArgs {
@@ -64,6 +69,9 @@ struct Outcome {
     when: Vec<WatchCondition>,
     /// Why pull-request answers were missing at the end, when they were.
     problem: Option<String>,
+    /// What GitHub said of a condition that holds, where it said more than
+    /// the condition does: why a merge was dropped.
+    why: Vec<Option<String>>,
     waited: Duration,
 }
 
@@ -109,7 +117,7 @@ impl Outcome {
     fn state(&self, index: usize, now_ms: i64) -> (&'static str, Option<String>) {
         let cond = &self.when[index];
         match &self.truths[index] {
-            Truth::Holds => ("holds", None),
+            Truth::Holds => ("holds", self.why.get(index).cloned().flatten()),
             Truth::NotYet => (
                 "not_yet",
                 cond.delay
@@ -263,11 +271,39 @@ async fn wait_until(
         .when
         .iter()
         .any(|cond| !matches!(cond.cond, Condition::At { .. }));
+    // Before the first read, so nothing written during it is missed.
+    let mut signals = Signals::new(ctx);
+    let mut changed = Changed::default();
+    let mut signals_at: Option<Instant> = None;
+    // Read the rows again without waiting out the interval.
+    let mut rows_due = false;
+    // When the shared GitHub read may ask again.
+    let mut github_due: Option<Instant> = None;
     loop {
-        if reads_rows && rows_at.is_none_or(|at| at.elapsed() >= GIT_INTERVAL) {
+        if changed.any() && signals_at.is_none_or(|at| at.elapsed() >= SIGNAL_FLOOR) {
+            let changed = std::mem::take(&mut changed);
+            signals_at = Some(Instant::now());
+            if changed.git {
+                externals.git_changed();
+            }
+            rows_due |= reads_rows
+                && reader
+                    .concerns(ctx, std::slice::from_ref(&watch), changed)
+                    .await;
+        }
+        rows_due |= github_due.is_some_and(|due| Instant::now() >= due);
+        if reads_rows && (rows_due || rows_at.is_none_or(|at| at.elapsed() >= GIT_INTERVAL)) {
+            rows_due = false;
+            github_due = None;
             match reader.read(ctx, std::slice::from_ref(&watch)).await {
                 Ok(read) => {
                     problem.clone_from(&read.problem);
+                    // No sooner than the pace allows, so the read this
+                    // prompts finds GitHub askable.
+                    github_due = read.github_due_ms.map(|due_ms| {
+                        let wait = due_ms.saturating_sub(u64::try_from(now_ms()).unwrap_or(0));
+                        Instant::now() + Duration::from_millis(wait.saturating_add(1))
+                    });
                     rows = read;
                     rows_known = true;
                 }
@@ -306,24 +342,50 @@ async fn wait_until(
             None
         };
         if let Some(ended) = ended {
+            let why = watch
+                .when
+                .iter()
+                .map(|cond| {
+                    let slug = match &cond.cond {
+                        Condition::Own(RowState::Evicted) => &watch.slug,
+                        Condition::Worktree {
+                            slug,
+                            state: RowState::Evicted,
+                        } => slug,
+                        _ => return None,
+                    };
+                    rows.removals.get(slug).cloned()
+                })
+                .collect();
             return Ok(Outcome {
                 ended,
                 truths: evaluation.truths,
                 when: watch.when,
                 problem,
+                why,
                 waited,
             });
         }
-        // The next moment something can change without a read: the
-        // deadline, a time, a delay running out.
+        // The next moment something can change without a file changing:
+        // the deadline, a time, a delay running out, the backstop read of
+        // the rows, GitHub becoming askable, a held-back change coming due.
         let instants = watch
             .when
             .iter()
             .filter_map(WatchCondition::known_at_ms)
             .filter(|at| *at > now)
             .map(|at| Duration::from_millis(u64::try_from(at - now).unwrap_or(0)));
+        let until = |at: Instant| at.saturating_duration_since(Instant::now());
+        let backstop = rows_at
+            .filter(|_| reads_rows)
+            .map(|at| GIT_INTERVAL.saturating_sub(at.elapsed()));
+        let held_back = signals_at
+            .filter(|_| changed.any())
+            .map(|at| SIGNAL_FLOOR.saturating_sub(at.elapsed()));
         let pause = instants
-            .chain(reads_rows.then_some(GIT_INTERVAL))
+            .chain(backstop)
+            .chain(github_due.filter(|_| reads_rows).map(until))
+            .chain(held_back)
             .chain([timeout.saturating_sub(waited)])
             .min()
             .unwrap_or(GIT_INTERVAL);
@@ -334,6 +396,7 @@ async fn wait_until(
                     externals.absorb(arrived);
                 }
             }
+            seen = signals.changed() => changed.absorb(seen),
             () = tokio::time::sleep(pause) => {}
         }
     }
@@ -353,12 +416,15 @@ async fn wait(ctx: &AppContext, args: &WaitArgs) -> Result<(i32, Option<Outcome>
         Err(message) => return refuse(2, message),
     };
     let clock = clock();
-    let read = match super::watch::read_conditions(ctx, &args.conditions, clock).await {
+    // The worktrees could not be listed: nothing was wrong with the
+    // conditions.
+    let inventory = match super::watch::inventory(ctx).await {
+        Ok(inventory) => inventory,
+        Err(message) => return refuse(1, message),
+    };
+    let read = match super::watch::read_conditions(ctx, &inventory, &args.conditions, clock).await {
         Ok(read) => read,
-        // The worktrees could not be listed: nothing was wrong with the
-        // conditions.
-        Err(super::watch::ConditionsError::Unreadable(message)) => return refuse(1, message),
-        Err(super::watch::ConditionsError::Invalid(message)) => return refuse(2, message),
+        Err(message) => return refuse(2, message),
     };
     if let Some(message) = args
         .conditions
@@ -372,7 +438,7 @@ async fn wait(ctx: &AppContext, args: &WaitArgs) -> Result<(i32, Option<Outcome>
         .when
         .iter()
         .any(|cond| matches!(cond.cond, Condition::Own(_) | Condition::Check { .. }));
-    let slug = match owner(ctx, args.slug.as_deref(), "a wait on this worktree").await {
+    let slug = match owner_in(&inventory, args.slug.as_deref(), "a wait on this worktree") {
         Ok(slug) => slug,
         // A time, a pull request or another worktree needs no owner.
         Err(_) if !about_owner && args.slug.is_none() => String::new(),
@@ -449,6 +515,7 @@ mod tests {
                 .map(|arg| parse(arg, clock()).unwrap())
                 .collect(),
             problem: None,
+            why: Vec::new(),
             waited: Duration::from_secs(750),
         }
     }
@@ -525,6 +592,18 @@ mod tests {
         let json = ended.json(&args, clock());
         assert_eq!(json["result"], "held");
         assert_eq!(json["held"], json!(["reviewed"]));
+        // A merge GitHub dropped holds with GitHub's reason beside it.
+        let mut dropped = outcome(Ended::Held, &["evicted"], vec![Truth::Holds]);
+        dropped.why = vec![Some("removed from the merge queue: merge_conflict".into())];
+        let one = super::tests::args(&["evicted"], false, "30m");
+        assert_eq!(
+            dropped.text(&one, clock()),
+            "held after 12m30s: evicted\n  evicted: merge dropped: holds (removed from the merge queue: merge_conflict)"
+        );
+        assert_eq!(
+            dropped.json(&one, clock())["conditions"][0]["reason"],
+            "removed from the merge queue: merge_conflict"
+        );
         assert_eq!(json["conditions"][0]["state"], "not_yet");
         assert_eq!(
             json["conditions"][2]["reason"],
@@ -636,8 +715,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(super::super::status::run(ctx, &status).await.unwrap(), 0);
-        let (code, how, _) = ended(waiting.await.unwrap().unwrap());
-        assert_eq!((code, how), (0, Ended::Held));
+        let (code, outcome) = waiting.await.unwrap().unwrap();
+        let outcome = outcome.unwrap();
+        assert_eq!((code, outcome.ended), (0, Ended::Held));
+        // The write itself ended the wait. The timed read of the rows comes
+        // a whole interval after the first one, so a wait that had to be
+        // ended by it has always waited longer than that, however loaded
+        // the machine is.
+        assert!(outcome.waited < GIT_INTERVAL, "{:?}", outcome.waited);
 
         // Nothing was stored for any of it.
         let state = ctx

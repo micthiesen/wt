@@ -60,6 +60,7 @@ pub struct HarnessService {
     claude: ClaudeHarness,
     claude_sessions: ClaudeSessionManager,
     claude_messenger: ClaudeMessenger,
+    claude_turn_limits: Option<(std::time::Duration, std::time::Duration)>,
     codex: CodexHarness,
     opencode: OpenCodeHarness,
     pi: PiHarness,
@@ -84,6 +85,7 @@ impl HarnessService {
             claude,
             claude_sessions,
             claude_messenger,
+            claude_turn_limits: None,
             codex: CodexHarness::new(codex_paths, runner.clone(), tmux.clone()),
             opencode: OpenCodeHarness::new(opencode_paths, runner.clone(), tmux.clone()),
             pi: PiHarness::new(pi_paths, runner, tmux),
@@ -129,11 +131,28 @@ impl HarnessService {
         self.rebuild_claude_messenger()
     }
 
+    /// Bound a Claude send: `human` is how long the session may keep waiting
+    /// on a person, `queue` how long the send queues behind another one
+    /// being delivered. Unset, each is a day, which suits callers with nobody
+    /// watching.
+    pub fn with_claude_turn_limits(
+        mut self,
+        human: std::time::Duration,
+        queue: std::time::Duration,
+    ) -> Self {
+        self.claude_turn_limits = Some((human, queue));
+        self.rebuild_claude_messenger()
+    }
+
     fn rebuild_claude_messenger(mut self) -> Self {
-        self.claude_messenger = ClaudeMessenger::new(
+        let messenger = ClaudeMessenger::new(
             self.claude_sessions.clone(),
             ClaudeInjector::new(self.claude.paths().cache_dir.clone()),
         );
+        self.claude_messenger = match self.claude_turn_limits {
+            Some((human, queue)) => messenger.with_turn_limits(human, queue),
+            None => messenger,
+        };
         self
     }
 
@@ -228,8 +247,11 @@ impl HarnessService {
         }
     }
 
-    /// Ensure the selected harness has a live slot. Returns true only when
-    /// this call created it, false when an existing slot was adopted.
+    /// Ensure the selected harness has a live slot for a person to attach to.
+    /// Returns true only when this call created it, false when an existing
+    /// slot was adopted. Claude's registration is not awaited: attaching
+    /// needs the tmux session only, and the person at the pane owns any
+    /// startup prompt. Sends wait for it themselves.
     pub async fn ensure_started(
         &self,
         id: HarnessId,
@@ -243,8 +265,7 @@ impl HarnessService {
                     cwd: request.worktree_path.clone(),
                     managed_name: request.managed_name.clone(),
                 };
-                let (_, started) = self.claude_sessions.ensure(&target, cancel).await?;
-                Ok(started)
+                Ok(self.claude_sessions.ensure_slot(&target, cancel).await?)
             }
             HarnessId::Codex => Ok(self.codex.start(request, cancel).await?),
             HarnessId::Opencode => Ok(self.opencode.start(request, cancel).await?),

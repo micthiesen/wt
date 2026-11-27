@@ -3062,7 +3062,10 @@ name = "wt-github"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "futures-util",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",

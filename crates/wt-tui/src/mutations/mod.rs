@@ -181,6 +181,18 @@ impl Mutation<Board> for UiMutation {
         }
     }
 
+    fn confirming(&self) -> Vec<Target> {
+        match &self.kind {
+            // One entry can remove several rows; each is confirmed by a read
+            // of that row, or by a listing that no longer has it.
+            MutationKind::Lifecycle(LifecycleChange::Remove { keys }) if !keys.is_empty() => keys
+                .iter()
+                .map(|key| Target::row(self.target.host.clone(), key.clone()))
+                .collect(),
+            _ => vec![self.target.clone()],
+        }
+    }
+
     fn apply(&self, board: &mut Board) {
         if let Some(family) = self.kind.family() {
             family.apply(&self.target, board);

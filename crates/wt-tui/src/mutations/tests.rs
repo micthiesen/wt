@@ -559,7 +559,6 @@ fn every_declared_domain_can_settle() {
             key: "a".into(),
             pin: None,
         },
-        UiAction::GithubFailedChecks { key: "a".into() },
         UiAction::KillAction {
             action_key: String::new(),
             run_id: String::new(),
@@ -791,5 +790,44 @@ fn a_notify_choice_shows_at_once_and_only_the_persons_own_watch_confirms_it() {
     assert_eq!(
         UiAction::PrepareNotify { key: "a".into() }.effect(&board()),
         Effect::ReadOnly
+    );
+}
+
+#[test]
+fn a_git_backed_change_names_the_rows_its_host_reads_again() {
+    let board = board();
+    let rows = |action: UiAction| action.effect(&board).rows();
+    assert_eq!(
+        rows(UiAction::Restack { key: "a".into() }),
+        Some(vec!["a".to_owned()])
+    );
+    // Creation's row does not exist yet: listing the rows again shows it.
+    assert_eq!(
+        rows(UiAction::Create {
+            input: "new".into(),
+            placement: None,
+        }),
+        Some(Vec::new())
+    );
+    // With no row to name, every row is read.
+    assert_eq!(
+        rows(UiAction::ReviewCheckout {
+            url: "https://github.com/o/r/pull/9".into(),
+            updated_at: String::new(),
+            branch: "review".into(),
+        }),
+        None
+    );
+    // One entry that removes several rows is confirmed by each of them.
+    let removal = whole(LifecycleChange::Remove {
+        keys: vec!["a".into(), "b".into()],
+    });
+    assert_eq!(
+        removal.confirming(),
+        vec![Target::row(None, "a"), Target::row(None, "b")]
+    );
+    assert_eq!(
+        Effect::Mutation(removal).rows(),
+        Some(vec!["a".to_owned(), "b".to_owned()])
     );
 }

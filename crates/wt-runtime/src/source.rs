@@ -1,6 +1,7 @@
 //! Push-driven sources. A leaf source fetches one domain and is the only kind
 //! that can publish live data or produce a `Confirmed` value. A derived source
 //! combines other sources and inherits their provenance.
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
@@ -15,7 +16,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::cache::{CacheSlot, DiskCache};
-use crate::snapshot::DomainMeta;
+use crate::snapshot::{DomainMeta, KeyedStamps};
 use crate::{Confirmed, SourceSnapshot, SourceState, Stamp, TaskScope};
 use wt_core::Domain;
 
@@ -114,13 +115,77 @@ impl Strongest {
         self.0.fetch_max(request as u8, Ordering::AcqRel);
     }
 
-    /// Nothing recorded means the request that woke this fetch was already
-    /// taken, at full strength, by the fetch before it.
-    fn take(&self) -> Request {
+    fn take(&self) -> Option<Request> {
         match self.0.swap(0, Ordering::AcqRel) {
-            3.. => Request::Direct,
-            2 => Request::Refresh,
-            _ => Request::Recheck,
+            0 => None,
+            1 => Some(Request::Recheck),
+            2 => Some(Request::Refresh),
+            _ => Some(Request::Direct),
+        }
+    }
+}
+
+/// What a leaf has been asked to read since it last looked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Demand {
+    /// Read everything.
+    pub whole: Option<Request>,
+    /// The key set may have changed: list the keys again.
+    pub index: Option<Request>,
+    /// Read these keys again.
+    pub keys: BTreeMap<String, Request>,
+}
+
+impl Demand {
+    /// The one request a leaf that reads its domain whole serves.
+    pub fn strongest(&self) -> Option<Request> {
+        self.keys
+            .values()
+            .copied()
+            .chain(self.whole)
+            .chain(self.index)
+            .max()
+    }
+}
+
+/// Requests made of a source since its last fetch started, coalesced: the
+/// strongest whole request, and the strongest request per key.
+#[derive(Clone, Default)]
+struct Intake {
+    whole: Strongest,
+    keyed: Arc<Mutex<Keyed>>,
+}
+
+#[derive(Default)]
+struct Keyed {
+    index: Option<Request>,
+    keys: BTreeMap<String, Request>,
+}
+
+impl Intake {
+    fn raise_keys(&self, request: Request, keys: impl IntoIterator<Item = String>) {
+        let mut keyed = self
+            .keyed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        keyed.index = keyed.index.max(Some(request));
+        for key in keys {
+            let entry = keyed.keys.entry(key).or_insert(request);
+            *entry = (*entry).max(request);
+        }
+    }
+
+    fn take(&self) -> Demand {
+        let Keyed { index, keys } = std::mem::take(
+            &mut *self
+                .keyed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Demand {
+            whole: self.whole.take(),
+            index,
+            keys,
         }
     }
 }
@@ -128,7 +193,7 @@ impl Strongest {
 /// Display access to a source. It has no way to produce a `Confirmed` value.
 pub struct SourceHandle<T> {
     requests: mpsc::Sender<()>,
-    strongest: Strongest,
+    intake: Intake,
     snapshots: watch::Receiver<SourceSnapshot<T>>,
 }
 
@@ -136,7 +201,7 @@ impl<T> Clone for SourceHandle<T> {
     fn clone(&self) -> Self {
         Self {
             requests: self.requests.clone(),
-            strongest: self.strongest.clone(),
+            intake: self.intake.clone(),
             snapshots: self.snapshots.clone(),
         }
     }
@@ -153,7 +218,25 @@ impl<T> SourceHandle<T> {
     /// (`start_requested_source`).
     pub fn request(&self, request: Request) -> bool {
         // Recorded before the wake-up, so a fetch never runs without it.
-        self.strongest.raise(request);
+        self.intake.whole.raise(request);
+        self.wake()
+    }
+
+    /// Ask a leaf that reads its rows independently (`start_keyed_source`)
+    /// to list its keys again and re-read only the named ones. No keys means
+    /// only the key set may have changed. A leaf that reads its domain whole
+    /// serves this as `request`.
+    pub fn request_keys(
+        &self,
+        request: Request,
+        keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> bool {
+        self.intake
+            .raise_keys(request, keys.into_iter().map(Into::into));
+        self.wake()
+    }
+
+    fn wake(&self) -> bool {
         match self.requests.try_send(()) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(())) => true,
             Err(mpsc::error::TrySendError::Closed(())) => false,
@@ -174,7 +257,7 @@ impl<T> SourceHandle<T> {
         let (_, snapshots) = snapshot_channel(snapshot);
         Self {
             requests,
-            strongest: Strongest::default(),
+            intake: Intake::default(),
             snapshots,
         }
     }
@@ -231,13 +314,14 @@ fn confirm<T>(snapshot: &SourceSnapshot<T>, domain: Domain) -> Option<Confirmed<
     }
     snapshot
         .data()
-        .map(|data| Confirmed::new(data.clone(), meta.observed()))
+        .map(|data| Confirmed::from_meta(data.clone(), meta))
 }
 
 /// Publishes a leaf's own fetches. Live data enters the system only here.
 pub struct LeafPublisher<T> {
     sender: Arc<watch::Sender<SourceSnapshot<T>>>,
     requests: mpsc::Receiver<()>,
+    intake: Intake,
     domain: Domain,
 }
 
@@ -250,7 +334,23 @@ impl<T> LeafPublisher<T> {
     /// Live data whose lane reports a non-ready state, such as a remote host
     /// that is reachable but still refreshing.
     pub fn publish_live_with_state(&self, data: T, observed: Stamp, state: SourceState) {
-        publish_live(&self.sender, self.domain, Arc::new(data), observed, state);
+        let meta = DomainMeta::live(observed, state);
+        publish_live(&self.sender, self.domain, Arc::new(data), meta);
+    }
+
+    /// Live rows read at different moments, each with the start of its own
+    /// read. The domain is stamped with the oldest of them.
+    pub fn publish_live_keyed(&self, data: Arc<T>, stamps: KeyedStamps, state: SourceState) {
+        let meta = DomainMeta::live_keyed(stamps, state);
+        publish_live(&self.sender, self.domain, data, meta);
+    }
+
+    /// Everything asked of this leaf since the last call, for a leaf that
+    /// serves whole and per-key requests differently.
+    pub fn take_demand(&mut self) -> Demand {
+        // A wake-up already queued belongs to the demand taken here.
+        while self.requests.try_recv().is_ok() {}
+        self.intake.take()
     }
 
     /// Change the lane state while keeping the last data and its provenance.
@@ -267,13 +367,13 @@ fn publish_live<T>(
     sender: &watch::Sender<SourceSnapshot<T>>,
     domain: Domain,
     data: Arc<T>,
-    observed: Stamp,
-    state: SourceState,
+    meta: DomainMeta,
 ) {
     sender.send_modify(|snapshot| {
         let revision = snapshot.revision().wrapping_add(1);
+        let state = meta.state().clone();
         snapshot.set_data(Some(data));
-        snapshot.set_meta(domain, DomainMeta::live(observed, state.clone()));
+        snapshot.set_meta(domain, meta);
         *snapshot = std::mem::take(snapshot).with_state(state);
         snapshot.set_revision(revision);
     });
@@ -307,6 +407,7 @@ fn set_state<T>(sender: &watch::Sender<SourceSnapshot<T>>, domain: Domain, state
 pub struct DerivedPublisher<T> {
     sender: watch::Sender<SourceSnapshot<T>>,
     requests: mpsc::Receiver<()>,
+    intake: Intake,
     last: Mutex<Option<SourceSnapshot<T>>>,
 }
 
@@ -325,6 +426,14 @@ impl<T> DerivedPublisher<T> {
     /// same_view`), so an input that woke without a visible change does not
     /// ripple through later stages or redraw the TUI. Returns whether it
     /// published.
+    /// Everything asked of this stage since the last call, for a stage that
+    /// passes a request for named rows on to the leaf that can serve it
+    /// rather than refreshing all its inputs.
+    pub fn take_demand(&mut self) -> Demand {
+        while self.requests.try_recv().is_ok() {}
+        self.intake.take()
+    }
+
     pub fn publish_if_changed(&self, snapshot: SourceSnapshot<T>) -> bool
     where
         T: PartialEq,
@@ -367,13 +476,15 @@ pub fn derived_channel<T>(
     });
     let (requests, pending) = mpsc::channel(1);
     let (sender, snapshots) = snapshot_channel(SourceSnapshot::default());
+    let intake = Intake::default();
     (
         SourceHandle {
             requests,
-            strongest: Strongest::default(),
+            intake: intake.clone(),
             snapshots,
         },
         DerivedPublisher {
+            intake,
             sender,
             requests: pending,
             last: Mutex::new(None),
@@ -390,6 +501,7 @@ pub fn leaf_channel<T: Send + Sync + 'static>(
     let (sender, snapshots) = snapshot_channel(SourceSnapshot::default());
     let sender = Arc::new(sender);
     let domain = spec.domain;
+    let intake = Intake::default();
     register_leaf(scope, &spec);
     if let Persistence::Disk(cache) = spec.persistence {
         attach_cache(scope, spec.name, domain, cache.slot(), sender.clone());
@@ -398,7 +510,7 @@ pub fn leaf_channel<T: Send + Sync + 'static>(
         LeafHandle {
             handle: SourceHandle {
                 requests,
-                strongest: Strongest::default(),
+                intake: intake.clone(),
                 snapshots,
             },
             domain,
@@ -406,6 +518,7 @@ pub fn leaf_channel<T: Send + Sync + 'static>(
         LeafPublisher {
             sender,
             requests: pending,
+            intake,
             domain,
         },
     )
@@ -427,7 +540,7 @@ fn register_leaf<T>(scope: &TaskScope, spec: &SourceSpec<T>) {
 }
 
 /// A fetch running longer than this shows its lane as refreshing.
-const REFRESHING_AFTER: Duration = Duration::from_millis(100);
+pub(crate) const REFRESHING_AFTER: Duration = Duration::from_millis(100);
 
 /// Minimum spacing between cache writes of one source.
 const WRITE_INTERVAL: Duration = Duration::from_secs(10);
@@ -583,11 +696,34 @@ where
 pub struct Fetched<T> {
     pub data: T,
     pub observed: Stamp,
+    keyed: Option<KeyedStamps>,
 }
 
 impl<T> Fetched<T> {
     pub fn new(data: T, observed: Stamp) -> Self {
-        Self { data, observed }
+        Self {
+            data,
+            observed,
+            keyed: None,
+        }
+    }
+
+    /// Data whose parts were read at different moments: a full read with
+    /// newer reads of some keys merged in. `stamps` carries the full read's
+    /// start as its listing stamp and each merged key's own read start. The
+    /// domain is stamped with the oldest of them, so the result confirms no
+    /// more of the domain than the full read did.
+    pub fn keyed(data: T, stamps: KeyedStamps) -> Self {
+        Self {
+            data,
+            observed: stamps.oldest(),
+            keyed: Some(stamps),
+        }
+    }
+
+    /// The per-key stamps, if the data carries any.
+    pub fn stamps(&self) -> Option<&KeyedStamps> {
+        self.keyed.as_ref()
     }
 }
 
@@ -639,9 +775,32 @@ where
     F: FnMut(Request, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = Result<Option<Fetched<T>>, E>> + Send + 'static,
 {
+    // Nothing recorded means the request that woke this fetch was already
+    // taken, at full strength, by the fetch before it.
+    start_demanded_source(scope, spec, move |demand, token| {
+        fetch(demand.strongest().unwrap_or(Request::Recheck), token)
+    })
+}
+
+/// Like `start_requested_source`, but the fetch is given everything asked of
+/// the source since the last fetch started: the strongest whole request and
+/// the strongest request per named key (`SourceHandle::request_keys`). A
+/// fetch may then read only the named keys and publish them merged into its
+/// last full read with `Fetched::keyed`. A request for keys also sets
+/// `Demand::index`; a fetch that has no listing of its own can ignore it.
+pub fn start_demanded_source<T, E, F, Fut>(
+    scope: &TaskScope,
+    spec: SourceSpec<T>,
+    mut fetch: F,
+) -> LeafHandle<T>
+where
+    T: Send + Sync + 'static,
+    E: Display + Send + 'static,
+    F: FnMut(Demand, CancellationToken) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Option<Fetched<T>>, E>> + Send + 'static,
+{
     let policy = spec.policy;
     let (handle, mut publisher) = leaf_channel(scope, spec);
-    let strongest = handle.strongest.clone();
     let token = scope.token();
     scope.spawn(async move {
         let mut last_start = None::<Instant>;
@@ -661,8 +820,7 @@ where
             }
             // Events before the fetch are included in it. Do not carry them
             // forward as a spurious extra refresh.
-            while publisher.requests.try_recv().is_ok() {}
-            let request = strongest.take();
+            let request = publisher.take_demand();
             let previous = publisher.sender.borrow().state().clone();
             let started = Instant::now();
             // Include the factory call inside the protected future: it can
@@ -700,7 +858,14 @@ where
             match result {
                 Ok(Some(fetched)) => {
                     last_start = Some(started);
-                    publisher.publish_live(fetched.data, fetched.observed)
+                    match fetched.keyed {
+                        Some(stamps) => publisher.publish_live_keyed(
+                            Arc::new(fetched.data),
+                            stamps,
+                            SourceState::Ready,
+                        ),
+                        None => publisher.publish_live(fetched.data, fetched.observed),
+                    }
                 }
                 // Nothing was fetched, so the rate-limit floor is untouched.
                 // Restored data that arrived meanwhile keeps reading as stale.

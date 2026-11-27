@@ -31,6 +31,14 @@ const PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// once on a large repository each take minutes of disk time.
 const WORKTREE_ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROCESS_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+/// How old a completed origin fetch may be for a creation to resolve its refs
+/// from it instead of fetching again. The events daemon and the board fetch
+/// on every push they hear of, and a creation queued behind another used to
+/// repeat the fetch that one had just made. Within the window a push to
+/// origin is not seen yet, so a new branch forks from a base at most this
+/// stale. What must not be stale is fetched for after all: a base that does
+/// not resolve, a branch origin already has, and a review's pinned head.
+const CREATE_FETCH_REUSE: Duration = Duration::from_secs(30);
 /// Bounded retries of `rm` on an already-verified quarantine. Only
 /// `Directory not empty` (entries created mid-deletion) is retried.
 const QUARANTINE_DELETE_ATTEMPTS: u32 = 4;
@@ -255,6 +263,7 @@ pub struct LifecycleService {
     id_pattern: Option<Regex>,
     dev: Option<wt_dev::DevServerService>,
     before_remove: Option<BeforeRemoveHook>,
+    deferred_maintenance: Option<Arc<dyn Fn() + Send + Sync>>,
     sst_program: OsString,
     resolved_rift: Arc<tokio::sync::OnceCell<OsString>>,
 }
@@ -291,6 +300,39 @@ struct ReviewHead {
     expected: String,
 }
 
+/// A dependency install that holds its install slot and may run.
+pub struct PreparedInstall {
+    /// The package manager's command, with its directory and time limit.
+    pub spec: CommandSpec,
+    _slot: crate::slots::Slot,
+    phase: crate::creation_trace::CreationPhase,
+}
+
+impl PreparedInstall {
+    /// Record how the install ended, for a caller that ran the command
+    /// itself. `None` is an install that was killed or never started.
+    pub fn finished(self, exit_code: Option<i32>) {
+        self.phase.exit(exit_code);
+    }
+}
+
+/// What the starter of a durable removal needs from its worker: the moment
+/// the worker holds the worktree's lifecycle lock.
+pub struct RemovalHandover {
+    /// How long the worker waits for that lock before it refuses the
+    /// removal, having changed nothing.
+    pub lock_wait: Duration,
+    /// Runs once the lock is held and before anything is checked or removed.
+    pub locked: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
+}
+
+/// A finished creation, and whether it made the origin fetch whose ref
+/// maintenance it therefore owes.
+struct Created {
+    result: CreateResult,
+    owes_maintenance: bool,
+}
+
 impl LifecycleService {
     pub fn new(config: ServiceConfig, repository: GitRepository, runner: ProcessRunner) -> Self {
         let id_pattern = regex::RegexBuilder::new(&config.branch_id_pattern)
@@ -304,6 +346,7 @@ impl LifecycleService {
             id_pattern,
             dev: None,
             before_remove: None,
+            deferred_maintenance: None,
             sst_program: "pnpm".into(),
             resolved_rift: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -328,6 +371,31 @@ impl LifecycleService {
         self
     }
 
+    /// Hand the ref maintenance a creation owes to work that outlives the
+    /// call, so the creation returns as soon as its checkout is usable.
+    /// `start` must not block and must start work that neither the caller
+    /// returning nor this process exiting interrupts: maintenance can
+    /// fast-forward the main clone's checkout and install its dependencies,
+    /// and neither is safe to cut short. Without it the creation runs the
+    /// maintenance itself before returning.
+    pub fn with_deferred_maintenance(mut self, start: impl Fn() + Send + Sync + 'static) -> Self {
+        self.deferred_maintenance = Some(Arc::new(start));
+        self
+    }
+
+    /// The ref maintenance a creation that fetched origin owes: local base
+    /// branches, the main clone's checkout and dependencies, Rift trunk
+    /// refs. It works on the refs as last fetched and fetches nothing.
+    pub async fn maintain_origin(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<wt_vcs::FetchOriginReport, LifecycleError> {
+        Ok(self
+            .repository
+            .maintain_fetched_refs(self.maintenance_options(), cancellation)
+            .await?)
+    }
+
     /// The stable inventory key a branch will use under this host's naming
     /// policy. Preparation does not create directories or Git objects.
     pub fn creation_key(&self, branch: &str) -> String {
@@ -347,9 +415,12 @@ impl LifecycleService {
             return Err(LifecycleError::Invalid("branch must not be empty".into()));
         }
         let slug = self.dir_slug(branch);
-        let _lock = self.acquire_lock(&slug, "create", cancellation).await?;
-        self.create_locked(branch, &slug, options, cancellation)
-            .await
+        let lock = self.acquire_lock(&slug, "create", cancellation).await?;
+        let created = self
+            .create_locked(branch, &slug, options, cancellation)
+            .await?;
+        drop(lock);
+        Ok(self.settle_creation(created, cancellation).await)
     }
 
     /// Create a worktree from a pinned GitHub pull-request head when the
@@ -374,20 +445,23 @@ impl LifecycleService {
             ));
         }
         let slug = self.dir_slug(branch);
-        let _lock = self
+        let lock = self
             .acquire_lock(&slug, "create review worktree", cancellation)
             .await?;
-        self.create_locked_inner(
-            branch,
-            &slug,
-            options,
-            Some(ReviewHead {
-                number: pull_number,
-                expected: expected_head.to_ascii_lowercase(),
-            }),
-            cancellation,
-        )
-        .await
+        let created = self
+            .create_locked_inner(
+                branch,
+                &slug,
+                options,
+                Some(ReviewHead {
+                    number: pull_number,
+                    expected: expected_head.to_ascii_lowercase(),
+                }),
+                cancellation,
+            )
+            .await?;
+        drop(lock);
+        Ok(self.settle_creation(created, cancellation).await)
     }
 
     /// Restore a removed checkout only if the exact removal shown to the user
@@ -402,7 +476,7 @@ impl LifecycleService {
         options: CreateOptions,
         cancellation: &CancellationToken,
     ) -> Result<CreateResult, LifecycleError> {
-        let _lock = self.acquire_lock(slug, "restore", cancellation).await?;
+        let lock = self.acquire_lock(slug, "restore", cancellation).await?;
         let expected_slug = slug.to_owned();
         let expected_branch_owned = expected_branch.to_owned();
         let expected_removed_at_owned = expected_removed_at.to_owned();
@@ -427,7 +501,10 @@ impl LifecycleService {
             .create_locked(&record.branch, slug, options, cancellation)
             .await
         {
-            Ok(result) => Ok(result),
+            Ok(created) => {
+                drop(lock);
+                Ok(self.settle_creation(created, cancellation).await)
+            }
             Err(error) => {
                 let record_to_restore = record.clone();
                 let slug_to_restore = slug.to_owned();
@@ -451,13 +528,35 @@ impl LifecycleService {
         }
     }
 
+    /// Finish a creation once its slug lock is released: the worktree is
+    /// usable, and nothing that waits on the slug waits on the main clone.
+    async fn settle_creation(
+        &self,
+        created: Created,
+        cancellation: &CancellationToken,
+    ) -> CreateResult {
+        if created.owes_maintenance {
+            match &self.deferred_maintenance {
+                Some(start) => start(),
+                None => {
+                    self.maintain_after_checkout(
+                        Path::new(&created.result.target.path),
+                        cancellation,
+                    )
+                    .await
+                }
+            }
+        }
+        created.result
+    }
+
     async fn create_locked(
         &self,
         branch: &str,
         slug: &str,
         options: CreateOptions,
         cancellation: &CancellationToken,
-    ) -> Result<CreateResult, LifecycleError> {
+    ) -> Result<Created, LifecycleError> {
         self.create_locked_inner(branch, slug, options, None, cancellation)
             .await
     }
@@ -469,7 +568,7 @@ impl LifecycleService {
         options: CreateOptions,
         review_head: Option<ReviewHead>,
         cancellation: &CancellationToken,
-    ) -> Result<CreateResult, LifecycleError> {
+    ) -> Result<Created, LifecycleError> {
         let phase = crate::creation_trace::CreationPhase::new(
             &self.config.worktree_root.join(slug),
             "create-transaction",
@@ -488,7 +587,7 @@ impl LifecycleService {
         options: CreateOptions,
         review_head: Option<ReviewHead>,
         cancellation: &CancellationToken,
-    ) -> Result<CreateResult, LifecycleError> {
+    ) -> Result<Created, LifecycleError> {
         if self.config.reserved_slugs.contains(slug) {
             return Err(LifecycleError::Refused(format!(
                 "{slug:?} is a reserved worktree/session slug"
@@ -524,36 +623,67 @@ impl LifecycleService {
                 path.display()
             )));
         }
+        // Whether this creation resolved its refs from another caller's
+        // fetch, and whether it made one whose maintenance it now owes.
+        let mut reused_fetch = false;
+        let mut owes_maintenance = false;
         if options.fetch_origin {
-            let phase = crate::creation_trace::CreationPhase::new(
-                &path,
-                "fetch-origin-including-maintenance",
-            );
-            let report = self
-                .repository
-                .fetch_origin(
-                    wt_vcs::FetchOriginOptions {
-                        keep_fresh: self.config.keep_fresh.clone(),
-                        auto_regen_paths: self.config.auto_regen_paths.clone(),
-                        sync_install: Some(wt_platform::install::InstallPolicy {
-                            command: self.config.install_command.clone(),
-                            shell: self.config.shell.clone(),
-                        }),
-                    },
-                    cancellation,
-                )
-                .await
-                .map_err(LifecycleError::from);
-            phase.lifecycle(&report);
-            let report = report?;
-            for warning in report.warnings {
-                tracing::warn!(%warning, "Git ref maintenance before creation");
+            if self.maintains_before_checkout(options.base.as_deref()) {
+                let phase = crate::creation_trace::CreationPhase::new(
+                    &path,
+                    "fetch-origin-including-maintenance",
+                );
+                let report = self
+                    .repository
+                    .fetch_origin(self.maintenance_options(), cancellation)
+                    .await
+                    .map_err(LifecycleError::from);
+                phase.lifecycle(&report);
+                let report = report?;
+                for warning in report.warnings {
+                    tracing::warn!(%warning, "Git ref maintenance before creation");
+                }
+            } else {
+                // A review pins a head GitHub named a moment ago, so it is
+                // compared only with refs fetched after the request.
+                let reuse = if review_head.is_some() {
+                    Duration::ZERO
+                } else {
+                    CREATE_FETCH_REUSE
+                };
+                let fetched = self.fetch_refs(&path, reuse, cancellation).await?;
+                reused_fetch = fetched == wt_vcs::FetchedRefs::Reused;
+                owes_maintenance = !reused_fetch;
             }
         }
         let local_ref = format!("refs/heads/{branch}");
         let remote_ref = format!("refs/remotes/origin/{branch}");
         let local_oid = self.resolve_ref(&main, &local_ref, cancellation).await?;
-        let remote_oid = self.resolve_ref(&main, &remote_ref, cancellation).await?;
+        let mut remote_oid = self.resolve_ref(&main, &remote_ref, cancellation).await?;
+        if reused_fetch && remote_oid.is_some() {
+            // The checkout will be of origin's branch itself, so it gets the
+            // tip origin has now rather than one up to the window old.
+            reused_fetch = false;
+            owes_maintenance |= self.fetch_refs(&path, Duration::ZERO, cancellation).await?
+                == wt_vcs::FetchedRefs::Fetched;
+            remote_oid = self.resolve_ref(&main, &remote_ref, cancellation).await?;
+        } else if reused_fetch
+            && local_oid.is_none()
+            && self.origin_has_branch(&main, branch, cancellation).await?
+        {
+            // Pushed since the reused fetch. Created from the base instead,
+            // this name would diverge from origin's branch, and a later
+            // force-push from here would destroy the commits it holds.
+            reused_fetch = false;
+            owes_maintenance |= self.fetch_refs(&path, Duration::ZERO, cancellation).await?
+                == wt_vcs::FetchedRefs::Fetched;
+            remote_oid = self.resolve_ref(&main, &remote_ref, cancellation).await?;
+            if remote_oid.is_none() {
+                return Err(LifecycleError::Refused(format!(
+                    "origin has a branch {branch:?} that could not be fetched; nothing was created"
+                )));
+            }
+        }
         let (existing, base_ref, logical_base) = if let Some(review_head) = &review_head {
             for (name, oid) in [("local", &local_oid), ("origin", &remote_oid)] {
                 if let Some(oid) = oid
@@ -650,12 +780,19 @@ impl LifecycleService {
             _ => None,
         };
         if let Some(base) = &base_ref {
-            let in_main = self.ref_exists(&main, base, cancellation).await?;
+            let mut in_main = self.ref_exists(&main, base, cancellation).await?;
             let in_parent = if let Some(source) = &base_source {
                 self.ref_exists(source, base, cancellation).await?
             } else {
                 false
             };
+            if !in_main && !in_parent && reused_fetch {
+                // The reused fetch may predate the base: ask origin itself
+                // before refusing it.
+                owes_maintenance |= self.fetch_refs(&path, Duration::ZERO, cancellation).await?
+                    == wt_vcs::FetchedRefs::Fetched;
+                in_main = self.ref_exists(&main, base, cancellation).await?;
+            }
             if !in_main && !in_parent {
                 return Err(LifecycleError::Refused(format!(
                     "base ref {base:?} does not resolve in the main clone or configured parent checkout"
@@ -683,9 +820,12 @@ impl LifecycleService {
             )
             .await;
         match created {
-            Ok(target) => Ok(CreateResult {
-                target,
-                is_main: false,
+            Ok(target) => Ok(Created {
+                result: CreateResult {
+                    target,
+                    is_main: false,
+                },
+                owes_maintenance,
             }),
             Err(primary) => {
                 let prior = progress.prior_state.take();
@@ -715,6 +855,111 @@ impl LifecycleService {
                     }),
                 }
             }
+        }
+    }
+
+    /// Whether origin advertises `branch` right now: one round trip for one
+    /// ref, where a fetch moves every ref. An origin that cannot be read is
+    /// an error, as a failed fetch is: it is no proof the name is free.
+    async fn origin_has_branch(
+        &self,
+        main: &Path,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, LifecycleError> {
+        let reference = format!("refs/heads/{branch}");
+        let phase = crate::creation_trace::CreationPhase::new(main, "origin-branch-probe");
+        let mut spec = git_spec(
+            main,
+            vec![
+                "ls-remote".into(),
+                "--exit-code".into(),
+                "--refs".into(),
+                "origin".into(),
+                reference.clone().into(),
+            ],
+        );
+        spec.timeout = PROCESS_TIMEOUT;
+        let result = self.runner.bulk().run(spec, cancellation).await;
+        phase.process(&result, false);
+        let output =
+            result.map_err(|source| process_error("ask origin for the branch", main, source))?;
+        // `--exit-code` exits 2 when origin answered without the ref.
+        match output.status.code() {
+            Some(0) => Ok(output.stdout_text().lines().any(|line| {
+                line.split_once('\t')
+                    .is_some_and(|(_, name)| name == reference)
+            })),
+            Some(2) => Ok(false),
+            _ => Err(process_error(
+                "ask origin for the branch",
+                main,
+                output.checked("git").unwrap_err(),
+            )),
+        }
+    }
+
+    fn maintenance_options(&self) -> wt_vcs::FetchOriginOptions {
+        wt_vcs::FetchOriginOptions {
+            keep_fresh: self.config.keep_fresh.clone(),
+            auto_regen_paths: self.config.auto_regen_paths.clone(),
+            sync_install: Some(wt_platform::install::InstallPolicy {
+                command: self.config.install_command.clone(),
+                shell: self.config.shell.clone(),
+            }),
+        }
+    }
+
+    /// Whether the checkout is made from something ref maintenance updates,
+    /// so maintenance has to finish first. A Rift clone copies the main
+    /// clone, packages included. A base named as the trunk's or a kept-fresh
+    /// local branch forks from that branch, which only maintenance advances.
+    /// Every other checkout forks from a remote-tracking ref or a stacked
+    /// parent, which the fetch alone settles.
+    fn maintains_before_checkout(&self, base: Option<&str>) -> bool {
+        if self.config.backend == BackendKind::Rift {
+            return true;
+        }
+        let Some(base) = base.filter(|base| !base.starts_with("origin/")) else {
+            return false;
+        };
+        let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+        let trunk = &self.config.base_branch;
+        base == trunk.strip_prefix("origin/").unwrap_or(trunk)
+            || self.config.keep_fresh.iter().any(|kept| kept == base)
+    }
+
+    async fn fetch_refs(
+        &self,
+        path: &Path,
+        reuse: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<wt_vcs::FetchedRefs, LifecycleError> {
+        let phase = crate::creation_trace::CreationPhase::new(path, "fetch-origin");
+        let fetched = self
+            .repository
+            .fetch_origin_refs(reuse, cancellation)
+            .await
+            .map_err(LifecycleError::from);
+        phase.lifecycle(&fetched);
+        fetched
+    }
+
+    /// The maintenance a creation owes for the fetch it made, run once its
+    /// checkout is usable. The worktree exists, so a failure here is logged
+    /// like any other fetch's and never fails or rolls back the creation.
+    async fn maintain_after_checkout(&self, path: &Path, cancellation: &CancellationToken) {
+        let phase = crate::creation_trace::CreationPhase::new(path, "origin-maintenance");
+        let report = self.maintain_origin(cancellation).await;
+        phase.lifecycle(&report);
+        match report {
+            Ok(report) => {
+                for warning in report.warnings {
+                    tracing::warn!(%warning, "Git ref maintenance after creation");
+                }
+            }
+            Err(_) if cancellation.is_cancelled() => {}
+            Err(error) => tracing::warn!(%error, "Git ref maintenance after creation failed"),
         }
     }
 
@@ -892,7 +1137,7 @@ impl LifecycleService {
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
         let removed = self
-            .remove_inner(target, options, false, None, cancellation)
+            .remove_inner(target, options, false, None, None, cancellation)
             .await;
         self.delete_inline(removed, cancellation).await
     }
@@ -970,7 +1215,7 @@ impl LifecycleService {
         cancellation: &CancellationToken,
     ) -> Result<RemoveResult, LifecycleError> {
         let removed = self
-            .remove_inner(target, options, false, Some(expected), cancellation)
+            .remove_inner(target, options, false, Some(expected), None, cancellation)
             .await;
         self.delete_inline(removed, cancellation).await
     }
@@ -986,8 +1231,31 @@ impl LifecycleService {
         expected: &RemovalRevision,
         cancellation: &CancellationToken,
     ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
-        self.remove_inner(target, options, false, Some(expected), cancellation)
+        self.remove_inner(target, options, false, Some(expected), None, cancellation)
             .await
+    }
+
+    /// [`Self::remove_with_revision_deferred`] for a worker whose starter
+    /// waits to hear that the worktree is locked. Until `handover.locked`
+    /// has run, another operation can still take the worktree first; from
+    /// then on this removal owns it until it returns.
+    pub async fn remove_with_revision_handover(
+        &self,
+        target: &WorktreeTarget,
+        options: RemoveOptions,
+        expected: &RemovalRevision,
+        handover: RemovalHandover,
+        cancellation: &CancellationToken,
+    ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
+        self.remove_inner(
+            target,
+            options,
+            false,
+            Some(expected),
+            Some(handover),
+            cancellation,
+        )
+        .await
     }
 
     /// Delete the files of a removal that already finished. A failure is a
@@ -1111,6 +1379,7 @@ impl LifecycleService {
                     },
                     true,
                     None,
+                    None,
                     cancellation,
                 )
                 .await;
@@ -1125,11 +1394,19 @@ impl LifecycleService {
         options: RemoveOptions,
         cleanup: bool,
         expected_revision: Option<&RemovalRevision>,
+        handover: Option<RemovalHandover>,
         cancellation: &CancellationToken,
     ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
         let total = RemovalPhase::new(Path::new(&target.path), "total");
         let result = self
-            .remove_locked(target, options, cleanup, expected_revision, cancellation)
+            .remove_locked(
+                target,
+                options,
+                cleanup,
+                expected_revision,
+                handover,
+                cancellation,
+            )
             .await;
         total.lifecycle(&result);
         result
@@ -1141,16 +1418,28 @@ impl LifecycleService {
         options: RemoveOptions,
         cleanup: bool,
         expected_revision: Option<&RemovalRevision>,
+        handover: Option<RemovalHandover>,
         cancellation: &CancellationToken,
     ) -> Result<(RemoveResult, Option<QuarantinedCheckout>), LifecycleError> {
         let slug = target.slug();
         let trace = Path::new(&target.path);
-        let lock = timed(
-            trace,
-            "slug-lock-wait",
-            self.acquire_lock(slug, "remove", cancellation),
-        )
+        let lock_wait = handover.as_ref().map(|handover| handover.lock_wait);
+        let lock = timed(trace, "slug-lock-wait", async {
+            let acquire = self.acquire_lock(slug, "remove", cancellation);
+            match lock_wait {
+                None => acquire.await,
+                Some(wait) => tokio::time::timeout(wait, acquire).await.unwrap_or_else(|_| {
+                    Err(LifecycleError::Refused(format!(
+                        "another operation held {slug} for {}s; nothing was removed; retry when it has finished",
+                        wait.as_secs()
+                    )))
+                }),
+            }
+        })
         .await?;
+        if let Some(handover) = handover {
+            (handover.locked)().await;
+        }
         let root = canonicalize(&self.config.worktree_root, "resolve worktree root").await?;
         let main = canonicalize(&self.config.main_clone, "resolve main clone").await?;
         let requested = PathBuf::from(&target.path);
@@ -1270,12 +1559,37 @@ impl LifecycleService {
             // Keep the slug lock through supervision cleanup and checkout
             // removal. A new server cannot start in the gap, and a failed
             // external teardown leaves its checkout available for recovery.
-            timed(trace, "dev-server-stop", async {
+            let stopped = timed(trace, "dev-server-stop", async {
                 dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(&row), &lock, cancellation)
                     .await
                     .map_err(LifecycleError::from)
             })
-            .await?;
+            .await;
+            match stopped {
+                Ok(()) => {}
+                Err(_) if cancellation.is_cancelled() => return Err(LifecycleError::Cancelled),
+                // Forcing is a decision to remove whatever is in the way. A
+                // teardown hook that can no longer succeed for this checkout
+                // would otherwise keep it forever.
+                Err(error) if options.force => warnings.push(format!(
+                    "the dev server's stop_command failed and the worktree was removed anyway; \
+                     whatever that hook cleans up (containers, databases, ports) may be left \
+                     behind: {}",
+                    dev_stop_failure(&error)
+                )),
+                Err(
+                    error @ LifecycleError::Dev(wt_dev::DevServerError::StopCommandFailed {
+                        ..
+                    }),
+                ) => {
+                    return Err(LifecycleError::Refused(format!(
+                        "the dev server's stop_command failed, so nothing was removed: {}; \
+                         fix the hook, or remove the worktree anyway with `wt rm {slug} --force`",
+                        dev_stop_failure(&error)
+                    )));
+                }
+                Err(error) => return Err(error),
+            }
         }
         let mut force = options.force;
         let mut destroyed_stage = false;
@@ -1322,7 +1636,7 @@ impl LifecycleService {
                         spec.timeout = Duration::from_secs(20 * 60);
                         spec.output_limit = PROCESS_OUTPUT_LIMIT;
                         let phase = RemovalPhase::new(trace, "sst-remove");
-                        let sst = self.runner.run(spec, cancellation).await;
+                        let sst = self.runner.bulk().run(spec, cancellation).await;
                         phase.finish(match &sst {
                             Ok(output) if output.status.success() => "success",
                             _ => "error",
@@ -1826,10 +2140,7 @@ impl LifecycleService {
         validate_slug(slug)?;
         FileLock::acquire(&self.config.lock_dir, slug, operation, cancellation)
             .await
-            .map_err(|error| match error {
-                LockError::Cancelled => LifecycleError::Cancelled,
-                error => LifecycleError::Lock(error),
-            })
+            .map_err(lock_error)
     }
 
     async fn mutate_store<R: Send + 'static>(
@@ -2016,7 +2327,16 @@ impl LifecycleService {
             _ => None,
         }
         .map(|phase| crate::creation_trace::CreationPhase::new(cwd, phase));
-        let result = self.runner.run(spec, cancellation).await;
+        let runner = match operation {
+            "create Git worktree" | "switch Rift clone branch" | "create branch in Rift clone" => {
+                self.runner.heavy()
+            }
+            "fetch stacked base into Rift clone" | "fetch reviewed pull-request head" => {
+                self.runner.bulk()
+            }
+            _ => self.runner.clone(),
+        };
+        let result = runner.run(spec, cancellation).await;
         if let Some(phase) = phase {
             phase.process(&result, operation == "refresh copied Git index");
         }
@@ -2466,6 +2786,37 @@ impl LifecycleService {
         path: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), LifecycleError> {
+        let Some(install) = self.prepare_install(path, cancellation, || {}).await? else {
+            return Ok(());
+        };
+        // Bounded by its install slot, not by a heavy slot as well: installs
+        // run for minutes, and holding both would leave checkouts queued
+        // behind them.
+        let result = self
+            .runner
+            .bulk()
+            .run_streaming(install.spec, cancellation, |_, _| {})
+            .await;
+        install.phase.process(&result, false);
+        let output = result.map_err(|source| process_error("run package install", path, source))?;
+        output
+            .checked("package manager")
+            .map(|_| ())
+            .map_err(|source| process_error("run package install", path, source))
+    }
+
+    /// Resolve the dependency install of the checkout at `path` and take one
+    /// of the machine's install slots for it
+    /// ([`crate::slots::DEPENDENCY_INSTALLS`]), waiting if none is free.
+    /// `on_wait` runs once if it has to queue. The caller runs the returned
+    /// command and keeps the value until the package manager and everything
+    /// it started are gone. `None` means there is nothing to install.
+    pub async fn prepare_install(
+        &self,
+        path: &Path,
+        cancellation: &CancellationToken,
+        on_wait: impl FnOnce(),
+    ) -> Result<Option<PreparedInstall>, LifecycleError> {
         let policy = wt_platform::install::InstallPolicy {
             command: self.config.install_command.clone(),
             shell: self.config.shell.clone(),
@@ -2480,20 +2831,32 @@ impl LifecycleService {
                     source,
                 })?
         else {
-            return Ok(());
+            return Ok(None);
         };
-        let spec = plan.spec;
-        let phase = crate::creation_trace::CreationPhase::new(path, "dependency-install");
-        let result = self
-            .runner
-            .run_streaming(spec, cancellation, |_, _| {})
-            .await;
-        phase.process(&result, false);
-        let output = result.map_err(|source| process_error("run package install", path, source))?;
-        output
-            .checked("package manager")
-            .map(|_| ())
-            .map_err(|source| process_error("run package install", path, source))
+        let mut queued = None;
+        let slot = crate::slots::DEPENDENCY_INSTALLS
+            .acquire(
+                &self.config.lock_dir,
+                path.file_name().and_then(|slug| slug.to_str()),
+                cancellation,
+                || {
+                    queued = Some(crate::creation_trace::CreationPhase::new(
+                        path,
+                        "dependency-install-queue",
+                    ));
+                    on_wait();
+                },
+            )
+            .await
+            .map_err(lock_error);
+        if let Some(queued) = queued {
+            queued.lifecycle(&slot);
+        }
+        Ok(Some(PreparedInstall {
+            spec: plan.spec,
+            _slot: slot?,
+            phase: crate::creation_trace::CreationPhase::new(path, "dependency-install"),
+        }))
     }
 
     /// Why Git holds the worktree at `path` locked: `None` when it is not
@@ -2682,6 +3045,7 @@ impl LifecycleService {
         // until it exits; ordinary Git reads retain their short deadlines.
         let result = self
             .runner
+            .heavy()
             .run_to_completion(git_spec(main, args), cancellation)
             .await
             .map_err(|source| LifecycleError::IncompleteRemoval {
@@ -2759,6 +3123,7 @@ impl LifecycleService {
         spec.timeout = PROCESS_TIMEOUT;
         let output = self
             .runner
+            .heavy()
             .run(spec, cancellation)
             .await
             .map_err(|source| process_error("remove Rift worktree", main, source))?;
@@ -2846,6 +3211,26 @@ impl LifecycleService {
         quarantine: &Path,
         cancellation: &CancellationToken,
     ) -> Result<(), ProcessError> {
+        // The removal is already finished and reported, so its files wait
+        // their turn: unbounded, these deletions kept the disk busy for over
+        // an hour at a time. A quarantine whose deletion never starts is
+        // taken up by a later removal's sweep.
+        let _slot = crate::slots::QUARANTINE_DELETES
+            .acquire(&self.config.lock_dir, None, cancellation, || {
+                tracing::info!(target: "wt::removal", quarantine = %quarantine.display(),
+                    "removed checkout waits for earlier deletions before its files are deleted");
+            })
+            .await
+            .map_err(|error| match error {
+                LockError::Cancelled => ProcessError::Cancelled {
+                    program: "rm".into(),
+                },
+                error => ProcessError::Io {
+                    program: "rm".into(),
+                    operation: "wait for a deletion slot",
+                    source: io::Error::other(error.to_string()),
+                },
+            })?;
         let phase = RemovalPhase::new(trace, "quarantine-delete");
         for attempt in 1..=QUARANTINE_DELETE_ATTEMPTS {
             let mut spec = quarantine_cleanup(
@@ -2857,6 +3242,7 @@ impl LifecycleService {
             // exits. Cancelling halfway cannot restore an independent object store.
             let result = self
                 .runner
+                .bulk()
                 .run_to_completion(spec, cancellation)
                 .await
                 .and_then(|output| output.checked("rm").map(|_| ()));
@@ -2910,7 +3296,7 @@ impl LifecycleService {
         // Rift owns its internal postcreate hooks, so this measures its whole
         // command, not just the kernel clonefile call.
         let phase = crate::creation_trace::CreationPhase::new(path, "rift-create-including-hooks");
-        let result = self.runner.run(spec, cancellation).await;
+        let result = self.runner.heavy().run(spec, cancellation).await;
         phase.process(&result, false);
         result.map_err(|source| process_error("create Rift clone", main, source))
     }
@@ -2926,6 +3312,7 @@ impl LifecycleService {
         spec.output_limit = PROCESS_OUTPUT_LIMIT;
         let output = self
             .runner
+            .heavy()
             .run(spec, cancellation)
             .await
             .map_err(|source| process_error("reclaim Rift clone storage", main, source))?;
@@ -3020,17 +3407,6 @@ impl LifecycleService {
     ) -> Result<RemovalRevision, LifecycleError> {
         let path = Path::new(&row.target.path);
         let exclusions = exclusion_pathspecs(excluded_paths)?;
-        let head = self
-            .git_snapshot_output(path, ["rev-parse", "--verify", "HEAD"], cancellation)
-            .await?
-            .stdout_text()
-            .trim()
-            .to_owned();
-        if head.is_empty() {
-            return Err(LifecycleError::Refused(
-                "checkout HEAD could not be captured".into(),
-            ));
-        }
         let mut status_args = args([
             "status",
             "--porcelain=v2",
@@ -3040,15 +3416,9 @@ impl LifecycleService {
         ]);
         status_args.push(".".into());
         status_args.extend(exclusions.iter().cloned());
-        let status = self
-            .git_snapshot_digest(path, status_args, cancellation)
-            .await?;
         let mut worktree_args = args(["diff", "--binary", "--no-ext-diff", "--no-textconv", "--"]);
         worktree_args.push(".".into());
         worktree_args.extend(exclusions.iter().cloned());
-        let worktree_diff = self
-            .git_snapshot_digest(path, worktree_args, cancellation)
-            .await?;
         let mut index_args = args([
             "diff",
             "--cached",
@@ -3058,20 +3428,29 @@ impl LifecycleService {
             "--",
         ]);
         index_args.push(".".into());
-        index_args.extend(exclusions.iter().cloned());
-        let index_diff = self
-            .git_snapshot_digest(path, index_args, cancellation)
-            .await?;
-        let mut untracked_args = args(["ls-files", "--others", "--exclude-standard", "-z", "--"]);
-        untracked_args.push(".".into());
-        untracked_args.extend(exclusions);
-        let untracked = self
-            .git_snapshot_output_vec(path, untracked_args, cancellation)
-            .await?
-            .stdout;
+        index_args.extend(exclusions);
+        // The four reads are independent, and none takes the index lock
+        // (see `git_snapshot_spec`), so they run side by side. Reading them
+        // closer together also narrows what a concurrent writer can tear;
+        // callers still compare two captures before trusting one.
+        let (head, (status, untracked), worktree_diff, index_diff) = tokio::try_join!(
+            self.git_snapshot_output(path, ["rev-parse", "--verify", "HEAD"], cancellation),
+            self.git_status_snapshot(path, status_args, cancellation),
+            self.git_snapshot_digest(path, worktree_args, cancellation),
+            self.git_snapshot_digest(path, index_args, cancellation),
+        )?;
+        let head = head.stdout_text().trim().to_owned();
+        if head.is_empty() {
+            return Err(LifecycleError::Refused(
+                "checkout HEAD could not be captured".into(),
+            ));
+        }
         let checkout = PathBuf::from(&row.target.path);
         let snapshot_cancellation = cancellation.clone();
-        let untracked = tokio::task::spawn_blocking(move || {
+        // Hashing a checkout's untracked files takes seconds, and several
+        // rows are captured at once: on the runtime's small blocking pool
+        // that would stall every `tokio::fs` call behind it.
+        let untracked = wt_platform::blocking::run_long(move || {
             untracked_metadata(
                 &checkout,
                 &untracked,
@@ -3295,12 +3674,56 @@ impl LifecycleService {
         args: Vec<OsString>,
         cancellation: &CancellationToken,
     ) -> Result<[u8; 32], LifecycleError> {
+        self.git_snapshot_stream(path, args, cancellation, |_| {})
+            .await
+    }
+
+    /// The fingerprint of `git status --porcelain=v2 -z --untracked-files=all`
+    /// and, from the same output, the untracked paths as NUL-terminated
+    /// names. Status has already walked the tree for them; asking
+    /// `git ls-files --others` walked it a second time.
+    async fn git_status_snapshot(
+        &self,
+        path: &Path,
+        args: Vec<OsString>,
+        cancellation: &CancellationToken,
+    ) -> Result<([u8; 32], Vec<u8>), LifecycleError> {
+        let untracked = Arc::new(std::sync::Mutex::new(StatusUntracked::default()));
+        let observer_untracked = untracked.clone();
+        let digest = self
+            .git_snapshot_stream(path, args, cancellation, move |bytes| {
+                observer_untracked
+                    .lock()
+                    .expect("untracked list lock poisoned")
+                    .feed(bytes);
+            })
+            .await?;
+        let untracked =
+            std::mem::take(&mut *untracked.lock().expect("untracked list lock poisoned"));
+        if untracked.overflowed {
+            return Err(LifecycleError::Process {
+                operation: "capture removal revision",
+                path: path.to_path_buf(),
+                source: ProcessError::OutputLimit {
+                    program: "git".into(),
+                    stream: "stdout",
+                    limit: PROCESS_OUTPUT_LIMIT,
+                },
+            });
+        }
+        Ok((digest, untracked.paths))
+    }
+
+    async fn git_snapshot_stream(
+        &self,
+        path: &Path,
+        args: Vec<OsString>,
+        cancellation: &CancellationToken,
+        observe: impl Fn(&[u8]) + Send + Sync + 'static,
+    ) -> Result<[u8; 32], LifecycleError> {
         let digest = Arc::new(std::sync::Mutex::new(Sha256::new()));
         let observer_digest = digest.clone();
-        let mut command = CommandSpec::new("git");
-        command.args = args;
-        command.cwd = Some(path.to_path_buf());
-        command.timeout = Duration::from_secs(30);
+        let mut command = git_snapshot_spec(path, args);
         command.output_limit = 8192;
         self.runner
             .run_streaming(command, cancellation, move |stream, bytes| {
@@ -3309,6 +3732,7 @@ impl LifecycleService {
                         .lock()
                         .expect("digest lock poisoned")
                         .update(bytes);
+                    observe(bytes);
                 }
             })
             .await
@@ -3332,10 +3756,7 @@ impl LifecycleService {
         args: Vec<OsString>,
         cancellation: &CancellationToken,
     ) -> Result<wt_platform::process::ProcessOutput, LifecycleError> {
-        let mut command = CommandSpec::new("git");
-        command.args = args;
-        command.cwd = Some(path.to_path_buf());
-        command.timeout = Duration::from_secs(30);
+        let mut command = git_snapshot_spec(path, args);
         command.output_limit = PROCESS_OUTPUT_LIMIT;
         self.runner
             .run(command, cancellation)
@@ -4155,6 +4576,7 @@ impl LifecycleService {
         spec.timeout = Duration::from_secs(5 * 60);
         let output = self
             .runner
+            .heavy()
             .run(spec, cancellation)
             .await
             .map_err(|source| process_error("run destroy command", path, source))?;
@@ -4223,6 +4645,31 @@ fn git_spec(cwd: &Path, args: Vec<OsString>) -> CommandSpec {
     spec.timeout = PROCESS_TIMEOUT;
     spec.output_limit = PROCESS_OUTPUT_LIMIT;
     spec
+}
+
+/// What a failed dev-server stop said, cut to the hook's last lines: its
+/// output can be a whole teardown log, and the end is where it failed.
+fn dev_stop_failure(error: &LifecycleError) -> String {
+    let LifecycleError::Dev(wt_dev::DevServerError::StopCommandFailed { output, .. }) = error
+    else {
+        return error.to_string();
+    };
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "it exited with an error and printed nothing".into();
+    }
+    lines[lines.len().saturating_sub(5)..].join(" | ")
+}
+
+fn lock_error(error: LockError) -> LifecycleError {
+    match error {
+        LockError::Cancelled => LifecycleError::Cancelled,
+        error => LifecycleError::Lock(error),
+    }
 }
 
 fn process_error(operation: &'static str, path: &Path, source: ProcessError) -> LifecycleError {
@@ -4362,6 +4809,57 @@ fn removal_hazards_without_checkout_dirty(hazards: &[String]) -> Vec<&str> {
 fn with_capture_hazards(mut hazards: Vec<String>, capture: &RemovalRevision) -> Vec<String> {
     hazards.extend(capture.hazards.iter().cloned());
     hazards
+}
+
+/// A read-only Git command of a revision capture. Status and diff refresh
+/// the index in memory either way; without optional locks they do not also
+/// take `index.lock` to write that refresh back, so captures neither queue
+/// behind each other nor make a concurrent `git` in the checkout fail on
+/// the lock. The output is the same.
+fn git_snapshot_spec(path: &Path, args: Vec<OsString>) -> CommandSpec {
+    let mut command = CommandSpec::new("git");
+    command.args = args;
+    command.cwd = Some(path.to_path_buf());
+    command.env = vec![("GIT_OPTIONAL_LOCKS".into(), Some("0".into()))];
+    command.timeout = Duration::from_secs(30);
+    command
+}
+
+/// The untracked paths in a `git status --porcelain=v2 -z` stream, kept as
+/// `git ls-files --others -z` prints them: each name followed by a NUL.
+#[derive(Default)]
+struct StatusUntracked {
+    /// The record being read, which a chunk boundary may split.
+    record: Vec<u8>,
+    /// The next record is the second path of a rename or copy entry. It has
+    /// no prefix of its own, so it must not be read as one.
+    original_path_next: bool,
+    paths: Vec<u8>,
+    /// More names than a capture retains; the caller refuses the capture.
+    overflowed: bool,
+}
+
+impl StatusUntracked {
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while let Some(end) = bytes.iter().position(|byte| *byte == 0) {
+            self.record.extend_from_slice(&bytes[..end]);
+            bytes = &bytes[end + 1..];
+            if self.original_path_next {
+                self.original_path_next = false;
+            } else if self.record.starts_with(b"2 ") {
+                self.original_path_next = true;
+            } else if let Some(path) = self.record.strip_prefix(b"? ") {
+                if self.paths.len() + path.len() + 1 > PROCESS_OUTPUT_LIMIT {
+                    self.overflowed = true;
+                } else {
+                    self.paths.extend_from_slice(path);
+                    self.paths.push(0);
+                }
+            }
+            self.record.clear();
+        }
+        self.record.extend_from_slice(bytes);
+    }
 }
 
 fn hashes_untracked(revision: &RemovalRevision) -> bool {
@@ -4685,10 +5183,12 @@ fn prioritized_cleanup(binary: &OsString, args: Vec<OsString>) -> CommandSpec {
     cleanup_with_policy(binary, args, &["-b"])
 }
 
-/// Deletion of a checkout already moved aside. The user waits on this job,
-/// so it runs at utility QoS: below interactive work, but without the
-/// background clamp, whose disk I/O throttling stretched large deletions
-/// to minutes. CPU priority stays lowered with `nice`.
+/// Deletion of a checkout already moved aside. It runs below interactive
+/// work for both CPU and disk: `nice`, and utility QoS, which lowers its I/O
+/// tier. Not the background clamp: its disk throttling stretched one large
+/// deletion to many minutes, and each deletion holds one of the few
+/// [`crate::slots::QUARANTINE_DELETES`] while removed checkouts keep their
+/// disk space until their turn comes.
 fn quarantine_cleanup(binary: &OsString, args: Vec<OsString>) -> CommandSpec {
     cleanup_with_policy(binary, args, &["-c", "utility"])
 }
@@ -7030,8 +7530,8 @@ mod tests {
 
     /// A pull request merged from the pushed head and the branch was rebased
     /// onto the newer base afterwards. Its local commits are the base's own
-    /// and a copy of the merged work, so only the advertised base tip can
-    /// show that nothing here exists nowhere else.
+    /// and a copy of the pushed work: the refs origin gave show that nothing
+    /// here exists nowhere else, with or without an advertised base tip.
     #[tokio::test]
     async fn landed_cleanup_does_not_count_commits_the_published_base_holds_by_patch() {
         let (scratch, service, runner, main, _root) = setup().await;
@@ -7078,10 +7578,19 @@ mod tests {
                     .unwrap()
             }
         };
-        assert_eq!(hazards(None).await, [unpushed_hazard(2)]);
+        assert!(hazards(None).await.is_empty());
         assert!(hazards(Some(tip.clone())).await.is_empty());
-        // A base that cannot be read is not evidence: the plain count stands.
+        assert!(hazards(Some("0".repeat(40))).await.is_empty());
+        // Without the pushed branch to compare with, only a readable base
+        // tip can prove it: a base that cannot be read leaves the count.
+        let pushed_ref = format!("refs/remotes/origin/{branch}");
+        let pushed = rev(&runner, &path, &pushed_ref).await;
+        let behind = format!("{pushed}~1");
+        run(&runner, &path, &["update-ref", &pushed_ref, &behind]).await;
+        assert!(hazards(Some(tip.clone())).await.is_empty());
         assert_eq!(hazards(Some("0".repeat(40))).await, [unpushed_hazard(2)]);
+        assert_eq!(hazards(None).await, [unpushed_hazard(2)]);
+        run(&runner, &path, &["update-ref", &pushed_ref, &pushed]).await;
 
         fs::write(path.join("work.txt"), "after the merge\n")
             .await
@@ -7114,8 +7623,8 @@ mod tests {
     }
 
     /// Matching patches are not the whole proof. A merge commit carries a
-    /// resolution `git cherry` never looks at, and a patch the base applied
-    /// and then reverted still matches: both are work that exists only here.
+    /// resolution `git cherry` never looks at: work that exists only here.
+    /// A copy of the pushed commit is not, whatever the base did with it.
     #[tokio::test]
     async fn landed_cleanup_counts_an_unpushed_merge_and_a_reapplied_revert() {
         let (scratch, service, runner, main, _root) = setup().await;
@@ -7177,6 +7686,14 @@ mod tests {
         let reverted = rev(&runner, &main, "refs/heads/main").await;
         run(&runner, &path, &["rebase", &moved]).await;
         assert!(hazards(merged).await.is_empty());
+        // The base reverted the work, but origin's branch still holds the
+        // commit this one copies, so removing the checkout loses nothing.
+        assert!(hazards(reverted.clone()).await.is_empty());
+        // With the pushed branch behind, the base is all there is to compare
+        // with, and a base that reverted the patch does not hold it.
+        let pushed_ref = format!("refs/remotes/origin/{branch}");
+        let behind = format!("{pushed}~1");
+        run(&runner, &path, &["update-ref", &pushed_ref, &behind]).await;
         assert_eq!(hazards(reverted).await, [unpushed_hazard(2)]);
     }
 
@@ -9229,5 +9746,710 @@ mod tests {
             "{unavailable}"
         );
         assert!(Path::new(&target.path).join("tracked.txt").exists());
+    }
+    #[test]
+    fn status_stream_yields_the_untracked_names_whatever_the_chunking() {
+        // A renamed entry's original path follows it as a bare record; here
+        // it is spelled like an untracked one and must not be taken for one.
+        let stream: &[u8] = b"1 .M N... 100644 100644 100644 aaaa bbbb tracked.txt\0\
+            2 R. N... 100644 100644 100644 aaaa aaaa R100 moved to\0? not untracked\0\
+            ? plain\0? dir/with space\0u UU N... 100644 100644 100644 100644 a b c both\0\
+            ? ? nested question\0";
+        let expected: &[u8] = b"plain\0dir/with space\0? nested question\0";
+        let mut whole = StatusUntracked::default();
+        whole.feed(stream);
+        assert_eq!(whole.paths, expected);
+        assert!(!whole.overflowed);
+        for split in 0..=stream.len() {
+            let mut parts = StatusUntracked::default();
+            parts.feed(&stream[..split]);
+            parts.feed(&stream[split..]);
+            assert_eq!(parts.paths, expected, "split at {split}");
+        }
+        let mut bytes = StatusUntracked::default();
+        for byte in stream {
+            bytes.feed(std::slice::from_ref(byte));
+        }
+        assert_eq!(bytes.paths, expected);
+    }
+
+    /// The removal digest as it was computed before the reads ran side by
+    /// side: each Git command on its own, with default index locking, and the
+    /// untracked list from `git ls-files --others`. A plan made by an older
+    /// wt must still verify, so the digest may not move.
+    async fn separately_read_digest(
+        runner: &ProcessRunner,
+        checkout: &Path,
+        excluded: &[String],
+        hash_untracked: bool,
+    ) -> String {
+        let exclusions = exclusion_pathspecs(excluded).unwrap();
+        let read = |base: &[&str]| {
+            let mut spec = CommandSpec::new("git");
+            spec.args = base.iter().map(OsString::from).collect();
+            spec.args.push(".".into());
+            spec.args.extend(exclusions.iter().cloned());
+            spec.cwd = Some(checkout.to_path_buf());
+            spec.output_limit = 64 * 1024 * 1024;
+            async move {
+                runner
+                    .run(spec, &CancellationToken::new())
+                    .await
+                    .unwrap()
+                    .checked("git")
+                    .unwrap()
+                    .stdout
+            }
+        };
+        let status = read(&[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
+            "--",
+        ])
+        .await;
+        let worktree_diff =
+            read(&["diff", "--binary", "--no-ext-diff", "--no-textconv", "--"]).await;
+        let index_diff = read(&[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--",
+        ])
+        .await;
+        let untracked = read(&["ls-files", "--others", "--exclude-standard", "-z", "--"]).await;
+        let untracked = untracked_metadata(
+            checkout,
+            &untracked,
+            hash_untracked.then_some(UNTRACKED_HASH_BUDGET),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let mut digest = Sha256::new();
+        for bytes in [
+            Sha256::digest(&status).as_slice(),
+            Sha256::digest(&worktree_diff).as_slice(),
+            Sha256::digest(&index_diff).as_slice(),
+            &untracked.metadata,
+        ] {
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        let digest = digest.finalize();
+        if untracked.stat_only {
+            format!("{STAT_ONLY_DIGEST_PREFIX}{digest:x}")
+        } else {
+            format!("{digest:x}")
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_removal_digest_is_unchanged_by_reading_the_checkout_in_one_pass() {
+        let (_scratch, service, runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let target = linked(&service, "michael/ENG-61-digest").await;
+        let row = service
+            .find_live_target(&target, &cancellation)
+            .await
+            .unwrap();
+        let path = PathBuf::from(&target.path);
+        let mut seen = BTreeSet::new();
+        let mut check = async |state: &str| {
+            let excluded = ["generated".to_owned()];
+            for (excluded, hash) in [(&[][..], true), (&[][..], false), (&excluded[..], true)] {
+                let expected = separately_read_digest(&runner, &path, excluded, hash).await;
+                let captured = service
+                    .capture_revision_for_row_excluding(&row, excluded, hash, &cancellation)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    captured.digest, expected,
+                    "{state}, excluding {excluded:?}, hashing {hash}"
+                );
+            }
+            let digest = separately_read_digest(&runner, &path, &[], true).await;
+            assert!(seen.insert(digest), "{state} left the digest as it was");
+        };
+
+        check("clean").await;
+
+        fs::write(path.join("tracked.txt"), "edited\n")
+            .await
+            .unwrap();
+        check("a tracked file edited").await;
+
+        fs::write(path.join("staged.txt"), "staged\n")
+            .await
+            .unwrap();
+        run(&runner, &path, &["add", "staged.txt"]).await;
+        fs::write(path.join("staged.txt"), "staged, then edited\n")
+            .await
+            .unwrap();
+        check("a file staged and edited again").await;
+
+        fs::create_dir_all(path.join("dir/deep")).await.unwrap();
+        fs::create_dir_all(path.join("generated")).await.unwrap();
+        fs::create_dir_all(path.join("empty")).await.unwrap();
+        for name in [
+            "notes.txt",
+            "dir/deep/file",
+            "name with space",
+            "? spelled like a record",
+            "2 R. also spelled like one",
+            "\u{fc}n\u{ef}c\u{f8}de.txt",
+            "generated/output.json",
+        ] {
+            fs::write(path.join(name), format!("{name}\n"))
+                .await
+                .unwrap();
+        }
+        std::os::unix::fs::symlink("notes.txt", path.join("link")).unwrap();
+        check("untracked files, a symlink and an empty directory").await;
+
+        fs::write(path.join(".gitignore"), "*.log\nignored/\n")
+            .await
+            .unwrap();
+        fs::create_dir_all(path.join("ignored")).await.unwrap();
+        fs::write(path.join("ignored/secret"), "ignored\n")
+            .await
+            .unwrap();
+        fs::write(path.join("build.log"), "ignored\n")
+            .await
+            .unwrap();
+        check("ignored files beside an untracked ignore file").await;
+
+        run(&runner, &path, &["add", ".gitignore", "notes.txt"]).await;
+        run(&runner, &path, &["commit", "-m", "notes"]).await;
+        let row = service
+            .find_live_target(&target, &cancellation)
+            .await
+            .unwrap();
+        let check = async |state: &str| {
+            let excluded = ["generated".to_owned()];
+            for (excluded, hash) in [(&[][..], true), (&[][..], false), (&excluded[..], true)] {
+                let expected = separately_read_digest(&runner, &path, excluded, hash).await;
+                let captured = service
+                    .capture_revision_for_row_excluding(&row, excluded, hash, &cancellation)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    captured.digest, expected,
+                    "{state}, excluding {excluded:?}, hashing {hash}"
+                );
+            }
+        };
+        // The original path of a rename is a bare record in the status
+        // stream; this one is spelled like an untracked entry.
+        run(&runner, &path, &["mv", "notes.txt", "? renamed notes"]).await;
+        check("a staged rename").await;
+
+        fs::remove_file(path.join("tracked.txt")).await.unwrap();
+        check("a tracked file deleted").await;
+
+        fs::create_dir_all(path.join("nested")).await.unwrap();
+        run(&runner, &path.join("nested"), &["init", "-b", "main"]).await;
+        fs::write(path.join("nested/inner.txt"), "inner\n")
+            .await
+            .unwrap();
+        check("a nested repository").await;
+    }
+
+    async fn with_origin(runner: &ProcessRunner, scratch: &Path, main: &Path) -> PathBuf {
+        let origin = scratch.join("origin.git");
+        run(
+            runner,
+            scratch,
+            &["init", "--bare", "-b", "main", origin.to_str().unwrap()],
+        )
+        .await;
+        run(
+            runner,
+            main,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        run(runner, main, &["push", "-u", "origin", "main"]).await;
+        let seed = scratch.join("seed");
+        run(
+            runner,
+            scratch,
+            &["clone", origin.to_str().unwrap(), seed.to_str().unwrap()],
+        )
+        .await;
+        seed
+    }
+
+    async fn push_commit(runner: &ProcessRunner, seed: &Path, branch: &str, file: &str) -> String {
+        run(runner, seed, &["checkout", "-B", branch]).await;
+        fs::write(seed.join(file), format!("{file}\n"))
+            .await
+            .unwrap();
+        run(runner, seed, &["add", file]).await;
+        run(runner, seed, &["commit", "-m", file]).await;
+        run(runner, seed, &["push", "origin", branch]).await;
+        let head = rev(runner, seed, "HEAD").await;
+        run(runner, seed, &["checkout", "main"]).await;
+        head
+    }
+
+    fn finished_creation_phases(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["fields"]["message"] == "creation phase finished")
+            .filter_map(|event| event["fields"]["phase"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_creation_fetches_before_its_checkout_and_maintains_the_main_clone_after_it() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let seed = with_origin(&runner, scratch.path(), &main).await;
+        let pushed = push_commit(&runner, &seed, "main", "second.txt").await;
+        let behind = rev(&runner, &main, "HEAD").await;
+        assert_ne!(behind, pushed);
+
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let file = log.reopen().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || file.try_clone().unwrap())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let created = service
+            .create(
+                "michael/ENG-70-fetched",
+                CreateOptions {
+                    base: None,
+                    fetch_origin: true,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        drop(guard);
+
+        // Forked from the base as origin had it when the creation asked.
+        assert_eq!(
+            rev(&runner, Path::new(&created.target.path), "HEAD").await,
+            pushed
+        );
+        // The main clone's own branch was brought up to date as well, only
+        // not while the checkout waited on it.
+        assert_eq!(rev(&runner, &main, "HEAD").await, pushed);
+        let phases = finished_creation_phases(log.path());
+        let position = |name: &str| phases.iter().position(|phase| phase == name);
+        assert!(
+            position("fetch-origin").is_some()
+                && position("fetch-origin") < position("git-worktree-checkout")
+                && position("git-worktree-checkout") < position("origin-maintenance"),
+            "{phases:?}"
+        );
+        assert_eq!(position("fetch-origin-including-maintenance"), None);
+    }
+
+    #[tokio::test]
+    async fn a_creation_reuses_a_recent_fetch_but_fetches_for_a_base_it_lacks() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let seed = with_origin(&runner, scratch.path(), &main).await;
+        let fetched = rev(&runner, &main, "origin/main").await;
+        let published = "michael/ENG-75-published";
+        push_commit(&runner, &seed, published, "published.txt").await;
+        assert_eq!(
+            service
+                .repository
+                .fetch_origin_refs(Duration::ZERO, &cancellation)
+                .await
+                .unwrap(),
+            wt_vcs::FetchedRefs::Fetched
+        );
+        let pushed = push_commit(&runner, &seed, "main", "second.txt").await;
+        let topic = push_commit(&runner, &seed, "topic", "topic.txt").await;
+        let options = |base: Option<&str>| CreateOptions {
+            base: base.map(str::to_owned),
+            fetch_origin: true,
+            run_install: false,
+        };
+
+        let reused = service
+            .create("michael/ENG-71-reused", options(None), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&reused.target.path), "HEAD").await,
+            fetched,
+            "the fetch made a moment ago stands in for another"
+        );
+        assert_eq!(rev(&runner, &main, "origin/main").await, fetched);
+
+        // The reused fetch predates this base, so origin is asked after all.
+        let stacked = service
+            .create(
+                "michael/ENG-72-stacked",
+                options(Some("origin/topic")),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&stacked.target.path), "HEAD").await,
+            topic
+        );
+        assert_eq!(rev(&runner, &main, "origin/main").await, pushed);
+
+        let refused = service
+            .create(
+                "michael/ENG-73-missing",
+                options(Some("origin/never-pushed")),
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(LifecycleError::Refused(message)) if message.contains("does not resolve"))
+        );
+
+        // A branch origin already has is checked out at the tip it has now,
+        // not the one the reused fetch saw.
+        run(&runner, &seed, &["checkout", published]).await;
+        fs::write(seed.join("published.txt"), "pushed again\n")
+            .await
+            .unwrap();
+        run(&runner, &seed, &["commit", "-am", "pushed again"]).await;
+        run(&runner, &seed, &["push", "origin", published]).await;
+        let newest = rev(&runner, &seed, "HEAD").await;
+        let attached = service
+            .create(published, options(None), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&attached.target.path), "HEAD").await,
+            newest
+        );
+    }
+
+    #[tokio::test]
+    async fn a_creation_from_the_local_trunk_still_maintains_it_first() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let seed = with_origin(&runner, scratch.path(), &main).await;
+        let pushed = push_commit(&runner, &seed, "main", "second.txt").await;
+        let created = service
+            .create(
+                "michael/ENG-74-local-trunk",
+                CreateOptions {
+                    base: Some("main".into()),
+                    fetch_origin: true,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&created.target.path), "HEAD").await,
+            pushed,
+            "the local branch it forks from was advanced before the checkout"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_install_queues_for_a_slot_and_says_it_is_waiting() {
+        let (scratch, mut service, _runner, _main, _root) = setup().await;
+        service.config.install_command = Some("touch installed".into());
+        let checkout = scratch.path().join("queued");
+        fs::create_dir_all(&checkout).await.unwrap();
+        let pool = crate::slots::DEPENDENCY_INSTALLS;
+        let lock_dir = service.config.lock_dir.clone();
+        let mut held = Vec::new();
+        for _ in 0..pool.slots() {
+            held.push(pool.try_acquire(&lock_dir).await.unwrap().unwrap());
+        }
+        let (waited, told) = tokio::sync::oneshot::channel();
+        let install = tokio::spawn({
+            let (service, checkout) = (service.clone(), checkout.clone());
+            async move {
+                service
+                    .prepare_install(&checkout, &CancellationToken::new(), || {
+                        let _ = waited.send(());
+                    })
+                    .await
+                    .map(|install| install.is_some())
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), told)
+            .await
+            .expect("the install reports that it queued")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !pool.is_waiting(&lock_dir, "queued").await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the queued install is visible by its slug");
+        assert!(!checkout.join("installed").exists());
+        assert!(!install.is_finished());
+
+        held.pop();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), install)
+                .await
+                .expect("a freed slot goes to the queued install")
+                .unwrap()
+                .unwrap()
+        );
+        service
+            .install(&checkout, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(checkout.join("installed").exists());
+        assert!(!pool.is_waiting(&lock_dir, "queued").await);
+    }
+
+    #[tokio::test]
+    async fn removed_checkouts_are_deleted_a_bounded_number_at_a_time() {
+        let (_scratch, service, _runner, _main, root) = setup().await;
+        let quarantine = root.join(".wt-removing-fixture");
+        fs::create_dir_all(quarantine.join("nested")).await.unwrap();
+        fs::write(quarantine.join("nested/file"), "data")
+            .await
+            .unwrap();
+        let pool = crate::slots::QUARANTINE_DELETES;
+        let mut held = Vec::new();
+        for _ in 0..pool.slots() {
+            held.push(
+                pool.try_acquire(&service.config.lock_dir)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let delete = tokio::spawn({
+            let (service, quarantine) = (service.clone(), quarantine.clone());
+            async move {
+                service
+                    .delete_quarantined(
+                        QuarantinedCheckout {
+                            original: quarantine.with_file_name("fixture"),
+                            quarantine,
+                            _owner: None,
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            quarantine.join("nested/file").exists() && !delete.is_finished(),
+            "the deletion started while every slot was taken"
+        );
+        held.pop();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(20), delete)
+                .await
+                .expect("a freed slot starts the deletion")
+                .unwrap(),
+            None
+        );
+        assert!(!quarantine.exists());
+    }
+
+    /// The reused fetch skipped origin, so a branch pushed there a moment
+    /// ago is unknown locally. Recreated from the base it would diverge from
+    /// origin's branch of the same name.
+    #[tokio::test]
+    async fn a_creation_over_a_reused_fetch_still_finds_a_branch_just_pushed_to_origin() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let seed = with_origin(&runner, scratch.path(), &main).await;
+        assert_eq!(
+            service
+                .repository
+                .fetch_origin_refs(Duration::ZERO, &cancellation)
+                .await
+                .unwrap(),
+            wt_vcs::FetchedRefs::Fetched
+        );
+        let branch = "michael/ENG-76-pushed-elsewhere";
+        let pushed = push_commit(&runner, &seed, branch, "elsewhere.txt").await;
+        let options = || CreateOptions {
+            base: None,
+            fetch_origin: true,
+            run_install: false,
+        };
+        let created = service
+            .create(branch, options(), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&created.target.path), "HEAD").await,
+            pushed,
+            "the worktree is on origin's branch, not a new one of its name"
+        );
+
+        // A name origin does not have is still created from the base, and
+        // an origin that cannot be asked is not taken for "no such branch".
+        let fresh = service
+            .create("michael/ENG-77-new", options(), &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&fresh.target.path), "HEAD").await,
+            rev(&runner, &main, "origin/main").await
+        );
+        run(
+            &runner,
+            &main,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                scratch.path().join("gone.git").to_str().unwrap(),
+            ],
+        )
+        .await;
+        let unreachable = service
+            .create("michael/ENG-78-unreachable", options(), &cancellation)
+            .await;
+        assert!(unreachable.is_err());
+        assert!(
+            !scratch
+                .path()
+                .join("worktree root/ENG-78-unreachable")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_creation_hands_its_maintenance_to_deferred_work_instead_of_waiting_on_it() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let seed = with_origin(&runner, scratch.path(), &main).await;
+        let pushed = push_commit(&runner, &seed, "main", "second.txt").await;
+        let behind = rev(&runner, &main, "HEAD").await;
+        let handed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deferring = service.clone().with_deferred_maintenance({
+            let handed = handed.clone();
+            move || {
+                handed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let created = deferring
+            .create(
+                "michael/ENG-79-deferred",
+                CreateOptions {
+                    base: None,
+                    fetch_origin: true,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rev(&runner, Path::new(&created.target.path), "HEAD").await,
+            pushed
+        );
+        assert_eq!(handed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            rev(&runner, &main, "HEAD").await,
+            behind,
+            "the creation returned without touching the main clone"
+        );
+        // What the deferred work then runs.
+        service.maintain_origin(&cancellation).await.unwrap();
+        assert_eq!(rev(&runner, &main, "HEAD").await, pushed);
+
+        // A creation that reused a fetch owes nothing and hands off nothing.
+        deferring
+            .create(
+                "michael/ENG-80-reused",
+                CreateOptions {
+                    base: None,
+                    fetch_origin: true,
+                    run_install: false,
+                },
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(handed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The starter of a durable removal is told the worktree is locked only
+    /// once it is, and a worktree another operation holds is refused whole.
+    #[tokio::test]
+    async fn a_removal_reports_its_lock_before_it_checks_or_removes_anything() {
+        let (_scratch, service, _runner, _main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let target = linked(&service, "michael/ENG-81-handover").await;
+        let revision = service
+            .removal_revision(&target, false, &cancellation)
+            .await
+            .unwrap();
+        let handover = |wait: Duration, locked: &Arc<std::sync::atomic::AtomicBool>| {
+            let locked = locked.clone();
+            let (lock_dir, slug) = (service.config.lock_dir.clone(), target.slug().to_owned());
+            RemovalHandover {
+                lock_wait: wait,
+                locked: Box::new(move || {
+                    Box::pin(async move {
+                        // The removal itself holds the worktree's lock here.
+                        assert!(
+                            FileLock::try_acquire(&lock_dir, &slug, "probe")
+                                .await
+                                .unwrap()
+                                .is_none()
+                        );
+                        locked.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                }),
+            }
+        };
+
+        let busy = FileLock::try_acquire(&service.config.lock_dir, target.slug(), "restack")
+            .await
+            .unwrap()
+            .unwrap();
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refused = service
+            .remove_with_revision_handover(
+                &target,
+                RemoveOptions::default(),
+                &revision,
+                handover(Duration::from_millis(300), &locked),
+                &cancellation,
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(LifecycleError::Refused(message)) if message.contains("another operation")),
+            "{refused:?}"
+        );
+        assert!(!locked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(Path::new(&target.path).exists());
+
+        drop(busy);
+        let (removed, quarantined) = service
+            .remove_with_revision_handover(
+                &target,
+                RemoveOptions::default(),
+                &revision,
+                handover(Duration::from_secs(30), &locked),
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(removed.removed && locked.load(std::sync::atomic::Ordering::SeqCst));
+        drop(quarantined);
     }
 }

@@ -638,7 +638,8 @@ pub async fn secret_is_configured(context: &AppContext) -> bool {
 }
 
 /// The running daemon as the board shows it: its version, and whether it
-/// runs this process's build, without which its snapshot is not used.
+/// runs this process's build, without which the board does not use its
+/// snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DaemonSummary {
     NotRunning,
@@ -744,8 +745,14 @@ pub async fn status(context: &AppContext) -> Result<()> {
                 snapshot.prs.as_object().map_or(0, serde_json::Map::len),
                 ago(snapshot.updated_at)
             );
-            if snapshot.writer_sha.as_deref() != Some(wt_app_core::build_info::build_id()) {
-                println!("  snapshot build stale; live GitHub reads will be used until refreshed");
+            if !snapshot.schema_current() {
+                println!(
+                    "  snapshot format differs; live GitHub reads will be used until refreshed"
+                );
+            } else if snapshot.writer_sha.as_deref() != Some(wt_app_core::build_info::build_id()) {
+                println!(
+                    "  snapshot from another build; commands that print use it, the board reads GitHub itself"
+                );
             }
             if let Some(line) = snapshot
                 .rate_limit

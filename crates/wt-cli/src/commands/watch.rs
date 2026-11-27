@@ -19,7 +19,7 @@ use wt_core::{
         parse,
     },
 };
-use wt_ops::commands::resolve::resolve_worktree;
+use wt_ops::commands::resolve::Inventory;
 use wt_store::{NewWatch, WatchRefusal, WatchSelector};
 
 pub(crate) const CONDITION_HELP: &str = "What to wait for; all must hold. One argument each: a local time (17:00, 5pm, 3h, \"tomorrow 09:00\", 2030-01-15T09:00), this worktree (merged, staging, production, ready, green, verified, closed), its open PR (settled: checks passed or failed; reviewed: the review bot finished the current head; evicted: the armed merge was dropped), a pull request (pr:3806, pr:3806:production), another worktree (wt:<slug>:merged, wt:<slug>:gone; <slug>:merged also reads), release:production, check:<id>[=<arg>]. Anything but a time may end in +<duration>: it must have held that long";
@@ -259,60 +259,47 @@ fn absent_worktree(cond: &Condition, live: &[String]) -> Option<String> {
     }
 }
 
-async fn live_slugs(ctx: &AppContext) -> Result<Vec<String>, String> {
-    Ok(ctx
-        .repository
-        .inventory(&ctx.cancellation)
+/// The listing every later step of the command asks, or why there is none.
+pub(crate) async fn inventory(ctx: &AppContext) -> Result<Inventory, String> {
+    Inventory::read(ctx)
         .await
-        .map_err(|error| format!("cannot list the worktrees: {error:#}"))?
-        .iter()
-        .filter(|record| !record.is_main)
+        .map_err(|error| format!("cannot list the worktrees: {error:#}"))
+}
+
+fn live_slugs(inventory: &Inventory) -> Vec<String> {
+    inventory
+        .worktrees()
         .map(|record| record.target.slug().to_owned())
-        .collect())
-}
-
-/// Why condition arguments could not be read.
-#[derive(Debug)]
-pub(crate) enum ConditionsError {
-    /// The arguments are wrong; asking again changes nothing.
-    Invalid(String),
-    /// The worktrees could not be listed, whatever the arguments say.
-    Unreadable(String),
-}
-
-impl std::fmt::Display for ConditionsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Self::Invalid(message) | Self::Unreadable(message)) = self;
-        f.write_str(message)
-    }
+        .collect()
 }
 
 /// Read condition arguments for a watch about to be set. A release
 /// condition takes the stage's current release as its baseline when that is
-/// known now; otherwise the engine takes the first one it sees.
+/// known now; otherwise the engine takes the first one it sees. `Err` says
+/// what is wrong with the arguments.
 pub(crate) async fn read_conditions(
     ctx: &AppContext,
+    inventory: &Inventory,
     args: &[String],
     clock: LocalClock,
-) -> Result<ReadConditions, ConditionsError> {
-    use ConditionsError::{Invalid, Unreadable};
+) -> Result<ReadConditions, String> {
     if no_conditions(args) {
-        return Err(Invalid(NO_CONDITIONS.into()));
+        return Err(NO_CONDITIONS.into());
     }
     let mut read = ReadConditions {
         when: Vec::new(),
         notes: Vec::new(),
         warnings: Vec::new(),
     };
-    let live = live_slugs(ctx).await.map_err(Unreadable)?;
+    let live = live_slugs(inventory);
     for arg in args {
-        let mut cond = parse(arg, clock).map_err(|error| Invalid(error.to_string()))?;
+        let mut cond = parse(arg, clock).map_err(|error| error.to_string())?;
         if let Some(warning) = absent_worktree(&cond.cond, &live)
             && !read.warnings.contains(&warning)
         {
             read.warnings.push(warning);
         }
-        if let Some((note, true)) = config_fact(&ctx.config, &cond.cond).map_err(Invalid)?
+        if let Some((note, true)) = config_fact(&ctx.config, &cond.cond)?
             && !read.notes.contains(&note)
         {
             read.notes.push(note);
@@ -333,7 +320,22 @@ pub(crate) async fn owner(
     slug: Option<&str>,
     what: &str,
 ) -> Result<String, String> {
-    match resolve_worktree(ctx, slug).await {
+    match Inventory::read(ctx).await {
+        Ok(inventory) => owner_in(&inventory, slug, what),
+        Err(_) if slug.is_none() => {
+            Err("not inside a worktree: run this in one, or pass --slug <slug>".into())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// [`owner`] against a listing the command already read.
+pub(crate) fn owner_in(
+    inventory: &Inventory,
+    slug: Option<&str>,
+    what: &str,
+) -> Result<String, String> {
+    match inventory.resolve(slug) {
         Ok(record) if !record.is_main => Ok(record.target.slug().to_owned()),
         Ok(_) => Err(format!(
             "{what} belongs to a worktree and the main clone is not one: pass --slug <slug>"
@@ -482,7 +484,14 @@ async fn set_and_report(
     then: WatchActions,
     before_release: bool,
 ) -> Result<i32> {
-    let slug = match owner(ctx, slug, "a watch").await {
+    let inventory = match inventory(ctx).await {
+        Ok(inventory) => inventory,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(1);
+        }
+    };
+    let slug = match owner_in(&inventory, slug, "a watch") {
         Ok(slug) => slug,
         Err(message) => {
             eprintln!("{message}");
@@ -490,7 +499,7 @@ async fn set_and_report(
         }
     };
     let clock = clock();
-    let read = match read_conditions(ctx, conditions, clock).await {
+    let read = match read_conditions(ctx, &inventory, conditions, clock).await {
         Ok(read) => read,
         Err(message) => {
             eprintln!("{message}");
@@ -517,8 +526,10 @@ async fn set_and_report(
                 if let Some(warning) = duplicates_check(record.as_ref(), &set.watch) {
                     println!("  warning: {warning}");
                 }
+                // Only the note changes here, and no list is derived from it:
+                // the state read above still says what the worktree owes.
                 super::status::drop_ops_none(ctx, &slug).await?;
-                super::owed::print_list(ctx, &slug).await;
+                super::owed::print_list_from(ctx, &inventory, &slug, &state).await;
             }
             Ok(0)
         }
@@ -580,7 +591,11 @@ fn print_cancelled(watch: &Watch) {
 
 /// Cancelling a wake or a gate's watch changes what its worktree owes:
 /// print each affected worktree's list once.
-async fn print_lists_after_cancel(ctx: &AppContext, cancelled: &[Watch]) {
+async fn print_lists_after_cancel(
+    ctx: &AppContext,
+    inventory: Option<Inventory>,
+    cancelled: &[Watch],
+) {
     let mut slugs = Vec::new();
     for watch in cancelled {
         let owed = watch.then.wake.is_some() || watch.then.unblock.is_some();
@@ -588,8 +603,19 @@ async fn print_lists_after_cancel(ctx: &AppContext, cancelled: &[Watch]) {
             slugs.push(watch.slug.clone());
         }
     }
+    if slugs.is_empty() {
+        return;
+    }
+    // A list that cannot be read prints nothing: the cancellation stands.
+    let inventory = match inventory {
+        Some(inventory) => inventory,
+        None => match Inventory::read(ctx).await {
+            Ok(inventory) => inventory,
+            Err(_) => return,
+        },
+    };
     for slug in slugs {
-        super::owed::print_list(ctx, &slug).await;
+        super::owed::print_list(ctx, &inventory, &slug).await;
     }
 }
 
@@ -777,7 +803,15 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
     let by = author();
     let cancelled_by = (by != "human").then(|| by.clone());
     if mine {
-        let slug = match owner(ctx, slug, "a watch").await {
+        let inventory = Inventory::read(ctx).await;
+        let owner = match &inventory {
+            Ok(inventory) => owner_in(inventory, slug, "a watch"),
+            Err(_) if slug.is_none() => {
+                Err("not inside a worktree: run this in one, or pass --slug <slug>".into())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let slug = match owner {
             Ok(slug) => slug,
             Err(message) => {
                 eprintln!("{message}");
@@ -801,7 +835,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
             println!("{by} has set no watches on {slug}");
         }
         cancelled.iter().for_each(print_cancelled);
-        print_lists_after_cancel(ctx, &cancelled).await;
+        print_lists_after_cancel(ctx, inventory.ok(), &cancelled).await;
         return Ok(0);
     }
     if ids.is_empty() {
@@ -816,7 +850,7 @@ async fn cancel(ctx: &AppContext, ids: &[String], mine: bool, slug: Option<&str>
         })
         .await?;
     cancelled.iter().for_each(print_cancelled);
-    print_lists_after_cancel(ctx, &cancelled).await;
+    print_lists_after_cancel(ctx, None, &cancelled).await;
     let missing = ids
         .iter()
         .filter(|id| !cancelled.iter().any(|watch| watch.id == **id))
@@ -864,8 +898,8 @@ fn missing_watch(id: &str, due: Option<&wt_core::OwedRecord>) -> String {
 async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
     let config = &ctx.config;
     let clock = clock();
-    let live = match live_slugs(ctx).await {
-        Ok(live) => live,
+    let live = match inventory(ctx).await {
+        Ok(inventory) => live_slugs(&inventory),
         Err(message) => {
             eprintln!("{message}");
             return Ok(1);
@@ -1144,6 +1178,7 @@ mod tests {
     #[tokio::test]
     async fn conditions_are_judged_against_the_configuration() {
         let fixture = CommandFixture::new().await.unwrap();
+        let listed = inventory(&fixture.ctx).await.unwrap();
         let mut config = (*fixture.ctx.config).clone();
         let fact =
             |config: &Config, arg: &str| config_fact(config, &parse(arg, clock()).unwrap().cond);
@@ -1189,12 +1224,12 @@ mod tests {
         let mut ctx = fixture.ctx.clone();
         ctx.config = std::sync::Arc::new(config);
         assert!(
-            read_conditions(&ctx, &["check:other".into()], clock())
+            read_conditions(&ctx, &listed, &["check:other".into()], clock())
                 .await
                 .is_err()
         );
         assert!(
-            read_conditions(&ctx, &["tomorrow".into()], clock())
+            read_conditions(&ctx, &listed, &["tomorrow".into()], clock())
                 .await
                 .err()
                 .unwrap()
@@ -1204,6 +1239,7 @@ mod tests {
         // With a probe and nothing deployed yet there is no baseline to take.
         let read = read_conditions(
             &ctx,
+            &listed,
             &["release:production".into(), "staging".into()],
             clock(),
         )
@@ -1212,7 +1248,7 @@ mod tests {
         assert_eq!(read.when[0].baseline, None);
         assert_eq!(read.notes.len(), 1);
         // Without one, the stage branch's tip is the release to wait past.
-        let read = read_conditions(&fixture.ctx, &["release:staging".into()], clock())
+        let read = read_conditions(&fixture.ctx, &listed, &["release:staging".into()], clock())
             .await
             .unwrap();
         assert_eq!(read.when[0].baseline.as_deref().map(str::len), Some(40));
@@ -1223,6 +1259,7 @@ mod tests {
     async fn watches_are_set_listed_and_cancelled() {
         let fixture = CommandFixture::new().await.unwrap();
         let ctx = &fixture.ctx;
+        let listed = inventory(ctx).await.unwrap();
         let wake = |conditions: &[&str], slug: Option<&str>| WakeArgs {
             conditions: conditions.iter().map(|arg| (*arg).to_owned()).collect(),
             message: Some("Run the smoke test".into()),
@@ -1255,7 +1292,7 @@ mod tests {
         assert_eq!(run_notify(ctx, &lost).await.unwrap(), 2);
         for lost in [&[][..], &[String::new()][..]] {
             assert!(
-                read_conditions(ctx, lost, clock())
+                read_conditions(ctx, &listed, lost, clock())
                     .await
                     .err()
                     .unwrap()
@@ -1293,6 +1330,7 @@ mod tests {
         // A worktree that is not there is accepted, with a warning.
         let read = read_conditions(
             ctx,
+            &listed,
             &[
                 "ghost:merged".into(),
                 "wt:ghost:gone".into(),

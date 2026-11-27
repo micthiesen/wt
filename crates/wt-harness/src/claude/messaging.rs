@@ -17,8 +17,8 @@ use super::{
 };
 
 const HUMAN_WAIT_POLL: Duration = Duration::from_millis(250);
-/// One bound for a send's turn at the slot: queueing for the send lock, and
-/// holding it while the session waits on a human.
+/// The default bound on each part of a send's turn at the slot: queueing for
+/// the send lock, and holding it while the session waits on a human.
 const SEND_TURN_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 /// One missing registry read may be Claude rewriting its entry, not an exit;
 /// absence lasting this long is treated as one.
@@ -60,11 +60,30 @@ pub enum ClaudeMessageOutcome {
 pub struct ClaudeMessenger {
     sessions: ClaudeSessionManager,
     injector: ClaudeInjector,
+    human_wait: Duration,
+    queue_wait: Duration,
 }
 
 impl ClaudeMessenger {
     pub fn new(sessions: ClaudeSessionManager, injector: ClaudeInjector) -> Self {
-        Self { sessions, injector }
+        Self {
+            sessions,
+            injector,
+            human_wait: SEND_TURN_MAX,
+            queue_wait: SEND_TURN_MAX,
+        }
+    }
+
+    /// Bound a send for a caller that cannot wait out a person. `human` is
+    /// how long the session may keep waiting on a person, whether this send
+    /// holds the slot's turn or queues behind the send that does. `queue`
+    /// is how long it queues behind another send that is being delivered,
+    /// which legitimately takes a cold start, a submit and a confirmation.
+    /// Past either the send ends with nothing submitted and says which.
+    pub fn with_turn_limits(mut self, human: Duration, queue: Duration) -> Self {
+        self.human_wait = human.min(SEND_TURN_MAX);
+        self.queue_wait = queue.min(SEND_TURN_MAX);
+        self
     }
 
     /// Serialize, cold-start if needed, prefer Inspector submission, and use
@@ -94,16 +113,19 @@ impl ClaudeMessenger {
                 maybe_submitted: false,
             });
         }
-        let _send_lock = SessionLock::acquire(
-            &self.sessions.paths().lock_dir,
-            &format!("__claude_send__{}", self.sessions.tmux_name(target)),
-            SEND_TURN_MAX,
-            cancel,
-        )
-        .await?;
+        let tmux_name = self.sessions.tmux_name(target);
+        let _send_lock = match self.queue_for_turn(target, &tmux_name, cancel).await? {
+            Ok(lock) => lock,
+            Err(reason) => {
+                return Ok(ClaudeMessageOutcome::Failed {
+                    reason,
+                    maybe_submitted: false,
+                });
+            }
+        };
+        let turn_ends = tokio::time::Instant::now() + self.human_wait;
         let text = stamp_sender(text, sender);
         let (session, cold_started) = self.sessions.ensure(target, cancel).await?;
-        let tmux_name = self.sessions.tmux_name(target);
 
         let mut snapshot = Some(session.clone());
         let mut require_ready = session.status == RegistryStatus::Waiting;
@@ -117,6 +139,7 @@ impl ClaudeMessenger {
                         tmux_name.as_str(),
                         snapshot,
                         require_ready,
+                        turn_ends,
                         cancel,
                     )
                     .await?
@@ -236,7 +259,14 @@ impl ClaudeMessenger {
             }
         }
         if let Err(reason) = self
-            .wait_until_unblocked(target, &tmux_name, snapshot, require_ready, cancel)
+            .wait_until_unblocked(
+                target,
+                &tmux_name,
+                snapshot,
+                require_ready,
+                turn_ends,
+                cancel,
+            )
             .await?
         {
             return Ok(ClaudeMessageOutcome::Failed {
@@ -266,6 +296,58 @@ impl ClaudeMessenger {
         }
     }
 
+    /// Queue for the slot's send lock. The holder may be delivering (its cold
+    /// start, submit and confirmation) or waiting on a person; the registry
+    /// says which, so the inner error blames a person only when the session
+    /// has been waiting on one for the whole human limit.
+    async fn queue_for_turn(
+        &self,
+        target: &ClaudeSessionTarget,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Result<SessionLock, String>, ClaudeSessionManagerError> {
+        let key = format!("__claude_send__{name}");
+        let queued_until = tokio::time::Instant::now() + self.queue_wait;
+        let mut waiting_since = None;
+        loop {
+            let slice = HUMAN_WAIT_POLL.min(self.queue_wait);
+            if let Some(lock) =
+                SessionLock::acquire_within(&self.sessions.paths().lock_dir, &key, slice, cancel)
+                    .await?
+            {
+                return Ok(Ok(lock));
+            }
+            let now = tokio::time::Instant::now();
+            // An unreadable registry is not evidence of a person.
+            let waiting = self
+                .sessions
+                .find(target)
+                .ok()
+                .flatten()
+                .filter(|session| session.status == RegistryStatus::Waiting);
+            match waiting {
+                Some(session) => {
+                    if now.duration_since(*waiting_since.get_or_insert(now)) >= self.human_wait {
+                        return Ok(Err(format!(
+                            "{name} is waiting on a human{} and another message is already queued for it. Nothing was sent",
+                            session
+                                .waiting_for
+                                .map(|what| format!(" ({what})"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                }
+                None => waiting_since = None,
+            }
+            if now >= queued_until {
+                return Ok(Err(format!(
+                    "another message to {name} was still being delivered after {}. Nothing was sent, so a retry is safe",
+                    turn_length(self.queue_wait)
+                )));
+            }
+        }
+    }
+
     /// Wait while the session waits on a human. The inner error is why the
     /// wait ended with nothing submitted: the session exited (no later poll
     /// can find it again, and the caller holds the slot's send lock), or the
@@ -276,9 +358,9 @@ impl ClaudeMessenger {
         name: &str,
         mut snapshot: Option<super::ClaudeSessionInfo>,
         require_ready: bool,
+        deadline: tokio::time::Instant,
         cancel: &CancellationToken,
     ) -> Result<Result<Option<super::ClaudeSessionInfo>, String>, ClaudeSessionManagerError> {
-        let deadline = tokio::time::Instant::now() + SEND_TURN_MAX;
         let mut gone_since = None;
         loop {
             let now = tokio::time::Instant::now();
@@ -287,7 +369,13 @@ impl ClaudeMessenger {
                     gone_since = None;
                     if now >= deadline {
                         return Ok(Err(format!(
-                            "{name} was still waiting on a human after 24 hours. Nothing was sent"
+                            "{name} was still waiting on a human{} after {}. Nothing was sent",
+                            session
+                                .waiting_for
+                                .as_ref()
+                                .map(|what| format!(" ({what})"))
+                                .unwrap_or_default(),
+                            turn_length(self.human_wait)
                         )));
                     }
                 }
@@ -667,6 +755,13 @@ fn stamp_sender(text: &str, sender: Option<&str>) -> String {
         format!("[{tag}] {text}")
     }
 }
+fn turn_length(limit: Duration) -> String {
+    match limit.as_secs() {
+        seconds if seconds >= 3600 => format!("{} hours", seconds / 3600),
+        seconds => format!("{seconds} seconds"),
+    }
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -860,5 +955,83 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_limited_turn_ends_unsent_while_the_session_or_its_queue_waits_on_a_person() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths = super::super::ClaudePaths::new(&home, tmp.path().join("cache"));
+        let tmux = wt_tmux::TmuxClient::new(
+            wt_platform::process::ProcessRunner::default(),
+            wt_tmux::TmuxServer::at(tmp.path().join("tmux.sock")).with_config_file("/dev/null"),
+        );
+        let sessions =
+            ClaudeSessionManager::new(super::super::ClaudeHarness::new(paths.clone()), tmux);
+        let messenger = ClaudeMessenger::new(sessions, ClaudeInjector::new(&paths.cache_dir))
+            .with_turn_limits(Duration::from_millis(400), Duration::from_millis(1500));
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd,
+            managed_name: Some("review".into()),
+        };
+        // The registered session stays alive and waiting for the whole send.
+        register(&home, &target, "waiting");
+        let cancel = CancellationToken::new();
+        let waiting = tokio::time::timeout(
+            Duration::from_secs(10),
+            messenger.send_with_sender(&target, "hello", None, &cancel),
+        )
+        .await
+        .expect("a limited send outlived its turn")
+        .unwrap();
+        assert!(
+            matches!(&waiting, ClaudeMessageOutcome::Failed { reason, maybe_submitted: false }
+                if reason.contains("waiting on a human") && reason.contains("Nothing was sent")),
+            "{waiting:?}"
+        );
+        // Queued behind another sender while the session waits on a person,
+        // the person is still the reason.
+        let held = SessionLock::acquire(
+            &paths.lock_dir,
+            "__claude_send__repo~review",
+            Duration::from_millis(200),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let queued = tokio::time::timeout(
+            Duration::from_secs(10),
+            messenger.send_with_sender(&target, "hello", None, &cancel),
+        )
+        .await
+        .expect("a limited send outlived its turn")
+        .unwrap();
+        assert!(
+            matches!(&queued, ClaudeMessageOutcome::Failed { reason, maybe_submitted: false }
+                if reason.contains("waiting on a human (permission)")
+                    && reason.contains("Nothing was sent")),
+            "{queued:?}"
+        );
+        // A holder that is delivering to a session nobody is blocking is
+        // waited for past the human limit and never blamed on a person.
+        register(&home, &target, "idle");
+        let started = tokio::time::Instant::now();
+        let delivering = tokio::time::timeout(
+            Duration::from_secs(10),
+            messenger.send_with_sender(&target, "hello", None, &cancel),
+        )
+        .await
+        .expect("a limited send outlived its queue")
+        .unwrap();
+        drop(held);
+        assert!(started.elapsed() >= Duration::from_millis(1500));
+        assert!(
+            matches!(&delivering, ClaudeMessageOutcome::Failed { reason, maybe_submitted: false }
+                if reason.contains("still being delivered") && !reason.contains("human")),
+            "{delivering:?}"
+        );
     }
 }

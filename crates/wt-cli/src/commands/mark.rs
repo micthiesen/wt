@@ -9,9 +9,9 @@ use serde_json::Value;
 use wt_app_core::context::AppContext;
 use wt_config::HistoryConfig;
 use wt_core::WorktreeEventKind;
-use wt_ops::commands::resolve::worktree_at_cwd;
+use wt_ops::commands::resolve::{Inventory, worktree_at_cwd};
 
-use super::watch::{agent, owner};
+use super::watch::{agent, owner_in};
 
 #[derive(Debug, Clone, Args, Default)]
 pub struct MarkArgs {
@@ -131,7 +131,7 @@ pub async fn run(ctx: &AppContext, args: &MarkArgs) -> Result<i32> {
         return Ok(2);
     }
     let slug = match target(ctx, args.slug.as_deref(), agent.as_deref()).await {
-        Ok(slug) => slug,
+        Ok((slug, _)) => slug,
         Err(message) => {
             eprintln!("{message}");
             return Ok(1);
@@ -161,20 +161,16 @@ async fn stamp(
         eprintln!("a stamp is named like a skill: letters, digits, '_', ':', '.', '-'");
         return Ok(2);
     }
-    let slug = match target(ctx, slug, agent).await {
-        Ok(slug) => slug,
+    let (slug, inventory) = match target(ctx, slug, agent).await {
+        Ok(found) => found,
         Err(message) => {
             eprintln!("{message}");
             return Ok(1);
         }
     };
-    let head = ctx
-        .repository
-        .inventory(&ctx.cancellation)
-        .await?
-        .into_iter()
-        .find(|row| !row.is_main && row.target.slug() == slug)
-        .and_then(|row| row.head_sha);
+    let head = inventory
+        .worktree(&slug)
+        .and_then(|row| row.head_sha.clone());
     let (owner, skill, by) = (slug.clone(), name.clone(), agent.map(str::to_owned));
     let stamped = ctx
         .database
@@ -197,18 +193,21 @@ async fn stamp(
     Ok(0)
 }
 
-/// The named worktree, the current one, or else the agent's own.
+/// The named worktree, the current one, or else the agent's own, with the
+/// listing it was found in.
 async fn target(
     ctx: &AppContext,
     slug: Option<&str>,
     agent: Option<&str>,
-) -> Result<String, String> {
-    match (owner(ctx, slug, "a mark").await, slug, agent) {
+) -> Result<(String, Inventory), String> {
+    let inventory = super::watch::inventory(ctx).await?;
+    let found = match (owner_in(&inventory, slug, "a mark"), slug, agent) {
         (Err(error), None, Some(agent)) if agent != "manager" => {
-            owner(ctx, Some(agent), "a mark").await.map_err(|_| error)
+            owner_in(&inventory, Some(agent), "a mark").map_err(|_| error)
         }
         (found, ..) => found,
-    }
+    };
+    Ok((found?, inventory))
 }
 
 /// Record a skill use on the worktree that holds the session's directory.
@@ -566,7 +565,7 @@ mod tests {
         );
         assert_eq!(run(&main, &mark("in main", None)).await.unwrap(), 1);
         // An agent outside its checkout still marks its own worktree.
-        assert_eq!(target(&main, None, Some("two")).await.unwrap(), "two");
+        assert_eq!(target(&main, None, Some("two")).await.unwrap().0, "two");
         assert!(target(&main, None, Some("manager")).await.is_err());
         fixture.close().await.unwrap();
     }

@@ -21,12 +21,19 @@ use crate::{
         not_yet_enqueueable, output_failure, rollup_checks, wildcard_eq,
     },
     mutations::{AsyncMergeEndpoint, AsyncMergeOutcome},
+    transport::{self, ApiReply, Call, Endpoint, HttpFailure, TokenKey, TokenRead},
     types::*,
 };
 
 const GH_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_ATTEMPTS: usize = 3;
+/// Requests one read runs at a time through gh: each is a subprocess.
 const MAX_CHUNK_CONCURRENCY: usize = 4;
+/// Requests one read runs at a time over HTTPS. A query's cost does not
+/// depend on what runs beside it, so a fleet of a few dozen branches is one
+/// round trip; GitHub's secondary limits count concurrent requests, so a
+/// large fleet still goes in waves.
+const HTTP_CONCURRENCY: usize = 8;
 const WORKFLOW_SCOPE_REMEDY: &str = "This is the LOCAL gh token, not the PR: run `gh auth refresh -h github.com -s workflow` (then `gh auth status` to confirm), and try again. Retrying as-is never clears it.";
 const PICKER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a resolved repository answers for its checkout. Callers build a
@@ -35,11 +42,26 @@ const PICKER_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const REPOSITORY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 type RepositoryKey = (OsString, PathBuf);
+/// A checkout's repository and the host of its web URL, when gh named one.
+type ResolvedRepository = (RepoSlug, Option<String>, Instant);
 
-fn repository_cache() -> &'static Mutex<HashMap<RepositoryKey, (RepoSlug, Instant)>> {
-    static CACHE: std::sync::OnceLock<Mutex<HashMap<RepositoryKey, (RepoSlug, Instant)>>> =
+fn repository_cache() -> &'static Mutex<HashMap<RepositoryKey, ResolvedRepository>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<RepositoryKey, ResolvedRepository>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
+}
+
+/// How a client's reads reach the API. Writes always run gh.
+#[derive(Clone, Debug)]
+enum ReadTransport {
+    /// Over HTTPS with gh's token for the repository's host, and through gh
+    /// itself when it gives no token or names no host.
+    Auto,
+    /// Through the gh program alone.
+    Gh,
+    /// Over HTTPS to an API served at this base URL.
+    #[cfg(test)]
+    Api(String),
 }
 type PickerCache<T> = Arc<AsyncMutex<Option<(tokio::time::Instant, T)>>>;
 
@@ -85,6 +107,9 @@ pub struct GithubClient {
     options: GithubOptions,
     repo: Option<RepoSlug>,
     gh_program: OsString,
+    reads: ReadTransport,
+    /// Turns for this client's GraphQL reads through gh.
+    gh_reads: Arc<tokio::sync::Semaphore>,
     merge_requests: Arc<Mutex<HashSet<u64>>>,
     viewer_login_cache: PickerCache<String>,
     contributors_cache: PickerCache<Vec<Contributor>>,
@@ -98,6 +123,8 @@ impl GithubClient {
             options,
             repo: None,
             gh_program: "gh".into(),
+            reads: ReadTransport::Auto,
+            gh_reads: Arc::new(tokio::sync::Semaphore::new(MAX_CHUNK_CONCURRENCY)),
             merge_requests: Arc::new(Mutex::new(HashSet::new())),
             viewer_login_cache: Arc::new(AsyncMutex::new(None)),
             contributors_cache: Arc::new(AsyncMutex::new(None)),
@@ -110,8 +137,23 @@ impl GithubClient {
     }
 
     /// Set an explicit executable, primarily for isolated transport fixtures.
+    /// Every request then runs it, reads included, unless
+    /// [`with_api_base`](Self::with_api_base) names an API to read from.
     pub fn with_gh_program(mut self, program: impl Into<OsString>) -> Self {
         self.gh_program = program.into();
+        if matches!(self.reads, ReadTransport::Auto) {
+            self.reads = ReadTransport::Gh;
+        }
+        self
+    }
+
+    /// Read over HTTPS from an API served at `base` instead of the one gh
+    /// names for the repository, for isolated transport fixtures. The token
+    /// still comes from the gh program. Test-only: it sends gh's token to
+    /// whatever `base` names.
+    #[cfg(test)]
+    pub(crate) fn with_api_base(mut self, base: impl Into<String>) -> Self {
+        self.reads = ReadTransport::Api(base.into());
         self
     }
 
@@ -161,15 +203,27 @@ impl GithubClient {
         if let Some(repo) = &self.repo {
             return Ok(repo.clone());
         }
+        Ok(self.resolve_repository(cancellation).await?.0)
+    }
+
+    /// The checkout's repository and the host gh reaches it at, from one
+    /// `gh repo view` per [`REPOSITORY_CACHE_TTL`].
+    async fn resolve_repository(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(RepoSlug, Option<String>), GithubError> {
         let key = (self.gh_program.clone(), self.cwd.clone());
         if let Ok(cache) = repository_cache().lock()
-            && let Some((repo, at)) = cache.get(&key)
+            && let Some((repo, host, at)) = cache.get(&key)
             && at.elapsed() < REPOSITORY_CACHE_TTL
         {
-            return Ok(repo.clone());
+            return Ok((repo.clone(), host.clone()));
         }
         let out = self
-            .run(["repo", "view", "--json", "nameWithOwner"], cancellation)
+            .run(
+                ["repo", "view", "--json", "nameWithOwner,url"],
+                cancellation,
+            )
             .await?;
         if !out.status.success() {
             // A rate limit or outage is not a repository problem; keep its
@@ -188,23 +242,203 @@ impl GithubClient {
             .ok_or_else(|| GithubError::Protocol("gh repo view omitted nameWithOwner".into()))?;
         let repo = RepoSlug::parse(slug)
             .ok_or_else(|| GithubError::Protocol(format!("invalid repository name {slug:?}")))?;
+        let host = data
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(transport::url_host);
         if let Ok(mut cache) = repository_cache().lock() {
-            cache.insert(key, (repo.clone(), Instant::now()));
+            cache.insert(key, (repo.clone(), host.clone(), Instant::now()));
         }
-        Ok(repo)
+        Ok((repo, host))
+    }
+
+    /// The API this client reads from over HTTPS and the token to send,
+    /// when it has both. Without either, reads run gh.
+    async fn http(&self, cancellation: &CancellationToken) -> Option<(Endpoint, String)> {
+        let endpoint = match &self.reads {
+            ReadTransport::Gh => return None,
+            #[cfg(test)]
+            ReadTransport::Api(base) => Endpoint::at(base)?,
+            // The host of the repository gh resolved for this checkout, so
+            // GH_HOST and enterprise remotes are read as gh reads them.
+            ReadTransport::Auto => {
+                Endpoint::for_host(&self.resolve_repository(cancellation).await.ok()?.1?)?
+            }
+        };
+        if !transport::usable(&endpoint.host) {
+            return None;
+        }
+        let token = transport::token(&self.token_key(&endpoint), None, cancellation, || {
+            self.read_token(&endpoint.host, cancellation)
+        })
+        .await?;
+        Some((endpoint, token))
+    }
+
+    fn token_key(&self, endpoint: &Endpoint) -> TokenKey {
+        (self.gh_program.clone(), endpoint.host.clone())
+    }
+
+    /// Ask gh for its token for `host`: the one its own requests would send,
+    /// from the environment, the keyring or its configuration.
+    async fn read_token(&self, host: &str, cancellation: &CancellationToken) -> TokenRead {
+        match self
+            .run(["auth", "token", "--hostname", host], cancellation)
+            .await
+        {
+            Ok(out) if out.status.success() => transport::plausible_token(&out.stdout_text())
+                .map_or(TokenRead::Absent, TokenRead::Found),
+            Ok(_) | Err(GithubError::MissingCli) => TokenRead::Absent,
+            Err(_) => TokenRead::Unknown,
+        }
+    }
+
+    /// `call` over HTTPS. `None` when this client has no API host or token
+    /// to use, or the host has never answered and cannot be connected to:
+    /// the caller runs gh instead.
+    async fn over_http(
+        &self,
+        call: &Call<'_>,
+        cancellation: &CancellationToken,
+    ) -> Option<Result<ApiReply, GithubError>> {
+        let (endpoint, mut token) = self.http(cancellation).await?;
+        let mut asked_again = false;
+        loop {
+            let reply = match transport::send(&endpoint, &token, call, cancellation).await {
+                Ok(reply) => reply,
+                Err(HttpFailure::Cancelled) => {
+                    return Some(Err(GithubError::Transient {
+                        message: "GitHub request cancelled".into(),
+                    }));
+                }
+                Err(HttpFailure::Unreachable(message)) => {
+                    tracing::info!(
+                        host = %endpoint.host,
+                        error = %message,
+                        "GitHub API unreachable over HTTPS; reading through gh"
+                    );
+                    return None;
+                }
+                Err(HttpFailure::Failed(message)) => {
+                    return Some(Err(GithubError::Transient { message }));
+                }
+            };
+            // The remembered token may have been refreshed or replaced
+            // since gh gave it: ask gh once, and resend only a different one.
+            if reply.status == 401 && !asked_again {
+                asked_again = true;
+                let fresh = transport::token(
+                    &self.token_key(&endpoint),
+                    Some(&token),
+                    cancellation,
+                    || self.read_token(&endpoint.host, cancellation),
+                )
+                .await;
+                if let Some(fresh) = fresh.filter(|fresh| *fresh != token) {
+                    token = fresh;
+                    continue;
+                }
+            }
+            let reset = header_reset_ms(&reply.headers, epoch_ms());
+            return Some(Ok(
+                reply.into_reply(matches!(call, Call::Graphql { .. }), reset)
+            ));
+        }
+    }
+
+    /// One GraphQL request, over HTTPS when this client can and through gh
+    /// otherwise. Variables are strings or lists of strings. `include` asks
+    /// gh for the response headers too: a rate-limited reply names its reset
+    /// only there.
+    async fn graphql(
+        &self,
+        query: &str,
+        variables: &[(String, Value)],
+        include: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<ApiReply, GithubError> {
+        if let Some(reply) = self
+            .over_http(&Call::Graphql { query, variables }, cancellation)
+            .await
+        {
+            return reply;
+        }
+        // A read sized for HTTPS that lands here (the API became unreachable
+        // under it) still runs only so many subprocesses at once.
+        let _turn = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(GithubError::Transient {
+                    message: "GitHub request cancelled".into(),
+                });
+            }
+            turn = self.gh_reads.acquire() => turn,
+        };
+        let mut args = vec!["api".to_owned(), "graphql".to_owned()];
+        if include {
+            args.push("--include".to_owned());
+        }
+        args.extend(["-f".to_owned(), format!("query={query}")]);
+        let text = |value: &Value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        for (key, value) in variables {
+            // All variables in these queries are GraphQL strings. `-F`
+            // asks gh to coerce values such as `false` and `2026` to
+            // JSON booleans/numbers, which GraphQL then rejects.
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        args.extend(["-f".to_owned(), format!("{key}[]={}", text(item))]);
+                    }
+                }
+                single => args.extend(["-f".to_owned(), format!("{key}={}", text(single))]),
+            }
+        }
+        Ok(gh_reply(self.run(args, cancellation).await?))
+    }
+
+    /// One REST read of `path`, relative to the API root.
+    async fn rest_get(
+        &self,
+        path: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<ApiReply, GithubError> {
+        if let Some(reply) = self.over_http(&Call::Get(path), cancellation).await {
+            return reply;
+        }
+        Ok(gh_reply(self.run(["api", path], cancellation).await?))
+    }
+
+    /// The authenticated user, with the bare login as the reply's body.
+    async fn login_reply(&self, cancellation: &CancellationToken) -> Result<ApiReply, GithubError> {
+        if let Some(reply) = self.over_http(&Call::Get("user"), cancellation).await {
+            let mut reply = reply?;
+            if reply.ok {
+                reply.body = serde_json::from_slice::<Value>(&reply.body)
+                    .ok()
+                    .and_then(|user| Some(user.get("login")?.as_str()?.to_owned()))
+                    .unwrap_or_default()
+                    .into_bytes();
+            }
+            return Ok(reply);
+        }
+        Ok(gh_reply(
+            self.run(["api", "user", "--jq", ".login"], cancellation)
+                .await?,
+        ))
     }
 
     pub async fn authenticated_login(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, GithubError> {
-        let out = self
-            .run(["api", "user", "--jq", ".login"], cancellation)
-            .await?;
-        if !out.status.success() {
+        let out = self.login_reply(cancellation).await?;
+        if !out.ok {
             return Ok(None);
         }
-        let login = out.stdout_text().trim().to_owned();
+        let login = String::from_utf8_lossy(&out.body).trim().to_owned();
         Ok((!login.is_empty()).then_some(login))
     }
 
@@ -218,16 +452,14 @@ impl GithubClient {
         probes: usize,
         cancellation: &CancellationToken,
     ) -> Result<Vec<RateLimit>, GithubError> {
-        let query = format!("query={{ {RATE_LIMIT_FIELD} }}");
+        let query = format!("{{ {RATE_LIMIT_FIELD} }}");
         let replies: Vec<Result<Option<RateLimit>, GithubError>> =
             stream::iter((0..probes).map(|_| async {
-                let out = self
-                    .run(["api", "graphql", "-f", &query], cancellation)
-                    .await?;
-                if !out.status.success() {
-                    return Err(classify_output(&out));
+                let out = self.graphql(&query, &[], false, cancellation).await?;
+                if !out.ok {
+                    return Err(out.failure());
                 }
-                let reply: Value = serde_json::from_slice(&out.stdout)
+                let reply: Value = serde_json::from_slice(&out.body)
                     .map_err(|e| GithubError::Protocol(format!("invalid rateLimit JSON: {e}")))?;
                 Ok(parse_rate_limit(&reply))
             }))
@@ -268,6 +500,12 @@ impl GithubClient {
         let groups = chunk_branches(branches, CHUNK_SIZE);
         let requests = groups.len();
         let started = Instant::now();
+        let over_http = self.http(cancellation).await.is_some();
+        let width = if over_http {
+            HTTP_CONCURRENCY
+        } else {
+            MAX_CHUNK_CONCURRENCY
+        };
         let client = self.clone();
         let cancel = cancellation.clone();
         let fetch = async {
@@ -277,7 +515,7 @@ impl GithubClient {
                 let repo = repo.clone();
                 async move { client.fetch_chunk(&repo, &group, i == 0, &cancel).await }
             }))
-            .buffer_unordered(MAX_CHUNK_CONCURRENCY)
+            .buffer_unordered(width)
             .try_collect::<Vec<_>>()
             .await?;
             let mut data = GithubData::default();
@@ -293,9 +531,9 @@ impl GithubClient {
             // authors out (they were most of its cost). A failed author
             // read fails the whole read like a chunk's.
             if !unread.is_empty() {
-                let spent = self.read_more_threads(&mut unread, &cancel).await?;
-                spend(&mut data.rate_limit, spent);
-                let spent = self.read_thread_authors(&mut unread, &cancel).await?;
+                let spent = self
+                    .read_thread_details(&mut unread, width, &cancel)
+                    .await?;
                 spend(&mut data.rate_limit, spent);
                 for node in &unread {
                     let pr = parse_pr(node, &self.options).ok_or_else(|| {
@@ -323,9 +561,43 @@ impl GithubClient {
             elapsed_ms = started.elapsed().as_millis() as u64,
             role = process_role(),
             pid = std::process::id(),
+            transport = if over_http { "https" } else { "gh" },
             "GitHub fetch"
         );
         Ok(data)
+    }
+
+    /// The follow-up reads of the pull requests in `nodes`: the authors of
+    /// the unresolved threads the batched query listed and the thread pages
+    /// past the first, at once, and then the authors of whatever unresolved
+    /// threads those pages brought.
+    async fn read_thread_details(
+        &self,
+        nodes: &mut [Value],
+        width: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RateLimit>, GithubError> {
+        let listed: Vec<String> = nodes.iter().flat_map(unread_thread_ids).collect();
+        let ((authors, mut spent), paged) = futures_util::future::try_join(
+            self.read_thread_authors(&listed, width, cancellation),
+            self.read_more_threads(nodes, width, cancellation),
+        )
+        .await?;
+        spend(&mut spent, paged);
+        for node in nodes.iter_mut() {
+            set_thread_authors(node, &authors);
+        }
+        let paged: Vec<String> = nodes.iter().flat_map(unread_thread_ids).collect();
+        if !paged.is_empty() {
+            let (authors, rate) = self
+                .read_thread_authors(&paged, width, cancellation)
+                .await?;
+            spend(&mut spent, rate);
+            for node in nodes.iter_mut() {
+                set_thread_authors(node, &authors);
+            }
+        }
+        Ok(spent)
     }
 
     /// Read the review threads past the first page of each open pull
@@ -337,6 +609,7 @@ impl GithubClient {
     async fn read_more_threads(
         &self,
         nodes: &mut [Value],
+        width: usize,
         cancellation: &CancellationToken,
     ) -> Result<Option<RateLimit>, GithubError> {
         let mut spent = None;
@@ -354,7 +627,10 @@ impl GithubClient {
             if pending.is_empty() {
                 break;
             }
-            for group in pending.chunks(THREAD_PAGE_PRS) {
+            // Owned groups: futures over borrowed chunks cannot be boxed as
+            // `Send` by the callers that hold this read in a trait object.
+            let groups: Vec<Vec<_>> = pending.chunks(THREAD_PAGE_PRS).map(<[_]>::to_vec).collect();
+            let reads: Vec<_> = stream::iter(groups.into_iter().map(|group| async move {
                 let asked: Vec<_> = group.iter().map(|(_, page)| page.clone()).collect();
                 let query = more_threads_query(&asked);
                 let read = self
@@ -362,6 +638,13 @@ impl GithubClient {
                         parse_more_threads(bytes, asked.len())
                     })
                     .await;
+                (group, read)
+            }))
+            .buffer_unordered(width)
+            .collect()
+            .await;
+            let mut stopped = false;
+            for (group, read) in reads {
                 match read {
                     Ok((pages, rate)) => {
                         spend(&mut spent, rate);
@@ -381,42 +664,51 @@ impl GithubClient {
                             pull_requests = group.len(),
                             "cannot read more review threads; thread counts are lower bounds"
                         );
-                        return Ok(spent);
+                        stopped = true;
                     }
                 }
+            }
+            if stopped {
+                break;
             }
         }
         Ok(spent)
     }
 
-    /// Fill in the first comment's author of every thread in `nodes` that
-    /// lacks one, in one request per [`THREAD_AUTHOR_PAGE`] threads.
+    /// The first comment's author of each thread in `ids`, by thread ID, in
+    /// one request per [`THREAD_AUTHOR_PAGE`] threads.
     async fn read_thread_authors(
         &self,
-        nodes: &mut [Value],
+        ids: &[String],
+        width: usize,
         cancellation: &CancellationToken,
-    ) -> Result<Option<RateLimit>, GithubError> {
-        let ids: Vec<String> = nodes.iter().flat_map(unread_thread_ids).collect();
+    ) -> Result<(HashMap<String, Value>, Option<RateLimit>), GithubError> {
+        // Owned pages, for the reason `read_more_threads` owns its groups.
+        let pages: Vec<Vec<String>> = ids
+            .chunks(THREAD_AUTHOR_PAGE)
+            .map(<[String]>::to_vec)
+            .collect();
+        let pages: Vec<_> = stream::iter(pages.into_iter().map(|page| async move {
+            let query = thread_authors_query(&page);
+            self.graphql_read(
+                &query,
+                &[],
+                cancellation,
+                Reply::WithErrors,
+                |bytes, last| parse_thread_authors(bytes, &page, last),
+            )
+            .await
+        }))
+        .buffer_unordered(width)
+        .try_collect()
+        .await?;
         let mut authors = HashMap::new();
         let mut spent = None;
-        for page in ids.chunks(THREAD_AUTHOR_PAGE) {
-            let query = thread_authors_query(page);
-            let (found, rate) = self
-                .graphql_read(
-                    &query,
-                    &[],
-                    cancellation,
-                    Reply::WithErrors,
-                    |bytes, last| parse_thread_authors(bytes, page, last),
-                )
-                .await?;
+        for (found, rate) in pages {
             authors.extend(found);
             spend(&mut spent, rate);
         }
-        for node in nodes {
-            set_thread_authors(node, &authors);
-        }
-        Ok(spent)
+        Ok((authors, spent))
     }
 
     async fn fetch_chunk(
@@ -438,57 +730,45 @@ impl GithubClient {
                 10
             },
         );
+        let vars: Vec<(String, Value)> = vars
+            .into_iter()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect();
         self.graphql_read(&query, &vars, cancellation, Reply::Clean, |bytes, _| {
             parse_chunk(bytes, branches, with_queue, &self.options)
         })
         .await
     }
 
-    /// One GraphQL read with string variables, asking gh for the response
-    /// headers too: a rate-limited reply names its reset only there.
-    /// `parse` is told whether this is the last attempt, so it can settle
-    /// for what a retry did not improve.
+    /// One GraphQL read with string variables, retried at this boundary
+    /// while its failure is a transport-level transient. `parse` is told
+    /// whether this is the last attempt, so it can settle for what a retry
+    /// did not improve.
     async fn graphql_read<T>(
         &self,
         query: &str,
-        vars: &[(String, String)],
+        vars: &[(String, Value)],
         cancellation: &CancellationToken,
         reply: Reply,
         parse: impl Fn(&[u8], bool) -> Result<T, GithubError>,
     ) -> Result<T, GithubError> {
         for attempt in 0..MAX_ATTEMPTS {
-            let mut args = vec![
-                "api".to_owned(),
-                "graphql".to_owned(),
-                "--include".to_owned(),
-                "-f".to_owned(),
-                format!("query={query}"),
-            ];
-            for (key, value) in vars {
-                // All variables in these queries are GraphQL strings. `-F`
-                // asks gh to coerce values such as `false` and `2026` to
-                // JSON booleans/numbers, which GraphQL then rejects.
-                args.extend(["-f".into(), format!("{key}={value}")]);
-            }
-            let error = match self.run(args, cancellation).await {
-                Ok(mut out) => {
-                    let reset = take_response_headers(&mut out.stdout)
-                        .and_then(|headers| header_reset_ms(&headers, epoch_ms()));
+            let error = match self.graphql(query, vars, true, cancellation).await {
+                Ok(out) => {
                     let last = attempt + 1 >= MAX_ATTEMPTS;
-                    let error = if out.status.success() {
-                        match parse(&out.stdout, last) {
+                    let error = if out.ok {
+                        match parse(&out.body, last) {
                             Ok(read) => return Ok(read),
                             Err(error) => error,
                         }
                     } else {
-                        // gh exits non-zero when the reply carries errors,
-                        // and still prints the reply.
-                        let failed = classify_output(&out);
-                        match (reply, failed) {
-                            // gh's own failure says nothing more than "the
-                            // reply had errors": the parser's reading stands.
+                        // A reply that carries errors is not `ok`, and its
+                        // body is still the reply.
+                        match (reply, out.failure()) {
+                            // The failure says nothing more than "the reply
+                            // had errors": the parser's reading stands.
                             (Reply::WithErrors, GithubError::Command(message)) => {
-                                match parse(&out.stdout, last) {
+                                match parse(&out.body, last) {
                                     Ok(read) => return Ok(read),
                                     Err(error) if error.retryable() => error,
                                     Err(_) => GithubError::Command(message),
@@ -497,7 +777,7 @@ impl GithubClient {
                             (_, failed) => failed,
                         }
                     };
-                    with_reset(error, reset)
+                    with_reset(error, out.reset_at_ms)
                 }
                 Err(error) => error,
             };
@@ -524,16 +804,11 @@ impl GithubClient {
             return Ok(Vec::new());
         }
         let query = review_requests_query();
-        let out = self
-            .run(
-                ["api", "graphql", "-f", &format!("query={query}")],
-                cancellation,
-            )
-            .await?;
-        if !out.status.success() {
-            return Err(classify_output(&out));
+        let out = self.graphql(query, &[], false, cancellation).await?;
+        if !out.ok {
+            return Err(out.failure());
         }
-        let body: Value = serde_json::from_slice(&out.stdout)
+        let body: Value = serde_json::from_slice(&out.body)
             .map_err(|e| GithubError::Protocol(format!("invalid review-request JSON: {e}")))?;
         if body
             .get("errors")
@@ -599,20 +874,15 @@ impl GithubClient {
             return Ok(Default::default());
         }
         let query = "query($ids: [ID!]!) { nodes(ids:$ids) { ... on PullRequest { id mergeQueueEntry { id } } } }";
-        let mut args = vec![
-            "api".to_owned(),
-            "graphql".to_owned(),
-            "-f".to_owned(),
-            format!("query={query}"),
-        ];
-        for id in ids {
-            args.extend(["-f".to_owned(), format!("ids[]={id}")]);
+        let variables = [(
+            "ids".to_owned(),
+            Value::Array(ids.iter().cloned().map(Value::String).collect()),
+        )];
+        let out = self.graphql(query, &variables, false, cancellation).await?;
+        if !out.ok {
+            return Err(out.failure());
         }
-        let out = self.run(args, cancellation).await?;
-        if !out.status.success() {
-            return Err(classify_output(&out));
-        }
-        parse_queued_pull_requests(&out.stdout, ids)
+        parse_queued_pull_requests(&out.body, ids)
     }
 
     /// How each named pull request ended, in one request. A number the
@@ -627,30 +897,19 @@ impl GithubClient {
             return Ok(Default::default());
         }
         let repo = self.repository(cancellation).await?;
-        let mut out = self
-            .run(
-                [
-                    "api".to_owned(),
-                    "graphql".to_owned(),
-                    "--include".to_owned(),
-                    "-f".to_owned(),
-                    format!("query={}", pr_outcomes_query(numbers)),
-                    "-f".to_owned(),
-                    format!("owner={}", repo.owner),
-                    "-f".to_owned(),
-                    format!("name={}", repo.name),
-                ],
-                cancellation,
-            )
+        let variables = [
+            ("owner".to_owned(), Value::String(repo.owner)),
+            ("name".to_owned(), Value::String(repo.name)),
+        ];
+        let out = self
+            .graphql(&pr_outcomes_query(numbers), &variables, true, cancellation)
             .await?;
-        let reset = take_response_headers(&mut out.stdout)
-            .and_then(|headers| header_reset_ms(&headers, epoch_ms()));
-        // gh exits non-zero when the reply carries errors, and still prints
-        // the reply: an unknown number must not fail the other PRs.
-        match parse_pr_outcomes(&out.stdout, numbers) {
+        // A reply that carries errors is not `ok` and is still the reply:
+        // an unknown number must not fail the other PRs.
+        match parse_pr_outcomes(&out.body, numbers) {
             Ok(outcomes) => Ok(outcomes),
-            Err(_) if !out.status.success() => Err(with_reset(classify_output(&out), reset)),
-            Err(error) => Err(with_reset(error, reset)),
+            Err(_) if !out.ok => Err(with_reset(out.failure(), out.reset_at_ms)),
+            Err(error) => Err(with_reset(error, out.reset_at_ms)),
         }
     }
 
@@ -1311,33 +1570,39 @@ impl GithubClient {
         branch: &str,
         cancellation: &CancellationToken,
     ) -> Result<(u64, Vec<String>), GithubError> {
-        let out = self
-            .run(
-                [
-                    "run",
-                    "list",
-                    "--branch",
-                    branch,
-                    "--status",
-                    "failure",
-                    "--limit",
-                    "1",
-                    "--json",
-                    "databaseId",
-                ],
-                cancellation,
-            )
-            .await?;
-        if !out.status.success() {
-            return Err(classify_output(&out));
-        }
-        let runs: Vec<Value> = serde_json::from_slice(&out.stdout)
-            .map_err(|e| GithubError::Protocol(format!("invalid run list: {e}")))?;
-        let id = runs
-            .first()
-            .and_then(|v| v.get("databaseId"))
-            .and_then(Value::as_u64)
-            .ok_or_else(|| GithubError::Protocol("no failed workflow run".into()))?;
+        let id = match self.latest_failed_run(branch, cancellation).await {
+            Some(id) => id?,
+            None => {
+                let out = self
+                    .run(
+                        [
+                            "run",
+                            "list",
+                            "--branch",
+                            branch,
+                            "--status",
+                            "failure",
+                            "--limit",
+                            "1",
+                            "--json",
+                            "databaseId",
+                        ],
+                        cancellation,
+                    )
+                    .await?;
+                if !out.status.success() {
+                    return Err(classify_output(&out));
+                }
+                let runs: Vec<Value> = serde_json::from_slice(&out.stdout)
+                    .map_err(|e| GithubError::Protocol(format!("invalid run list: {e}")))?;
+                runs.first()
+                    .and_then(|v| v.get("databaseId"))
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| GithubError::Protocol("no failed workflow run".into()))?
+            }
+        };
+        // Which steps failed and their lines come from the run's log
+        // archive, which gh downloads and reads.
         let out = self
             .run(
                 ["run", "view", &id.to_string(), "--log-failed"],
@@ -1348,6 +1613,40 @@ impl GithubClient {
             return Err(classify_output(&out));
         }
         Ok((id, out.stdout_text().lines().map(str::to_owned).collect()))
+    }
+
+    /// The branch's latest failed workflow run, as `gh run list` finds it,
+    /// read over HTTPS. `None` when this client reads through gh.
+    async fn latest_failed_run(
+        &self,
+        branch: &str,
+        cancellation: &CancellationToken,
+    ) -> Option<Result<u64, GithubError>> {
+        self.http(cancellation).await?;
+        let repo = match self.repository(cancellation).await {
+            Ok(repo) => repo.as_str(),
+            Err(error) => return Some(Err(error)),
+        };
+        let path = format!(
+            "repos/{repo}/actions/runs?branch={}&status=failure&per_page=1",
+            encode_ref_path(branch)
+        );
+        let out = match self.over_http(&Call::Get(&path), cancellation).await? {
+            Ok(out) => out,
+            Err(error) => return Some(Err(error)),
+        };
+        if !out.ok {
+            return Some(Err(out.failure()));
+        }
+        Some(
+            serde_json::from_slice::<Value>(&out.body)
+                .map_err(|e| GithubError::Protocol(format!("invalid run list: {e}")))
+                .and_then(|runs| {
+                    runs.pointer("/workflow_runs/0/id")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| GithubError::Protocol("no failed workflow run".into()))
+                }),
+        )
     }
 
     /// Top contributors intersected with authors active on the default branch
@@ -1379,13 +1678,11 @@ impl GithubClient {
         {
             return Ok(login.clone());
         }
-        let output = self
-            .run(["api", "user", "--jq", ".login"], cancellation)
-            .await?;
-        if !output.status.success() {
-            return Err(classify_output(&output));
+        let output = self.login_reply(cancellation).await?;
+        if !output.ok {
+            return Err(output.failure());
         }
-        let login = output.stdout_text().trim().to_owned();
+        let login = String::from_utf8_lossy(&output.body).trim().to_owned();
         if login.is_empty() {
             return Err(GithubError::Protocol(
                 "authenticated GitHub user response omitted login".into(),
@@ -1401,18 +1698,15 @@ impl GithubClient {
     ) -> Result<Vec<Contributor>, GithubError> {
         let repo = self.repository(cancellation).await?.as_str();
         let contributors = self
-            .run(
-                [
-                    "api".into(),
-                    format!("repos/{repo}/contributors?per_page=100"),
-                ],
+            .rest_get(
+                &format!("repos/{repo}/contributors?per_page=100"),
                 cancellation,
             )
             .await?;
-        if !contributors.status.success() {
-            return Err(classify_output(&contributors));
+        if !contributors.ok {
+            return Err(contributors.failure());
         }
-        let raw: Vec<Value> = serde_json::from_slice(&contributors.stdout)
+        let raw: Vec<Value> = serde_json::from_slice(&contributors.body)
             .map_err(|e| GithubError::Protocol(format!("invalid contributor list: {e}")))?;
         let since = (OffsetDateTime::now_utc() - time::Duration::days(183))
             .format(&Rfc3339)
@@ -1421,11 +1715,8 @@ impl GithubClient {
         let mut recency_ok = true;
         for page in 1..=5 {
             let commits = self
-                .run(
-                    [
-                        "api".into(),
-                        format!("repos/{repo}/commits?since={since}&per_page=100&page={page}"),
-                    ],
+                .rest_get(
+                    &format!("repos/{repo}/commits?since={since}&per_page=100&page={page}"),
                     cancellation,
                 )
                 .await;
@@ -1433,11 +1724,11 @@ impl GithubClient {
                 recency_ok = false;
                 break;
             };
-            if !commits.status.success() {
+            if !commits.ok {
                 recency_ok = false;
                 break;
             }
-            let Ok(entries) = serde_json::from_slice::<Vec<Value>>(&commits.stdout) else {
+            let Ok(entries) = serde_json::from_slice::<Vec<Value>>(&commits.body) else {
                 recency_ok = false;
                 break;
             };
@@ -1522,6 +1813,18 @@ impl Drop for MergeGuard {
         if let Ok(mut set) = self.requests.lock() {
             set.remove(&self.number);
         }
+    }
+}
+
+/// A finished gh request as the read paths judge it.
+fn gh_reply(mut out: ProcessOutput) -> ApiReply {
+    let reset_at_ms = take_response_headers(&mut out.stdout)
+        .and_then(|headers| header_reset_ms(&headers, epoch_ms()));
+    ApiReply {
+        ok: out.status.success(),
+        diagnostics: out.stderr_text(),
+        body: out.stdout,
+        reset_at_ms,
     }
 }
 
@@ -1884,6 +2187,7 @@ commits(last:1) { nodes { commit { committedDate statusCheckRollup { contexts(fi
 reviewThreads(first:50) { pageInfo { hasNextPage endCursor } nodes { id isResolved } }
 comments(last:COMMENT_FETCH_LIMIT) { nodes { author { login __typename } body createdAt updatedAt } }
 reviews(last:10) { nodes { author { login __typename } body state createdAt } }
+timelineItems(last:1, itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]) { nodes { ... on RemovedFromMergeQueueEvent { reason createdAt beforeCommit { oid } } } }
 }"#;
 
 /// Asked in every read, so each reply says what it cost and what is left.
@@ -1945,6 +2249,8 @@ pub const ROLES: &[&str] = &[
     "_gh-guard",
     "_hello",
     "_host",
+    "_install-dependencies",
+    "_maintain-origin",
     "_inventory",
     "_managed",
     "_remote",
@@ -2558,6 +2864,14 @@ fn parse_pr(pr: &Value, options: &GithubOptions) -> Option<PullRequest> {
         unresolved_threads_more: has_more_threads(pr),
         merged_at: str_at(pr, "/mergedAt").map(str::to_owned),
         closed_at: str_at(pr, "/closedAt").map(str::to_owned),
+        queue_removal: pr.pointer("/timelineItems/nodes/0").and_then(|event| {
+            let at = OffsetDateTime::parse(str_at(event, "/createdAt")?, &Rfc3339).ok()?;
+            Some(QueueRemoval {
+                reason: str_at(event, "/reason").unwrap_or_default().into(),
+                at_ms: u64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()?,
+                before_commit_oid: str_at(event, "/beforeCommit/oid").map(str::to_owned),
+            })
+        }),
     })
 }
 
@@ -2852,6 +3166,10 @@ fn review_bot_status(
 }
 
 #[cfg(test)]
+#[path = "http_tests.rs"]
+mod http_tests;
+
+#[cfg(test)]
 mod transport_tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt};
@@ -2869,7 +3187,7 @@ mod transport_tests {
         super::parse_chunk(bytes, branches, with_queue, options).map(|read| read.data)
     }
 
-    fn options() -> GithubOptions {
+    pub(super) fn options() -> GithubOptions {
         GithubOptions {
             base_branch: "main".into(),
             reviewers_enabled: true,
@@ -2928,7 +3246,7 @@ mod transport_tests {
         assert!(!missing.ok && !missing.ambiguous, "{missing:?}");
     }
 
-    fn fake_gh(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    pub(super) fn fake_gh(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
@@ -3199,7 +3517,7 @@ mod transport_tests {
     }
 
     /// [`pr_reply`] whose thread connection says more threads follow.
-    fn paged_pr_reply(threads: serde_json::Value, cursor: &str) -> String {
+    pub(super) fn paged_pr_reply(threads: serde_json::Value, cursor: &str) -> String {
         let mut reply: serde_json::Value = serde_json::from_str(&pr_reply(threads)).unwrap();
         reply["data"]["repository"]["wt_0"]["nodes"][0]["reviewThreads"]["pageInfo"] =
             serde_json::json!({"hasNextPage": true, "endCursor": cursor});
@@ -3431,13 +3749,14 @@ mod transport_tests {
         // GitHub charges one point per hundred requests, and counts one
         // request per connection per parent node. Per branch: the PR
         // connection, then for each of its two PRs the review requests, the
-        // commit, its check contexts, the threads, the comments and the
-        // reviews. A chunk of eight, with the merge queue, rounds to a point.
+        // commit, its check contexts, the threads, the comments, the
+        // reviews and the latest merge-queue removal. A chunk of eight, with
+        // the merge queue, rounds to a point.
         let fragment = &PR_FRAGMENT[PR_FRAGMENT.find('{').unwrap()..];
         let connections = fragment.matches("(first:").count() + fragment.matches("(last:").count();
-        assert_eq!(connections, 6);
+        assert_eq!(connections, 7);
         let requests = CHUNK_SIZE * (1 + 2 * connections) + 1;
-        assert_eq!(requests, 105);
+        assert_eq!(requests, 121);
         assert_eq!((requests as f64 / 100.0).round() as u64, 1);
         // The author read asks one thread per alias, by ID.
         let authors = thread_authors_query(&["PRRT_a".into(), "PRRT_b".into()]);
@@ -3446,6 +3765,46 @@ mod transport_tests {
             r#"t1: node(id:"PRRT_b") { ... on PullRequestReviewThread { comments(first:1)"#
         ));
         assert!(authors.ends_with("rateLimit { cost remaining resetAt limit } }"));
+    }
+
+    /// The latest removal from a merge queue is read with its reason, time
+    /// and the head it was removed at; a pull request never removed has none.
+    #[test]
+    fn the_latest_merge_queue_removal_is_read_with_its_reason() {
+        let mut reply: serde_json::Value =
+            serde_json::from_str(&pr_reply(serde_json::json!([]))).unwrap();
+        let read = |reply: &serde_json::Value| {
+            parse_chunk(
+                reply.to_string().as_bytes(),
+                &["feature/a".into()],
+                false,
+                &options(),
+            )
+            .unwrap()
+            .prs["feature/a"]
+                .clone()
+        };
+        assert_eq!(read(&reply).queue_removal, None);
+        reply["data"]["repository"]["wt_0"]["nodes"][0]["timelineItems"] = serde_json::json!({"nodes":[
+            {"reason":"FAILED_CHECKS","createdAt":"2026-10-03T12:00:00Z","beforeCommit":{"oid":"abc1234"}}
+        ]});
+        let pr = read(&reply);
+        assert_eq!(
+            pr.queue_removal,
+            Some(QueueRemoval {
+                reason: "FAILED_CHECKS".into(),
+                at_ms: 1_791_028_800_000,
+                before_commit_oid: Some("abc1234".into()),
+            })
+        );
+        // Data written before the field existed still parses, and the field
+        // is left out of what is written when there is nothing to say.
+        let mut json = serde_json::to_value(&pr).unwrap();
+        assert_eq!(json["queueRemoval"]["atMs"], 1_791_028_800_000u64);
+        json.as_object_mut().unwrap().remove("queueRemoval");
+        let older: PullRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(older.queue_removal, None);
+        assert_eq!(serde_json::to_value(&older).unwrap(), json);
     }
 
     #[test]

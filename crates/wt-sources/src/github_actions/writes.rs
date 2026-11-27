@@ -3,6 +3,7 @@
 //! model lags, and is never published.
 
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -60,6 +61,18 @@ impl Mutation<GithubData> for GithubWrite {
 
     fn target(&self) -> Target {
         Target::row(None, self.branch.clone())
+    }
+
+    /// A read of the branch alone confirms the write. Whether a merge is
+    /// armed also depends on the merge queue, which has a read of its own.
+    fn confirming(&self) -> Vec<Target> {
+        match self.change {
+            WriteChange::AutoMerge { .. } => vec![
+                self.target(),
+                Target::row(None, crate::github_source::MERGE_QUEUE_KEY),
+            ],
+            WriteChange::Ready => vec![self.target()],
+        }
     }
 
     fn label(&self) -> String {
@@ -178,12 +191,17 @@ pub(super) fn spawn_confirmer(scope: &TaskScope, ledger: WriteLedger) {
                         // No live read at all: let deadlines lapse.
                         state.settle(&GithubData::default(), |_, _| None, Instant::now());
                     }
-                    !state.is_empty()
+                    (!state.is_empty()).then(|| {
+                        state
+                            .mutations()
+                            .map(|write| write.branch.clone())
+                            .collect::<BTreeSet<_>>()
+                    })
                 };
-                if !open {
-                    break;
+                let Some(branches) = open else { break };
+                for branch in branches {
+                    ledger.refresh.refresh_live_branch(&branch);
                 }
-                ledger.refresh.refresh_live();
             }
         }
     });
@@ -209,8 +227,9 @@ impl WriteLedger {
     /// not the events daemon's older snapshot, to confirm it.
     pub(super) fn accepted(&self, write: GithubWrite) -> Stamp {
         let at = Stamp::now();
+        let branch = write.branch.clone();
         record_accepted(&mut self.lock(), self.op(), write, at);
-        self.refresh.refresh_live();
+        self.refresh.refresh_live_branch(&branch);
         self.recorded.notify_one();
         at
     }
@@ -265,7 +284,18 @@ pub(super) fn record_accepted(state: &mut LedgerState, op: u64, write: GithubWri
 /// Returns whether any record expired unconfirmed.
 fn settle(state: &mut LedgerState, github: &Confirmed<GithubData>, now: Instant) -> bool {
     let observed = github.observed();
-    let expired = state.settle(github, |_, _| Some(observed), now);
+    let expired = state.settle(
+        github,
+        |target, _| {
+            Some(
+                target
+                    .key
+                    .as_deref()
+                    .map_or(observed, |key| github.observed_for(key)),
+            )
+        },
+        now,
+    );
     for expired in &expired {
         tracing::info!(
             write = %expired.mutation.key(),

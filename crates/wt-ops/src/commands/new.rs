@@ -120,10 +120,13 @@ pub async fn run_created(
         }
         return Ok((0, None));
     }
-    let service = LifecycleService::new(
-        ServiceConfig::from_config(&ctx.config),
-        (*ctx.repository).clone(),
-        ctx.processes.clone(),
+    let service = crate::lifecycle_ops::with_detached_maintenance(
+        ctx,
+        LifecycleService::new(
+            ServiceConfig::from_config(&ctx.config),
+            (*ctx.repository).clone(),
+            ctx.processes.clone(),
+        ),
     );
     let lookup = IssueTitleLookup::start(ctx, &title);
     let created = match service
@@ -212,13 +215,17 @@ async fn install_request(
     let Some(plan) = policy.resolve(Path::new(&target.path), false).await? else {
         return Ok(None);
     };
-    let mut command = vec![plan.spec.program.to_string_lossy().into_owned()];
-    command.extend(
-        plan.spec
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned()),
-    );
+    // The action runs wt's own install worker rather than the package
+    // manager, so the install takes one of the machine's install slots
+    // inside the process that outlives this one.
+    let command = vec![
+        std::env::current_exe()
+            .context("resolve current wt executable")?
+            .to_string_lossy()
+            .into_owned(),
+        INSTALL_WORKER_COMMAND.to_owned(),
+        target.path.clone(),
+    ];
     let mut config_selectors = std::collections::BTreeMap::new();
     if let Some(path) = &ctx.config.repository_config {
         config_selectors.insert("WT_REPO_CONFIG".into(), path.to_string_lossy().into_owned());
@@ -242,6 +249,168 @@ async fn install_request(
         auto_fire_keys: Vec::new(),
         config_selectors,
     }))
+}
+
+/// Name of the hidden command an install action runs.
+pub const INSTALL_WORKER_COMMAND: &str = "_install-dependencies";
+
+#[derive(Debug, Clone, Args)]
+pub struct InstallWorkerArgs {
+    /// The worktree whose dependencies to install.
+    #[arg(value_name = "PATH")]
+    pub path: std::path::PathBuf,
+}
+
+/// Install one worktree's dependencies as the body of its install action.
+/// At most a few installs run on the machine at once (see
+/// `wt_lifecycle::slots::DEPENDENCY_INSTALLS`); the rest wait here, and say
+/// so in the action's log and the activity feed. Exits with the package
+/// manager's status.
+pub async fn run_install_worker(ctx: &AppContext, args: &InstallWorkerArgs) -> Result<i32> {
+    let rows = ctx.repository.inventory(&ctx.cancellation).await?;
+    let row = rows
+        .iter()
+        .find(|row| !row.is_main && Path::new(&row.target.path) == args.path)
+        .with_context(|| format!("{} is not a worktree to install in", args.path.display()))?;
+    let key = wt_core::worktree_target_key(&row.target);
+    let service = LifecycleService::new(
+        ServiceConfig::from_config(&ctx.config),
+        (*ctx.repository).clone(),
+        ctx.processes.clone(),
+    );
+    let prepared = service
+        .prepare_install(&args.path, &ctx.cancellation, || {
+            println!(
+                "waiting to install: {} dependency installs are already running",
+                wt_lifecycle::slots::DEPENDENCY_INSTALLS.slots()
+            );
+            tracing::info!(
+                target: "wt::creation",
+                event_source = %key,
+                event_text = "waiting to install dependencies",
+                "dependency install queued"
+            );
+        })
+        .await;
+    let install = match prepared {
+        Ok(Some(install)) => {
+            println!("installing dependencies");
+            install
+        }
+        Ok(None) => {
+            println!("nothing to install");
+            return Ok(0);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(1);
+        }
+    };
+    // Whoever kills this action kills this process's group. The package
+    // manager is only reached by that if this process leads the group it
+    // was started in, which an action's command does.
+    #[cfg(unix)]
+    // SAFETY: both calls only read this process's ids.
+    let reach = if unsafe { libc::getpgrp() == libc::getpid() } {
+        Reach::Group
+    } else {
+        Reach::Child
+    };
+    #[cfg(not(unix))]
+    let reach = Reach::Child;
+    let ended = run_in_this_group(&install.spec, &ctx.cancellation, reach).await;
+    let (code, stop_group) = match ended {
+        Ok(Ended::Exited(code)) => (code, false),
+        Ok(Ended::Stopped(why)) => {
+            eprintln!("dependency install {why}");
+            (None, true)
+        }
+        Err(error) => {
+            eprintln!("could not run the dependency install: {error}");
+            (Some(1), false)
+        }
+    };
+    install.finished(code);
+    #[cfg(unix)]
+    if stop_group && reach == Reach::Group {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        // What the package manager started and a SIGTERM did not end goes
+        // with this process: the install slot frees only as the tree dies.
+        // SAFETY: signals this process's own group, which it leads.
+        unsafe {
+            libc::kill(0, libc::SIGKILL);
+        }
+    }
+    Ok(code.unwrap_or(1))
+}
+
+/// How far stopping an install reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// This process's whole group, which it leads.
+    Group,
+    /// The package manager alone: the group belongs to someone else.
+    Child,
+}
+
+enum Ended {
+    Exited(Option<i32>),
+    Stopped(&'static str),
+}
+
+/// How long a stopped package manager gets to end on its own.
+const INSTALL_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run the package manager in this process's own group, on its terminal.
+///
+/// Not through `ProcessRunner`: that gives every command a group of its
+/// own, and this worker is killed as a group by whoever runs it (the action
+/// worker's runner, on a kill or a closed session). A package manager in a
+/// second group would outlive that kill, still installing while the slot
+/// this process held for it is already free. Sharing the group, the kill
+/// takes the package manager and whatever it started in one signal.
+async fn run_in_this_group(
+    spec: &wt_platform::process::CommandSpec,
+    cancellation: &tokio_util::sync::CancellationToken,
+    reach: Reach,
+) -> std::io::Result<Ended> {
+    let mut command = tokio::process::Command::new(&spec.program);
+    command.args(&spec.args).stdin(std::process::Stdio::null());
+    if let Some(cwd) = &spec.cwd {
+        command.current_dir(cwd);
+    }
+    for (name, value) in &spec.env {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    let mut child = command.spawn()?;
+    let why = tokio::select! {
+        status = child.wait() => return Ok(Ended::Exited(status?.code())),
+        _ = cancellation.cancelled() => "was stopped",
+        _ = tokio::time::sleep(spec.timeout) => "ran past its time limit and was stopped",
+    };
+    #[cfg(unix)]
+    if reach == Reach::Group {
+        // SAFETY: signals this process's own group. wt handles SIGTERM, so
+        // it survives the signal it sends itself here.
+        unsafe {
+            libc::kill(0, libc::SIGTERM);
+        }
+    }
+    if reach == Reach::Child {
+        let _ = child.start_kill();
+    }
+    if tokio::time::timeout(INSTALL_STOP_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+    Ok(Ended::Stopped(why))
 }
 
 /// A dependency install running as a durable background action.
@@ -323,6 +492,75 @@ impl IssueTitleLookup {
         Self(Some(tokio::spawn(async move {
             wt_app_core::issue_tracker::title(&ctx, &id, &ctx.cancellation).await
         })))
+    }
+
+    /// How long a read that outlasted the creation may still retitle it.
+    const LATE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Title the new worktree without waiting on the tracker, for a caller
+    /// other requests queue behind. A read that has answered titles it now.
+    /// Otherwise it takes the bare id at once, and the returned task
+    /// replaces exactly that title when the read answers: a title set in
+    /// between stands. A command that exits once it returns has nothing to
+    /// run that task in; it waits with [`Self::finish`].
+    pub async fn record(
+        mut self,
+        ctx: &AppContext,
+        slug: &str,
+        title: CreationTitle,
+        creator: TitleSource,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let mut read = match self.0.take() {
+            Some(read) if !read.is_finished() => read,
+            read => {
+                let issue_title = match read {
+                    Some(read) => read.await.ok().flatten(),
+                    None => None,
+                };
+                record_title(ctx, slug, title, creator, issue_title).await;
+                return None;
+            }
+        };
+        let placeholder = match &title {
+            CreationTitle::Issue(id) => Some(id.clone()),
+            _ => None,
+        };
+        let (ctx, slug) = (ctx.clone(), slug.to_owned());
+        record_title(&ctx, &slug, title, creator, None).await;
+        let Some(id) = placeholder else {
+            read.abort();
+            return None;
+        };
+        Some(tokio::spawn(async move {
+            let issue_title = tokio::select! {
+                _ = ctx.cancellation.cancelled() => None,
+                answered = tokio::time::timeout(Self::LATE, &mut read) => {
+                    answered.ok().and_then(Result::ok).flatten()
+                }
+            };
+            let Some(issue_title) = issue_title else {
+                read.abort();
+                return;
+            };
+            let db_slug = slug.clone();
+            let written = ctx
+                .database
+                .call(move |store| {
+                    let state = store.read_wt_state()?;
+                    // Only the placeholder this creation wrote is replaced.
+                    if wt_store::stored_title(&state, &db_slug) != Some((id, TitleSource::Fallback))
+                    {
+                        return Ok(());
+                    }
+                    let revision = state["slugs"][&db_slug]["manualTitleRevision"].as_u64();
+                    store.set_slug_title(&db_slug, &issue_title, TitleSource::Issue, revision)?;
+                    Ok(())
+                })
+                .await;
+            if let Err(error) = written {
+                tracing::warn!(slug, error = %format!("{error:#}"), "could not save the tracker's title for the new worktree");
+            }
+        }))
     }
 
     pub async fn finish(mut self) -> Option<String> {
@@ -579,8 +817,9 @@ async fn open_editor(ctx: &AppContext, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CREATE_INSTALL_ACTION_ID, CreationTitle, InstallTiming, IssueTitleLookup, NewArgs,
-        TitleSource, install_request, parse_branch, record_title, run_created, slugify,
+        CREATE_INSTALL_ACTION_ID, CreationTitle, INSTALL_WORKER_COMMAND, InstallTiming,
+        InstallWorkerArgs, IssueTitleLookup, NewArgs, TitleSource, install_request, parse_branch,
+        record_title, run_created, run_install_worker, slugify,
     };
     use clap::{Args as _, Command, FromArgMatches};
 
@@ -818,9 +1057,165 @@ mod tests {
         assert_eq!(request.action_id, CREATE_INSTALL_ACTION_ID);
         assert_eq!(request.action_key, wt_core::worktree_target_key(&target));
         assert_eq!(request.cwd, path);
+        // The action runs the install worker, which takes an install slot.
         assert_eq!(
-            request.command.last().map(String::as_str),
-            Some("touch installed.marker")
+            request.command[1..],
+            [INSTALL_WORKER_COMMAND.to_owned(), created.path.clone()]
+        );
+        assert_eq!(request.prompt, "touch installed.marker");
+
+        let worker = InstallWorkerArgs { path: path.into() };
+        assert_eq!(run_install_worker(&fixture.ctx, &worker).await.unwrap(), 0);
+        assert!(path.join("installed.marker").exists());
+        let elsewhere = InstallWorkerArgs {
+            path: fixture.ctx.config.paths.main_clone.clone(),
+        };
+        assert!(
+            run_install_worker(&fixture.ctx, &elsewhere).await.is_err(),
+            "only a worktree is installed in"
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// A kill of the install action is a kill of the worker's process
+    /// group. The package manager has to be in it, or it would go on
+    /// installing after its install slot was freed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_package_manager_runs_in_the_workers_own_process_group() {
+        use super::{Ended, Reach, run_in_this_group};
+        let scratch = tempfile::tempdir().unwrap();
+        let mut spec = wt_platform::process::CommandSpec::new("sh")
+            .args(["-c", "ps -o pgid= -p $$ > group"])
+            .cwd(scratch.path());
+        spec.timeout = std::time::Duration::from_secs(30);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let ended = run_in_this_group(&spec, &cancel, Reach::Child)
+            .await
+            .unwrap();
+        assert!(matches!(ended, Ended::Exited(Some(0))));
+        let group = std::fs::read_to_string(scratch.path().join("group")).unwrap();
+        // SAFETY: reads this process's group id.
+        assert_eq!(group.trim().parse::<i32>().unwrap(), unsafe {
+            libc::getpgrp()
+        });
+
+        // Stopped, it does not outlive the call.
+        let mut spec = wt_platform::process::CommandSpec::new("sh")
+            .args(["-c", "echo $$ > pid; exec sleep 60"])
+            .cwd(scratch.path());
+        spec.timeout = std::time::Duration::from_secs(120);
+        let running = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { run_in_this_group(&spec, &cancel, Reach::Child).await }
+        });
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(scratch.path().join("pid"))
+                    && let Ok(pid) = text.trim().parse::<i32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.cancel();
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(10), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ended, Ended::Stopped(_)));
+        // SAFETY: signal 0 only asks whether the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[tokio::test]
+    async fn an_install_worker_exits_with_the_package_managers_status() {
+        let mut fixture = installing_fixture().await;
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .lifecycle
+            .install_command = Some("exit 7".into());
+        let (_, created) = run_created(
+            &fixture.ctx,
+            &new_args("feature/failing"),
+            InstallTiming::Deferred,
+        )
+        .await
+        .unwrap();
+        let worker = InstallWorkerArgs {
+            path: created.unwrap().path.into(),
+        };
+        assert_eq!(run_install_worker(&fixture.ctx, &worker).await.unwrap(), 7);
+        fixture.close().await.unwrap();
+    }
+
+    /// The tracker answers after the worktree exists: the creation is not
+    /// held for it, and the title follows once it lands.
+    #[tokio::test]
+    async fn a_slow_tracker_titles_the_worktree_after_the_creation_replied() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).issue_tracker =
+            Some(wt_config::IssueTrackerConfig {
+                status_command: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    r#"sleep 1; printf '%s' '{"issues":[{"id":"ENG-42","status":"Todo","title":"Calendar renders twice"}]}'"#.into(),
+                    "reader".into(),
+                    "{ids}".into(),
+                ]),
+                ..Default::default()
+            });
+        let stored = |slug: &'static str| {
+            let database = fixture.ctx.database.clone();
+            async move {
+                let state = database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await
+                    .unwrap();
+                wt_store::stored_title(&state, slug)
+            }
+        };
+        let title = CreationTitle::Issue("ENG-42".into());
+
+        let started = std::time::Instant::now();
+        let late = IssueTitleLookup::start(&fixture.ctx, &title)
+            .record(&fixture.ctx, "one", title.clone(), TitleSource::User)
+            .await
+            .expect("the read is still in flight");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(900),
+            "recording waited for the tracker"
+        );
+        assert_eq!(
+            stored("one").await,
+            Some(("ENG-42".into(), TitleSource::Fallback))
+        );
+        late.await.unwrap();
+        assert_eq!(
+            stored("one").await,
+            Some(("Calendar renders twice".into(), TitleSource::Issue))
+        );
+
+        // A title set while the read was in flight is not replaced.
+        let late = IssueTitleLookup::start(&fixture.ctx, &title)
+            .record(&fixture.ctx, "two", title, TitleSource::User)
+            .await
+            .unwrap();
+        fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.set_slug_title("two", "Mine", TitleSource::Agent, None)?))
+            .await
+            .unwrap();
+        late.await.unwrap();
+        assert_eq!(
+            stored("two").await,
+            Some(("Mine".into(), TitleSource::Agent))
         );
         fixture.close().await.unwrap();
     }

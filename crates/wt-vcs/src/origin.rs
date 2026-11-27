@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use wt_platform::install::InstallPolicy;
 use wt_platform::lock::{FileLock, LockError};
-use wt_platform::process::{CommandSpec, ProcessError};
+use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner};
 
 use crate::{
     repository::{
@@ -27,7 +27,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const FAST_FORWARD_ADMISSION: Duration = Duration::from_secs(60);
 const GIT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 /// Beside the fetch lock: when the last successful `git fetch` started, in
-/// wall-clock nanoseconds. Read and written only while holding that lock.
+/// wall-clock nanoseconds. Written only while holding that lock, and read
+/// under it wherever a fetch may follow the read.
 const FETCH_STAMP: &str = "fetch-origin.stamp";
 
 /// Wall clock, because the stamp is compared across processes. `None` (a
@@ -70,6 +71,14 @@ pub struct FetchOriginReport {
     pub after_main_head: Option<String>,
     pub warnings: Vec<String>,
     pub rift_refs_updated: usize,
+}
+
+/// Whether [`GitRepository::fetch_origin_refs`] ran a fetch of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchedRefs {
+    Fetched,
+    /// A fetch another caller completed stands in for it.
+    Reused,
 }
 
 #[derive(Clone, Debug)]
@@ -266,6 +275,103 @@ impl GitRepository {
             .await
     }
 
+    /// Bring origin's remote-tracking refs up to date and nothing else: no
+    /// checkout, local branch or dependency is touched, so a caller that only
+    /// needs to resolve a ref does not wait on that maintenance. A fetch that
+    /// started within `reuse` before this call stands in for one of its own;
+    /// `Duration::ZERO` accepts only a fetch that started after the call.
+    /// Whoever performs a fetch owes the maintenance that follows it
+    /// ([`Self::maintain_fetched_refs`]).
+    pub async fn fetch_origin_refs(
+        &self,
+        reuse: Duration,
+        cancellation: &CancellationToken,
+    ) -> Result<FetchedRefs, RepositoryError> {
+        if cancellation.is_cancelled() {
+            return Err(RepositoryError::Cancelled);
+        }
+        let requested = wall_clock_nanos().map(|now| now.saturating_sub(reuse.as_nanos()));
+        let lock_dir = self.repository_lock_dir().await;
+        // Read without the lock, which its holder keeps through maintenance
+        // that can run for minutes. The stamp is written by truncating, so a
+        // torn read is empty or a shorter number: an older fetch, never a
+        // newer one.
+        if stamped_fetch_covers(&lock_dir.join(FETCH_STAMP), requested).await {
+            return Ok(FetchedRefs::Reused);
+        }
+        let _lock = self.lock_fetch(&lock_dir, cancellation).await?;
+        Ok(
+            if self
+                .fetch_unless_covered(&lock_dir, requested, cancellation)
+                .await?
+            {
+                FetchedRefs::Fetched
+            } else {
+                FetchedRefs::Reused
+            },
+        )
+    }
+
+    /// The maintenance half of [`Self::fetch_origin`] over the refs as they
+    /// were last fetched: it fetches only when no fetch has ever completed.
+    /// Never joins or leads a shared flight, whose callers are promised a
+    /// fetch that started after they asked.
+    pub async fn maintain_fetched_refs(
+        &self,
+        options: FetchOriginOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<FetchOriginReport, RepositoryError> {
+        self.fetch_origin_requested_at(options, Some(0), cancellation)
+            .await
+    }
+
+    async fn lock_fetch(
+        &self,
+        lock_dir: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<FileLock, RepositoryError> {
+        FileLock::acquire(lock_dir, "fetch-origin", "fetch origin", cancellation)
+            .await
+            .map_err(|source| {
+                if matches!(source, LockError::Cancelled) {
+                    RepositoryError::Cancelled
+                } else {
+                    RepositoryError::FetchLock {
+                        path: lock_dir.to_path_buf(),
+                        source,
+                    }
+                }
+            })
+    }
+
+    /// Fetch unless a completed fetch already covers `requested`. Callers
+    /// hold the fetch lock. Returns whether it fetched.
+    async fn fetch_unless_covered(
+        &self,
+        lock_dir: &Path,
+        requested: Option<u128>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let stamp = lock_dir.join(FETCH_STAMP);
+        if stamped_fetch_covers(&stamp, requested).await {
+            return Ok(false);
+        }
+        let started = wall_clock_nanos();
+        self.run_git_args_on(
+            &self.origin_runner().bulk(),
+            &self.origin_config().main_clone,
+            ["fetch", "origin", "--prune"].map(Into::into).to_vec(),
+            cancellation,
+            "fetch origin",
+        )
+        .await?;
+        // An unwritten stamp only costs the next waiter its own fetch.
+        if let Some(started) = started {
+            let _ = tokio::fs::write(&stamp, started.to_string()).await;
+        }
+        Ok(true)
+    }
+
     async fn fetch_origin_requested_at(
         &self,
         options: FetchOriginOptions,
@@ -273,37 +379,13 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<FetchOriginReport, RepositoryError> {
         let lock_dir = self.repository_lock_dir().await;
-        let _lock = FileLock::acquire(&lock_dir, "fetch-origin", "fetch origin", cancellation)
-            .await
-            .map_err(|source| {
-                if matches!(source, LockError::Cancelled) {
-                    RepositoryError::Cancelled
-                } else {
-                    RepositoryError::FetchLock {
-                        path: lock_dir.clone(),
-                        source,
-                    }
-                }
-            })?;
+        let _lock = self.lock_fetch(&lock_dir, cancellation).await?;
 
         let before_main_head = self
             .rev_parse(&self.origin_config().main_clone, "HEAD", cancellation)
             .await?;
-        let stamp = lock_dir.join(FETCH_STAMP);
-        if !stamped_fetch_covers(&stamp, requested).await {
-            let started = wall_clock_nanos();
-            self.run_git_args(
-                &self.origin_config().main_clone,
-                ["fetch", "origin", "--prune"].map(Into::into).to_vec(),
-                cancellation,
-                "fetch origin",
-            )
+        self.fetch_unless_covered(&lock_dir, requested, cancellation)
             .await?;
-            // An unwritten stamp only costs the next waiter its own fetch.
-            if let Some(started) = started {
-                let _ = tokio::fs::write(&stamp, started.to_string()).await;
-            }
-        }
 
         let checked_out = self
             .run_git_optional(
@@ -517,6 +599,7 @@ impl GitRepository {
         }
         let result = self
             .origin_runner()
+            .heavy()
             // Package managers can be verbose. Keep a bounded diagnostic
             // capture while draining the rest, never terminate an install just
             // because it printed more than the capture budget.
@@ -668,7 +751,8 @@ impl GitRepository {
                     .as_nanos()
             );
             let fetch_result = self
-                .run_git_args(
+                .run_git_args_on(
+                    &self.origin_runner().bulk(),
                     path,
                     [
                         "fetch".into(),
@@ -819,6 +903,7 @@ impl GitRepository {
         spec.output_limit = GIT_OUTPUT_LIMIT;
         let output = self
             .origin_runner()
+            .bulk()
             .run_to_completion(spec, cancellation)
             .await
             .map_err(|source| RepositoryError::Process {
@@ -894,20 +979,35 @@ impl GitRepository {
         cancellation: &CancellationToken,
         operation: &'static str,
     ) -> Result<Vec<u8>, RepositoryError> {
+        self.run_git_args_on(self.origin_runner(), cwd, args, cancellation, operation)
+            .await
+    }
+
+    /// `runner` is the repository's own for short commands and its
+    /// `bulk()` handle for a fetch, so a slow network transfer holds one of
+    /// the few bulk slots and never a reader's.
+    async fn run_git_args_on(
+        &self,
+        runner: &ProcessRunner,
+        cwd: &Path,
+        args: Vec<std::ffi::OsString>,
+        cancellation: &CancellationToken,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, RepositoryError> {
         let mut spec = CommandSpec::new("git").args(args);
         spec.cwd = Some(cwd.to_path_buf());
         spec.env = common_git_env();
         spec.timeout = GIT_TIMEOUT;
         spec.output_limit = GIT_OUTPUT_LIMIT;
-        let output = self
-            .origin_runner()
-            .run(spec, cancellation)
-            .await
-            .map_err(|source| RepositoryError::Process {
-                operation,
-                path: cwd.to_path_buf(),
-                source,
-            })?;
+        let output =
+            runner
+                .run(spec, cancellation)
+                .await
+                .map_err(|source| RepositoryError::Process {
+                    operation,
+                    path: cwd.to_path_buf(),
+                    source,
+                })?;
         Ok(output
             .checked("git")
             .map_err(|source| RepositoryError::Process {
@@ -1430,6 +1530,78 @@ mod tests {
         );
 
         assert!(!fetch_stamp(&main).await.exists());
+    }
+
+    #[tokio::test]
+    async fn a_refs_only_fetch_reuses_a_recent_one_and_leaves_maintenance_to_its_owner() {
+        let (_root, runner, seed, main, worktrees) = fixture().await;
+        let repository = repository(&main, &worktrees);
+        let cancel = CancellationToken::new();
+        let local_main = git(&runner, &main, &["rev-parse", "HEAD"]).await;
+        commit_file(&runner, &seed, "next.txt", "next\n", "next remote commit").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        let pushed = git(&runner, &seed, &["rev-parse", "HEAD"]).await;
+
+        assert_eq!(
+            repository
+                .fetch_origin_refs(Duration::from_secs(30), &cancel)
+                .await
+                .unwrap(),
+            super::FetchedRefs::Fetched
+        );
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            pushed
+        );
+        // Only the remote-tracking ref moved: the checkout is maintenance's.
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "HEAD"]).await,
+            local_main
+        );
+
+        commit_file(
+            &runner,
+            &seed,
+            "later.txt",
+            "later\n",
+            "later remote commit",
+        )
+        .await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        assert_eq!(
+            repository
+                .fetch_origin_refs(Duration::from_secs(30), &cancel)
+                .await
+                .unwrap(),
+            super::FetchedRefs::Reused
+        );
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            pushed
+        );
+        // Maintenance runs over the refs as fetched, without another fetch.
+        repository
+            .maintain_fetched_refs(FetchOriginOptions::default(), &cancel)
+            .await
+            .unwrap();
+        assert_eq!(git(&runner, &main, &["rev-parse", "HEAD"]).await, pushed);
+        assert_eq!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            pushed
+        );
+
+        // No window: only a fetch that starts after the call will do.
+        assert_eq!(
+            repository
+                .fetch_origin_refs(Duration::ZERO, &cancel)
+                .await
+                .unwrap(),
+            super::FetchedRefs::Fetched
+        );
+        assert_ne!(
+            git(&runner, &main, &["rev-parse", "origin/main"]).await,
+            pushed
+        );
     }
 
     #[tokio::test]

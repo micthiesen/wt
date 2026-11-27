@@ -2,11 +2,15 @@
 //! presentation data, not permission to skip the service's locked rechecks.
 use std::{
     collections::BTreeMap,
+    future::Future,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
-use futures_util::{StreamExt, stream};
+use futures_util::{
+    StreamExt,
+    stream::{self, FuturesUnordered},
+};
 use wt_github::{GithubClient, GithubData, GithubOptions};
 use wt_lifecycle::{LifecycleService, ServiceConfig};
 use wt_runtime::Confirmed;
@@ -47,11 +51,93 @@ pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
             }
         }
     });
+    let service = with_detached_maintenance(ctx, service);
     Ok(if ctx.config.dev_server.is_some() {
         service.with_dev_server(wt_app_core::dev::service(ctx)?)
     } else {
         service
     })
+}
+
+/// Name of the hidden command that runs the ref maintenance a creation owes.
+pub const MAINTENANCE_WORKER_COMMAND: &str = "_maintain-origin";
+
+/// Let creations return at their checkout: the maintenance they owe (local
+/// base branches, the main clone's checkout and dependencies) runs in a
+/// process of its own, which neither the creation's caller going away nor
+/// this process exiting interrupts. That matters because the maintenance
+/// can fast-forward the main clone and install its dependencies, and
+/// neither may be cut short. Workers queue on the repository's fetch lock,
+/// and one with nothing left to do ends after a few ref reads.
+pub fn with_detached_maintenance(ctx: &AppContext, service: LifecycleService) -> LifecycleService {
+    // A test binary is not wt: it has no such command to run.
+    if cfg!(test) {
+        return service;
+    }
+    let (main_clone, home, repository_config) = (
+        ctx.config.paths.main_clone.clone(),
+        ctx.home.clone(),
+        ctx.config.repository_config.clone(),
+    );
+    service.with_deferred_maintenance(move || {
+        let started = std::env::current_exe().and_then(|executable| {
+            let mut command = std::process::Command::new(executable);
+            command
+                .arg(MAINTENANCE_WORKER_COMMAND)
+                .current_dir(&main_clone)
+                .env("HOME", &home)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(path) = &repository_config {
+                command.env("WT_REPO_CONFIG", path);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            command.spawn()
+        });
+        match started {
+            // Reaped here when it ends; it outlives this process otherwise.
+            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
+            // The next origin fetch by the board or the events daemon runs
+            // the same maintenance.
+            Err(error) => {
+                tracing::warn!(target: "wt::origin", %error, "could not start ref maintenance after creation")
+            }
+        }
+    })
+}
+
+/// Body of [`MAINTENANCE_WORKER_COMMAND`]. It has no caller to answer:
+/// what it finds is logged like any other origin maintenance.
+pub async fn run_maintenance_worker(ctx: &AppContext) -> Result<i32> {
+    let started = std::time::Instant::now();
+    let service = LifecycleService::new(
+        ServiceConfig::from_config(&ctx.config),
+        (*ctx.repository).clone(),
+        ctx.processes.clone(),
+    );
+    match service.maintain_origin(&ctx.cancellation).await {
+        Ok(report) => {
+            for warning in &report.warnings {
+                tracing::warn!(target: "wt::origin", %warning, "Git ref maintenance after creation");
+            }
+            tracing::info!(
+                target: "wt::origin",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                warnings = report.warnings.len(),
+                "ref maintenance after creation finished"
+            );
+            Ok(0)
+        }
+        Err(error) => {
+            tracing::warn!(target: "wt::origin", %error, "Git ref maintenance after creation failed");
+            Ok(1)
+        }
+    }
 }
 
 pub async fn resolve_key(ctx: &AppContext, key: &str) -> Result<WorktreeRecord> {
@@ -158,27 +244,7 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
         .database
         .call(|store| Ok(store.read_wt_state()?))
         .await?;
-    let branches = rows
-        .iter()
-        .map(|row| row.target.branch.clone())
-        .collect::<Vec<_>>();
-    let client = GithubClient::new(
-        ctx.processes.clone(),
-        ctx.config.paths.main_clone.clone(),
-        GithubOptions::from_config(&ctx.config, false),
-    );
-    let (github, warning) = if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
-        (GithubData::default(), None)
-    } else {
-        match client.fetch_worktrees(&branches, &ctx.cancellation).await {
-            Ok(data) => (data, None),
-            Err(error) if !ctx.cancellation.is_cancelled() => (
-                GithubData::default(),
-                Some(format!("GitHub merge evidence unavailable: {error}")),
-            ),
-            Err(error) => return Err(error.into()),
-        }
-    };
+    let (github, warning) = fresh_github(ctx, &rows).await?;
     crate::other_branches::observe(
         ctx,
         &rows,
@@ -188,6 +254,34 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
     )
     .await;
     plan_with_evidence(ctx, rows, &state, &github, warning).await
+}
+
+/// This process's own GitHub read for the rows' branches. A failed read is
+/// no evidence, with a warning saying so; only cancellation is an error.
+async fn fresh_github(
+    ctx: &AppContext,
+    rows: &[WorktreeRecord],
+) -> Result<(GithubData, Option<String>)> {
+    if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
+        return Ok((GithubData::default(), None));
+    }
+    let branches = rows
+        .iter()
+        .map(|row| row.target.branch.clone())
+        .collect::<Vec<_>>();
+    let client = GithubClient::new(
+        ctx.processes.clone(),
+        ctx.config.paths.main_clone.clone(),
+        GithubOptions::from_config(&ctx.config, false),
+    );
+    match client.fetch_worktrees(&branches, &ctx.cancellation).await {
+        Ok(data) => Ok((data, None)),
+        Err(error) if !ctx.cancellation.is_cancelled() => Ok((
+            GithubData::default(),
+            Some(format!("GitHub merge evidence unavailable: {error}")),
+        )),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Read local hazards with the host's confirmed GitHub evidence. A merged PR
@@ -788,7 +882,10 @@ async fn copy_of_published_head(
     head: &str,
     base: &str,
 ) -> bool {
-    let base = format!("refs/remotes/origin/{base}");
+    let base = format!(
+        "refs/remotes/origin/{}",
+        base.strip_prefix("origin/").unwrap_or(base)
+    );
     let held = wt_vcs::published_head_holds_everything(merged_head, head, &base, |args| async {
         let output = run_git(ctx, path, args).await.ok()?;
         (!output.stdout_truncated).then(|| wt_vcs::GitRead {
@@ -800,6 +897,11 @@ async fn copy_of_published_head(
     matches!(held, wt_vcs::BeyondBase::Nothing(_))
 }
 
+/// How many rows are planned at once. A plan is two captures of the checkout
+/// and a dozen short Git reads, all through the process runner, which bounds
+/// the subprocesses themselves; a wider fan-out only queues there.
+const PLAN_ROWS: usize = 4;
+
 /// `github` is either this process's fresh fetch or confirmed leaf data; the
 /// public entry points never accept displayed or restored data.
 async fn plan_with_evidence(
@@ -810,110 +912,145 @@ async fn plan_with_evidence(
     mut warning: Option<String>,
 ) -> Result<RemovalPlans> {
     let lifecycle = service(ctx)?;
-    let mut plans = Vec::with_capacity(rows.len());
     let published_bases = PublishedBases::default();
-    for row in rows {
-        if row.is_main {
-            continue;
-        }
-        let result: Result<RemovalPlan> = async {
-            let path = Path::new(&row.target.path);
-            let stored = &state["slugs"][row.target.slug()];
-            let landing =
-                landing_evidence(ctx, &row, stored, github, &published_bases, &mut warning).await?;
-            let landed = landing.landed();
-            let pr_landed = landing.pr_landed;
-            let mut extra = serde_json::Map::new();
-            let pr = github.prs.get(&row.target.branch);
-            if let Some(title) = stored["manualTitle"]
-                .as_str()
-                .filter(|title| !title.trim().is_empty())
-                .or_else(|| {
-                    pr.map(|pr| pr.title.as_str())
-                        .filter(|title| !title.trim().is_empty())
-                })
-            {
-                extra.insert("title".into(), serde_json::json!(title));
-            }
-            if let Some(issue_id) =
-                wt_app_core::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
-            {
-                extra.insert("issueId".into(), serde_json::json!(issue_id));
-            }
-            if let Some(github_issue) = stored.get("githubIssue") {
-                extra.insert("githubIssue".into(), github_issue.clone());
-            }
-            // The removal record is where the worktree's other branches
-            // stay findable once its reflog is gone.
-            if let Some(others) = stored
-                .get(wt_core::OTHER_BRANCHES)
-                .filter(|others| others.as_object().is_some_and(|others| !others.is_empty()))
-            {
-                extra.insert(wt_core::OTHER_BRANCHES.into(), others.clone());
-            }
-            if landed {
-                extra.insert("gitState".into(), serde_json::json!("merged"));
-            }
-            // A branch may have advanced after an older PR merged. Persist the
-            // current revision's verdict so historical PR metadata cannot turn
-            // those unlanded commits into a claim that all work landed.
-            extra.insert(
-                "landedOnAtRemoval".into(),
-                serde_json::json!(if landed { "base" } else { "unlanded" }),
-            );
-            if let Some(pr) = pr {
-                extra.insert("prNumber".into(), serde_json::json!(pr.number));
-                extra.insert("prUrl".into(), serde_json::json!(pr.url));
-                extra.insert("prState".into(), serde_json::json!(pr.state));
-                if pr_landed && let Some(merge_oid) = &pr.merge_commit_oid {
-                    extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
-                }
-            }
-            let removed_snapshot = wt_store::RemovedWorktree {
-                slug: row.target.slug().to_owned(),
-                branch: row.target.branch.clone(),
-                removed_at: String::new(),
-                work: None,
-                automations_paused: None,
-                extra,
-            };
-            let base_tip = if landing.on_published_base() {
-                published_bases.known(proof_repository(ctx, path)).await
-            } else {
-                None
-            };
-            let mut revision = lifecycle
-                .removal_revision_on(&row.target, landed, base_tip.as_deref(), &ctx.cancellation)
-                .await?;
-            revision.published_base = base_tip
-                .map(|tip| Box::new((format!("refs/heads/{}", ctx.config.branch.base), tip)));
-            let hazards = revision.hazards.clone();
-            let stage_path = path.to_path_buf();
-            let stage = row.target.stage.clone();
-            let prefix = ctx.config.stage.prefix.clone();
-            let default_stage = ctx.config.stage.default_personal.clone();
-            let has_sst = ctx.config.sst.is_some();
-            let destroy_stage = tokio::task::spawn_blocking(move || {
-                has_sst
-                    && stage != default_stage
-                    && crate::commands::remove::is_our_stage_deployed(&stage_path, &stage, &prefix)
+    let (lifecycle, published_bases) = (&lifecycle, &published_bases);
+    // Rows are read side by side and reported in the order given. They share
+    // the batch's one published base, read by whichever row asks first.
+    let mut planned = std::pin::pin!(
+        stream::iter(rows.into_iter().filter(|row| !row.is_main))
+            .map(|row| async move {
+                let mut warning = None;
+                let plan = plan_row(
+                    ctx,
+                    lifecycle,
+                    row,
+                    state,
+                    github,
+                    published_bases,
+                    &mut warning,
+                )
+                .await;
+                (plan, warning)
             })
-            .await?;
-            Ok(RemovalPlan {
-                row,
-                landed,
-                hazards,
-                destroy_stage,
-                revision,
-                removed_snapshot,
-            })
-        }
-        .await;
-        plans.push(result?);
+            .buffered(PLAN_ROWS)
+    );
+    let mut plans = Vec::new();
+    while let Some((plan, row_warning)) = planned.next().await {
+        warning = join_warnings(warning, row_warning);
+        plans.push(plan?);
     }
     Ok(RemovalPlans {
         rows: plans,
         warning,
+    })
+}
+
+fn join_warnings(earlier: Option<String>, later: Option<String>) -> Option<String> {
+    match (earlier, later) {
+        (Some(earlier), Some(later)) => Some(format!("{earlier}; {later}")),
+        (earlier, later) => earlier.or(later),
+    }
+}
+
+/// One row's removal plan: its landing proof, the hazards and revision the
+/// removal will be checked against, and the record it leaves behind.
+async fn plan_row(
+    ctx: &AppContext,
+    lifecycle: &LifecycleService,
+    row: WorktreeRecord,
+    state: &serde_json::Value,
+    github: &GithubData,
+    published_bases: &PublishedBases,
+    warning: &mut Option<String>,
+) -> Result<RemovalPlan> {
+    let path = Path::new(&row.target.path);
+    let stored = &state["slugs"][row.target.slug()];
+    let landing = landing_evidence(ctx, &row, stored, github, published_bases, warning).await?;
+    let landed = landing.landed();
+    let pr_landed = landing.pr_landed;
+    let mut extra = serde_json::Map::new();
+    let pr = github.prs.get(&row.target.branch);
+    if let Some(title) = stored["manualTitle"]
+        .as_str()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            pr.map(|pr| pr.title.as_str())
+                .filter(|title| !title.trim().is_empty())
+        })
+    {
+        extra.insert("title".into(), serde_json::json!(title));
+    }
+    if let Some(issue_id) =
+        wt_app_core::issue_identity::resolve(row.target.slug(), stored["issueId"].as_str())
+    {
+        extra.insert("issueId".into(), serde_json::json!(issue_id));
+    }
+    if let Some(github_issue) = stored.get("githubIssue") {
+        extra.insert("githubIssue".into(), github_issue.clone());
+    }
+    // The removal record is where the worktree's other branches
+    // stay findable once its reflog is gone.
+    if let Some(others) = stored
+        .get(wt_core::OTHER_BRANCHES)
+        .filter(|others| others.as_object().is_some_and(|others| !others.is_empty()))
+    {
+        extra.insert(wt_core::OTHER_BRANCHES.into(), others.clone());
+    }
+    if landed {
+        extra.insert("gitState".into(), serde_json::json!("merged"));
+    }
+    // A branch may have advanced after an older PR merged. Persist the
+    // current revision's verdict so historical PR metadata cannot turn
+    // those unlanded commits into a claim that all work landed.
+    extra.insert(
+        "landedOnAtRemoval".into(),
+        serde_json::json!(if landed { "base" } else { "unlanded" }),
+    );
+    if let Some(pr) = pr {
+        extra.insert("prNumber".into(), serde_json::json!(pr.number));
+        extra.insert("prUrl".into(), serde_json::json!(pr.url));
+        extra.insert("prState".into(), serde_json::json!(pr.state));
+        if pr_landed && let Some(merge_oid) = &pr.merge_commit_oid {
+            extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
+        }
+    }
+    let removed_snapshot = wt_store::RemovedWorktree {
+        slug: row.target.slug().to_owned(),
+        branch: row.target.branch.clone(),
+        removed_at: String::new(),
+        work: None,
+        automations_paused: None,
+        extra,
+    };
+    let base_tip = if landing.on_published_base() {
+        published_bases.known(proof_repository(ctx, path)).await
+    } else {
+        None
+    };
+    let mut revision = lifecycle
+        .removal_revision_on(&row.target, landed, base_tip.as_deref(), &ctx.cancellation)
+        .await?;
+    revision.published_base =
+        base_tip.map(|tip| Box::new((format!("refs/heads/{}", ctx.config.branch.base), tip)));
+    let hazards = revision.hazards.clone();
+    let stage_path = path.to_path_buf();
+    let stage = row.target.stage.clone();
+    let prefix = ctx.config.stage.prefix.clone();
+    let default_stage = ctx.config.stage.default_personal.clone();
+    let has_sst = ctx.config.sst.is_some();
+    let destroy_stage = tokio::task::spawn_blocking(move || {
+        has_sst
+            && stage != default_stage
+            && crate::commands::remove::is_our_stage_deployed(&stage_path, &stage, &prefix)
+    })
+    .await?;
+    Ok(RemovalPlan {
+        row,
+        landed,
+        hazards,
+        destroy_stage,
+        revision,
+        removed_snapshot,
     })
 }
 
@@ -1095,30 +1232,6 @@ async fn cleanup_with_evidence(
     evidence: Evidence<'_>,
     targets: Option<&[wt_tui::CleanupTarget]>,
 ) -> Result<String> {
-    let live = ctx.repository.inventory(&ctx.cancellation).await?;
-    let selected = live
-        .into_iter()
-        .filter(|row| {
-            targets.is_some_and(|targets| targets.iter().any(|item| target_matches(row, item)))
-                || confirmed.iter().any(|item| {
-                    item.key == wt_core::worktree_target_key(&row.target)
-                        && item.path == row.target.path
-                        && item.branch == row.target.branch
-                        && item.head == row.head_sha.as_deref().unwrap_or_default()
-                })
-        })
-        .collect();
-    let plans = match evidence {
-        Evidence::Cached(github) => plan_cached(ctx, selected, github).await?,
-        Evidence::Fresh => plan(ctx, selected).await?,
-    };
-    let mut by_key: BTreeMap<_, _> = plans
-        .rows
-        .into_iter()
-        .map(|plan| (wt_core::worktree_target_key(&plan.row.target), plan))
-        .collect();
-    let mut requests = Vec::new();
-    let mut kept = Vec::new();
     // Board selections carry identity only. Current hazards and landing proof
     // must pass before the worker receives its locked removal revision.
     let selections = if let Some(targets) = targets {
@@ -1129,61 +1242,178 @@ async fn cleanup_with_evidence(
     } else {
         confirmed.iter().map(CleanupSelection::Revision).collect()
     };
-    for expected in selections {
-        let key = expected.key();
-        match by_key.remove(key) {
-            Some(plan)
-                if expected.matches_revision(&plan.revision)
-                    && plan.landed
-                    && plan.hazards.is_empty() =>
-            {
-                requests.push((
-                    plan.row,
-                    crate::commands::_destroy::DestroyOptions {
-                        force: false,
-                        delete_branch: true,
-                        landed: true,
-                        destroy_stage: plan.destroy_stage,
-                        expected_revision: Some(plan.revision),
-                        removed_snapshot: Some(plan.removed_snapshot),
-                    },
+    let live = ctx.repository.inventory(&ctx.cancellation).await?;
+    let (rows, kept) = select_rows(live, &selections);
+    let selected: Vec<WorktreeRecord> = rows.iter().map(|(_, row)| row.clone()).collect();
+    let state = ctx
+        .database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await?;
+    // Confirmed data that is still loading is no GitHub read at all.
+    let read_github = !matches!(evidence, Evidence::Cached(None));
+    let (fresh, empty);
+    let github = match evidence {
+        Evidence::Cached(github) => {
+            empty = GithubData::default();
+            github.map_or(&empty, |github| &**github)
+        }
+        Evidence::Fresh => {
+            fresh = fresh_github(ctx, &selected).await?.0;
+            &fresh
+        }
+    };
+    crate::other_branches::observe(
+        ctx,
+        &selected,
+        &state,
+        read_github.then_some(github),
+        crate::other_branches::Ask::Github,
+    )
+    .await;
+    let lifecycle = service(ctx)?;
+    let published_bases = PublishedBases::default();
+    let prepared = crate::commands::_destroy::prepare_removals(ctx)
+        .await
+        .map_err(|error| format!("{error:#}"));
+    let (lifecycle, published_bases, prepared, state) =
+        (&lifecycle, &published_bases, &prepared, &state);
+    run_cleanup(
+        &selections,
+        rows,
+        kept,
+        |row| async move {
+            let mut warning = None;
+            plan_row(
+                ctx,
+                lifecycle,
+                row,
+                state,
+                github,
+                published_bases,
+                &mut warning,
+            )
+            .await
+        },
+        |plan| async move {
+            if let Err(error) = prepared {
+                bail!("{error}");
+            }
+            crate::commands::_destroy::start_prepared_remove(
+                ctx,
+                &plan.row,
+                crate::commands::_destroy::DestroyOptions {
+                    force: false,
+                    delete_branch: true,
+                    landed: true,
+                    destroy_stage: plan.destroy_stage,
+                    expected_revision: Some(plan.revision),
+                    removed_snapshot: Some(plan.removed_snapshot),
+                },
+            )
+            .await
+        },
+        |job| async move { crate::commands::_destroy::wait_for_completion(ctx, &job).await },
+    )
+    .await
+}
+
+/// The live rows a confirmed cleanup may touch: for each selection, the
+/// worktree that still is what was confirmed (key, path, branch and HEAD).
+/// A selection without one is kept with the reason, and no other live row
+/// is returned at all, so nothing downstream can plan or remove it.
+fn select_rows(
+    live: Vec<WorktreeRecord>,
+    selections: &[CleanupSelection<'_>],
+) -> (Vec<(usize, WorktreeRecord)>, Vec<Option<String>>) {
+    let mut by_key: BTreeMap<_, _> = live
+        .into_iter()
+        .filter(|row| !row.is_main)
+        .map(|row| (wt_core::worktree_target_key(&row.target), row))
+        .collect();
+    // Why each selection was kept, in the order it was confirmed.
+    let mut kept: Vec<Option<String>> = vec![None; selections.len()];
+    let mut rows = Vec::new();
+    for (index, expected) in selections.iter().enumerate() {
+        match by_key.remove(expected.key()) {
+            Some(row) if expected.matches_row(&row) => rows.push((index, row)),
+            _ => {
+                kept[index] = Some(format!(
+                    "{}: no longer present or identity changed",
+                    expected.key()
                 ))
             }
-            Some(plan) if !expected.matches_revision(&plan.revision) => kept.push(format!(
-                "{}: checkout changed after confirmation",
-                plan.row.target.slug()
-            )),
-            Some(plan) => kept.push(format!(
-                "{}: {}",
-                plan.row.target.slug(),
-                if plan.hazards.is_empty() {
-                    "landing no longer proven".into()
-                } else {
-                    plan.hazards.join(", ")
-                }
-            )),
-            None => kept.push(format!("{}: no longer present or identity changed", key)),
         }
     }
+    (rows, kept)
+}
+
+/// Plan each selected row on its own and start its removal as soon as its
+/// plan passes, while later rows are still being read: a failed or refused
+/// row keeps only itself, and a removal never waits on another row's
+/// checkout. `start` returns the job `wait` then follows to its end.
+async fn run_cleanup<P, PF, S, SF, W, WF>(
+    selections: &[CleanupSelection<'_>],
+    rows: Vec<(usize, WorktreeRecord)>,
+    mut kept: Vec<Option<String>>,
+    plan: P,
+    start: S,
+    wait: W,
+) -> Result<String>
+where
+    P: Fn(WorktreeRecord) -> PF,
+    PF: Future<Output = Result<RemovalPlan>>,
+    S: Fn(RemovalPlan) -> SF,
+    SF: Future<Output = Result<String>>,
+    W: Fn(String) -> WF,
+    WF: Future<Output = Result<()>>,
+{
+    let (plan, start, wait) = (&plan, &start, &wait);
+    let mut starting = std::pin::pin!(
+        stream::iter(rows)
+            // Items are owned: a borrowed one makes the stream's closure
+            // too specific for a caller that must be `Send`.
+            .map(|(index, row)| async move {
+                let expected = &selections[index];
+                let slug = row.target.slug().to_owned();
+                let started = match plan(row).await {
+                    Err(error) => Err(format!("{error:#}")),
+                    Ok(plan) if !expected.matches_revision(&plan.revision) => {
+                        Err("checkout changed after confirmation".to_owned())
+                    }
+                    Ok(plan) if !plan.hazards.is_empty() => Err(plan.hazards.join(", ")),
+                    Ok(plan) if !plan.landed => Err("landing no longer proven".to_owned()),
+                    Ok(plan) => start(plan).await.map_err(|error| format!("{error:#}")),
+                };
+                (index, slug, started)
+            })
+            .buffer_unordered(PLAN_ROWS)
+            .fuse()
+    );
+    let mut finishing = FuturesUnordered::new();
     let mut removed = 0;
     let mut uncertain = false;
-    for (request, result) in requests
-        .iter()
-        .zip(crate::commands::_destroy::start_removals(ctx, &requests).await)
-    {
-        match result {
-            Ok(job) => match crate::commands::_destroy::wait_for_completion(ctx, &job).await {
+    loop {
+        tokio::select! {
+            Some((index, slug, started)) = starting.next() => match started {
+                Ok(job) => finishing.push(async move {
+                    let finished = wait(job).await;
+                    (index, slug, finished)
+                }),
+                Err(reason) => kept[index] = Some(format!("{slug}: {reason}")),
+            },
+            Some((index, slug, finished)) = finishing.next() => match finished {
                 Ok(()) => removed += 1,
                 Err(error) => {
                     uncertain |= error
                         .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
                         .is_some();
-                    kept.push(format!("{}: {error:#}", request.0.target.slug()));
+                    kept[index] = Some(format!("{slug}: {error:#}"));
                 }
             },
-            Err(error) => kept.push(format!("{}: {error:#}", request.0.target.slug())),
+            else => break,
         }
     }
+    let kept: Vec<String> = kept.into_iter().flatten().collect();
     if !kept.is_empty() {
         if uncertain {
             return Err(crate::commands::_destroy::RemovalUncertain(format!(
@@ -1207,6 +1437,19 @@ impl CleanupSelection<'_> {
         match self {
             Self::Revision(revision) => &revision.key,
             Self::Target(target) => &target.key,
+        }
+    }
+
+    /// Whether a live row is still the worktree this selection named.
+    fn matches_row(&self, row: &WorktreeRecord) -> bool {
+        match self {
+            Self::Revision(item) => {
+                item.key == wt_core::worktree_target_key(&row.target)
+                    && item.path == row.target.path
+                    && item.branch == row.target.branch
+                    && item.head == row.head_sha.as_deref().unwrap_or_default()
+            }
+            Self::Target(target) => target_matches(row, target),
         }
     }
 
@@ -2136,6 +2379,250 @@ mod tests {
         // A production check on a stage with no probe keeps the Git landing.
         let state = owe(Some(wt_core::VerifyStage::Production));
         assert_eq!(deploys(state).await.production, None);
+        fixture.close().await.unwrap();
+    }
+
+    /// A checkout that cannot be read used to fail the whole cleanup before
+    /// any row was judged. Each row now stands or falls alone.
+    #[tokio::test]
+    async fn a_row_that_cannot_be_planned_keeps_only_itself() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let targets: Vec<wt_tui::CleanupTarget> = ctx
+            .repository
+            .inventory(&ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| !row.is_main)
+            .map(|row| wt_tui::CleanupTarget {
+                key: wt_core::worktree_target_key(&row.target),
+                path: row.target.path.clone(),
+                branch: row.target.branch.clone(),
+                head: row.head_sha.clone().unwrap(),
+            })
+            .collect();
+        assert_eq!(targets.len(), 2);
+        let broken = Path::new(&targets[1].path);
+        std::fs::write(broken.join(".git"), "gitdir: /nonexistent/gitdir\n").unwrap();
+
+        let refused = cleanup_targets_cached(ctx, &targets, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.starts_with("Removed 0; kept "), "{refused}");
+        // The readable row was judged on its own evidence, in the order asked.
+        let (first, second) = refused.split_once("; two: ").expect(&refused);
+        assert!(
+            first.contains("one: landing no longer proven") && !first.contains("git:"),
+            "{refused}"
+        );
+        assert!(second.contains("git:"), "{refused}");
+        assert!(!second.contains("no longer present"), "{refused}");
+        assert!(Path::new(&targets[0].path).exists() && broken.exists());
+        fixture.close().await.unwrap();
+    }
+
+    fn fake_row(template: &WorktreeRecord, slug: &str) -> WorktreeRecord {
+        let mut row = template.clone();
+        row.target = wt_core::local_worktree_target(
+            slug,
+            format!("feature/{slug}"),
+            format!("/fixture/{slug}"),
+            "stage",
+        );
+        row.head_sha = Some(format!("head-{slug}"));
+        row
+    }
+
+    fn fake_plan(row: WorktreeRecord) -> RemovalPlan {
+        RemovalPlan {
+            landed: true,
+            hazards: Vec::new(),
+            destroy_stage: false,
+            revision: wt_lifecycle::RemovalRevision {
+                key: wt_core::worktree_target_key(&row.target),
+                path: row.target.path.clone(),
+                branch: row.target.branch.clone(),
+                head: row.head_sha.clone().unwrap(),
+                digest: "digest".into(),
+                hazards: Vec::new(),
+                published_base: None,
+            },
+            removed_snapshot: wt_store::RemovedWorktree {
+                slug: row.target.slug().to_owned(),
+                branch: row.target.branch.clone(),
+                removed_at: String::new(),
+                work: None,
+                automations_paused: None,
+                extra: Default::default(),
+            },
+            row,
+        }
+    }
+
+    /// The cleanup pipeline with its Git and its workers replaced: row `b`
+    /// cannot finish planning until the removal of `a` has started, `c`
+    /// fails to plan, `d` moved since it was confirmed, and `e` was never
+    /// confirmed at all.
+    #[tokio::test]
+    async fn a_cleanup_starts_each_removal_as_its_plan_passes_and_touches_only_what_was_confirmed()
+    {
+        let fixture = CommandFixture::new().await.unwrap();
+        let template = row_one(&fixture.ctx).await;
+        let live: Vec<WorktreeRecord> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|slug| fake_row(&template, slug))
+            .collect();
+        let target = |row: &WorktreeRecord| wt_tui::CleanupTarget {
+            key: wt_core::worktree_target_key(&row.target),
+            path: row.target.path.clone(),
+            branch: row.target.branch.clone(),
+            head: row.head_sha.clone().unwrap(),
+        };
+        let mut confirmed: Vec<wt_tui::CleanupTarget> = live[..4].iter().map(target).collect();
+        confirmed[3].head = "an-older-head".into();
+        confirmed.push(wt_tui::CleanupTarget {
+            key: "gone".into(),
+            path: "/fixture/gone".into(),
+            branch: "feature/gone".into(),
+            head: "head-gone".into(),
+        });
+        let selections: Vec<_> = confirmed.iter().map(CleanupSelection::Target).collect();
+        let (rows, kept) = select_rows(live, &selections);
+        assert_eq!(
+            rows.iter()
+                .map(|(_, row)| row.target.slug())
+                .collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+
+        let a_started = tokio::sync::Notify::new();
+        let planned = std::sync::Mutex::new(Vec::new());
+        let started = std::sync::Mutex::new(Vec::new());
+        let (a_started, planned, started) = (&a_started, &planned, &started);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_cleanup(
+                &selections,
+                rows,
+                kept,
+                |row| async move {
+                    let slug = row.target.slug().to_owned();
+                    planned.lock().unwrap().push(slug.clone());
+                    match slug.as_str() {
+                        // Still being planned until a removal is under way.
+                        "b" => a_started.notified().await,
+                        "c" => anyhow::bail!("cannot read the checkout"),
+                        _ => {}
+                    }
+                    Ok(fake_plan(row))
+                },
+                |plan| async move {
+                    let slug = plan.row.target.slug().to_owned();
+                    started.lock().unwrap().push(slug.clone());
+                    if slug == "a" {
+                        a_started.notify_one();
+                    }
+                    Ok(format!("job-{slug}"))
+                },
+                |job| async move {
+                    assert!(job == "job-a" || job == "job-b", "{job}");
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("a removal starts without waiting for the other rows' plans")
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(*started.lock().unwrap(), ["a", "b"]);
+        let mut planned = planned.lock().unwrap().clone();
+        planned.sort();
+        assert_eq!(planned, ["a", "b", "c"]);
+        assert_eq!(
+            outcome,
+            "Removed 2; kept c: cannot read the checkout; \
+             d: no longer present or identity changed; \
+             gone: no longer present or identity changed"
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// The dev server's `stop_command` can stop succeeding for an old
+    /// checkout. That keeps the worktree from every removal that does not
+    /// force, with the reason, and from none that does.
+    #[tokio::test]
+    async fn a_failing_dev_stop_command_refuses_removal_unless_it_is_forced() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).dev_server =
+            Some(wt_config::DevServerConfig {
+                command: "true".into(),
+                stop_command: Some(
+                    "echo tearing down; echo 'the database volume is gone' >&2; exit 1".into(),
+                ),
+                ..Default::default()
+            });
+        let ctx = &fixture.ctx;
+        let row = row_one(ctx).await;
+        let lifecycle = service(ctx).unwrap();
+        let path = Path::new(&row.target.path);
+        let refusal = |error: wt_lifecycle::LifecycleError| {
+            let text = error.to_string();
+            assert!(text.contains("stop_command failed"), "{text}");
+            assert!(text.contains("the database volume is gone"), "{text}");
+            assert!(text.contains("nothing was removed"), "{text}");
+            assert!(text.contains("wt rm one --force"), "{text}");
+        };
+
+        // Cleanup of a landed row never forces.
+        let cleaned = lifecycle
+            .cleanup(
+                &[wt_lifecycle::CleanupCandidate {
+                    target: row.target.clone(),
+                    landed: true,
+                    destroy_stage: false,
+                }],
+                &ctx.cancellation,
+            )
+            .await;
+        refusal(cleaned.into_iter().next().unwrap().unwrap_err());
+        assert!(path.exists());
+
+        refusal(
+            lifecycle
+                .remove(
+                    &row.target,
+                    wt_lifecycle::RemoveOptions::default(),
+                    &ctx.cancellation,
+                )
+                .await
+                .unwrap_err(),
+        );
+        assert!(path.exists());
+
+        let forced = lifecycle
+            .remove(
+                &row.target,
+                wt_lifecycle::RemoveOptions {
+                    force: true,
+                    ..Default::default()
+                },
+                &ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(forced.removed && !path.exists());
+        assert!(
+            forced.warnings.iter().any(|warning| {
+                warning.contains("stop_command failed")
+                    && warning.contains("the database volume is gone")
+                    && warning.contains("may be left")
+            }),
+            "{:?}",
+            forced.warnings
+        );
         fixture.close().await.unwrap();
     }
 }

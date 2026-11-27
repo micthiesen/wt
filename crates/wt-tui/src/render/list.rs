@@ -503,6 +503,22 @@ impl RowContext<'_> {
 /// the controller's clock (`22:32`, `Fri 18:12`), `other work`, `done`.
 fn waits_for(row: &BoardRow, board: &crate::Board) -> Option<(String, Color)> {
     use crate::OwedBlock;
+    // A row on its way out waits for nothing; it says that instead.
+    if row
+        .removal
+        .as_ref()
+        .is_some_and(|removal| removal.error.is_some())
+    {
+        return Some(("removal failed".to_owned(), theme::ERR));
+    }
+    // Before the worker has recorded the removal the label is the optimistic
+    // one ("checking removal").
+    if let Some(busy) = row.busy.as_ref().filter(|busy| busy.op == "remove") {
+        return Some((busy.label.clone(), theme::FG_DIM));
+    }
+    if row.removal.is_some() {
+        return Some(("removing".to_owned(), theme::FG_DIM));
+    }
     let block = row.owed_block?;
     // The list is ordered most urgent first: due checks by stage, then due
     // steps.
@@ -532,7 +548,11 @@ pub(crate) fn landed_counts(rows: &[&BoardRow]) -> [usize; 3] {
     use crate::OwedBlock;
     let count = |wanted: fn(OwedBlock) -> bool| {
         rows.iter()
-            .filter(|row| row.owed_block.is_some_and(wanted))
+            .filter(|row| {
+                row.removal.is_none()
+                    && row.busy.as_ref().is_none_or(|busy| busy.op != "remove")
+                    && row.owed_block.is_some_and(wanted)
+            })
             .count()
     };
     [
@@ -1610,6 +1630,55 @@ mod tests {
                 assert!(text.contains("1 done"), "{width}: {text}");
                 assert!(text.width() <= width, "{width}: {text}");
             }
+        }
+    }
+
+    /// A row being removed stays in the Landed block: its label says so in
+    /// place of what it waited for, its title is struck through, and the
+    /// header stops counting it.
+    #[test]
+    fn a_landed_row_being_removed_says_so_where_its_label_was() {
+        let mut board = landed_board();
+        // Requested here, before the worker has recorded anything.
+        board.rows[0].busy = Some(crate::BusyView {
+            op: "remove".into(),
+            label: "checking removal".into(),
+            ..Default::default()
+        });
+        board.rows[1].removal = Some(crate::RemovalView::default());
+        board.rows[1].busy = Some(crate::BusyView {
+            op: "remove".into(),
+            label: "removing".into(),
+            ..Default::default()
+        });
+        board.rows[2].removal = Some(crate::RemovalView {
+            error: Some("denied".into()),
+            ..Default::default()
+        });
+        let lines = drawn(&board, 90);
+        assert!(
+            plain(&lines[0]).starts_with(" ── Landed · 4 waiting · 1 done ─"),
+            "{}",
+            plain(&lines[0])
+        );
+        for (line, label, color, struck) in [
+            (&lines[1], "checking removal", theme::FG_DIM, true),
+            (&lines[2], "removing", theme::FG_DIM, true),
+            (&lines[3], "removal failed", theme::ERR, false),
+        ] {
+            let spans = &line.line.spans;
+            let at = spans
+                .iter()
+                .position(|span| span.content.trim() == label)
+                .unwrap_or_else(|| panic!("{label}: {}", plain(line)));
+            assert_eq!(spans[at].style.fg, Some(color), "{label}");
+            assert_eq!(
+                spans
+                    .iter()
+                    .any(|span| span.style.add_modifier.contains(Modifier::CROSSED_OUT)),
+                struck,
+                "{label}"
+            );
         }
     }
 

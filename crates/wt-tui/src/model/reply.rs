@@ -9,6 +9,10 @@ use crate::{LineEditor, PickerAction, TextAction, UiModal, UiReply};
 /// commit it. It can appear under a key already on its way to the board.
 pub(crate) const CONFIRM_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// How many unanswered requests the model remembers having begun. A reply
+/// to one forgotten is treated like a background read's.
+pub(crate) const BEGUN_LIMIT: usize = 32;
+
 impl Model {
     /// Something other than the board takes the next key: a menu, overlay or
     /// prompt that is open, or a host menu still loading. A confirm opened
@@ -77,7 +81,12 @@ impl Model {
                     && Some(request.generation) == reply.ui_generation
                     && request.generation == self.ui_generation
             }) {
-                self.toast = Some((progress, ToastTone::Info));
+                // An earlier request's failure stays beside the progress of
+                // the one in flight until the user acts again.
+                self.toast = Some(match &self.earlier_failure {
+                    Some(failure) => (format!("{failure}; {progress}"), ToastTone::Failed),
+                    None => (progress, ToastTone::Info),
+                });
             }
             return None;
         }
@@ -122,6 +131,18 @@ impl Model {
         } else {
             None
         };
+        // Whether the user asked for this: a request the model began, not a
+        // read the terminal sent on its own.
+        let begun = reply
+            .operation_id
+            .is_some_and(|id| self.begun.contains(&id));
+        if reply.handoff.is_none() {
+            self.begun.retain(|id| Some(*id) != reply.operation_id);
+        }
+        let menu_request = completed_request
+            .as_ref()
+            .filter(|request| request.preparation)
+            .map(|request| (request.id, request.started, request.typeahead.len()));
         let typeahead = completed_request
             .as_ref()
             .filter(|request| request.generation == self.ui_generation && request.preparation)
@@ -252,7 +273,27 @@ impl Model {
             && reply.modal.is_none()
             && reply.handoff.is_none()
             && !reply.failed;
-        if self.pending_request.is_none() && !preserves_failure && !empty_unrelated_completion {
+        // The request in flight owns the toast, except that the failure,
+        // refusal or notice of an earlier request the user made must still
+        // be said: its optimistic change reverts now, and nothing else
+        // explains why. A background read's reply never interrupts.
+        let speaks_over_pending = completed_request.is_none()
+            && begun
+            && (reply.failed || reply.notice)
+            && !reply.message.trim().is_empty();
+        if speaks_over_pending && reply.failed && self.pending_request.is_some() {
+            self.earlier_failure = Some(reply.message.clone());
+        }
+        // That failure is still unacknowledged when the request in flight
+        // succeeds, so the success joins it instead of replacing it.
+        let earlier_failure = completed_request
+            .as_ref()
+            .and_then(|_| self.earlier_failure.take())
+            .filter(|_| !reply.failed);
+        if (self.pending_request.is_none() || speaks_over_pending)
+            && !preserves_failure
+            && !empty_unrelated_completion
+        {
             let message = if reply.message.is_empty()
                 && reply.modal.is_none()
                 && reply.handoff.is_none()
@@ -271,7 +312,11 @@ impl Model {
             } else {
                 reply.message
             };
-            self.toast = Some((message, tone));
+            self.toast = Some(match earlier_failure {
+                Some(failure) if message.trim().is_empty() => (failure, ToastTone::Failed),
+                Some(failure) => (format!("{failure}; {message}"), ToastTone::Failed),
+                None => (message, tone),
+            });
         }
         self.interaction = match reply.modal.filter(|_| presentation_current) {
             Some(UiModal::Reviewers {
@@ -382,6 +427,7 @@ impl Model {
                 self.reopen_stale_menu(stale_id, stale_message);
             }
         }
+        let mut typeahead_replayed = false;
         if let Some((keys, started, overflow)) = typeahead {
             // A confirm the user did not ask for takes none of it.
             if presentation_current
@@ -390,6 +436,7 @@ impl Model {
                 && self.confirm_settles_at.is_none()
                 && started.elapsed() <= super::input::TYPEAHEAD_TTL
             {
+                typeahead_replayed = true;
                 self.replay_typeahead(keys);
                 // A replayed commit closes the menu and reports its own
                 // result; the overflow only matters to a menu still open.
@@ -402,6 +449,19 @@ impl Model {
             } else if !reply.failed {
                 self.append_typeahead_notice("keys typed while the menu loaded were dropped");
             }
+        }
+        if let Some((id, started, keys)) = menu_request {
+            tracing::info!(
+                operation_id = id,
+                prepare_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                typeahead = match (keys, typeahead_replayed) {
+                    (0, _) => "none",
+                    (_, true) => "replayed",
+                    (_, false) => "dropped",
+                },
+                keys,
+                "host menu prepared"
+            );
         }
         if reply.handoff.is_none() {
             self.show_next_removal_review();

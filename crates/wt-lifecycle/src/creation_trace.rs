@@ -39,6 +39,18 @@ impl CreationPhase {
         self.finish(outcome, exit_code);
     }
 
+    /// A command the caller ran itself, by its exit status.
+    pub(crate) fn exit(mut self, exit_code: Option<i32>) {
+        self.finish(
+            match exit_code {
+                Some(0) => "success",
+                Some(_) => "error",
+                None => "interrupted",
+            },
+            exit_code,
+        );
+    }
+
     pub(crate) fn lifecycle<T>(mut self, result: &Result<T, crate::LifecycleError>) {
         self.finish(
             match result {

@@ -47,6 +47,13 @@ pub trait Mutation<T>: Clone + Send + Sync + 'static {
     fn apply(&self, view: &mut T);
     /// Whether confirmed data already shows the requested result.
     fn observed(&self, confirmed: &T) -> bool;
+    /// The rows whose reads confirm the change: every one of them must have
+    /// been read by a fetch that started at or after the write. A change to
+    /// several rows names each, so it need not wait for rows it never
+    /// touched; a target without a row waits for the whole domain.
+    fn confirming(&self) -> Vec<Target> {
+        vec![self.target()]
+    }
     /// Bounds for work that legitimately runs long (a checkout, a queued
     /// removal). `None` uses the engine's limits. Still bounded: a change is
     /// never shown forever.
@@ -313,21 +320,32 @@ impl<T, M: Mutation<T>> Pending<T, M> {
 
     /// Drop entries a confirming fetch shows, and entries past their deadline.
     /// `observed(target, domain)` is the latest fetch-start stamp for that
-    /// target's host. Returns the entries that expired while confirmed data
-    /// still disagreed, so the caller can say the change was not reflected.
+    /// target on its host: the stamp of the target's own row where the domain
+    /// is read row by row, else the domain's. Returns the entries that expired
+    /// while confirmed data still disagreed, so the caller can say the change
+    /// was not reflected.
     pub fn settle(
         &mut self,
         confirmed: &T,
         observed: impl Fn(&Target, Domain) -> Option<Stamp>,
         now: Instant,
     ) -> Vec<Expired<M>> {
+        // The read every confirming row shares: the oldest of theirs.
+        let oldest = |mutation: &M, domain: Domain| {
+            mutation
+                .confirming()
+                .iter()
+                .map(|target| observed(target, domain))
+                .reduce(|a, b| Some(a?.earliest(b?)))
+                .flatten()
+        };
         let mut expired = Vec::new();
         self.entries.retain_mut(|entry| {
             let shown = entry.mutation.observed(confirmed);
             if let Phase::Accepted { at, read_after, .. } = &mut entry.phase {
-                let target = entry.mutation.target();
                 let fresh = entry.mutation.domains().iter().all(|domain| {
-                    observed(&target, *domain).and_then(|stamp| stamp.at_or_after(at)) == Some(true)
+                    oldest(&entry.mutation, *domain).and_then(|stamp| stamp.at_or_after(at))
+                        == Some(true)
                 });
                 if fresh && shown {
                     return false;
@@ -338,12 +356,11 @@ impl<T, M: Mutation<T>> Pending<T, M> {
                 if !shown {
                     let (accepted_at, observed) = match &entry.phase {
                         Phase::Accepted { at, .. } => {
-                            let target = entry.mutation.target();
                             let observed = entry
                                 .mutation
                                 .domains()
                                 .iter()
-                                .map(|domain| (*domain, observed(&target, *domain)))
+                                .map(|domain| (*domain, oldest(&entry.mutation, *domain)))
                                 .collect();
                             (Some(*at), observed)
                         }
@@ -460,6 +477,74 @@ mod tests {
             pending
                 .settle(&confirmed, |_, _| Some(after), Instant::now())
                 .is_empty()
+        );
+        assert!(pending.is_empty());
+    }
+
+    /// Removes several rows at once, as a cleanup does.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Drop(&'static [&'static str]);
+
+    impl Mutation<std::collections::BTreeMap<&'static str, bool>> for Drop {
+        fn key(&self) -> String {
+            "drop".into()
+        }
+        fn target(&self) -> Target {
+            Target::board(None)
+        }
+        fn label(&self) -> String {
+            "dropping".into()
+        }
+        fn domains(&self) -> &'static [Domain] {
+            &[Domain::Git]
+        }
+        fn apply(&self, _view: &mut std::collections::BTreeMap<&'static str, bool>) {}
+        fn observed(&self, confirmed: &std::collections::BTreeMap<&'static str, bool>) -> bool {
+            self.0.iter().all(|key| !confirmed.contains_key(key))
+        }
+        fn confirming(&self) -> Vec<Target> {
+            self.0.iter().map(|key| Target::row(None, *key)).collect()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_settles_on_reads_of_its_own_rows_and_on_all_of_them() {
+        let mut pending = Pending::default();
+        let gone = [("kept", true)].into_iter().collect();
+        let stale = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        pending.begin(1, Drop(&["a", "b"]), Instant::now());
+        let accepted = Stamp::now();
+        pending.accept(1, accepted, Instant::now());
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let fresh = Stamp::now();
+        let row = |target: &Target| target.key.clone().unwrap_or_default();
+        // A newer read of a row the change never touched proves nothing.
+        pending.settle(
+            &gone,
+            |target, _| Some(if row(target) == "kept" { fresh } else { stale }),
+            Instant::now(),
+        );
+        assert_eq!(pending.len(), 1);
+        // Nor does a read of only one of its rows.
+        pending.settle(
+            &gone,
+            |target, _| Some(if row(target) == "a" { fresh } else { stale }),
+            Instant::now(),
+        );
+        assert_eq!(pending.len(), 1);
+        // A row with no live read at all never confirms.
+        pending.settle(
+            &gone,
+            |target, _| (row(target) == "a").then_some(fresh),
+            Instant::now(),
+        );
+        assert_eq!(pending.len(), 1);
+        // Reads of both rows settle it while the rest of the domain is older.
+        pending.settle(
+            &gone,
+            |target, _| Some(if row(target) == "kept" { stale } else { fresh }),
+            Instant::now(),
         );
         assert!(pending.is_empty());
     }

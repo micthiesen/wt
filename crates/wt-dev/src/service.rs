@@ -27,7 +27,13 @@ use crate::{
 
 const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 const PORT_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
-const READY_POLL: Duration = Duration::from_secs(2);
+/// How often a ready wait looks at a server that is still starting: a
+/// marker read, a session listing and a local connect.
+const READY_POLL: Duration = Duration::from_millis(250);
+/// How long a ready wait leaves an unhealthy server before asking again.
+/// The health command is the project's own and may be costly, and what it
+/// waits for (a migration replay) does not finish in a fraction of a second.
+const HEALTH_RETRY: Duration = Duration::from_secs(2);
 const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Shortest health check a ready wait runs, even at its deadline.
@@ -1507,10 +1513,12 @@ where
         if cancellation.is_cancelled() {
             return Err(DevServerError::Cancelled);
         }
+        let mut pause = READY_POLL;
         match phase().await? {
             ServerPhase::Crashed => return Ok(ReadyOutcome::Crashed),
             ServerPhase::Starting => {}
             ServerPhase::Listening => {
+                pause = HEALTH_RETRY;
                 let budget = deadline
                     .saturating_duration_since(tokio::time::Instant::now())
                     .max(HEALTH_CHECK_FLOOR);
@@ -1529,7 +1537,7 @@ where
         }
         tokio::select! {
             _ = cancellation.cancelled() => return Err(DevServerError::Cancelled),
-            _ = tokio::time::sleep(READY_POLL) => {}
+            _ = tokio::time::sleep(pause) => {}
         }
     }
 }
@@ -2176,6 +2184,51 @@ mod tests {
             }
         );
         assert_eq!(checks.get(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_wait_notices_a_listening_server_within_a_quarter_second() {
+        let started = tokio::time::Instant::now();
+        let listening_at = started + Duration::from_millis(1100);
+        let outcome = poll_ready(
+            started + Duration::from_secs(60),
+            &CancellationToken::new(),
+            || async move {
+                Ok(if tokio::time::Instant::now() >= listening_at {
+                    ServerPhase::Listening
+                } else {
+                    ServerPhase::Starting
+                })
+            },
+            |_| async { Ok(None) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Ready { health: None });
+        assert!(
+            started.elapsed() <= Duration::from_millis(1350),
+            "noticed after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_wait_does_not_hammer_an_unhealthy_health_command() {
+        let checks = std::cell::Cell::new(0);
+        let outcome = poll_ready(
+            tokio::time::Instant::now() + Duration::from_secs(9),
+            &CancellationToken::new(),
+            || async { Ok(ServerPhase::Listening) },
+            |_| {
+                checks.set(checks.get() + 1);
+                async { Ok(Some(health(false, "replaying"))) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ReadyOutcome::Unhealthy(health(false, "replaying")));
+        // One check at the start and one every two seconds after it.
+        assert_eq!(checks.get(), 6);
     }
 
     #[tokio::test(start_paused = true)]

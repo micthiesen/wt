@@ -8,7 +8,7 @@ use wt_tui::{SessionSelection, SessionTarget};
 
 use wt_app_core::{
     context::AppContext,
-    harness::{prepare_session, ui_session_with_harness},
+    harness::{SessionNavigation, enter_selected_session, enter_session_by_slug},
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -39,8 +39,8 @@ async fn run_inner(context: &AppContext, args: &[String]) -> Result<i32> {
     if args.len() == 1 {
         let selection: SessionSelection =
             serde_json::from_str(&args[0]).context("parse structured session selection")?;
-        let prepared = prepare_session(context, &selection).await?;
-        return attach_navigable(context, prepared, selection.key, selection.target).await;
+        let (prepared, navigation) = enter_selected_session(context, &selection).await?;
+        return attach_navigable(context, prepared, navigation).await;
     }
     if !(2..=3).contains(&args.len()) {
         eprintln!(
@@ -68,31 +68,15 @@ async fn run_inner(context: &AppContext, args: &[String]) -> Result<i32> {
         RemoteTarget::Wt => SessionTarget::WtSource,
         RemoteTarget::Dotfiles => SessionTarget::Dotfiles,
     };
-    let key = if matches!(
-        target,
-        SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff
-    ) {
-        let inventory = context.repository.inventory(&context.cancellation).await?;
-        let record = inventory
-            .iter()
-            .find(|record| !record.is_main && record.target.slug() == args[0])
-            .with_context(|| format!("remote worktree not found: {}", args[0]))?;
-        Some(wt_core::worktree_target_key(&record.target))
-    } else {
-        None
-    };
-    let prepared = ui_session_with_harness(context, key.clone(), target, harness).await?;
-    attach_navigable(context, prepared, key, target).await
+    let (prepared, navigation) = enter_session_by_slug(context, &args[0], target, harness).await?;
+    attach_navigable(context, prepared, navigation).await
 }
 
 async fn attach_navigable(
     context: &AppContext,
     mut prepared: wt_app_core::harness::PreparedSession,
-    key: Option<String>,
-    target: SessionTarget,
+    mut navigation: SessionNavigation<'_>,
 ) -> Result<i32> {
-    let mut navigation =
-        wt_app_core::harness::SessionNavigation::new(context, key, target, &prepared).await?;
     loop {
         let code = attach(context, prepared).await?;
         if let Some(next) = navigation.next(Some(code)).await? {

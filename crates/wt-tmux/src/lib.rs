@@ -266,6 +266,11 @@ pub fn write_terminal_config(
         styles,
     );
     let target = cache_root.join("tmux-session.conf");
+    // Every session request builds a client, and most find the file current.
+    // Replacing it only when it differs keeps a write and rename off that path.
+    if fs::read(&target).is_ok_and(|current| current == content.as_bytes()) {
+        return Ok(target);
+    }
     let temporary = cache_root.join(format!(
         "tmux-session.{}.{}.tmp",
         std::process::id(),

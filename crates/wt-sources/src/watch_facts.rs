@@ -98,6 +98,13 @@ impl Externals {
         }
     }
 
+    /// What a Git read answers from may have changed (a fetch finished):
+    /// the next [`Externals::request`] reads again without waiting out the
+    /// interval.
+    pub fn git_changed(&mut self) {
+        self.git_asked = None;
+    }
+
     pub fn absorb(&mut self, arrived: Arrived) {
         match arrived {
             Arrived::Prs(result) => {

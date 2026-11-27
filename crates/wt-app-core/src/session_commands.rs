@@ -166,26 +166,57 @@ pub fn picker_entries(
     options
 }
 
+/// A prepared agent attach with the tmux listing it was decided from, so the
+/// caller can retain the attached slot's identity without reading tmux again.
+pub(super) struct Attached {
+    pub(super) prepared: PreparedSession,
+    /// The attached session's tmux id, when the listing holds it.
+    pub(super) slot: Option<String>,
+    pub(super) live: Vec<wt_tmux::SessionInfo>,
+}
+
 /// Resume a live slot with the same identity checks as the session picker.
 /// A named Claude slot must retain its name; the harness alone is not enough.
+/// `agent` and `live` are the request's own resolution, so the witness the
+/// entry carries is checked against the listing it was built from.
 pub(super) async fn prepare_live_session(
     context: &AppContext,
+    app: &AppHarness,
+    agent: &AgentTarget,
     key: Option<String>,
     target: SessionTarget,
     harness: HarnessId,
-) -> Result<Option<PreparedSession>> {
-    let agent = picker_agent(context, key.as_deref(), target).await?;
-    let app = AppHarness::new(context);
-    let live = app.session_inventory(context).await?;
-    let options = picker_entries(&[harness], &agent, key, target, &[], &live);
+    live: &[wt_tmux::SessionInfo],
+) -> Result<Option<Attached>> {
+    ensure_picker_target(target)?;
+    if agent.remote {
+        bail!("session discovery must run on the worktree host");
+    }
+    let options = picker_entries(&[harness], agent, key, target, &[], live);
     let selected = options
         .iter()
         .find(|entry| entry.selection.managed_name == agent.managed_name)
         .or_else(|| options.first());
     match selected {
-        Some(entry) => prepare_session(context, &entry.selection).await.map(Some),
+        Some(entry) => prepare_selected(context, app, agent.clone(), &entry.selection, Some(live))
+            .await
+            .map(Some),
         None => Ok(None),
     }
+}
+
+pub(super) fn ensure_harness_selection(target: SessionTarget) -> Result<()> {
+    if !matches!(
+        target,
+        SessionTarget::Harness
+            | SessionTarget::Manager
+            | SessionTarget::Main
+            | SessionTarget::WtSource
+            | SessionTarget::Dotfiles
+    ) {
+        bail!("selected target does not accept a harness session");
+    }
+    Ok(())
 }
 
 /// Prepare the exact selected conversation for terminal handoff. It never
@@ -195,18 +226,25 @@ pub async fn prepare_session(
     context: &AppContext,
     selection: &SessionSelection,
 ) -> Result<PreparedSession> {
-    if !matches!(
-        selection.target,
-        SessionTarget::Harness
-            | SessionTarget::Manager
-            | SessionTarget::Main
-            | SessionTarget::WtSource
-            | SessionTarget::Dotfiles
-    ) {
-        bail!("selected target does not accept a harness session");
-    }
+    ensure_harness_selection(selection.target)?;
     let app = AppHarness::new(context);
-    let mut agent = resolve_target(context, selection.key.as_deref(), selection.target).await?;
+    let agent = resolve_target(context, selection.key.as_deref(), selection.target).await?;
+    Ok(prepare_selected(context, &app, agent, selection, None)
+        .await?
+        .prepared)
+}
+
+/// [`prepare_session`] for a target the caller resolved. `live` is a tmux
+/// listing the caller already took for this request; without one, the
+/// listing is read here.
+pub(super) async fn prepare_selected(
+    context: &AppContext,
+    app: &AppHarness,
+    mut agent: AgentTarget,
+    selection: &SessionSelection,
+    live: Option<&[wt_tmux::SessionInfo]>,
+) -> Result<Attached> {
+    ensure_harness_selection(selection.target)?;
     if selection.harness == HarnessId::Claude
         && let Some(managed_name) = selection.managed_name.as_ref()
     {
@@ -250,7 +288,10 @@ pub async fn prepare_session(
         if selection.mode != SessionMode::Resume {
             bail!("new session selection must not include a live slot");
         }
-        let sessions = app.session_inventory(context).await?;
+        let sessions = match live {
+            Some(live) => live.to_vec(),
+            None => app.session_inventory(context).await?,
+        };
         let live = sessions
             .iter()
             .find(|slot| slot.name == tmux_name)
@@ -259,7 +300,7 @@ pub async fn prepare_session(
                     "selected live session has ended; reopen the session picker",
                 )
             })?;
-        validate_live_selection(context, &app, &agent, selection, live).await?;
+        validate_live_selection(context, app, &agent, selection, live).await?;
         if selection.harness == HarnessId::Pi {
             app.validate_live_pi(
                 &HarnessSpawnRequest {
@@ -273,7 +314,11 @@ pub async fn prepare_session(
             )
             .await?;
         }
-        return Ok(app.attach_command(&live.id, &agent.cwd));
+        return Ok(Attached {
+            prepared: app.attach_command(&live.id, &agent.cwd),
+            slot: Some(live.id.clone()),
+            live: sessions,
+        });
     }
     if selection.mode == SessionMode::Resume && wanted_id.is_none() {
         bail!("resume selection is missing its exact session id");
@@ -282,7 +327,10 @@ pub async fn prepare_session(
         bail!("new session selection must not include an existing session id");
     }
 
-    let live = app.session_inventory(context).await?;
+    let live = match live {
+        Some(live) => live.to_vec(),
+        None => app.session_inventory(context).await?,
+    };
     if selection.mode == SessionMode::New
         && let Some(wt_tui::Seen(shown)) = &selection.seen_live
     {
@@ -310,6 +358,11 @@ pub async fn prepare_session(
         }
     }
     if let Some(live_session) = live.iter().find(|session| session.name == tmux_name) {
+        let attached = Attached {
+            prepared: app.attach_command(&tmux_name, &agent.cwd),
+            slot: Some(live_session.id.clone()),
+            live: live.clone(),
+        };
         if let Some(wanted_id) = wanted_id
             && live_session.harness_session_id.as_deref() == Some(wanted_id)
         {
@@ -326,13 +379,13 @@ pub async fn prepare_session(
                 )
                 .await?;
             }
-            return Ok(app.attach_command(&tmux_name, &agent.cwd));
+            return Ok(attached);
         }
         if selection.harness == HarnessId::Claude
             && wanted_id == expected_claude_id.as_deref()
             && selection.mode == SessionMode::Resume
         {
-            return Ok(app.attach_command(&tmux_name, &agent.cwd));
+            return Ok(attached);
         }
         bail!(
             "{} is already live with a different or unknown conversation; select that session or stop it explicitly",
@@ -340,26 +393,27 @@ pub async fn prepare_session(
         );
     }
 
-    let discovered = app
-        .service
-        .discover(
-            selection.harness,
-            &DiscoveryRequest {
-                slug: agent.slug.clone(),
-                worktree_path: agent.cwd.clone(),
-                live_session_id: wanted_id.map(str::to_owned),
-            },
-            &[],
-            &context.cancellation,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "discover {:?} sessions for {}",
-                selection.harness, agent.slug
-            )
-        })?;
+    // Only a resume has a conversation to find; a new session reads no history.
     if selection.mode == SessionMode::Resume {
+        let discovered = app
+            .service
+            .discover(
+                selection.harness,
+                &DiscoveryRequest {
+                    slug: agent.slug.clone(),
+                    worktree_path: agent.cwd.clone(),
+                    live_session_id: wanted_id.map(str::to_owned),
+                },
+                &[],
+                &context.cancellation,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "discover {:?} sessions for {}",
+                    selection.harness, agent.slug
+                )
+            })?;
         let wanted_id = wanted_id.expect("validated above");
         let exact = discovered
             .iter()
@@ -429,7 +483,11 @@ pub async fn prepare_session(
     {
         bail!("harness slot started with a different or unknown conversation; refusing to attach");
     }
-    Ok(app.attach_command(&tmux_name, &agent.cwd))
+    Ok(Attached {
+        prepared: app.attach_command(&tmux_name, &agent.cwd),
+        slot: Some(started.id.clone()),
+        live: after,
+    })
 }
 
 /// How a live session is ended.
@@ -752,41 +810,54 @@ pub(super) async fn resolve_target(
         SessionTarget::Harness | SessionTarget::Shell | SessionTarget::Diff => {
             let key = key.context("worktree session requires a target key")?;
             let inventory = context.repository.inventory(&context.cancellation).await?;
-            let record = inventory
-                .into_iter()
-                .find(|record| wt_core::worktree_target_key(&record.target) == key)
-                .context("selected worktree no longer exists")?;
-            if record.is_main {
-                bail!("main clone uses the dedicated Main session target");
-            }
-            if matches!(
-                record.target.location(),
-                wt_core::WorktreeLocation::Remote { .. }
-            ) {
-                bail!("remote session operation must be dispatched to its host");
-            }
-            Ok(AgentTarget {
-                slug: record.target.slug().to_owned(),
-                kind: super::AgentTargetKind::Worktree,
-                branch: Some(record.target.branch.clone()),
-                cwd: PathBuf::from(record.target.path.clone()),
-                managed_name: None,
-                remote: false,
-            })
+            worktree_target(&inventory, key)
         }
         SessionTarget::Manager
         | SessionTarget::Main
         | SessionTarget::WtSource
         | SessionTarget::Dotfiles => {
-            AppHarness::new(context)
-                .slot_agent(target)
-                .context(match target {
-                    SessionTarget::WtSource => "wt source checkout is unavailable",
-                    SessionTarget::Dotfiles => "dotfiles checkout is unavailable",
-                    _ => "session slot is unavailable",
-                })
+            let paths = &context.config.paths;
+            super::slot_agent_at(
+                &paths.main_clone,
+                &paths.dotfiles,
+                paths.wt_source.as_deref(),
+                target,
+            )
+            .context(match target {
+                SessionTarget::WtSource => "wt source checkout is unavailable",
+                SessionTarget::Dotfiles => "dotfiles checkout is unavailable",
+                _ => "session slot is unavailable",
+            })
         }
     }
+}
+
+/// The local worktree a target key names in an inventory already taken.
+pub(super) fn worktree_target(
+    inventory: &[wt_vcs::WorktreeRecord],
+    key: &str,
+) -> Result<AgentTarget> {
+    let record = inventory
+        .iter()
+        .find(|record| wt_core::worktree_target_key(&record.target) == key)
+        .context("selected worktree no longer exists")?;
+    if record.is_main {
+        bail!("main clone uses the dedicated Main session target");
+    }
+    if matches!(
+        record.target.location(),
+        wt_core::WorktreeLocation::Remote { .. }
+    ) {
+        bail!("remote session operation must be dispatched to its host");
+    }
+    Ok(AgentTarget {
+        slug: record.target.slug().to_owned(),
+        kind: super::AgentTargetKind::Worktree,
+        branch: Some(record.target.branch.clone()),
+        cwd: PathBuf::from(record.target.path.clone()),
+        managed_name: None,
+        remote: false,
+    })
 }
 
 pub(super) fn session_name(agent: &AgentTarget, harness: HarnessId) -> String {

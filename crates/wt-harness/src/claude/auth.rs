@@ -316,6 +316,7 @@ pub(super) fn reap_stale_handoffs(dir: &Path, max_age: Duration) {
 /// it as soon as it has read it; dropping the handle removes it otherwise.
 pub(super) struct TokenHandoff {
     path: PathBuf,
+    left_for_pane: bool,
 }
 
 impl TokenHandoff {
@@ -344,17 +345,29 @@ impl TokenHandoff {
         contents.extend_from_slice(token.0.as_bytes());
         contents.push(b'\n');
         let path = crate::persist::write_private_launch_file(dir, &name, &contents)?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            left_for_pane: false,
+        })
     }
 
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Give the file to a pane that was created but has not been seen to
+    /// read it. The pane removes it; `reap_stale_handoffs` removes one whose
+    /// pane never ran.
+    pub(super) fn leave_for_pane(mut self) {
+        self.left_for_pane = true;
+    }
 }
 
 impl Drop for TokenHandoff {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if !self.left_for_pane {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 

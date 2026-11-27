@@ -145,6 +145,19 @@ impl BudgetWindows {
     }
 }
 
+/// What a snapshot's fields mean: this envelope, and the pull-request and
+/// merge-queue JSON the writer's `wt_github` types serialize into it. A
+/// reader that only displays the data uses a snapshot whose schema is its
+/// own, whichever release wrote it, so a session on an older wt still reads
+/// the daemon's file after an update. Bump this whenever a field here, in
+/// `wt_github::PullRequest` or in a merge-queue entry changes meaning, is
+/// removed or renamed, or becomes required. An added field needs no bump
+/// only if both directions stay true: an older reader may ignore it, and a
+/// newer reader that finds it missing in an older writer's file reads that
+/// as "unknown", never as a fact (an absent `queueRemoval` must not be
+/// taken to prove the pull request was never removed).
+pub const SNAPSHOT_SCHEMA: u32 = 1;
+
 /// The GitHub data maps are JSON envelopes to retain additive fields written
 /// by newer GitHub API selections.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -186,11 +199,27 @@ pub struct GithubSnapshot {
     pub next_fetch_at_ms: Option<u64>,
     #[serde(default)]
     pub writer_sha: Option<String>,
+    /// The writer's [`SNAPSHOT_SCHEMA`]. Absent from writers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<u32>,
+    /// Older daemons preserve unknown fields; bind the schema to its writer
+    /// so a rollback cannot advertise a leftover schema from a newer daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_writer_sha: Option<String>,
     /// The writer's repository identity (see `EventDaemonConfig::repository`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+impl GithubSnapshot {
+    /// Whether this build reads the fields as the writer meant them.
+    pub fn schema_current(&self) -> bool {
+        self.schema == Some(SNAPSHOT_SCHEMA)
+            && self.writer_sha.is_some()
+            && self.schema_writer_sha == self.writer_sha
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

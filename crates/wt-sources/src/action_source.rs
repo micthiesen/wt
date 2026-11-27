@@ -1,7 +1,7 @@
 //! Durable action metadata and bounded log tails drive the action pane.
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -32,6 +32,10 @@ struct ActionHistory {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ActionLogs {
     logs: BTreeMap<String, LogView>,
+    /// Rows whose running creation install is queued for an install slot.
+    /// Read with the logs because, like them, it changes while the run's
+    /// record does not.
+    install_waiting: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -86,8 +90,21 @@ impl RefreshTargets {
     fn completed(&self, run: &ActionRun) {
         for effect in &run.meta.affects {
             match effect {
+                // The action ran in one checkout: read that row (and the
+                // listing) for the user who ran it. What it did to other
+                // checkouts moved their refs or HEADs, which the watcher
+                // routes. An action with no checkout reads them all.
                 EffectTag::Git => {
-                    self.git.refresh();
+                    let key = run
+                        .meta
+                        .worktree_ref
+                        .as_ref()
+                        .map_or_else(|| run.meta.slug.clone(), wt_core::worktree_ledger_key);
+                    if key.is_empty() {
+                        self.git.refresh();
+                    } else {
+                        self.git.request_keys(wt_runtime::Request::Refresh, [key]);
+                    }
                     if let Some(origin) = &self.origin {
                         origin.refresh();
                     }
@@ -153,6 +170,7 @@ pub fn overlay(
     let log_runs = runs.clone();
     let log_service = service.clone();
     let log_cursors = cursors.clone();
+    let lock_dir = context.config.paths.lock_dir.clone();
     let logs = start_source(
         scope,
         SourceSpec {
@@ -168,9 +186,13 @@ pub fn overlay(
             let service = log_service.clone();
             let runs = log_runs.subscribe().borrow().clone();
             let cursors = log_cursors.clone();
+            let lock_dir = lock_dir.clone();
             async move {
                 let service = service.map_err(anyhow::Error::msg)?;
-                load_logs(&service, runs.data().map(Arc::as_ref), &cursors).await
+                let history = runs.data().map(Arc::as_ref);
+                let mut logs = load_logs(&service, history, &cursors).await?;
+                logs.install_waiting = install_waiting(&lock_dir, history).await;
+                Ok::<_, anyhow::Error>(logs)
             }
         },
     );
@@ -340,7 +362,36 @@ async fn load_logs(
             },
         );
     }
-    Ok(ActionLogs { logs })
+    Ok(ActionLogs {
+        logs,
+        install_waiting: BTreeSet::new(),
+    })
+}
+
+/// The row a run belongs to, as the board keys it.
+fn row_key(meta: &wt_actions::ActionMeta) -> String {
+    meta.worktree_ref
+        .as_ref()
+        .map(wt_core::worktree_ledger_key)
+        .unwrap_or_else(|| meta.slug.clone())
+}
+
+/// The rows whose running creation install has not been given an install
+/// slot yet. Only local installs are asked about: the slots are this
+/// machine's.
+async fn install_waiting(lock_dir: &Path, history: Option<&ActionHistory>) -> BTreeSet<String> {
+    let mut waiting = BTreeSet::new();
+    for run in history.into_iter().flat_map(|history| &history.runs) {
+        if run.meta.action_id == CREATE_INSTALL_ACTION_ID
+            && run.meta.status == ActionRunStatus::Running
+            && wt_lifecycle::slots::DEPENDENCY_INSTALLS
+                .is_waiting(lock_dir, &run.meta.slug)
+                .await
+        {
+            waiting.insert(row_key(&run.meta));
+        }
+    }
+    waiting
 }
 
 fn append_log_lines(lines: &mut VecDeque<String>, pending: &mut String, label: &str, bytes: &[u8]) {
@@ -793,14 +844,7 @@ fn compose(
         let mut row_runs = history
             .into_iter()
             .flat_map(|history| history.runs.iter())
-            .filter(|run| {
-                run.meta
-                    .worktree_ref
-                    .as_ref()
-                    .map(wt_core::worktree_ledger_key)
-                    .unwrap_or_else(|| run.meta.slug.clone())
-                    == row.key
-            });
+            .filter(|run| row_key(&run.meta) == row.key);
         let latest = row_runs.next();
         // Any run, not only the latest: an action started during the install
         // must not make the row look ready.
@@ -808,6 +852,10 @@ fn compose(
             run.meta.action_id == CREATE_INSTALL_ACTION_ID
                 && run.meta.status == ActionRunStatus::Running
         });
+        row.install_queued = row.installing
+            && logs
+                .data()
+                .is_some_and(|logs| logs.install_waiting.contains(&row.key));
         if let Some(run) = latest {
             let label = match run.meta.status {
                 ActionRunStatus::Running => "running",
@@ -1142,6 +1190,97 @@ mod tests {
             );
         }
         assert_eq!(compose_with(Vec::new()), (false, false));
+    }
+
+    /// An install that has not been given an install slot is not installing
+    /// yet, and the row says so for exactly as long as that lasts.
+    #[tokio::test]
+    async fn a_creation_install_queued_for_a_slot_marks_its_row_as_waiting() {
+        let locks = tempfile::tempdir().unwrap();
+        let pool = wt_lifecycle::slots::DEPENDENCY_INSTALLS;
+        let mut held = Vec::new();
+        for _ in 0..pool.slots() {
+            held.push(pool.try_acquire(locks.path()).await.unwrap().unwrap());
+        }
+        let mut install = run("install", "running", 110);
+        install.meta.action_id = CREATE_INSTALL_ACTION_ID.into();
+        install.meta.issue_status = None;
+        let slug = install.meta.slug.clone();
+        let key = row_key(&install.meta);
+        let mut other = run("other", "running", 120);
+        other.meta.issue_status = None;
+        let history = ActionHistory {
+            runs: vec![other, install],
+        };
+        assert!(
+            install_waiting(locks.path(), Some(&history))
+                .await
+                .is_empty()
+        );
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = tokio::spawn({
+            let (path, slug, cancel) = (locks.path().to_path_buf(), slug.clone(), cancel.clone());
+            async move { pool.acquire(&path, Some(&slug), &cancel, || {}).await }
+        });
+        let waiting = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let waiting = install_waiting(locks.path(), Some(&history)).await;
+                if !waiting.is_empty() {
+                    break waiting;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the queued install is seen");
+        assert_eq!(waiting, BTreeSet::from([key.clone()]));
+
+        let queued = |install_waiting: BTreeSet<String>, runs: Vec<ActionRun>| {
+            let board = Board {
+                rows: vec![wt_tui::BoardRow {
+                    key: key.clone(),
+                    ..Default::default()
+                }],
+                ..Board::default()
+            };
+            let output = compose(
+                SourceSnapshot::test_live(Some(board), SourceState::Ready, Domain::Git),
+                SourceSnapshot::test_live(
+                    Some(ActionHistory { runs }),
+                    SourceState::Ready,
+                    Domain::Git,
+                ),
+                SourceSnapshot::test_live(
+                    Some(ActionLogs {
+                        logs: BTreeMap::new(),
+                        install_waiting,
+                    }),
+                    SourceState::Ready,
+                    Domain::Git,
+                ),
+                &Tracker::new(0),
+                &mut wt_app_core::feeds::FailureClock::default(),
+            );
+            let row = &output.data().unwrap().rows[0];
+            (row.installing, row.install_queued)
+        };
+        assert_eq!(queued(waiting.clone(), history.runs.clone()), (true, true));
+        assert_eq!(queued(BTreeSet::new(), history.runs.clone()), (true, false));
+        // A stale answer about an install that has ended says nothing.
+        assert_eq!(queued(waiting, Vec::new()), (false, false));
+
+        held.pop();
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            install_waiting(locks.path(), Some(&history))
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test(start_paused = true)]

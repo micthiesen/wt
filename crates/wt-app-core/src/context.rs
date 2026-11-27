@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use tokio_util::sync::CancellationToken;
 use wt_config::Config;
-use wt_platform::process::ProcessRunner;
+use wt_platform::process::{ProcessClass, ProcessRunner};
 use wt_vcs::GitRepository;
 
 use crate::database::Database;
@@ -16,12 +16,14 @@ pub struct AppContext {
     pub cwd: PathBuf,
     pub database: Database,
     pub repository: Arc<GitRepository>,
+    /// The handle this view's work is admitted through. The three runners
+    /// are handles on one process budget and differ only in class.
     pub processes: ProcessRunner,
     /// Original admission retained when a selected action view is reused by a
     /// continuation. Ordinary work must never inherit the interactive reserve.
     pub background_processes: ProcessRunner,
-    /// Reserved admission for user-awaited controls. Created once per process;
-    /// background reads and lifecycle commands cannot consume these permits.
+    /// Admission for user-awaited controls: served first, with a reserve of
+    /// the budget that background reads and lifecycle commands cannot take.
     pub interactive_processes: ProcessRunner,
     pub cancellation: CancellationToken,
     /// Section moves this process made, so the attention feed can tell the
@@ -32,6 +34,21 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    /// This context with its subprocesses, the repository's included,
+    /// admitted as `class` on the same budget. A source read that serves an
+    /// accepted write or an explicit refresh takes `Confirming`; long heavy
+    /// commands take `processes.bulk()` at the call instead, so the short
+    /// commands around them keep their class.
+    pub fn with_process_class(&self, class: ProcessClass) -> Self {
+        let mut context = self.clone();
+        context.processes = self.processes.with_class(class);
+        context.repository = Arc::new(
+            self.repository
+                .with_process_runner(context.processes.clone()),
+        );
+        context
+    }
+
     /// Use the controller's scheduling classification at both local and remote
     /// execution boundaries. Cloning this view never creates a new process pool.
     pub fn for_action(&self, action: &wt_tui::UiAction) -> anyhow::Result<Self> {
@@ -46,6 +63,7 @@ impl AppContext {
                 | Lane::Target(..)
                 | Lane::SessionControl(..)
                 | Lane::Presentation
+                | Lane::Device
                 | Lane::ViewControl
         );
         context.processes = if interactive {
@@ -220,6 +238,65 @@ mod tests {
                     .await??;
                 }
             }
+            Ok(())
+        }
+        .await;
+        cancel.cancel();
+        blocker.await?;
+        fixture.close().await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn one_budget_serves_a_user_awaited_action_past_saturated_background_reads()
+    -> anyhow::Result<()> {
+        use std::{num::NonZeroUsize, sync::Arc, time::Duration};
+        use wt_platform::process::{CommandSpec, ProcessBudget, ProcessClass, ProcessRunner};
+        use wt_tui::UiAction;
+
+        let mut fixture = crate::test_support::CommandFixture::new().await?;
+        // As the application composes it: one budget, three handles.
+        let budget = ProcessRunner::with_budget(ProcessBudget {
+            total: NonZeroUsize::new(2).unwrap(),
+            interactive_reserve: 1,
+            background: NonZeroUsize::new(1).unwrap(),
+            bulk: NonZeroUsize::new(1).unwrap(),
+            starvation_bound: Duration::from_secs(5),
+        });
+        fixture.ctx.processes = budget.clone();
+        fixture.ctx.background_processes = budget.clone();
+        fixture.ctx.interactive_processes = budget.with_class(ProcessClass::Interactive);
+        fixture.ctx.repository = Arc::new(fixture.ctx.repository.with_process_runner(budget));
+        let (cancel, blocker) = hold_process_permit(fixture.ctx.processes.clone()).await;
+        let result: anyhow::Result<()> = async {
+            let quick = |runner: ProcessRunner| async move {
+                let mut command = CommandSpec::new("true");
+                command.admission_timeout = Some(Duration::from_millis(100));
+                runner
+                    .run(command, &tokio_util::sync::CancellationToken::new())
+                    .await
+            };
+            let ordinary = fixture
+                .ctx
+                .for_action(&UiAction::Restack { key: "one".into() })?;
+            assert_eq!(ordinary.processes.class(), ProcessClass::Background);
+            assert!(quick(ordinary.processes).await.is_err());
+            let confirming = fixture.ctx.with_process_class(ProcessClass::Confirming);
+            assert!(
+                quick(confirming.processes).await.is_err(),
+                "a confirming read cannot take the slot kept for a person"
+            );
+            let awaited = fixture.ctx.for_action(&UiAction::SetTitle {
+                key: "one".into(),
+                title: "Renamed".into(),
+            })?;
+            assert_eq!(awaited.processes.class(), ProcessClass::Interactive);
+            quick(awaited.processes.clone()).await?;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                awaited.repository.inventory(&awaited.cancellation),
+            )
+            .await??;
             Ok(())
         }
         .await;

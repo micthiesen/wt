@@ -324,7 +324,12 @@ async fn run_inner<'a>(
     let mut metric_at = Instant::now();
     let mut controller_open = true;
     let mut toast_until = None;
-    let mut log_refresh_at: Option<tokio::time::Instant> = None;
+    let mut log_refresh = LogRefresh::default();
+    let outbox = Outbox {
+        requests: &actions.requests,
+        background: &actions.background,
+        views: &actions.views,
+    };
     let mut wave_at: Option<tokio::time::Instant> = None;
     let mut screen: Option<ratatui::buffer::Buffer> = None;
     source.refresh();
@@ -335,11 +340,7 @@ async fn run_inner<'a>(
             model.log_refresh = None;
             model.log_close_key = None;
         }
-        if model.log_refresh.is_none() {
-            log_refresh_at = None;
-        } else if log_refresh_at.is_none() {
-            log_refresh_at = Some(tokio::time::Instant::now() + Duration::from_secs(1));
-        }
+        log_refresh.follow(&model, tokio::time::Instant::now());
         if dirty {
             let start = Instant::now();
             let mut copied = None;
@@ -369,7 +370,7 @@ async fn run_inner<'a>(
                     format!("{chars} chars")
                 };
                 let action = crate::UiAction::Copy { value: text, label };
-                if actions
+                if outbox
                     .requests
                     .try_send(crate::UiRequest {
                         id: 0,
@@ -433,7 +434,7 @@ async fn run_inner<'a>(
                             let received = Instant::now();
                             let toast_before = model.toast.clone();
                             let result = model.input(key, terminal.size()?.height.saturating_sub(4) as usize);
-                            send_background(&mut model, &actions.requests);
+                            send_background(&mut model, outbox);
                             if model.toast.is_some() && model.toast != toast_before {
                                 // Input-side feedback ("nothing needs you") expires
                                 // like any other toast.
@@ -451,12 +452,20 @@ async fn run_inner<'a>(
                                 }
                                 InputResult::Draw => { dirty = true; input_at.get_or_insert(received); }
                                 InputResult::Unchanged => {}
+                                // A view opening or closing is state the
+                                // controller follows, not a request to wait on.
+                                InputResult::Action(action) if publish_view(outbox, &action) => {
+                                    model.request_not_sent();
+                                    dirty = true;
+                                    input_at.get_or_insert(received);
+                                    return Ok(Batch::Frame);
+                                }
                                 InputResult::Action(action) => {
                                     let id = model.next_op_id();
                                     let action = model.resolve(action);
                                     let feedback = action.clone();
                                     let cancellation = action.is_cancellable().then(CancellationToken::new);
-                                    match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }) {
+                                    match outbox.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }) {
                                         Ok(()) => {
                                             model.begin_action(id, &feedback);
                                             if let Some(request) = &mut model.pending_request {
@@ -480,7 +489,7 @@ async fn run_inner<'a>(
                             dirty |= crate::mouse::select(&mut model, mouse, area);
                             dirty |= crate::mouse::scroll(&mut model, mouse, area);
                             // The wheel can move a picker or history selection; plan its prefetch.
-                            send_background(&mut model, &actions.requests);
+                            send_background(&mut model, outbox);
                             // A released drag copies what the next frame
                             // draws under it, so nothing later may change it.
                             if model.mouse_selection.is_some_and(|selection| selection.finished) {
@@ -501,7 +510,7 @@ async fn run_inner<'a>(
             }
             reply = actions.replies.recv(), if controller_open => {
                 if let Some(reply) = reply {
-                    let handoff = apply_reply(&mut model, reply, &actions.requests, &source);
+                    let handoff = apply_reply(&mut model, reply, outbox, &source, &mut log_refresh);
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                     dirty = true;
                     if let Some(ticket) = handoff {
@@ -515,11 +524,19 @@ async fn run_inner<'a>(
                                 // No key can ask for a session while one holds
                                 // the terminal. Dropping a ticket releases
                                 // its controller.
-                                drop(apply_reply(&mut model, reply, &actions.requests, &source));
+                                drop(apply_reply(&mut model, reply, outbox, &source, &mut log_refresh));
                             },
                         )
                         .await?;
                         model.restart_confirm_settle();
+                        // The board kept changing while the session held the
+                        // terminal. The first frame back shows it as it is
+                        // now, not as it was when the session began.
+                        if snapshots.has_changed().unwrap_or(false) {
+                            model.apply(snapshots.borrow_and_update().clone());
+                            send_background(&mut model, outbox);
+                            send_follow_up(&mut model, outbox);
+                        }
                         match suspended {
                             HandoffResult::Resumed(Ok(())) => {
                                 // Fullscreen resize clears both render buffers
@@ -559,23 +576,11 @@ async fn run_inner<'a>(
             // once a second while it stays open. Its generation is the
             // current one, so any key pressed meanwhile drops the reply.
             _ = async {
-                match log_refresh_at {
+                match log_refresh.due {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
-            }, if model.log_refresh.is_some() => {
-                log_refresh_at = None;
-                if let Some(action) = model.log_refresh.clone()
-                    && matches!(model.interaction, crate::Interaction::Log { .. })
-                {
-                    let _ = actions.requests.try_send(crate::UiRequest {
-                        id: 0,
-                        cancellation: None,
-                        generation: model.ui_generation,
-                        action,
-                    });
-                }
-            }
+            } => log_refresh.send(&mut model, outbox),
             // A pending change reached its deadline: stop showing it, and say
             // so when the confirmed data still disagrees.
             _ = async {
@@ -586,7 +591,7 @@ async fn run_inner<'a>(
             } => {
                 let before = model.toast.clone();
                 model.tick(tokio::time::Instant::now());
-                send_background(&mut model, &actions.requests);
+                send_background(&mut model, outbox);
                 if model.toast != before {
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                 }
@@ -596,8 +601,8 @@ async fn run_inner<'a>(
                 if changed.is_err() { break; }
                 let before = model.toast.clone();
                 model.apply(snapshots.borrow_and_update().clone());
-                send_background(&mut model, &actions.requests);
-                send_follow_up(&mut model, &actions.requests);
+                send_background(&mut model, outbox);
+                send_follow_up(&mut model, outbox);
                 if model.toast != before {
                     toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
                 }
@@ -701,41 +706,116 @@ enum HandoffResult {
     Cancelled,
 }
 
+/// The terminal's sending side. The loop polls the reply receiver apart
+/// from it.
+#[derive(Clone, Copy)]
+struct Outbox<'a> {
+    requests: &'a tokio::sync::mpsc::Sender<crate::UiRequest>,
+    background: &'a tokio::sync::mpsc::Sender<crate::UiRequest>,
+    views: &'a tokio::sync::watch::Sender<crate::ViewState>,
+}
+
+/// The refresh of an open Log overlay: at most one request in flight, the
+/// next timed from that one's reply, so a slow host is asked no faster than
+/// it answers and nothing queues up behind a hung one.
+#[derive(Default)]
+struct LogRefresh {
+    /// When the next request is due. Unset while one is in flight.
+    due: Option<tokio::time::Instant>,
+    /// The request in flight. Dropping its guard cancels it.
+    in_flight: Option<(u64, tokio_util::sync::DropGuard)>,
+}
+
+impl LogRefresh {
+    /// Follow the overlay: schedule while it is open, and when it closes
+    /// stop and cancel the request in flight.
+    fn follow(&mut self, model: &Model, now: tokio::time::Instant) {
+        if model.log_refresh.is_none() {
+            *self = Self::default();
+        } else if self.due.is_none() && self.in_flight.is_none() {
+            self.due = Some(now + Duration::from_secs(1));
+        }
+    }
+
+    /// Send the due request. A full queue skips this tick.
+    fn send(&mut self, model: &mut Model, outbox: Outbox<'_>) {
+        self.due = None;
+        if self.in_flight.is_some() {
+            return;
+        }
+        let Some(action) = model.log_refresh.clone() else {
+            return;
+        };
+        let id = model.next_op_id();
+        let cancellation = CancellationToken::new();
+        let request = crate::UiRequest {
+            id,
+            cancellation: Some(cancellation.clone()),
+            generation: model.ui_generation,
+            action,
+        };
+        if outbox.background.try_send(request).is_ok() {
+            self.in_flight = Some((id, cancellation.drop_guard()));
+        }
+    }
+
+    /// Note a reply. The request's own answer lets the next be scheduled;
+    /// its progress, or another request's reply, does not.
+    fn answered(&mut self, reply: &crate::UiReply) {
+        if reply.progress.is_none()
+            && self
+                .in_flight
+                .as_ref()
+                .is_some_and(|(id, _)| Some(*id) == reply.operation_id)
+            && let Some((_, cancel)) = self.in_flight.take()
+        {
+            // Nothing is left to cancel.
+            drop(cancel.disarm());
+        }
+    }
+}
+
+/// Publish a view change. Returns false for an action that is a request.
+fn publish_view(outbox: Outbox<'_>, action: &crate::UiAction) -> bool {
+    let mut view = false;
+    outbox.views.send_if_modified(|state| {
+        let before = *state;
+        view = state.apply(action);
+        *state != before
+    });
+    view
+}
+
 /// Apply a host reply and send what it queued. Returns the session the
 /// terminal should be handed to, if the reply carries one.
 fn apply_reply(
     model: &mut Model,
     reply: crate::UiReply,
-    requests: &tokio::sync::mpsc::Sender<crate::UiRequest>,
+    outbox: Outbox<'_>,
     source: &SourceHandle<Board>,
+    log_refresh: &mut LogRefresh,
 ) -> Option<TerminalHandoff> {
+    log_refresh.answered(&reply);
     let history_was_open = model.history.active;
     let perf_was_open = model.show_perf;
     let handoff = model.reply(reply);
-    send_background(model, requests);
+    send_background(model, outbox);
     if std::mem::take(&mut model.refresh_requested) {
         source.refresh();
     }
-    send_follow_up(model, requests);
+    send_follow_up(model, outbox);
     if history_was_open && !model.history.active {
-        let _ = requests.try_send(crate::UiRequest {
-            id: 0,
-            cancellation: None,
-            generation: model.ui_generation,
-            action: crate::UiAction::SetHistoryActive { active: false },
-        });
+        publish_view(outbox, &crate::UiAction::SetHistoryActive { active: false });
     }
     if perf_was_open && !model.show_perf {
-        let _ = requests.try_send(crate::UiRequest {
-            id: 0,
-            cancellation: None,
-            generation: model.ui_generation,
-            action: crate::UiAction::SetPerf {
+        publish_view(
+            outbox,
+            &crate::UiAction::SetPerf {
                 active: false,
                 continuous: model.perf_continuous,
                 refresh: false,
             },
-        });
+        );
     }
     handoff
 }
@@ -806,17 +886,15 @@ fn log_latencies(samples: &mut Vec<f64>, coalesced: &mut usize) {
     *coalesced = 0;
 }
 
-/// Queue slots background reads leave free for foreground requests.
-const BACKGROUND_HEADROOM: usize = 3;
-
-/// Send read-only warm-up requests a board menu asked for. They carry no
-/// foreground feedback and never block input; a full queue drops them.
 /// Send the action a reply or a new snapshot queued behind it.
-fn send_follow_up(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
+fn send_follow_up(model: &mut Model, outbox: Outbox<'_>) {
     model.release_creation_moves();
     let Some(action) = model.follow_up.take() else {
         return;
     };
+    if publish_view(outbox, &action) {
+        return;
+    }
     let id = model.next_op_id();
     let action = model.resolve(action);
     let feedback = action.clone();
@@ -827,7 +905,7 @@ fn send_follow_up(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate:
         action,
         cancellation: cancellation.clone(),
     };
-    if requests.try_send(request).is_err() {
+    if outbox.requests.try_send(request).is_err() {
         model.request_not_sent();
         model.toast = Some((
             "action queue is busy; retry the action".into(),
@@ -851,22 +929,24 @@ fn send_follow_up(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate:
     model.toast = Some((text.into(), ToastTone::Info));
 }
 
-fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate::UiRequest>) {
+/// Send read-only warm-up requests a board menu asked for. They carry no
+/// foreground feedback and never block input. They travel apart from the
+/// user's requests, so neither can fill the other's queue; a skipped
+/// prefetch is retried later.
+fn send_background(model: &mut Model, outbox: Outbox<'_>) {
     let now = tokio::time::Instant::now();
     model.plan_palette_warm(now);
     model.fire_palette_warm(now);
     for action in std::mem::take(&mut model.background) {
-        // Background reads keep headroom in the bounded queue for the keys
-        // the user is pressing; a skipped prefetch is retried later.
-        let sent = requests.capacity() > BACKGROUND_HEADROOM
-            && requests
-                .try_send(crate::UiRequest {
-                    id: 0,
-                    cancellation: None,
-                    generation: model.ui_generation,
-                    action: action.clone(),
-                })
-                .is_ok();
+        let sent = outbox
+            .background
+            .try_send(crate::UiRequest {
+                id: 0,
+                cancellation: None,
+                generation: model.ui_generation,
+                action: action.clone(),
+            })
+            .is_ok();
         if !sent {
             model.background_not_sent(&action, now);
         }
@@ -1032,6 +1112,232 @@ mod handoff_tests {
             session
         );
         assert!(matches!(result, HandoffResult::Resumed(Ok(()))));
+    }
+}
+
+#[cfg(test)]
+mod request_channel_tests {
+    use super::*;
+    use crate::UiAction;
+
+    #[tokio::test]
+    async fn view_changes_are_published_as_state_and_never_queued() {
+        let (actions, mut controller) = crate::action_channel();
+        let outbox = Outbox {
+            requests: &actions.requests,
+            background: &actions.background,
+            views: &actions.views,
+        };
+        assert!(publish_view(
+            outbox,
+            &UiAction::SetHistoryActive { active: true }
+        ));
+        let perf = |refresh| UiAction::SetPerf {
+            active: true,
+            continuous: true,
+            refresh,
+        };
+        assert!(publish_view(outbox, &perf(false)));
+        assert!(publish_view(outbox, &perf(true)));
+        assert!(controller.views.has_changed().unwrap());
+        assert_eq!(
+            *controller.views.borrow_and_update(),
+            crate::ViewState {
+                history: true,
+                perf: true,
+                perf_continuous: true,
+                perf_revision: 1,
+            }
+        );
+        // Repeating the state wakes nobody; a request is not a view.
+        assert!(publish_view(outbox, &perf(false)));
+        assert!(!controller.views.has_changed().unwrap());
+        assert!(!publish_view(outbox, &UiAction::HardRefresh));
+        assert!(controller.requests.try_recv().is_err());
+        assert!(controller.background.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn background_reads_and_user_requests_cannot_fill_each_others_queue() {
+        let (actions, mut controller) = crate::action_channel();
+        let outbox = Outbox {
+            requests: &actions.requests,
+            background: &actions.background,
+            views: &actions.views,
+        };
+        let request = |action| crate::UiRequest {
+            id: 0,
+            generation: 0,
+            action,
+            cancellation: None,
+        };
+        // A backlog of prefetches leaves every slot for the user's keys.
+        while actions
+            .background
+            .try_send(request(UiAction::DiscoverSessions {
+                key: None,
+                target: crate::SessionTarget::Main,
+            }))
+            .is_ok()
+        {}
+        let free = actions.requests.capacity();
+        assert_eq!(free, actions.requests.max_capacity());
+        // And a backlog of the user's requests does not drop a prefetch.
+        while actions
+            .requests
+            .try_send(request(UiAction::HardRefresh))
+            .is_ok()
+        {}
+        while controller.background.try_recv().is_ok() {}
+        let mut model = Model::default();
+        let warm = UiAction::DiscoverSessions {
+            key: Some("row".into()),
+            target: crate::SessionTarget::Harness,
+        };
+        model.background.push(warm.clone());
+        send_background(&mut model, outbox);
+        assert!(model.background.is_empty());
+        assert_eq!(controller.background.try_recv().unwrap().action, warm);
+    }
+
+    #[tokio::test]
+    async fn an_overlay_refresh_is_single_and_is_cancelled_with_its_overlay() {
+        let (actions, mut controller) = crate::action_channel();
+        let outbox = Outbox {
+            requests: &actions.requests,
+            background: &actions.background,
+            views: &actions.views,
+        };
+        let source = SourceHandle::constant(wt_runtime::SourceSnapshot::default());
+        let mut model = Model::default();
+        let refresh_action = UiAction::DiscoverSessions {
+            key: None,
+            target: crate::SessionTarget::Main,
+        };
+        let open = |model: &mut Model| {
+            model.interaction = crate::Interaction::Log {
+                title: "dev".into(),
+                lines: Vec::new(),
+                scroll: 0,
+            };
+            model.log_refresh = Some(refresh_action.clone());
+        };
+        let reply = |id, progress: Option<&str>| crate::UiReply {
+            operation_id: Some(id),
+            progress: progress.map(str::to_owned),
+            ..Default::default()
+        };
+        let now = tokio::time::Instant::now();
+        let mut refresh = LogRefresh::default();
+        // Closed: nothing is scheduled.
+        refresh.follow(&model, now);
+        assert!(refresh.due.is_none());
+        open(&mut model);
+        refresh.follow(&model, now);
+        assert_eq!(refresh.due, Some(now + Duration::from_secs(1)));
+        refresh.send(&mut model, outbox);
+        let first = controller.background.try_recv().expect("one request");
+        assert_eq!(first.action, refresh_action);
+        let first_cancel = first.cancellation.clone().expect("cancellable");
+        // While it is unanswered, a slow host is not asked again, however
+        // often the loop turns or a stray timer fires.
+        for _ in 0..3 {
+            refresh.follow(&model, now + Duration::from_secs(5));
+            assert!(refresh.due.is_none());
+            refresh.send(&mut model, outbox);
+        }
+        assert!(controller.background.try_recv().is_err());
+        // Another request's reply, and progress for this one, are not its answer.
+        drop(apply_reply(
+            &mut model,
+            reply(first.id + 100, None),
+            outbox,
+            &source,
+            &mut refresh,
+        ));
+        drop(apply_reply(
+            &mut model,
+            reply(first.id, Some("still loading")),
+            outbox,
+            &source,
+            &mut refresh,
+        ));
+        assert!(refresh.in_flight.is_some());
+        drop(apply_reply(
+            &mut model,
+            reply(first.id, None),
+            outbox,
+            &source,
+            &mut refresh,
+        ));
+        assert!(refresh.in_flight.is_none());
+        assert!(
+            !first_cancel.is_cancelled(),
+            "an answered request is not cancelled"
+        );
+        // Answered: the next one is timed from now, and sent.
+        open(&mut model);
+        refresh.follow(&model, now);
+        assert!(refresh.due.is_some());
+        refresh.send(&mut model, outbox);
+        let second = controller.background.try_recv().expect("the next request");
+        let second_cancel = second.cancellation.clone().expect("cancellable");
+        // The overlay closes with that request in flight: it is cancelled
+        // and nothing more is scheduled.
+        model.log_refresh = None;
+        refresh.follow(&model, now);
+        assert!(second_cancel.is_cancelled());
+        assert!(refresh.due.is_none() && refresh.in_flight.is_none());
+        // A full queue skips a tick instead of pretending one is in flight.
+        open(&mut model);
+        while actions
+            .background
+            .try_send(crate::UiRequest {
+                id: 0,
+                generation: 0,
+                action: refresh_action.clone(),
+                cancellation: None,
+            })
+            .is_ok()
+        {}
+        refresh.follow(&model, now);
+        refresh.send(&mut model, outbox);
+        assert!(refresh.in_flight.is_none());
+        refresh.follow(&model, now);
+        assert!(refresh.due.is_some());
+    }
+
+    #[test]
+    fn an_earlier_requests_refusal_is_said_while_a_later_request_is_pending() {
+        let archive = UiAction::ToggleArchive {
+            key: "a".into(),
+            seen: None,
+        };
+        let fold = UiAction::FoldSection {
+            key: "inbox".into(),
+            folded: true,
+        };
+        let mut model = Model::default();
+        model.begin_action(1, &archive);
+        model.begin_action(2, &fold);
+        drop(model.reply(crate::UiReply {
+            operation_id: Some(1),
+            ..crate::UiReply::stale("row is already archived")
+        }));
+        assert_eq!(
+            model.toast,
+            Some(("row is already archived".into(), ToastTone::Failed))
+        );
+        // Its success would not interrupt the request the user now waits on.
+        let mut model = Model::default();
+        model.begin_action(1, &archive);
+        model.begin_action(2, &fold);
+        model.toast = Some(("working…".into(), ToastTone::Info));
+        drop(model.reply(crate::UiReply {
+            operation_id: Some(1),
+            ..crate::UiReply::message("Archived")
+        }));
+        assert_eq!(model.toast, Some(("working…".into(), ToastTone::Info)));
     }
 }
 

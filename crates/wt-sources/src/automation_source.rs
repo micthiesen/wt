@@ -875,6 +875,9 @@ async fn tell_removed_due(
         .database
         .call(|store| Ok(store.read_removed_worktrees()?))
         .await?;
+    // Each wake is awaited here, inside the source's loop. Once the manager
+    // has deferred one, the rest of this look would only wait on it again.
+    let mut manager_reachable = true;
     for entry in removed {
         if live.contains(&entry.slug) || entry.automations_paused == Some(true) {
             continue;
@@ -900,7 +903,7 @@ async fn tell_removed_due(
                 Some((item.done_target()?, what))
             })
             .collect::<Vec<_>>();
-        if !lines.is_empty() {
+        if !lines.is_empty() && manager_reachable {
             let prompt = wt_ops::watch_actions::removed_due_prompt(&entry.slug, &lines);
             match wt_ops::action_dispatch::wake_manager(context, &prompt).await {
                 AutomationOutcome::Delivered { .. } | AutomationOutcome::Ambiguous { .. } => {
@@ -910,7 +913,7 @@ async fn tell_removed_due(
                     }
                 }
                 // Nothing was sent: the next look tries again.
-                _ => {}
+                _ => manager_reachable = false,
             }
         }
         if keys.is_empty() {
@@ -1562,6 +1565,104 @@ mod tests {
         ] {
             assert_eq!(end(kind, status, exit), RunEnd::Other, "{kind} {status}");
         }
+    }
+
+    /// A manager waiting on a person must not hold the automation loop. The
+    /// look gives up after one bounded wait, however many removed rows have
+    /// something due, and records nothing as told, so a later look asks
+    /// again and the manager is still told exactly once.
+    #[tokio::test]
+    async fn a_manager_waiting_on_a_person_is_asked_once_per_look_and_told_later() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.tmux.socket = format!(
+                "wt-removed-due-{}",
+                fixture._root.path().file_name().unwrap().to_string_lossy()
+            );
+            config.harness.primary = wt_core::HarnessId::Claude;
+        }
+        let context = &fixture.ctx;
+        // This test process stands in for the live, waiting manager.
+        let cwd = std::fs::canonicalize(&context.config.paths.main_clone).unwrap();
+        let sessions = context.home.join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{}.json", std::process::id())),
+            serde_json::json!({"pid": std::process::id(),
+                "sessionId": wt_harness::claude_session_id(&cwd, Some("manager")), "cwd": cwd,
+                "name": "manager~manager", "status": "waiting", "waitingFor": "question",
+                "startedAt": 1, "updatedAt": 2})
+            .to_string(),
+        )
+        .unwrap();
+        let now = 1_795_521_600_000_i64;
+        context
+            .database
+            .call(move |store| {
+                for slug in ["gone-a", "gone-b"] {
+                    store.record_slug_created(slug, "2026-11-01T00:00:00Z")?;
+                    let status = wt_store::WorkStatusRecord {
+                        state: "ready".into(),
+                        at: "2026-11-24T12:00:00Z".into(),
+                        note: None,
+                        risk: None,
+                        sha: None,
+                        by: Some(slug.into()),
+                        blocked_on: None,
+                        verify_after_merge: None,
+                        verify_in: None,
+                        extra: Default::default(),
+                    }
+                    .with_check(wt_core::VerifyStage::Staging, "open the page");
+                    store.set_slug_work_status(slug, Some(&status))?;
+                    store.record_removed_worktrees(
+                        &[wt_store::RemovedWorktree {
+                            slug: slug.into(),
+                            branch: format!("feature/{slug}"),
+                            removed_at: "2026-11-24T12:00:01Z".into(),
+                            work: None,
+                            automations_paused: None,
+                            extra: [("landedOnAtRemoval".to_owned(), serde_json::json!("base"))]
+                                .into_iter()
+                                .collect(),
+                        }],
+                        now,
+                    )?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let separate = context.config.branch.separate_production();
+        let untold = |context: &AppContext| {
+            let database = context.database.clone();
+            async move {
+                database
+                    .call(|store| Ok(store.read_removed_worktrees()?))
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| !wt_store::removed_due_untold(entry, separate, now).is_empty())
+                    .count()
+            }
+        };
+        assert_eq!(untold(context).await, 2, "the fixture owes nothing");
+        let mut told = BTreeSet::new();
+        // One wake waits about five seconds on the person; two would not fit.
+        let look = tokio::time::timeout(
+            Duration::from_secs(9),
+            tell_removed_due(context, &BTreeSet::new(), now, &mut told),
+        )
+        .await;
+        let still_untold = untold(context).await;
+        fixture.close().await.unwrap();
+        look.expect("the look waited on the manager once per removed row")
+            .unwrap();
+        assert!(told.is_empty(), "{told:?}");
+        assert_eq!(still_untold, 2);
     }
 
     /// Another live process may launch a run while this one starts. Its

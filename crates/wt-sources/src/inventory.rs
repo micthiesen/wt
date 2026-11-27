@@ -183,6 +183,8 @@ fn apply_removals(rows: &mut Vec<BoardRow>, state: &Value) {
                 .map(clean_text)
                 .unwrap_or_default(),
             checkout_absent: listed.is_none(),
+            landed: removal["landed"].as_bool().unwrap_or(false),
+            was_archived: removal["wasArchived"].as_bool().unwrap_or(false),
         });
         if let Some(error) = error {
             row.badge = "Removal failed".into();

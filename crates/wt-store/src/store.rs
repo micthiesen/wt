@@ -548,63 +548,87 @@ fn enable_wal(db: &Connection, timeout: Duration) -> Result<(), rusqlite::Error>
 #[path = "wal_tests.rs"]
 mod wal_tests;
 
+/// The schema, as the batches that brought it there: entry `n` is version
+/// `n + 1`. A new version is a new entry at the end and nothing else, so
+/// what an open applies and what it takes for current cannot disagree.
+///
+/// Version 2 only adds a table. Builds that know version 1 alone check for
+/// `version >= 1` and never read the new table, so they keep opening and
+/// writing a migrated database.
+const MIGRATIONS: [&str; 2] = [
+    "CREATE TABLE IF NOT EXISTS repositories (
+         repo_id TEXT PRIMARY KEY,
+         repo_path TEXT NOT NULL UNIQUE,
+         created_at INTEGER NOT NULL,
+         updated_at INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS repository_state (
+         repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE CASCADE,
+         data TEXT NOT NULL,
+         updated_at INTEGER NOT NULL
+     );
+     CREATE TABLE IF NOT EXISTS archived_worktrees (
+         repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
+         worktree_key TEXT NOT NULL,
+         archived_at INTEGER NOT NULL,
+         PRIMARY KEY (repo_id, worktree_key)
+     );",
+    crate::events::EVENTS_SCHEMA,
+];
+
+/// Whether every migration this build knows is applied, by plain reads that
+/// take no write lock. A database another process is still creating reads as
+/// not current; [`initialize_schema`] then decides under the write lock.
+fn schema_is_current(db: &Connection) -> Result<bool, StoreError> {
+    let present = db
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !present {
+        return Ok(false);
+    }
+    let versions = MIGRATIONS.len() as i64;
+    let applied: i64 = db.query_row(
+        "SELECT COUNT(*) FROM schema_migrations WHERE version BETWEEN 1 AND ?1",
+        [versions],
+        |row| row.get(0),
+    )?;
+    Ok(applied == versions)
+}
+
 fn initialize_schema(db: &mut Connection) -> Result<(), StoreError> {
+    // Every command opens the store, and almost every open finds the schema
+    // in place: that open must not queue behind a writer or append to the
+    // log, which every running board watches.
+    if schema_is_current(db)? {
+        return Ok(());
+    }
     // Serialize schema discovery and creation. Without this transaction two
     // first opens can both observe a missing migration row and race through DDL.
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);",
     )?;
-    let applied: bool = tx
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE version = 1",
-            [],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if !applied {
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS repositories (
-                 repo_id TEXT PRIMARY KEY,
-                 repo_path TEXT NOT NULL UNIQUE,
-                 created_at INTEGER NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS repository_state (
-                 repo_id TEXT PRIMARY KEY REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                 data TEXT NOT NULL,
-                 updated_at INTEGER NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS archived_worktrees (
-                 repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-                 worktree_key TEXT NOT NULL,
-                 archived_at INTEGER NOT NULL,
-                 PRIMARY KEY (repo_id, worktree_key)
-             );",
-        )?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
-            [now_ms()],
-        )?;
-    }
-    // Version 2 only adds a table. Builds that know version 1 alone check
-    // for `version >= 1` and never read the new table, so they keep opening
-    // and writing a migrated database.
-    let events: bool = tx
-        .query_row(
-            "SELECT 1 FROM schema_migrations WHERE version = 2",
-            [],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if !events {
-        tx.execute_batch(crate::events::EVENTS_SCHEMA)?;
-        tx.execute(
-            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (2, ?1)",
-            [now_ms()],
-        )?;
+    for (version, batch) in (1_i64..).zip(MIGRATIONS) {
+        let applied = tx
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [version],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !applied {
+            tx.execute_batch(batch)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, now_ms()],
+            )?;
+        }
     }
     tx.commit()?;
     Ok(())
@@ -636,6 +660,19 @@ fn register_repository(
     db: &mut Connection,
     identity: &RepositoryIdentity,
 ) -> Result<(), StoreError> {
+    // A row with this id and path is the whole registration: `repo_path` is
+    // unique, so no other id can hold the path. Anything else (no row yet,
+    // or a collision to report) is decided under the write lock below.
+    let registered: Option<String> = db
+        .query_row(
+            "SELECT repo_path FROM repositories WHERE repo_id = ?1",
+            [&identity.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if registered.as_deref() == Some(identity.path.as_str()) {
+        return Ok(());
+    }
     // Identity validation and registration must be one serialized operation.
     // A deferred transaction allowed concurrent opens to both read the old
     // identity snapshot, then one failed while upgrading to a writer.
@@ -669,7 +706,7 @@ fn register_repository(
     let now = now_ms();
     tx.execute(
         "INSERT INTO repositories (repo_id, repo_path, created_at, updated_at) VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(repo_id) DO UPDATE SET updated_at = excluded.updated_at",
+         ON CONFLICT(repo_id) DO NOTHING",
         params![identity.id, identity.path, now, now],
     )?;
     tx.commit()?;
@@ -762,4 +799,100 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn log_state(path: &Path) -> (u64, SystemTime) {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        let meta = fs::metadata(PathBuf::from(wal)).unwrap();
+        (meta.len(), meta.modified().unwrap())
+    }
+
+    /// The store every command opens: a second open of a registered
+    /// repository must neither wait for the writer nor write.
+    #[test]
+    fn opening_a_registered_repository_takes_no_write_lock_and_writes_nothing() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("wt.sqlite");
+        let identity = || RepositoryIdentity::new("repo", "/repo");
+        let mut first = Store::open(&path, identity()).unwrap();
+        first.write_repository_state_json("{}").unwrap();
+        let registered_at = |db: &Connection| -> i64 {
+            db.query_row("SELECT updated_at FROM repositories", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = (log_state(&path), registered_at(first.connection().unwrap()));
+
+        // A writer mid-transaction, as a board or another command is.
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = Instant::now();
+        let second = Store::open(&path, identity()).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            second.read_repository_state_json().unwrap().as_deref(),
+            Some("{}")
+        );
+        drop(second);
+        writer.execute_batch("ROLLBACK").unwrap();
+
+        assert_eq!(
+            (log_state(&path), registered_at(first.connection().unwrap())),
+            before
+        );
+    }
+
+    /// The fast path must not take an older database for current: every
+    /// version this build knows is applied by the open that finds one missing.
+    #[test]
+    fn an_open_applies_each_version_a_database_lacks() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("wt.sqlite");
+        let identity = || RepositoryIdentity::new("repo", "/repo");
+        drop(Store::open(&path, identity()).unwrap());
+        let versions = |db: &Connection| -> Vec<i64> {
+            db.prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let all = (1..=MIGRATIONS.len() as i64).collect::<Vec<_>>();
+        for missing in all.iter().copied().skip(1) {
+            let db = Connection::open(&path).unwrap();
+            db.execute(
+                "DELETE FROM schema_migrations WHERE version >= ?1",
+                [missing],
+            )
+            .unwrap();
+            assert!(!schema_is_current(&db).unwrap(), "version {missing}");
+            drop(db);
+            let store = Store::open(&path, identity()).unwrap();
+            assert_eq!(versions(store.connection().unwrap()), all);
+        }
+    }
+
+    #[test]
+    fn a_collision_is_still_refused_and_a_new_repository_still_registered() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("wt.sqlite");
+        drop(Store::open(&path, RepositoryIdentity::new("repo", "/repo")).unwrap());
+        assert!(matches!(
+            Store::open(&path, RepositoryIdentity::new("repo", "/elsewhere")),
+            Err(StoreError::RepositoryCollision { .. })
+        ));
+        assert!(matches!(
+            Store::open(&path, RepositoryIdentity::new("other", "/repo")),
+            Err(StoreError::PathCollision(_))
+        ));
+        let mut other = Store::open(&path, RepositoryIdentity::new("other", "/other")).unwrap();
+        other.write_repository_state_json("{}").unwrap();
+        assert!(other.has_repository_state().unwrap());
+    }
 }

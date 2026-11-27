@@ -29,6 +29,24 @@ impl Effect {
             Self::Mutation(mutation) => mutation.domains(),
         }
     }
+
+    /// The rows whose reads confirm the change, for a host whose source can
+    /// read rows one at a time. `None` means the whole domain. Creation
+    /// names no row before the host has resolved its key: the row is new, so
+    /// listing the rows again is what shows it.
+    pub fn rows(&self) -> Option<Vec<String>> {
+        let Self::Mutation(mutation) = self else {
+            return None;
+        };
+        if let MutationKind::Lifecycle(LifecycleChange::Create { resolved, .. }) = &mutation.kind {
+            return Some(resolved.iter().cloned().collect());
+        }
+        mutation
+            .confirming()
+            .into_iter()
+            .map(|target| target.key)
+            .collect()
+    }
 }
 
 impl UiAction {
@@ -192,12 +210,8 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
             GithubChange::AutoMerge { enable: *enable },
         ),
         UiAction::GithubShip { key, .. } => on_row(board, host, key, GithubChange::Ship),
-        UiAction::GithubFailedChecks { key } => unprojected(
-            host,
-            Some(key),
-            "sending failed checks",
-            &[Domain::Sessions],
-        ),
+        // Reads the failed run's log into an overlay; it writes nothing.
+        UiAction::GithubFailedChecks { .. } => Effect::ReadOnly,
         UiAction::KillAction { .. } => {
             unprojected(host, None, "stopping action", &[Domain::Actions])
         }

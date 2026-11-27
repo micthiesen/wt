@@ -224,8 +224,9 @@ fn attach(
     base.with_data(Some(Arc::new(board))).with_input(history)
 }
 
-/// Every slug whose history the board can show: live local worktrees and the
-/// removals the state still holds. A slug is one or the other on the board;
+/// Every slug whose history the board can show: live local worktrees, those
+/// being removed (the row outlives its checkout) and the removals the state
+/// still holds. A slug is one or the other on the board;
 /// the removed-history source drops a removal whose slug is live again.
 fn history_slugs(inventory: &[WorktreeSnapshot], state: &serde_json::Value) -> Vec<String> {
     let live = inventory
@@ -244,7 +245,15 @@ fn history_slugs(inventory: &[WorktreeSnapshot], state: &serde_json::Value) -> V
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.get("slug")?.as_str().map(str::to_owned));
-    live.chain(removed)
+    let removing = state
+        .get("removals")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| !wt_core::is_remote_worktree_ledger_key(key))
+        .map(|(key, _)| key.clone());
+    live.chain(removing)
+        .chain(removed)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()

@@ -2,6 +2,13 @@
 //! Watch Git metadata and checkout roots, not generated dependency trees.
 //! Edit timestamps therefore cover filesystem events at those watched roots;
 //! this does not recursively walk worktree contents.
+//!
+//! A change is routed to the checkouts it can affect, so one commit re-reads
+//! one row and not the fleet. Where the platform reports changes itself, its
+//! notifications drive this and a metadata scan of the same paths catches
+//! lost ones. On macOS the scan is the only detector: its native watcher is
+//! unsafe next to SQLite (see `wt_app_core::watcher`), and a second poller
+//! over the same tree would only double the cost.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -13,22 +20,111 @@ use std::{
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
 use wt_app_core::watcher::{self, WtWatcher};
 use wt_config::Config;
 use wt_core::Domain;
 use wt_runtime::{
-    Persistence, RefreshPolicy, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
+    Persistence, RefreshPolicy, Request, SourceHandle, SourceSpec, SourceState, Stamp, TaskScope,
     leaf_channel,
 };
 use wt_tui::Board;
 use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
 const BACKSTOP: Duration = Duration::from_secs(60);
-const METADATA_BACKSTOP: Duration = Duration::from_secs(1);
-const MAX_METADATA_ENTRIES: usize = 8192;
+/// Spacing of metadata scans, from the start of the preceding one. Where the
+/// scan is the only detector it runs twice a second: the same number of walks
+/// as the poller and the backstop it replaces made between them, for half
+/// the wait.
+const SCAN_INTERVAL: Duration = Duration::from_millis(if POLLING { 500 } else { 1000 });
+/// A scan slower than `SCAN_INTERVAL / SCAN_DUTY` stretches the spacing to
+/// this many times its own duration, so a large watch set is sampled less
+/// often rather than abandoned, and scanning never takes more than one part
+/// in this many of a thread.
+const SCAN_DUTY: u32 = 4;
+/// How often the files other processes signal through are checked where
+/// changes are only found by polling.
+const SIGNAL_TICK: Duration = Duration::from_millis(75);
 /// A deleted watch root makes the poller report it missing on every poll.
 /// Those reports re-read the watch list at most this often.
 const VANISHED_INTERVAL: Duration = Duration::from_secs(5);
+/// How long a Git listing waits for its checkouts to be watched. Past this
+/// it proceeds, and the periodic sweep covers what a watch would have.
+const COVER_WAIT: Duration = Duration::from_secs(2);
+
+/// The least spacing between metadata reads caused by other processes'
+/// writes to the state database. Forty agents writing status would
+/// otherwise have every wt read its state, and project its board again, at
+/// the tick's own rate. A lone write is still read at once; a read wt's own
+/// write asks for never goes through this.
+const METADATA_PACE: Duration = Duration::from_millis(250);
+
+/// Whether ref names differ only by case name the same file here.
+const REFS_FOLD_CASE: bool = cfg!(any(target_os = "macos", windows));
+
+/// Whether filesystem changes are found only by polling on this platform.
+pub(crate) const POLLING: bool = cfg!(target_os = "macos");
+
+/// Asks the watcher to cover checkouts before they are first read.
+#[derive(Clone)]
+pub struct Coverage {
+    requests: mpsc::Sender<CoverRequest>,
+    /// Checkout paths already watched, so the usual listing asks nothing.
+    covered: Arc<RwLock<BTreeSet<String>>>,
+}
+
+pub struct CoverageRequests {
+    requests: mpsc::Receiver<CoverRequest>,
+    covered: Arc<RwLock<BTreeSet<String>>>,
+}
+
+struct CoverRequest {
+    records: Vec<WorktreeRecord>,
+    done: oneshot::Sender<()>,
+}
+
+pub fn coverage() -> (Coverage, CoverageRequests) {
+    let (requests, receiver) = mpsc::channel(4);
+    let covered = Arc::new(RwLock::new(BTreeSet::new()));
+    (
+        Coverage {
+            requests,
+            covered: covered.clone(),
+        },
+        CoverageRequests {
+            requests: receiver,
+            covered,
+        },
+    )
+}
+
+impl Coverage {
+    /// Resolve once every listed checkout is watched and has a baseline to
+    /// compare later samples against. A read that starts after this cannot
+    /// miss a change: whatever happens next differs from the baseline.
+    pub async fn cover(&self, records: &[WorktreeRecord]) {
+        let known = self.covered.read().is_ok_and(|covered| {
+            records
+                .iter()
+                .all(|record| covered.contains(&record.target.path))
+        });
+        if known {
+            return;
+        }
+        let (done, covered) = oneshot::channel();
+        let request = CoverRequest {
+            records: records.to_vec(),
+            done,
+        };
+        // A watcher that is gone or stuck must not hold the listing.
+        let _ = tokio::time::timeout(COVER_WAIT, async {
+            if self.requests.send(request).await.is_ok() {
+                let _ = covered.await;
+            }
+        })
+        .await;
+    }
+}
 
 pub fn start(
     scope: &TaskScope,
@@ -36,19 +132,499 @@ pub fn start(
     source: SourceHandle<Board>,
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<crate::local_source::Metadata>,
+    coverage: CoverageRequests,
 ) -> SourceHandle<BTreeMap<String, i64>> {
-    start_with_notifications(scope, config, source, git, metadata, true, None)
+    start_with_notifications(
+        scope, config, source, git, metadata, coverage, !POLLING, None,
+    )
 }
 
 /// Test seam: the watch set the backend actually holds.
 type WatchProbe = Arc<Mutex<BTreeMap<PathBuf, bool>>>;
 
+/// What the files another process changes look like, as last seen.
+type Seen = Arc<Mutex<BTreeMap<PathBuf, Option<FileSignature>>>>;
+
+/// Call `changed` soon after any of `files` changes, for the few files
+/// other processes signal through (the state database, the events daemon's
+/// snapshot). A full scan of the watch set finds the same change up to a
+/// second later; this only shortens the wait, on a thread of its own so it
+/// never queues behind blocking work. It reads nothing but file metadata.
+pub(crate) fn watch_signal_files(
+    scope: &TaskScope,
+    files: Vec<PathBuf>,
+    changed: impl Fn() + Send + 'static,
+) {
+    signal_tick(scope, files, changed);
+}
+
+/// `watch_signal_files`, also returning what the tick has seen so a scan
+/// does not report the same change a second time.
+fn signal_tick(
+    scope: &TaskScope,
+    files: Vec<PathBuf>,
+    changed: impl Fn() + Send + 'static,
+) -> Seen {
+    let seen = Seen::default();
+    let cancellation = scope.token();
+    let (stopped, joined) = oneshot::channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name("wt-signal-tick".into())
+        .spawn({
+            let seen = seen.clone();
+            let cancellation = cancellation.clone();
+            move || {
+                let _stopped = stopped;
+                // The WAL comes and goes; name it through its directory.
+                let files: Vec<PathBuf> = files
+                    .into_iter()
+                    .map(|file| match (file.parent(), file.file_name()) {
+                        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                            .map_or_else(|_| file.clone(), |parent| parent.join(name)),
+                        _ => file,
+                    })
+                    .collect();
+                let mut first = true;
+                while !cancellation.is_cancelled() {
+                    let mut moved = false;
+                    if let Ok(mut seen) = seen.lock() {
+                        for file in &files {
+                            let now = std::fs::symlink_metadata(file)
+                                .ok()
+                                .map(|metadata| FileSignature::from_metadata(&metadata));
+                            if seen.get(file) != Some(&now) {
+                                seen.insert(file.clone(), now);
+                                moved = true;
+                            }
+                        }
+                    }
+                    if moved && !std::mem::take(&mut first) {
+                        changed();
+                    }
+                    first = false;
+                    std::thread::sleep(SIGNAL_TICK);
+                }
+            }
+        });
+    match thread {
+        // Shutdown waits for the thread, which notices cancellation within
+        // one tick.
+        Ok(_) => {
+            scope.spawn(async move {
+                cancellation.cancelled().await;
+                let _ = joined.await;
+            });
+        }
+        Err(error) => tracing::warn!(%error, "cannot start the signal-file tick; using the scan"),
+    }
+    seen
+}
+
+/// One checkout as the router sees it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LayoutRow {
+    key: String,
+    path: PathBuf,
+    git_dir: Option<PathBuf>,
+    common_dir: Option<PathBuf>,
+    branch: String,
+    upstream: Option<String>,
+}
+
+/// Which checkouts a set of changed paths can affect.
+#[derive(Debug, PartialEq, Eq)]
+enum Touch {
+    /// A path whose reach is not known: read every row.
+    All,
+    /// Read these rows and list the checkouts again. An empty set is a
+    /// change to the checkout set or to something no row's status reads.
+    Rows(BTreeSet<String>),
+}
+
+#[derive(Debug, Default)]
+struct Layout {
+    rows: Vec<LayoutRow>,
+}
+
+impl Layout {
+    fn new(rows: &[WorktreeSnapshot]) -> Self {
+        let keys = crate::local_source::git_keys(rows.iter().map(|row| &row.worktree));
+        Self {
+            rows: rows
+                .iter()
+                .zip(keys)
+                .map(|(row, key)| LayoutRow {
+                    key,
+                    path: PathBuf::from(&row.worktree.target.path),
+                    git_dir: row.worktree.git_dir.clone(),
+                    common_dir: row.worktree.common_dir.clone(),
+                    branch: row.worktree.target.branch.clone(),
+                    upstream: row
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.upstream.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Route Git-relevant paths to rows. Anything that cannot be placed
+    /// reads everything: a wrong guess here would leave a row stale until
+    /// the next sweep.
+    fn touch(&self, paths: &[PathBuf], worktree_root: &Path) -> Touch {
+        if paths.is_empty() {
+            return Touch::All;
+        }
+        let mut keys = BTreeSet::new();
+        for path in paths {
+            let common = self
+                .rows
+                .iter()
+                .filter_map(|row| row.common_dir.as_deref())
+                .filter(|common| path.starts_with(common))
+                .max_by_key(|common| common.components().count());
+            if let Some(common) = common {
+                let owner = |directory: &Path| {
+                    self.rows
+                        .iter()
+                        .find(|row| row.git_dir.as_deref() == Some(directory))
+                        .map(|row| row.key.clone())
+                };
+                let relative = path.strip_prefix(common).unwrap_or(path);
+                let mut parts = relative.components().map(|part| part.as_os_str());
+                match parts.next().and_then(|part| part.to_str()) {
+                    // A linked checkout's own administration directory. One
+                    // that is not listed is a checkout arriving or leaving.
+                    Some("worktrees") => {
+                        if let Some(name) = parts.next() {
+                            keys.extend(owner(&common.join("worktrees").join(name)));
+                        }
+                    }
+                    // A ref reaches the checkouts on that branch or tracking
+                    // it. Any other ref moves no status, but facts derived
+                    // from refs wake on the listing it asks for.
+                    Some("refs") => {
+                        let kind = parts.next().and_then(|part| part.to_str());
+                        let name = parts
+                            .filter_map(|part| part.to_str())
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        // The path is spelled as the file is, which on a
+                        // case-folding filesystem need not be how the branch
+                        // is.
+                        let fold = |text: &str| {
+                            if REFS_FOLD_CASE {
+                                text.to_lowercase()
+                            } else {
+                                text.to_owned()
+                            }
+                        };
+                        let name = fold(&name);
+                        // A directory under refs stands for every ref in it.
+                        let names = |candidate: &str| {
+                            let candidate = fold(candidate);
+                            !name.is_empty()
+                                && (candidate == name
+                                    || candidate
+                                        .strip_prefix(name.as_str())
+                                        .is_some_and(|rest| rest.starts_with('/')))
+                        };
+                        for row in &self.rows {
+                            if row.common_dir.as_deref() != Some(common) {
+                                continue;
+                            }
+                            let upstream = row.upstream.as_deref().unwrap_or_default();
+                            let reached = match kind {
+                                Some("heads") => names(&row.branch) || names(upstream),
+                                Some("remotes") => names(upstream),
+                                _ => false,
+                            };
+                            if reached {
+                                keys.insert(row.key.clone());
+                            }
+                        }
+                    }
+                    // Every checkout resolves refs and upstreams through
+                    // the first two, and counts untracked files by the
+                    // excludes under the third.
+                    Some("packed-refs" | "config" | "info") => return Touch::All,
+                    // HEAD, the index and operation state of the checkout
+                    // this directory administers.
+                    _ => match owner(common) {
+                        Some(key) => {
+                            keys.insert(key);
+                        }
+                        None => return Touch::All,
+                    },
+                }
+                continue;
+            }
+            let checkout = self
+                .rows
+                .iter()
+                .filter(|row| path.starts_with(&row.path))
+                .max_by_key(|row| row.path.components().count());
+            match checkout {
+                Some(row) => {
+                    keys.insert(row.key.clone());
+                }
+                // The root itself, or a directory in it that is not listed.
+                None if path.starts_with(worktree_root) => {}
+                None => return Touch::All,
+            }
+        }
+        Touch::Rows(keys)
+    }
+}
+
+/// Requests metadata reads for changes other processes made, no more often
+/// than `interval`: the first at once, and one more when the interval has
+/// passed if anything changed meanwhile.
+struct Paced {
+    metadata: SourceHandle<crate::local_source::Metadata>,
+    interval: Duration,
+    /// When the last read was asked for, and whether another is held back.
+    state: Mutex<(Option<std::time::Instant>, bool)>,
+    held: tokio::sync::Notify,
+}
+
+impl Paced {
+    fn new(metadata: SourceHandle<crate::local_source::Metadata>, interval: Duration) -> Self {
+        Self {
+            metadata,
+            interval,
+            state: Mutex::default(),
+            held: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn signal(&self) {
+        let now = std::time::Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .0
+            .is_none_or(|last| now.duration_since(last) >= self.interval)
+        {
+            *state = (Some(now), false);
+            drop(state);
+            self.metadata.refresh();
+        } else if !std::mem::replace(&mut state.1, true) {
+            self.held.notify_one();
+        }
+    }
+
+    /// When the read being held back is due.
+    fn due(&self) -> Option<tokio::time::Instant> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.1.then(|| {
+            let waited = state.0.map_or(self.interval, |last| last.elapsed());
+            tokio::time::Instant::now() + self.interval.saturating_sub(waited)
+        })
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::mem::take(&mut state.1) {
+            state.0 = Some(std::time::Instant::now());
+            drop(state);
+            self.metadata.refresh();
+        }
+    }
+}
+
+/// Turns changed paths into source requests.
+struct Router {
+    git: SourceHandle<Vec<WorktreeSnapshot>>,
+    metadata: Arc<Paced>,
+    state_db: PathBuf,
+    /// The main clone and the worktree root.
+    checkout_roots: [PathBuf; 2],
+    layout: RwLock<Layout>,
+}
+
+impl Router {
+    fn invalidate(&self, paths: &[PathBuf]) {
+        let (git, metadata) = invalidations(paths, &self.state_db, &self.checkout_roots);
+        tracing::debug!(?paths, git, metadata, "filesystem invalidation");
+        if metadata {
+            self.metadata.signal();
+        }
+        if !git {
+            return;
+        }
+        let git_paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| invalidation(path, &self.state_db, &self.checkout_roots).0)
+            .cloned()
+            .collect();
+        let touch = self.layout.read().map_or(Touch::All, |layout| {
+            layout.touch(&git_paths, &self.checkout_roots[1])
+        });
+        match touch {
+            Touch::All => self.git.request(Request::Recheck),
+            Touch::Rows(keys) => self.git.request_keys(Request::Recheck, keys),
+        };
+    }
+}
+
+/// The watch set, its backend and the baseline later samples compare with.
+struct Watch {
+    /// `None` where the scan is the only detector, or the backend failed.
+    watcher: Option<WtWatcher>,
+    /// Roots being watched: with the backend when there is one.
+    registered: BTreeMap<PathBuf, bool>,
+    /// Roots the fingerprint holds a sample of.
+    sampled: BTreeMap<PathBuf, bool>,
+    fingerprint: Option<Arc<WatchFingerprint>>,
+    /// Shared with the notification callback, to drop repeats of a change
+    /// a scan already reported.
+    observed: Arc<RwLock<Option<Arc<WatchFingerprint>>>>,
+    probe: Option<WatchProbe>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl Watch {
+    /// Watch exactly `desired`, and sample every root that is new so a
+    /// later scan has something to compare it with. Returns the new roots.
+    async fn apply(&mut self, desired: BTreeMap<PathBuf, bool>) -> BTreeSet<PathBuf> {
+        match self.watcher.take() {
+            Some(active) => {
+                let registered = std::mem::take(&mut self.registered);
+                let cancel = self.cancellation.clone();
+                let wanted = desired.clone();
+                let update = tokio::task::spawn_blocking(move || {
+                    update_watches(active, registered, wanted, &cancel)
+                });
+                match update.await {
+                    Ok((active, registered, _cancelled)) => {
+                        self.watcher = Some(active);
+                        self.registered = registered;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "filesystem watch worker stopped; using the scan");
+                        self.registered = desired;
+                    }
+                }
+            }
+            None => self.registered = desired,
+        }
+        if let Some(probe) = &self.probe
+            && let Ok(mut probe) = probe.lock()
+        {
+            *probe = self.registered.clone();
+        }
+        let before = self.sampled.clone();
+        self.sampled
+            .retain(|root, recursive| self.registered.get(root) == Some(recursive));
+        let fresh: BTreeMap<PathBuf, bool> = self
+            .registered
+            .iter()
+            .filter(|(root, recursive)| self.sampled.get(*root) != Some(*recursive))
+            .map(|(root, recursive)| (root.clone(), *recursive))
+            .collect();
+        let mut fingerprint = self.fingerprint.as_deref().cloned().unwrap_or_default();
+        if self.sampled != before {
+            fingerprint.retain(|path, _| covers(&self.sampled, path));
+        }
+        if !fresh.is_empty() {
+            let roots = fresh.clone();
+            let cancel = self.cancellation.clone();
+            let sample =
+                tokio::task::spawn_blocking(move || watch_fingerprint(&roots, &cancel)).await;
+            let Ok(Some(sample)) = sample else {
+                // Cancelled: nothing was sampled, so nothing is covered.
+                return BTreeSet::new();
+            };
+            for (path, signature) in sample {
+                // A path an older root already samples keeps its older
+                // signature: a change since then is still owed to the next
+                // scan, and overwriting it here would swallow it.
+                if !covers(&self.sampled, &path) {
+                    fingerprint.insert(path, signature);
+                }
+            }
+            self.sampled.extend(fresh.clone());
+        }
+        self.publish(fingerprint);
+        fresh.into_keys().collect()
+    }
+
+    fn publish(&mut self, fingerprint: WatchFingerprint) {
+        let fingerprint = Arc::new(fingerprint);
+        if let Ok(mut observed) = self.observed.write() {
+            *observed = Some(fingerprint.clone());
+        }
+        self.fingerprint = Some(fingerprint);
+    }
+
+    /// Fold in a finished scan of `roots` and return what changed since the
+    /// last sample. A path counts only where both samples looked: a root
+    /// added or dropped while the scan ran is not a change to its files.
+    fn settle(&mut self, roots: &BTreeMap<PathBuf, bool>, scan: WatchFingerprint) -> Vec<PathBuf> {
+        let Some(previous) = self.fingerprint.clone() else {
+            self.sampled = roots.clone();
+            self.publish(scan);
+            return Vec::new();
+        };
+        if *roots == self.sampled {
+            let changed = changed_paths(&previous, &scan);
+            self.publish(scan);
+            return changed;
+        }
+        let both = |path: &PathBuf| covers(roots, path) && covers(&self.sampled, path);
+        let changed = changed_paths(&previous, &scan)
+            .into_iter()
+            .filter(both)
+            .collect();
+        let mut next: WatchFingerprint = scan
+            .into_iter()
+            .filter(|(path, _)| covers(&self.sampled, path))
+            .collect();
+        for (path, signature) in previous.iter() {
+            if !covers(roots, path) {
+                next.insert(path.clone(), signature.clone());
+            }
+        }
+        self.publish(next);
+        changed
+    }
+}
+
+/// Whether a sample of `roots` includes `path`: a root, a direct child of
+/// one, or anything below a recursive one.
+fn covers(roots: &BTreeMap<PathBuf, bool>, path: &Path) -> bool {
+    if roots.contains_key(path)
+        || path
+            .parent()
+            .is_some_and(|parent| roots.contains_key(parent))
+    {
+        return true;
+    }
+    path.ancestors()
+        .skip(1)
+        .any(|ancestor| roots.get(ancestor) == Some(&true))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one caller per mode; the last two are test seams"
+)]
 fn start_with_notifications(
     scope: &TaskScope,
     config: Arc<Config>,
     source: SourceHandle<Board>,
     git: SourceHandle<Vec<WorktreeSnapshot>>,
     metadata: SourceHandle<crate::local_source::Metadata>,
+    mut coverage: CoverageRequests,
     notifications: bool,
     probe: Option<WatchProbe>,
 ) -> SourceHandle<BTreeMap<String, i64>> {
@@ -65,13 +641,23 @@ fn start_with_notifications(
     let edit_roots = Arc::new(RwLock::new(BTreeMap::<PathBuf, String>::new()));
     let pending_edits = Arc::new(Mutex::new(BTreeMap::<String, i64>::new()));
     let edit_changed = Arc::new(tokio::sync::Notify::new());
-    // Native notifications can arrive after the metadata backstop already
+    // Native notifications can arrive after the metadata scan already
     // observed and invalidated an edit. Share that witness across both lanes.
     let observed_files = Arc::new(RwLock::new(None::<Arc<WatchFingerprint>>));
     // A watched checkout disappeared; re-read the watch list.
     let rewatch = Arc::new(tokio::sync::Notify::new());
     let vanished_gate = Arc::new(RateGate::new(VANISHED_INTERVAL));
     let cancellation = scope.token();
+    // Another process's write to the state database reaches the board
+    // through this file alone, so it is not left to the one-second scan.
+    let paced = Arc::new(Paced::new(metadata.clone(), METADATA_PACE));
+    let signals = (!notifications).then(|| {
+        let database = config.paths.state_db.clone();
+        let mut wal = database.clone().into_os_string();
+        wal.push("-wal");
+        let paced = paced.clone();
+        signal_tick(scope, vec![database, wal.into()], move || paced.signal())
+    });
     scope.spawn(async move {
         if let Some(board) = source.snapshot().data().cloned()
             && let Ok(mut roots) = edit_roots.write()
@@ -82,101 +668,111 @@ fn start_with_notifications(
                 .map(|row| (PathBuf::from(&row.path), row.key.clone()))
                 .collect();
         }
-        let observed_git = git.clone();
-        let observed_metadata = metadata.clone();
         let state_db = canonical_watch_path(&config.paths.state_db).await;
-        let checkout_roots = [
-            canonical_watch_path(&config.paths.main_clone).await,
-            canonical_watch_path(&config.paths.worktree_root).await,
-        ];
-        let probe_state_db = state_db.clone();
-        let probe_checkout_roots = checkout_roots.clone();
-        let callback_roots = edit_roots.clone();
-        let callback_pending = pending_edits.clone();
-        let callback_changed = edit_changed.clone();
-        let callback_observed_files = observed_files.clone();
-        let callback_rewatch = rewatch.clone();
-        let callback_vanished = vanished_gate.clone();
-        let mut watcher = tokio::task::spawn_blocking(move || {
-            watcher::new(move |event: notify::Result<Event>| match event {
-                Ok(event) if relevant(&event) => {
-                    let paths = if event.need_rescan() {
-                        event.paths.clone()
-                    } else {
-                        unobserved_paths(&event.paths, &callback_observed_files)
-                    };
-                    let (git, metadata) = if !event.paths.is_empty() && paths.is_empty() {
-                        (false, false)
-                    } else {
-                        invalidations(&paths, &state_db, &checkout_roots)
-                    };
-                    tracing::debug!(?event, ?paths, git, metadata, "filesystem notification invalidation");
-                    if git { observed_git.refresh(); }
-                    if metadata { observed_metadata.refresh(); }
-                    if edit_event(&event) {
-                        let roots = callback_roots.read().ok();
-                        let mut changed = false;
-                        if let Some(roots) = roots.as_deref() {
-                            let timestamp = now_ms();
-                            let slugs: BTreeSet<_> = event.paths.iter().take(256)
-                                .filter(|path| !is_state_db_path(path, &state_db))
-                                .filter_map(|path| edited_slug(path, roots))
-                                .collect();
-                            if !slugs.is_empty()
-                                && let Ok(mut pending) = callback_pending.lock()
-                            {
-                                for slug in slugs {
-                                    let value = pending.entry(slug).or_default();
-                                    *value = (*value).max(timestamp);
-                                    changed = true;
+        let router = Arc::new(Router {
+            git: git.clone(),
+            metadata: paced.clone(),
+            state_db: state_db.clone(),
+            checkout_roots: [
+                canonical_watch_path(&config.paths.main_clone).await,
+                canonical_watch_path(&config.paths.worktree_root).await,
+            ],
+            layout: RwLock::default(),
+        });
+        let watcher = if notifications {
+            let callback_router = router.clone();
+            let callback_roots = edit_roots.clone();
+            let callback_pending = pending_edits.clone();
+            let callback_changed = edit_changed.clone();
+            let callback_observed_files = observed_files.clone();
+            let callback_rewatch = rewatch.clone();
+            let callback_vanished = vanished_gate.clone();
+            let mut watcher = tokio::task::spawn_blocking(move || {
+                watcher::new(move |event: notify::Result<Event>| match event {
+                    Ok(event) if relevant(&event) => {
+                        let paths = if event.need_rescan() {
+                            event.paths.clone()
+                        } else {
+                            unobserved_paths(&event.paths, &callback_observed_files)
+                        };
+                        if event.paths.is_empty() || !paths.is_empty() {
+                            callback_router.invalidate(&paths);
+                        }
+                        if edit_event(&event) {
+                            let roots = callback_roots.read().ok();
+                            let mut changed = false;
+                            if let Some(roots) = roots.as_deref() {
+                                let timestamp = now_ms();
+                                let slugs: BTreeSet<_> = event.paths.iter().take(256)
+                                    .filter(|path| !is_state_db_path(path, &callback_router.state_db))
+                                    .filter_map(|path| edited_slug(path, roots))
+                                    .collect();
+                                if !slugs.is_empty()
+                                    && let Ok(mut pending) = callback_pending.lock()
+                                {
+                                    for slug in slugs {
+                                        let value = pending.entry(slug).or_default();
+                                        *value = (*value).max(timestamp);
+                                        changed = true;
+                                    }
                                 }
                             }
-                        }
-                        if changed {
-                            callback_changed.notify_one();
+                            if changed {
+                                callback_changed.notify_one();
+                            }
                         }
                     }
-                }
-                Ok(_) => {},
-                Err(error) if vanished(&error) => {
-                    // Expected while a checkout is removed. The poller repeats
-                    // this every interval until the path is unwatched, so one
-                    // refresh and watch-list re-read covers the whole burst.
-                    if callback_vanished.allow() {
-                        tracing::debug!(%error, paths = ?error.paths, "watched path vanished; re-reading watch list");
-                        observed_git.refresh();
-                        observed_metadata.refresh();
-                        callback_rewatch.notify_one();
+                    Ok(_) => {},
+                    Err(error) if vanished(&error) => {
+                        // Expected while a checkout is removed. The poller repeats
+                        // this every interval until the path is unwatched, so one
+                        // refresh and watch-list re-read covers the whole burst.
+                        if callback_vanished.allow() {
+                            tracing::debug!(%error, paths = ?error.paths, "watched path vanished; re-reading watch list");
+                            callback_router.invalidate(&error.paths);
+                            callback_router.metadata.metadata.refresh();
+                            callback_rewatch.notify_one();
+                        }
                     }
+                    Err(error) => {
+                        tracing::warn!(%error, "filesystem notification lost; refreshing source");
+                        callback_router.git.refresh();
+                        callback_router.metadata.metadata.refresh();
+                    }
+                })
+            });
+            let watcher = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    // `spawn_blocking` cannot be aborted. Drain its result so a
+                    // watcher created concurrently with shutdown is dropped here
+                    // instead of being detached from the source lifetime.
+                    if let Ok(Ok(watcher)) = watcher.await {
+                        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
+                    }
+                    return;
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "filesystem notification lost; refreshing source");
-                    observed_git.refresh();
-                    observed_metadata.refresh();
+                watcher = &mut watcher => watcher,
+            };
+            match watcher {
+                Ok(Ok(watcher)) => Some(watcher),
+                error => {
+                    tracing::warn!(?error, "filesystem watcher unavailable; using the scan");
+                    None
                 }
-            })
-        });
-        let watcher = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                // `spawn_blocking` cannot be aborted. Drain its result so a
-                // watcher created concurrently with shutdown is dropped here
-                // instead of being detached from the source lifetime.
-                if let Ok(Ok(watcher)) = watcher.await {
-                    wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
-                }
-                return;
             }
-            watcher = &mut watcher => watcher,
+        } else {
+            None
         };
-        let mut watcher = match watcher {
-            Ok(Ok(watcher)) => Some(watcher),
-            error => {
-                tracing::warn!(?error, "filesystem watcher unavailable; using refresh backstop");
-                None
-            }
+        let mut watch = Watch {
+            watcher,
+            registered: BTreeMap::new(),
+            sampled: BTreeMap::new(),
+            fingerprint: None,
+            observed: observed_files,
+            probe,
+            cancellation: cancellation.clone(),
         };
-        let mut registered = BTreeMap::new();
         let mut updates = source.subscribe();
         updates.mark_changed();
         // The watch list derives from the Git source's inventory, minus
@@ -186,6 +782,11 @@ fn start_with_notifications(
         git_updates.mark_changed();
         metadata_updates.mark_changed();
         let mut inputs = Vec::<WorktreeRecord>::new();
+        // Inventory checkouts kept out of `inputs`: their removal is accepted.
+        let mut unwatched = BTreeSet::<String>::new();
+        // Checkouts a listing named that no published inventory shows yet,
+        // with the moment each was named.
+        let mut listed = Vec::<(WorktreeRecord, Stamp)>::new();
         // Some listed checkout was missing at the last reconcile; any later
         // inventory may be the one that shows it again.
         let mut inputs_missing = false;
@@ -194,87 +795,69 @@ fn start_with_notifications(
         // File invalidation belongs to the host even when no automation
         // subscribes to the optional edit-timestamp stream.
         let mut edits_open = true;
+        let mut coverage_open = true;
         let mut reconcile = true;
         let mut backstop = tokio::time::interval_at(tokio::time::Instant::now() + BACKSTOP, BACKSTOP);
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut metadata_backstop = tokio::time::interval_at(
-            tokio::time::Instant::now() + METADATA_BACKSTOP,
-            METADATA_BACKSTOP,
-        );
-        metadata_backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut fingerprint = None;
+        let mut next_scan = tokio::time::Instant::now() + SCAN_INTERVAL;
+        let mut scan = None::<Scan>;
+        let slow_scan = RateGate::new(BACKSTOP);
         loop {
-            if reconcile && let Some(active) = watcher.take() {
-                let desired = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => {
-                        wt_app_core::watcher_cleanup::drop_watcher(active).await;
-                        break;
-                    }
-                    desired = desired_paths(&config, &inputs) => desired,
-                };
-                match desired {
+            if std::mem::take(&mut reconcile) {
+                let records: Vec<WorktreeRecord> = inputs
+                    .iter()
+                    .chain(listed.iter().map(|(record, _)| record))
+                    .cloned()
+                    .collect();
+                match desired_paths(&config, &records).await {
                     Ok((paths, missing)) => {
                         inputs_missing = missing;
-                        let previous_registered = registered.clone();
-                        let update_cancel = cancellation.clone();
-                        let mut update = tokio::task::spawn_blocking(move || {
-                            if notifications {
-                                update_watches(active, registered, paths, &update_cancel)
-                            } else {
-                                (active, paths, false)
-                            }
-                        });
-                        let update = tokio::select! {
-                            biased;
-                            _ = cancellation.cancelled() => {
-                                // The blocking watcher update owns `active`.
-                                // Join it and drop the returned watcher before
-                                // this source task exits.
-                                if let Ok((watcher, _, _)) = update.await {
-                                    wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
-                                }
-                                break;
-                            }
-                            update = &mut update => update,
-                        };
-                        match update {
-                            Ok((active, paths, cancelled)) => {
-                                if cancelled {
-                                    wt_app_core::watcher_cleanup::drop_watcher(active).await;
-                                    break;
-                                }
-                                let watch_set_changed = paths != previous_registered;
-                                watcher = Some(active);
-                                registered = paths;
-                                if let Some(probe) = &probe && let Ok(mut probe) = probe.lock() {
-                                    *probe = registered.clone();
-                                }
-                                if watch_set_changed {
-                                    tracing::debug!("watch registration invalidates Git");
-                                    // Inventory can finish before its paths are
-                                    // watched. A single follow-up scan closes that
-                                    // gap without delaying the first board render.
-                                    git.refresh();
-                                }
-                                if !edits_published {
-                                    edits_published = true;
-                                    edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "filesystem watch worker stopped; using refresh backstop");
-                                registered = BTreeMap::new();
-                            }
+                        let fresh = watch.apply(paths).await;
+                        if cancellation.is_cancelled() {
+                            break;
+                        }
+                        // A root that was not watched until now may have
+                        // changed since its rows were read, and no sample
+                        // will ever show that. Read what it can reach again.
+                        if !fresh.is_empty() {
+                            let rows: Option<Vec<String>> = fresh
+                                .iter()
+                                .map(|root| {
+                                    records
+                                        .iter()
+                                        .zip(crate::local_source::git_keys(&records))
+                                        .find(|(record, _)| {
+                                            Path::new(&record.target.path) == root.as_path()
+                                        })
+                                        .map(|(_, key)| key)
+                                })
+                                .collect();
+                            tracing::debug!(?fresh, ?rows, "new watch roots invalidate Git");
+                            match rows {
+                                Some(rows) => git.request_keys(Request::Recheck, rows),
+                                None => git.request(Request::Recheck),
+                            };
+                        }
+                        // A checkout left unwatched on purpose (its removal is
+                        // accepted) has nothing more to wait for either.
+                        if let Ok(mut covered) = coverage.covered.write() {
+                            *covered = records
+                                .iter()
+                                .map(|record| record.target.path.clone())
+                                .chain(unwatched.iter().cloned())
+                                .collect();
+                        }
+                        if !edits_published {
+                            edits_published = true;
+                            edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
                         }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "cannot reconcile filesystem watches");
-                        watcher = Some(active);
                     }
                 }
-                reconcile = false;
             }
+            let metadata_due = paced.due();
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
@@ -296,18 +879,86 @@ fn start_with_notifications(
                 changed = git_updates.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = git_updates.borrow_and_update().clone();
+                    if let Some(rows) = snapshot.data()
+                        && let Ok(mut layout) = router.layout.write()
+                    {
+                        *layout = Layout::new(rows);
+                    }
+                    // A live inventory listed at or after a checkout was
+                    // named decides whether it is still there.
+                    if let Some(meta) = snapshot.domains().get(&Domain::Git).filter(|meta| meta.is_live()) {
+                        let index = meta.keyed().map_or(meta.observed(), |keyed| keyed.index());
+                        let named = listed.len();
+                        listed.retain(|(_, named)| index.at_or_after(named) != Some(true));
+                        reconcile |= listed.len() != named;
+                    }
                     let next = watch_inputs(&snapshot, &metadata.snapshot());
                     reconcile |= next != inputs || inputs_missing;
+                    unwatched = unwatched_paths(&snapshot, &next);
                     inputs = next;
                 }
                 changed = metadata_updates.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = metadata_updates.borrow_and_update().clone();
-                    let next = watch_inputs(&git.snapshot(), &snapshot);
+                    let rows = git.snapshot();
+                    let next = watch_inputs(&rows, &snapshot);
                     reconcile |= next != inputs;
+                    unwatched = unwatched_paths(&rows, &next);
                     inputs = next;
                 }
                 _ = rewatch.notified() => { reconcile = true; }
+                request = coverage.requests.recv(), if coverage_open => {
+                    let Some(request) = request else {
+                        coverage_open = false;
+                        continue;
+                    };
+                    let state = metadata.snapshot();
+                    let state = state.data().map(|metadata| &metadata.0);
+                    let named = Stamp::now();
+                    let mut records: Vec<WorktreeRecord> = inputs
+                        .iter()
+                        .chain(listed.iter().map(|(record, _)| record))
+                        .cloned()
+                        .collect();
+                    let mut asked = Vec::with_capacity(request.records.len());
+                    let asked_keys = crate::local_source::git_keys(&request.records);
+                    for record in request.records {
+                        asked.push(record.target.path.clone());
+                        if !state.is_some_and(|state| removing(state, &record))
+                            && !records.iter().any(|known| known.target.path == record.target.path)
+                        {
+                            records.push(record.clone());
+                            listed.push((record, named));
+                        }
+                    }
+                    // The listing waits for this, so its rows are read
+                    // against a baseline: nothing here needs a second read.
+                    match desired_paths(&config, &records).await {
+                        Ok((paths, missing)) => {
+                            inputs_missing |= missing;
+                            watch.apply(paths).await;
+                            if cancellation.is_cancelled() {
+                                break;
+                            }
+                            if let Ok(mut covered) = coverage.covered.write() {
+                                covered.extend(asked);
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "cannot cover listed checkouts"),
+                    }
+                    // A listing that stopped waiting has read its rows, or is
+                    // reading them, without this baseline: whatever changed
+                    // between such a read and now will never differ from a
+                    // sample. Read those rows again against it.
+                    if request.done.send(()).is_err() {
+                        tracing::debug!(rows = ?asked_keys, "checkouts were covered after their listing stopped waiting");
+                        git.request_keys(Request::Recheck, asked_keys);
+                    }
+                }
+                _ = paced.held.notified() => {}
+                _ = tokio::time::sleep_until(metadata_due.unwrap_or_else(tokio::time::Instant::now)), if metadata_due.is_some() => {
+                    paced.release();
+                }
                 request = edit_publisher.requested(), if edits_open => {
                     if request.is_none() { edits_open = false; }
                     else { edit_changed.notify_one(); }
@@ -320,38 +971,86 @@ fn start_with_notifications(
                     }
                     edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
                 }
-                _ = metadata_backstop.tick() => {
-                    let paths = registered.clone();
-                    let probe_cancel = cancellation.clone();
-                    let next = tokio::task::spawn_blocking(move || watch_fingerprint(&paths, &probe_cancel)).await;
-                    if let Ok(Some(next)) = next {
-                        let next = Arc::new(next);
-                        // Refresh on the first sample too: an edit may occur
-                        // between watcher registration and this baseline.
-                        let changed = changed_paths(fingerprint.as_deref(), &next);
-                        if !changed.is_empty() {
-                            let (git_changed, metadata_changed) = invalidations(&changed, &probe_state_db, &probe_checkout_roots);
-                            tracing::debug!(?changed, git_changed, metadata_changed, "filesystem metadata invalidation");
-                            if git_changed { git.refresh(); }
-                            if metadata_changed { metadata.refresh(); }
-                        }
-                        if let Ok(mut observed) = observed_files.write() {
-                            *observed = Some(next.clone());
-                        }
-                        fingerprint = Some(next);
+                finished = async {
+                    match scan.as_mut() {
+                        Some(scan) => (&mut scan.work).await,
+                        None => std::future::pending().await,
                     }
+                }, if scan.is_some() => {
+                    let Some(Scan { roots, started, .. }) = scan.take() else { continue };
+                    let elapsed = started.elapsed();
+                    next_scan = started + SCAN_INTERVAL.max(elapsed * SCAN_DUTY);
+                    if elapsed > SCAN_INTERVAL && slow_scan.allow() {
+                        tracing::warn!(
+                            roots = roots.len(),
+                            elapsed_ms = elapsed.as_millis(),
+                            "the filesystem scan is slow; changes are noticed that much later"
+                        );
+                    }
+                    let Ok(Some(sample)) = finished else { continue };
+                    let entries = sample.len();
+                    let mut changed = watch.settle(&roots, sample);
+                    // A signal file the tick has already reported as it is now.
+                    if let Some(signals) = &signals
+                        && let (Ok(seen), Some(now)) = (signals.lock(), watch.fingerprint.as_deref())
+                    {
+                        changed.retain(|path| seen.get(path).is_none_or(|seen| seen.as_ref() != now.get(path)));
+                    }
+                    changed.retain(|path| relevant_path(path));
+                    tracing::debug!(entries, elapsed_ms = elapsed.as_millis(), ?changed, "filesystem scan");
+                    if changed.is_empty() {
+                        continue;
+                    }
+                    router.invalidate(&changed);
+                    // Without notifications the scan is also what dates edits.
+                    if watch.watcher.is_none()
+                        && let Ok(roots) = edit_roots.read()
+                    {
+                        let timestamp = now_ms();
+                        let slugs: BTreeSet<_> = changed.iter().take(256)
+                            .filter(|path| !is_state_db_path(path, &state_db))
+                            .filter_map(|path| edited_slug(path, &roots))
+                            .collect();
+                        if !slugs.is_empty() {
+                            for slug in slugs {
+                                latest_edits.entry(slug).and_modify(|current| *current = (*current).max(timestamp)).or_insert(timestamp);
+                            }
+                            edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(next_scan), if scan.is_none() => {
+                    let roots = watch.registered.clone();
+                    let scan_roots = roots.clone();
+                    let scan_cancel = cancellation.clone();
+                    scan = Some(Scan {
+                        roots,
+                        started: tokio::time::Instant::now(),
+                        work: tokio::task::spawn_blocking(move || watch_fingerprint(&scan_roots, &scan_cancel)),
+                    });
                 }
                 _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
             }
         }
-        wt_app_core::watcher_cleanup::drop_watcher(watcher).await;
+        // A scan in flight stops at its next cancellation check.
+        if let Some(scan) = scan {
+            let _ = scan.work.await;
+        }
+        wt_app_core::watcher_cleanup::drop_watcher(watch.watcher).await;
     });
     edits
 }
 
-/// A bounded notification-loss backstop, not a recursive checkout scan. The
-/// watch contract includes immediate checkout children and recursive Git
-/// metadata only. Symlinks and generated dependency trees are never followed.
+/// A metadata scan in flight, with the roots it was started for.
+struct Scan {
+    roots: BTreeMap<PathBuf, bool>,
+    started: tokio::time::Instant,
+    work: tokio::task::JoinHandle<Option<WatchFingerprint>>,
+}
+
+/// File metadata of the watch set, not a recursive checkout scan. The watch
+/// contract includes immediate checkout children and recursive Git metadata
+/// only. Symlinks and generated dependency trees are never followed.
 type WatchFingerprint = BTreeMap<PathBuf, FileSignature>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -409,10 +1108,7 @@ fn unobserved_paths(
         .collect()
 }
 
-fn changed_paths(previous: Option<&WatchFingerprint>, next: &WatchFingerprint) -> Vec<PathBuf> {
-    let Some(previous) = previous else {
-        return next.keys().cloned().collect();
-    };
+fn changed_paths(previous: &WatchFingerprint, next: &WatchFingerprint) -> Vec<PathBuf> {
     previous
         .keys()
         .chain(next.keys())
@@ -423,41 +1119,38 @@ fn changed_paths(previous: Option<&WatchFingerprint>, next: &WatchFingerprint) -
         .collect()
 }
 
+/// Sample the whole watch set. Only cancellation ends a scan early: a sample
+/// cut short by a size or time limit would compare as nothing changed while
+/// still costing the walk. A large set is paced by its caller instead. A
+/// directory that cannot be listed (it is being removed) keeps its own entry
+/// and loses its children, which reads as their removal.
 fn watch_fingerprint(
     paths: &BTreeMap<PathBuf, bool>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Option<WatchFingerprint> {
-    let started = std::time::Instant::now();
     let mut result = BTreeMap::new();
     let mut pending: Vec<_> = paths
         .iter()
         .map(|(path, recursive)| (path.clone(), *recursive, true))
         .collect();
     while let Some((path, recursive, descend)) = pending.pop() {
-        if cancellation.is_cancelled() || started.elapsed() > Duration::from_millis(200) {
+        if cancellation.is_cancelled() {
             return None;
         }
         if generated_path(&path) {
             continue;
-        }
-        if result.len() >= MAX_METADATA_ENTRIES {
-            return None;
         }
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
         result.insert(path.clone(), FileSignature::from_metadata(&metadata));
         if descend && metadata.is_dir() {
-            let entries = std::fs::read_dir(&path).ok()?;
-            for entry in entries {
-                if cancellation.is_cancelled() || started.elapsed() > Duration::from_millis(200) {
-                    return None;
-                }
-                let path = entry.ok()?.path();
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
                 if !generated_path(&path) {
-                    if pending.len() + result.len() >= MAX_METADATA_ENTRIES {
-                        return None;
-                    }
                     pending.push((path, recursive, recursive));
                 }
             }
@@ -509,6 +1202,20 @@ fn watch_inputs(
         .flat_map(|rows| rows.iter())
         .map(|row| &row.worktree)
         .filter(|record| !state.is_some_and(|state| removing(state, record)))
+        .cloned()
+        .collect()
+}
+
+/// Paths of inventory checkouts that `inputs` leaves out.
+fn unwatched_paths(
+    git: &wt_runtime::SourceSnapshot<Vec<WorktreeSnapshot>>,
+    inputs: &[WorktreeRecord],
+) -> BTreeSet<String> {
+    git.data()
+        .into_iter()
+        .flat_map(|rows| rows.iter())
+        .map(|row| &row.worktree.target.path)
+        .filter(|path| !inputs.iter().any(|record| record.target.path == **path))
         .cloned()
         .collect()
 }
@@ -699,16 +1406,16 @@ fn relevant(event: &Event) -> bool {
     if matches!(event.kind, EventKind::Access(_)) {
         return false;
     }
-    event.paths.is_empty()
-        || event.paths.iter().any(|path| {
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            !name.ends_with(".lock")
-                && !matches!(name, "FETCH_HEAD" | "ORIG_HEAD")
-                && !generated_path(path)
-        })
+    event.paths.is_empty() || event.paths.iter().any(|path| relevant_path(path))
+}
+
+/// Lock files and fetch bookkeeping change nothing the board shows.
+fn relevant_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    !name.ends_with(".lock") && !matches!(name, "FETCH_HEAD" | "ORIG_HEAD") && !generated_path(path)
 }
 
 fn generated_path(path: &Path) -> bool {
@@ -739,24 +1446,32 @@ fn invalidations(
     if paths.is_empty() {
         return (true, true);
     }
-    let mut git = false;
-    let mut metadata = false;
-    for path in paths {
-        if is_state_db_path(path, state_db) {
-            metadata = true;
-        } else if Some(path.as_path()) == state_db.parent() {
-            // Creating/removing a WAL changes its parent directory's mtime.
-            // The metadata probe samples that directory too; it is not a Git
-            // edit unless the shared state directory is inside a checkout.
-            metadata = true;
-            git |= checkout_roots.iter().any(|root| path.starts_with(root));
-        } else if path.parent() != state_db.parent()
-            || checkout_roots.iter().any(|root| path.starts_with(root))
-        {
-            git = true;
-        }
+    paths.iter().fold((false, false), |(git, metadata), path| {
+        let path = invalidation(path, state_db, checkout_roots);
+        (git | path.0, metadata | path.1)
+    })
+}
+
+/// Whether one changed path invalidates Git facts, presentation state, both
+/// or neither.
+fn invalidation(path: &Path, state_db: &Path, checkout_roots: &[PathBuf]) -> (bool, bool) {
+    if is_state_db_path(path, state_db) {
+        (false, true)
+    } else if Some(path) == state_db.parent() {
+        // Creating/removing a WAL changes its parent directory's mtime.
+        // The metadata scan samples that directory too; it is not a Git
+        // edit unless the shared state directory is inside a checkout.
+        (
+            checkout_roots.iter().any(|root| path.starts_with(root)),
+            true,
+        )
+    } else {
+        (
+            path.parent() != state_db.parent()
+                || checkout_roots.iter().any(|root| path.starts_with(root)),
+            false,
+        )
     }
-    (git, metadata)
 }
 
 fn is_state_db_path(path: &Path, state_db: &Path) -> bool {
@@ -1014,10 +1729,7 @@ mod tests {
         let before = watch_fingerprint(&paths, &cancel).unwrap();
         std::fs::write(&file, "new").unwrap();
         let after = watch_fingerprint(&paths, &cancel).unwrap();
-        assert_eq!(
-            changed_paths(Some(&before), &after),
-            std::slice::from_ref(&file)
-        );
+        assert_eq!(changed_paths(&before, &after), std::slice::from_ref(&file));
         let observed = RwLock::new(Some(Arc::new(after)));
         assert!(unobserved_paths(std::slice::from_ref(&file), &observed).is_empty());
         std::fs::write(&file, "newer").unwrap();
@@ -1115,13 +1827,11 @@ mod tests {
         assert!(first.contains_key(&root.path().join(".git/refs/heads/main")));
         assert!(!first.contains_key(&root.path().join("src/deep")));
         assert!(!first.keys().any(|path| generated_path(path)));
-        assert!(
-            changed_paths(Some(&first), &watch_fingerprint(&paths, &cancel).unwrap()).is_empty()
-        );
+        assert!(changed_paths(&first, &watch_fingerprint(&paths, &cancel).unwrap()).is_empty());
         std::fs::write(root.path().join("tracked.txt"), "changed").unwrap();
         let next = watch_fingerprint(&paths, &cancel).unwrap();
         assert_eq!(
-            changed_paths(Some(&first), &next),
+            changed_paths(&first, &next),
             vec![root.path().join("tracked.txt")]
         );
         cancel.cancel();
@@ -1225,6 +1935,7 @@ mod tests {
             board,
             git.view(),
             metadata.view(),
+            coverage().1,
             notifications,
             None,
         );
@@ -1395,6 +2106,7 @@ mod tests {
             board,
             git.view(),
             metadata.view(),
+            coverage().1,
             true,
             Some(probe.clone()),
         );
@@ -1456,5 +2168,385 @@ mod tests {
         );
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();
+    }
+
+    fn layout_row(
+        key: &str,
+        path: &str,
+        git_dir: &str,
+        branch: &str,
+        upstream: Option<&str>,
+    ) -> LayoutRow {
+        LayoutRow {
+            key: key.into(),
+            path: path.into(),
+            git_dir: Some(git_dir.into()),
+            common_dir: Some("/repo/main/.git".into()),
+            branch: branch.into(),
+            upstream: upstream.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn changed_paths_reach_only_the_checkouts_they_can_affect() {
+        let layout = Layout {
+            rows: vec![
+                layout_row(
+                    "main",
+                    "/repo/main",
+                    "/repo/main/.git",
+                    "main",
+                    Some("origin/main"),
+                ),
+                layout_row(
+                    "one",
+                    "/wt/one",
+                    "/repo/main/.git/worktrees/one",
+                    "feature/one",
+                    Some("origin/feature/one"),
+                ),
+                layout_row(
+                    "two",
+                    "/wt/two",
+                    "/repo/main/.git/worktrees/two",
+                    "feature/two",
+                    None,
+                ),
+            ],
+        };
+        let touch = |path: &str| layout.touch(&[PathBuf::from(path)], Path::new("/wt"));
+        let rows = |keys: &[&str]| Touch::Rows(keys.iter().map(|key| (*key).to_owned()).collect());
+        // A checkout's files and its own Git administration reach that row.
+        assert_eq!(touch("/wt/one/src/lib.rs"), rows(&["one"]));
+        assert_eq!(touch("/wt/one/.git"), rows(&["one"]));
+        assert_eq!(touch("/repo/main/.git/worktrees/one/index"), rows(&["one"]));
+        assert_eq!(touch("/repo/main/.git/worktrees/one"), rows(&["one"]));
+        assert_eq!(touch("/repo/main/.git/index"), rows(&["main"]));
+        assert_eq!(touch("/repo/main/.git"), rows(&["main"]));
+        assert_eq!(touch("/repo/main/tracked.txt"), rows(&["main"]));
+        // A ref reaches the checkouts on it or tracking it; a directory of
+        // refs stands for all of them.
+        assert_eq!(
+            touch("/repo/main/.git/refs/heads/feature/one"),
+            rows(&["one"])
+        );
+        assert_eq!(
+            touch("/repo/main/.git/refs/heads/feature"),
+            rows(&["one", "two"])
+        );
+        assert_eq!(
+            touch("/repo/main/.git/refs/remotes/origin/feature/one"),
+            rows(&["one"])
+        );
+        assert_eq!(
+            touch("/repo/main/.git/refs/remotes/origin/main"),
+            rows(&["main"])
+        );
+        assert_eq!(touch("/repo/main/.git/refs/heads/feature/o"), rows(&[]));
+        // Nothing a status reads, but still a listing: facts derived from
+        // refs wake on it, and a new or removed checkout shows there.
+        assert_eq!(touch("/repo/main/.git/refs/tags/v1"), rows(&[]));
+        assert_eq!(
+            touch("/repo/main/.git/refs/remotes/origin/other"),
+            rows(&[])
+        );
+        assert_eq!(touch("/repo/main/.git/worktrees"), rows(&[]));
+        assert_eq!(touch("/repo/main/.git/worktrees/arriving/HEAD"), rows(&[]));
+        assert_eq!(touch("/wt"), rows(&[]));
+        assert_eq!(touch("/wt/arriving/file"), rows(&[]));
+        // Shared by every checkout, or not placeable at all: read everything.
+        assert_eq!(touch("/repo/main/.git/packed-refs"), Touch::All);
+        assert_eq!(touch("/repo/main/.git/config"), Touch::All);
+        // The excludes every checkout counts its untracked files by.
+        assert_eq!(touch("/repo/main/.git/info"), Touch::All);
+        assert_eq!(touch("/repo/main/.git/info/exclude"), Touch::All);
+        // Where the filesystem folds case, a ref file need not be spelled
+        // as its branch is.
+        let folded: &[&str] = if REFS_FOLD_CASE { &["one"] } else { &[] };
+        assert_eq!(
+            touch("/repo/main/.git/refs/heads/Feature/one"),
+            rows(folded)
+        );
+        assert_eq!(
+            touch("/repo/main/.git/refs/remotes/origin/FEATURE/one"),
+            rows(folded)
+        );
+        assert_eq!(touch("/elsewhere/file"), Touch::All);
+        assert_eq!(layout.touch(&[], Path::new("/wt")), Touch::All);
+        assert_eq!(
+            layout.touch(
+                &[
+                    "/wt/one/a".into(),
+                    "/repo/main/.git/worktrees/two/HEAD".into()
+                ],
+                Path::new("/wt")
+            ),
+            rows(&["one", "two"])
+        );
+        assert_eq!(
+            layout.touch(&["/wt/one/a".into(), "/elsewhere".into()], Path::new("/wt")),
+            Touch::All
+        );
+        // With no inventory yet nothing can be placed.
+        assert_eq!(
+            Layout::default().touch(&["/repo/main/.git/index".into()], Path::new("/wt")),
+            Touch::All
+        );
+    }
+
+    #[test]
+    fn a_scan_past_the_old_entry_limit_is_still_a_whole_sample() {
+        let root = tempfile::tempdir().unwrap();
+        let refs = root.path().join("refs");
+        std::fs::create_dir(&refs).unwrap();
+        for index in 0..9_000 {
+            std::fs::write(refs.join(format!("ref-{index}")), "").unwrap();
+        }
+        let paths = BTreeMap::from([(refs.clone(), true)]);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = watch_fingerprint(&paths, &cancel).expect("a large watch set is sampled");
+        assert_eq!(first.len(), 9_001);
+        std::fs::write(refs.join("ref-8999"), "moved").unwrap();
+        let next = watch_fingerprint(&paths, &cancel).unwrap();
+        assert_eq!(changed_paths(&first, &next), [refs.join("ref-8999")]);
+    }
+
+    #[tokio::test]
+    async fn new_roots_get_a_baseline_and_changes_since_it_are_reported() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let (old, new) = (root.join("old"), root.join("new"));
+        std::fs::create_dir(&old).unwrap();
+        std::fs::create_dir(&new).unwrap();
+        std::fs::write(old.join("file"), "a").unwrap();
+        std::fs::write(new.join("file"), "a").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut watch = Watch {
+            watcher: None,
+            registered: BTreeMap::new(),
+            sampled: BTreeMap::new(),
+            fingerprint: None,
+            observed: Arc::default(),
+            probe: None,
+            cancellation: cancel.clone(),
+        };
+        let only_old = BTreeMap::from([(root.clone(), false), (old.clone(), false)]);
+        assert_eq!(watch.apply(only_old.clone()).await.len(), 2);
+        // The first sample of a root is a baseline, not a change.
+        assert!(
+            watch
+                .settle(&only_old, watch_fingerprint(&only_old, &cancel).unwrap())
+                .is_empty()
+        );
+
+        // A scan starts, then a root is added and baselined while it runs.
+        let scan = watch_fingerprint(&only_old, &cancel).unwrap();
+        let both = BTreeMap::from([
+            (root.clone(), false),
+            (old.clone(), false),
+            (new.clone(), false),
+        ]);
+        assert_eq!(
+            watch.apply(both.clone()).await,
+            BTreeSet::from([new.clone()])
+        );
+        std::fs::write(new.join("file"), "changed after the baseline").unwrap();
+        std::fs::write(old.join("file"), "changed too").unwrap();
+        // The older scan knows nothing of the new root: that is not a change
+        // to its files, and it must not cost the root its baseline.
+        assert!(watch.settle(&only_old, scan).is_empty());
+        let changed = watch.settle(&both, watch_fingerprint(&both, &cancel).unwrap());
+        assert_eq!(changed, [new.join("file"), old.join("file")]);
+
+        // Dropping a root is not a change to its files either.
+        let scan = watch_fingerprint(&both, &cancel).unwrap();
+        watch.apply(only_old.clone()).await;
+        assert!(watch.settle(&both, scan).is_empty());
+        assert!(
+            !watch
+                .fingerprint
+                .as_ref()
+                .unwrap()
+                .contains_key(&new.join("file"))
+        );
+        assert!(covers(&only_old, &old.join("file")));
+        assert!(!covers(&only_old, &old.join("deep/file")));
+        assert!(covers(
+            &BTreeMap::from([(old.clone(), true)]),
+            &old.join("deep/file")
+        ));
+    }
+
+    #[tokio::test]
+    async fn signal_files_are_noticed_within_a_few_ticks_and_only_when_they_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.sqlite");
+        let wal = root.path().join("state.sqlite-wal");
+        std::fs::write(&database, "a").unwrap();
+        let scope = TaskScope::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = signal_tick(&scope, vec![database.clone(), wal.clone()], {
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(SIGNAL_TICK * 4).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the first look is a baseline"
+        );
+        // A file that appears is a change, as the WAL does on first write.
+        let written = std::time::Instant::now();
+        std::fs::write(&wal, "frame").unwrap();
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                written.elapsed() < Duration::from_secs(5),
+                "the tick never fired"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let noticed = written.elapsed();
+        tokio::time::sleep(SIGNAL_TICK * 4).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged file is not reported again"
+        );
+        let wal = std::fs::canonicalize(&wal).unwrap();
+        assert!(seen.lock().unwrap().get(&wal).is_some_and(Option::is_some));
+        scope.shutdown(Duration::from_secs(2)).await.unwrap();
+        // Generous for a loaded machine; the one-second scan it replaces
+        // would average half a second and reach a full one.
+        assert!(
+            noticed < Duration::from_millis(600),
+            "noticed after {noticed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkouts_covered_after_their_listing_gave_up_are_read_again() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let records = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let scope = TaskScope::new();
+        fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
+            SourceSpec {
+                name,
+                domain,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            }
+        }
+        let (git, mut git_publisher) =
+            leaf_channel::<Vec<WorktreeSnapshot>>(&scope, spec("test-git", Domain::Git));
+        let (metadata, _metadata_publisher) = leaf_channel::<crate::local_source::Metadata>(
+            &scope,
+            spec("test-metadata", Domain::Metadata),
+        );
+        let (board, _board_publisher) = wt_runtime::derived_channel(&scope, "test-board");
+        let (coverage, requests) = coverage();
+        // The listing asked for coverage and stopped waiting before the
+        // watcher got to it: nobody is listening for the answer.
+        let (done, gave_up) = oneshot::channel();
+        drop(gave_up);
+        coverage
+            .requests
+            .send(CoverRequest {
+                records: records.clone(),
+                done,
+            })
+            .await
+            .unwrap();
+        let _edits = start_with_notifications(
+            &scope,
+            fixture.ctx.config.clone(),
+            board,
+            git.view(),
+            metadata.view(),
+            requests,
+            false,
+            None,
+        );
+        // Its rows were read without a baseline, so each is asked for again.
+        let mut asked = BTreeSet::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while asked.len() < records.len() {
+            tokio::time::timeout_at(deadline, git_publisher.requested())
+                .await
+                .expect("the late rows were never asked for again")
+                .unwrap();
+            let demand = git_publisher.take_demand();
+            assert!(
+                demand
+                    .keys
+                    .values()
+                    .all(|request| *request == Request::Recheck)
+            );
+            asked.extend(demand.keys.into_keys());
+        }
+        assert_eq!(
+            asked,
+            BTreeSet::from(["main".to_owned(), "one".to_owned(), "two".to_owned()])
+        );
+        // And they count as covered from here on.
+        assert!(
+            coverage
+                .covered
+                .read()
+                .unwrap()
+                .contains(&records[0].target.path)
+        );
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn other_processes_writes_are_read_at_once_and_then_paced() {
+        let scope = TaskScope::new();
+        let (metadata, mut publisher) = leaf_channel::<crate::local_source::Metadata>(
+            &scope,
+            SourceSpec {
+                name: "test-metadata",
+                domain: Domain::Metadata,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            },
+        );
+        let interval = Duration::from_millis(200);
+        let paced = Paced::new(metadata.view(), interval);
+        let asked =
+            |publisher: &mut wt_runtime::LeafPublisher<_>| publisher.take_demand().whole.is_some();
+        // A lone write is read at once.
+        paced.signal();
+        assert!(asked(&mut publisher));
+        assert!(paced.due().is_none());
+        // Writes that follow closely are held back, however many.
+        for _ in 0..20 {
+            paced.signal();
+        }
+        assert!(!asked(&mut publisher));
+        let due = paced.due().expect("one read is held back");
+        assert!(due <= tokio::time::Instant::now() + interval);
+        paced.held.notified().await;
+        // The held read goes out when its time comes, once.
+        tokio::time::sleep_until(due).await;
+        paced.release();
+        assert!(asked(&mut publisher));
+        paced.release();
+        assert!(!asked(&mut publisher));
+        // After a quiet interval the next write is read at once again.
+        tokio::time::sleep(interval).await;
+        paced.signal();
+        assert!(asked(&mut publisher));
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

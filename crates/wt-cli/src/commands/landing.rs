@@ -78,8 +78,13 @@ impl RowLanding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Want {
     /// Rows whose list reads differently once landed: those that owe a
-    /// check or hold a merge gate. Enough for the printed list.
+    /// check or hold a merge gate. Enough for the printed list, and for
+    /// nothing else: no other row is read at all, and its landing comes
+    /// back as not landed whatever it is.
     Lists,
+    /// [`Want::Lists`], and for every other row what Git alone proves at
+    /// no GitHub read: enough for the phase of a row already known landed.
+    ListsAndGit,
     /// Every row: the command reports each row's phase.
     Phases,
 }
@@ -177,13 +182,15 @@ async fn read_for(
     want: Want,
     usage: Use,
 ) -> BTreeMap<String, RowLanding> {
-    let saved = tokio::task::spawn_blocking({
-        let ctx = ctx.clone();
-        move || saved_merges(&ctx)
-    })
-    .await
-    .ok()
-    .flatten();
+    let saved = || async {
+        tokio::task::spawn_blocking({
+            let ctx = ctx.clone();
+            move || saved_merges(&ctx)
+        })
+        .await
+        .ok()
+        .flatten()
+    };
     resolve(
         ctx,
         rows,
@@ -210,31 +217,49 @@ pub(crate) async fn read_with(
         rows,
         state,
         Want::Phases,
-        None,
+        || async { None },
         &Use::Display.bases(),
         |_| async move { fetched },
     )
     .await
 }
 
-async fn resolve<F>(
+/// `saved` is the board's saved GitHub data, read only when Git leaves a
+/// row open.
+async fn resolve<S, F>(
     ctx: &AppContext,
     rows: &[WorktreeRecord],
     state: &Value,
     want: Want,
-    saved: Option<GithubData>,
+    saved: impl FnOnce() -> S,
     bases: &PublishedBases,
     fresh: impl FnOnce(Vec<String>) -> F,
 ) -> BTreeMap<String, RowLanding>
 where
+    S: Future<Output = Option<GithubData>>,
     F: Future<Output = Option<GithubData>>,
 {
     let landings = |rows: Vec<WorktreeRecord>, github: Option<GithubData>| async move {
         wt_ops::lifecycle_ops::row_landings(ctx, &rows, state, github.as_ref(), bases).await
     };
-    let rows: Vec<WorktreeRecord> = rows.iter().filter(|row| !row.is_main).cloned().collect();
-    let local = landings(rows.clone(), None).await;
     let mut result = BTreeMap::new();
+    let mut rows: Vec<WorktreeRecord> = rows.iter().filter(|row| !row.is_main).cloned().collect();
+    if want == Want::Lists {
+        // Each landing read is several Git subprocesses per row, and a
+        // fleet's list names only a few rows that owe a check or hold a gate.
+        rows.retain(|row| {
+            let slug = row.target.slug();
+            let read = list_depends_on_landing(state, slug);
+            if !read {
+                result.insert(slug.to_owned(), RowLanding::known(Landing::NONE));
+            }
+            read
+        });
+        if rows.is_empty() {
+            return result;
+        }
+    }
+    let local = landings(rows.clone(), None).await;
     let mut open = Vec::new();
     for row in rows {
         let slug = row.target.slug().to_owned();
@@ -251,7 +276,7 @@ where
         }
     }
     if !open.is_empty()
-        && let Some(saved) = saved
+        && let Some(saved) = saved().await
     {
         let proven = landings(open.clone(), Some(saved)).await;
         open.retain(|row| {
@@ -398,7 +423,7 @@ mod tests {
             std::slice::from_ref(row),
             state,
             want,
-            saved,
+            || async move { saved },
             &PublishedBases::default(),
             |branches| async move {
                 assert_eq!(branches, std::slice::from_ref(&row.target.branch));
@@ -540,6 +565,35 @@ mod tests {
             .unwrap();
         let landing = one(&fixture, &row, &state, Want::Lists, None, Some(None)).await;
         assert_eq!(landing.word(), "unknown");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_row_whose_list_cannot_change_with_its_landing_is_not_read() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let (row, _, _) = squashed(&fixture).await;
+        let ctx = &fixture.ctx;
+        // The work is on the base origin advertises: Git alone proves it.
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(ctx, &["remote", "add", "origin", origin.to_str().unwrap()]).await;
+        git(ctx, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        let state = ctx
+            .database
+            .call(|store| {
+                store.set_slug_work_status("one", None)?;
+                Ok(store.read_wt_state()?)
+            })
+            .await
+            .unwrap();
+        for want in [Want::Phases, Want::ListsAndGit] {
+            let landing = one(&fixture, &row, &state, want, None, None).await;
+            assert_eq!(landing.word(), "landed", "{want:?}");
+        }
+        // It owes no check and holds no gate, so its list is the same
+        // either way and no Git runs for it: the answer is not a landing.
+        let landing = one(&fixture, &row, &state, Want::Lists, None, None).await;
+        assert!(!landing.is_landed() && !landing.is_unknown());
         fixture.close().await.unwrap();
     }
 }

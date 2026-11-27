@@ -124,6 +124,13 @@ pub struct Model {
     pub(crate) output: crate::output::OutputState,
     pub(crate) ui_generation: u64,
     pub(crate) pending_request: Option<PendingRequest>,
+    /// Requests begun whose final reply has not arrived, oldest first. Only
+    /// their replies may speak over the request in flight; a background
+    /// read's never does.
+    pub(crate) begun: std::collections::VecDeque<u64>,
+    /// The failure of an earlier request, said while another was in flight
+    /// and kept beside that request's feedback until the user acts again.
+    pub(crate) earlier_failure: Option<String>,
     pub(crate) cancelled_menu: Option<CancelledMenu>,
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
@@ -223,6 +230,8 @@ impl Default for Model {
             output: Default::default(),
             ui_generation: 0,
             pending_request: None,
+            begun: Default::default(),
+            earlier_failure: None,
             cancelled_menu: None,
             pr_chord: None,
             help: false,

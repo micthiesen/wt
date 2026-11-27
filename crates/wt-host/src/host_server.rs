@@ -3,7 +3,7 @@
 use crate::host_service::HostService;
 use anyhow::{Context, Result, bail};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::Arc,
     time::Duration,
 };
@@ -112,7 +112,7 @@ where
     });
     let mut work = tokio::task::JoinSet::new();
     let mut queued = VecDeque::<(wt_app_core::lanes::Lane, (u64, UiAction))>::new();
-    let mut busy = BTreeSet::new();
+    let mut busy = wt_app_core::lanes::Admission::default();
     let mut running = BTreeMap::new();
     let mut last_id = 0;
     let mut perf_revision = 0;
@@ -147,7 +147,7 @@ where
         }
         while let Some((lane, (id, action))) = crate::controller::take_available(&mut queued, &busy)
         {
-            busy.insert(lane.clone());
+            let hold = busy.insert(lane.clone());
             let host = host.clone();
             let cancellation = action.is_preparation().then(CancellationToken::new);
             let token = cancellation.clone();
@@ -159,7 +159,7 @@ where
                         _ = token.cancelled() => Ok(UiReply::no_change("Read-only request cancelled")),
                         outcome = host.execute(action) => outcome,
                     }
-                } else { host.execute_with_shutdown(action, Some(&shutdown_wait)).await };
+                } else { host.execute_with_shutdown(action, Some(&shutdown_wait), Some(&hold)).await };
                 outcome.unwrap_or_else(|error| wt_app_core::host_errors::error_reply(&error))
             });
             running.insert(task.id(), (id, lane, cancellation));
@@ -171,6 +171,8 @@ where
             biased;
             _ = context.cancellation.cancelled(), if !closed => closed = true,
             _ = disconnected.cancelled(), if !closed => closed = true,
+            // A running removal handed over to its worker; admit what waited on it.
+            _ = busy.changed() => {},
             completed = work.join_next_with_id(), if !work.is_empty() => {
                 let completed = completed.expect("nonempty worker tasks");
                 let task_id = match &completed { Ok((id, _)) => *id, Err(error) => error.id() };

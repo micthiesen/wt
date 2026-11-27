@@ -13,7 +13,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use wt_config::{Config, LoadOptions};
-use wt_platform::process::ProcessRunner;
+use wt_platform::lock::MachineSlots;
+use wt_platform::process::{ProcessBudget, ProcessClass, ProcessRunner};
 use wt_runtime::TaskScope;
 use wt_vcs::{GitRepository, RepositoryConfig, StageConfig};
 
@@ -331,6 +332,12 @@ enum Command {
     /// Execute an acknowledged, durable background removal job.
     #[command(name = "_destroy", hide = true)]
     Destroy(wt_ops::commands::_destroy::DestroyWorkerArgs),
+    /// Install a new worktree's dependencies as the body of its install action.
+    #[command(name = "_install-dependencies", hide = true)]
+    InstallDependencies(wt_ops::commands::new::InstallWorkerArgs),
+    /// Run the ref maintenance a creation left for after its checkout.
+    #[command(name = "_maintain-origin", hide = true)]
+    MaintainOrigin,
     /// Create a worktree from an issue, branch or slug.
     New(commands::new::NewCommandArgs),
     /// Keep a worktree whose PR landed and start its next PR on a fresh branch.
@@ -432,6 +439,7 @@ enum Command {
 /// Run wt as the binary `info` describes, exiting the process when done.
 pub fn main(info: BuildInfo) {
     wt_app_core::build_info::install(info);
+    wt_github::set_user_agent_version(info.version);
     // wt runs inside the Claude sessions it starts, which carry BUN_INSPECT
     // for their own inspector socket. Every Bun program wt would run (hooks,
     // dev-server commands, actions) would otherwise try to bind that socket
@@ -627,6 +635,33 @@ fn run(mut cli: Cli) -> Result<i32> {
     result
 }
 
+/// The one subprocess budget of this process, and its share of the limits
+/// every wt process using this lock directory keeps together: heavy
+/// commands and whole-fleet reads. Each agent's wt command is a process with a
+/// budget of its own, so only limits held across processes bound their sum.
+async fn process_budget(config: &Config) -> ProcessRunner {
+    let mut processes = ProcessRunner::with_budget(ProcessBudget::application());
+    let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    if let Some(slots) = machine_slots(config, "process-heavy", (cores / 3).clamp(2, 4)).await {
+        processes = processes.with_heavy_slots(slots);
+    }
+    if let Some(slots) = machine_slots(config, "fleet-scan", (cores / 4).clamp(1, 4)).await {
+        processes = processes.with_fleet_scan_slots(slots);
+    }
+    processes
+}
+
+async fn machine_slots(config: &Config, name: &'static str, count: usize) -> Option<MachineSlots> {
+    let count = std::num::NonZeroUsize::new(count)?;
+    MachineSlots::open(&config.paths.lock_dir, name, count)
+        .await
+        .inspect_err(|error| {
+            // The limit sheds load and guards no data: run without it.
+            tracing::warn!(%error, limit = name, "machine-wide process limit unavailable");
+        })
+        .ok()
+}
+
 async fn run_application(
     cli: Cli,
     options: LoadOptions,
@@ -635,7 +670,7 @@ async fn run_application(
     token: tokio_util::sync::CancellationToken,
     scope_drained: &mut bool,
 ) -> Result<i32> {
-    let processes = ProcessRunner::default();
+    let processes = process_budget(&config).await;
     let repository = Arc::new(GitRepository::new(
         RepositoryConfig {
             main_clone: config.paths.main_clone.clone(),
@@ -662,8 +697,8 @@ async fn run_application(
             database: database.clone(),
             repository: repository.clone(),
             background_processes: processes.clone(),
+            interactive_processes: processes.with_class(ProcessClass::Interactive),
             processes,
-            interactive_processes: ProcessRunner::default(),
             cancellation: token,
             section_writes: Default::default(),
             caches: wt_app_core::query_cache::store(&config),
@@ -688,8 +723,8 @@ async fn run_application(
         database: database.clone(),
         repository,
         background_processes: processes.clone(),
+        interactive_processes: processes.with_class(ProcessClass::Interactive),
         processes,
-        interactive_processes: ProcessRunner::default(),
         cancellation: token.clone(),
         section_writes: Default::default(),
         caches,
@@ -767,6 +802,10 @@ async fn dispatch_command(
         Command::Hold(args) => wt_ops::commands::hold::run(context, args).await,
         Command::Automations(args) => commands::automations::run(context, args).await,
         Command::Destroy(args) => wt_ops::commands::_destroy::run_worker(context, args).await,
+        Command::InstallDependencies(args) => {
+            wt_ops::commands::new::run_install_worker(context, args).await
+        }
+        Command::MaintainOrigin => wt_ops::lifecycle_ops::run_maintenance_worker(context).await,
         Command::New(args) => commands::new::run(context, args).await,
         Command::Next(args) => commands::next::run(context, args).await,
         Command::Orphans(args) => commands::orphans::run(context, args).await,

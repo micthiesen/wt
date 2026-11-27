@@ -154,7 +154,12 @@ pub(crate) fn status_verb(row: &BoardRow) -> (Badge, String) {
         return (busy_badge(&busy.op), text);
     }
     if row.installing {
-        return (INITIALIZING, "installing dependencies".into());
+        let verb = if row.install_queued {
+            "waiting to install"
+        } else {
+            "installing dependencies"
+        };
+        return (INITIALIZING, verb.into());
     }
     if row.path_missing {
         return (badge(glyphs::UNLINK, theme::ERR), "missing".into());
@@ -1050,6 +1055,10 @@ mod tests {
         installing.installing = true;
         assert_eq!(marker(&installing, &policy), INITIALIZING);
         assert_eq!(status_verb(&installing).1, "installing dependencies");
+        installing.install_queued = true;
+        assert_eq!(marker(&installing, &policy), INITIALIZING);
+        assert_eq!(status_verb(&installing).1, "waiting to install");
+        installing.install_queued = false;
         installing.busy = Some(crate::BusyView {
             op: "remove".into(),
             ..Default::default()

@@ -197,6 +197,22 @@ impl Store {
         path: &str,
         branch: &str,
     ) -> Result<bool, StoreError> {
+        self.begin_removal_of(key, job_id, path, branch, false, false)
+    }
+
+    /// [`Self::begin_removal`], recording where the board drew the row: whether
+    /// its work had landed and whether it was archived. A removal archives
+    /// its row and deletes the checkout, and every Git fact with it, before
+    /// the row goes, so the board could not tell otherwise.
+    pub fn begin_removal_of(
+        &mut self,
+        key: &str,
+        job_id: &str,
+        path: &str,
+        branch: &str,
+        landed: bool,
+        was_archived: bool,
+    ) -> Result<bool, StoreError> {
         self.mutate_wt_state(|state| {
             let removals = object_mut(state, "removals");
             if removals
@@ -214,6 +230,13 @@ impl Store {
             entry.insert("path".into(), json!(path));
             entry.insert("branch".into(), json!(branch));
             entry.insert("error".into(), Value::Null);
+            for (name, set) in [("landed", landed), ("wasArchived", was_archived)] {
+                if set {
+                    entry.insert(name.into(), json!(true));
+                } else {
+                    entry.remove(name);
+                }
+            }
             removals.insert(key.into(), Value::Object(entry));
             Ok((true, true))
         })

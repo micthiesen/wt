@@ -179,6 +179,8 @@ struct Fleet {
 #[derive(Clone, Debug)]
 pub(super) struct PrSnapshot {
     age_ms: u64,
+    /// Branches shown from a newer read than the snapshot's, with its age.
+    newer: BTreeMap<String, u64>,
     /// Why data older than the board would use was shown.
     pub(super) held: Option<String>,
 }
@@ -194,11 +196,30 @@ pub(super) async fn pull_requests(
     Option<PrSnapshot>,
 ) {
     if let Some(shown) = wt_sources::github_events_source::load_for_display(ctx, branches).await {
-        let snapshot = PrSnapshot {
+        let mut snapshot = PrSnapshot {
             age_ms: shown.age_ms,
+            newer: BTreeMap::new(),
             held: shown.note(),
         };
-        return (Ok(shown.read.data), Some(snapshot));
+        let mut data = shown.read.data;
+        let now = u64::try_from(now_ms()).unwrap_or(0);
+        if let Some((read, started_ms)) = wt_sources::wait_facts::latest_shared_read(ctx).await {
+            // A branch the daemon read again on its own is as old as that.
+            let clock = tokio::time::Instant::now();
+            let daemon_ms = |branch: &str| match shown.read.scoped.get(branch) {
+                Some(at) => now.saturating_sub(
+                    u64::try_from(clock.saturating_duration_since(*at).as_millis())
+                        .unwrap_or(u64::MAX),
+                ),
+                None => now.saturating_sub(shown.age_ms),
+            };
+            for branch in overlay_newer(&mut data, branches, daemon_ms, &read, started_ms, now) {
+                snapshot
+                    .newer
+                    .insert(branch, now.saturating_sub(started_ms));
+            }
+        }
+        return (Ok(data), Some(snapshot));
     }
     let github = GithubClient::new(
         ctx.processes.clone(),
@@ -416,6 +437,20 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             .as_ref()
             .and_then(|entries| entries.get(&row.worktree.target.branch))
             .map(queue_json);
+        // Why the merge wt armed is no longer queued, where GitHub says.
+        let arm = worktree_state.and_then(|record| {
+            serde_json::from_value::<wt_core::MergeArm>(record["mergeArm"].clone()).ok()
+        });
+        let queue_removal = pr
+            .filter(|pr| pr.state == "OPEN" && pr_queue.is_none())
+            .filter(|pr| wt_sources::wait_facts::queue_removal(pr, arm.as_ref()).is_some())
+            .and_then(|pr| pr.queue_removal.as_ref())
+            .map(|removal| {
+                json!({
+                    "reason":wt_core::sanitize_terminal_text(removal.reason.trim()),
+                    "at":i64::try_from(removal.at_ms).ok().and_then(format_timestamp_ms),
+                })
+            });
         let owed = super::owed::derive(
             &state,
             &slug,
@@ -439,8 +474,8 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             "session":{"alive":alive,"busy":busy,"last_activity":last_activity}, "session_note":session_note,
             "operation":operation,"operation_note":operation_note,
             "dev":{"status":dev_status,"error":dev_error,"note":dev_note,"slots":dev.as_ref().map(|snapshot| &snapshot.slots)},
-            "pr":pr_json, "pr_note":pr_note,"merge_queue":pr_queue,
-            "pr_snapshot_age_seconds":pr_snapshot.as_ref().map(|snapshot| snapshot.age_ms / 1000),
+            "pr":pr_json, "pr_note":pr_note,"merge_queue":pr_queue,"queue_removal":queue_removal,
+            "pr_snapshot_age_seconds":pr_snapshot.as_ref().map(|snapshot| snapshot.newer.get(&row.worktree.target.branch).copied().unwrap_or(snapshot.age_ms) / 1000),
             "inventory_error":row.error
         });
         reports.push(report);
@@ -507,7 +542,9 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             Some(PrSnapshot {
                 held: Some(held), ..
             }) => println!("{held}"),
-            Some(PrSnapshot { age_ms, held: None }) => println!(
+            Some(PrSnapshot {
+                age_ms, held: None, ..
+            }) => println!(
                 "PR data from the events daemon snapshot, {}s old",
                 age_ms / 1000
             ),
@@ -522,11 +559,21 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
 
 /// The human PR column: the row's own pull request, then how many of its
 /// other branches hold, or may hold, one with no row (`other_prs` entries
-/// that are `open` or `unknown`; the JSON names them).
+/// that are `open` or `unknown`; the JSON names them). A merge GitHub took
+/// out of the queue is said with its reason.
 fn pr_cell(row: &Value) -> String {
-    let own = row["pr"]["number"]
+    let mut own = row["pr"]["number"]
         .as_u64()
         .map_or_else(|| "—".to_owned(), |number| format!("#{number}"));
+    if let Some(removal) = row["queue_removal"].as_object() {
+        own.push_str(" removed from the merge queue");
+        if let Some(reason) = removal["reason"]
+            .as_str()
+            .filter(|reason| !reason.is_empty())
+        {
+            own.push_str(&format!(": {reason}"));
+        }
+    }
     let others = row["other_prs"]
         .as_array()
         .into_iter()
@@ -589,6 +636,46 @@ fn merge_field(value: Option<&str>, state: &str) -> Option<String> {
     })
 }
 
+/// Show `branches` from `newer`, a GitHub read begun at `newer_ms`, where
+/// it covers them and the daemon's snapshot read them earlier
+/// (`daemon_ms`): a row must not contradict what a wait just reported from
+/// that read. A queue entry is dropped only when the read holds the whole
+/// queue. Returns the branches replaced.
+fn overlay_newer(
+    data: &mut wt_github::GithubData,
+    branches: &[String],
+    daemon_ms: impl Fn(&str) -> u64,
+    newer: &wt_github::GithubData,
+    newer_ms: u64,
+    now_ms: u64,
+) -> Vec<String> {
+    let mut replaced = Vec::new();
+    // A start in the future is a clock that moved, not a newer answer.
+    if newer_ms > now_ms {
+        return replaced;
+    }
+    for branch in branches {
+        if !newer.covered_branches.contains(branch) || newer_ms <= daemon_ms(branch) {
+            continue;
+        }
+        match newer.prs.get(branch) {
+            Some(pr) => data.prs.insert(branch.clone(), pr.clone()),
+            None => data.prs.remove(branch),
+        };
+        match newer.merge_queue.get(branch) {
+            Some(entry) => {
+                data.merge_queue.insert(branch.clone(), entry.clone());
+            }
+            None if newer.merge_queue_complete => {
+                data.merge_queue.remove(branch);
+            }
+            None => {}
+        }
+        replaced.push(branch.clone());
+    }
+    replaced
+}
+
 fn queue_json(entry: &MergeQueueEntry) -> Value {
     serde_json::to_value(entry).unwrap_or(Value::Null)
 }
@@ -646,6 +733,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_row_dropped_from_the_merge_queue_says_why() {
+        let row = json!({"pr":{"number":7},"queue_removal":{"reason":"merge_conflict","at":null}});
+        assert_eq!(
+            pr_cell(&row),
+            "#7 removed from the merge queue: merge_conflict"
+        );
+        let silent = json!({"pr":{"number":7},"queue_removal":{"reason":"","at":null}});
+        assert_eq!(pr_cell(&silent), "#7 removed from the merge queue");
+        assert_eq!(
+            pr_cell(&json!({"pr":{"number":7},"queue_removal":null})),
+            "#7"
+        );
+    }
+
+    #[test]
+    fn a_newer_read_replaces_what_the_snapshot_shows_of_a_branch() {
+        let entry = |branch: &str| {
+            serde_json::from_value::<MergeQueueEntry>(json!({
+                "headRefName": branch, "position": 3, "state": "QUEUED",
+                "enqueuedAt": "2026-11-27T17:00:00Z", "estimatedTimeToMerge": null,
+            }))
+            .unwrap()
+        };
+        let snapshot = || {
+            let mut data = wt_github::GithubData::default();
+            for branch in ["one", "two"] {
+                data.merge_queue.insert(branch.into(), entry(branch));
+            }
+            data
+        };
+        let branches = ["one".to_owned(), "two".to_owned()];
+        // A wait read "one" after the snapshot and found it out of the queue.
+        let mut read = wt_github::GithubData {
+            merge_queue_complete: true,
+            ..Default::default()
+        };
+        read.covered_branches.insert("one".into());
+        let mut data = snapshot();
+        let replaced = overlay_newer(&mut data, &branches, |_| 1_000, &read, 2_000, 3_000);
+        assert_eq!(replaced, ["one"]);
+        assert_eq!(data.merge_queue.keys().collect::<Vec<_>>(), ["two"]);
+
+        // Not when the snapshot is the newer one, the read is from a clock
+        // ahead of this one, or it holds only part of the queue.
+        let mut data = snapshot();
+        assert!(overlay_newer(&mut data, &branches, |_| 2_000, &read, 2_000, 3_000).is_empty());
+        assert!(overlay_newer(&mut data, &branches, |_| 1_000, &read, 4_000, 3_000).is_empty());
+        read.merge_queue_complete = false;
+        assert_eq!(
+            overlay_newer(&mut data, &branches, |_| 1_000, &read, 2_000, 3_000),
+            ["one"]
+        );
+        assert_eq!(data.merge_queue.len(), 2);
+    }
+
+    #[test]
     fn work_block_answers_in_both_key_spellings() {
         let mut gated =
             json!({"state":"ready","blockedOn":"mobile release","verifyAfterMerge":"1. check"});
@@ -700,6 +843,9 @@ mod tests {
                 }},
                 "mergeQueue": {},
                 "writerSha": wt_app_core::build_info::build_id(),
+                // wt_events::SNAPSHOT_SCHEMA, bound to its writer.
+                "schema": 1,
+                "schemaWriterSha": wt_app_core::build_info::build_id(),
                 "repository": wt_ops::events::repository_identity(&ctx.config),
             });
             fs::write(events.join("github.json"), snapshot.to_string()).unwrap();

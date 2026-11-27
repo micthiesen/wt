@@ -95,7 +95,9 @@ pub async fn load(context: &AppContext, branches: &[String]) -> Option<DaemonRea
 
 /// [`load`] for a command that only displays pull requests: it also takes
 /// a snapshot the daemon's budget is holding, so a low budget is not spent
-/// by every command that prints a table.
+/// by every command that prints a table, and one another build wrote in
+/// this build's schema, so a session started before an update still has the
+/// daemon's data.
 pub async fn load_for_display(context: &AppContext, branches: &[String]) -> Option<DisplayRead> {
     read(context, branches, true).await
 }
@@ -172,7 +174,8 @@ fn held(snapshot: &GithubSnapshot, now: u64) -> Option<(u64, Held)> {
 }
 
 /// `now` is the same moment on the wall clock (ms) and the process clock.
-/// Only a `display` reader is given a snapshot older than [`FRESH`].
+/// Only a `display` reader is given a snapshot older than [`FRESH`], or one
+/// another build wrote.
 fn admit(
     snapshot: GithubSnapshot,
     branches: &[String],
@@ -182,8 +185,22 @@ fn admit(
     display: bool,
 ) -> Option<DisplayRead> {
     let (age_ms, held) = held(&snapshot, now)?;
+    // What decides a write comes only from this build's own daemon. A
+    // display needs the fields to mean what it reads them as, not the build.
+    let written_for_reader = if display {
+        // A development build can change what a field means without a schema
+        // bump, so one on either side still needs the same build.
+        let development = build.starts_with("dev-")
+            || snapshot
+                .writer_sha
+                .as_deref()
+                .is_none_or(|writer| writer.starts_with("dev-"));
+        snapshot.schema_current() && (!development || snapshot.writer_sha.as_deref() == Some(build))
+    } else {
+        snapshot.writer_sha.as_deref() == Some(build)
+    };
     if (!display && held != Held::Fresh)
-        || snapshot.writer_sha.as_deref() != Some(build)
+        || !written_for_reader
         || snapshot.repository.as_deref() != Some(repository)
     {
         return None;
@@ -243,6 +260,18 @@ pub fn watch(scope: &TaskScope, context: &AppContext, github: SourceHandle<Githu
         return;
     }
     let directory = context.config.paths.cache_root.join("events");
+    // Where changes are only found by polling, the daemon's snapshot would
+    // wait for the next one-second poll; the signal tick shortens that.
+    if crate::freshness::POLLING {
+        let github = github.clone();
+        crate::freshness::watch_signal_files(
+            scope,
+            vec![directory.join("github.json")],
+            move || {
+                github.request(Request::Recheck);
+            },
+        );
+    }
     let cancellation = scope.token();
     scope.spawn(async move {
         let notify = github.clone();
@@ -324,6 +353,8 @@ mod tests {
             fetch_started_at_ms: Some(98_000),
             branches: vec!["feature".into()],
             writer_sha: Some("current".into()),
+            schema: Some(wt_events::SNAPSHOT_SCHEMA),
+            schema_writer_sha: Some("current".into()),
             repository: Some("repo".into()),
             prs: serde_json::json!({}),
             merge_queue: serde_json::json!({}),
@@ -491,14 +522,14 @@ mod tests {
             )
             .is_none()
         );
-        // Still nothing for another build, repository or branch set.
+        // Still nothing for another repository or branch set.
         assert!(
             admit(
                 paced.clone(),
                 &branches,
                 at(100_000 + 8 * MINUTE),
-                "other",
-                "repo",
+                "current",
+                "elsewhere",
                 true
             )
             .is_none()
@@ -536,6 +567,64 @@ mod tests {
         );
         // Once the window has reset the stored budget says nothing.
         assert!(display(low, 100_000 + 41 * MINUTE).is_none());
+    }
+
+    /// A session keeps the build that started it, and the daemon runs the
+    /// installed one. A display reads the daemon's file across that gap
+    /// while both mean the same by its fields; what decides a write does not.
+    #[test]
+    fn a_display_reads_another_builds_snapshot_only_in_its_own_schema() {
+        let branches = vec!["feature".to_owned()];
+        let display = |snapshot: GithubSnapshot| {
+            admit(
+                snapshot,
+                &branches,
+                at(101_000),
+                "older-session",
+                "repo",
+                true,
+            )
+        };
+        assert!(display(snapshot()).is_some());
+        assert!(validate(snapshot(), &branches, at(101_000), "older-session", "repo").is_none());
+        // A writer that predates the schema, or writes another one.
+        assert!(
+            display(GithubSnapshot {
+                schema: None,
+                schema_writer_sha: None,
+                ..snapshot()
+            })
+            .is_none()
+        );
+        assert!(
+            display(GithubSnapshot {
+                schema: Some(wt_events::SNAPSHOT_SCHEMA + 1),
+                ..snapshot()
+            })
+            .is_none()
+        );
+        // A development build on either side may mean something else by a
+        // field under the same schema number: only its own build reads it.
+        let dev_writer = || GithubSnapshot {
+            writer_sha: Some("dev-0.1.0".into()),
+            schema_writer_sha: Some("dev-0.1.0".into()),
+            ..snapshot()
+        };
+        assert!(display(dev_writer()).is_none());
+        let read_by = |build: &str, snapshot: GithubSnapshot| {
+            admit(snapshot, &branches, at(101_000), build, "repo", true)
+        };
+        assert!(read_by("dev-0.1.0", snapshot()).is_none());
+        assert!(read_by("dev-0.1.0", dev_writer()).is_some());
+        // A daemon rolled back to before the schema carries a newer
+        // daemon's field through and signs the file with its own build.
+        assert!(
+            display(GithubSnapshot {
+                writer_sha: Some("rolled-back".into()),
+                ..snapshot()
+            })
+            .is_none()
+        );
     }
 
     #[tokio::test(start_paused = true)]

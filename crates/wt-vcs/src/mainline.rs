@@ -254,7 +254,8 @@ const REPRODUCED_MERGES: usize = 8;
 /// Every commit `head` has beyond `base` and `published` must be either a
 /// copy, by patch, of a commit `published` has, or a merge Git reproduces
 /// exactly from its two parents, which therefore carries no resolution of
-/// its own. With no such commit at all, `head` must be off the base: it is
+/// its own. Where there are copies, `head`'s tree must also be exactly what
+/// replaying `published` on its base gives. With no such commit at all, `head` must be off the base: it is
 /// then history of `published`. A `head` the base contains is left to the
 /// containment proof, which knows a base snapshot from landed work.
 ///
@@ -330,6 +331,40 @@ where
             .filter(|tree| !tree.is_empty());
         match (reproduced, recorded.as_deref().map(str::trim)) {
             (Some(reproduced), Some(recorded)) if reproduced == recorded => {}
+            _ => return BeyondBase::Unknown,
+        }
+    }
+    if copies > 0 {
+        // Patch equality ignores whitespace, so a copy re-indented by hand
+        // (all there is to a YAML or Python change) still matches. The
+        // content must match too: replaying `published` on the base commit
+        // `head` sits on has to give exactly `head`'s tree. That also
+        // rules out a copy of only some of the published commits.
+        let onto = ok(run(args(&["merge-base", head, base])).await);
+        let Some(onto) = onto
+            .as_deref()
+            .map(str::trim)
+            .filter(|onto| !onto.is_empty())
+        else {
+            return BeyondBase::Unknown;
+        };
+        let replayed = ok(run(args(&["merge-tree", "--write-tree", onto, published])).await);
+        let tree = format!("{head}^{{tree}}");
+        let recorded = ok(run(args(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &tree,
+        ]))
+        .await);
+        let replayed = replayed
+            .as_deref()
+            .and_then(|tree| tree.lines().next())
+            .map(str::trim)
+            .filter(|tree| !tree.is_empty());
+        match (replayed, recorded.as_deref().map(str::trim)) {
+            (Some(replayed), Some(recorded)) if replayed == recorded => {}
             _ => return BeyondBase::Unknown,
         }
     }
@@ -550,19 +585,36 @@ mod tests {
         repo.write("more.txt", "more\n");
         repo.commit("more work");
         let published_two = repo.head();
+        repo.advance_main("other.txt", "other\n");
         repo.git(&["checkout", "-q", "main"]);
         repo.git(&["merge", "-q", "--squash", &published_two]);
         repo.commit("squash of work");
-        repo.write("other.txt", "other\n");
-        repo.commit("main moves");
         repo.git(&["checkout", "-q", "work"]);
         // Replayed onto the commit before the squash, as a rebase that ran
         // while the pull request sat in the merge queue would.
-        repo.git(&["rebase", "-q", "--onto", "main~2", &published, "work"]);
-        assert_eq!(repo.published(&published_two).await, BeyondBase::Nothing(1));
+        repo.git(&["rebase", "-q", "main~1"]);
+        assert_eq!(repo.published(&published_two).await, BeyondBase::Nothing(2));
+        // A copy of only the last published commit is not all of the work.
+        repo.git(&["rebase", "-q", "--onto", "main~1", "HEAD~1"]);
+        assert_eq!(repo.published(&published_two).await, BeyondBase::Unknown);
         // The first commit is history of the published head too.
         repo.git(&["reset", "-q", "--hard", &published]);
         assert_eq!(repo.published(&published_two).await, BeyondBase::Nothing(0));
+    }
+
+    /// Git compares patches with whitespace removed. A commit re-indented
+    /// after the push matched the pushed one and read as a copy of it, so
+    /// cleanup would have discarded the only place that change existed.
+    #[tokio::test]
+    async fn a_copy_that_differs_only_in_whitespace_is_not_held() {
+        let (repo, published) = Repo::new();
+        repo.advance_main("other.txt", "other\n");
+        repo.git(&["rebase", "-q", "main"]);
+        assert_eq!(repo.published(&published).await, BeyondBase::Nothing(1));
+        repo.write("work.txt", "    work\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "--amend", "--no-edit"]);
+        assert_eq!(repo.published(&published).await, BeyondBase::Unknown);
     }
 
     #[tokio::test]

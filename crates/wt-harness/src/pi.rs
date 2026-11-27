@@ -28,6 +28,61 @@ const MAX_TAIL: u64 = 512 * 1024;
 const MAX_REPLY: u64 = 1024 * 1024;
 /// How long a cold-started Pi has to bind its control socket.
 const COLD_START_READY: Duration = Duration::from_secs(20);
+/// The build whose `--version` this process last saw pass, and when. The
+/// check starts Node, which costs every cold start more than the session it
+/// guards.
+static VERIFIED_BUILD: std::sync::Mutex<Option<(PiBuild, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+/// A version manager's shim is one unchanging file in front of every
+/// installed version, so a pass is trusted only this long.
+const VERIFIED_FOR: Duration = Duration::from_secs(5 * 60);
+
+fn verified_still(
+    verified: &Option<(PiBuild, std::time::Instant)>,
+    build: &Option<PiBuild>,
+    now: std::time::Instant,
+) -> bool {
+    match (verified, build) {
+        (Some((passed, at)), Some(build)) => {
+            passed == build && now.saturating_duration_since(*at) < VERIFIED_FOR
+        }
+        _ => false,
+    }
+}
+
+/// The file a bare `pi` runs, with what a reinstall or upgrade changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PiBuild {
+    executable: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl PiBuild {
+    /// Resolve `pi` on a `PATH` value the way exec does, through links to
+    /// the installed file. A version manager that repoints the link, or a
+    /// package manager that replaces the file, yields a different build.
+    fn on(search: &std::ffi::OsStr) -> Option<Self> {
+        std::env::split_paths(search)
+            .filter(|dir| dir.is_absolute())
+            .find_map(|dir| {
+                let executable = fs::canonicalize(dir.join("pi")).ok()?;
+                let metadata = fs::metadata(&executable).ok()?;
+                #[cfg(unix)]
+                let runnable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let runnable = true;
+                (metadata.is_file() && runnable).then(|| Self {
+                    executable,
+                    modified: metadata.modified().ok(),
+                    len: metadata.len(),
+                })
+            })
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PiPaths {
@@ -273,16 +328,26 @@ impl PiHarness {
                 .await?;
             return Ok(false);
         }
-        let mut version = CommandSpec::new("pi").args(["--version"]);
-        version.timeout = Duration::from_secs(5);
-        version.output_limit = 4096;
-        let output = self
-            .runner
-            .run(version, cancel)
-            .await
-            .map_err(|e| PiError::Operation(format!("cannot verify Pi runtime: {e}")))?;
-        if !output.status.success() || output.stdout_text().trim() != PI_VERSION {
-            return Err(PiError::Operation("this wt integration requires Pi 1.2.0; install the supported runtime before launching".into()));
+        // An unresolvable `pi` is checked every time, so the error stays live.
+        let build = std::env::var_os("PATH").and_then(|search| PiBuild::on(&search));
+        let verified = || {
+            VERIFIED_BUILD
+                .lock()
+                .unwrap_or_else(|lock| lock.into_inner())
+        };
+        if !verified_still(&verified(), &build, std::time::Instant::now()) {
+            let mut version = CommandSpec::new("pi").args(["--version"]);
+            version.timeout = Duration::from_secs(5);
+            version.output_limit = 4096;
+            let output = self
+                .runner
+                .run(version, cancel)
+                .await
+                .map_err(|e| PiError::Operation(format!("cannot verify Pi runtime: {e}")))?;
+            if !output.status.success() || output.stdout_text().trim() != PI_VERSION {
+                return Err(PiError::Operation("this wt integration requires Pi 1.2.0; install the supported runtime before launching".into()));
+            }
+            *verified() = build.map(|build| (build, std::time::Instant::now()));
         }
         self.prepare_extension()?;
         let resume_path = match &request.resume_session_id {
@@ -979,6 +1044,52 @@ impl PiOutputTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pi_build_is_the_linked_file_and_changes_when_it_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (bin, package, shadow) = (
+            dir.path().join("bin"),
+            dir.path().join("package"),
+            dir.path().join("shadow"),
+        );
+        for path in [&bin, &package, &shadow] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let cli = package.join("cli.js");
+        fs::write(&cli, "#!/bin/sh\necho 1.2.0\n").unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&cli, bin.join("pi")).unwrap();
+        // Exec skips a file it cannot run; so does the lookup.
+        fs::write(shadow.join("pi"), "not runnable").unwrap();
+        let search = std::env::join_paths([&shadow, &dir.path().join("absent"), &bin]).unwrap();
+        let first = PiBuild::on(&search).unwrap();
+        assert_eq!(first.executable, fs::canonicalize(&cli).unwrap());
+        assert_eq!(PiBuild::on(&search).unwrap(), first);
+        fs::write(&cli, "#!/bin/sh\necho 1.3.0-upgraded\n").unwrap();
+        assert_ne!(PiBuild::on(&search).unwrap(), first);
+        assert!(PiBuild::on(shadow.as_os_str()).is_none());
+        // A pass covers the same build for a few minutes, never longer: a
+        // version manager's shim does not change when Pi does.
+        let now = std::time::Instant::now();
+        let passed = Some((first.clone(), now));
+        assert!(verified_still(&passed, &Some(first.clone()), now));
+        assert!(verified_still(
+            &passed,
+            &Some(first.clone()),
+            now + VERIFIED_FOR - Duration::from_secs(1)
+        ));
+        assert!(!verified_still(
+            &passed,
+            &Some(first.clone()),
+            now + VERIFIED_FOR
+        ));
+        assert!(!verified_still(&passed, &PiBuild::on(&search), now));
+        assert!(!verified_still(&passed, &None, now));
+        assert!(!verified_still(&None, &Some(first), now));
+    }
 
     #[tokio::test]
     async fn pinned_status_and_empty_live_discovery_need_no_tmux_server() {

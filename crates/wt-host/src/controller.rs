@@ -8,7 +8,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wt_app_core::host_errors::{Notice, error_reply};
-use wt_app_core::lanes::{Lane, cleanup_lane, lane_for, lanes_conflict};
+use wt_app_core::lanes::{Admission, Lane, cleanup_lane, lane_for, lanes_conflict};
 use wt_runtime::TaskScope;
 use wt_tui::{ActionController, UiReply};
 
@@ -30,9 +30,27 @@ struct RunningAction {
     name: Cow<'static, str>,
     target: Option<String>,
     pr: Option<u64>,
+    /// When the controller accepted the request. Progress counts from here.
     started: Instant,
+    /// When the request left the queue and began to run.
+    admitted: Instant,
     preparation: bool,
+    /// Sent by the terminal on its own; see [`Queued::background`].
+    background: bool,
 }
+
+/// A request waiting for its lane.
+struct Queued {
+    request: wt_tui::UiRequest,
+    accepted_at: Instant,
+    /// Sent by the terminal on its own (a prefetch, an overlay refresh).
+    /// Counted apart from the user's requests so neither crowds out the other.
+    background: bool,
+}
+
+/// Queue bounds. The terminal's channels add their own capacity on top.
+const QUEUED_FOREGROUND: usize = 32;
+const QUEUED_BACKGROUND: usize = 8;
 
 #[derive(Clone)]
 struct ActionLogContext {
@@ -81,18 +99,27 @@ pub fn start(
     let context = Arc::new(context);
     let fleet = Arc::new(fleet);
     let task = scope.spawn(async move {
-        let mut pending = VecDeque::new();
-        let mut busy = BTreeSet::new();
+        let mut pending = VecDeque::<(Lane, Queued)>::new();
+        let mut busy = Admission::default();
         let mut running = tokio::task::JoinSet::new();
         let mut task_lanes = HashMap::new();
         let mut progress_tick = Box::pin(tokio::time::sleep(Duration::from_secs(3)));
         let mut failed_lanes = BTreeSet::new();
         let mut closed = false;
+        let mut background_closed = false;
+        let mut views_open = true;
+        let mut perf_revision = port.views.borrow().perf_revision;
         let mut draining = false;
         loop {
-            while let Some((lane, (request, accepted_at))) = take_available(&mut pending, &busy) {
+            while let Some((lane, queued)) = take_available(&mut pending, &busy) {
+                let Queued { request, accepted_at, background } = queued;
                 let wt_tui::UiRequest { id, generation, action: command, cancellation } = request;
-                busy.insert(lane.clone());
+                let hold = busy.insert(lane.clone());
+                // A remote host's worker schedules the planning of its own
+                // removals; here the request only waits for that worker.
+                if matches!(lane, Lane::Removal(Some(_), _)) {
+                    hold.durable();
+                }
                 let operation_cancellation = command
                     .is_cancellable()
                     .then(|| cancellation.unwrap_or_else(|| shutdown.child_token()));
@@ -112,26 +139,23 @@ pub fn start(
                 let task = running.spawn(async move {
                     let retry = create_retry(&command);
                     let request_replies = RequestReplies { sender: replies, id, generation };
-                    let result = if let Some(cancellation) = operation_cancellation {
-                        run_request_or_cancel(
-                            &shutdown,
-                            &cancellation,
-                            crate::host_dispatch::execute(
-                                &context,
-                                &fleet,
-                                command,
-                                &request_replies,
-                                &shutdown,
-                            ),
-                        )
-                        .await
+                    let execution = crate::host_dispatch::execute(
+                        &context,
+                        &fleet,
+                        command,
+                        &request_replies,
+                        &shutdown,
+                        &hold,
+                    );
+                    let (result, cancelled) = if let Some(cancellation) = operation_cancellation {
+                        run_request_or_cancel(&shutdown, &cancellation, execution).await
                     } else {
-                        crate::host_dispatch::execute(&context, &fleet, command, &request_replies, &shutdown).await
+                        (execution.await, false)
                     };
                     let mut reply = action_reply_with_context(result, retry, Some(&log_context));
                     reply.ui_generation = Some(generation);
                     reply.operation_id = Some(id);
-                    (lane, reply)
+                    (lane, reply, cancelled)
                 });
                 task_lanes.insert(task.id(), RunningAction {
                     lane: task_lane,
@@ -141,34 +165,55 @@ pub fn start(
                     target: operation_target,
                     pr: operation_pr,
                     started: accepted_at,
+                    admitted: Instant::now(),
                     preparation: is_preparation,
+                    background,
                 });
             }
             if closed && pending.is_empty() && running.is_empty() { break; }
+            let queued_background = pending.iter().filter(|(_, queued)| queued.background).count();
+            let queued_foreground = pending.len() - queued_background;
             tokio::select! {
                 biased;
                 _ = shutdown.cancelled(), if !draining => {
                     draining = true;
                     port.requests.close();
+                    port.background.close();
                     progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
-                    // Pending menus and session entry can stop before handoff.
-                    // Drop them so shutdown drains only accepted work.
-                    pending.retain(|(_, (request, _))| !request.action.is_cancellable());
+                    // Pending menus, session entry and background reads can
+                    // stop before they start. Drop them so shutdown drains
+                    // only accepted work.
+                    pending.retain(|(lane, queued)| {
+                        let drained = !queued.background && !queued.request.action.is_cancellable();
+                        if !drained {
+                            log_unstarted(lane, queued, "cancelled");
+                        }
+                        drained
+                    });
                 },
                 finished = running.join_next_with_id(), if !running.is_empty() => match finished {
-                    Some(Ok((id, (lane, reply)))) => {
+                    Some(Ok((id, (lane, reply, cancelled)))) => {
                         let active = task_lanes.remove(&id);
-                        if let Some(active) = &active
-                            && (reply.failed || reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain))
-                        {
-                            tracing::warn!(
-                                operation_id = active.request_id,
-                                operation = %active.name,
-                                host = lane_host(&active.lane),
-                                target = active.target.as_deref().unwrap_or("-"),
-                                pr = active.pr,
-                                uncertain = reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain),
-                                "action worker returned a failed or unconfirmed outcome"
+                        if let Some(active) = &active {
+                            if reply.failed || reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
+                                tracing::warn!(
+                                    operation_id = active.request_id,
+                                    operation = %active.name,
+                                    host = lane_host(&active.lane),
+                                    target = active.target.as_deref().unwrap_or("-"),
+                                    pr = active.pr,
+                                    uncertain = reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain),
+                                    "action worker returned a failed or unconfirmed outcome"
+                                );
+                            }
+                            log_request(
+                                active.request_id,
+                                &active.name,
+                                &active.lane,
+                                active.admitted.saturating_duration_since(active.started),
+                                active.admitted.elapsed(),
+                                request_outcome(&reply, cancelled),
+                                active.background,
                             );
                         }
                         busy.remove(&lane);
@@ -195,14 +240,24 @@ pub fn start(
                                 &reply,
                                 reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain),
                             );
+                            log_request(
+                                active.request_id,
+                                &active.name,
+                                &active.lane,
+                                active.admitted.saturating_duration_since(active.started),
+                                active.admitted.elapsed(),
+                                request_outcome(&reply, false),
+                                active.background,
+                            );
                             if let Err(error) = port.replies.send(reply).await {
                                 report_unobserved_reply(&active, &error.0);
                             }
                             failed_lanes.insert(active.lane.clone());
                             busy.remove(&active.lane);
                             let skipped = pending.iter().filter(|(queued, _)| lanes_conflict(queued, &active.lane)).count();
-                            for (_, (request, _)) in pending.iter().filter(|(queued, _)| lanes_conflict(queued, &active.lane)) {
-                                let _ = port.replies.send(UiReply { operation_id: Some(request.id), ..UiReply::failure("Host action worker failed; operation did not start") }).await;
+                            for (lane, queued) in pending.iter().filter(|(queued, _)| lanes_conflict(queued, &active.lane)) {
+                                log_unstarted(lane, queued, "failed");
+                                let _ = port.replies.send(UiReply { operation_id: Some(queued.request.id), ..UiReply::failure("Host action worker failed; operation did not start") }).await;
                             }
                             pending.retain(|(queued, _)| !lanes_conflict(queued, &active.lane));
                             if skipped > 0 {
@@ -212,37 +267,41 @@ pub fn start(
                     },
                     None => {},
                 },
-                command = port.requests.recv(), if !closed && pending.len() < 32 => match command {
+                // A running request gave capacity back; admit what waited on it.
+                _ = busy.changed() => {},
+                changed = port.views.changed(), if views_open => match changed {
+                    Ok(()) => {
+                        let views = *port.views.borrow_and_update();
+                        crate::host_dispatch::apply_views(&fleet, views, &mut perf_revision);
+                    },
+                    Err(_) => views_open = false,
+                },
+                command = port.requests.recv(), if !closed && queued_foreground < QUEUED_FOREGROUND => match command {
                     Some(command) => {
                         if task_lanes.is_empty() && pending.is_empty() {
                             progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
                         }
-                        match lane_for(&command.action) {
-                        Ok(lane) if !lane_failed(&lane, &failed_lanes) => {
-                            // A newer identical prefetch replaces a queued one.
-                            if matches!(lane, Lane::Prefetch(_)) {
-                                pending.retain(|(queued, (other, _))| !matches!(queued, Lane::Prefetch(_)) || other.action != command.action);
-                            }
-                            pending.push_back((lane, (command, Instant::now())));
-                        },
-                        Ok(_) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure("Host command worker failed; this command was not started. Restart wt before retrying.") }).await; },
-                        Err(error) => { let _ = port.replies.send(UiReply { operation_id: Some(command.id), ..UiReply::failure(format!("{error:#}")) }).await; },
-                        }
+                        enqueue(&mut pending, &failed_lanes, &port.replies, command, false).await;
                     },
                     None => closed = true,
+                },
+                command = port.background.recv(), if !closed && !background_closed && queued_background < QUEUED_BACKGROUND => match command {
+                    Some(command) => enqueue(&mut pending, &failed_lanes, &port.replies, command, true).await,
+                    None => background_closed = true,
                 },
                 _ = &mut progress_tick, if !task_lanes.is_empty() || !pending.is_empty() => {
                     for active in task_lanes.values() {
                         if draining {
                             eprintln!("{}", shutdown_progress(active, Instant::now()));
-                        } else if active.started.elapsed() >= Duration::from_secs(3) {
+                        } else if active.request_id != 0 && active.started.elapsed() >= Duration::from_secs(3) {
                             let _ = port.replies.try_send(progress_reply(
                                 active.request_id, active.generation,
                                 format!("{} on {}: running ({})", active.name, lane_host(&active.lane), elapsed(active.started.elapsed())),
                             ));
                         }
                     }
-                    for (lane, (request, accepted_at)) in &pending {
+                    for (index, (lane, queued)) in pending.iter().enumerate() {
+                        let Queued { request, accepted_at, background } = queued;
                         if draining {
                             eprintln!("wt: shutdown waiting: {} on {} is queued ({} elapsed, operation {})",
                             action_name(&request.action),
@@ -250,15 +309,8 @@ pub fn start(
                             elapsed(accepted_at.elapsed()),
                             request.id,
                             );
-                        } else if accepted_at.elapsed() >= Duration::from_secs(3) {
-                            let blocker = task_lanes.values().find(|active| lanes_conflict(lane, &active.lane));
-                            let reason = blocker.map_or_else(
-                                || "waiting for command capacity".to_owned(),
-                                |active| {
-                                    let target = active.target.as_deref().map(|target| format!(" for {target}")).unwrap_or_default();
-                                    format!("waiting for {}{target} on {}", active.name, lane_host(&active.lane))
-                                },
-                            );
+                        } else if !background && accepted_at.elapsed() >= Duration::from_secs(3) {
+                            let reason = waiting_reason(&busy, &task_lanes, &pending, index);
                             let _ = port.replies.try_send(progress_reply(
                                 request.id, request.generation,
                                 format!("{}: {reason} ({})", action_name(&request.action), elapsed(accepted_at.elapsed())),
@@ -275,6 +327,191 @@ pub fn start(
         cancel,
         automations,
     }
+}
+
+/// Queue a request in its lane, or answer at once why it cannot run.
+async fn enqueue(
+    pending: &mut VecDeque<(Lane, Queued)>,
+    failed_lanes: &BTreeSet<Lane>,
+    replies: &tokio::sync::mpsc::Sender<UiReply>,
+    request: wt_tui::UiRequest,
+    background: bool,
+) {
+    let refusal = match lane_for(&request.action) {
+        Ok(lane) if !lane_failed(&lane, failed_lanes) => {
+            // A newer identical prefetch replaces a queued one.
+            if matches!(lane, Lane::Prefetch(_)) {
+                pending.retain(|(queued, other)| {
+                    let kept = !matches!(queued, Lane::Prefetch(_))
+                        || other.request.action != request.action;
+                    if !kept {
+                        log_unstarted(queued, other, "replaced");
+                    }
+                    kept
+                });
+            }
+            pending.push_back((
+                lane,
+                Queued {
+                    request,
+                    accepted_at: Instant::now(),
+                    background,
+                },
+            ));
+            return;
+        }
+        Ok(_) => {
+            "Host command worker failed; this command was not started. Restart wt before retrying."
+                .to_owned()
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    tracing::info!(
+        operation_id = request.id,
+        operation = %action_name(&request.action),
+        outcome = "failed",
+        "controller request refused"
+    );
+    let _ = replies
+        .send(UiReply {
+            operation_id: Some(request.id),
+            ..UiReply::failure(refusal)
+        })
+        .await;
+}
+
+/// Why a queued request has not started, for its progress notice.
+fn waiting_reason(
+    busy: &Admission,
+    running: &HashMap<tokio::task::Id, RunningAction>,
+    pending: &VecDeque<(Lane, Queued)>,
+    index: usize,
+) -> String {
+    let lane = &pending[index].0;
+    let blocker = busy
+        .blocker(lane)
+        .and_then(|blocking| running.values().find(|active| active.lane == *blocking));
+    if let Some(active) = blocker {
+        let target = active
+            .target
+            .as_deref()
+            .map(|target| format!(" for {target}"))
+            .unwrap_or_default();
+        return format!(
+            "waiting for {}{target} on {}",
+            active.name,
+            lane_host(&active.lane)
+        );
+    }
+    match Admission::ahead(pending, index) {
+        Some((earlier_lane, earlier)) => format!(
+            "waiting behind queued {} on {}",
+            action_name(&earlier.request.action),
+            lane_host(earlier_lane)
+        ),
+        None => "waiting for command capacity".to_owned(),
+    }
+}
+
+/// The lane's kind, without the host or checkout it names.
+fn lane_kind(lane: &Lane) -> &'static str {
+    match lane {
+        Lane::Host(_) => "host",
+        Lane::HostControl(_) => "host-control",
+        Lane::Target(_, _) => "target",
+        Lane::Action(_, _) => "action",
+        Lane::SessionControl(_, _) => "session-control",
+        Lane::Creation(_) => "creation",
+        Lane::Removal(_, _) => "removal",
+        Lane::Metadata(_, _) => "metadata",
+        Lane::Preparation(_) => "preparation",
+        Lane::Prefetch(_) => "prefetch",
+        Lane::FleetCleanup(_) => "cleanup",
+        Lane::Presentation => "presentation",
+        Lane::Device => "device",
+        Lane::ViewControl => "view-control",
+        Lane::Terminal(_, _) => "terminal",
+    }
+}
+
+fn request_outcome(reply: &UiReply, cancelled: bool) -> &'static str {
+    if cancelled {
+        "cancelled"
+    } else if reply.stale {
+        "stale"
+    } else if reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
+        "uncertain"
+    } else if reply.failed {
+        "failed"
+    } else {
+        "ok"
+    }
+}
+
+/// A background read slower than this is logged like a user's request.
+const SLOW_BACKGROUND: Duration = Duration::from_secs(1);
+
+/// One record per request: how long it waited for its lane and how long it
+/// ran. Carries names and identifiers only, never a request's content. The
+/// reads the terminal sends on its own (a prefetch per rested row, an overlay
+/// refresh per second) are recorded at debug unless one failed or was slow.
+fn log_request(
+    id: u64,
+    operation: &str,
+    lane: &Lane,
+    queued: Duration,
+    run: Duration,
+    outcome: &'static str,
+    background: bool,
+) {
+    let host = match lane {
+        Lane::FleetCleanup(_) => "fleet",
+        lane => match lane_host(lane) {
+            LOCAL_HOST => "local",
+            host => host,
+        },
+    };
+    let lane = lane_kind(lane);
+    let queued_ms = u64::try_from(queued.as_millis()).unwrap_or(u64::MAX);
+    let run_ms = u64::try_from(run.as_millis()).unwrap_or(u64::MAX);
+    let routine =
+        background && !matches!(outcome, "failed" | "uncertain") && queued + run <= SLOW_BACKGROUND;
+    if routine {
+        tracing::debug!(
+            operation_id = id,
+            operation,
+            lane,
+            host,
+            queued_ms,
+            run_ms,
+            outcome,
+            "controller request"
+        );
+    } else {
+        tracing::info!(
+            operation_id = id,
+            operation,
+            lane,
+            host,
+            queued_ms,
+            run_ms,
+            outcome,
+            "controller request"
+        );
+    }
+}
+
+/// A request that left the queue without running.
+fn log_unstarted(lane: &Lane, queued: &Queued, outcome: &'static str) {
+    log_request(
+        queued.request.id,
+        &action_name(&queued.request.action),
+        lane,
+        queued.accepted_at.elapsed(),
+        Duration::ZERO,
+        outcome,
+        queued.background,
+    );
 }
 
 fn progress_reply(id: u64, generation: u64, message: String) -> UiReply {
@@ -504,11 +741,14 @@ fn cleanup_target_summary(action: &wt_tui::UiAction) -> Option<String> {
     }
 }
 
+const LOCAL_HOST: &str = "local host";
+
 fn lane_host(lane: &Lane) -> &str {
     match lane {
         Lane::Host(Some(host))
         | Lane::HostControl(Some(host))
         | Lane::Target(Some(host), _)
+        | Lane::Action(Some(host), _)
         | Lane::SessionControl(Some(host), _)
         | Lane::Creation(Some(host))
         | Lane::Removal(Some(host), _)
@@ -519,22 +759,23 @@ fn lane_host(lane: &Lane) -> &str {
         Lane::Host(None)
         | Lane::HostControl(None)
         | Lane::Target(None, _)
+        | Lane::Action(None, _)
         | Lane::SessionControl(None, _)
         | Lane::Creation(None)
         | Lane::Removal(None, _)
         | Lane::Metadata(None, _)
         | Lane::Preparation(None)
         | Lane::Prefetch(None)
-        | Lane::Terminal(None, _) => "local host",
+        | Lane::Terminal(None, _) => LOCAL_HOST,
         Lane::FleetCleanup(targets) => {
             let mut hosts = targets.iter().map(|(host, _)| host.as_deref());
             match hosts.next() {
-                Some(first) if hosts.all(|host| host == first) => first.unwrap_or("local host"),
+                Some(first) if hosts.all(|host| host == first) => first.unwrap_or(LOCAL_HOST),
                 Some(_) => "local and remote hosts",
-                None => "local host",
+                None => LOCAL_HOST,
             }
         }
-        Lane::Presentation | Lane::ViewControl => "local host",
+        Lane::Presentation | Lane::Device | Lane::ViewControl => LOCAL_HOST,
     }
 }
 
@@ -609,19 +850,20 @@ fn unobserved_reply_status(reply: &UiReply) -> Option<&'static str> {
     }
 }
 
+/// The operation's result, and whether it was cancelled before it produced one.
 async fn run_request_or_cancel<F>(
     shutdown: &CancellationToken,
     cancellation: &CancellationToken,
     operation: F,
-) -> Result<UiReply>
+) -> (Result<UiReply>, bool)
 where
     F: std::future::Future<Output = Result<UiReply>>,
 {
     tokio::select! {
         biased;
-        _ = shutdown.cancelled() => Ok(UiReply::no_change("Request cancelled during shutdown")),
-        _ = cancellation.cancelled() => Ok(UiReply::no_change("Request cancelled")),
-        result = operation => result,
+        _ = shutdown.cancelled() => (Ok(UiReply::no_change("Request cancelled during shutdown")), true),
+        _ = cancellation.cancelled() => (Ok(UiReply::no_change("Request cancelled")), true),
+        result = operation => (result, false),
     }
 }
 
@@ -647,48 +889,11 @@ fn worker_panic_reply(active: &RunningAction, error: &str) -> UiReply {
     }
 }
 
-pub fn take_available<T>(
-    pending: &mut VecDeque<(Lane, T)>,
-    busy: &BTreeSet<Lane>,
-) -> Option<(Lane, T)> {
-    // Reserve slots for view controls, read-only preparations, creation, and
-    // terminal entry. Unrelated host jobs cannot consume interactive capacity;
-    // lane conflicts still serialize terminal handoffs with each other.
-    let ordinary_full = busy
-        .iter()
-        .filter(|lane| {
-            !matches!(
-                lane,
-                Lane::ViewControl
-                    | Lane::HostControl(_)
-                    | Lane::Preparation(_)
-                    | Lane::Prefetch(_)
-                    | Lane::Creation(_)
-                    | Lane::Terminal(_, _)
-                    | Lane::Metadata(_, _)
-            )
-        })
-        .count()
-        >= 4;
-    let control_busy = busy
-        .iter()
-        .any(|lane| matches!(lane, Lane::ViewControl | Lane::HostControl(_)));
-    let preparation_busy = busy.iter().any(|lane| matches!(lane, Lane::Preparation(_)));
-    let prefetch_busy = busy.iter().any(|lane| matches!(lane, Lane::Prefetch(_)));
-    let creation_busy = busy.iter().any(|lane| matches!(lane, Lane::Creation(_)));
-    let metadata_busy = busy.iter().any(|lane| matches!(lane, Lane::Metadata(_, _)));
-    let position = pending.iter().position(|(lane, _)| {
-        let has_capacity = match lane {
-            Lane::ViewControl | Lane::HostControl(_) => !control_busy,
-            Lane::Terminal(_, _) => true,
-            Lane::Preparation(_) => !preparation_busy,
-            Lane::Prefetch(_) => !prefetch_busy,
-            Lane::Creation(_) => !creation_busy,
-            Lane::Metadata(_, _) => !metadata_busy,
-            _ => !ordinary_full,
-        };
-        has_capacity && busy.iter().all(|active| !lanes_conflict(lane, active))
-    })?;
+/// Takes the queued request that may start now, in arrival order (see
+/// [`Admission`] for the rule). The caller records it with
+/// [`Admission::insert`].
+pub fn take_available<T>(pending: &mut VecDeque<(Lane, T)>, busy: &Admission) -> Option<(Lane, T)> {
+    let position = busy.next(pending)?;
     pending.remove(position)
 }
 
@@ -1063,8 +1268,9 @@ mod tests {
             &cancellation,
             std::future::pending::<Result<UiReply>>(),
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(result.1, "a cancelled request reports itself as cancelled");
+        let result = result.0.unwrap();
         assert!(!result.failed);
         assert_eq!(result.outcome, Some(wt_tui::ReplyOutcome::NoChange));
         let reply = action_reply(Ok(result), None);
@@ -1088,7 +1294,7 @@ mod tests {
         assert!(remote.is_cancellable());
         let remote_lane = lane_for(&remote).unwrap();
         let local_lane = lane_for(&local).unwrap();
-        let mut busy = BTreeSet::from([remote_lane.clone()]);
+        let mut busy = Admission::from([remote_lane.clone()]);
         let mut pending = VecDeque::from([(local_lane.clone(), local)]);
         assert!(take_available(&mut pending, &busy).is_none());
 
@@ -1109,6 +1315,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+            .0
             .unwrap();
         assert!(!reply.failed);
         assert_eq!(reply.outcome, Some(wt_tui::ReplyOutcome::NoChange));
@@ -1151,6 +1358,8 @@ mod tests {
             target: Some("row".into()),
             pr: None,
             started: Instant::now(),
+            admitted: Instant::now(),
+            background: false,
             preparation: false,
         };
         let reply = worker_panic_reply(&active, "panic");
@@ -1385,6 +1594,231 @@ mod tests {
         finish_automation.send(()).unwrap();
         shutdown.await.unwrap().unwrap();
         assert!(cancel.is_cancelled());
+    }
+
+    /// JSON log records written on this thread while the guard lives.
+    fn capture_logs() -> (
+        tracing::subscriber::DefaultGuard,
+        Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        #[derive(Clone)]
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// Parallel tests hit these callsites with no subscriber. Reporting
+        /// `sometimes` keeps any interest rebuilt while this subscriber is
+        /// alive from caching `never`, so each event asks it directly.
+        struct PerEventInterest;
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PerEventInterest {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+        }
+
+        use tracing_subscriber::layer::SubscriberExt;
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_writer({
+                let output = output.clone();
+                move || LogWriter(output.clone())
+            })
+            .finish()
+            .with(PerEventInterest);
+        (tracing::subscriber::set_default(subscriber), output)
+    }
+
+    #[tokio::test]
+    async fn a_request_is_answered_and_logged_once_with_its_lane_and_timings() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let (logging, output) = capture_logs();
+        let scope = TaskScope::new();
+        let host = Arc::new(crate::host_service::HostService::start(
+            &scope,
+            fixture.ctx.clone(),
+            CancellationToken::new(),
+        ));
+        let fleet = crate::remote_board::start(&scope, &fixture.ctx, host);
+        let (mut actions, port) = wt_tui::action_channel();
+        let controller = start(&scope, fixture.ctx.clone(), fleet, port);
+        actions
+            .requests
+            .send(wt_tui::UiRequest {
+                id: 7,
+                generation: 3,
+                action: UiAction::FoldSection {
+                    key: "private-section".into(),
+                    folded: true,
+                },
+                cancellation: None,
+            })
+            .await
+            .unwrap();
+        let reply = loop {
+            let reply = tokio::time::timeout(Duration::from_secs(30), actions.replies.recv())
+                .await
+                .expect("the controller answers")
+                .expect("the controller is running");
+            if reply.operation_id == Some(7) && reply.progress.is_none() {
+                break reply;
+            }
+        };
+        assert!(matches!(
+            reply.outcome,
+            Some(wt_tui::ReplyOutcome::Accepted(_))
+        ));
+        assert_eq!(reply.ui_generation, Some(3));
+        scope.cancel();
+        controller.shutdown().await.unwrap();
+        let _ = scope.shutdown(Duration::from_secs(5)).await;
+        fixture.close().await.unwrap();
+        drop(logging);
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let records = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|record| record["fields"]["message"] == "controller request")
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "{logs}");
+        let record = &records[0];
+        assert_eq!(record["level"], "INFO");
+        let fields = &record["fields"];
+        assert_eq!(fields["operation_id"], 7);
+        assert_eq!(fields["operation"], "fold section");
+        assert_eq!(fields["lane"], "presentation");
+        assert_eq!(fields["host"], "local");
+        assert_eq!(fields["outcome"], "ok");
+        assert!(fields["queued_ms"].is_u64() && fields["run_ms"].is_u64());
+        // The record names the operation, never what it carried.
+        assert!(!record.to_string().contains("private-section"));
+    }
+
+    #[test]
+    fn request_records_name_the_outcome_and_the_executing_host() {
+        assert_eq!(request_outcome(&UiReply::message("done"), false), "ok");
+        assert_eq!(request_outcome(&UiReply::failure("no"), false), "failed");
+        assert_eq!(request_outcome(&UiReply::stale("changed"), false), "stale");
+        assert_eq!(
+            request_outcome(&UiReply::uncertain("lost"), false),
+            "uncertain"
+        );
+        assert_eq!(
+            request_outcome(&UiReply::no_change("Request cancelled"), true),
+            "cancelled"
+        );
+        let (logging, output) = capture_logs();
+        log_request(
+            1,
+            "remove worktree",
+            &Lane::Removal(Some("builder".into()), "row".into()),
+            Duration::from_millis(1500),
+            Duration::from_millis(20),
+            "ok",
+            false,
+        );
+        log_request(
+            2,
+            "clean worktrees",
+            &cleanup([(None, "a"), (Some("builder".into()), "b")]),
+            Duration::ZERO,
+            Duration::ZERO,
+            "failed",
+            false,
+        );
+        // The terminal's own reads are routine: only a failed or slow one
+        // is worth a line at this level.
+        let prefetch = Lane::Prefetch(None);
+        let quick = Duration::from_millis(40);
+        for (id, run, outcome) in [
+            (3, quick, "ok"),
+            (4, quick, "cancelled"),
+            (5, quick, "replaced"),
+            (6, quick, "failed"),
+            (7, Duration::from_millis(1200), "ok"),
+        ] {
+            log_request(
+                id,
+                "prefetch action palette",
+                &prefetch,
+                quick,
+                run,
+                outcome,
+                true,
+            );
+        }
+        drop(logging);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let records = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record["fields"]["operation_id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 6, 7],
+            "{logs}"
+        );
+        let fields = &records[0]["fields"];
+        assert_eq!(fields["host"], "builder");
+        assert_eq!(fields["lane"], "removal");
+        assert_eq!(fields["queued_ms"], 1500);
+        assert_eq!(fields["run_ms"], 20);
+        assert_eq!(records[1]["fields"]["host"], "fleet");
+        assert_eq!(records[1]["fields"]["lane"], "cleanup");
+    }
+
+    #[test]
+    fn a_queued_request_names_what_it_waits_for() {
+        let queued = |action: UiAction| Queued {
+            request: wt_tui::UiRequest {
+                id: 1,
+                generation: 0,
+                action,
+                cancellation: None,
+            },
+            accepted_at: Instant::now(),
+            background: false,
+        };
+        let restack = UiAction::Restack { key: "row".into() };
+        let remove = UiAction::Remove {
+            key: "later".into(),
+            force: false,
+            revision: None,
+            seen: None,
+        };
+        let pending = VecDeque::from([
+            (lane_for(&restack).unwrap(), queued(restack)),
+            (lane_for(&remove).unwrap(), queued(remove)),
+        ]);
+        let busy = Admission::from([Lane::Creation(None)]);
+        let running = HashMap::new();
+        // Nothing running excludes the later removal: it keeps its place
+        // behind the whole-host request that arrived first.
+        assert_eq!(
+            waiting_reason(&busy, &running, &pending, 1),
+            "waiting behind queued restack on local host"
+        );
     }
 
     #[test]
@@ -1704,7 +2138,7 @@ mod tests {
             title: "Saved now".into(),
         };
         let lane = lane_for(&action).unwrap();
-        let busy = BTreeSet::from([
+        let busy = Admission::from([
             Lane::Host(None),
             Lane::Host(Some("one".into())),
             Lane::Host(Some("two".into())),
@@ -1743,7 +2177,7 @@ mod tests {
                 assert_eq!(
                     take_available(
                         &mut pending,
-                        &BTreeSet::from([Lane::Creation(host.clone())])
+                        &Admission::from([Lane::Creation(host.clone())])
                     ),
                     Some((lane, action))
                 );
@@ -1791,9 +2225,12 @@ mod tests {
             &stop,
             &Lane::Terminal(None, Some("existing".into()))
         ));
+        // One control at a time per host; a view control is this device's own.
         let mut pending = VecDeque::from([(Lane::HostControl(None), ())]);
-        assert!(take_available(&mut pending, &BTreeSet::from([Lane::ViewControl])).is_none());
-        assert!(take_available(&mut pending, &BTreeSet::new()).is_some());
+        assert!(
+            take_available(&mut pending, &Admission::from([Lane::HostControl(None)])).is_none()
+        );
+        assert!(take_available(&mut pending, &Admission::from([Lane::ViewControl])).is_some());
     }
 
     #[test]
@@ -1823,13 +2260,13 @@ mod tests {
         let menu = Lane::Preparation(None);
         // A running prefetch leaves the preparation slot free...
         let mut pending = VecDeque::from([(warm.clone(), 1), (menu.clone(), 2)]);
-        let busy = BTreeSet::from([warm.clone()]);
+        let busy = Admission::from([warm.clone()]);
         assert_eq!(take_available(&mut pending, &busy), Some((menu.clone(), 2)));
         // ...and only one prefetch runs at a time.
         assert_eq!(take_available(&mut pending, &busy), None);
         // A foreground preparation does not wait for the prefetch either.
         let mut pending = VecDeque::from([(warm.clone(), 3)]);
-        let busy = BTreeSet::from([menu]);
+        let busy = Admission::from([menu]);
         assert_eq!(take_available(&mut pending, &busy), Some((warm, 3)));
     }
 
@@ -1839,11 +2276,11 @@ mod tests {
         let next = Lane::Metadata(None, "second".into());
         let removal = Lane::Removal(None, "third".into());
         let mut pending = VecDeque::from([(next.clone(), 1), (removal.clone(), 2)]);
-        let busy = BTreeSet::from([active]);
+        let busy = Admission::from([active]);
         assert_eq!(take_available(&mut pending, &busy), Some((removal, 2)));
         assert_eq!(take_available(&mut pending, &busy), None);
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::new()),
+            take_available(&mut pending, &Admission::default()),
             Some((next, 1))
         );
     }
@@ -1861,18 +2298,18 @@ mod tests {
             (remote.clone(), title("second")),
             (local.clone(), title("local")),
         ]);
-        let busy = BTreeSet::from([remote.clone()]);
+        let busy = Admission::from([remote.clone()]);
         assert_eq!(
             take_available(&mut pending, &busy),
             Some((local, title("local")))
         );
         assert_eq!(take_available(&mut pending, &busy), None);
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::new()),
+            take_available(&mut pending, &Admission::default()),
             Some((remote.clone(), title("first")))
         );
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::new()),
+            take_available(&mut pending, &Admission::default()),
             Some((remote, title("second")))
         );
     }
@@ -1904,7 +2341,7 @@ mod tests {
             (preparation_lane.clone(), preparation.clone()),
             (mutation_lane.clone(), mutation),
         ]);
-        let busy = BTreeSet::from([Lane::Host(None)]);
+        let busy = Admission::from([Lane::Host(None)]);
         assert_eq!(
             take_available(&mut pending, &busy),
             Some((preparation_lane, preparation))
@@ -1948,7 +2385,7 @@ mod tests {
             ),
             (Lane::Host(None), "global host write"),
         ]);
-        let busy = BTreeSet::from([active]);
+        let busy = Admission::from([active]);
         assert_eq!(
             take_available(&mut pending, &busy),
             Some((other_remove, "other removal"))
@@ -2002,6 +2439,8 @@ mod tests {
                 target: Some("new-frontend".into()),
                 pr: None,
                 started,
+                admitted: started,
+                background: false,
             },
             Instant::now(),
         );
@@ -2012,7 +2451,7 @@ mod tests {
 
     #[test]
     fn view_controls_have_reserved_capacity_while_host_work_is_saturated() {
-        let busy = BTreeSet::from([
+        let busy = Admission::from([
             Lane::Host(None),
             Lane::Host(Some("builder-a".into())),
             Lane::Host(Some("builder-b".into())),
@@ -2059,7 +2498,7 @@ mod tests {
         assert_eq!(
             take_available(
                 &mut pending,
-                &BTreeSet::from([
+                &Admission::from([
                     Lane::Terminal(Some("other-host".into()), Some("one".into())),
                     Lane::Creation(None)
                 ])
@@ -2069,7 +2508,7 @@ mod tests {
         assert_eq!(
             take_available(
                 &mut pending,
-                &BTreeSet::from([
+                &Admission::from([
                     Lane::Creation(None),
                     Lane::Removal(None, "other".into()),
                     cleanup([(None, "other")])
@@ -2120,20 +2559,16 @@ mod tests {
 
     #[test]
     fn preparation_has_one_reserved_slot_beyond_four_ordinary_actions() {
-        let busy = BTreeSet::from([
-            Lane::Host(None),
-            Lane::Host(Some("builder-a".into())),
-            Lane::Host(Some("builder-b".into())),
-            Lane::Presentation,
-        ]);
+        let long_jobs = ["a", "b", "c", "d"].map(|key| Lane::Removal(None, key.into()));
+        let busy = Admission::from(long_jobs.clone());
         let preparation = UiAction::PrepareRemove { key: "row".into() };
         let preparation_lane = lane_for(&preparation).unwrap();
-        let fifth_host_lane = Lane::Host(Some("builder-c".into()));
-        // Use an unrelated remote host so the test isolates the reserved
-        // creation slot from same-host serialization with Host actions.
-        let creation_lane = Lane::Creation(Some("builder-c".into()));
+        // A fifth long job on a checkout nothing else touches, so the test
+        // isolates capacity from conflicts.
+        let fifth_long_job = Lane::Action(None, Some("e".into()));
+        let creation_lane = Lane::Creation(None);
         let mut pending = VecDeque::from([
-            (fifth_host_lane, UiAction::HardRefresh),
+            (fifth_long_job, UiAction::HardRefresh),
             (preparation_lane.clone(), preparation.clone()),
             (
                 creation_lane.clone(),
@@ -2157,16 +2592,16 @@ mod tests {
                 }
             ))
         );
-        let with_reserved = busy
+        let with_reserved = long_jobs
             .into_iter()
             .chain([preparation_lane, creation_lane])
-            .collect::<BTreeSet<_>>();
+            .collect::<Admission>();
         assert_eq!(take_available(&mut pending, &with_reserved), None);
     }
 
     #[test]
     fn view_controls_still_serialize_and_do_not_consume_host_capacity() {
-        let busy = BTreeSet::from([
+        let busy = Admission::from([
             Lane::ViewControl,
             Lane::Host(None),
             Lane::Host(Some("builder-a".into())),
@@ -2295,12 +2730,12 @@ mod tests {
         let preparation = Lane::Preparation(Some("builder".into()));
         let mut pending = VecDeque::from([(preparation.clone(), "open removal review")]);
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::from([active.clone()])),
+            take_available(&mut pending, &Admission::from([active.clone()])),
             Some((preparation, "open removal review"))
         );
         let mut pending = VecDeque::from([(host.clone(), "host mutation")]);
         assert_eq!(
-            take_available(&mut pending, &BTreeSet::from([active])),
+            take_available(&mut pending, &Admission::from([active])),
             None
         );
     }
@@ -2308,7 +2743,7 @@ mod tests {
     #[test]
     fn busy_cleanup_admits_unrelated_checkouts_and_holds_its_own_targets() {
         let remote = Some("builder".to_owned());
-        let busy = BTreeSet::from([cleanup([(None, "a"), (remote.clone(), "b")])]);
+        let busy = Admission::from([cleanup([(None, "a"), (remote.clone(), "b")])]);
         for admitted in [
             Lane::Terminal(None, Some("c".into())),
             Lane::Terminal(remote.clone(), Some("c".into())),

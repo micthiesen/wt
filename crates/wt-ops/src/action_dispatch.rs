@@ -211,7 +211,11 @@ pub async fn dispatch_automation(
             } else {
                 DeliverySlot::Session
             };
-            match deliver_prompt(context, route_slug, cwd, branch, managed, &text, true).await {
+            match deliver_prompt(
+                context, route_slug, cwd, branch, managed, &text, true, false,
+            )
+            .await
+            {
                 PromptDelivery::Delivered => AutomationOutcome::Delivered { slot },
                 PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous { reason, slot },
                 PromptDelivery::Unreachable(_) => AutomationOutcome::NotStarted,
@@ -233,6 +237,9 @@ enum PromptDelivery {
 /// prompts and watch wake-ups, so both resume sessions, respect harness
 /// slots and treat a lost reply the same way. `recorded` adds the message
 /// to the worktree's history; a wake-up is recorded by its watch instead.
+/// `attended` is a send whose caller is waited on: it gives up on a session
+/// that stays waiting on a person, with nothing sent.
+#[allow(clippy::too_many_arguments)]
 async fn deliver_prompt(
     context: &AppContext,
     slug: String,
@@ -241,15 +248,21 @@ async fn deliver_prompt(
     managed: Option<String>,
     text: &str,
     recorded: bool,
+    attended: bool,
 ) -> PromptDelivery {
-    let route = match delivery_route(context, slug, cwd, branch, managed).await {
+    let harness = AppHarness::new(context);
+    let harness = if attended {
+        harness.with_claude_turn_limits(ATTENDED_HUMAN_WAIT, ATTENDED_QUEUE_WAIT)
+    } else {
+        harness
+    };
+    let route = match delivery_route(context, &harness, slug, cwd, branch, managed, None).await {
         Ok(route) => route,
         Err(error) => return PromptDelivery::Unreachable(format!("{error:#}")),
     };
     if route.target.remote || route.choice.source == SelectionSource::RemoteUnavailable {
         return PromptDelivery::Unreachable("its session is on another host".into());
     }
-    let harness = AppHarness::new(context);
     let sent = if recorded {
         let record = wt_app_core::harness::MessageRecord {
             from: Some("wt"),
@@ -346,6 +359,7 @@ pub async fn wake_session(
         None,
         prompt,
         false,
+        false,
     )
     .await;
     match delivery {
@@ -362,7 +376,9 @@ pub async fn wake_session(
 
 /// Send a prompt of wt's own to the manager session, for what no worktree
 /// session is left to hear. A manager that cannot be reached defers: nothing
-/// was sent.
+/// was sent. The caller awaits this inside the automation source's loop, so
+/// a manager that stays waiting on a person defers too instead of holding
+/// every other automation until the person answers.
 pub async fn wake_manager(
     context: &AppContext,
     prompt: &str,
@@ -376,6 +392,7 @@ pub async fn wake_manager(
         Some("manager".into()),
         prompt,
         false,
+        true,
     )
     .await;
     match delivery {
@@ -404,15 +421,44 @@ pub async fn prepare(
     board: Option<&Board>,
     arg: Option<String>,
 ) -> Result<ActionContext> {
+    Ok(prepare_dispatch(context, surface, github, board, arg)
+        .await?
+        .context)
+}
+
+/// An action context with the worktree inventory it was resolved from. A
+/// caller that checks the context and then dispatches hands this to
+/// [`dispatch_prepared`], so one commit resolves its target once.
+pub struct PreparedContext {
+    pub context: ActionContext,
+    inventory: Option<Vec<WorktreeRecord>>,
+}
+
+pub async fn prepare_dispatch(
+    context: &AppContext,
+    surface: &ActionSurface,
+    github: Option<&Confirmed<GithubData>>,
+    board: Option<&Board>,
+    arg: Option<String>,
+) -> Result<PreparedContext> {
     let (target, key, slot) = match surface {
         ActionSurface::Row { key } => (None, Some(key.as_str()), None),
         ActionSurface::Manager { key } => (Some("manager"), key.as_deref(), None),
         ActionSurface::Slot { target } => (None, None, Some(*target)),
     };
-    let row_snapshot = if let Some(key) = key {
-        Some(resolve_row(context, key).await?)
-    } else {
-        None
+    let inventory = match key {
+        Some(_) => Some(context.repository.inventory(&context.cancellation).await?),
+        None => None,
+    };
+    let row_snapshot = match (key, &inventory) {
+        (Some(key), Some(inventory)) => Some(
+            inventory
+                .iter()
+                .find(|record| wt_core::worktree_target_key(&record.target) == key)
+                .cloned()
+                .with_context(|| format!("selected worktree no longer exists: {key}"))?,
+        ),
+        _ => None,
     };
     let (slug, cwd, branch, stage, worktree_ref, action_key) = if let Some(snapshot) = &row_snapshot
     {
@@ -510,10 +556,19 @@ pub async fn prepare(
     }
     let issue_id = row.issue_id.as_deref().unwrap_or_default().to_owned();
     // A slot whose harness is pinned renders its prompt for that harness.
-    let primary = slot
+    let primary = match slot
         .and_then(|slot| wt_app_core::harness::pinned_slot_harness(&context.config.harness, slot))
-        .unwrap_or_else(|| AppHarness::new(context).primary());
-    Ok(ActionContext {
+    {
+        Some(pinned) => pinned,
+        None => {
+            wt_app_core::harness::read_primary(
+                &context.config.paths.cache_root.join("harness.json"),
+                context.config.harness.primary,
+            )
+            .await
+        }
+    };
+    let action = ActionContext {
         action_key,
         slug,
         cwd,
@@ -530,8 +585,25 @@ pub async fn prepare(
         row,
         harness: harness_kind(primary),
         auto_fire_keys: Vec::new(),
+    };
+    Ok(PreparedContext {
+        context: action,
+        inventory,
     })
 }
+
+/// How long a send that something waits on lets a Claude session keep
+/// waiting on a person before it reports that nothing was sent. A prompt from
+/// the board holds a controller lane, and the manager wake is awaited by the
+/// automation source's loop; a person can take hours. Only that wait is
+/// bounded by this: a cold start and the delivery itself keep their own,
+/// shorter-than-a-minute bounds. Automation fires and the CLI run detached
+/// and keep the adapter's day.
+const ATTENDED_HUMAN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long such a send queues behind another message that is being
+/// delivered to the same session: long enough for that one's cold start,
+/// submit and confirmation.
+const ATTENDED_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 // Keep the palette's explicit immutable inputs visible at this boundary;
 // wrapping them in a second DTO would obscure the UI contract.
@@ -546,12 +618,36 @@ pub async fn dispatch(
     extras: &str,
     auto_fire_keys: Vec<String>,
 ) -> Result<String> {
+    let prepared = prepare_dispatch(context, surface, github, board, arg).await?;
+    dispatch_prepared(
+        context,
+        surface,
+        definition,
+        prepared,
+        extras,
+        auto_fire_keys,
+    )
+    .await
+}
+
+/// [`dispatch`] for a context the caller prepared in this same request.
+pub async fn dispatch_prepared(
+    context: &AppContext,
+    surface: &ActionSurface,
+    definition: &ActionDef,
+    prepared: PreparedContext,
+    extras: &str,
+    auto_fire_keys: Vec<String>,
+) -> Result<String> {
     let current_definition = definitions(context, surface)
         .into_iter()
         .find(|current| current.id == definition.id)
         .with_context(|| format!("action {:?} is no longer available", definition.id))?;
     let definition = &current_definition;
-    let mut action_context = prepare(context, surface, github, board, arg).await?;
+    let PreparedContext {
+        context: mut action_context,
+        inventory,
+    } = prepared;
     if matches!(surface, ActionSurface::Manager { .. })
         && wt_app_core::action_builtins::is_fleet(&definition.id)
     {
@@ -570,19 +666,30 @@ pub async fn dispatch(
     {
         bail!("{}: {reason}", definition.name);
     }
-    let delivery_route = if definition.kind == wt_config::ActionKind::Claude
+    let delivery = if definition.kind == wt_config::ActionKind::Claude
         && definition.target != wt_config::ActionTarget::Headless
     {
         let (slug, cwd, branch, managed_name) =
             delivery_identity(context, surface, definition.target, &action_context)?;
-        let route = delivery_route(context, slug, cwd, branch, managed_name).await?;
+        let harness = AppHarness::new(context)
+            .with_claude_turn_limits(ATTENDED_HUMAN_WAIT, ATTENDED_QUEUE_WAIT);
+        let route = delivery_route(
+            context,
+            &harness,
+            slug,
+            cwd,
+            branch,
+            managed_name,
+            inventory,
+        )
+        .await?;
         let selected = route
             .choice
             .selected
             .context("no harness selected for action target")?;
         action_context.harness = harness_kind(selected);
         action_context.skill_prefix = skill_prefix(selected).into();
-        Some(route)
+        Some((harness, route))
     } else {
         None
     };
@@ -628,28 +735,18 @@ pub async fn dispatch(
             if manager_row_prefix {
                 text = format!("[re: {}] {text}", action_context.slug);
             }
-            let route = delivery_route
+            let (harness, route) = delivery
                 .with_context(|| format!("no live target for action slot {route_slug:?}"))?;
             if route.target.remote || route.choice.source == SelectionSource::RemoteUnavailable {
                 bail!("action target {route_slug:?} is remote and cannot be delivered locally");
             }
-            let outcome = AppHarness::new(context)
+            let outcome = harness
                 .send(&route, &text, None, context)
                 .await
                 .with_context(|| format!("deliver {}", definition.name))?;
             report_delivery(&definition.name, &route_slug, outcome)
         }
     }
-}
-
-async fn resolve_row(context: &AppContext, key: &str) -> Result<WorktreeRecord> {
-    context
-        .repository
-        .inventory(&context.cancellation)
-        .await?
-        .into_iter()
-        .find(|record| wt_core::worktree_target_key(&record.target) == key)
-        .with_context(|| format!("selected worktree no longer exists: {key}"))
 }
 
 /// Template values for an MCP event fire. `{{event}}` fences the payload as
@@ -733,22 +830,25 @@ fn delivery_identity(
     }
 }
 
+/// `inventory` is the worktree listing this request already took, if any.
 async fn delivery_route(
     context: &AppContext,
+    app: &AppHarness,
     slug: String,
     cwd: PathBuf,
     branch: Option<String>,
     managed_name: Option<String>,
+    inventory: Option<Vec<WorktreeRecord>>,
 ) -> Result<AgentRoute> {
-    let app = AppHarness::new(context);
     let sessions = app
         .session_inventory(context)
         .await
         .context("inspect harness target sessions")?;
-    let known_slugs = context
-        .repository
-        .inventory(&context.cancellation)
-        .await?
+    let inventory = match inventory {
+        Some(inventory) => inventory,
+        None => context.repository.inventory(&context.cancellation).await?,
+    };
+    let known_slugs = inventory
         .into_iter()
         .map(|record| record.target.slug().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
@@ -1052,6 +1152,122 @@ mod tests {
         assert!(error.contains("do not retry automatically"));
     }
 
+    /// A prompt sent from the board to a Claude session that waits on a
+    /// person comes back within the board's turn limit saying nothing was
+    /// sent, instead of holding its controller lane until someone answers.
+    #[tokio::test]
+    async fn a_board_prompt_to_a_session_waiting_on_a_person_is_refused_promptly() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.tmux.socket = format!(
+                "wt-board-prompt-{}",
+                fixture._root.path().file_name().unwrap().to_string_lossy()
+            );
+            config.harness.primary = HarnessId::Claude;
+        }
+        let records = fixture
+            .ctx
+            .repository
+            .inventory(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.target.slug() == "one")
+            .unwrap();
+        // This test process stands in for the live, waiting Claude.
+        let cwd = std::fs::canonicalize(&record.target.path).unwrap();
+        let sessions = fixture.ctx.home.join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{}.json", std::process::id())),
+            serde_json::json!({"pid": std::process::id(),
+                "sessionId": wt_harness::claude_session_id(&cwd, None), "cwd": cwd,
+                "name": "one", "status": "waiting", "waitingFor": "permission",
+                "startedAt": 1, "updatedAt": 2})
+            .to_string(),
+        )
+        .unwrap();
+        let surface = ActionSurface::Row {
+            key: wt_core::worktree_target_key(&record.target),
+        };
+        // A row's custom prompt runs headless; this one goes to its session.
+        let definition = definitions(&fixture.ctx, &surface)
+            .into_iter()
+            .find(|definition| definition.id == "agent-continue")
+            .unwrap();
+        assert_eq!(definition.target, wt_config::ActionTarget::Session);
+        let sent = tokio::time::timeout(
+            ATTENDED_HUMAN_WAIT * 6,
+            dispatch(
+                &fixture.ctx,
+                &surface,
+                &definition,
+                None,
+                None,
+                None,
+                "",
+                Vec::new(),
+            ),
+        )
+        .await;
+        fixture.close().await.unwrap();
+        let error = sent
+            .expect("the send outlived the board's turn limit")
+            .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("waiting on a human (permission)") && error.contains("Nothing was sent"),
+            "{error}"
+        );
+    }
+
+    /// The manager wake is awaited by the automation source's loop. A manager
+    /// that waits on a person defers it with nothing sent, so the loop moves
+    /// on and a later look asks again.
+    #[tokio::test]
+    async fn a_manager_wake_defers_unsent_while_the_manager_waits_on_a_person() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        {
+            let config = std::sync::Arc::make_mut(&mut fixture.ctx.config);
+            config.tmux.socket = format!(
+                "wt-manager-wake-{}",
+                fixture._root.path().file_name().unwrap().to_string_lossy()
+            );
+            config.harness.primary = HarnessId::Claude;
+        }
+        // This test process stands in for the live, waiting manager.
+        let cwd = std::fs::canonicalize(&fixture.ctx.config.paths.main_clone).unwrap();
+        let sessions = fixture.ctx.home.join(".claude/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{}.json", std::process::id())),
+            serde_json::json!({"pid": std::process::id(),
+                "sessionId": wt_harness::claude_session_id(&cwd, Some("manager")), "cwd": cwd,
+                "name": "manager~manager", "status": "waiting", "waitingFor": "question",
+                "startedAt": 1, "updatedAt": 2})
+            .to_string(),
+        )
+        .unwrap();
+        let outcome = tokio::time::timeout(
+            ATTENDED_HUMAN_WAIT * 6,
+            wake_manager(&fixture.ctx, "a removed worktree owes a check"),
+        )
+        .await;
+        fixture.close().await.unwrap();
+        match outcome.expect("the wake outlived its human wait") {
+            wt_app_core::automation_engine::AutomationOutcome::Deferred { reason, .. } => {
+                assert!(
+                    reason.contains("waiting on a human (question)")
+                        && reason.contains("Nothing was sent"),
+                    "{reason}"
+                );
+            }
+            _ => panic!("a wake to a waiting manager was not deferred"),
+        }
+    }
+
     #[tokio::test]
     async fn prepare_resolves_current_row_without_git_status_scans() {
         let fixture = CommandFixture::new().await.unwrap();
@@ -1154,7 +1370,8 @@ mod tests {
         .unwrap();
         assert_eq!(main.harness, ActionHarness::Codex);
 
-        let route = delivery_route(&fixture.ctx, "wt".into(), wt_source, None, None)
+        let app = AppHarness::new(&fixture.ctx);
+        let route = delivery_route(&fixture.ctx, &app, "wt".into(), wt_source, None, None, None)
             .await
             .unwrap();
         assert_eq!(route.target.kind, AgentTargetKind::Special);
@@ -1162,8 +1379,10 @@ mod tests {
         assert_eq!(route.choice.source, SelectionSource::Pinned);
         let main = delivery_route(
             &fixture.ctx,
+            &app,
             "main".into(),
             fixture.ctx.config.paths.main_clone.clone(),
+            None,
             None,
             None,
         )

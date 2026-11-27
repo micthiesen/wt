@@ -1,6 +1,7 @@
 //! Bounded, cancellable subprocess execution.
 //!
-//! A permit covers queue admission through process reaping and pipe cleanup.
+//! A permit covers admission through process reaping and pipe cleanup. The
+//! run timeout starts at admission; waiting for it has its own bound.
 //! Every command owns a Unix process group so cancellation also reaches children
 //! that inherited stdout/stderr. Intentional daemons must detach themselves.
 
@@ -14,12 +15,25 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
+use crate::admission::Admission;
+pub use crate::admission::{ProcessBudget, ProcessClass};
+use crate::lock::{LockError, MachineSlot, MachineSlots};
+
 const TERMINATION_GRACE: Duration = Duration::from_millis(500);
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// A subprocess that waited or ran this long is logged at info.
+const SLOW_ADMISSION: Duration = Duration::from_secs(1);
+const SLOW_RUN: Duration = Duration::from_secs(5);
+/// The longest a whole-fleet read waits for its machine-wide turn before it
+/// reads without one. A holder can be suspended, and waiters in different
+/// processes are served in no order, so the wait must end on its own.
+const FLEET_SCAN_WAIT: Duration = Duration::from_secs(10);
+/// The longest a heavy command waits for a machine-wide slot before it runs
+/// without one. Long enough to queue behind installs that take minutes.
+const HEAVY_SLOT_WAIT: Duration = Duration::from_secs(10 * 60);
 type StreamObserver = Arc<dyn Fn(ProcessStream, &[u8]) + Send + Sync>;
 
 #[derive(Clone, Debug)]
@@ -30,9 +44,15 @@ pub struct CommandSpec {
     /// `None` removes a variable from the inherited environment.
     pub env: Vec<(OsString, Option<OsString>)>,
     pub input: Option<Vec<u8>>,
-    /// Includes queue wait, execution, and output collection. With
+    /// Execution and output collection, counted from admission. With
     /// `run_to_completion`, this bounds admission only.
     pub timeout: Duration,
+    /// The longest wait for admission. `None` uses the class default, a
+    /// minute (fifteen for bulk work), so a command queued behind others
+    /// fails only when the queue itself is stuck. A `heavy()` command first
+    /// waits for a machine-wide slot, for at most this long or ten minutes,
+    /// and then proceeds with or without one; that wait is not counted here.
+    pub admission_timeout: Option<Duration>,
     pub output_limit: usize,
     /// Explicit ownership transfer for desktop launchers/clipboard providers.
     /// Only a successful leader exit with closed pipes releases its children.
@@ -49,6 +69,7 @@ impl CommandSpec {
             env: Vec::new(),
             input: None,
             timeout: Duration::from_secs(45),
+            admission_timeout: None,
             output_limit: 16 * 1024 * 1024,
             preserve_children_on_success: false,
         }
@@ -118,6 +139,8 @@ pub enum ProcessError {
     },
     #[error("{program}: cancelled")]
     Cancelled { program: String },
+    /// The run exceeded its timeout, or admission exceeded its bound; the
+    /// duration is the bound that was reached.
     #[error("{program}: timed out after {timeout:?}")]
     Timeout { program: String, timeout: Duration },
     #[error("{program}: {stream} exceeded the {limit}-byte capture limit")]
@@ -139,16 +162,120 @@ pub enum ProcessError {
     },
 }
 
+/// A handle on one subprocess budget. Clones and `with_class` handles share
+/// the budget; the class says whose turn it is when the budget is contended.
 #[derive(Clone)]
 pub struct ProcessRunner {
-    permits: Arc<Semaphore>,
+    admission: Arc<Admission>,
+    class: ProcessClass,
+    /// Also take one of the budget's machine-wide heavy slots.
+    heavy: bool,
 }
 
 impl ProcessRunner {
+    /// One undivided FIFO pool of `max_active` subprocesses.
     pub fn new(max_active: std::num::NonZeroUsize) -> Self {
+        Self::with_budget(ProcessBudget::flat(max_active))
+    }
+
+    /// A budget shared between classes. The handle starts as `Background`.
+    pub fn with_budget(budget: ProcessBudget) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(max_active.get())),
+            admission: Admission::new(budget),
+            class: ProcessClass::Background,
+            heavy: false,
         }
+    }
+
+    /// The same budget, admitted as `class`.
+    pub fn with_class(&self, class: ProcessClass) -> Self {
+        Self {
+            admission: Arc::clone(&self.admission),
+            class,
+            heavy: false,
+        }
+    }
+
+    pub fn class(&self) -> ProcessClass {
+        self.class
+    }
+
+    /// The handle for a long command that is light on the machine or already
+    /// serialized elsewhere (an origin fetch): `Bulk`, so it holds one of the
+    /// few bulk slots and never a reader's. Work a person is waiting on
+    /// keeps its place.
+    pub fn bulk(&self) -> Self {
+        match self.class {
+            ProcessClass::Interactive => self.clone(),
+            _ => self.with_class(ProcessClass::Bulk),
+        }
+    }
+
+    /// The handle for a long command that loads the machine (a checkout, a
+    /// dependency install, a large delete): `bulk()`, and one of the heavy
+    /// slots shared by every wt process when the budget has them. Each
+    /// process has a budget of its own, so only those slots bound how many
+    /// such commands run at once. Work a person is waiting on is exempt.
+    pub fn heavy(&self) -> Self {
+        match self.class {
+            ProcessClass::Interactive => self.clone(),
+            _ => Self {
+                heavy: true,
+                ..self.with_class(ProcessClass::Bulk)
+            },
+        }
+    }
+
+    /// Bound `heavy()` commands across every process sharing `slots`. Applies
+    /// to every handle on this budget. The first setting stays.
+    pub fn with_heavy_slots(self, slots: MachineSlots) -> Self {
+        self.admission.set_heavy(slots);
+        self
+    }
+
+    /// Bound whole-fleet reads across every process sharing `slots`. See
+    /// [`Self::fleet_scan`]. Applies to every handle on this budget.
+    pub fn with_fleet_scan_slots(self, slots: MachineSlots) -> Self {
+        self.admission.set_fleet_scans(slots);
+        self
+    }
+
+    /// Take a turn for one read of every checkout (a status per worktree),
+    /// and hold the returned guard until the read ends. Each wt process has
+    /// its own subprocess budget, so without this turn several agents
+    /// listing the fleet at once multiply the load. A read someone is
+    /// waiting on (`Interactive`, `Confirming`) never waits here, and neither
+    /// does a budget with no fleet-scan slots. `None` also when cancelled
+    /// (the read then fails on the same token) and when no turn came within
+    /// ten seconds: the read then goes ahead without one.
+    pub async fn fleet_scan(&self, cancellation: &CancellationToken) -> Option<MachineSlot> {
+        if matches!(
+            self.class,
+            ProcessClass::Interactive | ProcessClass::Confirming
+        ) {
+            return None;
+        }
+        let slots = self.admission.fleet_scans()?;
+        let started = Instant::now();
+        let slot = match slots.acquire_within(FLEET_SCAN_WAIT, cancellation).await {
+            Ok(slot) => slot,
+            Err(LockError::Cancelled) => None,
+            Err(error) => {
+                tracing::warn!(target: "wt::process", %error, "fleet-scan slots unavailable; scanning without one");
+                None
+            }
+        };
+        let waited = started.elapsed();
+        if waited >= SLOW_ADMISSION {
+            tracing::info!(
+                target: "wt::process",
+                class = self.class.as_str(),
+                wait_ms = waited.as_millis() as u64,
+                acquired = slot.is_some(),
+                "waited for a fleet-scan turn"
+            );
+        }
+        slot
     }
 
     pub async fn run(
@@ -163,7 +290,8 @@ impl ProcessRunner {
     }
 
     /// Complete an irreversible local mutation once its process starts.
-    /// Admission still uses the command timeout and cancellation token. After
+    /// Admission uses `admission_timeout`, or else the command timeout, and
+    /// the cancellation token. After
     /// spawn, neither can interrupt the child. Capture stays bounded and extra
     /// output is drained. The caller must retain this future through completion.
     pub async fn run_to_completion(
@@ -201,29 +329,76 @@ impl ProcessRunner {
         complete_after_spawn: bool,
     ) -> Result<ProcessOutput, ProcessError> {
         let started = Instant::now();
-        let deadline = started + spec.timeout;
         let program = spec.program.to_string_lossy().into_owned();
+        let label = CommandLabel::new(&spec, self.class);
         let cancelled = || ProcessError::Cancelled {
             program: program.clone(),
         };
+        let admission_timeout = spec.admission_timeout.unwrap_or(if complete_after_spawn {
+            spec.timeout
+        } else {
+            self.class.admission_timeout()
+        });
+        // The machine slot comes first: waiting for it while holding a local
+        // permit would keep this process's few bulk permits from its fetches.
+        let slot = match self.admission.heavy().filter(|_| self.heavy) {
+            Some(slots) => {
+                let bound = HEAVY_SLOT_WAIT.min(admission_timeout);
+                match slots.acquire_within(bound, cancellation).await {
+                    Ok(Some(slot)) => Some(slot),
+                    Ok(None) => {
+                        tracing::info!(
+                            target: "wt::process",
+                            program = %label.program,
+                            wait_ms = bound.as_millis() as u64,
+                            "no machine slot came free; running the heavy command without one"
+                        );
+                        None
+                    }
+                    Err(LockError::Cancelled) => {
+                        label.report(started.elapsed(), None, "cancelled");
+                        return Err(cancelled());
+                    }
+                    Err(error) => {
+                        // The slots shed load; they guard no data. Unusable
+                        // slot files must not stop wt from running commands.
+                        tracing::warn!(target: "wt::process", %error, "machine slots unavailable; running without one");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let queued = Instant::now();
+        let admitted = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(cancelled()),
+            _ = tokio::time::sleep_until(queued + admission_timeout) => Err(ProcessError::Timeout {
+                program: program.clone(),
+                timeout: admission_timeout,
+            }),
+            permit = self.admission.acquire(self.class) => Ok((permit, slot)),
+        };
+        let _admitted = match admitted {
+            // Cancellation can arrive together with the permit. Do not launch
+            // work whose caller already withdrew it.
+            Ok(_) if cancellation.is_cancelled() => {
+                label.report(started.elapsed(), None, "cancelled");
+                return Err(cancelled());
+            }
+            Ok(admitted) => admitted,
+            Err(error) => {
+                label.report(started.elapsed(), None, outcome(&error));
+                return Err(error);
+            }
+        };
+        let admitted_at = Instant::now();
+        let waited = admitted_at.duration_since(started);
+        let deadline = admitted_at + spec.timeout;
         let timed_out = || ProcessError::Timeout {
             program: program.clone(),
             timeout: spec.timeout,
         };
-        let _permit = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Err(cancelled()),
-            _ = tokio::time::sleep_until(deadline) => return Err(timed_out()),
-            permit = self.permits.acquire() => permit.expect("runner semaphore is never closed"),
-        };
-        // Cancellation can arrive together with the permit. Do not launch work
-        // whose caller already withdrew it.
-        if cancellation.is_cancelled() {
-            return Err(cancelled());
-        }
-        if Instant::now() >= deadline {
-            return Err(timed_out());
-        }
 
         let mut command = Command::new(&spec.program);
         command
@@ -248,11 +423,17 @@ impl ProcessRunner {
         }
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command.spawn().map_err(|source| ProcessError::Io {
-            program: program.clone(),
-            operation: "spawn",
-            source,
-        })?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(source) => {
+                label.report(waited, Some(Duration::ZERO), "error");
+                return Err(ProcessError::Io {
+                    program: program.clone(),
+                    operation: "spawn",
+                    source,
+                });
+            }
+        };
         let mut group = ProcessGroup::new(child.id());
         let stdout = child.stdout.take().expect("stdout requested as pipe");
         let stderr = child.stderr.take().expect("stderr requested as pipe");
@@ -348,14 +529,106 @@ impl ProcessRunner {
             group.signal(libc::SIGKILL);
         }
         group.disarm();
+        let ran = admitted_at.elapsed();
         tracing::debug!(
             program,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            wait_ms = waited.as_millis() as u64,
+            elapsed_ms = ran.as_millis() as u64,
             success = result.is_ok(),
             "subprocess completed"
         );
+        label.report(
+            waited,
+            Some(ran),
+            match &result {
+                Ok(output) if output.status.success() => "ok",
+                Ok(_) => "exit",
+                Err(error) => outcome(error),
+            },
+        );
         result
     }
+}
+
+fn outcome(error: &ProcessError) -> &'static str {
+    match error {
+        ProcessError::Cancelled { .. } => "cancelled",
+        ProcessError::Timeout { .. } => "timeout",
+        _ => "error",
+    }
+}
+
+/// What a slow-subprocess record may say about a command: the program's
+/// name and, for Git, its subcommand. Paths, refs, URLs and every other
+/// argument can hold private content and stay out of the log.
+struct CommandLabel {
+    program: String,
+    subcommand: Option<String>,
+    class: ProcessClass,
+}
+
+impl CommandLabel {
+    fn new(spec: &CommandSpec, class: ProcessClass) -> Self {
+        let program = std::path::Path::new(&spec.program)
+            .file_name()
+            .unwrap_or(&spec.program)
+            .to_string_lossy()
+            .into_owned();
+        let subcommand = (program == "git")
+            .then(|| git_subcommand(&spec.args))
+            .flatten();
+        Self {
+            program,
+            subcommand,
+            class,
+        }
+    }
+
+    /// `ran` is `None` for a command that was never admitted.
+    fn report(&self, waited: Duration, ran: Option<Duration>, outcome: &'static str) {
+        if waited < SLOW_ADMISSION && ran.is_none_or(|ran| ran < SLOW_RUN) {
+            return;
+        }
+        tracing::info!(
+            target: "wt::process",
+            program = %self.program,
+            subcommand = self.subcommand.as_deref(),
+            class = self.class.as_str(),
+            wait_ms = waited.as_millis() as u64,
+            run_ms = ran.map(|ran| ran.as_millis() as u64),
+            admitted = ran.is_some(),
+            outcome,
+            "slow subprocess"
+        );
+    }
+}
+
+/// The first word after Git's global options, when it looks like a command
+/// name. A global option's separate value (`-C <path>`) is skipped unread.
+fn git_subcommand(args: &[OsString]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let arg = arg.to_str()?;
+        if matches!(
+            arg,
+            "-C" | "-c"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--config-env"
+                | "--super-prefix"
+                | "--attr-source"
+        ) {
+            args.next();
+        } else if !arg.starts_with('-') {
+            let named = arg.len() <= 32
+                && arg
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-');
+            return named.then(|| arg.to_owned());
+        }
+    }
+    None
 }
 
 impl Default for ProcessRunner {
@@ -452,4 +725,51 @@ async fn terminate(child: &mut Child, group: &ProcessGroup) {
     group.signal(libc::SIGKILL);
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subcommand(args: &[&str]) -> Option<String> {
+        git_subcommand(&args.iter().map(OsString::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_slow_subprocess_record_names_the_git_subcommand_and_nothing_else() {
+        assert_eq!(
+            subcommand(&[
+                "-C",
+                "/private/checkout",
+                "-c",
+                "user.name=x",
+                "status",
+                "--",
+                "secret"
+            ])
+            .as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            subcommand(&["--no-pager", "--git-dir", "private", "merge-base", "a", "b"]).as_deref(),
+            Some("merge-base")
+        );
+        // A value this does not recognise as a command name is not logged.
+        assert_eq!(subcommand(&["/private/checkout", "status"]), None);
+        assert_eq!(subcommand(&["--version"]), None);
+        let label = CommandLabel::new(
+            &CommandSpec::new("/opt/private/bin/git")
+                .args(["fetch", "https://token@example.invalid/x"]),
+            ProcessClass::Bulk,
+        );
+        assert_eq!(
+            (label.program.as_str(), label.subcommand.as_deref()),
+            ("git", Some("fetch"))
+        );
+        let other = CommandLabel::new(
+            &CommandSpec::new("gh").args(["api", "secret"]),
+            ProcessClass::Background,
+        );
+        assert_eq!((other.program.as_str(), other.subcommand), ("gh", None));
+    }
 }

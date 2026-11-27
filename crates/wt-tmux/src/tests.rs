@@ -782,6 +782,30 @@ async fn assert_no_injection_buffers(
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unchanged_terminal_config_is_not_rewritten() {
+    use std::os::unix::fs::MetadataExt;
+    let temp = tempdir().unwrap();
+    let cache = temp.path().join("cache");
+    let config = crate::write_terminal_config(&cache, temp.path(), None).unwrap();
+    let first = std::fs::metadata(&config).unwrap().ino();
+    assert_eq!(
+        crate::write_terminal_config(&cache, temp.path(), None).unwrap(),
+        config
+    );
+    assert_eq!(std::fs::metadata(&config).unwrap().ino(), first);
+    // A new palette observation changes the content and replaces the file.
+    assert!(crate::save_terminal_palette(&cache, "#ffffff", "#000000").unwrap());
+    crate::write_terminal_config(&cache, temp.path(), None).unwrap();
+    assert_ne!(std::fs::metadata(&config).unwrap().ino(), first);
+    assert!(
+        std::fs::read_to_string(&config)
+            .unwrap()
+            .contains("fg=#ffffff,bg=#000000")
+    );
+}
+
 #[tokio::test]
 async fn generated_terminal_config_reloads_navigation_without_replacing_sessions() {
     let temp = tempdir().unwrap();

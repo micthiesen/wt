@@ -1141,6 +1141,14 @@ pub struct RemovalView {
     /// retry. A failed record in this state can only be dismissed.
     #[serde(default)]
     pub checkout_absent: bool,
+    /// The work had landed when the removal began. With `owed_sections` the
+    /// row then stays in the Landed block until it is gone.
+    #[serde(default)]
+    pub landed: bool,
+    /// The row was archived before the removal began, which archives every
+    /// row it takes.
+    #[serde(default)]
+    pub was_archived: bool,
 }
 
 /// A branch other than the row's own that its checkout has been on, with
@@ -1241,6 +1249,9 @@ pub struct BoardRow {
     /// `busy` it holds no worktree lock and blocks no action.
     #[serde(default)]
     pub installing: bool,
+    /// That install is waiting for one of the machine's install slots.
+    #[serde(default)]
+    pub install_queued: bool,
     /// The checkout directory no longer exists.
     #[serde(default)]
     pub path_missing: bool,

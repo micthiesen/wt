@@ -109,6 +109,9 @@ pub struct MergeQueueEntry {
     pub estimated_time_to_merge: Option<u64>,
 }
 
+/// Serialized into the events daemon's snapshot and the query cache, which
+/// other builds read: a field that changes meaning there bumps
+/// `wt_events::SNAPSHOT_SCHEMA` and the query cache's schema.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequest {
@@ -144,6 +147,23 @@ pub struct PullRequest {
     pub unresolved_threads_more: bool,
     pub merged_at: Option<String>,
     pub closed_at: Option<String>,
+    /// The latest time GitHub took the pull request out of a merge queue
+    /// without merging it. It stays after a later enqueue, so compare its
+    /// time or commit with what is being asked about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_removal: Option<QueueRemoval>,
+}
+
+/// One removal of a pull request from a merge queue, as GitHub recorded it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueRemoval {
+    /// GitHub's own wording of why; empty when it gave none.
+    pub reason: String,
+    pub at_ms: u64,
+    /// The pull request's head when it was removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_commit_oid: Option<String>,
 }
 
 /// How a pull request named by number ended, or that it is still open.

@@ -14,14 +14,75 @@ use wt_app_core::context::AppContext;
 /// explicit slug/branch. Exact names win; unique slug prefixes are accepted.
 /// Multiple rows or a remote target are rejected before an operation routes.
 pub async fn resolve_worktree(ctx: &AppContext, input: Option<&str>) -> Result<WorktreeRecord> {
-    let records = ctx.repository.inventory(&ctx.cancellation).await?;
-    let Some(input) = input else {
-        let record = worktree_at_cwd(&records, &ctx.cwd)
-            .ok_or_else(|| anyhow!("not inside a worktree; pass a worktree slug or branch"))?;
-        ensure_local(&record.target)?;
-        return Ok(record.clone());
-    };
-    resolve_from_inventory(&records, input, true)
+    Inventory::read(ctx).await?.resolve(input)
+}
+
+/// One listing of the worktrees, read once and asked as often as a command
+/// needs: which worktree it runs in, which one a slug names, which exist.
+/// Listing costs a Git subprocess and a scan of the worktree root, and two
+/// listings in one command can disagree when a worktree is removed between
+/// them. A command that creates or removes a worktree reads a new one.
+#[derive(Clone, Debug)]
+pub struct Inventory {
+    records: Vec<WorktreeRecord>,
+    cwd: PathBuf,
+}
+
+impl Inventory {
+    pub async fn read(ctx: &AppContext) -> Result<Self> {
+        Ok(Self::of(
+            ctx.repository.inventory(&ctx.cancellation).await?,
+            &ctx.cwd,
+        ))
+    }
+
+    pub fn of(records: Vec<WorktreeRecord>, cwd: &Path) -> Self {
+        Self {
+            records,
+            cwd: cwd.to_path_buf(),
+        }
+    }
+
+    /// Every row, the main clone first.
+    pub fn records(&self) -> &[WorktreeRecord] {
+        &self.records
+    }
+
+    /// The worktrees: every row but the main clone.
+    pub fn worktrees(&self) -> impl Iterator<Item = &WorktreeRecord> {
+        self.records.iter().filter(|record| !record.is_main)
+    }
+
+    /// [`resolve_worktree`] against this listing.
+    pub fn resolve(&self, input: Option<&str>) -> Result<WorktreeRecord> {
+        let Some(input) = input else {
+            let record = self
+                .current()
+                .ok_or_else(|| anyhow!("not inside a worktree; pass a worktree slug or branch"))?;
+            ensure_local(&record.target)?;
+            return Ok(record.clone());
+        };
+        resolve_from_inventory(&self.records, input, true)
+    }
+
+    /// The row the command runs in, the main clone included.
+    pub fn current(&self) -> Option<&WorktreeRecord> {
+        worktree_at_cwd(&self.records, &self.cwd)
+    }
+
+    /// The worktree with exactly this slug.
+    pub fn worktree(&self, slug: &str) -> Option<&WorktreeRecord> {
+        self.worktrees().find(|record| record.target.slug() == slug)
+    }
+}
+
+/// Whether `cwd` can be inside a worktree at all: every worktree lives under
+/// the configured root, so a directory outside it is in the main clone or in
+/// no checkout of this repository. Answered from the paths alone, for a
+/// command that needs no listing when the answer is no.
+pub fn may_be_inside_a_worktree(ctx: &AppContext) -> bool {
+    canonical_or_original(&ctx.cwd)
+        .starts_with(canonical_or_original(&ctx.config.paths.worktree_root))
 }
 
 /// Resolve an explicit slug or branch, including the main clone. Callers that

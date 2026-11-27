@@ -30,8 +30,10 @@ impl Model {
         }
     }
 
-    /// The latest fetch-start stamp for a host's domain. Restored data has no
-    /// ordered stamp, so it can never confirm a pending change.
+    /// The latest fetch-start stamp for a target on its host's domain: the
+    /// read of the target's own row where the domain is read row by row, else
+    /// the domain's. Restored data has no ordered stamp, so it can never
+    /// confirm a pending change.
     pub(super) fn observed(
         &self,
         target: &wt_runtime::Target,
@@ -41,10 +43,20 @@ impl Model {
             None => &self.local_domains,
             Some(host) => self.source_board.host_domains.get(host)?,
         };
-        domains
-            .get(&domain)
-            .filter(|meta| meta.is_live())
-            .map(|meta| meta.observed())
+        let meta = domains.get(&domain).filter(|meta| meta.is_live())?;
+        Some(match (&target.key, &target.host) {
+            (None, _) => meta.observed(),
+            (Some(key), None) => meta.observed_for(key),
+            // A remote host stamps its rows under its own keys.
+            (Some(key), Some(host)) => {
+                let local = meta.keyed().and_then(|keyed| {
+                    keyed
+                        .keys()
+                        .find(|local| wt_core::remote_worktree_ledger_key(host, local) == *key)
+                });
+                meta.observed_for(local.unwrap_or(key))
+            }
+        })
     }
 
     /// Settle pending changes against the latest source board and present it
@@ -352,6 +364,11 @@ impl Model {
             inner = action;
         }
         let preparation = inner.is_preparation();
+        self.earlier_failure = None;
+        self.begun.push_back(id);
+        if self.begun.len() > super::reply::BEGUN_LIMIT {
+            self.begun.pop_front();
+        }
         self.last_menu = self.committed_menu.take().map(|menu| (id, menu));
         let carried = std::mem::take(&mut self.carry_typeahead);
         self.pending_request = Some(super::PendingRequest {
@@ -481,5 +498,63 @@ impl Model {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use wt_core::Domain;
+    use wt_runtime::{KeyedStamps, SourceState, Stamp, Target};
+
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_row_is_confirmed_by_the_read_of_that_row_on_its_own_host() {
+        let old = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let listed = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let new = Stamp::now();
+        let keyed = KeyedStamps::new(
+            listed,
+            [("one".to_owned(), new), ("two".to_owned(), old)].into(),
+        );
+        let local =
+            SourceSnapshot::test_live(Some(Board::default()), SourceState::Ready, Domain::Metadata)
+                .test_keyed(Domain::Git, keyed);
+        let whole = local.domains()[&Domain::Metadata].observed();
+        // A remote host reports the same rows under its own keys.
+        let mut board = Board::default();
+        board
+            .host_domains
+            .insert("devbox".into(), local.domains().clone());
+        let mut model = Model::default();
+        model.apply(local.with_data(Some(Arc::new(board))));
+
+        let git = |target: Target| model.observed(&target, Domain::Git);
+        assert_eq!(git(Target::row(None, "one")), Some(new));
+        assert_eq!(git(Target::row(None, "two")), Some(old));
+        // A change to the whole board waits for the oldest row.
+        assert_eq!(git(Target::board(None)), Some(old));
+        // A row that is not listed was absent when the rows were listed.
+        assert_eq!(git(Target::row(None, "gone")), Some(listed));
+        let remote = |slug: &str| {
+            Target::row(
+                Some("devbox".into()),
+                wt_core::remote_worktree_ledger_key("devbox", slug),
+            )
+        };
+        assert_eq!(git(remote("one")), Some(new));
+        assert_eq!(git(remote("two")), Some(old));
+        assert_eq!(git(remote("gone")), Some(listed));
+        assert_eq!(git(Target::board(Some("devbox".into()))), Some(old));
+        assert_eq!(git(Target::row(Some("elsewhere".into()), "one")), None);
+        // A domain read whole has one stamp for every row.
+        assert_eq!(
+            model.observed(&Target::row(None, "one"), Domain::Metadata),
+            Some(whole)
+        );
     }
 }

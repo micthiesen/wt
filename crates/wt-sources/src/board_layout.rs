@@ -55,8 +55,10 @@ fn in_landed_block(board: &Board, row: &BoardRow) -> bool {
         && row.host.is_none()
         && !row.is_main
         && !row.pending_creation
-        && row.git.landed_on.is_some()
-        && row.owed_block.is_some()
+        && ((row.git.landed_on.is_some() && row.owed_block.is_some())
+            // A removal deletes the checkout, and the Git facts with it,
+            // before the row goes: the record says where it was drawn.
+            || row.removal.as_ref().is_some_and(|removal| removal.landed))
 }
 
 /// When the row's work landed, which orders the Landed block, and when wt
@@ -133,9 +135,16 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             let section = state["slugs"][&row.key]["section"]
                 .as_str()
                 .filter(|name| !name.is_empty());
-            if row.removal.is_some() {
+            // With the Landed block a row being removed stays where it is
+            // drawn and says so itself; no section appears for it and goes.
+            if row.removal.is_some() && !board.display.owed_sections {
                 REMOVING.to_owned()
-            } else if row.archived {
+            } else if row
+                .removal
+                .as_ref()
+                // A removal archives its row while it runs.
+                .map_or(row.archived, |removal| removal.was_archived)
+            {
                 ARCHIVED.to_owned()
             } else {
                 section.map_or_else(|| INBOX.to_owned(), str::to_owned)
@@ -759,13 +768,13 @@ mod tests {
                         "done",
                         "due",
                         "later",
+                        "removing",
                         "sooner",
                         "wait-other",
                         "wait-prod",
                         "wait-staging"
                     ]
                 ),
-                ("Removing", &["removing"]),
                 ("Archived", &["archived"]),
             ])
         );
@@ -1111,5 +1120,68 @@ mod tests {
         assert_eq!(keys, ["Batch", INBOX, REMOVING, ARCHIVED]);
         assert_eq!(board.sections[2].rows, [2, 1]);
         assert!(!board.sections[2].folded);
+    }
+
+    /// With the Landed block there is no Removing section: a row being
+    /// removed stays where it was drawn, also once the removal has archived
+    /// it and deleted its checkout, which takes its Git facts with it.
+    #[test]
+    fn with_the_landed_block_a_row_being_removed_stays_where_it_was_drawn() {
+        // Landed when the removal began; the checkout is gone already.
+        let mut gone = row("gone");
+        gone.archived = true;
+        gone.removal = Some(wt_tui::RemovalView {
+            checkout_absent: true,
+            landed: true,
+            ..Default::default()
+        });
+        // Not landed, filed in a section; the removal archived it.
+        let mut filed = row("filed");
+        filed.archived = true;
+        filed.removal = Some(wt_tui::RemovalView::default());
+        // Archived before its removal.
+        let mut old = row("old");
+        old.archived = true;
+        old.removal = Some(wt_tui::RemovalView {
+            was_archived: true,
+            ..Default::default()
+        });
+        let mut failed = row("failed");
+        failed.removal = Some(wt_tui::RemovalView {
+            error: Some("denied".into()),
+            ..Default::default()
+        });
+        let mut board = Board {
+            rows: vec![
+                gone,
+                filed,
+                old,
+                failed,
+                owing("kept", wt_core::OwedPhase::Done, None),
+            ],
+            ..Board::default()
+        };
+        board.display.owed_sections = true;
+        let state = json!({"slugs": {"filed": {"section": "Batch"}}, "sectionsOrder": ["Batch"]});
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        let shown: Vec<(String, Vec<String>)> = layout(&board)
+            .into_iter()
+            .map(|(_, title, rows, _)| (title, rows))
+            .collect();
+        let named = |title: &str, rows: &[&str]| {
+            (
+                title.to_owned(),
+                rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            shown,
+            [
+                named("Batch", &["filed"]),
+                named("Inbox", &["failed"]),
+                named("Landed", &["gone", "kept"]),
+                named("Archived", &["old"]),
+            ]
+        );
     }
 }

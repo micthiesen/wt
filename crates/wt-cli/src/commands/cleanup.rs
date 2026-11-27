@@ -64,7 +64,7 @@ pub async fn run(ctx: &AppContext, args: &CleanupArgs) -> Result<i32> {
         .filter(|plan| plan.landed && plan.hazards.iter().any(|hazard| owes(hazard)))
         .map(|plan| plan.row.clone())
         .collect::<Vec<_>>();
-    let landings = landing::read(ctx, &owing, &state, Want::Lists).await;
+    let landings = landing::read(ctx, &owing, &state, Want::ListsAndGit).await;
     let clock = clock();
     let mut candidates = Vec::new();
     for mut plan in plans.rows {

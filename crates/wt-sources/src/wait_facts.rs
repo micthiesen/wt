@@ -9,10 +9,19 @@
 //! older than a minute proves only its merges: the rest reads unknown, with
 //! the time of the next read as the reason. Rows are built by the same rule the engine uses, so a
 //! word means the same in both.
+//!
+//! A wait does not sit out an interval to learn of a change. [`Signals`]
+//! looks at the few files a pass reads from (the state database, the
+//! daemon's snapshot, origin's base branches as last fetched), and
+//! [`RowReader::concerns`] tells a change that can alter the answer from
+//! the many that cannot, so the pass runs when there is something to find.
+//! The intervals stay as the backstop for what leaves no trace in those
+//! files.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 use serde::{Deserialize, Serialize};
@@ -36,12 +45,17 @@ const UNHELD_KEEP_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const SHARED_LOCK: &str = "wait-github";
 
 /// The GitHub read every `wt wait` of a repository shares, as stored in
-/// `wait-github.json` under the cache root. Written only while holding the
+/// `wait-github-<repository>.json` under the cache root. Written only while holding the
 /// `wait-github` lock, which a process keeps across its fetch, so a second
 /// wait finds the first one's answer instead of asking again.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct SharedRead {
+    /// The repository the read is of (`wt_ops::events::repository_identity`).
+    /// A cache root can serve several repositories, and a branch name means
+    /// a different pull request in each: a file naming another repository,
+    /// or none, is no answer.
+    repository: Option<String>,
     /// When the last fetch began, successful or not.
     fetch_started_ms: u64,
     /// No fetch before this: the last one failed.
@@ -170,16 +184,44 @@ fn budget_problem(next_ms: u64, utc_offset_minutes: i32) -> String {
     )
 }
 
+/// One file per repository, so two repositories on one cache root keep
+/// their own pace instead of each discarding the other's read.
 fn shared_path(ctx: &AppContext) -> PathBuf {
-    ctx.config.paths.cache_root.join("wait-github.json")
+    let repository: String = ctx
+        .config
+        .repo_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    ctx.config
+        .paths
+        .cache_root
+        .join(format!("wait-github-{repository}.json"))
 }
 
-async fn load_shared(path: &Path) -> SharedRead {
-    match tokio::fs::read(path).await {
+fn shared_identity(ctx: &AppContext) -> String {
+    wt_ops::events::repository_identity(&ctx.config)
+}
+
+/// The stored read of `repository`, or an empty one for it.
+async fn load_shared(path: &Path, repository: &str) -> SharedRead {
+    let stored = match tokio::fs::read(path).await {
         // A file this build cannot read is a missing answer, never an error.
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-        Err(_) => SharedRead::default(),
-    }
+        Ok(bytes) => serde_json::from_slice::<SharedRead>(&bytes).ok(),
+        Err(_) => None,
+    };
+    stored
+        .filter(|shared| shared.repository.as_deref() == Some(repository))
+        .unwrap_or_else(|| SharedRead {
+            repository: Some(repository.to_owned()),
+            ..SharedRead::default()
+        })
 }
 
 async fn save_shared(path: &Path, shared: &SharedRead) {
@@ -198,6 +240,149 @@ async fn save_shared(path: &Path, shared: &SharedRead) {
     }
 }
 
+/// How often the signal files are looked at: one `stat` each.
+const SIGNAL_TICK: Duration = Duration::from_millis(100);
+
+/// What changed on disk since a wait last looked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Changed {
+    /// The state database: a status, a gate, an arming.
+    pub state: bool,
+    /// The events daemon's GitHub snapshot.
+    pub github: bool,
+    /// What origin's base branches were last fetched as.
+    pub git: bool,
+}
+
+impl Changed {
+    pub fn any(self) -> bool {
+        self.state || self.github || self.git
+    }
+
+    pub fn absorb(&mut self, other: Self) {
+        self.state |= other.state;
+        self.github |= other.github;
+        self.git |= other.git;
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Signal {
+    State,
+    Github,
+    Git,
+}
+
+/// A file as last seen: `None` while it does not exist.
+type Seen = Option<(SystemTime, u64)>;
+
+fn seen(path: &Path) -> Seen {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The files whose change means a pass may read something new. Portable and
+/// independent of any running wt: a file nobody writes just never changes.
+pub struct Signals {
+    files: Vec<(PathBuf, Signal, Seen)>,
+}
+
+impl Signals {
+    /// Takes each file as it is now: create this before the first pass, so
+    /// a write made during that pass is still seen as a change.
+    pub fn new(ctx: &AppContext) -> Self {
+        let paths = &ctx.config.paths;
+        let mut wal = paths.state_db.clone().into_os_string();
+        wal.push("-wal");
+        let files = [
+            (paths.state_db.clone(), Signal::State),
+            (PathBuf::from(wal), Signal::State),
+            (
+                paths.cache_root.join("events").join("github.json"),
+                Signal::Github,
+            ),
+        ];
+        // A fetch run in any worktree moves the refs every checkout shares,
+        // and writes FETCH_HEAD only in its own: the refs are the signal.
+        // A base branch is a loose file until Git packs it.
+        let git = paths.main_clone.join(".git");
+        let branch = &ctx.config.branch;
+        let refs = std::iter::once(&branch.base)
+            .chain(&branch.production)
+            .map(|name| git.join("refs/remotes/origin").join(name))
+            .chain([git.join("packed-refs")])
+            .map(|path| (path, Signal::Git));
+        Self {
+            files: files
+                .into_iter()
+                .chain(refs)
+                .map(|(path, signal)| {
+                    let seen = seen(&path);
+                    (path, signal, seen)
+                })
+                .collect(),
+        }
+    }
+
+    fn poll(&mut self) -> Changed {
+        let mut changed = Changed::default();
+        for (path, signal, last) in &mut self.files {
+            let now = seen(path);
+            if now == *last {
+                continue;
+            }
+            *last = now;
+            match signal {
+                Signal::State => changed.state = true,
+                Signal::Github => changed.github = true,
+                Signal::Git => changed.git = true,
+            }
+        }
+        changed
+    }
+
+    /// Resolves when a file changed. Dropping it loses nothing: a change
+    /// not yet returned is found by the next call.
+    pub async fn changed(&mut self) -> Changed {
+        loop {
+            tokio::time::sleep(SIGNAL_TICK).await;
+            let changed = self.poll();
+            if changed.any() {
+                return changed;
+            }
+        }
+    }
+}
+
+/// The answer the waits of this repository last got from GitHub, with when
+/// its fetch began (epoch ms). A wait asks GitHub itself about the merge
+/// queue, so this can be newer than the events daemon's snapshot for the
+/// branches it covers. For display: nothing is decided from it.
+pub async fn latest_shared_read(ctx: &AppContext) -> Option<(GithubData, u64)> {
+    let shared = load_shared(&shared_path(ctx), &shared_identity(ctx)).await;
+    Some((shared.data?, shared.fetch_started_ms))
+}
+
+/// Why GitHub took `pr` out of the merge queue, in words, when it did so
+/// after `arm` was sent for it. GitHub keeps the latest removal on the pull
+/// request for good, so one from before the arming says nothing about it.
+pub fn queue_removal(
+    pr: &wt_github::PullRequest,
+    arm: Option<&wt_core::MergeArm>,
+) -> Option<String> {
+    let arm = arm.filter(|arm| arm.pr == pr.number)?;
+    let removal = pr.queue_removal.as_ref()?;
+    if i64::try_from(removal.at_ms).unwrap_or(i64::MAX) <= arm.armed_at_ms {
+        return None;
+    }
+    let reason = wt_core::sanitize_terminal_text(removal.reason.trim());
+    Some(if reason.is_empty() {
+        "removed from the merge queue".to_owned()
+    } else {
+        format!("removed from the merge queue: {reason}")
+    })
+}
+
 /// What one pass established.
 #[derive(Clone, Debug, Default)]
 pub struct RowsRead {
@@ -208,12 +393,25 @@ pub struct RowsRead {
     pub branches: BTreeMap<String, String>,
     /// Why pull-request answers are missing, when they are.
     pub problem: Option<String>,
+    /// Why GitHub took a named worktree's pull request out of the merge
+    /// queue since its merge was armed, by slug: see [`queue_removal`].
+    pub removals: BTreeMap<String, String>,
+    /// When the shared GitHub read may next ask GitHub (epoch ms), where
+    /// this pass went through it: nothing newer can be had before then.
+    pub github_due_ms: Option<u64>,
 }
 
 /// Reads rows for one process's watches.
 #[derive(Default)]
 pub struct RowReader {
     problem: Option<String>,
+    github_due_ms: Option<u64>,
+    /// What the last pass read from the state for the worktrees its watches
+    /// name: see [`concern`].
+    state_seen: Option<serde_json::Value>,
+    /// The state [`RowReader::concerns`] read to compare, kept for the pass
+    /// it then asks for.
+    state_next: Option<serde_json::Value>,
     /// Armings GitHub was seen holding during this process, as
     /// `(slug, armed_at_ms)`: the engine records that on the arm itself,
     /// and none may be running.
@@ -233,6 +431,36 @@ struct Asked {
     pr: bool,
     landing: bool,
     queue: bool,
+}
+
+/// The fields of a worktree's record a pass reads.
+const ROW_FIELDS: [&str; 5] = ["createdAt", "work", "mergeArm", "baseSha", "baseBranch"];
+
+/// The part of the state a pass over `watches` depends on: for each
+/// worktree they name, the fields it reads. Most writes to a fleet's state
+/// are about other worktrees or other fields and leave this as it was.
+fn concern(state: &serde_json::Value, watches: &[Watch]) -> serde_json::Value {
+    let mut slugs = BTreeSet::new();
+    for watch in watches {
+        slugs.insert(watch.slug.as_str());
+        for cond in &watch.when {
+            if let Condition::Worktree { slug, .. } | Condition::Gone { slug } = &cond.cond {
+                slugs.insert(slug.as_str());
+            }
+        }
+    }
+    slugs
+        .into_iter()
+        .map(|slug| {
+            let stored = &state["slugs"][slug];
+            let fields = ROW_FIELDS
+                .iter()
+                .map(|field| stored[*field].clone())
+                .collect::<Vec<_>>();
+            (slug.to_owned(), serde_json::Value::Array(fields))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
 }
 
 fn asked(watches: &[Watch]) -> BTreeMap<String, Asked> {
@@ -265,9 +493,44 @@ fn asked(watches: &[Watch]) -> BTreeMap<String, Asked> {
 }
 
 impl RowReader {
+    /// Whether what `changed` on disk can alter what a pass over `watches`
+    /// reads, so that a new pass is worth its Git and GitHub reads now. A
+    /// change it cannot judge counts as one that can.
+    pub async fn concerns(
+        &mut self,
+        ctx: &AppContext,
+        watches: &[Watch],
+        changed: Changed,
+    ) -> bool {
+        let asked = asked(watches);
+        if (changed.github && asked.values().any(|asked| asked.pr))
+            || (changed.git && asked.values().any(|asked| asked.landing))
+        {
+            return true;
+        }
+        // The daemon's snapshot also answers for pull requests named by number.
+        if changed.github && !wt_core::watch::needs(watches).prs.is_empty() {
+            return true;
+        }
+        if !changed.state {
+            return false;
+        }
+        let Ok(state) = ctx.database.call(|store| Ok(store.read_wt_state()?)).await else {
+            return true;
+        };
+        if self.state_seen.as_ref() == Some(&concern(&state, watches)) {
+            return false;
+        }
+        self.state_next = Some(state);
+        true
+    }
+
     /// One pass. `Err` when the worktrees or the state cannot be read
     /// at all; a failed GitHub read leaves its answers unknown instead.
     pub async fn read(&mut self, ctx: &AppContext, watches: &[Watch]) -> Result<RowsRead, String> {
+        // Taken before anything can fail: a state kept past a failed pass
+        // would be an old one by the pass that then used it.
+        let prompted = self.state_next.take();
         let records = ctx
             .repository
             .inventory(&ctx.cancellation)
@@ -276,11 +539,15 @@ impl RowReader {
             .into_iter()
             .filter(|record| !record.is_main)
             .collect::<Vec<_>>();
-        let state = ctx
-            .database
-            .call(|store| Ok(store.read_wt_state()?))
-            .await
-            .map_err(|error| format!("cannot read wt's state: {error:#}"))?;
+        let state = match prompted {
+            Some(state) => state,
+            None => ctx
+                .database
+                .call(|store| Ok(store.read_wt_state()?))
+                .await
+                .map_err(|error| format!("cannot read wt's state: {error:#}"))?,
+        };
+        self.state_seen = Some(concern(&state, watches));
         let asked = asked(watches);
         let named = records
             .iter()
@@ -295,6 +562,7 @@ impl RowReader {
             .collect::<Vec<_>>();
         let queue = asked.values().any(|asked| asked.queue);
         let read_started_ms = now_ms();
+        self.github_due_ms = None;
         let github_read = self.github(ctx, &branches, queue).await;
         let fetch_started_ms = github_read.as_ref().and_then(|read| read.fetch_started_ms);
         let github = github_read.map(|read| read.data);
@@ -324,6 +592,7 @@ impl RowReader {
         let probed = |stage| ctx.config.environments.get(stage).is_some();
         let mut read = RowsRead {
             problem: self.problem.clone().filter(|_| !branches.is_empty()),
+            github_due_ms: self.github_due_ms,
             ..RowsRead::default()
         };
         for record in &records {
@@ -410,6 +679,9 @@ impl RowReader {
                     arm.seen_armed_at_ms.get_or_insert(arm.armed_at_ms);
                 }
             }
+            if let Some(why) = pr.and_then(|pr| queue_removal(pr, merge_arm.as_ref())) {
+                read.removals.insert(slug.to_owned(), why);
+            }
             let work = wt_core::parse_work_status(&stored["work"]);
             read.rows.insert(
                 slug.to_owned(),
@@ -430,9 +702,8 @@ impl RowReader {
                 }),
             );
         }
-        if let Some(github) = &github {
-            read.prs = github
-                .prs
+        let numbered = |data: &GithubData| {
+            data.prs
                 .values()
                 .map(|pr| {
                     (
@@ -440,9 +711,54 @@ impl RowReader {
                         wt_ops::watch_probe::pr_facts(&pr.state, pr.merge_commit_oid.clone()),
                     )
                 })
-                .collect();
+                .collect::<Vec<_>>()
+        };
+        // A pull request named by number is usually a live worktree's: the
+        // daemon's snapshot then answers for it as soon as it is written,
+        // and GitHub is not asked about that number at all.
+        if !wt_core::watch::needs(watches).prs.is_empty() {
+            read.prs.extend(
+                self.fleet_prs(ctx, &records)
+                    .await
+                    .iter()
+                    .flat_map(numbered),
+            );
+        }
+        if let Some(github) = &github {
+            read.prs.extend(numbered(github));
         }
         Ok(read)
+    }
+
+    /// The daemon's snapshot for every live branch, when it holds them all
+    /// and `WT_GITHUB` allows it. Older than the board would use, it keeps
+    /// only its merges.
+    async fn fleet_prs(
+        &self,
+        ctx: &AppContext,
+        records: &[wt_vcs::WorktreeRecord],
+    ) -> Option<GithubData> {
+        use crate::github_events_source::Held;
+        if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
+            return None;
+        }
+        let branches = records
+            .iter()
+            .map(|record| record.target.branch.clone())
+            .filter(|branch| !branch.is_empty())
+            .collect::<Vec<_>>();
+        if branches.is_empty() {
+            return None;
+        }
+        // The display rule on purpose: a waiting session is usually on an
+        // older build than the daemon, and its answer is an observation the
+        // waiter reports, never a witness for a write. The snapshot is
+        // still schema-gated, and a development build reads only its own.
+        let shown = crate::github_events_source::load_for_display(ctx, &branches).await?;
+        Some(match shown.held {
+            Held::Fresh => shown.read.data,
+            Held::Paced { .. } | Held::BudgetLow => settled_only(shown.read.data),
+        })
     }
 
     /// GitHub's answer covering `branches`, or `None` when there is no
@@ -461,6 +777,7 @@ impl RowReader {
             self.problem = Some("GitHub is switched off (WT_GITHUB=off)".into());
             return None;
         }
+        // The display rule, for the reason given at the snapshot read above.
         if !queue
             && let Some(shown) = crate::github_events_source::load_for_display(ctx, branches).await
         {
@@ -507,11 +824,13 @@ impl RowReader {
             }
         };
         let path = shared_path(ctx);
-        let mut shared = load_shared(&path).await;
+        let mut shared = load_shared(&path, &shared_identity(ctx)).await;
         let now = epoch_ms();
+        let floor = u64::try_from(PR_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         let all = match shared.plan(branches, now) {
             Plan::Hold => {
                 self.problem = shared.problem.clone();
+                self.github_due_ms = Some(shared.backoff_until_ms);
                 return None;
             }
             Plan::Use => {
@@ -519,6 +838,7 @@ impl RowReader {
                     save_shared(&path, &shared).await;
                 }
                 self.problem = None;
+                self.github_due_ms = Some(shared.fetch_started_ms.saturating_add(floor));
                 return shared.data.map(|data| GithubRead {
                     data,
                     fetch_started_ms: Some(shared.fetch_started_ms),
@@ -534,6 +854,7 @@ impl RowReader {
                     next_ms,
                     wt_app_core::display_time::local_utc_offset_minutes(next_ms).unwrap_or(0),
                 ));
+                self.github_due_ms = Some(next_ms);
                 return shared.data.map(|data| GithubRead {
                     data: settled_only(data),
                     fetch_started_ms: Some(shared.fetch_started_ms),
@@ -577,6 +898,11 @@ impl RowReader {
         }
         save_shared(&path, &shared).await;
         self.problem = shared.problem.clone();
+        self.github_due_ms = Some(if shared.data.is_some() {
+            shared.fetch_started_ms.saturating_add(floor)
+        } else {
+            shared.backoff_until_ms
+        });
         shared.data.map(|data| GithubRead {
             data,
             fetch_started_ms: Some(shared.fetch_started_ms),
@@ -607,7 +933,7 @@ async fn settle_unheld(
         return BTreeSet::new();
     };
     let path = shared_path(ctx);
-    let mut shared = load_shared(&path).await;
+    let mut shared = load_shared(&path, &shared_identity(ctx)).await;
     let mut changed = false;
     for key in held {
         changed |= shared.unheld.remove(key).is_some();
@@ -810,14 +1136,25 @@ mod tests {
     async fn the_shared_read_survives_the_process_and_an_unreadable_file_is_no_answer() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wait-github.json");
-        assert_eq!(load_shared(&path).await, SharedRead::default());
+        let empty = |repository: &str| SharedRead {
+            repository: Some(repository.to_owned()),
+            ..SharedRead::default()
+        };
+        assert_eq!(load_shared(&path, "repo:/a").await, empty("repo:/a"));
         let mut shared = covering(&["one"], 7);
+        shared.repository = Some("repo:/a".into());
         shared.unheld.insert("one|5".into(), 7);
         save_shared(&path, &shared).await;
-        assert_eq!(load_shared(&path).await, shared);
+        assert_eq!(load_shared(&path, "repo:/a").await, shared);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // Another repository's read of a branch with the same name, or one
+        // stored before reads named their repository, answers nothing here.
+        assert_eq!(load_shared(&path, "repo:/b").await, empty("repo:/b"));
+        shared.repository = None;
+        save_shared(&path, &shared).await;
+        assert_eq!(load_shared(&path, "repo:/a").await, empty("repo:/a"));
         std::fs::write(&path, b"{ not json").unwrap();
-        assert_eq!(load_shared(&path).await, SharedRead::default());
+        assert_eq!(load_shared(&path, "repo:/a").await, empty("repo:/a"));
     }
 
     #[test]
@@ -848,5 +1185,192 @@ mod tests {
         assert_eq!(read.branches["one"], "feature/one");
         assert!(read.problem.is_none() && !shared_path(ctx).exists());
         fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_change_a_pass_would_read_differently_prompts_one() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let watches = [watch("one", &["wt:two:ready"])];
+        let title = |title: &'static str| {
+            ctx.database.call(move |store| {
+                store.set_slug_title("two", title, wt_store::TitleSource::Agent, None)?;
+                Ok(())
+            })
+        };
+        title("A title").await.unwrap();
+        let mut signals = Signals::new(ctx);
+        let mut reader = RowReader::default();
+        let read = reader.read(ctx, &watches).await.unwrap();
+        assert_eq!(read.rows["two"].ready, Some(false));
+        let state = Changed {
+            state: true,
+            ..Changed::default()
+        };
+
+        // A write to the state is seen without a pass, and one about a
+        // field no pass reads asks for none.
+        title("Another title").await.unwrap();
+        assert_eq!(signals.poll(), state);
+        assert!(!reader.concerns(ctx, &watches, state).await);
+
+        // The status of a worktree the watch names does.
+        ctx.database
+            .call(|store| {
+                let ready = wt_core::WorkStatusRecord::new(
+                    wt_core::WorkState::Ready,
+                    "2026-11-27T12:00:00Z",
+                );
+                let stored: wt_store::WorkStatusRecord =
+                    serde_json::from_value(serde_json::to_value(&ready)?)?;
+                store.set_slug_work_status("two", Some(&stored))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(signals.poll(), state);
+        assert!(reader.concerns(ctx, &watches, state).await);
+        let read = reader.read(ctx, &watches).await.unwrap();
+        assert_eq!(read.rows["two"].ready, Some(true));
+        assert!(!reader.concerns(ctx, &watches, state).await);
+        assert!(!signals.poll().any());
+
+        // GitHub's and Git's files concern only a watch that asks them.
+        let outside = Changed {
+            state: false,
+            github: true,
+            git: true,
+        };
+        assert!(!reader.concerns(ctx, &watches, outside).await);
+        for asks in ["merged", "green", "pr:7"] {
+            assert!(
+                reader
+                    .concerns(ctx, &[watch("one", &[asks])], outside)
+                    .await,
+                "{asks}"
+            );
+        }
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_fails_does_not_leave_its_state_for_a_later_one() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let watches = [watch("one", &["wt:two:ready"])];
+        let status = |state: Option<wt_core::WorkState>| {
+            ctx.database.call(move |store| {
+                let stored = state
+                    .map(|state| {
+                        let record = wt_core::WorkStatusRecord::new(state, "2026-11-27T12:00:00Z");
+                        serde_json::from_value::<wt_store::WorkStatusRecord>(serde_json::to_value(
+                            &record,
+                        )?)
+                    })
+                    .transpose()?;
+                store.set_slug_work_status("two", stored.as_ref())?;
+                Ok(())
+            })
+        };
+        let mut reader = RowReader::default();
+        reader.read(ctx, &watches).await.unwrap();
+        status(Some(wt_core::WorkState::Ready)).await.unwrap();
+        let state = Changed {
+            state: true,
+            ..Changed::default()
+        };
+        assert!(reader.concerns(ctx, &watches, state).await);
+        // The pass that change asked for cannot list the worktrees.
+        let mut failing = ctx.clone();
+        failing.cancellation = ctx.cancellation.child_token();
+        failing.cancellation.cancel();
+        assert!(reader.read(&failing, &watches).await.is_err());
+        // The next one reads the state as it is by then.
+        status(Some(wt_core::WorkState::Working)).await.unwrap();
+        let read = reader.read(ctx, &watches).await.unwrap();
+        assert_eq!(read.rows["two"].ready, Some(false));
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fetch_run_in_a_worktree_is_seen() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ctx.cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let origin = fixture._root.path().join("origin.git");
+        git(&["init", "--bare", origin.to_str().unwrap()]);
+        git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&["push", "origin", "main:refs/heads/main"]);
+        git(&["fetch", "origin"]);
+        let mut signals = Signals::new(ctx);
+        assert!(!signals.poll().any());
+        // The base moves on origin, and a fetch in the worktree (not in the
+        // main clone) brings it in.
+        std::fs::write(ctx.cwd.join("work.txt"), "work\n").unwrap();
+        git(&["add", "work.txt"]);
+        git(&["commit", "-m", "work"]);
+        git(&["push", "origin", "HEAD:refs/heads/main"]);
+        // The push moved the tracking ref too; put it back so the fetch is
+        // what moves it.
+        git(&["update-ref", "refs/remotes/origin/main", "main"]);
+        signals.poll();
+        git(&["fetch", "origin"]);
+        assert!(signals.poll().git);
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_queue_removal_is_a_reason_only_after_the_arming() {
+        let pr = |removal: serde_json::Value| -> wt_github::PullRequest {
+            serde_json::from_value(serde_json::json!({
+                "number": 7, "url": "https://example.invalid/pull/7",
+                "headRefName": "b", "headRefOid": "a".repeat(40),
+                "baseRefName": "main", "mergeCommitOid": null,
+                "title": "T", "isDraft": false, "state": "OPEN",
+                "checks": "pass", "failedChecks": [], "review": "none",
+                "reviewRequests": 0, "requestedReviewers": [], "suggestedReviewers": [],
+                "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0,
+                "queueRemoval": removal,
+            }))
+            .unwrap()
+        };
+        let arm = |pr: u64| -> wt_core::MergeArm {
+            serde_json::from_value(
+                serde_json::json!({"pr": pr, "armedAtMs": 1_000, "mechanism": "queue"}),
+            )
+            .unwrap()
+        };
+        let removed =
+            |reason: &str, at_ms: u64| pr(serde_json::json!({"reason": reason, "atMs": at_ms}));
+        assert_eq!(
+            queue_removal(&removed("merge_conflict", 2_000), Some(&arm(7))).as_deref(),
+            Some("removed from the merge queue: merge_conflict")
+        );
+        assert_eq!(
+            queue_removal(&removed("", 2_000), Some(&arm(7))).as_deref(),
+            Some("removed from the merge queue")
+        );
+        // An earlier round's removal, another pull request's arming, no
+        // arming, no removal.
+        assert_eq!(queue_removal(&removed("ci", 1_000), Some(&arm(7))), None);
+        assert_eq!(queue_removal(&removed("ci", 2_000), Some(&arm(8))), None);
+        assert_eq!(queue_removal(&removed("ci", 2_000), None), None);
+        assert_eq!(
+            queue_removal(&pr(serde_json::Value::Null), Some(&arm(7))),
+            None
+        );
     }
 }

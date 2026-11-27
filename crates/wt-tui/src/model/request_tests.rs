@@ -213,22 +213,82 @@ fn repeated_delete_closes_the_local_menu_without_enqueuing_work() {
 }
 
 #[test]
-fn all_foreground_requests_keep_feedback_until_their_own_reply() {
+fn another_requests_failure_is_said_and_outlives_the_pending_requests_feedback() {
     let mut model = Model::default();
     model.apply(board(&["one"]));
+    let archive = |id: u64, model: &mut Model| {
+        model.begin_action(
+            id,
+            &UiAction::ToggleArchive {
+                key: "one".into(),
+                seen: None,
+            },
+        );
+    };
+    archive(6, &mut model);
+    archive(7, &mut model);
     model.begin_action(8, &UiAction::OpenEditor { key: "one".into() });
-    model.toast = Some(("working…".into(), ToastTone::Info));
+    let working = Some(("working…".into(), ToastTone::Info));
+    model.toast = working.clone();
+    // An earlier request's success does not interrupt the one in flight.
     model.reply(UiReply {
-        operation_id: Some(9),
+        operation_id: Some(6),
+        ..UiReply::message("Archived")
+    });
+    assert_eq!(model.toast, working);
+    // Nor does anything the terminal sent on its own: a failed prefetch
+    // (id 0) or overlay refresh (an id the model never began) stays quiet,
+    // and leaves nothing behind to join the pending request's result.
+    for id in [0, 99] {
+        model.reply(UiReply {
+            operation_id: Some(id),
+            ..UiReply::failure("prefetch failed")
+        });
+    }
+    assert_eq!(model.toast, working);
+    assert!(model.earlier_failure.is_none());
+    // An earlier request's failure reverts something on screen, so it is
+    // said at once. Progress shows beside it, and the pending request's own
+    // success joins it.
+    model.reply(UiReply {
+        operation_id: Some(7),
         ..UiReply::failure("unrelated failure")
     });
     model.expire_toast();
-    assert_eq!(model.toast.as_ref().unwrap().0, "working…");
+    assert_eq!(
+        model.toast,
+        Some(("unrelated failure".into(), ToastTone::Failed))
+    );
+    model.reply(UiReply {
+        operation_id: Some(8),
+        ui_generation: Some(model.ui_generation),
+        progress: Some("open editor: running (3s)".into()),
+        ..Default::default()
+    });
+    assert_eq!(
+        model.toast,
+        Some((
+            "unrelated failure; open editor: running (3s)".into(),
+            ToastTone::Failed
+        ))
+    );
     model.reply(UiReply {
         operation_id: Some(8),
         ..Default::default()
     });
-    assert_eq!(model.toast.as_ref().unwrap().0, "done");
+    assert_eq!(
+        model.toast,
+        Some(("unrelated failure; done".into(), ToastTone::Failed))
+    );
+    // A failure toast the terminal put up itself is not an earlier request's
+    // failure: the next request's result replaces it.
+    model.begin_action(10, &UiAction::OpenEditor { key: "one".into() });
+    model.toast = Some(("actions are busy".into(), ToastTone::Failed));
+    model.reply(UiReply {
+        operation_id: Some(10),
+        ..UiReply::message("Opened one")
+    });
+    assert_eq!(model.toast, Some(("Opened one".into(), ToastTone::Info)));
 }
 
 #[test]

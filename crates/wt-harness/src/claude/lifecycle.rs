@@ -25,6 +25,9 @@ use crate::shims::{session_path, stale_harness_shims};
 
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const START_POLL: Duration = Duration::from_millis(200);
+/// How long a Claude whose tmux slot is gone may stay registered before it
+/// is taken for a process wt does not own.
+const EXIT_GRACE: Duration = Duration::from_secs(3);
 const PANE_TAIL: u32 = 8;
 /// The deterministic session id of the checkout and name a Claude slot was
 /// created for. tmux names are one flat space shared with every other slot
@@ -288,6 +291,65 @@ impl ClaudeSessionManager {
         Ok((session, true))
     }
 
+    /// Make the slot's tmux session exist for a person to attach to, and
+    /// return whether this call created it. Registration is not awaited: the
+    /// person at the pane sees Claude start and answers any startup prompt,
+    /// and a later message send waits for the registry through [`Self::ensure`].
+    pub async fn ensure_slot(
+        &self,
+        target: &ClaudeSessionTarget,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ClaudeSessionManagerError> {
+        let _guard = SessionLock::acquire(
+            &self.paths.lock_dir,
+            &self.lock_key(target),
+            Duration::from_secs(120),
+            cancel,
+        )
+        .await?;
+        let name = self.tmux_name(target);
+        if self.tmux.session_exists(&name, cancel).await? {
+            self.refuse_foreign_slot("attach", target, cancel).await?;
+            return Ok(false);
+        }
+        // A Claude registered for this slot with no tmux session is one
+        // still exiting after its slot was stopped, or one started outside
+        // wt. The first is gone within moments; a second process on the
+        // other's conversation is not a way in.
+        let exit_by = tokio::time::Instant::now() + EXIT_GRACE;
+        while let Some(session) = self.find(target)? {
+            if tokio::time::Instant::now() >= exit_by {
+                return Err(operation(
+                    "start",
+                    format!(
+                        "a Claude process (pid {}) is still registered for {name} with no session in wt's tmux server: it has not finished exiting, or it was started outside wt. No second session was started. Try again in a moment, or stop that process",
+                        session.pid
+                    ),
+                ));
+            }
+            tokio::select! { biased; _ = cancel.cancelled() => return Err(operation("start", "cancelled while the previous Claude process exits")), _ = tokio::time::sleep(START_POLL) => {} }
+        }
+        self.reap_handoffs();
+        self.prepare_inspector(&name)?;
+        let handoff = self.select_account(target, &name, cancel).await?;
+        let created = match self.create(target, &name, handoff.as_ref(), cancel).await {
+            Ok(()) => true,
+            // A lost tmux reply may still have created the pane. The stamp
+            // is set in the same tmux command, and no session had this name
+            // under the start lock, so a session stamped as this slot is ours.
+            Err(error) => {
+                if !self.tmux.session_exists(&name, cancel).await? {
+                    return Err(error);
+                }
+                self.slot_is_own(target, cancel).await? == Some(true)
+            }
+        };
+        if let Some(handoff) = handoff {
+            handoff.leave_for_pane();
+        }
+        Ok(created)
+    }
+
     pub async fn start(
         &self,
         target: &ClaudeSessionTarget,
@@ -515,10 +577,16 @@ impl ClaudeSessionManager {
             if self.slot_is_own(target, cancel).await? != Some(true) {
                 return Err(foreign_slot("start", &name));
             }
+            // A person attached to the slot owns whatever startup prompt keeps
+            // Claude from registering; recycling would close it under them.
+            self.refuse_attended(&name, cancel).await?;
             let before = self.pane_tail(&name, cancel).await;
             // Select the account before stopping the unregistered slot, so a
             // failing helper leaves it exactly as it was.
             handoff = self.select_account(target, &name, cancel).await?;
+            // The helper is an external command that can take seconds, long
+            // enough for a person to attach.
+            self.refuse_attended(&name, cancel).await?;
             self.tmux.kill_session(&name, cancel).await?;
             self.prepare_inspector(&name)?;
             self.create(target, &name, handoff.as_ref(), cancel).await?;
@@ -542,6 +610,36 @@ impl ClaudeSessionManager {
                 self.start_timeout.as_secs()
             ),
         ))
+    }
+
+    async fn refuse_attended(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), ClaudeSessionManagerError> {
+        if self.attended(name, cancel).await? {
+            return Err(operation(
+                "start",
+                format!(
+                    "Claude in {name} has not registered after {}s and a person is attached to it. The session was left running: finish its startup there, then retry",
+                    self.start_timeout.as_secs()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn attended(
+        &self,
+        name: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ClaudeSessionManagerError> {
+        Ok(self
+            .tmux
+            .list_sessions(cancel)
+            .await?
+            .iter()
+            .any(|session| session.name == name && session.attached_clients > 0))
     }
 
     async fn wait_for_registry(
@@ -843,6 +941,18 @@ impl SessionLock {
         timeout: Duration,
         cancel: &CancellationToken,
     ) -> Result<Self, ClaudeSessionManagerError> {
+        Self::acquire_within(lock_dir, key, timeout, cancel)
+            .await?
+            .ok_or_else(|| operation("lock", format!("timed out waiting for {key}")))
+    }
+
+    /// `None` when another holder kept the lock for all of `timeout`.
+    pub(super) async fn acquire_within(
+        lock_dir: &Path,
+        key: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Self>, ClaudeSessionManagerError> {
         fs::create_dir_all(lock_dir)?;
         let path = lock_dir.join(format!("{key}.lock"));
         let file = fs::OpenOptions::new()
@@ -856,7 +966,7 @@ impl SessionLock {
             // SAFETY: flock only uses the live descriptor and LOCK_NB never blocks.
             let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if result == 0 {
-                return Ok(Self { file });
+                return Ok(Some(Self { file }));
             }
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EWOULDBLOCK)
@@ -865,7 +975,7 @@ impl SessionLock {
                 return Err(error.into());
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err(operation("lock", format!("timed out waiting for {key}")));
+                return Ok(None);
             }
             tokio::select! { biased; _ = cancel.cancelled() => return Err(operation("lock", "cancelled waiting for session lock")), _ = tokio::time::sleep(Duration::from_millis(40)) => {} }
         }
@@ -1620,6 +1730,270 @@ exec /bin/sleep 30
             let refused = refused.expect("refused").to_string();
             assert!(refused.contains("left running"), "{refused}");
         }
+    }
+
+    /// A `claude` that starts and never registers, as one stopped at a
+    /// startup prompt does.
+    #[cfg(unix)]
+    fn unregistered_claude(tmp: &Path) -> String {
+        let bin = tmp.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        executable(
+            &bin.join("claude"),
+            "#!/bin/sh\nprintf '%s' \"${CLAUDE_CODE_OAUTH_TOKEN-unset}\" > \"$HOME/token-seen\"\nexec /bin/sleep 30\n",
+        );
+        format!("{}:/usr/bin:/bin", bin.display())
+    }
+
+    /// Entering a session needs the tmux slot, not Claude's registration: the
+    /// slot is created, stamped and handed back at once, and the pane still
+    /// receives its selected account after the call returned.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slot_is_ready_to_attach_before_claude_registers() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        fs::create_dir_all(&paths.home).unwrap();
+        let helper = tmp.path().join("helper");
+        executable(&helper, "#!/bin/sh\necho selected-token\n");
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let manager = manager
+            .with_spawn_path(unregistered_claude(tmp.path()))
+            .with_launch_auth(Some(ClaudeLaunchAuth::token_command(
+                "repo",
+                &cwd,
+                vec![helper.to_string_lossy().into_owned()],
+                ProcessRunner::new(NonZeroUsize::new(4).unwrap()),
+            )));
+        let cancel = CancellationToken::new();
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd: cwd.clone(),
+            managed_name: None,
+        };
+        let created = manager.ensure_slot(&target, &cancel).await;
+        let stamp = tmux
+            .get_option(
+                &OptionScope::Session("repo".into()),
+                CLAUDE_SLOT_OPTION,
+                &cancel,
+            )
+            .await;
+        let before = tmux_session_id(&tmux, "repo").await;
+        let adopted = manager.ensure_slot(&target, &cancel).await;
+        let after = tmux_session_id(&tmux, "repo").await;
+        let seen = paths.home.join("token-seen");
+        for _ in 0..100 {
+            if fs::read_to_string(&seen).is_ok_and(|token| !token.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let token = fs::read_to_string(&seen).unwrap_or_default();
+        let handoffs = fs::read_dir(paths.cache_dir.join("auth"))
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        let _ = tmux.kill_server(&cancel).await;
+        assert!(created.unwrap(), "the slot was not created");
+        assert_eq!(stamp.unwrap(), Some(claude_session_id(&cwd, None)));
+        assert!(!adopted.unwrap(), "a live slot was created twice");
+        assert!(before.is_some());
+        assert_eq!(after, before);
+        assert_eq!(token, "selected-token");
+        assert_eq!(handoffs, 0, "the pane left its token handoff behind");
+    }
+
+    /// A slot whose Claude has not registered is recycled by the next send,
+    /// but never while a person is attached to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unregistered_slot_a_person_is_attached_to_is_never_recycled() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        fs::create_dir_all(&paths.home).unwrap();
+        let manager = manager.with_spawn_path(unregistered_claude(tmp.path()));
+        let cancel = CancellationToken::new();
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd: tmp.path().to_owned(),
+            managed_name: None,
+        };
+        // A second session keeps the server, and so its id sequence, alive
+        // across the recycle.
+        fixture_session(&tmux, "keeper", tmp.path(), &[]).await;
+        manager.ensure_slot(&target, &cancel).await.unwrap();
+        let before = tmux_session_id(&tmux, "repo").await;
+        // A control-mode client counts as attached without needing a terminal.
+        let mut client = std::process::Command::new("tmux")
+            .arg("-S")
+            .arg(tmp.path().join("tmux.sock"))
+            .args(["-C", "attach-session", "-t", "=repo"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut attached = false;
+        for _ in 0..100 {
+            attached = manager.attended("repo", &cancel).await.unwrap();
+            if attached {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let attended = manager.ensure(&target, &cancel).await;
+        let kept = tmux_session_id(&tmux, "repo").await;
+        let _ = client.kill();
+        let _ = client.wait();
+        for _ in 0..100 {
+            if !manager.attended("repo", &cancel).await.unwrap() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // Unattended, the same slot is recycled as before.
+        let _ = manager.ensure(&target, &cancel).await;
+        let recycled = tmux_session_id(&tmux, "repo").await;
+        let _ = tmux.kill_server(&cancel).await;
+        assert!(attached, "the control client never attached");
+        let refused = attended.expect_err("refused").to_string();
+        assert!(refused.contains("a person is attached"), "{refused}");
+        assert_eq!(kept, before, "an attended slot was recycled");
+        assert_ne!(recycled, before, "an unattended slot was not recycled");
+    }
+
+    /// The account helper is an external command that can run for seconds.
+    /// A person who attaches while it runs keeps their session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_person_who_attaches_while_the_account_helper_runs_keeps_the_session() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        fs::create_dir_all(&paths.home).unwrap();
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        // The helper says it is running, then waits to be released, as a
+        // keychain prompt would. A control-mode client attaches meanwhile,
+        // as a person pressing F12 at that moment would.
+        let (running, release) = (tmp.path().join("running"), tmp.path().join("release"));
+        let helper = tmp.path().join("helper");
+        executable(
+            &helper,
+            &format!(
+                "#!/bin/sh\n: > '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 80 ]; do /bin/sleep 0.1; i=$((i+1)); done\necho selected-token\n",
+                running.display(),
+                release.display()
+            ),
+        );
+        let manager = manager.with_launch_auth(Some(ClaudeLaunchAuth::token_command(
+            "repo",
+            &cwd,
+            vec![helper.to_string_lossy().into_owned()],
+            ProcessRunner::new(NonZeroUsize::new(4).unwrap()),
+        )));
+        let cancel = CancellationToken::new();
+        let own = claude_session_id(&cwd, None);
+        fixture_session(&tmux, "repo", &cwd, &[(CLAUDE_SLOT_OPTION, &own)]).await;
+        let before = tmux_session_id(&tmux, "repo").await;
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd,
+            managed_name: None,
+        };
+        let person = async {
+            for _ in 0..200 {
+                if running.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let client = std::process::Command::new("tmux")
+                .arg("-S")
+                .arg(tmp.path().join("tmux.sock"))
+                .args(["-C", "attach-session", "-t", "=repo"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let mut attached = false;
+            for _ in 0..100 {
+                attached = manager.attended("repo", &cancel).await.unwrap_or(false);
+                if attached {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            fs::write(&release, "").unwrap();
+            (client, attached)
+        };
+        let (recycle, (mut client, attached)) =
+            tokio::join!(manager.ensure(&target, &cancel), person);
+        let after = tmux_session_id(&tmux, "repo").await;
+        let _ = client.kill();
+        let _ = client.wait();
+        let handoffs = fs::read_dir(paths.cache_dir.join("auth"))
+            .map(|entries| entries.count())
+            .unwrap_or_default();
+        let _ = tmux.kill_server(&cancel).await;
+        assert!(running.exists(), "the helper never ran");
+        assert!(attached, "the client never attached");
+        let refused = recycle.expect_err("refused").to_string();
+        assert!(refused.contains("a person is attached"), "{refused}");
+        assert!(before.is_some());
+        assert_eq!(after, before, "the session was killed under its client");
+        assert_eq!(handoffs, 0, "the unused token handoff was left behind");
+    }
+
+    /// Right after a slot is stopped its Claude can still be registered. An
+    /// entry waits that out; a process that stays is reported as what it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn entering_waits_out_a_claude_that_is_still_exiting() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        fs::create_dir_all(&paths.home).unwrap();
+        fs::create_dir_all(paths.sessions_dir()).unwrap();
+        let manager = manager.with_spawn_path(unregistered_claude(tmp.path()));
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let cancel = CancellationToken::new();
+        // This test process stands in for both registered Claudes.
+        let register = |file: &str, name: Option<&str>| {
+            let path = paths.sessions_dir().join(file);
+            fs::write(
+                &path,
+                serde_json::json!({"pid": std::process::id(),
+                    "sessionId": claude_session_id(&cwd, name), "cwd": cwd,
+                    "name": claude_tmux_name("repo", name), "status": "idle",
+                    "startedAt": 1, "updatedAt": 2})
+                .to_string(),
+            )
+            .unwrap();
+            path
+        };
+        let target = |name: Option<&str>| ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd: cwd.clone(),
+            managed_name: name.map(str::to_owned),
+        };
+        let exiting = register("exiting.json", None);
+        let exit = async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            fs::remove_file(&exiting).unwrap();
+        };
+        let (primary, review) = (target(None), target(Some("review")));
+        let (entered, ()) = tokio::join!(manager.ensure_slot(&primary, &cancel), exit);
+        register("staying.json", Some("review"));
+        let refused = manager.ensure_slot(&review, &cancel).await;
+        let started = tmux.session_exists("repo~review", &cancel).await;
+        let _ = tmux.kill_server(&cancel).await;
+        assert!(entered.unwrap(), "the slot was not created after the exit");
+        let refused = refused.expect_err("refused").to_string();
+        assert!(refused.contains("still registered"), "{refused}");
+        assert!(
+            !refused.contains("outside wt's tmux server (pid"),
+            "{refused}"
+        );
+        assert!(!started.unwrap(), "a second Claude was started");
     }
 
     /// A token handoff left by a wt that died mid-launch is removed by the

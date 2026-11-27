@@ -20,6 +20,16 @@ use wt_app_core::context::AppContext;
 
 const VERSION: u64 = 1;
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a worker waits for its worktree's lifecycle lock before it fails
+/// the job with nothing changed. Whoever started it is still holding other
+/// work off the worktree, so this is short.
+const WORKER_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// How long a start waits, past the worker's acknowledgement, to hear that
+/// the worker holds the lock or has finished: the worker's own lock wait and
+/// the reads it makes before it.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(75);
+/// Job field a worker sets once it holds the worktree's lifecycle lock.
+const LOCK_HELD_AT: &str = "lockHeldAt";
 
 #[derive(Debug, Clone, Args)]
 pub struct DestroyWorkerArgs {
@@ -37,16 +47,47 @@ pub struct DestroyOptions {
     pub removed_snapshot: Option<wt_store::RemovedWorktree>,
 }
 
+/// Start a durable removal and return its job id.
+///
+/// Contract: `Ok` means the removal now owns the worktree. Either its worker
+/// holds the worktree's lifecycle lock (`<slug>.lock`, the one create,
+/// restack and remove share) and keeps it until the removal has succeeded or
+/// failed, or the job has already succeeded. From then on no other
+/// lifecycle operation on that worktree can run before the removal's
+/// revision check, so the caller may stop excluding them. `Err` means no
+/// removal is running: the worker failed first (the error is the job's), or
+/// it never took the lock. The one exception is [`RemovalUncertain`], when
+/// the worker acknowledged the job and then said nothing for
+/// `HANDOVER_TIMEOUT`: it may still be running.
 pub async fn start_remove(
     ctx: &AppContext,
     record: &WorktreeRecord,
     options: DestroyOptions,
 ) -> Result<String> {
+    prepare_removals(ctx).await?;
+    start_remove_inner(ctx, record, options).await
+}
+
+/// What every start needs once per batch: the job directory, with the jobs
+/// of dead workers reaped. Reaping reads every job record, so a batch that
+/// starts its removals one by one does it once, then calls
+/// [`start_prepared_remove`] for each.
+pub async fn prepare_removals(ctx: &AppContext) -> Result<()> {
     let jobs = job_dir(ctx);
     tokio::fs::create_dir_all(&jobs)
         .await
         .with_context(|| format!("create job directory {}", jobs.display()))?;
-    reap_abandoned(ctx, &jobs).await?;
+    reap_abandoned(ctx, &jobs).await
+}
+
+/// [`start_remove`], with its contract, after the caller's own
+/// [`prepare_removals`]. Starts are independent of each other: each has its
+/// own job record and worker.
+pub async fn start_prepared_remove(
+    ctx: &AppContext,
+    record: &WorktreeRecord,
+    options: DestroyOptions,
+) -> Result<String> {
     start_remove_inner(ctx, record, options).await
 }
 
@@ -54,14 +95,7 @@ pub async fn start_removals(
     ctx: &AppContext,
     requests: &[(WorktreeRecord, DestroyOptions)],
 ) -> Vec<Result<String>> {
-    let jobs = job_dir(ctx);
-    let setup = async {
-        tokio::fs::create_dir_all(&jobs)
-            .await
-            .with_context(|| format!("create job directory {}", jobs.display()))?;
-        reap_abandoned(ctx, &jobs).await
-    }
-    .await;
+    let setup = prepare_removals(ctx).await;
     if let Err(error) = setup {
         let message = format!("{error:#}");
         return requests
@@ -169,53 +203,91 @@ async fn start_remove_inner(
         .context("start background wt destroy worker")?;
     let pid = child.id();
 
-    let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    let started = tokio::time::Instant::now();
     loop {
         let current = read_job(&job_path).await?;
-        if current["state"] == "running" && current["workerPid"].as_u64() == Some(pid as u64) {
-            // The job outlives this request; still reap its OS child when it
-            // finishes, including a crash before writing terminal state.
-            std::thread::spawn(move || child.wait());
-            return Ok(job_id);
-        }
-        if current["state"] == "succeeded" {
-            std::thread::spawn(move || child.wait());
-            return Ok(job_id);
-        }
-        if current["state"] == "failed" {
-            std::thread::spawn(move || child.wait());
-            bail!(
-                "background worker exited during startup; see {}",
-                log_path.display()
-            );
+        let seen = handover(&current, pid);
+        match &seen {
+            Handover::Locked | Handover::Succeeded => {
+                // The job outlives this request; still reap its OS child when
+                // it finishes, including a crash before writing terminal state.
+                std::thread::spawn(move || child.wait());
+                return Ok(job_id);
+            }
+            Handover::Failed(error) => {
+                std::thread::spawn(move || child.wait());
+                bail!("{error}; see {}", log_path.display());
+            }
+            Handover::Starting | Handover::Acknowledged => {}
         }
         if child.try_wait()?.is_some() {
             // The worker may have recorded a terminal state between the read
             // above and its exit; that record, not the exit, decides.
-            let current = read_job(&job_path).await?;
-            if current["state"] == "succeeded" {
-                return Ok(job_id);
+            match handover(&read_job(&job_path).await?, pid) {
+                Handover::Succeeded => return Ok(job_id),
+                Handover::Failed(error) => bail!("{error}; see {}", log_path.display()),
+                _ => bail!(
+                    "background worker exited before it took the worktree; see {}",
+                    log_path.display()
+                ),
             }
-            if current["state"] == "failed" {
+        }
+        match seen {
+            Handover::Starting if started.elapsed() >= STARTUP_TIMEOUT => {
+                // Unacknowledged, it has begun nothing.
+                let _ = child.kill();
+                let _ = child.wait();
                 bail!(
-                    "background worker exited during startup; see {}",
+                    "background worker did not acknowledge startup; see {}",
                     log_path.display()
                 );
             }
-            bail!(
-                "background worker exited before startup acknowledgement; see {}",
-                log_path.display()
-            );
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!(
-                "background worker did not acknowledge startup; see {}",
-                log_path.display()
-            );
+            Handover::Acknowledged if started.elapsed() >= HANDOVER_TIMEOUT => {
+                // It may be anywhere, so it is not killed: a removal cut
+                // short past its commit point is worse than a late one.
+                std::thread::spawn(move || child.wait());
+                return Err(RemovalUncertain(format!(
+                    "removal job {job_id} did not report holding the worktree; it may still be running; inspect {} before retrying",
+                    job_path.display()
+                ))
+                .into());
+            }
+            _ => {}
         }
         sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// Where a just-started job stands, as its starter reads the record.
+#[derive(Debug, PartialEq, Eq)]
+enum Handover {
+    /// The worker has not written to the record yet.
+    Starting,
+    /// The worker runs, and has not yet locked the worktree.
+    Acknowledged,
+    /// The worker holds the worktree's lifecycle lock.
+    Locked,
+    Succeeded,
+    Failed(String),
+}
+
+fn handover(job: &Value, worker: u32) -> Handover {
+    match job["state"].as_str() {
+        Some("succeeded") => Handover::Succeeded,
+        Some("failed") => Handover::Failed(
+            job["error"]
+                .as_str()
+                .unwrap_or("background worker failed during startup")
+                .to_owned(),
+        ),
+        Some("running") if job["workerPid"].as_u64() == Some(u64::from(worker)) => {
+            if job[LOCK_HELD_AT].is_string() {
+                Handover::Locked
+            } else {
+                Handover::Acknowledged
+            }
+        }
+        _ => Handover::Starting,
     }
 }
 
@@ -378,9 +450,13 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
         .as_str()
         .context("job missing branch")?
         .to_owned();
+    let landed = job["options"]["landed"].as_bool().unwrap_or(false);
+    let was_archived = job["wasArchived"].as_bool().unwrap_or(false);
     let accepted = ctx
         .database
-        .call(move |store| Ok(store.begin_removal(&key, &job_id, &path, &branch)?))
+        .call(move |store| {
+            Ok(store.begin_removal_of(&key, &job_id, &path, &branch, landed, was_archived)?)
+        })
         .await?;
     if !accepted {
         job["state"] = json!("failed");
@@ -401,7 +477,11 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
     job["state"] = json!("running");
     atomic_write(&job_path, &job).await?;
 
-    let result = execute_job(ctx, &job).await;
+    let result = execute_job(ctx, &job, &job_path).await;
+    // The lock marker was written to the record beside this copy of it.
+    if let Ok(current) = read_job(&job_path).await {
+        job[LOCK_HELD_AT] = current[LOCK_HELD_AT].clone();
+    }
     match result {
         Ok(quarantined) => {
             job["state"] = json!("succeeded");
@@ -557,7 +637,11 @@ async fn delete_after_success(
     }
 }
 
-async fn execute_job(ctx: &AppContext, job: &Value) -> Result<Option<QuarantinedCheckout>> {
+async fn execute_job(
+    ctx: &AppContext,
+    job: &Value,
+    job_path: &Path,
+) -> Result<Option<QuarantinedCheckout>> {
     let target = &job["target"];
     let key = target["key"].as_str().context("job missing target key")?;
     let path = target["path"].as_str().context("job missing target path")?;
@@ -589,8 +673,27 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<Option<Quarantined
     let options = &job["options"];
     let dev_port = crate::host_cleanup::stored_dev_port(ctx, row.target.slug()).await;
     let service = crate::lifecycle_ops::service(ctx)?;
+    // The starter keeps other work off this worktree until it reads this
+    // marker, so it is written the moment the lock is held. A record that
+    // cannot be written leaves the starter waiting out its bound.
+    let locked = {
+        let job_path = job_path.to_path_buf();
+        Box::new(move || {
+            Box::pin(async move {
+                let marked = async {
+                    let mut current = read_job(&job_path).await?;
+                    current[LOCK_HELD_AT] = json!(now_string());
+                    atomic_write(&job_path, &current).await
+                }
+                .await;
+                if let Err(error) = marked {
+                    eprintln!("warning: could not record the worktree lock: {error:#}");
+                }
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        })
+    };
     let (removed, quarantined) = service
-        .remove_with_revision_deferred(
+        .remove_with_revision_handover(
             &row.target,
             RemoveOptions {
                 force: options["force"].as_bool().unwrap_or(false),
@@ -605,6 +708,10 @@ async fn execute_job(ctx: &AppContext, job: &Value) -> Result<Option<Quarantined
                     .context("background job has invalid removed-history snapshot")?,
             },
             &revision,
+            wt_lifecycle::RemovalHandover {
+                lock_wait: WORKER_LOCK_WAIT,
+                locked,
+            },
             &ctx.cancellation,
         )
         .await?;
@@ -1123,6 +1230,187 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.downcast_ref::<RemovalUncertain>().is_some());
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_start_is_handed_over_only_once_the_worker_holds_the_lock_or_is_done() {
+        let job = |state: &str, pid: u64, held: bool| {
+            json!({
+                "state": state,
+                "workerPid": pid,
+                "error": "revision changed",
+                LOCK_HELD_AT: if held { json!("2026-11-27T00:00:00Z") } else { Value::Null },
+            })
+        };
+        assert_eq!(handover(&job("starting", 7, false), 7), Handover::Starting);
+        // Running is written before the worker takes the lock: not yet.
+        assert_eq!(
+            handover(&job("running", 7, false), 7),
+            Handover::Acknowledged
+        );
+        assert_eq!(handover(&job("running", 7, true), 7), Handover::Locked);
+        // Another process's record of the same name proves nothing.
+        assert_eq!(handover(&job("running", 8, true), 7), Handover::Starting);
+        assert_eq!(
+            handover(&job("succeeded", 7, false), 7),
+            Handover::Succeeded
+        );
+        assert_eq!(
+            handover(&job("failed", 7, false), 7),
+            Handover::Failed("revision changed".into())
+        );
+        // A record written by a build without the marker reads as not locked.
+        assert_eq!(
+            handover(&json!({"state": "running", "workerPid": 7}), 7),
+            Handover::Acknowledged
+        );
+    }
+
+    /// The window the marker closes: the worker says it runs, and only later
+    /// holds the worktree. A restack that took the lock in between would
+    /// make the confirmed removal fail its revision check.
+    #[tokio::test]
+    async fn a_worker_marks_its_job_only_after_it_holds_the_worktree_lock() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let row = crate::lifecycle_ops::resolve_key(ctx, "one").await.unwrap();
+        let revision = crate::lifecycle_ops::service(ctx)
+            .unwrap()
+            .removal_revision(&row.target, false, &ctx.cancellation)
+            .await
+            .unwrap();
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let path = jobs.join("3-c.json");
+        atomic_write(
+            &path,
+            &json!({
+                "version": VERSION, "id": "3-c", "state": "starting",
+                "wasArchived": false, "operation": "remove",
+                "options": {"force": false, "deleteBranch": true, "landed": false},
+                "target": {
+                    "key": "one", "path": row.target.path, "branch": row.target.branch,
+                    "head": row.head_sha, "revision": revision,
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let busy = wt_platform::lock::FileLock::try_acquire(
+            &ctx.config.paths.lock_dir,
+            row.target.slug(),
+            "restack",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let worker = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                run_worker(
+                    &ctx,
+                    &DestroyWorkerArgs {
+                        job_id: "3-c".into(),
+                    },
+                )
+                .await
+            }
+        });
+        let pid = std::process::id();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while handover(&read_job(&path).await.unwrap(), pid) != Handover::Acknowledged {
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the worker acknowledges the job");
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            handover(&read_job(&path).await.unwrap(), pid),
+            Handover::Acknowledged,
+            "the job reads as handed over while another operation holds the worktree"
+        );
+        assert!(Path::new(&row.target.path).exists());
+
+        drop(busy);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(60), worker)
+                .await
+                .expect("the worker finishes once the worktree is free")
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let done = read_job(&path).await.unwrap();
+        assert_eq!(done["state"], "succeeded");
+        assert!(done[LOCK_HELD_AT].is_string(), "{done}");
+        assert!(!Path::new(&row.target.path).exists());
+        fixture.close().await.unwrap();
+    }
+
+    /// A dev `stop_command` that fails is a refusal like any other made
+    /// before the checkout is touched: the job fails with the reason, the
+    /// removal record carries it for the row, and the checkout stays.
+    #[tokio::test]
+    async fn a_failing_dev_stop_command_fails_the_job_and_leaves_the_checkout() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).dev_server =
+            Some(wt_config::DevServerConfig {
+                command: "true".into(),
+                stop_command: Some("echo 'the database volume is gone' >&2; exit 1".into()),
+                ..Default::default()
+            });
+        let ctx = &fixture.ctx;
+        let row = crate::lifecycle_ops::resolve_key(ctx, "one").await.unwrap();
+        let revision = crate::lifecycle_ops::service(ctx)
+            .unwrap()
+            .removal_revision(&row.target, false, &ctx.cancellation)
+            .await
+            .unwrap();
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let path = jobs.join("4-d.json");
+        atomic_write(
+            &path,
+            &json!({
+                "version": VERSION, "id": "4-d", "state": "starting",
+                "wasArchived": false, "operation": "remove",
+                "options": {"force": false, "deleteBranch": true, "landed": false},
+                "target": {
+                    "key": "one", "path": row.target.path, "branch": row.target.branch,
+                    "head": row.head_sha, "revision": revision,
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let error = run_worker(
+            ctx,
+            &DestroyWorkerArgs {
+                job_id: "4-d".into(),
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("the database volume is gone"), "{error}");
+        assert!(error.contains("wt rm one --force"), "{error}");
+        assert!(Path::new(&row.target.path).exists());
+        assert_eq!(read_job(&path).await.unwrap()["state"], "failed");
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(
+            state["removals"]["one"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("the database volume is gone"),
+            "{}",
+            state["removals"]
+        );
         fixture.close().await.unwrap();
     }
 }

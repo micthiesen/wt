@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Requests cross the input boundary as data. The controller owns execution,
 /// persistence and refresh; the terminal never waits for an action to finish.
@@ -951,13 +951,56 @@ pub struct TerminalHandoff {
     pub resumed: oneshot::Receiver<Result<(), String>>,
 }
 
+/// Which read-only views the terminal has open. This is state, not a request:
+/// the terminal publishes the whole value and the controller applies the
+/// newest, so a view change is never queued behind, or lost among, actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewState {
+    pub history: bool,
+    pub perf: bool,
+    pub perf_continuous: bool,
+    /// Incremented to ask for a fresh performance sample.
+    pub perf_revision: u64,
+}
+
+impl ViewState {
+    /// Fold in a view request the model produced. Returns false for any
+    /// other action, which is a request and goes through the request channel.
+    pub fn apply(&mut self, action: &UiAction) -> bool {
+        match action {
+            UiAction::SetHistoryActive { active } => self.history = *active,
+            UiAction::SetPerf {
+                active,
+                continuous,
+                refresh,
+            } => {
+                self.perf = *active;
+                self.perf_continuous = *continuous;
+                if *refresh {
+                    self.perf_revision = self.perf_revision.wrapping_add(1);
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
 pub struct UiActions {
+    /// What the user asked for. Nothing else is sent here, so only the
+    /// user's own backlog can fill it.
     pub requests: mpsc::Sender<UiRequest>,
+    /// Reads the terminal starts on its own: prefetches and overlay
+    /// refreshes. A full queue skips one; it is asked for again later.
+    pub background: mpsc::Sender<UiRequest>,
+    pub views: watch::Sender<ViewState>,
     pub replies: mpsc::Receiver<UiReply>,
 }
 
 pub struct ActionController {
     pub requests: mpsc::Receiver<UiRequest>,
+    pub background: mpsc::Receiver<UiRequest>,
+    pub views: watch::Receiver<ViewState>,
     pub replies: mpsc::Sender<UiReply>,
 }
 
@@ -971,15 +1014,25 @@ pub struct UiRequest {
 }
 
 pub fn action_channel() -> (UiActions, ActionController) {
-    let (requests, incoming) = mpsc::channel(8);
+    let (requests, incoming) = mpsc::channel(16);
+    let (background, incoming_background) = mpsc::channel(8);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "which views are open is a control signal from the terminal, not board data"
+    )]
+    let (views, incoming_views) = watch::channel(ViewState::default());
     let (replies, outgoing) = mpsc::channel(16);
     (
         UiActions {
             requests,
+            background,
+            views,
             replies: outgoing,
         },
         ActionController {
             requests: incoming,
+            background: incoming_background,
+            views: incoming_views,
             replies,
         },
     )

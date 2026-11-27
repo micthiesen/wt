@@ -381,3 +381,109 @@ async fn coalesced_requests_reach_the_fetch_as_their_strongest_reason() {
     );
     scope.shutdown(Duration::from_secs(1)).await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_leaf_that_reads_its_domain_whole_serves_a_keyed_request_as_a_fetch() {
+    let scope = TaskScope::new();
+    let served = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = wt_runtime::start_requested_source(&scope, spec(RefreshPolicy::default()), {
+        let served = served.clone();
+        move |request, _| {
+            served.lock().unwrap().push(request);
+            async move {
+                Ok::<_, String>(Some(wt_runtime::Fetched::new(
+                    1u8,
+                    wt_runtime::Stamp::now(),
+                )))
+            }
+        }
+    });
+    let mut updates = source.subscribe();
+    // A hint for one key and a confirming read for another share the fetch;
+    // the stronger reason wins.
+    source.request_keys(wt_runtime::Request::Recheck, ["a"]);
+    source.request_keys(wt_runtime::Request::Direct, ["b"]);
+    updates.wait_for(|s| s.data().is_some()).await.unwrap();
+    assert_eq!(*served.lock().unwrap(), [wt_runtime::Request::Direct]);
+    let revision = source.snapshot().revision();
+    source.request_keys(wt_runtime::Request::Recheck, Vec::<String>::new());
+    updates.wait_for(|s| s.revision() > revision).await.unwrap();
+    assert_eq!(
+        *served.lock().unwrap(),
+        [wt_runtime::Request::Direct, wt_runtime::Request::Recheck]
+    );
+    scope.shutdown(Duration::from_secs(1)).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_demanded_source_reads_named_keys_and_stamps_them_apart_from_its_full_read() {
+    use wt_runtime::{Demand, Fetched, KeyedStamps, Request, Stamp};
+    let scope = TaskScope::new();
+    let demands = Arc::new(std::sync::Mutex::new(Vec::<Demand>::new()));
+    let source = wt_runtime::start_demanded_source(&scope, spec(RefreshPolicy::default()), {
+        let demands = demands.clone();
+        let mut full = None::<Stamp>;
+        move |demand: Demand, _| {
+            let started = Stamp::now();
+            demands.lock().unwrap().push(demand.clone());
+            // A whole request is a full read; a request for keys alone reads
+            // those and keeps the full read's stamp for everything else.
+            let fetched = match (demand.whole, full) {
+                (None, Some(full)) if !demand.keys.is_empty() => Fetched::keyed(
+                    2u8,
+                    KeyedStamps::new(
+                        full,
+                        demand
+                            .keys
+                            .keys()
+                            .map(|key| (key.clone(), started))
+                            .collect(),
+                    ),
+                ),
+                _ => {
+                    full = Some(started);
+                    Fetched::new(1u8, started)
+                }
+            };
+            async move { Ok::<_, String>(Some(fetched)) }
+        }
+    });
+    let mut updates = source.subscribe();
+    source.refresh();
+    updates.wait_for(|s| s.data().is_some()).await.unwrap();
+    let full = source.confirmed().unwrap().observed();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let accepted = Stamp::now();
+    source.request_keys(Request::Direct, ["pr-7"]);
+    updates
+        .wait_for(|s| s.data().map(|d| **d) == Some(2))
+        .await
+        .unwrap();
+    {
+        let demands = demands.lock().unwrap();
+        assert_eq!(demands[0].whole, Some(Request::Refresh));
+        assert!(demands[0].keys.is_empty());
+        assert_eq!(demands[1].whole, None);
+        assert_eq!(
+            demands[1].keys.iter().collect::<Vec<_>>(),
+            [(&"pr-7".to_owned(), &Request::Direct)]
+        );
+    }
+    // The named key carries its own read; the domain, and so anything
+    // confirmed about any other key, is still only as fresh as the full read.
+    let confirmed = source.confirmed().unwrap();
+    assert_eq!(confirmed.observed(), full);
+    assert_eq!(
+        confirmed.observed_for("pr-7").at_or_after(&accepted),
+        Some(true)
+    );
+    assert_eq!(confirmed.observed_for("pr-8"), full);
+    assert_eq!(
+        confirmed.map(|value| *value).observed_for("pr-7"),
+        confirmed.observed_for("pr-7")
+    );
+    let meta = source.snapshot().domains()[&Domain::Git].clone();
+    assert_eq!(meta.observed(), full);
+    assert_eq!(meta.observed_for("pr-7"), confirmed.observed_for("pr-7"));
+    scope.shutdown(Duration::from_secs(1)).await.unwrap();
+}

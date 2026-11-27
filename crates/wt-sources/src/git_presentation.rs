@@ -30,6 +30,11 @@ use crate::local_source::Metadata;
 use wt_app_core::context::AppContext;
 
 const MAX_CONCURRENT_ROWS: usize = 4;
+/// Row signatures read at once: file stats only, no subprocess.
+const MAX_CONCURRENT_SIGNATURES: usize = 16;
+/// How often a pass that is still reading rows publishes the ones it has.
+/// Each publish rebuilds the board, so rows that land together go together.
+const PARTIAL_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const GIT_TIMEOUT: Duration = Duration::from_secs(8);
 const GIT_OUTPUT_LIMIT: usize = 1024 * 1024;
 /// Dirty rows re-read their diff stat at most this often: editing an already
@@ -145,6 +150,98 @@ struct CachedRow {
     anchors: ActivityAnchors,
 }
 
+/// A row whose facts must be read in full: its key, signature, identity,
+/// inputs, the facts to keep showing if the read fails, and activity epoch.
+type EnrichProbe = (
+    String,
+    String,
+    FactIdentity,
+    WorktreeSnapshot,
+    Option<PullRequest>,
+    Option<GitPresentation>,
+    Option<u64>,
+);
+
+/// A dirty row whose diff stat alone is due: key, checkout, fork point and
+/// activity epoch.
+type DiffProbe = (String, PathBuf, Option<String>, Option<u64>);
+
+enum Probe {
+    Enrich(Box<EnrichProbe>),
+    Diff(DiffProbe),
+}
+
+enum Probed {
+    Enriched(String, Box<CachedRow>),
+    Diff(String, Option<wt_tui::DiffStat>, Option<u64>),
+}
+
+/// What the board shows while a pass is still reading rows: last pass's
+/// facts for the rows not read yet, each replaced as its read lands, so one
+/// slow checkout no longer holds back every other row.
+struct PartialFacts {
+    /// `None` when the pass publishes once, at its end: the lane still
+    /// shows facts restored from disk, which are never republished as live.
+    shown: Option<PresentationMap>,
+    remaining: usize,
+    published_at: tokio::time::Instant,
+    unpublished: bool,
+}
+
+impl PartialFacts {
+    fn new(
+        last_published: Option<&PresentationMap>,
+        shows_facts: bool,
+        current_keys: &std::collections::HashSet<String>,
+        probes: usize,
+    ) -> Self {
+        let shown = match last_published {
+            Some(published) => Some(
+                published
+                    .iter()
+                    .filter(|(key, _)| current_keys.contains(*key))
+                    .map(|(key, fact)| (key.clone(), fact.clone()))
+                    .collect(),
+            ),
+            // Shown but never published by this process: restored.
+            None if shows_facts => None,
+            None => Some(PresentationMap::new()),
+        };
+        Self {
+            shown,
+            remaining: probes,
+            published_at: tokio::time::Instant::now(),
+            unpublished: false,
+        }
+    }
+
+    /// Take one finished row from the cache. Returns the facts to publish
+    /// now: only when something changed, other rows are still being read
+    /// (the pass publishes its own result when none are), and the last
+    /// partial publish is at least `PARTIAL_PUBLISH_INTERVAL` old.
+    fn land(&mut self, key: String, cache: &HashMap<String, CachedRow>) -> Option<PresentationMap> {
+        self.remaining = self.remaining.saturating_sub(1);
+        let shown = self.shown.as_mut()?;
+        if let Some(cached) = cache.get(&key) {
+            let fact = GitFact {
+                identity: cached.identity.clone(),
+                presentation: cached.presentation.clone(),
+            };
+            self.unpublished |= shown.get(&key) != Some(&fact);
+            shown.insert(key, fact);
+        }
+        if !self.unpublished
+            || self.remaining == 0
+            || self.published_at.elapsed() < PARTIAL_PUBLISH_INTERVAL
+        {
+            return None;
+        }
+        self.published_at = tokio::time::Instant::now();
+        self.unpublished = false;
+        Some(shown.clone())
+    }
+}
+
 /// The facts survive restarts as restored display data. A restored fact only
 /// applies to a row whose current identity (path, branch, HEAD, base, PR)
 /// still matches, so stale facts never attach to a changed worktree.
@@ -171,6 +268,7 @@ pub fn start(
     let (source, mut publisher) = leaf_channel(scope, facts_spec(context));
     let cancellation = scope.token();
     let context = context.clone();
+    let shown_facts = source.view();
     scope.spawn(async move {
         let mut git_updates = git.subscribe();
         let mut metadata_updates = metadata.subscribe();
@@ -185,6 +283,8 @@ pub fn start(
         let conflicts = Arc::new(ConflictCache::default());
         let mut last_published: Option<PresentationMap> = None;
         let mut last_state: Option<SourceState> = None;
+        // When the inputs of the last complete pass were sampled.
+        let mut last_observed: Option<Stamp> = None;
         let mut activity_tick = tokio::time::interval(ACTIVITY_REFRESH);
         activity_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -236,14 +336,34 @@ pub fn start(
                 continue;
             };
             let prs = github_snapshot.data().map(Arc::as_ref);
+            let live_rows = rows
+                .iter()
+                .filter(|row| !row.worktree.is_main)
+                .collect::<Vec<_>>();
+            // Signatures are a dozen stats per row. Read side by side, they
+            // cost one row's worth of waiting instead of the fleet's.
+            let deployed_refs = deployed_ref_stamps(&context).await;
+            let (context_for_signatures, deployed_refs, signed_rows) =
+                (&context, &deployed_refs, &live_rows);
+            // By index: a borrowed item makes the stream's closure too
+            // specific for this task, which must be `Send`.
+            let signatures = stream::iter(0..live_rows.len())
+                .map(|index| async move {
+                    let row = signed_rows[index];
+                    let pr = prs.and_then(|data| data.prs.get(&row.worktree.target.branch));
+                    let signature =
+                        row_signature(row, state, pr, context_for_signatures, deployed_refs).await;
+                    serde_json::to_string(&signature).unwrap_or_default()
+                })
+                .buffered(MAX_CONCURRENT_SIGNATURES)
+                .collect::<Vec<_>>()
+                .await;
             let mut keyed = Vec::with_capacity(rows.len());
             let mut ticked = Vec::new();
-            for row in rows.iter().filter(|row| !row.worktree.is_main) {
+            for (row, serialized) in live_rows.into_iter().zip(signatures) {
                 let target = &row.worktree.target;
                 let key = wt_core::worktree_target_key(target);
                 let pr = prs.and_then(|data| data.prs.get(&target.branch));
-                let signature = row_signature(row, state, pr, &context).await;
-                let serialized = serde_json::to_string(&signature).unwrap_or_default();
                 let identity = fact_identity(row, state, pr, &context.config.branch.base);
                 let epoch = activity_epoch(row, SystemTime::now());
                 if let Some(cached) = cache.get(&key).filter(|cached| {
@@ -306,86 +426,108 @@ pub fn start(
                 last_state = Some(SourceState::Refreshing);
             }
 
-            let context_for_rows = context.clone();
-            let state_for_rows = state.clone();
-            let updated = stream::iter(keyed)
-                .map(|(key, signature, identity, row, pr, previous, epoch)| {
-                    let context = context_for_rows.clone();
-                    let state = state_for_rows.clone();
-                    let conflicts = conflicts.clone();
-                    let cancellation = cancellation.child_token();
-                    async move {
-                        let (mut presentation, needs_retry, anchors) = enrich(
-                            &context,
-                            &row,
-                            &state,
-                            pr.as_ref(),
-                            &conflicts,
-                            &cancellation,
-                        )
-                        .await;
-                        if needs_retry && let Some(previous) = previous {
-                            let error = presentation.error.clone();
-                            presentation = previous;
-                            presentation.error = error;
-                        }
-                        (
-                            key,
-                            signature,
-                            identity,
-                            presentation,
-                            needs_retry,
-                            epoch,
-                            anchors,
-                        )
-                    }
-                })
-                .buffer_unordered(MAX_CONCURRENT_ROWS)
-                .collect::<Vec<_>>()
-                .await;
-            let refreshed = stream::iter(ticked)
-                .map(|(key, path, merge_base, epoch)| {
-                    let context = context_for_rows.clone();
-                    let cancellation = cancellation.child_token();
-                    async move {
-                        let diff = match &merge_base {
-                            Some(merge_base) => {
-                                diff_stat(&context, &path, merge_base, &cancellation).await
+            let mut partial = PartialFacts::new(
+                last_published.as_ref(),
+                shown_facts.snapshot().data().is_some(),
+                &current_keys,
+                keyed.len() + ticked.len(),
+            );
+            let context_for_rows = &context;
+            let state_for_rows = state;
+            let conflicts_for_rows = &conflicts;
+            let cancellation_for_rows = &cancellation;
+            let mut probes = std::pin::pin!(
+                stream::iter(
+                    keyed
+                        .into_iter()
+                        .map(|probe| Probe::Enrich(Box::new(probe)))
+                        .chain(ticked.into_iter().map(Probe::Diff)),
+                )
+                .map(|probe| async move {
+                    let cancellation = cancellation_for_rows.child_token();
+                    match probe {
+                        Probe::Enrich(probe) => {
+                            let (key, signature, identity, row, pr, previous, epoch) = *probe;
+                            let (mut presentation, needs_retry, anchors) = enrich(
+                                context_for_rows,
+                                &row,
+                                state_for_rows,
+                                pr.as_ref(),
+                                conflicts_for_rows,
+                                &cancellation,
+                            )
+                            .await;
+                            if needs_retry && let Some(previous) = previous {
+                                let error = presentation.error.clone();
+                                presentation = previous;
+                                presentation.error = error;
                             }
-                            None => None,
-                        };
-                        (key, diff, epoch)
+                            Probed::Enriched(
+                                key,
+                                Box::new(CachedRow {
+                                    signature,
+                                    identity,
+                                    presentation,
+                                    retry_after: needs_retry.then(|| {
+                                        tokio::time::Instant::now() + Duration::from_secs(3)
+                                    }),
+                                    activity_epoch: epoch,
+                                    anchors,
+                                }),
+                            )
+                        }
+                        Probe::Diff((key, path, merge_base, epoch)) => {
+                            let diff = match &merge_base {
+                                Some(merge_base) => {
+                                    diff_stat(context_for_rows, &path, merge_base, &cancellation)
+                                        .await
+                                }
+                                None => None,
+                            };
+                            Probed::Diff(key, diff, epoch)
+                        }
                     }
                 })
                 .buffer_unordered(MAX_CONCURRENT_ROWS)
-                .collect::<Vec<_>>()
-                .await;
+            );
+            loop {
+                let probed = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    probed = probes.next() => probed,
+                };
+                let Some(probed) = probed else {
+                    break;
+                };
+                let key = match probed {
+                    Probed::Enriched(key, row) => {
+                        cache.insert(key.clone(), *row);
+                        key
+                    }
+                    Probed::Diff(key, diff, epoch) => {
+                        if let Some(cached) = cache.get_mut(&key) {
+                            cached.activity_epoch = epoch;
+                            if diff.is_some() {
+                                cached.presentation.diff = diff;
+                            }
+                        }
+                        key
+                    }
+                };
+                if let Some(shown) = partial.land(key, &cache) {
+                    // The rows still being read keep their old facts, so the
+                    // lane claims no newer read than its last complete one.
+                    publisher.publish_live_with_state(
+                        shown.clone(),
+                        last_observed.unwrap_or(observed),
+                        SourceState::Refreshing,
+                    );
+                    last_published = Some(shown);
+                    last_state = Some(SourceState::Refreshing);
+                }
+            }
             if cancellation.is_cancelled() {
                 break;
-            }
-            for (key, signature, identity, presentation, needs_retry, activity_epoch, anchors) in
-                updated
-            {
-                cache.insert(
-                    key,
-                    CachedRow {
-                        signature,
-                        identity,
-                        presentation,
-                        retry_after: needs_retry
-                            .then(|| tokio::time::Instant::now() + Duration::from_secs(3)),
-                        activity_epoch,
-                        anchors,
-                    },
-                );
-            }
-            for (key, diff, epoch) in refreshed {
-                if let Some(cached) = cache.get_mut(&key) {
-                    cached.activity_epoch = epoch;
-                    if diff.is_some() {
-                        cached.presentation.diff = diff;
-                    }
-                }
             }
             if let Ok(mut conflicts) = conflicts.lock() {
                 let live = cache
@@ -418,6 +560,7 @@ pub fn start(
                 publisher.publish_live_with_state(presentation.clone(), observed, state.clone());
                 last_published = Some(presentation);
                 last_state = Some(state);
+                last_observed = Some(observed);
             }
         }
     });
@@ -601,11 +744,26 @@ fn apply_facts(
     applied
 }
 
+/// Stamps of the deployed refs, which live in the main clone and are the
+/// same for every row.
+async fn deployed_ref_stamps(context: &AppContext) -> Vec<FileStamp> {
+    let main_clone = &context.config.paths.main_clone;
+    let main_common = Some(main_clone.join(".git"))
+        .filter(|git| git.is_dir())
+        .unwrap_or_else(|| main_clone.clone());
+    let mut deployed_refs = Vec::new();
+    for (stage, _) in context.config.environments.probed() {
+        deployed_refs.push(file_stamp(&main_common.join(stage.deployed_ref())).await);
+    }
+    deployed_refs
+}
+
 async fn row_signature<'a>(
     row: &'a WorktreeSnapshot,
     state: &'a Value,
     pr: Option<&'a PullRequest>,
     context: &AppContext,
+    deployed_refs: &[FileStamp],
 ) -> RowSignature<'a> {
     let worktree = &row.worktree;
     let (index, rebase_merge, rebase_apply, base_ref, production_ref, packed_refs) =
@@ -670,16 +828,6 @@ async fn row_signature<'a>(
                 FileStamp::default(),
             )
         };
-    // The deployed refs live in the main clone, which is not the common
-    // directory of a row that is a clone of its own.
-    let mut deployed_refs = Vec::new();
-    let main_clone = &context.config.paths.main_clone;
-    let main_common = Some(main_clone.join(".git"))
-        .filter(|git| git.is_dir())
-        .unwrap_or_else(|| main_clone.clone());
-    for (stage, _) in context.config.environments.probed() {
-        deployed_refs.push(file_stamp(&main_common.join(stage.deployed_ref())).await);
-    }
     let status = row.status.as_ref().map(|status| StatusSignature {
         branch: status.branch.as_deref(),
         head: status.head_sha.as_deref(),
@@ -721,7 +869,9 @@ async fn row_signature<'a>(
         rebase_apply,
         base_ref,
         production_ref,
-        deployed_refs,
+        // They live in the main clone, which is not the common directory of
+        // a row that is a clone of its own.
+        deployed_refs: deployed_refs.to_vec(),
         packed_refs,
     }
 }
@@ -1967,19 +2117,114 @@ mod tests {
             .unwrap();
         let row = rows.iter().find(|row| !row.worktree.is_main).unwrap();
         let state = serde_json::json!({"slugs": {}});
-        let before = row_signature(row, &state, None, &fixture.ctx).await;
+        let before = row_signature(
+            row,
+            &state,
+            None,
+            &fixture.ctx,
+            &deployed_ref_stamps(&fixture.ctx).await,
+        )
+        .await;
         let output = std::process::Command::new("git")
             .args(["add", "tracked.txt"])
             .current_dir(&row.worktree.target.path)
             .output()
             .unwrap();
         assert!(output.status.success());
-        let after = row_signature(row, &state, None, &fixture.ctx).await;
+        let after = row_signature(
+            row,
+            &state,
+            None,
+            &fixture.ctx,
+            &deployed_ref_stamps(&fixture.ctx).await,
+        )
+        .await;
         assert_ne!(
             serde_json::to_string(&before).unwrap(),
             serde_json::to_string(&after).unwrap()
         );
         fixture.close().await.unwrap();
+    }
+
+    fn cached(title: &str) -> CachedRow {
+        CachedRow {
+            signature: String::new(),
+            identity: FactIdentity {
+                path: "/checkout".into(),
+                branch: "branch".into(),
+                head: None,
+                base_branch: "main".into(),
+                base_sha: None,
+                pr: None,
+            },
+            presentation: GitPresentation {
+                first_commit_title: Some(title.into()),
+                ..GitPresentation::default()
+            },
+            retry_after: None,
+            activity_epoch: None,
+            anchors: ActivityAnchors::default(),
+        }
+    }
+
+    fn titles(facts: &PresentationMap) -> Vec<(&str, &str)> {
+        facts
+            .iter()
+            .map(|(key, fact)| {
+                (
+                    key.as_str(),
+                    fact.presentation.first_commit_title.as_deref().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// One row hitting its timeout used to hold every other row's facts
+    /// until it gave up. Rows now reach the board as they are read.
+    #[tokio::test(start_paused = true)]
+    async fn rows_read_early_are_published_while_a_slow_row_is_still_being_read() {
+        let keys = ["fast", "gone", "slow", "steady"].map(str::to_owned);
+        let last: PresentationMap =
+            presentation_map(&HashMap::from(keys.clone().map(|key| (key, cached("old")))));
+        let current =
+            std::collections::HashSet::from(["fast", "slow", "steady"].map(str::to_owned));
+        let mut cache = HashMap::from([("steady".to_owned(), cached("old"))]);
+        let mut partial = PartialFacts::new(Some(&last), true, &current, 3);
+
+        // Landing at once, a row waits for the interval: rows that finish
+        // together are published together.
+        cache.insert("fast".into(), cached("new"));
+        assert!(partial.land("fast".into(), &cache).is_none());
+        tokio::time::advance(PARTIAL_PUBLISH_INTERVAL).await;
+        // An unchanged row is still a reason to publish what is waiting.
+        let shown = partial.land("steady".into(), &cache).unwrap();
+        assert_eq!(
+            titles(&shown),
+            [("fast", "new"), ("slow", "old"), ("steady", "old")],
+            "the slow row keeps its last facts and the removed row is gone"
+        );
+        // The last row is the end of the pass, which publishes its result.
+        tokio::time::advance(PARTIAL_PUBLISH_INTERVAL).await;
+        cache.insert("slow".into(), cached("new"));
+        assert!(partial.land("slow".into(), &cache).is_none());
+
+        // Nothing changed: nothing to publish, however long it takes.
+        let mut unchanged = PartialFacts::new(Some(&last), true, &current, 2);
+        tokio::time::advance(PARTIAL_PUBLISH_INTERVAL).await;
+        assert!(unchanged.land("steady".into(), &cache).is_none());
+
+        // A first pass with nothing on screen fills in row by row.
+        let mut first = PartialFacts::new(None, false, &current, 3);
+        tokio::time::advance(PARTIAL_PUBLISH_INTERVAL).await;
+        assert_eq!(
+            titles(&first.land("fast".into(), &cache).unwrap()),
+            [("fast", "new")]
+        );
+        // Over restored facts it does not: they would be republished as live
+        // or dropped for the rows not read yet.
+        let mut restored = PartialFacts::new(None, true, &current, 3);
+        tokio::time::advance(PARTIAL_PUBLISH_INTERVAL).await;
+        assert!(restored.land("fast".into(), &cache).is_none());
     }
 
     #[tokio::test]
@@ -2402,9 +2647,17 @@ mod tests {
             )
             .await
             .0;
-            let signature =
-                serde_json::to_string(&row_signature(&row, &state, None, &fixture.ctx).await)
-                    .unwrap();
+            let signature = serde_json::to_string(
+                &row_signature(
+                    &row,
+                    &state,
+                    None,
+                    &fixture.ctx,
+                    &deployed_ref_stamps(&fixture.ctx).await,
+                )
+                .await,
+            )
+            .unwrap();
             (presentation.landed_on, presentation.deploys, signature)
         };
         // Not landed: nothing is looked up, and the probed stage reads not
@@ -2442,7 +2695,12 @@ mod tests {
         independent.worktree.common_dir = independent.worktree.git_dir.clone();
         let signature = |row: WorktreeSnapshot| {
             let (state, ctx) = (&state, &fixture.ctx);
-            async move { serde_json::to_string(&row_signature(&row, state, None, ctx).await).unwrap() }
+            async move {
+                serde_json::to_string(
+                    &row_signature(&row, state, None, ctx, &deployed_ref_stamps(ctx).await).await,
+                )
+                .unwrap()
+            }
         };
         let own_clone_before = signature(independent.clone()).await;
         git(&main, &["update-ref", "refs/wt/deployed/staging", "HEAD"]);

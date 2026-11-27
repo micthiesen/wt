@@ -23,6 +23,24 @@ pub(crate) async fn run_git(
         .map_err(StackError::Process)
 }
 
+/// [`run_git`] with untranslated messages, for the one caller that reads
+/// what Git says about recorded resolutions.
+pub(crate) async fn run_git_plain(
+    runner: &ProcessRunner,
+    cwd: &Path,
+    args: impl IntoIterator<Item = impl Into<std::ffi::OsString>>,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, StackError> {
+    let mut spec = CommandSpec::new("git").args(args).cwd(cwd.to_path_buf());
+    spec.timeout = GIT_TIMEOUT;
+    spec.output_limit = OUTPUT_LIMIT;
+    spec.env.push(("LC_ALL".into(), Some("C".into())));
+    runner
+        .run(spec, cancellation)
+        .await
+        .map_err(StackError::Process)
+}
+
 pub(crate) async fn checked_git(
     runner: &ProcessRunner,
     cwd: &Path,

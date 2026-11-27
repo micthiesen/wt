@@ -18,9 +18,9 @@ pub use mainline::{
     committed_on_branch, contained_head_landed, mainline_args, on_first_parent_line,
     published_head_holds_everything,
 };
-pub use origin::{FetchOriginOptions, FetchOriginReport};
+pub use origin::{FetchOriginOptions, FetchOriginReport, FetchedRefs};
 pub use repository::{
-    DiffStats, GitRepository, RepositoryConfig, RepositoryError, RepositoryKind, StageConfig,
-    WorktreeRecord, WorktreeSnapshot, operation_in_progress, stack_parent_refs,
+    DiffStats, FleetScan, GitRepository, RepositoryConfig, RepositoryError, RepositoryKind,
+    StageConfig, WorktreeRecord, WorktreeSnapshot, operation_in_progress, stack_parent_refs,
 };
 pub use status::GitStatus;

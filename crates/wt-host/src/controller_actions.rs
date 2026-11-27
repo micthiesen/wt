@@ -87,6 +87,44 @@ fn checkout_absent(path: &Path) -> bool {
     )
 }
 
+/// The checkout a board key names.
+struct Checkout {
+    slug: String,
+    path: std::path::PathBuf,
+}
+
+/// Resolve a key without asking Git when the board can answer. A local row is
+/// taken as it is shown only when its path is a checkout right now: it has
+/// its `.git` entry, and no removal record. The board also lists rows that
+/// are not checkouts (one restored from cache, one a removal has overtaken,
+/// one kept only for its failed removal record, whose directory may survive
+/// without being a worktree); for those Git inventory decides as before.
+async fn checkout(ctx: &AppContext, board: Option<&Board>, key: &str) -> Result<Checkout> {
+    let listed = board.and_then(|board| {
+        board
+            .rows
+            .iter()
+            .find(|row| row.key == key && row.host.is_none() && !row.pending_creation)
+    });
+    if let Some(row) = listed
+        && row.removal.is_none()
+        && !row.path.is_empty()
+        && tokio::fs::symlink_metadata(Path::new(&row.path).join(".git"))
+            .await
+            .is_ok()
+    {
+        return Ok(Checkout {
+            slug: row.slug.clone(),
+            path: row.path.clone().into(),
+        });
+    }
+    let row = resolve_key(ctx, key).await?;
+    Ok(Checkout {
+        slug: row.target.slug().to_owned(),
+        path: row.target.path.into(),
+    })
+}
+
 fn message(text: impl Into<String>) -> UiReply {
     UiReply {
         message: text.into(),
@@ -107,7 +145,7 @@ pub async fn execute(
     board: Option<&Board>,
     github: Option<&Confirmed<wt_github::GithubData>>,
 ) -> Result<UiReply> {
-    execute_with_shutdown(ctx, action, board, github, None).await
+    execute_with_shutdown(ctx, action, board, github, None, None).await
 }
 
 pub async fn execute_with_shutdown(
@@ -116,6 +154,7 @@ pub async fn execute_with_shutdown(
     board: Option<&Board>,
     github: Option<&Confirmed<wt_github::GithubData>>,
     shutdown: Option<&CancellationToken>,
+    hold: Option<&wt_app_core::lanes::LaneHold>,
 ) -> Result<UiReply> {
     match action {
         // Built by the TUI from its board (`UiAction::menu`); the host
@@ -335,8 +374,7 @@ pub async fn execute_with_shutdown(
             })
         }
         UiAction::SetTitle { key, title } => {
-            let row = resolve_key(ctx, &key).await?;
-            let slug = row.target.slug().to_owned();
+            let slug = checkout(ctx, board, &key).await?.slug;
             ctx.database
                 .call(move |store| {
                     // The TUI rename is the user's, and final.
@@ -374,9 +412,9 @@ pub async fn execute_with_shutdown(
         }),
         UiAction::CreateResolved { plan } => create_resolved(ctx, plan).await,
         UiAction::OpenEditor { key } => {
-            let row = resolve_key(ctx, &key).await?;
-            wt_app_core::editor::open(ctx, Path::new(&row.target.path)).await?;
-            Ok(message(format!("Opened {}", row.target.slug())))
+            let checkout = checkout(ctx, board, &key).await?;
+            wt_app_core::editor::open(ctx, &checkout.path).await?;
+            Ok(message(format!("Opened {}", checkout.slug)))
         }
         UiAction::PrepareRemove { key } => {
             let row = resolve_key(ctx, &key).await?;
@@ -512,6 +550,14 @@ pub async fn execute_with_shutdown(
                 },
             )
             .await?;
+            // By `start_remove`'s contract the worker now holds the
+            // checkout's lifecycle lock (or has finished), so no queued
+            // whole-host job can take the checkout before the removal's
+            // revision check. What follows is a wait for another process: it
+            // must not keep a job slot or hold up work on other checkouts.
+            if let Some(hold) = hold {
+                hold.durable();
+            }
             match wt_ops::commands::_destroy::wait_for_completion_or_shutdown(ctx, &job, shutdown)
                 .await?
             {
@@ -576,8 +622,7 @@ pub async fn execute_with_shutdown(
                     .context("remote worktree metadata is still loading")?;
                 require_live_host(board, row.host.as_deref())?;
             } else {
-                let row = resolve_key(ctx, &key).await?;
-                let slug = row.target.slug().to_owned();
+                let slug = checkout(ctx, board, &key).await?.slug;
                 if FileLock::try_acquire(&ctx.config.paths.lock_dir, &slug, "archive probe")
                     .await?
                     .is_none()
@@ -637,7 +682,6 @@ pub async fn execute_with_shutdown(
             crate::watch_actions::set_notify(ctx, &key, change, seen.0).await
         }
         UiAction::SetIssueOverride { key, issue_id } => {
-            let row = resolve_key(ctx, &key).await?;
             let value = issue_id.unwrap_or_default().trim().to_ascii_uppercase();
             if !value.is_empty()
                 && !regex::Regex::new(r"^[A-Z][A-Z0-9]*-\d+$")
@@ -646,7 +690,7 @@ pub async fn execute_with_shutdown(
             {
                 bail!("Issue ID must look like ENG-123, or be empty for no issue");
             }
-            let slug = row.target.slug().to_owned();
+            let slug = checkout(ctx, board, &key).await?.slug;
             ctx.database
                 .call(move |store| {
                     store.set_slug_issue_id(&slug, Some(&value))?;
@@ -656,9 +700,8 @@ pub async fn execute_with_shutdown(
             Ok(message("Issue updated"))
         }
         UiAction::OpenUrl { key, kind } => {
-            if !wt_core::is_remote_worktree_ledger_key(&key) {
-                resolve_key(ctx, &key).await?;
-            }
+            // The link is the one the board shows; nothing here depends on
+            // the checkout still existing.
             let row = board
                 .and_then(|board| board.rows.iter().find(|row| row.key == key))
                 .context("worktree metadata is still loading")?;
@@ -790,16 +833,12 @@ async fn create_resolved(ctx: &AppContext, plan: wt_tui::CreatePlan) -> Result<U
             )
             .await?
             .target;
-        let issue_title = lookup.finish().await;
-        // Creating from the TUI is the user's own request.
-        wt_ops::commands::new::record_title(
-            ctx,
-            target.slug(),
-            plan.title,
-            wt_store::TitleSource::User,
-            issue_title,
-        )
-        .await;
+        // Creating from the TUI is the user's own request. The reply, and
+        // the creations queued behind it, do not wait on the tracker: a
+        // title still being read is saved when it arrives.
+        lookup
+            .record(ctx, target.slug(), plan.title, wt_store::TitleSource::User)
+            .await;
         target
     };
     let mut setup_warning = None;
@@ -919,21 +958,16 @@ async fn set_status(
     {
         anyhow::bail!("post-merge steps need a stage: staging or production");
     }
-    let row = resolve_key(ctx, key).await?;
-    let slug = row.target.slug().to_owned();
+    let Checkout { slug, path } = checkout(ctx, board, key).await?;
     let state = state
         .map(|state| wt_core::resolve_work_state(&state).context("unknown work status"))
         .transpose()?;
-    let head = run_git(
-        ctx,
-        Path::new(&row.target.path),
-        ["rev-parse", "--verify", "HEAD"],
-    )
-    .await?
-    .checked("git")?
-    .stdout_text()
-    .trim()
-    .to_owned();
+    let head = run_git(ctx, &path, ["rev-parse", "--verify", "HEAD"])
+        .await?
+        .checked("git")?
+        .stdout_text()
+        .trim()
+        .to_owned();
     let now = OffsetDateTime::now_utc();
     let at = now.format(&Rfc3339)?;
     // Verified on a row that owes checks closes them by the rule `wt status
@@ -1074,6 +1108,9 @@ async fn set_status(
                         }
                     });
                     wt_ops::status_checks::assert_checks(&mut next, before.as_ref(), edit);
+                    // The menu neither shows nor edits the merge gate, so a
+                    // status picked here keeps it, as `wt status` does.
+                    wt_ops::status_checks::assert_gate(&mut next, before.as_ref(), None);
                     let stored = serde_json::to_value(&next)
                         .and_then(serde_json::from_value::<wt_store::WorkStatusRecord>)
                         .context("encode status record")?;
@@ -1856,6 +1893,131 @@ mod tests {
                 .unwrap();
             assert!(!read(paused(&fixture.ctx).await));
         }
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_checkout_the_board_lists_is_resolved_without_asking_git() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let existing = fixture.ctx.config.paths.worktree_root.join("one");
+        let row = |key: &str, path: &Path, host: Option<&str>| wt_tui::BoardRow {
+            key: key.into(),
+            slug: key.into(),
+            path: path.to_string_lossy().into_owned(),
+            host: host.map(str::to_owned),
+            ..Default::default()
+        };
+        // What a failed removal can leave: the directory, without its
+        // `.git`, inside some other repository.
+        let leftover = fixture.ctx.config.paths.main_clone.join("leftover");
+        std::fs::create_dir_all(&leftover).unwrap();
+        // Git inventory knows none of these keys, so an answer can only have
+        // come from the board, and a refusal only from Git.
+        let board = Board {
+            rows: vec![
+                row("listed", &existing, None),
+                row("gone", &existing.join("missing"), None),
+                row("elsewhere", &existing, Some("builder")),
+                row("leftover", &leftover, None),
+                wt_tui::BoardRow {
+                    removal: Some(wt_tui::RemovalView::default()),
+                    ..row("removing", &existing, None)
+                },
+            ],
+            ..Default::default()
+        };
+        let found = checkout(&fixture.ctx, Some(&board), "listed")
+            .await
+            .unwrap();
+        assert_eq!(found.slug, "listed");
+        assert_eq!(found.path, existing);
+        for key in ["gone", "elsewhere", "unlisted", "leftover", "removing"] {
+            let error = checkout(&fixture.ctx, Some(&board), key)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{key} must be decided by Git inventory"));
+            assert!(
+                error.to_string().contains("worktree disappeared"),
+                "{error:#}"
+            );
+        }
+        // A status set on the leftover would otherwise record the HEAD of
+        // the repository that encloses it.
+        let error = set_status(
+            &fixture.ctx,
+            Some(&board),
+            "leftover",
+            status(Some("working".into()), None, None, None, None),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("worktree disappeared"),
+            "{error:#}"
+        );
+        // Without a board, Git answers as before.
+        let real = checkout(&fixture.ctx, None, "one").await.unwrap();
+        assert_eq!(real.slug, "one");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_status_picked_in_the_menu_keeps_the_merge_gate_until_the_work_ends() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let pick = |state: &str| status(Some(state.into()), None, None, None, None);
+        set_status(&fixture.ctx, None, "one", pick("ready"))
+            .await
+            .unwrap();
+        // As `wt status ready --blocked-on` records it.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store
+                    .update_slug_work_status_local("one", 0, |previous| {
+                        let mut gated = previous.cloned().expect("status was just set");
+                        gated.blocked_on = Some("old mobile builds are cut off".into());
+                        Ok::<_, anyhow::Error>(Some(gated))
+                    })?
+                    .map(|_| ())
+            })
+            .await
+            .unwrap();
+        let gate = |fixture: &wt_app_core::test_support::CommandFixture| {
+            let database = fixture.ctx.database.clone();
+            async move {
+                let state = database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await
+                    .unwrap();
+                state["slugs"]["one"]["work"]["blockedOn"]
+                    .as_str()
+                    .map(str::to_owned)
+            }
+        };
+        assert_eq!(
+            gate(&fixture).await.as_deref(),
+            Some("old mobile builds are cut off")
+        );
+        for state in ["working", "review", "ready"] {
+            set_status(&fixture.ctx, None, "one", pick(state))
+                .await
+                .unwrap();
+            assert_eq!(
+                gate(&fixture).await.as_deref(),
+                Some("old mobile builds are cut off"),
+                "{state} is not about the gate"
+            );
+        }
+        // Dropped ends the work the gate held back.
+        set_status(&fixture.ctx, None, "one", pick("dropped"))
+            .await
+            .unwrap();
+        assert_eq!(gate(&fixture).await, None);
         fixture.close().await.unwrap();
     }
 

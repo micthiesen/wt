@@ -370,6 +370,118 @@ async fn conflicting_replay_aborts_clean_and_retains_the_original_tip_backup() -
     Ok(())
 }
 
+/// The same conflict as above, resolved by hand once with rerere on: the
+/// replay reuses that resolution instead of bailing again.
+#[tokio::test]
+async fn a_conflict_resolved_before_replays_on_its_recorded_resolution() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    git(&fixture.main, ["config", "rerere.enabled", "true"])?;
+    fs::write(fixture.child.join("base.txt"), "child edit\n")?;
+    git(&fixture.child, ["add", "base.txt"])?;
+    git(
+        &fixture.child,
+        ["commit", "-m", "child conflicts with main"],
+    )?;
+    git(&fixture.child, ["push", "origin", "child"])?;
+    let old_head = output(&fixture.child, ["rev-parse", "HEAD"])?;
+    fs::write(fixture.main.join("base.txt"), "main edit\n")?;
+    git(&fixture.main, ["add", "base.txt"])?;
+    git(&fixture.main, ["commit", "-m", "main conflicts with child"])?;
+    git(&fixture.main, ["push", "origin", "main"])?;
+
+    // First time: wt bails, and a person resolves the stopped rebase.
+    let first = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert!(
+        matches!(first, RestackOutcome::Conflict { .. }),
+        "{first:?}"
+    );
+    git(&fixture.child, ["fetch", "-q", "origin"])?;
+    let stopped = Command::new("git")
+        .current_dir(&fixture.child)
+        .args(["rebase", "origin/main"])
+        .output()?;
+    assert!(!stopped.status.success());
+    fs::write(fixture.child.join("base.txt"), "both edits\n")?;
+    git(&fixture.child, ["add", "base.txt"])?;
+    git(
+        &fixture.child,
+        ["-c", "core.editor=true", "rebase", "--continue"],
+    )?;
+    // The base moved again before that was pushed: back to the old tip.
+    git(&fixture.child, ["reset", "-q", "--hard", &old_head])?;
+
+    let mut events = Vec::new();
+    let again = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .await?;
+    assert!(
+        !matches!(again, RestackOutcome::Conflict { .. }),
+        "{again:?} {events:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.child.join("base.txt"))?,
+        "both edits\n"
+    );
+    assert!(output(&fixture.child, ["status", "--porcelain"])?.is_empty());
+    assert!(events.iter().any(
+        |event| matches!(event, StackEvent::Log(line) if line.contains("reused recorded resolutions"))
+    ));
+    Ok(())
+}
+
+/// rerere does not track a conflict without markers, so it reports nothing
+/// remaining for a binary file both sides changed. Adding that path would
+/// keep one side and drop the other: the replay must bail as before.
+#[tokio::test]
+async fn a_binary_conflict_is_never_continued_on_rerere_s_silence() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    git(&fixture.main, ["config", "rerere.enabled", "true"])?;
+    fs::write(fixture.child.join("blob.bin"), [0_u8, 1, 2, 3, 0, 9])?;
+    git(&fixture.child, ["add", "blob.bin"])?;
+    git(&fixture.child, ["commit", "-m", "child adds a binary"])?;
+    git(&fixture.child, ["push", "origin", "child"])?;
+    let old_head = output(&fixture.child, ["rev-parse", "HEAD"])?;
+    fs::write(fixture.main.join("blob.bin"), [0_u8, 7, 7, 7, 0, 7])?;
+    git(&fixture.main, ["add", "blob.bin"])?;
+    git(&fixture.main, ["commit", "-m", "main adds another binary"])?;
+    git(&fixture.main, ["push", "origin", "main"])?;
+
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await?;
+    assert!(
+        matches!(result, RestackOutcome::Conflict { .. }),
+        "{result:?}"
+    );
+    assert_eq!(output(&fixture.child, ["rev-parse", "HEAD"])?, old_head);
+    assert_eq!(
+        fs::read(fixture.child.join("blob.bin"))?,
+        [0_u8, 1, 2, 3, 0, 9]
+    );
+    assert!(output(&fixture.child, ["status", "--porcelain"])?.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn missing_external_parent_and_no_pr_reconcile_to_trunk() -> Result<()> {
     let fixture = Fixture::squash_parent()?;

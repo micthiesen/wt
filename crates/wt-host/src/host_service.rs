@@ -115,21 +115,24 @@ impl HostService {
     /// Run one host-owned request, then refresh exactly the domains its
     /// effect names and classify the reply for the TUI's pending engine.
     pub async fn execute(&self, command: UiAction) -> Result<UiReply> {
-        self.execute_with_shutdown(command, None).await
+        self.execute_with_shutdown(command, None, None).await
     }
 
-    /// Run a request owned by the interactive controller. Shutdown may stop
-    /// waiting for a durable removal only after its worker is proven running;
-    /// other accepted mutations continue through their normal completion.
+    /// Run a request owned by a scheduler: the interactive controller or a
+    /// worker's command loop. Shutdown may stop waiting for a durable removal
+    /// only after its worker is proven running; other accepted mutations
+    /// continue through their normal completion. `hold` is the request's
+    /// place in that scheduler, which a removal narrows once its worker runs.
     pub async fn execute_with_shutdown(
         &self,
         command: UiAction,
         shutdown: Option<&CancellationToken>,
+        hold: Option<&wt_app_core::lanes::LaneHold>,
     ) -> Result<UiReply> {
         let snapshot = self.sources.board.snapshot();
         let empty = Board::default();
         let effect = command.effect(snapshot.data().map_or(&empty, |board| board.as_ref()));
-        let result = self.run(command, &snapshot, shutdown).await;
+        let result = self.run(command, &snapshot, shutdown, hold).await;
         // Stamp the write before any refresh is queued, so the confirming
         // fetch always starts at or after it.
         let reply = match result {
@@ -160,18 +163,29 @@ impl HostService {
         let mut refresh_local_board = false;
         for domain in effect.domains() {
             match domain {
+                // A user-caused read of the rows the change names, ahead of
+                // background reads; a change that names none reads them all.
+                // A created row is only named by the reply.
                 Domain::Git => {
-                    self.sources.git.refresh();
+                    match effect.rows() {
+                        Some(rows) => self.sources.git.request_keys(
+                            wt_runtime::Request::Direct,
+                            rows.into_iter().chain(reply.select_when_visible.clone()),
+                        ),
+                        None => self.sources.git.request(wt_runtime::Request::Direct),
+                    };
                 }
                 Domain::Metadata => {
                     self.sources.metadata.refresh();
                 }
                 // The read that may confirm an accepted write must be a
                 // direct fetch that started after it, not a daemon snapshot.
-                Domain::Github if matches!(reply.outcome, Some(ReplyOutcome::Accepted(_))) => {
-                    self.sources.github_refresh.refresh_live()
-                }
-                Domain::Github => self.sources.github_refresh.refresh(),
+                Domain::Github => match &reply.outcome {
+                    Some(ReplyOutcome::Accepted(at)) => {
+                        self.sources.github_refresh.refresh_live_since(*at)
+                    }
+                    _ => self.sources.github_refresh.refresh(),
+                },
                 Domain::Reviews => self.sources.review_requests.refresh(),
                 Domain::Sessions => {
                     self.sources.sessions.inventory.refresh();
@@ -214,6 +228,7 @@ impl HostService {
         command: UiAction,
         snapshot: &SourceSnapshot<Board>,
         shutdown: Option<&CancellationToken>,
+        hold: Option<&wt_app_core::lanes::LaneHold>,
     ) -> Result<UiReply> {
         if command.is_board_menu() {
             anyhow::bail!("this menu is built from the board and never asks the host");
@@ -472,7 +487,7 @@ impl HostService {
             }
             command => {
                 Box::pin(crate::controller_actions::execute_with_shutdown(
-                    &context, command, board, github, shutdown,
+                    &context, command, board, github, shutdown, hold,
                 ))
                 .await?
             }
@@ -669,6 +684,17 @@ mod tests {
         );
         let read = UiAction::PrepareSection { key: "one".into() }.effect(&Board::default());
         assert!(complete_local(&read, UiReply::default()).outcome.is_none());
+        // Reading failed checks writes nothing. Its plain answer must not be
+        // stamped as an accepted write, which would mark the row pending and
+        // refresh session sources.
+        let failed_checks = UiAction::GithubFailedChecks { key: "one".into() };
+        let failed_checks = failed_checks.effect(&Board::default());
+        assert!(failed_checks.domains().is_empty());
+        assert!(
+            complete_local(&failed_checks, UiReply::message("no failing checks"))
+                .outcome
+                .is_none()
+        );
         let recheck = complete_local(
             &effect,
             UiReply {

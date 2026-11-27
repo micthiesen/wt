@@ -5,6 +5,7 @@
 mod cache;
 #[cfg(any(test, feature = "testing"))]
 pub mod conformance;
+mod keyed;
 mod pending;
 mod scope;
 mod snapshot;
@@ -12,17 +13,19 @@ mod source;
 mod stamp;
 
 pub use cache::{CacheStore, DiskCache, MAX_CACHE_AGE, MAX_CACHE_BYTES, scope_difference};
+pub use keyed::{KeyedPolicy, KeyedReader, start_keyed_source};
 pub use pending::{
     Deadlines, Expired, Mutation, Pending, PendingLimits, PendingPhase, PendingView, Target,
 };
 pub use scope::{ShutdownError, TaskScope};
 pub use snapshot::{
-    Confirmed, DomainMap, DomainMeta, Provenance, SourceSnapshot, SourceState, hold_for_settlement,
-    merge_domains, settling, stamps_advanced,
+    Confirmed, DomainMap, DomainMeta, KeyedStamps, Provenance, SourceSnapshot, SourceState,
+    hold_for_settlement, merge_domains, settling, stamps_advanced,
 };
 pub use source::{
-    DerivedPublisher, Fetched, LeafHandle, LeafPublisher, Persistence, RefreshPolicy, Request,
-    SourceHandle, SourceInfo, SourceKind, SourceSpec, derived_channel, leaf_channel,
-    start_observed_source, start_requested_source, start_skippable_source, start_source,
+    Demand, DerivedPublisher, Fetched, LeafHandle, LeafPublisher, Persistence, RefreshPolicy,
+    Request, SourceHandle, SourceInfo, SourceKind, SourceSpec, derived_channel, leaf_channel,
+    start_demanded_source, start_observed_source, start_requested_source, start_skippable_source,
+    start_source,
 };
 pub use stamp::Stamp;
