@@ -177,7 +177,7 @@ fn evaluate_checks_due(
                     )
                 }),
                 due_since_ms: check_due_since(row, context, stage, &check),
-                steps: check.steps,
+                steps: check.text().to_owned(),
             });
             fire
         })

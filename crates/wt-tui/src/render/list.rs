@@ -26,6 +26,10 @@ use crate::{
 const SECTION_REF_CELLS: usize = 20;
 const SECTION_REF_MIN: usize = 10;
 const MIN_LABEL_CELLS: usize = 24;
+/// Fewest title cells a row in the Landed block keeps beside what it waits
+/// for. That label outranks the title, which is cut to fit; only a pane
+/// too narrow for both drops it.
+const LANDED_TITLE_MIN_CELLS: usize = 8;
 const REF_ARROW: &str = " → ";
 /// The deepest rail drawn; a pathological chain cannot eat the title.
 const MAX_GUTTER: usize = 3;
@@ -180,7 +184,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
         if model.reviews_folded {
             let item = positions.get(&VisualItem::ReviewHeader).copied();
             bottom.push(folded_header(
-                "Review requests",
+                &["Review requests".to_owned()],
                 board.review_requests.len(),
                 &FoldSummary::default(),
                 item == model.selected && item.is_some(),
@@ -271,15 +275,15 @@ impl RowContext<'_> {
         }
         let landed = section.key == crate::LANDED_SECTION;
         let members: Vec<&BoardRow> = rows.iter().map(|(_, row)| *row).collect();
-        let title = if landed {
-            landed_title(&section.title, &members)
+        let titles = if landed {
+            landed_titles(&section.title, &members)
         } else {
-            section.title.clone()
+            vec![section.title.clone()]
         };
         if section.folded {
             let item = positions.get(&VisualItem::Section(index)).copied();
             let mut header = folded_header(
-                &title,
+                &titles,
                 rows.len(),
                 &FoldSummary::of(&members, &self.model.board.display),
                 item.is_some() && item == self.model.selected,
@@ -298,7 +302,14 @@ impl RowContext<'_> {
             lines.push(header);
             return;
         }
-        lines.push(divider(&title, self.width));
+        lines.push(ListLine {
+            line: if landed {
+                counted_rule(&titles, self.width)
+            } else {
+                rule(&titles[0], self.width, false)
+            },
+            item: None,
+        });
         for (row, data) in rows {
             let item = positions.get(&VisualItem::Row(row)).copied();
             lines.push(self.row_in(data, item, landed));
@@ -340,14 +351,10 @@ impl RowContext<'_> {
         let budget = self
             .width
             .saturating_sub(2 + self.gutter + 3 + remote_cells + cluster_width);
-        // Shown where the title keeps its room, or is short enough not to
-        // need it.
         let waits = landed
             .then(|| waits_for(row, &self.model.board))
             .flatten()
-            .filter(|(text, _)| {
-                budget > MIN_LABEL_CELLS.min(row_label(row).width()) + text.width()
-            });
+            .filter(|(text, _)| budget >= text.width() + 1 + LANDED_TITLE_MIN_CELLS);
         let budget = budget.saturating_sub(waits.as_ref().map_or(0, |(text, _)| text.width() + 1));
         let reference_room =
             SECTION_REF_CELLS.min(budget.saturating_sub(MIN_LABEL_CELLS + REF_ARROW.width() + 1));
@@ -476,29 +483,49 @@ fn waits_for(row: &BoardRow, board: &crate::Board) -> Option<(String, Color)> {
     Some((text, theme::FG_DIM))
 }
 
-/// The Landed block's header, open or folded: `Landed · 3 due · 24 waiting
-/// · 2 done`, without the counts that are zero.
-fn landed_title(title: &str, rows: &[&BoardRow]) -> String {
+/// How many rows of the Landed block have something due, wait, and are
+/// done. The header and the block's details pane both count from here.
+pub(crate) fn landed_counts(rows: &[&BoardRow]) -> [usize; 3] {
     use crate::OwedBlock;
     let count = |wanted: fn(OwedBlock) -> bool| {
         rows.iter()
             .filter(|row| row.owed_block.is_some_and(wanted))
             .count()
     };
-    let mut text = title.to_owned();
-    for (count, word) in [
-        (count(|block| block == OwedBlock::Due), "due"),
-        (
-            count(|block| !matches!(block, OwedBlock::Due | OwedBlock::Done)),
-            "waiting",
-        ),
-        (count(|block| block == OwedBlock::Done), "done"),
-    ] {
-        if count > 0 {
-            text.push_str(&format!(" · {count} {word}"));
-        }
+    [
+        count(|block| block == OwedBlock::Due),
+        count(|block| !matches!(block, OwedBlock::Due | OwedBlock::Done)),
+        count(|block| block == OwedBlock::Done),
+    ]
+}
+
+/// The counts in words, `3 due · 24 waiting · 2 done`, without those that
+/// are zero; `short` says `wait`.
+pub(crate) fn landed_counts_text(counts: [usize; 3], short: bool) -> String {
+    let waiting = if short { "wait" } else { "waiting" };
+    counts
+        .into_iter()
+        .zip(["due", waiting, "done"])
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, word)| format!("{count} {word}"))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The Landed block's header, open or folded, from the fullest form to the
+/// shortest: `Landed · 3 due · 24 waiting · 2 done`, the same with `wait`,
+/// and the counts alone. A header takes the first that fits: it gives up
+/// its rule and then its words before it cuts a count.
+fn landed_titles(title: &str, rows: &[&BoardRow]) -> Vec<String> {
+    let counts = landed_counts(rows);
+    if counts == [0; 3] {
+        return vec![title.to_owned()];
     }
-    text
+    vec![
+        format!("{title} · {}", landed_counts_text(counts, false)),
+        format!("{title} · {}", landed_counts_text(counts, true)),
+        landed_counts_text(counts, true),
+    ]
 }
 
 /// The row's title exactly as named. Issue identity, removal progress and
@@ -550,6 +577,40 @@ fn rule(label: &str, width: usize, selected: bool) -> Line<'static> {
     ])
 }
 
+/// A rule whose label must not be cut: `labels` from the fullest form to
+/// the shortest. Each is tried with the whole rule, then with one leading
+/// dash, then with none, before the next shorter one. Only a pane narrower
+/// than the shortest form cuts it.
+fn counted_rule(labels: &[String], width: usize) -> Line<'static> {
+    let body = width.saturating_sub(3);
+    let dashes = theme::fg(theme::BORDER_DIM);
+    let line = |lead: usize, label: String, trail: usize| {
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled("─".repeat(lead), dashes),
+            Span::styled(label, theme::dim()),
+            Span::styled("─".repeat(trail), dashes),
+        ])
+    };
+    for label in labels {
+        let cells = label.width();
+        if cells + 4 <= body {
+            return line(2, format!(" {label} "), body - cells - 4);
+        }
+        if cells + 2 <= body {
+            return line(1, format!(" {label}"), 0);
+        }
+        if cells <= body {
+            return line(0, label.clone(), 0);
+        }
+    }
+    line(
+        0,
+        truncate_end(labels.last().map_or("", String::as_str), body),
+        0,
+    )
+}
+
 fn divider(label: &str, width: usize) -> ListLine {
     ListLine {
         line: rule(label, width, false),
@@ -570,7 +631,7 @@ fn empty_section(label: &str, selected: bool, width: usize, item: Option<usize>)
 /// and on the right the hidden rows' markers, counted, so folding a section
 /// never hides that something inside needs attention.
 fn folded_header(
-    label: &str,
+    labels: &[String],
     count: usize,
     fold: &FoldSummary,
     selected: bool,
@@ -610,8 +671,9 @@ fn folded_header(
     // when the name would otherwise be cut; alarms always stay.
     let cells =
         |spans: &[Span<'static>]| spans.iter().map(|span| span.content.width()).sum::<usize>();
+    let full = labels.first().map_or("", String::as_str);
     while !states.is_empty()
-        && width.saturating_sub(2 + chip.width() + cells(&states) + cells(&alarms)) < label.width()
+        && width.saturating_sub(2 + chip.width() + cells(&states) + cells(&alarms)) < full.width()
     {
         states.pop();
     }
@@ -619,6 +681,12 @@ fn folded_header(
     right.extend(alarms);
     let right_width: usize = right.iter().map(|span| span.content.width()).sum();
     let room = width.saturating_sub(2 + chip.width() + right_width);
+    // A header with shorter forms takes the first that fits whole.
+    let label = labels
+        .iter()
+        .find(|label| label.width() <= room)
+        .or(labels.last())
+        .map_or("", String::as_str);
     let label = truncate_end(label, room);
     let filler = room.saturating_sub(label.width());
     let mut spans = vec![
@@ -1266,6 +1334,104 @@ mod tests {
         line.line.to_string().trim_end().to_owned()
     }
 
+    /// What a landed row waits for outranks its title: a long title is cut
+    /// to make room, down to a pane with no room for both.
+    #[test]
+    fn a_landed_rows_label_stays_and_a_long_title_is_cut_for_it() {
+        let mut board = landed_board();
+        for row in &mut board.rows {
+            row.title = format!(
+                "{} with a title far too long for a narrow list pane",
+                row.key
+            );
+        }
+        let labels = [
+            "due staging",
+            "due production",
+            "due",
+            "staging",
+            "production",
+            "Fri 18:12",
+            "other work",
+            "done",
+        ];
+        for width in [30, 35, 50] {
+            let lines = drawn(&board, width);
+            for (line, label) in lines[1..].iter().zip(labels) {
+                let text = plain(line);
+                assert!(text.contains(&format!("… {label}")), "{width}: {text}");
+                assert!(line.line.width() <= width, "{width}: {text}");
+            }
+        }
+        // Eight title cells and the label, or the title alone.
+        let room = |width| plain(&drawn(&board, width)[1]);
+        let fits = (10..40)
+            .find(|width| room(*width).contains("due staging"))
+            .unwrap();
+        let kept = room(fits);
+        let title = kept
+            .trim_start()
+            .split('…')
+            .next()
+            .unwrap()
+            .trim_start_matches(|c: char| !c.is_alphanumeric());
+        assert_eq!(title.width() + 1, LANDED_TITLE_MIN_CELLS, "{kept}");
+        assert!(!room(fits - 1).contains("due"), "{}", room(fits - 1));
+    }
+
+    /// The Landed header gives up its rule, then says `wait`, and folded
+    /// then drops its name, before any count is cut.
+    #[test]
+    fn the_landed_header_never_cuts_a_count() {
+        let board = landed_board();
+        let mut folded = board.clone();
+        folded.sections[0].folded = true;
+        let header = |board: &crate::Board, width| plain(&drawn(board, width)[0]);
+        assert_eq!(
+            header(&board, 44).trim_end(),
+            " ── Landed · 3 due · 4 waiting · 1 done ──"
+        );
+        assert_eq!(
+            header(&board, 40).trim_end(),
+            " ─ Landed · 3 due · 4 waiting · 1 done"
+        );
+        assert_eq!(
+            header(&board, 38).trim_end(),
+            " Landed · 3 due · 4 waiting · 1 done"
+        );
+        assert_eq!(
+            header(&board, 37).trim_end(),
+            " ─ Landed · 3 due · 4 wait · 1 done"
+        );
+        assert_eq!(
+            header(&board, 35).trim_end(),
+            " Landed · 3 due · 4 wait · 1 done"
+        );
+        assert_eq!(
+            header(&folded, 43).trim_end(),
+            " [×08] Landed · 3 due · 4 waiting · 1 done"
+        );
+        assert_eq!(
+            header(&folded, 42).trim_end(),
+            " [×08] Landed · 3 due · 4 wait · 1 done"
+        );
+        for width in [39, 35] {
+            assert_eq!(
+                header(&folded, width).trim_end(),
+                " [×08] 3 due · 4 wait · 1 done"
+            );
+        }
+        for width in 32..=120 {
+            for board in [&board, &folded] {
+                let text = header(board, width);
+                assert!(!text.contains('…'), "{width}: {text}");
+                assert!(text.contains("3 due · 4 wait"), "{width}: {text}");
+                assert!(text.contains("1 done"), "{width}: {text}");
+                assert!(text.width() <= width, "{width}: {text}");
+            }
+        }
+    }
+
     #[test]
     fn the_landed_block_counts_its_rows_and_each_says_what_it_waits_for() {
         let board = landed_board();
@@ -1392,7 +1558,7 @@ mod tests {
             ..Default::default()
         });
         let fold = fold_of(&rows, &Default::default());
-        let line = folded_header("Statuses", 8, &fold, false, 30, None);
+        let line = folded_header(&["Statuses".to_owned()], 8, &fold, false, 30, None);
         let text: String = line
             .line
             .spans
@@ -1416,7 +1582,7 @@ mod tests {
         ]
         .map(state_row);
         let fold = fold_of(&rows, &Default::default());
-        let line = folded_header("Batch", 4, &fold, false, 60, None);
+        let line = folded_header(&["Batch".to_owned()], 4, &fold, false, 60, None);
         let colors = line
             .line
             .spans
@@ -1488,7 +1654,7 @@ mod tests {
                     "{badge:?}"
                 );
             }
-            let line = folded_header("All", rows.len(), &fold, false, 400, None);
+            let line = folded_header(&["All".to_owned()], rows.len(), &fold, false, 400, None);
             for (badge, count) in &fold.markers {
                 assert!(line.line.spans.iter().any(|span| {
                     span.content == format!("{} {count} ", badge.glyph)

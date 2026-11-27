@@ -1052,7 +1052,11 @@ async fn set_status(
                     if steps.is_empty() {
                         wt_ops::status_checks::CheckEdit::Drop { stage }
                     } else {
-                        wt_ops::status_checks::CheckEdit::Owe { stage, steps }
+                        wt_ops::status_checks::CheckEdit::Owe {
+                            stage,
+                            steps,
+                            lines: None,
+                        }
                     }
                 });
                 wt_ops::status_checks::assert_checks(&mut next, before.as_ref(), edit);

@@ -12,8 +12,10 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const NEVER_SHIM: &[&str] = &["claude", "codex", "opencode", "pi"];
 const ALWAYS_SHIM: &[&str] = &["bun"];
 const LAUNCHER_SHIM: &[&str] = &["pnpm", "pnpx", "npx", "yarn"];
-/// The guard's exit code for "do not create this pull request".
-pub const GH_GUARD_REFUSED: i32 = 75;
+/// The guard's exit code for "do not create this pull request". No other wt
+/// exit shares it, so a wt that failed for its own reasons is never read as
+/// a refusal.
+pub const GH_GUARD_REFUSED: i32 = 83;
 const MIN_COMPILED_BYTES: u64 = 8 * 1024 * 1024;
 const HEAD_BYTES: usize = 64 * 1024;
 /// A shim write finishes in well under this; an older temp file is orphaned.
@@ -196,7 +198,10 @@ fn shim_body(command: &str, real: &str, shim_dir: &Path) -> String {
 /// `gh` runs untouched except for `gh pr create`, which first asks
 /// `wt _gh-guard` whether this worktree may open a pull request. Only the
 /// guard's explicit refusal stops it; a missing `wt` or any other failure
-/// says so in one line and lets `gh` run.
+/// says so in one line and lets `gh` run. A pull request aimed at another
+/// repository (`--repo`, `-R`, `GH_REPO`) is not this worktree's and is
+/// not asked about. The guard never sees stdin, which belongs to `gh`
+/// (`--body-file -`).
 fn gh_shim_body(real: &str, shim_dir: &Path) -> String {
     let real = sh_quote(real);
     let shims = sh_quote(&shim_dir.to_string_lossy());
@@ -219,17 +224,22 @@ if [ ! -x "$real" ]; then
 fi
 first=
 second=
+elsewhere=$GH_REPO
+value=
 for arg in "$@"; do
+  if [ -n "$value" ]; then value=; continue; fi
   case $arg in
+    -R|--repo) elsewhere=1; value=1 ;;
+    -R*|--repo=*) elsewhere=1 ;;
     -*) ;;
     *)
-      if [ -z "$first" ]; then first=$arg; else second=$arg; break; fi
+      if [ -z "$first" ]; then first=$arg; elif [ -z "$second" ]; then second=$arg; fi
       ;;
   esac
 done
-if [ "$first" = pr ] && [ "$second" = create ] && [ -z "$WT_GH_GUARD" ]; then
+if [ "$first" = pr ] && [ "$second" = create ] && [ -z "$elsewhere" ] && [ -z "$WT_GH_GUARD" ]; then
   if wt=$(command -v wt); then
-    WT_GH_GUARD=1 WT_REAL_GH=$real "$wt" _gh-guard "$@"
+    WT_GH_GUARD=1 WT_REAL_GH=$real "$wt" _gh-guard "$@" </dev/null
     code=$?
     [ "$code" -eq {refused} ] && exit 1
     [ "$code" -ne 0 ] && echo "wt shim: could not check this worktree's pull request (wt exit $code); running gh unchecked" >&2
@@ -293,33 +303,58 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// Runs the generated gh shim with fakes for gh and wt on PATH. The fake
-    /// gh prints its arguments and exits 7; the fake wt exits `guard`.
     fn run_gh_shim(guard: Option<i32>, args: &[&str]) -> (i32, String, String) {
+        run_gh_shim_with(guard, args, "", None)
+    }
+
+    /// Runs the generated gh shim with fakes for gh and wt on PATH. The fake
+    /// gh prints its arguments and its stdin and exits 7; the fake wt reads
+    /// whatever stdin it is given and exits `guard`.
+    fn run_gh_shim_with(
+        guard: Option<i32>,
+        args: &[&str],
+        stdin: &str,
+        gh_repo: Option<&str>,
+    ) -> (i32, String, String) {
         let tmp = tempdir().unwrap();
         let bin = tmp.path().join("bin");
         let shims = tmp.path().join("shims");
         fs::create_dir_all(&bin).unwrap();
         executable(
             &bin.join("gh"),
-            "#!/bin/sh\nprintf 'gh'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; echo\nexit 7\n",
+            "#!/bin/sh\nprintf 'gh'; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; echo\ncat\nexit 7\n",
         );
         if let Some(code) = guard {
             executable(
                 &bin.join("wt"),
                 &format!(
-                    "#!/bin/sh\necho \"guard $WT_GH_GUARD $*\" >&2\n[ -x \"$WT_REAL_GH\" ] || exit 99\nexit {code}\n"
+                    "#!/bin/sh\ncat >/dev/null\necho \"guard $WT_GH_GUARD $*\" >&2\n[ -x \"$WT_REAL_GH\" ] || exit 99\nexit {code}\n"
                 ),
             );
         }
         let path = format!("{}:/usr/bin:/bin", bin.display());
         ensure_inspect_shims_at(&shims, &path).unwrap();
-        let output = std::process::Command::new(shims.join("gh"))
+        let mut command = std::process::Command::new(shims.join("gh"));
+        command
             .args(args)
             .env("PATH", format!("{}:{path}", shims.display()))
             .env_remove("WT_GH_GUARD")
-            .output()
+            .env_remove("GH_REPO")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(repo) = gh_repo {
+            command.env("GH_REPO", repo);
+        }
+        let mut child = command.spawn().unwrap();
+        // Dropping the handle closes the pipe, which ends the fakes' `cat`.
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
             .unwrap();
+        let output = child.wait_with_output().unwrap();
         (
             output.status.code().unwrap(),
             String::from_utf8(output.stdout).unwrap(),
@@ -359,6 +394,45 @@ mod tests {
         let (code, out, err) = run_gh_shim(None, &["pr", "create"]);
         assert_eq!((code, out.as_str()), (7, "gh [pr] [create]\n"));
         assert_eq!(err, "wt shim: wt is not on PATH; running gh unchecked\n");
+    }
+
+    #[test]
+    fn a_pull_request_for_another_repository_is_not_asked_about() {
+        for spelling in [
+            &["pr", "create", "--repo", "o/r"][..],
+            &["pr", "create", "--repo=o/r", "--draft"],
+            &["pr", "create", "-R", "o/r"],
+            &["pr", "create", "-Ro/r"],
+            &["-R", "o/r", "pr", "create"],
+            &["--repo", "o/r", "pr", "create"],
+        ] {
+            let (code, out, err) = run_gh_shim(Some(GH_GUARD_REFUSED), spelling);
+            let passed = format!("gh [{}]\n", spelling.join("] ["));
+            assert_eq!((code, out, err.as_str()), (7, passed, ""), "{spelling:?}");
+        }
+        let (code, out, err) =
+            run_gh_shim_with(Some(GH_GUARD_REFUSED), &["pr", "create"], "", Some("o/r"));
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (7, "gh [pr] [create]\n", "")
+        );
+    }
+
+    #[test]
+    fn stdin_reaches_gh_and_not_the_guard() {
+        let (code, out, _) = run_gh_shim_with(
+            Some(0),
+            &["pr", "create", "--body-file", "-"],
+            "the body\nline two\n",
+            None,
+        );
+        assert_eq!(
+            (code, out.as_str()),
+            (
+                7,
+                "gh [pr] [create] [--body-file] [-]\nthe body\nline two\n"
+            )
+        );
     }
 
     #[test]

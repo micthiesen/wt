@@ -160,9 +160,11 @@ fn left_branches(slug_state: &Value) -> impl Iterator<Item = &str> {
         .filter_map(Value::as_str)
 }
 
-/// Every branch a checkout's HEAD reflog (the text of its `logs/HEAD`) says
-/// it was switched from or to. A detached HEAD is named by its commit and is
-/// not a branch.
+/// Every name a checkout's HEAD reflog (the text of its `logs/HEAD`) says
+/// it was switched from or to. These are candidates: a detached HEAD is
+/// named by its commit and a checked-out tag by the tag, and a branch may be
+/// named like either, so only a ref that exists (or the durable record) says
+/// which names are branches.
 pub fn reflog_branches(head_log: &str) -> BTreeSet<String> {
     let mut branches = BTreeSet::new();
     for line in head_log.lines() {
@@ -176,19 +178,12 @@ pub fn reflog_branches(head_log: &str) -> BTreeSet<String> {
             continue;
         };
         for name in [from, to] {
-            if !name.is_empty() && !looks_like_commit(name) && !name.contains(' ') {
+            if !name.is_empty() && !name.contains(' ') {
                 branches.insert(name.to_owned());
             }
         }
     }
     branches
-}
-
-fn looks_like_commit(name: &str) -> bool {
-    name.len() >= 7 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || name.contains('~')
-        || name.contains('^')
-        || name.contains('@')
 }
 
 /// The other branches of one worktree: every branch recorded for it before,
@@ -214,11 +209,23 @@ pub fn other_branch_names(
 /// Removal hazard for an other branch with an open pull request. `here` is
 /// the recorded branch when the other one is checked out in the worktree
 /// right now, where `wt new` cannot take it until the worktree lets go.
-pub fn open_pr_hazard(branch: &str, number: Option<u64>, here: Option<&str>) -> String {
+/// `exists` is false when the branch is neither a local branch nor one of
+/// origin's here, where there is nothing for `wt new` to adopt.
+pub fn open_pr_hazard(
+    branch: &str,
+    number: Option<u64>,
+    here: Option<&str>,
+    exists: bool,
+) -> String {
     let pr = number.map_or_else(
         || "an open PR".to_owned(),
         |number| format!("open PR #{number}"),
     );
+    if !exists {
+        return format!(
+            "holds {pr} on {branch}, a branch that is gone here: merge or close the PR, or retry once GitHub answers"
+        );
+    }
     match here {
         Some(recorded) => format!(
             "holds {pr} on {branch}: run git switch {recorded} here, then give it its own worktree with wt new {branch}"
@@ -263,16 +270,27 @@ mod tests {
 2222222222222222222222222222222222222222 2222222222222222222222222222222222222222 A <a@example.invalid> 1795730005 +0000\trebase (start): checkout origin/main\n";
 
     #[test]
-    fn the_reflog_names_every_branch_the_checkout_was_on_and_no_commits() {
+    fn the_reflog_names_everything_the_checkout_moved_between() {
         assert_eq!(
             reflog_branches(LOG),
-            BTreeSet::from(["michael/one".to_owned(), "michael/retire-x".to_owned()])
+            BTreeSet::from([
+                "3".repeat(40),
+                "michael/one".to_owned(),
+                "michael/retire-x".to_owned()
+            ])
+        );
+        // A name is not judged by its shape: these are all legal branches.
+        let odd =
+            "0 1 A <a@example.invalid> 1 +0000\tcheckout: moving from deadbeef to release@2\n";
+        assert_eq!(
+            reflog_branches(odd),
+            BTreeSet::from(["deadbeef".to_owned(), "release@2".to_owned()])
         );
     }
 
     #[test]
     fn other_branches_are_everything_but_the_recorded_and_the_left_behind() {
-        let reflog = reflog_branches(LOG);
+        let reflog = BTreeSet::from(["michael/one".to_owned(), "michael/retire-x".to_owned()]);
         // Until a branch is recorded, the checked-out one is the worktree's.
         assert_eq!(
             other_branch_names(&json!({}), "michael/one", &reflog),

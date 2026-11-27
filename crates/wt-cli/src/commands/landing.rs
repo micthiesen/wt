@@ -8,7 +8,9 @@
 //! looked for where it is cheapest first: the board's saved GitHub data,
 //! then the events daemon's snapshot, then one bounded GitHub read for the
 //! rows still open. When none of them answers, the landing is unknown and
-//! is reported as unknown, never as "not landed".
+//! is reported as unknown, never as "not landed". A command that prints
+//! the landing also takes a snapshot GitHub's budget is holding back; one
+//! that decides a write from it ([`read_one_live`]) never does.
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -102,16 +104,32 @@ fn saved_merges(ctx: &AppContext) -> Option<GithubData> {
     (!data.prs.is_empty()).then_some(data)
 }
 
+/// What a command does with the landing it reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Use {
+    /// Prints it: a snapshot the budget is holding back will do.
+    Display,
+    /// Decides a write from it: only what the board itself would use.
+    Decide,
+}
+
 /// One batched read for exactly these branches: the events daemon's
-/// snapshot while it is fresh and covers them, else GitHub itself. `None`
-/// when neither answers in time; a partial answer is no answer.
-async fn fresh_github(ctx: &AppContext, branches: &[String]) -> Option<GithubData> {
+/// snapshot while it covers them and `usage` accepts its age, else GitHub
+/// itself. `None` when neither answers in time; a partial answer is no
+/// answer.
+async fn fresh_github(ctx: &AppContext, branches: &[String], usage: Use) -> Option<GithubData> {
     // With GitHub switched off for the process, Git is all the evidence
     // there is: its answer stands.
     if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
         return Some(GithubData::default());
     }
-    if let Some(read) = wt_sources::github_events_source::load(ctx, branches).await {
+    let snapshot = match usage {
+        Use::Display => wt_sources::github_events_source::load_for_display(ctx, branches)
+            .await
+            .map(|shown| shown.read),
+        Use::Decide => wt_sources::github_events_source::load(ctx, branches).await,
+    };
+    if let Some(read) = snapshot {
         return Some(read.data);
     }
     let github = GithubClient::new(
@@ -128,12 +146,23 @@ async fn fresh_github(ctx: &AppContext, branches: &[String]) -> Option<GithubDat
     .ok()
 }
 
-/// The landing of each of `rows`, by slug. The main clone is left out.
+/// The landing of each of `rows`, by slug, for a command that prints it.
+/// The main clone is left out.
 pub(crate) async fn read(
     ctx: &AppContext,
     rows: &[WorktreeRecord],
     state: &Value,
     want: Want,
+) -> BTreeMap<String, RowLanding> {
+    read_for(ctx, rows, state, want, Use::Display).await
+}
+
+async fn read_for(
+    ctx: &AppContext,
+    rows: &[WorktreeRecord],
+    state: &Value,
+    want: Want,
+    usage: Use,
 ) -> BTreeMap<String, RowLanding> {
     let saved = tokio::task::spawn_blocking({
         let ctx = ctx.clone();
@@ -143,7 +172,7 @@ pub(crate) async fn read(
     .ok()
     .flatten();
     resolve(ctx, rows, state, want, saved, |branches| async move {
-        fresh_github(ctx, &branches).await
+        fresh_github(ctx, &branches, usage).await
     })
     .await
 }
@@ -240,7 +269,7 @@ where
     result
 }
 
-/// The landing of one row.
+/// The landing of one row, for a command that prints it.
 pub(crate) async fn read_one(
     ctx: &AppContext,
     row: &WorktreeRecord,
@@ -248,6 +277,20 @@ pub(crate) async fn read_one(
     want: Want,
 ) -> RowLanding {
     read(ctx, std::slice::from_ref(row), state, want)
+        .await
+        .remove(row.target.slug())
+        .unwrap_or(RowLanding::unknown(Landing::NONE))
+}
+
+/// [`read_one`] for a command that closes or refuses something by the
+/// answer: a snapshot older than the board would use is not asked.
+pub(crate) async fn read_one_live(
+    ctx: &AppContext,
+    row: &WorktreeRecord,
+    state: &Value,
+    want: Want,
+) -> RowLanding {
+    read_for(ctx, std::slice::from_ref(row), state, want, Use::Decide)
         .await
         .remove(row.target.slug())
         .unwrap_or(RowLanding::unknown(Landing::NONE))

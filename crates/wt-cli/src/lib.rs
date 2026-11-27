@@ -459,10 +459,14 @@ pub fn main(info: BuildInfo) {
         return;
     }
     let hook = matches!(&cli.command, Some(Command::Mark(args)) if args.claude_hook);
+    let gh_guard = matches!(&cli.command, Some(Command::GhGuard { .. }));
     match run(cli) {
         // A harness shows a hook's output to the model or the person on
         // every prompt, so a hook that cannot record says nothing.
         _ if hook => std::process::exit(0),
+        // The person ran gh, not wt: in a repository wt does not manage, or
+        // wherever else wt cannot answer, gh runs with nothing said.
+        Err(_) if gh_guard => std::process::exit(0),
         Ok(code) => std::process::exit(code),
         Err(error) => {
             eprintln!("wt: {}", error_chain(&error));

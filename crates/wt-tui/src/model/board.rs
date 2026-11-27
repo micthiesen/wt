@@ -818,6 +818,10 @@ pub struct GitPresentation {
     pub ahead: Option<u32>,
     pub behind: Option<u32>,
     pub landed_on: Option<LandingKind>,
+    /// UTC epoch milliseconds the work landed on its base, where that can
+    /// be told: the pull request's merge time, else the committer time of
+    /// the base commit that brought the branch in.
+    pub landed_at_ms: Option<u64>,
     /// Whether the landing is deployed, for each stage with a deploy probe.
     pub deploys: wt_core::StageDeploys,
     pub rebasing: bool,

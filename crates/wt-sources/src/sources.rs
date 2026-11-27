@@ -57,6 +57,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         scope,
         context,
         local_sources.git.clone(),
+        local_sources.metadata.clone(),
         enabled,
         wt_ops::origin::backstop(context),
     );

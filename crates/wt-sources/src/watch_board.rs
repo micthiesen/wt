@@ -255,7 +255,7 @@ pub(crate) fn owed_view(
         kind: item.kind,
         state: item.state,
         stage: item.stage,
-        what: sanitize_terminal_text(&item.what),
+        what: wt_core::sanitize_terminal_lines(&item.what),
         headline: sanitize_terminal_text(&item.headline()),
         when: sanitize_terminal_text(&item.when_words(clock)),
         conditions: watch
@@ -529,7 +529,8 @@ mod tests {
         assert_eq!(staging.stage, Some(wt_core::VerifyStage::Staging));
         // Named by what it proves; its inline steps are not the headline.
         assert_eq!(staging.headline, "check: Look.");
-        assert_eq!(step.what, "Run it then say so");
+        // The text keeps its author's lines for the pane to draw.
+        assert_eq!(step.what, "Run it\nthen say so");
         assert_eq!(step.headline, "Run it");
         assert_eq!(step.by.as_deref(), Some("manager"));
         assert_eq!(step.conditions[0].due_in.as_deref(), Some("2h10m"));

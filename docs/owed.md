@@ -198,8 +198,14 @@ when the status is asserted again. A new round replaces it;
 Sessions keep the build that started them for days and share the state.
 
 - **Checks.** The status record gains `checks` (per stage: `steps`, optional
-  `notBeforeMs`, `sinceMs`, `dueSinceMs`, `duePr`; an older build carries
-  the ones it does not know through its writes) and `checksMirror`. The legacy pair `verifyAfterMerge` /
+  `text`, `notBeforeMs`, `sinceMs`, `dueSinceMs`, `duePr`; an older build carries
+  the ones it does not know through its writes) and `checksMirror`. `steps`
+  is the check's text on one line and is what names it: the same steps are
+  the same check, in every build. `text` is the same text with its author's
+  line breaks, kept only when it has any, and read only while it still
+  flattens to `steps`, because an older build that re-sets the steps carries
+  the old `text` through. The details pane, the due prompt and the `what` of
+  the JSON surfaces give the lines; a list gives the first one. The legacy pair `verifyAfterMerge` /
   `verifyIn` stays and mirrors the first open check, staging before
   production. A pure normalize step runs wherever a record is read or
   written: legacy fields present set that stage's check (also the upgrade

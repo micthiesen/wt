@@ -294,7 +294,8 @@ impl<'a> EventLog<'a> {
             if matches!(
                 serde_json::from_str::<WorktreeEventKind>(&data?),
                 Ok(WorktreeEventKind::Landed {
-                    on: wt_core::LandedOn::Production
+                    on: wt_core::LandedOn::Production,
+                    ..
                 })
             ) {
                 return Ok(true);

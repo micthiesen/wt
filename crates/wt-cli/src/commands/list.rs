@@ -166,13 +166,13 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
         }
         return Ok(0);
     }
-    let prs = match prs {
-        Some(Ok(prs)) => Some(prs),
-        Some(Err(error)) => {
+    let (prs, prs_held) = match prs {
+        Some((Ok(prs), held)) => (Some(prs), held),
+        Some((Err(error), _)) => {
             eprintln!("PR data unavailable: {error}");
-            None
+            (None, None)
         }
-        None => None,
+        None => (None, None),
     };
     let with_stage = ctx.config.sst.is_some();
     if with_stage {
@@ -231,31 +231,43 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
     if !merged.is_empty() {
         println!("\nrecently merged: {}", merged.join(", "));
     }
+    if let Some(held) = prs_held {
+        eprintln!("{held}");
+    }
     Ok(0)
 }
 
 /// PRs for the table's display-only PR column: the events daemon's snapshot
-/// while it is fresh and covers every branch, else one batched GitHub read.
+/// while it covers every branch and is fresh or held back by GitHub's
+/// budget, else one batched GitHub read. The second value is what to say of
+/// a snapshot older than the board would use.
 async fn pull_requests(
     ctx: &AppContext,
     live: &[&WorktreeSnapshot],
-) -> Result<BTreeMap<String, PullRequest>, wt_github::GithubError> {
+) -> (
+    Result<BTreeMap<String, PullRequest>, wt_github::GithubError>,
+    Option<String>,
+) {
     let branches = live
         .iter()
         .map(|snapshot| snapshot.worktree.target.branch.clone())
         .collect::<Vec<_>>();
-    if let Some(read) = wt_sources::github_events_source::load(ctx, &branches).await {
-        return Ok(read.data.prs);
+    if let Some(shown) = wt_sources::github_events_source::load_for_display(ctx, &branches).await {
+        let held = shown.note();
+        return (Ok(shown.read.data.prs), held);
     }
     let github = GithubClient::new(
         ctx.processes.clone(),
         ctx.config.paths.main_clone.clone(),
         GithubOptions::from_config(&ctx.config, true),
     );
-    Ok(github
-        .fetch_worktrees(&branches, &ctx.cancellation)
-        .await?
-        .prs)
+    (
+        github
+            .fetch_worktrees(&branches, &ctx.cancellation)
+            .await
+            .map(|data| data.prs),
+        None,
+    )
 }
 
 async fn collect_push_facts(

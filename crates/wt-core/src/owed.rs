@@ -391,7 +391,7 @@ pub fn owed_items(
             } else {
                 OwedState::Waiting
             },
-            &check.steps,
+            check.text(),
             OwedWhen::Stage {
                 stage: standing.stage,
                 not_before_ms: check.not_before_ms,

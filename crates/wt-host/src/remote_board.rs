@@ -454,7 +454,9 @@ fn compose(
 
 /// What a remote row owes is derived on its host; this board only draws it.
 fn sanitize_owed(item: &mut wt_tui::OwedView) {
-    for value in [&mut item.what, &mut item.headline, &mut item.when] {
+    // The text keeps its lines: the pane draws them as written.
+    item.what = wt_core::sanitize_terminal_lines(&item.what);
+    for value in [&mut item.headline, &mut item.when] {
         *value = wt_core::sanitize_terminal_text(value);
     }
     for value in [

@@ -170,26 +170,35 @@ fn add_snake_case_aliases(work: &mut serde_json::Map<String, Value>) {
 struct Fleet {
     reports: Vec<Value>,
     pr_note: Option<String>,
-    /// How old the events daemon snapshot the PR data came from is.
-    pr_snapshot_age_ms: Option<u64>,
+    /// The events daemon snapshot the PR data came from, when it did.
+    pr_snapshot: Option<PrSnapshot>,
     session_note: Option<String>,
 }
 
+/// What the report says of a snapshot it showed in place of a GitHub read.
+#[derive(Clone, Debug)]
+struct PrSnapshot {
+    age_ms: u64,
+    /// Why data older than the board would use was shown.
+    held: Option<String>,
+}
+
 /// PR data for the report, which only displays it: the events daemon's
-/// snapshot while it is fresh and covers every branch (the rule `wt ls`
-/// follows), with its age in milliseconds, else one batched GitHub read.
+/// snapshot while it covers every branch and is fresh or held back by
+/// GitHub's budget (the rule `wt ls` follows), else one batched GitHub read.
 async fn pull_requests(
     ctx: &AppContext,
     branches: &[String],
 ) -> (
     Result<wt_github::GithubData, wt_github::GithubError>,
-    Option<u64>,
+    Option<PrSnapshot>,
 ) {
-    if let Some(read) = wt_sources::github_events_source::load(ctx, branches).await {
-        let age = u64::try_from(now_ms())
-            .unwrap_or(0)
-            .saturating_sub(read.written_ms);
-        return (Ok(read.data), Some(age));
+    if let Some(shown) = wt_sources::github_events_source::load_for_display(ctx, branches).await {
+        let snapshot = PrSnapshot {
+            age_ms: shown.age_ms,
+            held: shown.note(),
+        };
+        return (Ok(shown.read.data), Some(snapshot));
     }
     let github = GithubClient::new(
         ctx.processes.clone(),
@@ -228,7 +237,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
     let live_slugs = head_by_slug.keys().cloned().collect::<BTreeSet<_>>();
     // One batched GitHub read for exactly the reported branches; the other
     // probes do not depend on it, so none waits behind the slowest.
-    let (stored, (fetched, pr_snapshot_age_ms), sessions, registry, (dev, dev_note), locks) = tokio::join!(
+    let (stored, (fetched, pr_snapshot), sessions, registry, (dev, dev_note), locks) = tokio::join!(
         ctx.database.call(move |store| {
             let removed = if selected {
                 Vec::new()
@@ -250,11 +259,15 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
         .map(|row| row.worktree.clone())
         .collect::<Vec<_>>();
     // This command's own GitHub read, when it succeeded, proves PR landings.
+    // A snapshot the budget is holding is shown but recorded nowhere.
+    let held = pr_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.held.is_some());
     wt_ops::other_branches::refresh(
         ctx,
         &records,
         &mut state,
-        fetched.as_ref().ok(),
+        fetched.as_ref().ok().filter(|_| !held),
         wt_ops::other_branches::Ask::Nothing,
     )
     .await;
@@ -426,7 +439,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             "operation":operation,"operation_note":operation_note,
             "dev":{"status":dev_status,"error":dev_error,"note":dev_note,"slots":dev.as_ref().map(|snapshot| &snapshot.slots)},
             "pr":pr_json, "pr_note":pr_note,"merge_queue":pr_queue,
-            "pr_snapshot_age_seconds":pr_snapshot_age_ms.map(|age| age / 1000),
+            "pr_snapshot_age_seconds":pr_snapshot.as_ref().map(|snapshot| snapshot.age_ms / 1000),
             "inventory_error":row.error
         });
         reports.push(report);
@@ -444,7 +457,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
     Ok(Ok(Fleet {
         reports,
         pr_note,
-        pr_snapshot_age_ms,
+        pr_snapshot,
         session_note,
     }))
 }
@@ -453,7 +466,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
     let Fleet {
         reports,
         pr_note,
-        pr_snapshot_age_ms,
+        pr_snapshot,
         session_note,
     } = match fleet(ctx, args).await? {
         Ok(fleet) => fleet,
@@ -479,10 +492,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
                     .as_bool()
                     .map(|v| if v { "dirty" } else { "clean" })
                     .unwrap_or("unknown"),
-                row["pr"]["number"]
-                    .as_u64()
-                    .map(|n| format!("#{n}"))
-                    .unwrap_or_else(|| "—".into())
+                pr_cell(row)
             );
         }
         if reports.is_empty() {
@@ -492,17 +502,41 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         if let Some(note) = &pr_note {
             println!("PR data unavailable: {note}");
         }
-        if let Some(age) = pr_snapshot_age_ms {
-            println!(
+        match pr_snapshot {
+            Some(PrSnapshot {
+                held: Some(held), ..
+            }) => println!("{held}"),
+            Some(PrSnapshot { age_ms, held: None }) => println!(
                 "PR data from the events daemon snapshot, {}s old",
-                age / 1000
-            );
+                age_ms / 1000
+            ),
+            None => {}
         }
         if let Some(note) = &session_note {
             println!("Session data unavailable: {note}");
         }
     }
     Ok(0)
+}
+
+/// The human PR column: the row's own pull request, then how many of its
+/// other branches hold, or may hold, one with no row (`other_prs` entries
+/// that are `open` or `unknown`; the JSON names them).
+fn pr_cell(row: &Value) -> String {
+    let own = row["pr"]["number"]
+        .as_u64()
+        .map_or_else(|| "—".to_owned(), |number| format!("#{number}"));
+    let others = row["other_prs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|other| matches!(other["state"].as_str(), Some("open" | "unknown")))
+        .count();
+    match others {
+        0 => own,
+        1 => format!("{own} +1 PR"),
+        count => format!("{own} +{count} PRs"),
+    }
 }
 
 /// The human WORK column. A merge gate overrides the state (`blocked/ready`
@@ -646,10 +680,13 @@ mod tests {
         ctx.config = std::sync::Arc::new(config);
         let events = ctx.config.paths.cache_root.join("events");
         fs::create_dir_all(&events).unwrap();
-        let write = |age_ms: i64| {
+        let write_paced = |age_ms: i64, next_in_ms: i64, remaining: u64| {
             let written = now_ms() - age_ms;
             let snapshot = json!({
                 "updatedAt": written, "fetchStartedAtMs": written - 1_000,
+                "nextFetchAtMs": now_ms() + next_in_ms,
+                "rateLimit": {"limit": 5000, "remaining": remaining, "cost": 5,
+                    "resetAtMs": now_ms() + 30 * 60_000},
                 "branches": ["feature/a", "feature/b"],
                 "prs": {"feature/a": {
                     "number": 7, "url": "https://github.com/acme/app/pull/7",
@@ -666,17 +703,37 @@ mod tests {
             });
             fs::write(events.join("github.json"), snapshot.to_string()).unwrap();
         };
+        // A daemon on its ordinary floor planned its next read long ago.
+        let write = |age_ms: i64| write_paced(age_ms, 9_000 - age_ms, 4_000);
         write(12_000);
-        let (read, age) = pull_requests(&ctx, &["feature/a".into()]).await;
+        let (read, shown) = pull_requests(&ctx, &["feature/a".into()]).await;
         assert_eq!(read.unwrap().prs["feature/a"].number, 7);
-        assert!(matches!(age, Some(12_000..14_000)), "{age:?}");
+        let shown = shown.unwrap();
+        assert!(matches!(shown.age_ms, 12_000..14_000), "{shown:?}");
+        assert_eq!(shown.held, None);
         // A branch the snapshot does not cover, or a snapshot gone stale,
         // is a live read with no age. `gh` has nothing to answer here.
-        let (_, age) = pull_requests(&ctx, &["feature/new".into()]).await;
-        assert_eq!(age, None);
+        let (_, shown) = pull_requests(&ctx, &["feature/new".into()]).await;
+        assert!(shown.is_none());
         write(10 * 60_000);
-        let (_, age) = pull_requests(&ctx, &["feature/a".into()]).await;
-        assert_eq!(age, None);
+        let (_, shown) = pull_requests(&ctx, &["feature/a".into()]).await;
+        assert!(shown.is_none());
+        // The same age while the daemon's budget holds its next read, or
+        // once that read is overdue with only the reserve left, is shown
+        // with the reason instead of spending the budget on a table.
+        write_paced(10 * 60_000, 4 * 60_000, 1_400);
+        let (read, shown) = pull_requests(&ctx, &["feature/a".into()]).await;
+        assert_eq!(read.unwrap().prs["feature/a"].number, 7);
+        assert_eq!(
+            shown.unwrap().held.as_deref(),
+            Some("GitHub reads are paced, using data 10 min old")
+        );
+        write_paced(10 * 60_000, -5 * 60_000, 900);
+        let (_, shown) = pull_requests(&ctx, &["feature/a".into()]).await;
+        assert_eq!(
+            shown.unwrap().held.as_deref(),
+            Some("GitHub budget low, using data 10 min old")
+        );
         fixture.close().await.unwrap();
     }
 
@@ -721,6 +778,27 @@ mod tests {
             1
         );
         fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn the_pr_column_counts_other_prs_that_are_open_or_unanswered() {
+        let other =
+            |state: &str| json!({"branch": "b", "number": null, "state": state, "draft": false});
+        assert_eq!(
+            pr_cell(&json!({"pr": {"number": 7}, "other_prs": []})),
+            "#7"
+        );
+        assert_eq!(pr_cell(&json!({"pr": null})), "—");
+        assert_eq!(
+            pr_cell(&json!({"pr": {"number": 7}, "other_prs": [other("open"), other("merged")]})),
+            "#7 +1 PR"
+        );
+        assert_eq!(
+            pr_cell(&json!({"pr": null, "other_prs": [
+                other("open"), other("unknown"), other("closed"), other("none")
+            ]})),
+            "— +2 PRs"
+        );
     }
 
     #[test]

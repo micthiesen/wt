@@ -5,7 +5,9 @@
 //! worktrees named: the events daemon's snapshot while it is fresh, else one
 //! batched request at the pace every other watch read keeps. That pace is
 //! shared by every waiting process through a file, so ten waits ask GitHub
-//! as often as one. Rows are built by the same rule the engine uses, so a
+//! as often as one. While a low budget holds the next read back, an answer
+//! older than a minute proves only its merges: the rest reads unknown, with
+//! the time of the next read as the reason. Rows are built by the same rule the engine uses, so a
 //! word means the same in both.
 
 use std::{
@@ -60,6 +62,10 @@ struct SharedRead {
 enum Plan {
     /// The stored answer is young enough and covers the branches.
     Use,
+    /// The stored answer covers the branches and is older than a wait would
+    /// normally accept, and GitHub's budget keeps the next read until
+    /// `next_ms`.
+    Paced { next_ms: u64 },
     /// A failed fetch is still backing off.
     Hold,
     /// Ask GitHub about these branches.
@@ -74,8 +80,9 @@ impl SharedRead {
         // Waits poll in the background, so a low GitHub budget stretches
         // their interval as it does every other poller's. Judged as of the
         // fetch that reported the budget, which the interval counts from.
+        let floor = u64::try_from(PR_INTERVAL.as_millis()).unwrap_or(u64::MAX);
         let interval = wt_events::paced_interval_ms(
-            u64::try_from(PR_INTERVAL.as_millis()).unwrap_or(u64::MAX),
+            floor,
             self.data
                 .as_ref()
                 .and_then(|data| data.rate_limit)
@@ -83,14 +90,20 @@ impl SharedRead {
             self.fetch_started_ms,
         );
         // A start in the future is a clock that moved, not a fresh answer.
-        let fresh = self.fetch_started_ms <= now_ms && now_ms - self.fetch_started_ms < interval;
+        let age = now_ms.checked_sub(self.fetch_started_ms);
         let covers = self.data.as_ref().is_some_and(|data| {
             branches
                 .iter()
                 .all(|branch| data.covered_branches.contains(branch))
         });
-        if fresh && covers {
-            return Plan::Use;
+        if covers && let Some(age) = age.filter(|age| *age < interval) {
+            return if age < floor {
+                Plan::Use
+            } else {
+                Plan::Paced {
+                    next_ms: self.fetch_started_ms.saturating_add(interval),
+                }
+            };
         }
         let mut all = branches.iter().cloned().collect::<BTreeSet<_>>();
         all.extend(
@@ -133,6 +146,28 @@ impl SharedRead {
             }
         }
     }
+}
+
+/// What an answer held past its minute by the budget still proves: a merge
+/// is final, so a merged pull request stays one. Everything else it says
+/// may have changed, and reads as not covered.
+fn settled_only(mut data: GithubData) -> GithubData {
+    data.prs.retain(|_, pr| pr.state == "MERGED");
+    data.covered_branches = data.prs.keys().cloned().collect();
+    data.merge_queue.clear();
+    data.merge_queue_complete = false;
+    data
+}
+
+/// Why a wait has no current pull-request answer while the budget is low.
+fn budget_problem(next_ms: u64, utc_offset_minutes: i32) -> String {
+    let minutes = (i64::try_from(next_ms / 60_000).unwrap_or(0) + i64::from(utc_offset_minutes))
+        .rem_euclid(24 * 60);
+    format!(
+        "GitHub budget low, next read at {:02}:{:02}",
+        minutes / 60,
+        minutes % 60
+    )
 }
 
 fn shared_path(ctx: &AppContext) -> PathBuf {
@@ -426,12 +461,36 @@ impl RowReader {
             self.problem = Some("GitHub is switched off (WT_GITHUB=off)".into());
             return None;
         }
-        if !queue && let Some(read) = crate::github_events_source::load(ctx, branches).await {
-            self.problem = None;
-            return Some(GithubRead {
-                data: read.data,
-                fetch_started_ms: None,
-            });
+        if !queue
+            && let Some(shown) = crate::github_events_source::load_for_display(ctx, branches).await
+        {
+            use crate::github_events_source::Held;
+            match shown.held {
+                Held::Fresh => {
+                    self.problem = None;
+                    return Some(GithubRead {
+                        data: shown.read.data,
+                        fetch_started_ms: None,
+                    });
+                }
+                // The daemon is waiting out the budget and will read before
+                // this process may: its old answer proves what the shared
+                // read's would, and asking GitHub here would defeat the pace.
+                Held::Paced { next_fetch_at_ms } => {
+                    self.problem = Some(budget_problem(
+                        next_fetch_at_ms,
+                        wt_app_core::display_time::local_utc_offset_minutes(next_fetch_at_ms)
+                            .unwrap_or(0),
+                    ));
+                    return Some(GithubRead {
+                        data: settled_only(shown.read.data),
+                        fetch_started_ms: None,
+                    });
+                }
+                // The daemon's read is overdue: the shared read below keeps
+                // the pace itself.
+                Held::BudgetLow => {}
+            }
         }
         let _lock = match FileLock::acquire(
             &ctx.config.paths.lock_dir,
@@ -462,6 +521,21 @@ impl RowReader {
                 self.problem = None;
                 return shared.data.map(|data| GithubRead {
                     data,
+                    fetch_started_ms: Some(shared.fetch_started_ms),
+                });
+            }
+            // Waiting out the budget is not an answer: say so, and keep
+            // only what cannot have changed, so the rest reads unknown.
+            Plan::Paced { next_ms } => {
+                if shared.note_asked(branches, now) {
+                    save_shared(&path, &shared).await;
+                }
+                self.problem = Some(budget_problem(
+                    next_ms,
+                    wt_app_core::display_time::local_utc_offset_minutes(next_ms).unwrap_or(0),
+                ));
+                return shared.data.map(|data| GithubRead {
+                    data: settled_only(data),
                     fetch_started_ms: Some(shared.fetch_started_ms),
                 });
             }
@@ -640,8 +714,9 @@ mod tests {
             shared.plan(&["three".to_owned()], start + 1),
             Plan::Fetch(vec!["three".into(), "two".into()])
         );
-        // With only the reserve of GitHub's budget left, the stored answer
-        // serves every wait until the budget resets.
+        // With only the reserve of GitHub's budget left, waits read once
+        // per paced interval. The stored answer is current for its minute;
+        // after that the plan names when the next read is due.
         let mut low = covering(&["one"], start);
         low.data.as_mut().unwrap().rate_limit = Some(wt_github::RateLimit {
             limit: 5_000,
@@ -649,9 +724,21 @@ mod tests {
             cost: 5,
             reset_at_ms: start + 20 * minute,
         });
-        assert_eq!(low.plan(&one, start + 19 * minute), Plan::Use);
+        assert_eq!(low.plan(&one, start + minute - 1), Plan::Use);
+        assert_eq!(
+            low.plan(&one, start + 14 * minute),
+            Plan::Paced {
+                next_ms: start + wt_events::MAX_PACED_WAIT_MS
+            }
+        );
+        // A branch the stored answer lacks is still asked for.
         assert!(matches!(
-            low.plan(&one, start + 21 * minute),
+            low.plan(&["new".to_owned()], start + 14 * minute),
+            Plan::Fetch(_)
+        ));
+        // The reset is 20 minutes off, and the next read is not held for it.
+        assert!(matches!(
+            low.plan(&one, start + 15 * minute),
             Plan::Fetch(_)
         ));
         // A stored backoff holds a process that never saw the failure.
@@ -667,6 +754,45 @@ mod tests {
             failed.plan(&one, start + 5 * minute),
             Plan::Fetch(_)
         ));
+    }
+
+    #[test]
+    fn a_paced_answer_keeps_only_merges_and_says_when_the_next_read_is() {
+        let pr = |state: &str| -> wt_github::PullRequest {
+            serde_json::from_value(serde_json::json!({
+                "number": 1, "url": "https://example.invalid/pull/1",
+                "headRefName": "b", "headRefOid": "a".repeat(40),
+                "baseRefName": "main", "mergeCommitOid": null,
+                "title": "T", "isDraft": false, "state": state,
+                "checks": "pass", "failedChecks": [], "review": "none",
+                "reviewRequests": 0, "requestedReviewers": [], "suggestedReviewers": [],
+                "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0
+            }))
+            .unwrap()
+        };
+        let mut data = GithubData {
+            merge_queue_complete: true,
+            ..GithubData::default()
+        };
+        for (branch, state) in [("done", "MERGED"), ("open", "OPEN"), ("shut", "CLOSED")] {
+            data.prs.insert(branch.into(), pr(state));
+            data.covered_branches.insert(branch.into());
+        }
+        data.covered_branches.insert("none".into());
+        let kept = settled_only(data);
+        assert_eq!(kept.prs.keys().collect::<Vec<_>>(), ["done"]);
+        assert_eq!(kept.covered_branches.iter().collect::<Vec<_>>(), ["done"]);
+        assert!(!kept.merge_queue_complete);
+        // 13:05 UTC, read an hour east and half a day west.
+        let at = (13 * 60 + 5) * 60_000;
+        assert_eq!(
+            budget_problem(at, 60),
+            "GitHub budget low, next read at 14:05"
+        );
+        assert_eq!(
+            budget_problem(at, -14 * 60),
+            "GitHub budget low, next read at 23:05"
+        );
     }
 
     #[test]

@@ -9,7 +9,13 @@ use wt_store::{CheckTargets, ChecksClosed, Store, StoreError};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckEdit {
     /// Owe these steps there; a check owed in the other stage is left alone.
-    Owe { stage: VerifyStage, steps: String },
+    /// `lines` is the text as written, for its line breaks; `None` where
+    /// the writer has only the one line.
+    Owe {
+        stage: VerifyStage,
+        steps: String,
+        lines: Option<String>,
+    },
     /// Stop owing the check there.
     Drop { stage: VerifyStage },
 }
@@ -32,7 +38,11 @@ pub fn assert_checks(
     }
     for edit in edits {
         match edit {
-            CheckEdit::Owe { stage, steps } => next.set_check(stage, steps),
+            CheckEdit::Owe {
+                stage,
+                steps,
+                lines,
+            } => next.set_check_lines(stage, steps, lines.as_deref()),
             CheckEdit::Drop { stage } => {
                 next.drop_check(stage);
             }
@@ -128,10 +138,12 @@ mod tests {
                 CheckEdit::Owe {
                     stage: VerifyStage::Staging,
                     steps: "1. staging".into(),
+                    lines: None,
                 },
                 CheckEdit::Owe {
                     stage: VerifyStage::Production,
                     steps: "1. production".into(),
+                    lines: None,
                 },
             ],
         );
@@ -147,6 +159,7 @@ mod tests {
             [CheckEdit::Owe {
                 stage: VerifyStage::Production,
                 steps: "2. production".into(),
+                lines: None,
             }],
         );
         assert_eq!(

@@ -13,7 +13,8 @@ pub use deployed::{
     record_deployed, resolve_deployed_commit,
 };
 pub use mainline::{
-    MAINLINE_WALK, branch_reflog_args, cherry_all_in_base, cherry_args, cherry_unmatched,
+    BeyondBase, BroughtIn, GitRead, MAINLINE_WALK, base_holds_everything, branch_reflog_args,
+    brought_in, brought_in_args, cherry_all_in_base, cherry_args, cherry_unmatched,
     committed_on_branch, contained_head_landed, mainline_args, on_first_parent_line,
 };
 pub use origin::{FetchOriginOptions, FetchOriginReport};

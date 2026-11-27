@@ -422,7 +422,7 @@ fn show_event(
         }
         .to_owned(),
         // The words the details pane uses for the same landing.
-        Kind::Landed { on } => match on {
+        Kind::Landed { on, .. } => match on {
             LandedOn::Base => "merged",
             LandedOn::Production => "in production",
         }
@@ -746,6 +746,7 @@ pub(crate) fn summary(
         let verb = match landed.event {
             Kind::Landed {
                 on: LandedOn::Production,
+                ..
             } => "in production",
             _ => "merged",
         };
@@ -1083,11 +1084,20 @@ mod tests {
                     verify_in: None,
                 },
             ),
-            at(now - 2 * HOUR, Kind::Landed { on: LandedOn::Base }),
+            at(
+                now - 2 * HOUR,
+                Kind::Landed {
+                    on: LandedOn::Base,
+                    head: None,
+                    landed_at_ms: None,
+                },
+            ),
             at(
                 now - HOUR,
                 Kind::Landed {
                     on: LandedOn::Production,
+                    head: None,
+                    landed_at_ms: None,
                 },
             ),
             at(now - 10 * MINUTE, Kind::Removed { landed: true }),

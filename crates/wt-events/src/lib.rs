@@ -109,6 +109,11 @@ pub struct GithubSnapshot {
     /// reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateBudget>,
+    /// Wall-clock epoch ms before which the daemon starts no background
+    /// read after this one: this read's start plus the interval its budget
+    /// asks for. A reader that only displays the data may use it until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fetch_at_ms: Option<u64>,
     #[serde(default)]
     pub writer_sha: Option<String>,
     /// The writer's repository identity (see `EventDaemonConfig::repository`).
@@ -293,7 +298,10 @@ pub async fn read_state(
 
 mod daemon;
 
-pub use daemon::{backoff_interval_ms, failure_wait_ms, paced_interval_ms, rate_limited};
+pub use daemon::{
+    MAX_PACED_WAIT_MS, backoff_interval_ms, budget_low, failure_wait_ms, paced_interval_ms,
+    rate_limited,
+};
 
 #[cfg(test)]
 mod tests {

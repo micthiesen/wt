@@ -216,6 +216,7 @@ impl GithubClient {
         if branches.is_empty() {
             return Ok(GithubData::default());
         }
+        let observed_at_ms = epoch_ms();
         let repo = self.repository(cancellation).await?;
         let groups = chunk_branches(branches, CHUNK_SIZE);
         let requests = groups.len();
@@ -254,6 +255,7 @@ impl GithubClient {
                 }
             }
             data.covered_branches = branches.iter().cloned().collect();
+            data.observed_at_ms = Some(observed_at_ms);
             Ok::<GithubData, GithubError>(data)
         };
         let data = timeout(Duration::from_secs(100), fetch)
@@ -287,9 +289,13 @@ impl GithubClient {
         for page in ids.chunks(THREAD_AUTHOR_PAGE) {
             let query = thread_authors_query(page);
             let (found, rate) = self
-                .graphql_read(&query, &[], cancellation, |bytes| {
-                    parse_thread_authors(bytes, page)
-                })
+                .graphql_read(
+                    &query,
+                    &[],
+                    cancellation,
+                    Reply::WithErrors,
+                    |bytes, last| parse_thread_authors(bytes, page, last),
+                )
                 .await?;
             authors.extend(found);
             spend(&mut spent, rate);
@@ -319,7 +325,7 @@ impl GithubClient {
                 10
             },
         );
-        self.graphql_read(&query, &vars, cancellation, |bytes| {
+        self.graphql_read(&query, &vars, cancellation, Reply::Clean, |bytes, _| {
             parse_chunk(bytes, branches, with_queue, &self.options)
         })
         .await
@@ -327,12 +333,15 @@ impl GithubClient {
 
     /// One GraphQL read with string variables, asking gh for the response
     /// headers too: a rate-limited reply names its reset only there.
+    /// `parse` is told whether this is the last attempt, so it can settle
+    /// for what a retry did not improve.
     async fn graphql_read<T>(
         &self,
         query: &str,
         vars: &[(String, String)],
         cancellation: &CancellationToken,
-        parse: impl Fn(&[u8]) -> Result<T, GithubError>,
+        reply: Reply,
+        parse: impl Fn(&[u8], bool) -> Result<T, GithubError>,
     ) -> Result<T, GithubError> {
         for attempt in 0..MAX_ATTEMPTS {
             let mut args = vec![
@@ -352,13 +361,28 @@ impl GithubClient {
                 Ok(mut out) => {
                     let reset = take_response_headers(&mut out.stdout)
                         .and_then(|headers| header_reset_ms(&headers, epoch_ms()));
+                    let last = attempt + 1 >= MAX_ATTEMPTS;
                     let error = if out.status.success() {
-                        match parse(&out.stdout) {
+                        match parse(&out.stdout, last) {
                             Ok(read) => return Ok(read),
                             Err(error) => error,
                         }
                     } else {
-                        classify_output(&out)
+                        // gh exits non-zero when the reply carries errors,
+                        // and still prints the reply.
+                        let failed = classify_output(&out);
+                        match (reply, failed) {
+                            // gh's own failure says nothing more than "the
+                            // reply had errors": the parser's reading stands.
+                            (Reply::WithErrors, GithubError::Command(message)) => {
+                                match parse(&out.stdout, last) {
+                                    Ok(read) => return Ok(read),
+                                    Err(error) if error.retryable() => error,
+                                    Err(_) => GithubError::Command(message),
+                                }
+                            }
+                            (_, failed) => failed,
+                        }
                     };
                     with_reset(error, reset)
                 }
@@ -1805,20 +1829,61 @@ fn thread_authors_query(ids: &[String]) -> String {
     format!("query {{ {nodes} {RATE_LIMIT_FIELD} }}")
 }
 
+/// Whether a reply that carries GraphQL errors can still be the answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reply {
+    /// Any error fails the read.
+    Clean,
+    /// The parser reads the errors and decides.
+    WithErrors,
+}
+
+/// Whether `error` only says that the node asked for under one of the
+/// `t<n>` aliases is gone.
+fn thread_not_found(error: &Value) -> bool {
+    error.get("type").and_then(Value::as_str) == Some("NOT_FOUND")
+        && error
+            .pointer("/path/0")
+            .and_then(Value::as_str)
+            .and_then(|alias| alias.strip_prefix('t'))
+            .is_some_and(|index| index.parse::<usize>().is_ok())
+}
+
 /// Each asked thread's first-comment author (`null` for a deleted account),
-/// by thread ID. A thread the reply does not answer for fails the read.
+/// by thread ID. A thread the reply leaves out fails the read. A thread
+/// that comes back `null` was deleted since the batched query listed it, or
+/// cannot be read: that is retried, and when `settle` says no retry is
+/// left its author is `null` too, so one thread never fails the fleet.
 fn parse_thread_authors(
     bytes: &[u8],
     ids: &[String],
+    settle: bool,
 ) -> Result<(HashMap<String, Value>, Option<RateLimit>), GithubError> {
-    let reply: Value = serde_json::from_slice(bytes).map_err(|e| GithubError::Transient {
+    let mut reply: Value = serde_json::from_slice(bytes).map_err(|e| GithubError::Transient {
         message: format!("unparseable GitHub JSON: {e}"),
     })?;
+    // GitHub reports each missing node as an error beside its `null`.
+    if let Some(errors) = reply.get_mut("errors").and_then(Value::as_array_mut) {
+        errors.retain(|error| !thread_not_found(error));
+    }
     if let Some(error) = graphql_errors(&reply) {
         return Err(error);
     }
     let mut authors = HashMap::new();
     for (i, id) in ids.iter().enumerate() {
+        if reply
+            .pointer(&format!("/data/t{i}"))
+            .is_some_and(Value::is_null)
+        {
+            if !settle {
+                return Err(GithubError::Transient {
+                    message: format!("GitHub returned no review thread for t{i}"),
+                });
+            }
+            tracing::warn!(thread = %id, "review thread unreadable; its author is unknown");
+            authors.insert(id.clone(), Value::Null);
+            continue;
+        }
         let comments = reply
             .pointer(&format!("/data/t{i}/comments/nodes"))
             .and_then(Value::as_array)
@@ -2685,11 +2750,11 @@ mod transport_tests {
             {"id":"PRRT_b","isResolved":false}
         ]));
         for (authors, rate_limited) in [
+            (r#"{"data":{"t0":{"comments":{"nodes":[]}}}}"#, false),
             (
-                r#"{"data":{"t0":{"comments":{"nodes":[]}},"t1":null}}"#,
+                r#"{"data":{"t0":{"comments":{"nodes":[]}},"t1":{}}}"#,
                 false,
             ),
-            (r#"{"data":{"t0":{"comments":{"nodes":[]}}}}"#, false),
             (
                 r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
                 true,
@@ -2718,6 +2783,85 @@ mod transport_tests {
                 Err(GithubError::Protocol(_))
             ));
         }
+    }
+
+    /// A thread deleted between the two requests comes back `null` with a
+    /// NOT_FOUND error, and gh exits non-zero for it.
+    #[tokio::test]
+    async fn a_thread_that_comes_back_null_is_retried_and_then_only_its_author_is_unknown() {
+        let cancel = CancellationToken::new();
+        let unresolved = pr_reply(serde_json::json!([
+            {"id":"PRRT_a","isResolved":false},
+            {"id":"PRRT_gone","isResolved":false}
+        ]));
+        let gone = r#"{"data":{"t0":{"comments":{"nodes":[{"author":{"login":"person","__typename":"User"}}]}},"t1":null},"errors":[{"type":"NOT_FOUND","path":["t1"],"message":"Could not resolve to a node with the global id of 'PRRT_gone'"}]}"#;
+        let whole = r#"{"data":{"t0":{"comments":{"nodes":[{"author":{"login":"person","__typename":"User"}}]}},"t1":{"comments":{"nodes":[{"author":{"login":"other","__typename":"User"}}]}}}}"#;
+        let gh = |dir: &std::path::Path, authors: &str| {
+            fs::write(dir.join("prs.json"), &unresolved).unwrap();
+            fs::write(dir.join("gone.json"), gone).unwrap();
+            fs::write(dir.join("whole.json"), whole).unwrap();
+            let script = fake_gh(
+                dir,
+                "fake-gh",
+                &format!(
+                    "cd '{}'\ncase \"$*\" in\n*PullRequestReviewThread*) echo asked >> author-queries\n{authors};;\n*) cat prs.json;;\nesac",
+                    dir.display()
+                ),
+            );
+            GithubClient::new(ProcessRunner::default(), dir.to_owned(), options())
+                .with_gh_program(script)
+                .with_repository(RepoSlug::parse("acme/app").unwrap())
+        };
+        let asked = |dir: &std::path::Path| {
+            fs::read_to_string(dir.join("author-queries"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        let not_found = "cat gone.json; echo 'gh: Could not resolve to a node' >&2; exit 1";
+
+        // Gone on the first request only: the retry's answer is the whole one.
+        let dir = tempdir().unwrap();
+        let data = gh(
+            dir.path(),
+            &format!("if [ -e seen ]; then cat whole.json; else touch seen; {not_found}; fi"),
+        )
+        .fetch_worktrees(&["feature/a".into()], &cancel)
+        .await
+        .unwrap();
+        assert_eq!(asked(dir.path()), 2);
+        let pr = &data.prs["feature/a"];
+        assert_eq!((pr.unresolved_threads_total, pr.unresolved_threads), (2, 2));
+
+        // Gone for good: the read succeeds, and that thread is nobody's.
+        let dir = tempdir().unwrap();
+        let data = gh(dir.path(), not_found)
+            .fetch_worktrees(&["feature/a".into()], &cancel)
+            .await
+            .unwrap();
+        assert_eq!(asked(dir.path()), MAX_ATTEMPTS);
+        let pr = &data.prs["feature/a"];
+        assert_eq!((pr.unresolved_threads_total, pr.unresolved_threads), (2, 1));
+        assert_eq!(data.covered_branches, ["feature/a".to_owned()].into());
+        assert!(data.observed_at_ms.is_some());
+
+        // Any other error beside the null still fails the whole read.
+        let settled = |reply: &str| {
+            parse_thread_authors(
+                reply.as_bytes(),
+                &["PRRT_a".into(), "PRRT_gone".into()],
+                true,
+            )
+        };
+        assert!(settled(gone).is_ok());
+        assert!(matches!(
+            settled(&gone.replace("NOT_FOUND", "FORBIDDEN")),
+            Err(GithubError::Protocol(_))
+        ));
+        assert!(matches!(
+            settled(&gone.replace(r#"["t1"]"#, r#"["rateLimit"]"#)),
+            Err(GithubError::Protocol(_))
+        ));
     }
 
     #[test]

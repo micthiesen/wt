@@ -4,15 +4,16 @@
 //! refusal exits [`wt_harness::GH_GUARD_REFUSED`]; whatever cannot be
 //! established lets `gh` run.
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use anyhow::Result;
 use serde::Deserialize;
 use wt_app_core::context::AppContext;
 use wt_ops::commands::resolve::resolve_worktree;
-use wt_platform::process::CommandSpec;
+use wt_platform::process::{CommandSpec, ProcessRunner};
 
-const GH_WAIT: Duration = Duration::from_secs(8);
+/// `gh pr create` waits on this lookup; past it the guard lets gh run.
+const GH_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +40,37 @@ fn head_flag(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The pull requests of `branch`, or `None` when GitHub did not say within
+/// `wait`.
+async fn pull_requests_of(
+    processes: &ProcessRunner,
+    cancellation: &tokio_util::sync::CancellationToken,
+    gh: &str,
+    branch: &str,
+    cwd: &Path,
+    wait: Duration,
+) -> Option<Vec<HeadPr>> {
+    let mut spec = CommandSpec::new(gh)
+        .args([
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--head",
+            branch,
+            "--json",
+            "number,state,isCrossRepository",
+        ])
+        .cwd(cwd);
+    spec.timeout = wait;
+    processes
+        .run(spec, cancellation)
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice(&output.stdout).ok())
 }
 
 /// Why this pull request would be the worktree's second, if it would.
@@ -80,26 +112,15 @@ pub async fn run(ctx: &AppContext, args: &[String]) -> Result<i32> {
     let head = head_flag(args).unwrap_or_else(|| row.target.branch.clone());
     let prs = if head == recorded {
         let gh = std::env::var("WT_REAL_GH").unwrap_or_else(|_| "gh".into());
-        let mut spec = CommandSpec::new(gh)
-            .args([
-                "pr",
-                "list",
-                "--state",
-                "all",
-                "--head",
-                recorded.as_str(),
-                "--json",
-                "number,state,isCrossRepository",
-            ])
-            .cwd(&row.target.path);
-        spec.timeout = GH_WAIT;
-        let listed = ctx
-            .processes
-            .run(spec, &ctx.cancellation)
-            .await
-            .ok()
-            .filter(|output| output.status.success())
-            .and_then(|output| serde_json::from_slice::<Vec<HeadPr>>(&output.stdout).ok());
+        let listed = pull_requests_of(
+            &ctx.processes,
+            &ctx.cancellation,
+            &gh,
+            &recorded,
+            Path::new(&row.target.path),
+            GH_WAIT,
+        )
+        .await;
         match listed {
             Some(prs) => prs,
             None => {
@@ -149,6 +170,31 @@ mod tests {
         ] {
             assert_eq!(head_flag(&args(spelling)).as_deref(), Some("michael/x"));
         }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_github_does_not_answer_in_time_is_given_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = |name: &str, body: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let answer = r#"echo '[{"number":4,"state":"OPEN","isCrossRepository":false}]'"#;
+        let prompt = fake("gh", &format!("#!/bin/sh\n{answer}\n"));
+        let slow = fake("slow-gh", &format!("#!/bin/sh\nsleep 20\n{answer}\n"));
+        let processes = ProcessRunner::default();
+        let token = tokio_util::sync::CancellationToken::new();
+        let wait = Duration::from_secs(5);
+        let listed = pull_requests_of(&processes, &token, &prompt, "x", tmp.path(), wait).await;
+        assert_eq!(listed.unwrap()[0].number, 4);
+        let started = std::time::Instant::now();
+        let wait = Duration::from_millis(300);
+        let listed = pull_requests_of(&processes, &token, &slow, "x", tmp.path(), wait).await;
+        assert!(listed.is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

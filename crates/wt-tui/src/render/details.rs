@@ -848,21 +848,34 @@ fn git_value(row: &BoardRow, width: usize, now: u64) -> Spans {
             .upstream
             .as_ref()
             .map(|_| (row.git.ahead, row.git.behind));
-        let remote = sync_group("(", ")", upstream.and_then(|(a, b)| a.zip(b)));
-        let base = sync_group("[", "]", row.git.base_ahead.zip(row.git.base_behind));
-        let mut both = remote.clone();
-        both.push(Span::raw(" "));
-        both.extend(base);
-        segments.push(Segment::new(2, vec![both, remote]));
+        // A side with no counts says nothing: no upstream, or not read.
+        let remote = upstream
+            .and_then(|(a, b)| a.zip(b))
+            .map(|counts| sync_group("(", ")", counts));
+        let base = row
+            .git
+            .base_ahead
+            .zip(row.git.base_behind)
+            .map(|counts| sync_group("[", "]", counts));
+        let modes = match (remote, base) {
+            (Some(remote), Some(base)) => {
+                let mut both = remote.clone();
+                both.push(Span::raw(" "));
+                both.extend(base);
+                vec![both, remote]
+            }
+            (Some(one), None) | (None, Some(one)) => vec![one],
+            (None, None) => Vec::new(),
+        };
+        if !modes.is_empty() {
+            segments.push(Segment::new(2, modes));
+        }
     }
     fit_segments(segments, width)
 }
 
-/// `(↑a ↓b)`: ahead warns, behind errs, zero is dim, unknown is `(—)`.
-fn sync_group(open: &str, close: &str, counts: Option<(u32, u32)>) -> Spans {
-    let Some((ahead, behind)) = counts else {
-        return vec![Span::styled(format!("{open}—{close}"), theme::dim())];
-    };
+/// `(↑a ↓b)`: ahead warns, behind errs, zero is dim.
+fn sync_group(open: &str, close: &str, (ahead, behind): (u32, u32)) -> Spans {
     if ahead == 0 && behind == 0 {
         return vec![Span::styled(format!("{open}↑0 ↓0{close}"), theme::dim())];
     }
@@ -1040,7 +1053,7 @@ fn work_status_block(row: &BoardRow, width: usize) -> Vec<Line<'static>> {
     let header = status_header(row);
     let mut lines = header
         .as_ref()
-        .map(|(spans, _)| wrap_spans(spans.clone(), width))
+        .map(|(items, _)| wrap_items(items.clone(), width))
         .unwrap_or_default();
     if let Some((_, color)) = header
         && let Some(note) = row
@@ -1062,10 +1075,10 @@ fn owes_block(row: &BoardRow, times: &Times, width: usize) -> Vec<Line<'static>>
     lines
 }
 
-/// The banner's first line and its color. A landed row reads from where it
-/// stands with what it owes; until then the asserted state and the gate
-/// say where the row is.
-fn status_header(row: &BoardRow) -> Option<(Spans, ratatui::style::Color)> {
+/// The banner's first line, as the items its ` · ` separators join, and its
+/// color. A landed row reads from where it stands with what it owes; until
+/// then the asserted state and the gate say where the row is.
+fn status_header(row: &BoardRow) -> Option<(Vec<Spans>, ratatui::style::Color)> {
     let work = row.work.as_ref();
     let record = work.and_then(|work| work.record.as_ref());
     let effective = work.and_then(|work| work.effective_state);
@@ -1096,20 +1109,19 @@ fn status_header(row: &BoardRow) -> Option<(Spans, ratatui::style::Color)> {
             }
         }
     };
-    let mut header = vec![
+    let mut header = vec![vec![
         Span::styled(format!("{glyph} "), theme::fg(color)),
         Span::styled(text, theme::bold(color)),
-    ];
+    ]];
     // Someone is still at work on a landed row, or is asked something.
     if row.owed_phase.is_some()
         && let Some(state @ (WorkState::NeedsHuman | WorkState::Working | WorkState::Review)) =
             effective
     {
-        header.push(Span::styled(" · ", theme::dim()));
-        header.push(Span::styled(
+        header.push(vec![Span::styled(
             state.as_str(),
             theme::fg(badges::work_state_color(state)),
-        ));
+        )]);
     }
     // The review stamp trails the line, hollow once the head has moved.
     let stamp = badges::stamp(row).map(|(stamp, current)| {
@@ -1118,7 +1130,10 @@ fn status_header(row: &BoardRow) -> Option<(Spans, ratatui::style::Color)> {
         } else {
             wt_core::STAMP_MOVED
         };
-        Span::styled(format!(" · {glyph} {}", stamp.skill), theme::dim())
+        vec![Span::styled(
+            format!("{glyph} {}", stamp.skill),
+            theme::dim(),
+        )]
     });
     // What a landed row owes is all it has left to say: the claim's risk
     // and age were about a merge that has happened.
@@ -1127,27 +1142,26 @@ fn status_header(row: &BoardRow) -> Option<(Spans, ratatui::style::Color)> {
         return Some((header, color));
     }
     if let Some(risk) = record.and_then(|record| record.risk) {
-        header.push(Span::styled(" · risk ", theme::dim()));
-        header.push(Span::styled(
-            risk.as_str(),
-            theme::fg(badges::risk_color(risk)),
-        ));
+        header.push(vec![
+            Span::styled("risk ", theme::dim()),
+            Span::styled(risk.as_str(), theme::fg(badges::risk_color(risk))),
+        ]);
     }
     if let Some(age) = work
         .and_then(|work| work.age.as_ref())
         .filter(|_| !derived || record.is_some())
     {
-        header.push(Span::styled(format!(" · {age} ago"), theme::dim()));
+        header.push(vec![Span::styled(format!("{age} ago"), theme::dim())]);
     }
     if work.is_some_and(|work| work.stale == Some(true)) && !derived {
-        header.push(Span::styled(" · commits since", theme::fg(theme::WARN)));
+        header.push(vec![Span::styled("commits since", theme::fg(theme::WARN))]);
     }
     // The list itself is below the facts: say that there is one.
     if !row.owes.is_empty() {
-        header.push(Span::styled(
-            format!(" · owes {}", row.owes.len()),
+        header.push(vec![Span::styled(
+            format!("owes {}", row.owes.len()),
             theme::dim(),
-        ));
+        )]);
     }
     header.extend(stamp);
     Some((header, color))
@@ -1181,13 +1195,7 @@ fn phase_header(
         wt_core::OwedPhase::Waiting => {
             // What it waits on, as the list's blocks name it; the items
             // below say the rest.
-            let what = match block {
-                Some(crate::OwedBlock::WaitingStaging) => "waiting for staging",
-                Some(crate::OwedBlock::WaitingProduction) => "waiting for production",
-                Some(crate::OwedBlock::Scheduled) => "scheduled",
-                Some(crate::OwedBlock::WaitingOther) => "waiting on other work",
-                _ => "waiting",
-            };
+            let what = block.map_or("waiting", waiting_words);
             (
                 glyphs::OWED_CLOCK,
                 format!("{what} · {} owed", owes.len()),
@@ -1195,6 +1203,18 @@ fn phase_header(
             )
         }
         wt_core::OwedPhase::Done => (glyphs::OWED_DONE, "done".to_owned(), theme::OK),
+    }
+}
+
+/// What a landed row with nothing due waits on, as its header and the
+/// Landed block's pane both name it.
+fn waiting_words(block: crate::OwedBlock) -> &'static str {
+    match block {
+        crate::OwedBlock::WaitingStaging => "waiting for staging",
+        crate::OwedBlock::WaitingProduction => "waiting for production",
+        crate::OwedBlock::Scheduled => "scheduled",
+        crate::OwedBlock::WaitingOther => "waiting on other work",
+        crate::OwedBlock::Due | crate::OwedBlock::Done => "waiting",
     }
 }
 
@@ -2011,7 +2031,146 @@ fn review_lines(review: &ReviewRequestRow, width: usize) -> Vec<Line<'static>> {
 // ---------------------------------------------------------------------------
 // Folded sections
 
+/// The Landed block's pane says what its header counts and nothing else:
+/// the rows with something due and what that is, the rows that wait under
+/// what they wait for, and the rows that are done. What each row asserted
+/// before it merged is not this block's business.
+fn landed_section_lines(section: &BoardSection, model: &Model, width: usize) -> Vec<Line<'static>> {
+    use crate::OwedBlock;
+    let times = &model.board.history_times;
+    let members: Vec<&BoardRow> = section
+        .rows
+        .iter()
+        .filter_map(|&index| model.board.rows.get(index))
+        .collect();
+    let mut lines = vec![Line::styled(
+        truncate_end(&section.title, width),
+        Style::new()
+            .fg(theme::FG_BRIGHT)
+            .add_modifier(Modifier::BOLD),
+    )];
+    let overdue = |row: &&BoardRow| row.owes.iter().any(|item| item.overdue);
+    let due_color = if members.iter().any(overdue) {
+        theme::ERR
+    } else {
+        theme::WARN
+    };
+    let counts = super::list::landed_counts(&members);
+    let counted: Vec<Spans> = counts
+        .into_iter()
+        .zip([
+            ("due", due_color),
+            ("waiting", theme::FG_MID),
+            ("done", theme::OK),
+        ])
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, (word, color))| {
+            vec![Span::styled(format!("{count} {word}"), theme::fg(color))]
+        })
+        .collect();
+    if counted.is_empty() {
+        lines.push(Line::styled("no worktrees", theme::dim()));
+    }
+    lines.extend(wrap_items(counted, width));
+    // A row under its group: its title, and at the right edge what the
+    // group's name leaves unsaid.
+    let row_line = |row: &BoardRow, right: Option<String>| {
+        let right = right.filter(|right| width >= right.width() + 3 + NOTE_BODY_MIN_CELLS);
+        let right_cells = right.as_ref().map_or(0, |right| right.width() + 1);
+        let room = width.saturating_sub(2 + right_cells);
+        let label = truncate_end(&super::list::row_label(row), room);
+        let pad = room.saturating_sub(label.width());
+        let mut spans = vec![Span::raw("  "), Span::styled(label, theme::fg(theme::FG))];
+        if let Some(right) = right {
+            spans.push(Span::raw(" ".repeat(pad + 1)));
+            spans.push(Span::styled(right, theme::dim()));
+        }
+        Line::from(spans)
+    };
+    let in_block = |block: OwedBlock| -> Vec<&BoardRow> {
+        members
+            .iter()
+            .copied()
+            .filter(|row| row.owed_block == Some(block))
+            .collect()
+    };
+    let group = |glyph: &str, text: &str, color| {
+        [
+            Line::default(),
+            fit_line(
+                vec![
+                    Span::styled(format!("{glyph} "), theme::fg(color)),
+                    Span::styled(text.to_owned(), theme::bold(color)),
+                ],
+                width,
+            ),
+        ]
+    };
+    let due = in_block(OwedBlock::Due);
+    if !due.is_empty() {
+        lines.extend(group(glyphs::OWED_DUE, "due", due_color));
+    }
+    for row in due {
+        lines.push(row_line(row, None));
+        // In the list's own order: due checks by stage, then due steps.
+        for item in row.owes.iter().filter(|item| item.due()) {
+            let (_, color) = owed_mark(item);
+            lines.push(fit_line(
+                vec![
+                    Span::raw("    "),
+                    Span::styled(owed_label(item, times), theme::fg(color)),
+                    Span::raw("  "),
+                    Span::styled(item.headline.clone(), theme::fg(theme::FG_MID)),
+                ],
+                width,
+            ));
+        }
+    }
+    for block in [
+        OwedBlock::WaitingStaging,
+        OwedBlock::WaitingProduction,
+        OwedBlock::Scheduled,
+        OwedBlock::WaitingOther,
+    ] {
+        let rows = in_block(block);
+        if rows.is_empty() {
+            continue;
+        }
+        lines.extend(group(
+            glyphs::OWED_CLOCK,
+            waiting_words(block),
+            theme::FG_MID,
+        ));
+        for row in rows {
+            // The stage is the group's name; a time or other work is not.
+            let next = matches!(block, OwedBlock::Scheduled | OwedBlock::WaitingOther)
+                .then(|| row.owes.iter().min_by_key(|item| owed_rank(item)))
+                .flatten()
+                .map(|item| owed_label(item, times));
+            lines.push(row_line(row, next));
+        }
+    }
+    let done = in_block(OwedBlock::Done);
+    if !done.is_empty() {
+        lines.extend(group(glyphs::OWED_DONE, "done · c cleans up", theme::OK));
+    }
+    for row in done {
+        lines.push(row_line(row, None));
+    }
+    lines.push(Line::default());
+    let hint = if section.folded {
+        "TAB expand · y yank"
+    } else {
+        "TAB fold · y yank"
+    };
+    lines.push(Line::styled(truncate_end(hint, width), theme::dim()));
+    lines
+}
+
 fn section_lines(section: &BoardSection, model: &Model, width: usize) -> Vec<Line<'static>> {
+    if section.key == crate::LANDED_SECTION {
+        return landed_section_lines(section, model, width);
+    }
     let policy = &model.board.display;
     let mut lines = vec![Line::styled(
         truncate_end(&section.title, width),
@@ -2326,6 +2485,49 @@ fn wrap_under(prefix: Spans, spans: Spans, width: usize) -> Vec<Line<'static>> {
             Line::from(spans)
         })
         .collect()
+}
+
+/// Join `items` with dim ` · ` separators, wrapping only between items: a
+/// line never starts with a separator, and later lines start under the
+/// first item's text, past its glyph. An item wider than a whole line
+/// wraps at its own spaces.
+fn wrap_items(items: Vec<Spans>, width: usize) -> Vec<Line<'static>> {
+    const SEPARATOR: &str = " · ";
+    let hang = items
+        .first()
+        .and_then(|item| item.first().filter(|_| item.len() > 1))
+        .map_or(0, |glyph| glyph.content.width());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Spans = Vec::new();
+    let mut used = 0;
+    // Whether `current` holds an item, not only its indent.
+    let mut said = false;
+    for item in items {
+        let cells = spans_width(&item);
+        if said && used + SEPARATOR.width() + cells <= width {
+            current.push(Span::styled(SEPARATOR, theme::dim()));
+            used += SEPARATOR.width();
+        } else if said {
+            lines.push(Line::from(std::mem::take(&mut current)));
+            current.push(Span::raw(" ".repeat(hang)));
+            used = hang;
+        }
+        if used + cells <= width {
+            current.extend(item);
+            used += cells;
+        } else {
+            let mut wrapped = wrap_under(std::mem::take(&mut current), item, width);
+            let last = wrapped.pop().unwrap_or_default();
+            lines.extend(wrapped);
+            used = last.width();
+            current = last.spans;
+        }
+        said = true;
+    }
+    if said {
+        lines.push(Line::from(current));
+    }
+    lines
 }
 
 /// Wrap a styled line at span boundaries and spaces.
@@ -3570,6 +3772,187 @@ mod tests {
         (0..40)
             .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect()
+    }
+
+    /// The status line breaks only between its items, so no line starts or
+    /// ends with a separator, and later lines start under the first one's
+    /// text.
+    #[test]
+    fn the_status_line_wraps_between_items_and_never_starts_with_a_separator() {
+        let mut row = owing_row();
+        row.work.as_mut().unwrap().stale = Some(true);
+        row.work.as_mut().unwrap().record.as_mut().unwrap().extra.insert(
+            "stamp".into(),
+            serde_json::json!({"skill": "fable-review", "sha": "abc", "at": "2026-10-09T00:00:00Z"}),
+        );
+        let header = |width| {
+            plain(&work_status_block(&row, width))
+                .into_iter()
+                .take_while(|line| !line.starts_with('│'))
+                .collect::<Vec<_>>()
+        };
+        let whole = header(200);
+        assert_eq!(whole.len(), 1);
+        assert!(whole[0].contains(" · commits since · owes 6"), "{whole:?}");
+        for width in 20..whole[0].width() {
+            let lines = header(width);
+            assert!(lines.len() > 1, "{width}: {lines:?}");
+            for line in &lines {
+                assert!(!line.trim_start().starts_with('·'), "{width}: {lines:?}");
+                assert!(!line.trim_end().ends_with('·'), "{width}: {lines:?}");
+                assert!(line.width() <= width, "{width}: {lines:?}");
+            }
+            assert!(
+                lines[1..].iter().all(|line| line.starts_with("  ")),
+                "{width}: {lines:?}"
+            );
+            let joined = lines
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            assert_eq!(joined, whole[0], "{width}");
+        }
+    }
+
+    /// The Landed block's pane says what its header counts: what is due
+    /// and on which row, who waits for what, and who is done. No asserted
+    /// states, risks, attention count or merge gates.
+    #[test]
+    fn the_landed_blocks_pane_lists_what_its_header_counts() {
+        use crate::OwedBlock;
+        let filed = |key: &str, block: OwedBlock, owes: Vec<OwedView>| {
+            let phase = match block {
+                OwedBlock::Due => OwedPhase::Due,
+                OwedBlock::Done => OwedPhase::Done,
+                _ => OwedPhase::Waiting,
+            };
+            let mut row = landed(phase, owes);
+            row.key = key.into();
+            row.slug = key.into();
+            row.title = format!("Title of {key}");
+            row.owed_block = Some(block);
+            // A gate asserted before the merge is not what the block waits on.
+            row.work
+                .as_mut()
+                .unwrap()
+                .record
+                .as_mut()
+                .unwrap()
+                .blocked_on = Some("needs the importer".into());
+            row
+        };
+        let mut headed = check(VerifyStage::Staging, OwedState::Due, "x");
+        headed.headline = "Import preview renders".into();
+        let mut step_due = step(OwedState::Due, "x");
+        step_due.headline = "delete the flag".into();
+        step_due.due_at_ms = Some(1_000);
+        let mut timed = step(OwedState::Waiting, "x");
+        timed.next_at_ms = Some(2_000);
+        timed.conditions = vec![WatchConditionView {
+            at_ms: Some(2_000),
+            ..waits("at", "at 09:00 tomorrow", WatchTruth::NotYet)
+        }];
+        let mut other = step(OwedState::Waiting, "x");
+        other.conditions = vec![WatchConditionView {
+            label: "u-work merged".into(),
+            ..waits("u-work", "u-work merged", WatchTruth::NotYet)
+        }];
+        let rows = vec![
+            filed("done", OwedBlock::Done, Vec::new()),
+            filed(
+                "due",
+                OwedBlock::Due,
+                vec![
+                    headed,
+                    step_due,
+                    check(VerifyStage::Production, OwedState::Waiting, "x"),
+                ],
+            ),
+            filed(
+                "prod",
+                OwedBlock::WaitingProduction,
+                vec![check(VerifyStage::Production, OwedState::Waiting, "x")],
+            ),
+            filed("sched", OwedBlock::Scheduled, vec![timed]),
+            filed("gate", OwedBlock::WaitingOther, vec![other]),
+            filed(
+                "stg",
+                OwedBlock::WaitingStaging,
+                vec![check(VerifyStage::Staging, OwedState::Waiting, "x")],
+            ),
+        ];
+        let mut board = Board {
+            sections: vec![BoardSection {
+                key: crate::LANDED_SECTION.into(),
+                title: crate::LANDED_TITLE.into(),
+                folded: true,
+                rows: (0..rows.len()).collect(),
+            }],
+            rows,
+            ..Default::default()
+        };
+        for (at_ms, terse) in [(1_000, "19:34"), (2_000, "Fri 09:00")] {
+            board.history_times.insert(
+                at_ms,
+                LocalStamp {
+                    terse: terse.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let model = Model {
+            board: Arc::new(board),
+            ..Model::default()
+        };
+        let lines = plain(&section_lines(&model.board.sections[0], &model, 40));
+        let lines: Vec<&str> = lines.iter().map(|line| line.trim_end()).collect();
+        assert_eq!(
+            lines,
+            [
+                "Landed",
+                "1 due · 4 waiting · 1 done",
+                "",
+                "● due",
+                "  Title of due",
+                "    staging  Import preview renders",
+                "    since 19:34  delete the flag",
+                "",
+                "◷ waiting for staging",
+                "  Title of stg",
+                "",
+                "◷ waiting for production",
+                "  Title of prod",
+                "",
+                "◷ scheduled",
+                "  Title of sched               Fri 09:00",
+                "",
+                "◷ waiting on other work",
+                "  Title of gate            u-work merged",
+                "",
+                "✓ done · c cleans up",
+                "  Title of done",
+                "",
+                "TAB expand · y yank",
+            ]
+        );
+        for width in [12, 20, 30] {
+            let narrow = section_lines(&model.board.sections[0], &model, width);
+            assert!(narrow.iter().all(|line| line.width() <= width), "{width}");
+        }
+    }
+
+    /// A side of the git line with no counts is left out, not drawn empty.
+    #[test]
+    fn the_git_line_omits_a_sync_group_it_has_no_counts_for() {
+        let text = |row: &BoardRow| Line::from(git_value(row, 200, 0)).to_string();
+        assert!(text(&row()).ends_with("(↑2) [↑3 ↓1]"), "{}", text(&row()));
+        let mut local = row();
+        local.git.upstream = None;
+        assert!(text(&local).ends_with("· [↑3 ↓1]"), "{}", text(&local));
+        local.git.base_ahead = None;
+        assert!(!text(&local).contains('—'), "{}", text(&local));
+        assert!(!text(&local).ends_with("· "), "{}", text(&local));
     }
 
     #[test]

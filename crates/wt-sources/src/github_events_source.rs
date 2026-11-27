@@ -3,7 +3,7 @@
 //! rereading the same file never makes old data look fresher, and a snapshot
 //! whose request began before a local write can never confirm that write.
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -41,19 +41,64 @@ impl DaemonRead {
     }
 }
 
+/// How long past the daemon's planned next read a display still waits for
+/// it: the delivery that prompts the read and the read itself take time.
+const LATE: Duration = Duration::from_secs(30);
+
+/// Why a reader that only displays pull requests may show a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// Within [`FRESH`]: what the board itself would use.
+    Fresh,
+    /// Older, and the daemon's budget keeps its next read until then
+    /// (wall-clock epoch ms).
+    Paced { next_fetch_at_ms: u64 },
+    /// The daemon's next read is overdue and the budget it saw is down to
+    /// its reserve, in a window still open: a read here would spend it.
+    BudgetLow,
+}
+
+/// A snapshot a display may show in place of a GitHub read. Never evidence
+/// for a write: only [`Held::Fresh`] data is what [`load`] would return.
+#[derive(Clone, Debug)]
+pub struct DisplayRead {
+    pub read: DaemonRead,
+    pub age_ms: u64,
+    pub held: Held,
+}
+
+impl DisplayRead {
+    /// What a command says under data older than the board would use.
+    pub fn note(&self) -> Option<String> {
+        let minutes = (self.age_ms.saturating_add(30_000) / 60_000).max(1);
+        match self.held {
+            Held::Fresh => None,
+            Held::Paced { .. } => Some(format!(
+                "GitHub reads are paced, using data {minutes} min old"
+            )),
+            Held::BudgetLow => Some(format!("GitHub budget low, using data {minutes} min old")),
+        }
+    }
+}
+
 /// A stale, foreign-build or incomplete snapshot is disposable. Live fetches
 /// are the fallback, and retain their own last-good data on a fetch error.
 pub async fn load(context: &AppContext, branches: &[String]) -> Option<DaemonRead> {
-    context.config.github.events.as_ref()?;
-    read(
-        context.config.paths.cache_root.join("events"),
-        branches.to_vec(),
-        wt_ops::events::repository_identity(&context.config),
-    )
-    .await
+    read(context, branches, false).await.map(|shown| shown.read)
 }
 
-async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> Option<DaemonRead> {
+/// [`load`] for a command that only displays pull requests: it also takes
+/// a snapshot the daemon's budget is holding, so a low budget is not spent
+/// by every command that prints a table.
+pub async fn load_for_display(context: &AppContext, branches: &[String]) -> Option<DisplayRead> {
+    read(context, branches, true).await
+}
+
+async fn read(context: &AppContext, branches: &[String], display: bool) -> Option<DisplayRead> {
+    context.config.github.events.as_ref()?;
+    let directory = context.config.paths.cache_root.join("events");
+    let branches = branches.to_vec();
+    let repository = wt_ops::events::repository_identity(&context.config);
     let result = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         const LIMIT: u64 = 16 * 1024 * 1024;
@@ -71,12 +116,13 @@ async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> 
         // Read the process clock first so the wall-clock age it is offset by
         // can only place the daemon's moments earlier, never later.
         let local_now = Instant::now();
-        Ok::<_, anyhow::Error>(validate(
+        Ok::<_, anyhow::Error>(admit(
             snapshot,
             &branches,
             (now_ms(), local_now),
             wt_app_core::build_info::build_id(),
             &repository,
+            display,
         ))
     })
     .await;
@@ -92,16 +138,39 @@ async fn read(directory: PathBuf, branches: Vec<String>, repository: String) -> 
     }
 }
 
+/// The snapshot's age and why it may still be shown at `now`, if it may.
+fn held(snapshot: &GithubSnapshot, now: u64) -> Option<(u64, Held)> {
+    let age = now.checked_sub(snapshot.updated_at)?;
+    if age <= FRESH.as_millis() as u64 {
+        return Some((age, Held::Fresh));
+    }
+    // The daemon never plans further ahead than its pacing cap.
+    let planned = snapshot
+        .next_fetch_at_ms
+        .filter(|next| next.saturating_sub(snapshot.updated_at) <= wt_events::MAX_PACED_WAIT_MS);
+    if let Some(next_fetch_at_ms) =
+        planned.filter(|next| now <= next.saturating_add(LATE.as_millis() as u64))
+    {
+        return Some((age, Held::Paced { next_fetch_at_ms }));
+    }
+    snapshot
+        .rate_limit
+        .is_some_and(|budget| wt_events::budget_low(budget, now))
+        .then_some((age, Held::BudgetLow))
+}
+
 /// `now` is the same moment on the wall clock (ms) and the process clock.
-fn validate(
+/// Only a `display` reader is given a snapshot older than [`FRESH`].
+fn admit(
     snapshot: GithubSnapshot,
     branches: &[String],
     (now, local_now): (u64, Instant),
     build: &str,
     repository: &str,
-) -> Option<DaemonRead> {
-    let age = now.checked_sub(snapshot.updated_at)?;
-    if age > FRESH.as_millis() as u64
+    display: bool,
+) -> Option<DisplayRead> {
+    let (age_ms, held) = held(&snapshot, now)?;
+    if (!display && held != Held::Fresh)
         || snapshot.writer_sha.as_deref() != Some(build)
         || snapshot.repository.as_deref() != Some(repository)
     {
@@ -121,14 +190,20 @@ fn validate(
     data.prs.retain(|branch, _| branches.contains(branch));
     data.covered_branches = branches.iter().cloned().collect();
     // A start after the write is inconsistent; such data cannot be ordered.
-    let started = snapshot
+    let fetch_started = snapshot
         .fetch_started_at_ms
-        .filter(|started| *started <= snapshot.updated_at)
+        .filter(|started| *started <= snapshot.updated_at);
+    data.observed_at_ms = fetch_started;
+    let started = fetch_started
         .and_then(|started| local_now.checked_sub(Duration::from_millis(now - started)));
-    Some(DaemonRead {
-        data,
-        started,
-        written_ms: snapshot.updated_at,
+    Some(DisplayRead {
+        read: DaemonRead {
+            data,
+            started,
+            written_ms: snapshot.updated_at,
+        },
+        age_ms,
+        held,
     })
 }
 
@@ -204,6 +279,17 @@ mod tests {
         (now, Instant::now())
     }
 
+    /// The board's rule.
+    fn validate(
+        snapshot: GithubSnapshot,
+        branches: &[String],
+        now: (u64, Instant),
+        build: &str,
+        repository: &str,
+    ) -> Option<DaemonRead> {
+        admit(snapshot, branches, now, build, repository, false).map(|shown| shown.read)
+    }
+
     fn snapshot() -> GithubSnapshot {
         GithubSnapshot {
             updated_at: 100_000,
@@ -245,6 +331,107 @@ mod tests {
         assert!(validate(malformed, &branches, at(101_000), "current", "repo").is_none());
         assert!(snapshot_event(Path::new("/events/.github.json.123.tmp")));
         assert!(!snapshot_event(Path::new("/events/state.json")));
+    }
+
+    /// A display takes a snapshot the board would not: one the daemon's
+    /// pace still holds, or one whose budget is down to the reserve. Past
+    /// both it reads GitHub like any other reader.
+    #[test]
+    fn a_display_shows_a_snapshot_the_budget_is_holding_and_says_how_old() {
+        const MINUTE: u64 = 60_000;
+        let branches = vec!["feature".to_owned()];
+        let display = |snapshot: GithubSnapshot, now| {
+            admit(snapshot, &branches, at(now), "current", "repo", true)
+        };
+        let budget = |remaining| {
+            Some(wt_events::RateBudget {
+                limit: 5_000,
+                remaining,
+                cost: 5,
+                reset_at_ms: 100_000 + 40 * MINUTE,
+            })
+        };
+        let fresh = display(snapshot(), 101_000).unwrap();
+        assert_eq!(
+            (fresh.held, fresh.age_ms, fresh.note()),
+            (Held::Fresh, 1_000, None)
+        );
+        assert_eq!(fresh.read.data.observed_at_ms, Some(98_000));
+        // No plan and a healthy budget: stale is stale.
+        assert!(display(snapshot(), 100_000 + 2 * MINUTE).is_none());
+
+        let paced = GithubSnapshot {
+            next_fetch_at_ms: Some(98_000 + 10 * MINUTE),
+            rate_limit: budget(1_400),
+            ..snapshot()
+        };
+        let shown = display(paced.clone(), 100_000 + 8 * MINUTE).unwrap();
+        assert_eq!(
+            shown.held,
+            Held::Paced {
+                next_fetch_at_ms: 98_000 + 10 * MINUTE
+            }
+        );
+        assert_eq!(
+            shown.note().as_deref(),
+            Some("GitHub reads are paced, using data 8 min old")
+        );
+        // The board keeps its own rule and its own paced reads.
+        assert!(
+            validate(
+                paced.clone(),
+                &branches,
+                at(100_000 + 8 * MINUTE),
+                "current",
+                "repo"
+            )
+            .is_none()
+        );
+        // Still nothing for another build, repository or branch set.
+        assert!(
+            admit(
+                paced.clone(),
+                &branches,
+                at(100_000 + 8 * MINUTE),
+                "other",
+                "repo",
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            admit(
+                paced.clone(),
+                &["missing".into()],
+                at(100_000 + 8 * MINUTE),
+                "current",
+                "repo",
+                true
+            )
+            .is_none()
+        );
+        // The planned read is overdue and the budget is healthy: read GitHub.
+        assert!(display(paced.clone(), 100_000 + 11 * MINUTE).is_none());
+        // A plan further out than the daemon ever makes is not believed.
+        let absurd = GithubSnapshot {
+            next_fetch_at_ms: Some(100_000 + 60 * MINUTE),
+            ..paced
+        };
+        assert!(display(absurd, 100_000 + 8 * MINUTE).is_none());
+
+        let low = GithubSnapshot {
+            next_fetch_at_ms: Some(98_000 + 15 * MINUTE),
+            rate_limit: budget(900),
+            ..snapshot()
+        };
+        let shown = display(low.clone(), 100_000 + 25 * MINUTE).unwrap();
+        assert_eq!(shown.held, Held::BudgetLow);
+        assert_eq!(
+            shown.note().as_deref(),
+            Some("GitHub budget low, using data 25 min old")
+        );
+        // Once the window has reset the stored budget says nothing.
+        assert!(display(low, 100_000 + 41 * MINUTE).is_none());
     }
 
     #[tokio::test(start_paused = true)]

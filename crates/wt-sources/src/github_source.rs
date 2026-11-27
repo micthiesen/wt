@@ -17,7 +17,7 @@ use wt_runtime::{
 };
 use wt_vcs::WorktreeSnapshot;
 
-use crate::github_events_source::DaemonRead;
+use crate::{github_events_source::DaemonRead, local_source::Metadata};
 use wt_app_core::context::AppContext;
 
 /// Network reads of GitHub, measured from the prior read's start.
@@ -92,10 +92,16 @@ pub fn start(
     scope: &TaskScope,
     context: &AppContext,
     git: LeafHandle<Vec<WorktreeSnapshot>>,
+    metadata: LeafHandle<Metadata>,
     enabled: bool,
     backstop: Duration,
 ) -> (LeafHandle<GithubData>, GithubRefresh) {
-    let lane = Arc::new(GithubLane::new(context.clone(), git.clone(), enabled));
+    let lane = Arc::new(GithubLane::new(
+        context.clone(),
+        git.clone(),
+        metadata.clone(),
+        enabled,
+    ));
     let github = start_requested_source(
         scope,
         SourceSpec {
@@ -120,7 +126,14 @@ pub fn start(
         reads: lane.reads.clone(),
     };
     spawn_deferred_reads(scope, &lane, github.view());
-    spawn_github_driver(scope, git, github.view(), backstop);
+    spawn_github_driver(
+        scope,
+        git.clone(),
+        metadata.clone(),
+        github.view(),
+        backstop,
+    );
+    spawn_other_branch_recorder(scope, context, git, metadata, github.clone());
     if enabled {
         crate::github_events_source::watch(scope, context, github.view());
     }
@@ -130,6 +143,7 @@ pub fn start(
 struct GithubLane {
     context: AppContext,
     git: LeafHandle<Vec<WorktreeSnapshot>>,
+    metadata: LeafHandle<Metadata>,
     enabled: bool,
     clock: Mutex<LaneClock>,
     reads: Arc<Mutex<ReadTimes>>,
@@ -272,18 +286,17 @@ impl LaneClock {
     }
 
     /// A direct read was refused for the rate limit: background reads wait
-    /// for its reset when the reply named one.
+    /// for its reset when the reply named one, and otherwise as long as
+    /// every other reader backs off from a limit it cannot time.
     fn rate_limited(&mut self, reset_at_ms: Option<u64>) {
         let floor = u64::try_from(GITHUB_MINIMUM.as_millis()).unwrap_or(u64::MAX);
-        self.pace = reset_at_ms.map(|_| {
-            Duration::from_millis(wt_events::failure_wait_ms(
-                floor,
-                1,
-                true,
-                reset_at_ms,
-                epoch_ms(),
-            ))
-        });
+        self.pace = Some(Duration::from_millis(wt_events::failure_wait_ms(
+            floor,
+            1,
+            true,
+            reset_at_ms,
+            epoch_ms(),
+        )));
     }
 
     /// A direct read that started at `started` succeeded.
@@ -313,6 +326,12 @@ fn merge_older(
     let observed = if added.is_empty() {
         *shown_at
     } else {
+        // The combined data is only as recent as its older part, and has no
+        // known time when either part has none.
+        data.observed_at_ms = shown
+            .observed_at_ms
+            .zip(older.data.observed_at_ms)
+            .map(|(shown, older)| shown.min(older));
         shown_at.earliest(older.stamp())
     };
     for branch in added {
@@ -326,10 +345,16 @@ fn merge_older(
 }
 
 impl GithubLane {
-    fn new(context: AppContext, git: LeafHandle<Vec<WorktreeSnapshot>>, enabled: bool) -> Self {
+    fn new(
+        context: AppContext,
+        git: LeafHandle<Vec<WorktreeSnapshot>>,
+        metadata: LeafHandle<Metadata>,
+        enabled: bool,
+    ) -> Self {
         Self {
             context,
             git,
+            metadata,
             enabled,
             clock: Mutex::default(),
             reads: Arc::default(),
@@ -367,7 +392,12 @@ impl GithubLane {
         let Some(inventory) = self.git.confirmed() else {
             return Ok(None);
         };
-        let branches = inventory_branches(&inventory);
+        // Each row's recorded other branches come from wt's state, under
+        // the same rule: an unread state cannot name them.
+        let Some(state) = self.metadata.confirmed() else {
+            return Ok(None);
+        };
+        let branches = inventory_branches(&inventory, &state.0);
         if !self.enabled || branches.is_empty() {
             let mut clock = self.clock();
             if clock.published.as_ref() == Some(&branches) {
@@ -486,16 +516,18 @@ fn spawn_deferred_reads(
 }
 
 /// Rereads GitHub when the confirmed branch set changes (including when Git
-/// first goes live) and on the slow backstop.
+/// and wt's state first go live) and on the slow backstop.
 fn spawn_github_driver(
     scope: &TaskScope,
     git: LeafHandle<Vec<WorktreeSnapshot>>,
+    metadata: LeafHandle<Metadata>,
     github: SourceHandle<GithubData>,
     backstop: Duration,
 ) {
     let cancel = scope.token();
     scope.spawn(async move {
         let mut updates = git.subscribe();
+        let mut states = metadata.subscribe();
         updates.mark_changed();
         let mut previous: Option<Vec<String>> = None;
         let mut interval = tokio::time::interval_at(Instant::now() + backstop, backstop);
@@ -506,15 +538,21 @@ fn spawn_github_driver(
                 _ = cancel.cancelled() => break,
                 changed = updates.changed() => {
                     if changed.is_err() { break; }
-                    let snapshot = updates.borrow_and_update().clone();
-                    let Some(confirmed) = git.confirm(&snapshot) else { continue };
-                    let next = inventory_branches(&confirmed);
-                    if previous.as_ref() != Some(&next) {
-                        previous = Some(next);
-                        github.refresh();
-                    }
+                    updates.borrow_and_update();
                 }
-                _ = interval.tick() => { github.refresh(); }
+                changed = states.changed() => {
+                    if changed.is_err() { break; }
+                    states.borrow_and_update();
+                }
+                _ = interval.tick() => { github.refresh(); continue; }
+            }
+            let (Some(inventory), Some(state)) = (git.confirmed(), metadata.confirmed()) else {
+                continue;
+            };
+            let next = inventory_branches(&inventory, &state.0);
+            if previous.as_ref() != Some(&next) {
+                previous = Some(next);
+                github.refresh();
             }
         }
     });
@@ -557,17 +595,72 @@ fn epoch_ms() -> u64 {
         })
 }
 
-/// Branches GitHub is asked about: every linked worktree's branch.
-fn inventory_branches(inventory: &[WorktreeSnapshot]) -> Vec<String> {
-    let mut branches: Vec<_> = inventory
-        .iter()
-        .filter(|snapshot| !snapshot.worktree.is_main)
-        .map(|snapshot| snapshot.worktree.target.branch.clone())
-        .filter(|branch| !branch.is_empty())
-        .collect();
-    branches.sort();
-    branches.dedup();
-    branches
+/// Records what each live GitHub read says of the worktrees' recorded other
+/// branches (see `wt_ops::other_branches`). The record is what the board
+/// shows and what removal checks under its lock, so the batched read's
+/// answer has to reach it without waiting for someone to ask for a removal.
+fn spawn_other_branch_recorder(
+    scope: &TaskScope,
+    context: &AppContext,
+    git: LeafHandle<Vec<WorktreeSnapshot>>,
+    metadata: LeafHandle<Metadata>,
+    github: LeafHandle<GithubData>,
+) {
+    let cancel = scope.token();
+    let context = context.clone();
+    scope.spawn(async move {
+        let mut updates = github.subscribe();
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                changed = updates.changed() => if changed.is_err() { break; },
+            }
+            let snapshot = updates.borrow_and_update().clone();
+            // A failed fetch keeps its last data, and restored data was
+            // never read by this process: neither is an answer from now.
+            let Some(data) = github
+                .confirm(&snapshot)
+                .filter(|_| matches!(snapshot.state(), wt_runtime::SourceState::Ready))
+            else {
+                continue;
+            };
+            let (Some(inventory), Some(state)) = (git.confirmed(), metadata.confirmed()) else {
+                continue;
+            };
+            let rows: Vec<wt_vcs::WorktreeRecord> = inventory
+                .iter()
+                .map(|snapshot| &snapshot.worktree)
+                .filter(|row| {
+                    !row.is_main
+                        && wt_core::stored_other_branches(&state.0["slugs"][row.target.slug()])
+                            .iter()
+                            .any(|other| data.covered_branches.contains(&other.branch))
+                })
+                .cloned()
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            wt_ops::other_branches::observe(
+                &context,
+                &rows,
+                &state.0,
+                Some(&data),
+                wt_ops::other_branches::Ask::Nothing,
+            )
+            .await;
+        }
+    });
+}
+
+/// Branches GitHub is asked about: every linked worktree's branch and the
+/// other branches `state` records for it.
+fn inventory_branches(inventory: &[WorktreeSnapshot], state: &serde_json::Value) -> Vec<String> {
+    wt_ops::other_branches::github_branches(
+        inventory.iter().map(|snapshot| &snapshot.worktree),
+        state,
+    )
 }
 
 #[cfg(test)]
@@ -613,8 +706,10 @@ mod tests {
             .unwrap();
         let scope = TaskScope::new();
         let (git, git_publisher) = leaf_channel(&scope, spec("git", Domain::Git));
+        let (metadata, metadata_publisher) =
+            leaf_channel(&scope, spec("metadata", Domain::Metadata));
         // Disabled GitHub still proves the gate without a network client.
-        let lane = GithubLane::new(fixture.ctx.clone(), git, false);
+        let lane = GithubLane::new(fixture.ctx.clone(), git, metadata, false);
         let cancel = CancellationToken::new();
         assert!(
             lane.fetch(Request::Refresh, &cancel)
@@ -629,13 +724,31 @@ mod tests {
             ],
             Stamp::now(),
         );
+        // The recorded other branches are part of the key set, so an unread
+        // state holds the fetch as an unread inventory does.
+        assert!(
+            lane.fetch(Request::Refresh, &cancel)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        metadata_publisher.publish_live(
+            (
+                serde_json::json!({"slugs": {"one": {"otherBranches": {"feature/extra": {}}}}}),
+                Default::default(),
+            ),
+            Stamp::now(),
+        );
         let fetched = lane
             .fetch(Request::Refresh, &cancel)
             .await
             .unwrap()
-            .expect("confirmed Git fetches");
+            .expect("confirmed Git and state fetch");
         assert!(fetched.data.prs.is_empty());
-        assert_eq!(*lane.clock().published.as_ref().unwrap(), ["feature/one"]);
+        assert_eq!(
+            *lane.clock().published.as_ref().unwrap(),
+            ["feature/extra", "feature/one"]
+        );
         // The same branch set does not republish.
         assert!(
             lane.fetch(Request::Refresh, &cancel)
@@ -648,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn inventory_branches_are_linked_sorted_and_unique() {
+    fn inventory_branches_are_linked_sorted_unique_and_include_recorded_other_branches() {
         let inventory = [
             worktree("main", "main", true),
             worktree("two", "feature/two", false),
@@ -657,8 +770,22 @@ mod tests {
             worktree("detached", "", false),
         ];
         assert_eq!(
-            inventory_branches(&inventory),
+            inventory_branches(&inventory, &serde_json::Value::Null),
             ["feature/one", "feature/two"]
+        );
+        // A row's recorded other branches ride the same read; a recorded
+        // merge is final, and the main clone's record is not a worktree's.
+        let state = serde_json::json!({"slugs": {
+            "two": {"otherBranches": {
+                "feature/extra": {"state": "open", "number": 9},
+                "feature/one": {"state": "unknown"},
+                "feature/done": {"state": "merged", "number": 8},
+            }},
+            "main": {"otherBranches": {"feature/main-side": {}}},
+        }});
+        assert_eq!(
+            inventory_branches(&inventory, &state),
+            ["feature/extra", "feature/one", "feature/two"]
         );
     }
 
@@ -709,8 +836,9 @@ mod tests {
     }
 
     /// A budget down to its reserve holds the backstop and other background
-    /// reads until the reset, whether a direct read or the daemon's snapshot
-    /// reported it. A read the user asked for keeps the ordinary floor.
+    /// reads for the paced interval, whether a direct read or the daemon's
+    /// snapshot reported it. A read the user asked for keeps the ordinary
+    /// floor.
     #[tokio::test(start_paused = true)]
     async fn a_low_budget_defers_background_reads_but_not_requested_ones() {
         let branches = branches();
@@ -742,8 +870,11 @@ mod tests {
             plan(&mut clock, Request::Refresh, later),
             Plan::Defer
         ));
-        let due = clock.deferred.unwrap();
-        assert!(due >= start + reset_in && due <= start + reset_in + Duration::from_secs(10));
+        // The reset is 20 minutes off; the hold is capped short of it.
+        assert_eq!(
+            clock.deferred,
+            Some(start + Duration::from_millis(wt_events::MAX_PACED_WAIT_MS))
+        );
         assert!(matches!(
             plan(&mut clock, Request::Direct, later),
             Plan::Network
@@ -771,7 +902,8 @@ mod tests {
             Plan::Defer
         ));
 
-        // A refused read waits for the reset its reply named, and only then.
+        // A refused read waits for the reset its reply named. One that named
+        // none still backs off, instead of reading again on the next tick.
         let mut clock = LaneClock {
             live_started: Some(start),
             ..LaneClock::default()
@@ -781,9 +913,16 @@ mod tests {
             plan(&mut clock, Request::Refresh, later),
             Plan::Defer
         ));
+        assert!(clock.deferred.unwrap() >= start + reset_in);
         clock.rate_limited(None);
+        let soon = start + Duration::from_secs(60);
         assert!(matches!(
-            plan(&mut clock, Request::Refresh, later),
+            plan(&mut clock, Request::Refresh, soon),
+            Plan::Defer
+        ));
+        assert_eq!(clock.deferred, Some(start + Duration::from_secs(5 * 60)));
+        assert!(matches!(
+            plan(&mut clock, Request::Direct, soon),
             Plan::Network
         ));
     }

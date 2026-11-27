@@ -417,9 +417,11 @@ async fn stage_reach(
 /// What this process can prove of each row's landing, for saying what the
 /// row owes: the base landing, and production and deploy proof for the
 /// stages its checks name. `github` is the caller's own fresh read; without
-/// one only Git ancestry proves a landing, so a squash-merged row reads as
-/// not landed. A row whose evidence cannot be read is left out. Display
-/// only: removal takes its proof from [`plan`].
+/// one only Git ancestry proves a landing, or the row's own history where it
+/// records the pull request merged and the work landed at the current HEAD
+/// (see [`history_landed`]). A squash-merged row with neither reads as not
+/// landed. A row whose evidence cannot be read is left out. Display only:
+/// removal takes its proof from [`plan`].
 pub async fn row_landings(
     ctx: &AppContext,
     rows: &[WorktreeRecord],
@@ -431,21 +433,46 @@ pub async fn row_landings(
     let mut published_bases = BTreeMap::new();
     let mut warning = None;
     let mut landings = BTreeMap::new();
+    let mut read = Vec::new();
     for row in rows.iter().filter(|row| !row.is_main) {
-        let slug = row.target.slug();
-        let stored = &state["slugs"][slug];
+        let stored = &state["slugs"][row.target.slug()];
         let Ok(landing) =
             landing_evidence(ctx, row, stored, github, &mut published_bases, &mut warning).await
         else {
             continue;
         };
-        let owed = landing.landed().then(|| owed_check_stages(stored));
+        read.push((row, landing.landed()));
+    }
+    // GitHub not returning a pull request is no answer about it. One that
+    // it returns open or closed is, and stands against the history.
+    let silent: Vec<String> = read
+        .iter()
+        .filter(|(row, landed)| !landed && !github.prs.contains_key(&row.target.branch))
+        .map(|(row, _)| row.target.slug().to_owned())
+        .collect();
+    let history = if silent.is_empty() {
+        BTreeMap::new()
+    } else {
+        ctx.database
+            .call(move |store| Ok(store.read_worktree_events_for(&silent, HISTORY_PROOF_EVENTS)?))
+            .await
+            .unwrap_or_default()
+    };
+    for (row, landed) in read {
+        let slug = row.target.slug();
+        let stored = &state["slugs"][slug];
+        let landed = landed
+            || match history.get(slug) {
+                Some(events) => history_landed(ctx, row, events).await,
+                None => false,
+            };
+        let owed = landed.then(|| owed_check_stages(stored));
         let asked = |stage| owed.is_some_and(|owed| owed.stage(stage));
         let reach = stage_reach(ctx, row, github, asked, false).await;
         landings.insert(
             slug.to_owned(),
             wt_core::Landing::new(
-                landing.landed(),
+                landed,
                 reach.in_production,
                 ctx.config.branch.separate_production(),
             )
@@ -453,6 +480,35 @@ pub async fn row_landings(
         );
     }
     landings
+}
+
+/// How much of a row's newest history is read for [`history_landed`].
+const HISTORY_PROOF_EVENTS: usize = 200;
+
+/// Whether the row's own history proves the landing GitHub is silent about:
+/// it records the pull request merged, and the work landed at the HEAD the
+/// checkout is on now (see [`wt_core::history_landed_at`]). A stopped rebase
+/// or merge has a transient HEAD and proves nothing.
+async fn history_landed(
+    ctx: &AppContext,
+    row: &WorktreeRecord,
+    events: &[wt_core::WorktreeEvent],
+) -> bool {
+    if wt_vcs::operation_in_progress(row.git_dir.as_deref()).await
+        || wt_lifecycle::checkout_missing(row).await
+    {
+        return false;
+    }
+    let head = run_git(
+        ctx,
+        Path::new(&row.target.path),
+        ["rev-parse", "--verify", "HEAD"],
+    )
+    .await
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| output.stdout_text().trim().to_owned());
+    head.is_some_and(|head| wt_core::history_landed_at(events, &head))
 }
 
 /// The board's "in production" proof: HEAD, or the exact merge commit of the
@@ -835,10 +891,15 @@ async fn published_base_holds_patches(
     let Some(tip) = published_tip(ctx, path, published, warning).await? else {
         return Ok(false);
     };
-    let cherry = run_git(ctx, path, wt_vcs::cherry_args(&tip, head)).await?;
-    Ok(cherry.status.success()
-        && !cherry.stdout_truncated
-        && wt_vcs::cherry_all_in_base(&cherry.stdout_text()))
+    let held = wt_vcs::base_holds_everything(&tip, head, None, |args| async {
+        let output = run_git(ctx, path, args).await.ok()?;
+        (!output.stdout_truncated).then(|| wt_vcs::GitRead {
+            code: output.status.code(),
+            stdout: output.stdout_text(),
+        })
+    })
+    .await;
+    Ok(matches!(held, wt_vcs::BeyondBase::Nothing(commits) if commits > 0))
 }
 
 /// The object store whose origin a landing proof is read from and rechecked
@@ -1251,6 +1312,97 @@ mod tests {
         let advanced = plan().await;
         assert!(!advanced.landed);
         assert!(!advanced.hazards.is_empty());
+        git(ctx, path, &["reset", "-q", "--hard", "HEAD~1"]).await;
+        assert!(plan().await.landed);
+
+        // A base that reverted the work no longer holds it, though the
+        // reverted patch still matches the branch's commit.
+        let branch = row_one(ctx).await.target.branch;
+        git(ctx, path, &["checkout", "-q", "--detach", "origin/main"]).await;
+        git(ctx, path, &["revert", "--no-edit", &pushed]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        git(ctx, path, &["fetch", "-q", "origin"]).await;
+        git(ctx, path, &["checkout", "-q", &branch]).await;
+        let reverted = plan().await;
+        assert!(!reverted.landed);
+        assert!(!reverted.hazards.is_empty());
+        fixture.close().await.unwrap();
+    }
+
+    /// A squash merge leaves no ancestry, and a later GitHub read may not
+    /// return the merged pull request. The row's own history then proves
+    /// the landing, at the HEAD it recorded and nowhere else, and never
+    /// against a pull request GitHub returns unmerged.
+    #[tokio::test]
+    async fn history_proves_a_merged_landing_github_no_longer_returns() {
+        use wt_core::{LandedOn, PrChange, WorktreeEventKind};
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        with_origin(&fixture).await;
+        std::fs::write(path.join("work.txt"), "squashed work\n").unwrap();
+        git(ctx, path, &["add", "work.txt"]).await;
+        git(ctx, path, &["commit", "-m", "feature work"]).await;
+        let head = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let row = row_one(ctx).await;
+        let landed = |github: Option<GithubData>| {
+            let row = row.clone();
+            let state = state.clone();
+            async move {
+                row_landings(ctx, std::slice::from_ref(&row), &state, github.as_ref()).await["one"]
+                    .base
+            }
+        };
+        assert!(!landed(None).await);
+        let record = |event: WorktreeEventKind| async move {
+            ctx.database
+                .call(move |store| Ok(store.append_worktree_event("one", 1, &event)?))
+                .await
+                .unwrap();
+        };
+        record(WorktreeEventKind::Pr {
+            number: 42,
+            change: PrChange::Merged,
+        })
+        .await;
+        // A landing recorded without its HEAD says nothing of this one.
+        record(WorktreeEventKind::Landed {
+            on: LandedOn::Base,
+            head: None,
+            landed_at_ms: None,
+        })
+        .await;
+        assert!(!landed(None).await);
+        record(WorktreeEventKind::Landed {
+            on: LandedOn::Base,
+            head: Some(head.clone()),
+            landed_at_ms: None,
+        })
+        .await;
+        assert!(landed(None).await);
+        // A read that covers the branch and returns no pull request is
+        // silent, not a contradiction.
+        let mut silent = GithubData::default();
+        silent.covered_branches.insert(row.target.branch.clone());
+        assert!(landed(Some(silent)).await);
+        // GitHub's own answer that the pull request is open wins.
+        let mut open = merged_pr(&row.target.branch, &head);
+        open.prs.get_mut(&row.target.branch).unwrap().state = "OPEN".into();
+        assert!(!landed(Some(open)).await);
+        // Removal never takes this proof.
+        let plan = plan_with_evidence(ctx, vec![row.clone()], &state, &GithubData::default(), None)
+            .await
+            .unwrap();
+        assert!(!plan.rows[0].landed);
+        // Work past the recorded HEAD has not landed.
+        std::fs::write(path.join("work.txt"), "after the merge\n").unwrap();
+        git(ctx, path, &["commit", "-am", "local only"]).await;
+        assert!(!landed(None).await);
         fixture.close().await.unwrap();
     }
 

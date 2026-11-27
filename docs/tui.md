@@ -56,7 +56,7 @@ Sections fold with `Tab`. Only folded and empty sections are cursor stops; an
 expanded section is just its rows. A folded header reads `[×NN] Name` with a
 right-aligned count of each marker its rows wear, most urgent first, so it
 shows exactly the glyphs you would see expanded (dim markers such as todo,
-finished and archived are left out), plus conflicts and failing checks. Selecting it shows the full rollup and blocker notes in the
+finished and archived are left out), plus conflicts and failing checks. Selecting it shows the full rollup and blocker notes (for the Landed block, [what its header counts](#the-landed-blocks-pane)) in the
 details pane. `[ui].sort = "status"` orders rows by work status; manual section
 placement remains separate. Within a section, rows without a manual order sort
 first, and a stack sorts as one unit under its root's identity. A stack member
@@ -68,7 +68,11 @@ local row is drawn in one derived block, **Landed**, instead of its section.
 The block sits after the manual sections and the Inbox and before the rows
 being removed and the archive, is hidden while empty, and folds like a
 section. Its header counts its rows by where they stand, leaving out a count
-of zero, open or folded:
+of zero, open or folded. The counts outrank the rule: a pane too narrow for
+the whole header first shortens and then drops the rule's dashes, then says
+`wait` for `waiting` (`Landed · 3 due · 24 wait · 2 done`), and the folded
+header last drops the name (`[×29] 3 due · 24 wait · 2 done`). A count is
+never cut.
 
     ── Landed · 3 due · 24 waiting · 2 done ──────────────
        Renew the add-on expiry             due staging  …
@@ -76,11 +80,17 @@ of zero, open or folded:
        Rerun the renewal check               Mon 10:53  …
        Drop the old topic sweep                   done  …
 
-Rows are in landing order, oldest first, and a new landing is added at the
-bottom: a row never moves inside the block when what it owes changes. The
-landing time is the row's first recorded `landed` history event; a row with
-none is placed by the newest commit of its branch, then by when its checkout
-was created, and rows that tie are ordered by slug. History loads after the
+Rows are in landing order, oldest first: a row never moves inside the block
+when what it owes changes or on a later refresh. The landing time is the one
+the row's first `landed` history event recorded: the pull request's merge
+time where GitHub gave one, else the committer time of the base commit that
+brought the branch in (the merge commit on the base's first-parent line, or
+the branch's own commit when the base fast-forwarded to it). So several
+merges that wt first sees in one refresh are still in the order they merged.
+An event from before that was recorded, or with neither known, counts as
+landed when wt saw it, which also breaks a tie; then the slug does. A row
+with no `landed` event is placed by the newest commit of its branch, then by
+when its checkout was created. History loads after the
 first frame, so until it has loaded every row is placed by its last commit
 time and the order can change once when the landing events arrive.
 
@@ -89,8 +99,22 @@ waits for next: `due staging`, `due production` or `due` (yellow, red once
 anything is overdue), `staging`, `production`, the time its next item comes
 due (`22:32`, `Fri 18:12`), `other work`, or `done`. The label is the
 heading `wt owed --all` lists the row under
-([how a row is filed](owed.md#the-landed-block)), so the two agree. It gives
-way to a title that needs the room.
+([how a row is filed](owed.md#the-landed-block)), so the two agree. The label
+and the glyph cluster outrank the title: a long title is cut with an
+ellipsis to make room for them, and the label goes only in a pane too narrow
+for it and eight cells of title.
+
+#### The Landed block's pane
+
+Selecting the folded block shows what its header counts and nothing else.
+After the name and the counts (`1 due · 4 waiting · 1 done`) come the groups
+that have rows: `● due`, each row followed by one line per thing due (`staging
+Import preview renders`, `since 19:34  delete the flag`); `◷ waiting for
+staging`, `◷ waiting for production`, `◷ scheduled` (with the time its next
+item comes due at the right edge) and `◷ waiting on other work` (with what it
+waits for); and `✓ done · c cleans up`. There is no rollup of asserted states
+or risks, no attention count and no "blocked on" group: those describe rows
+before they merge.
 
 The block cannot be renamed, deleted or used as a move target, and a row in
 it cannot be moved or reordered: the notice reads `Landed is derived from
@@ -127,7 +151,9 @@ unavailable fact shows `—` rather than reading as clean.
 Below the rows come a rebase block when the branch would not rebase cleanly
 onto its base (listing up to eight conflicting files from a `git merge-tree`
 pre-flight), paused automations, the session summary, PR comments, and the
-unresolved thread count. A folded section's details show its rollup, member
+unresolved thread count. The status line wraps only between its ` · `
+separated items, so a continuation line starts under the first line's text
+and never with a separator. A folded section's details show its rollup, member
 rows, a red "blocked on you" group with each needs-human member's note, and a
 yellow "blocked on" group with external gates. A review request's details show its state, branch,
 author, checks, and keys. The details pane scrolls with `Ctrl+J`/`Ctrl+K` and
@@ -355,9 +381,12 @@ row's own work lands, so a real row never shows it beside a landed header:
   without proof it arrived, `delivering` once the conditions held, `held:
   automations paused` while a pause holds the delivery, and the reason a
   condition cannot be read.
-- **Text.** All of it, wrapped under the "when": what a check proves or a
-  step's prompt with the author's line breaks kept, then its numbered steps,
-  each wrapped under its own text. A gate's text is followed by a dim line
+- **Text.** All of it, wrapped under the "when", with the author's line
+  breaks kept: a check's opening line and then why only that stage can prove
+  it, or a step's prompt; then its numbered steps (`STEPS: 1. … 2. …`), each
+  wrapped under its own text. A check set by a build from before line
+  breaks were stored, or restated by one, is one line and reads as one paragraph before
+  its steps. A gate's text is followed by a dim line
   saying what clears it, `clears when ○ #3806 in production` (`clears at
   17:00` for a time, `, then wakes the session` with a `--then`), or `a
   person clears it`.
@@ -386,7 +415,7 @@ has landed its marker on the left carries the phase, so the mark is shown
 only as the count of two or more things due. A folded section's
 header counts markers only, so it never shows a mark its rows would not, and
 its rollup in the details pane counts rows with something `due`, `owed,
-waiting` and `overdue`.
+waiting` and `overdue`. The Landed block has [its own pane](#the-landed-blocks-pane).
 
 ### Waiting rows
 
@@ -840,6 +869,8 @@ Several behaviors are intentional rather than incidental:
   never reads green.
 - A landed row's git line names the base as the branch line does
   (`merged into main`) rather than always saying `origin/main`.
+- The git line leaves out a sync group it has no counts for (a branch with
+  no upstream, a base not read yet) instead of drawing an empty pair of brackets.
 
 Session `; d` and `; x` act immediately, without confirmation; the
 review-requests fold is not persisted.

@@ -464,6 +464,7 @@ fn observations(
                     };
                     Some(observed_pr(pr, queued, review_bot))
                 });
+            let landed = git_facts.then_some(row.git.landed_on).flatten();
             let observed = ObservedRow {
                 pr,
                 conflicted: git_facts
@@ -474,12 +475,12 @@ fn observations(
                             .map(|files| !files.is_empty())
                     })
                     .flatten(),
-                landed: git_facts.then_some(row.git.landed_on).flatten().map(
-                    |landed| match landed {
-                        LandingKind::Base => LandedOn::Base,
-                        LandingKind::Production => LandedOn::Production,
-                    },
-                ),
+                landed: landed.map(|landed| match landed {
+                    LandingKind::Base => LandedOn::Base,
+                    LandingKind::Production => LandedOn::Production,
+                }),
+                landed_head: landed.and(row.git.head_sha.clone()),
+                landed_at_ms: landed.and(row.git.landed_at_ms),
                 work: None,
             };
             (row.slug.clone(), observed)

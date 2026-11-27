@@ -565,7 +565,7 @@ pub(crate) fn event_badge(event: &WorktreeEventKind, policy: &DisplayPolicy) -> 
         ),
         Event::Conflict { resolved: false } => badge(glyphs::CONFLICT, theme::ERR),
         Event::Conflict { resolved: true } => badge(glyphs::RESTACK, theme::OK),
-        Event::Landed { on } => badge(
+        Event::Landed { on, .. } => badge(
             match on {
                 LandedOn::Base => glyphs::MERGE,
                 LandedOn::Production => glyphs::PRODUCTION,
@@ -1408,12 +1408,18 @@ mod tests {
         let mut landed = row();
         landed.git.landed_on = Some(LandingKind::Base);
         assert_eq!(
-            event(Event::Landed { on: LandedOn::Base }),
+            event(Event::Landed {
+                on: LandedOn::Base,
+                head: None,
+                landed_at_ms: None,
+            }),
             loud_status_badge(&landed)
         );
         assert_eq!(
             event(Event::Landed {
-                on: LandedOn::Production
+                on: LandedOn::Production,
+                head: None,
+                landed_at_ms: None,
             }),
             Some(badge(glyphs::PRODUCTION, theme::OK))
         );

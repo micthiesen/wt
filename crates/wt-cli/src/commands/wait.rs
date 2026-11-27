@@ -161,10 +161,17 @@ impl Outcome {
         for (index, arg) in args.conditions.iter().enumerate() {
             let (state, reason) = self.state(index, clock.now_ms);
             let state = state.replace('_', " ");
+            // The argument is named beside its reading only where the
+            // reading says more than the argument did.
             let described = self.when[index].describe(clock);
+            let named = if *arg == described {
+                described
+            } else {
+                format!("{arg}: {described}")
+            };
             lines.push(match reason {
-                Some(reason) => format!("  {arg}: {described}: {state} ({reason})"),
-                None => format!("  {arg}: {described}: {state}"),
+                Some(reason) => format!("  {named}: {state} ({reason})"),
+                None => format!("  {named}: {state}"),
             });
         }
         if self.ended == Ended::TimedOut {
@@ -473,6 +480,27 @@ mod tests {
         assert_eq!(
             code(Ended::Interrupted, vec![Truth::NotYet, Truth::NotYet]),
             130
+        );
+    }
+
+    /// A condition whose reading is its own word is printed once.
+    #[test]
+    fn a_condition_that_reads_as_its_argument_is_named_once() {
+        let conditions = ["merged", "settled"];
+        let mut ended = outcome(
+            Ended::TimedOut,
+            &conditions,
+            vec![Truth::Unknown("no current data".into()), Truth::NotYet],
+        );
+        ended.problem = Some("GitHub is switched off (WT_GITHUB=off)".into());
+        let text = ended.text(&args(&conditions, false, "30m"), clock());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1..3],
+            [
+                "  merged: unknown (GitHub is switched off (WT_GITHUB=off))",
+                "  settled: PR checks settled: not yet",
+            ]
         );
     }
 

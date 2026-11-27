@@ -180,6 +180,11 @@ pub struct GithubData {
     /// server reports none (rate limiting switched off, an older snapshot).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
+    /// Wall-clock start of the read that produced this data: what it says
+    /// was true no later than then. `None` for data that cannot say, which
+    /// then orders after nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
 }
 
 impl GithubData {

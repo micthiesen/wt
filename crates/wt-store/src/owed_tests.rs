@@ -1297,6 +1297,8 @@ fn a_removed_row_that_reached_production_owes_its_production_check_now() {
             u64::try_from(NOON).unwrap(),
             &WorktreeEventKind::Landed {
                 on: wt_core::LandedOn::Production,
+                head: None,
+                landed_at_ms: None,
             },
         )
         .unwrap();

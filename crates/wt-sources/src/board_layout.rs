@@ -59,23 +59,31 @@ fn in_landed_block(board: &Board, row: &BoardRow) -> bool {
         && row.owed_block.is_some()
 }
 
-/// When the row's work landed, which orders the Landed block: its first
-/// recorded landing, else the newest commit of its branch (nothing is
-/// committed after a landing), else the checkout's creation. None of these
-/// changes with what the row owes, so a row keeps its place.
-fn landed_at_ms(board: &Board, row: &BoardRow) -> u64 {
-    board
-        .row_history
-        .get(&row.key)
-        .and_then(|events| {
-            events
-                .iter()
-                .find(|event| matches!(event.event, wt_core::WorktreeEventKind::Landed { .. }))
+/// When the row's work landed, which orders the Landed block, and when wt
+/// first saw that, which breaks a tie. The first recorded landing says
+/// both: the merge time it recorded, or for an event from before it
+/// recorded one the time it was seen. Several landings seen in one refresh
+/// share that second time, so the first is what orders them. Without an
+/// event, the newest commit of the branch (nothing is committed after a
+/// landing), else the checkout's creation. None of these changes with what
+/// the row owes or with a later refresh, so a row keeps its place.
+fn landed_at_ms(board: &Board, row: &BoardRow) -> (u64, u64) {
+    let recorded = board.row_history.get(&row.key).and_then(|events| {
+        events.iter().find_map(|event| match event.event {
+            wt_core::WorktreeEventKind::Landed { landed_at_ms, .. } => {
+                Some((landed_at_ms.unwrap_or(event.at_ms), event.at_ms))
+            }
+            _ => None,
         })
-        .map(|event| event.at_ms)
-        .or(row.git.last_commit_ms)
-        .or(row.git.created_ms)
-        .unwrap_or(u64::MAX)
+    });
+    recorded.unwrap_or_else(|| {
+        let at = row
+            .git
+            .last_commit_ms
+            .or(row.git.created_ms)
+            .unwrap_or(u64::MAX);
+        (at, at)
+    })
 }
 
 /// Lay the board out from the stored placement. With
@@ -804,7 +812,11 @@ mod tests {
         use wt_core::{LandedOn, OwedPhase, VerifyStage, WorktreeEvent, WorktreeEventKind};
         let landing = |at_ms: u64, on: LandedOn| WorktreeEvent {
             at_ms,
-            event: WorktreeEventKind::Landed { on },
+            event: WorktreeEventKind::Landed {
+                on,
+                head: None,
+                landed_at_ms: None,
+            },
         };
         let mut committed = owing("committed", OwedPhase::Waiting, None);
         committed.git.last_commit_ms = Some(2_500);
@@ -896,6 +908,98 @@ mod tests {
         ];
         appended.extend(["a-fresh", "unknown"]);
         assert_eq!(drawn(&board), appended);
+    }
+
+    /// Several merges seen by one refresh share the time wt saw them. The
+    /// time each recorded as its merge orders them; an event from before
+    /// that was recorded keeps the time it was seen.
+    #[test]
+    fn landings_seen_in_one_refresh_are_ordered_by_when_each_merged() {
+        use wt_core::{LandedOn, OwedPhase, WorktreeEvent, WorktreeEventKind};
+        const SEEN: u64 = 9_000;
+        let merged = [
+            ("f-first", 1_000),
+            ("e-second", 2_000),
+            ("d-third", 3_000),
+            ("c-fourth", 4_000),
+            ("b-fifth", 5_000),
+            ("a-sixth", 6_000),
+        ];
+        let mut board = Board {
+            rows: merged
+                .iter()
+                .rev()
+                .map(|(slug, _)| owing(slug, OwedPhase::Waiting, None))
+                .collect(),
+            ..Board::default()
+        };
+        board.display.owed_sections = true;
+        let landing = |seen: u64, landed_at_ms: Option<u64>| {
+            vec![WorktreeEvent {
+                at_ms: seen,
+                event: WorktreeEventKind::Landed {
+                    on: LandedOn::Base,
+                    head: None,
+                    landed_at_ms,
+                },
+            }]
+        };
+        board.row_history = merged
+            .iter()
+            .map(|(slug, at)| ((*slug).to_owned(), landing(SEEN, Some(*at))))
+            .collect();
+        let drawn = |board: &Board| -> Vec<String> {
+            board
+                .sections
+                .iter()
+                .find(|section| section.key == LANDED_SECTION)
+                .unwrap()
+                .rows
+                .iter()
+                .map(|&index| board.rows[index].key.clone())
+                .collect()
+        };
+        let state = json!({"slugs": {}});
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(drawn(&board), merged.map(|(slug, _)| slug));
+        // A later refresh, and a later landing in production, move nothing.
+        board
+            .row_history
+            .get_mut("a-sixth")
+            .unwrap()
+            .push(WorktreeEvent {
+                at_ms: SEEN + 1,
+                event: WorktreeEventKind::Landed {
+                    on: LandedOn::Production,
+                    head: None,
+                    landed_at_ms: Some(500),
+                },
+            });
+        prepare(&mut board, &state, "main", UiSort::Status);
+        assert_eq!(drawn(&board), merged.map(|(slug, _)| slug));
+        // Old events have no merge time: the time seen orders them among
+        // the rest, and then the slug, as before.
+        for slug in ["c-fourth", "d-third"] {
+            board
+                .row_history
+                .insert(slug.to_owned(), landing(3_500, None));
+        }
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(
+            drawn(&board),
+            [
+                "f-first", "e-second", "c-fourth", "d-third", "b-fifth", "a-sixth"
+            ]
+        );
+        // The same merge time falls back to when each was seen.
+        board
+            .row_history
+            .insert("b-fifth".to_owned(), landing(SEEN - 1, Some(6_000)));
+        board
+            .row_history
+            .insert("a-sixth".to_owned(), landing(SEEN, Some(6_000)));
+        prepare(&mut board, &state, "main", UiSort::Manual);
+        assert_eq!(drawn(&board)[4..], ["b-fifth", "a-sixth"]);
     }
 
     #[test]

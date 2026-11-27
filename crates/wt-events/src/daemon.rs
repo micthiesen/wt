@@ -540,29 +540,48 @@ const RESERVE_DIVISOR: u64 = 4;
 /// not its only spender and learn what others spent only at their next read.
 const PACE_SAFETY: u64 = 2;
 
+/// The longest a budget stretches the floor. A reader that stopped until
+/// the reset showed nothing new for up to an hour; four reads an hour out
+/// of the reserve keep the board moving.
+pub const MAX_PACED_WAIT_MS: u64 = 15 * 60 * 1000;
+
+/// How long until `budget`'s window resets, while it is open and its reset
+/// is near enough to believe.
+fn open_window_ms(budget: RateBudget, now_ms: u64) -> Option<u64> {
+    budget
+        .reset_at_ms
+        .checked_sub(now_ms)
+        .filter(|wait| *wait > 0 && *wait <= MAX_RESET_WAIT_MS)
+}
+
+/// Whether `budget`, in a window still open at `now_ms`, is down to the
+/// reserve background reads leave alone.
+pub fn budget_low(budget: RateBudget, now_ms: u64) -> bool {
+    open_window_ms(budget, now_ms).is_some() && budget.remaining <= budget.limit / RESERVE_DIVISOR
+}
+
 /// The floor between starts of background GitHub reads, given the budget
 /// the last one left: `floor_ms`, stretched so that reads costing what the
-/// last one did would use the unreserved budget evenly until it resets, and
-/// all the way to the reset once only the reserve is left. A budget that is
-/// unknown, already reset, or resetting implausibly far away leaves the
-/// floor as it is. User-initiated reads do not ask this.
+/// last one did would use the unreserved budget evenly until it resets, up
+/// to the reset or [`MAX_PACED_WAIT_MS`], whichever is sooner; that is also
+/// the interval once only the reserve is left. A budget that is unknown,
+/// already reset, or resetting implausibly far away leaves the floor as it
+/// is. User-initiated reads do not ask this.
 pub fn paced_interval_ms(floor_ms: u64, budget: Option<RateBudget>, now_ms: u64) -> u64 {
     let Some(budget) = budget else {
         return floor_ms;
     };
-    let Some(to_reset) = budget
-        .reset_at_ms
-        .checked_sub(now_ms)
-        .filter(|wait| *wait > 0 && *wait <= MAX_RESET_WAIT_MS)
-    else {
+    let Some(to_reset) = open_window_ms(budget, now_ms) else {
         return floor_ms;
     };
-    let until_reset = to_reset.saturating_add(RESET_SLACK_MS);
+    let longest = to_reset
+        .saturating_add(RESET_SLACK_MS)
+        .min(MAX_PACED_WAIT_MS);
     let spendable = budget
         .remaining
         .saturating_sub(budget.limit / RESERVE_DIVISOR);
     if spendable == 0 {
-        return until_reset.max(floor_ms);
+        return longest.max(floor_ms);
     }
     let paced = budget
         .cost
@@ -570,7 +589,7 @@ pub fn paced_interval_ms(floor_ms: u64, budget: Option<RateBudget>, now_ms: u64)
         .saturating_mul(to_reset)
         .saturating_mul(PACE_SAFETY)
         / spendable;
-    paced.min(until_reset).max(floor_ms)
+    paced.min(longest).max(floor_ms)
 }
 
 async fn scheduler(
@@ -737,15 +756,18 @@ async fn scheduler(
                 // began: a write accepted after this moment may be missing.
                 let fetch_started_at_ms = now_millis();
                 let fetched = source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await;
-                let mut budget = None;
+                let mut paced_ms = config.min_fetch_interval_ms;
                 let mut reset_at_ms = None;
                 let failure = match fetched {
                     Ok(data) => {
-                        budget = data.budget;
+                        // A busy hour stretches the floor instead of running the
+                        // budget out; the floor still counts from this fetch's start.
+                        paced_ms = paced_interval_ms(config.min_fetch_interval_ms, data.budget, now_millis());
                         let snapshot = GithubSnapshot {
                             updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
                             branches: fetch_branches.into_iter().collect(), prs: data.prs,
                             merge_queue: data.merge_queue, rate_limit: data.budget,
+                            next_fetch_at_ms: Some(fetch_started_at_ms.saturating_add(paced_ms)),
                             writer_sha: config.writer_sha.clone(),
                             repository: config.repository.clone(),
                             extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
@@ -768,9 +790,7 @@ async fn scheduler(
                     }
                 };
                 match failure {
-                    // A busy hour stretches the floor instead of running the
-                    // budget out; the floor still counts from this fetch's start.
-                    None => (failures, fetch_interval_ms) = (0, paced_interval_ms(config.min_fetch_interval_ms, budget, now_millis())),
+                    None => (failures, fetch_interval_ms) = (0, paced_ms),
                     // A read cut short by shutdown says nothing about GitHub.
                     Some(message) if cancel.is_cancelled() => {
                         debug!(error = %message, "GitHub refresh interrupted by shutdown");
@@ -1596,18 +1616,26 @@ mod tests {
         assert_eq!(paced(budget(1_750, 5, 30 * MINUTE)), 36_000);
         // What the old query cost per read would have had to wait.
         assert_eq!(paced(budget(1_750, 42, 30 * MINUTE)), 302_400);
-        // Only the reserve is left, or nothing at all: wait for the reset.
+        // Only the reserve is left, or nothing at all: wait for the reset
+        // when it is near, and never longer than the cap.
         for remaining in [1_250, 1_000, 0] {
             assert_eq!(
-                paced(budget(remaining, 5, 20 * MINUTE)),
-                20 * MINUTE + RESET_SLACK_MS
+                paced(budget(remaining, 5, 10 * MINUTE)),
+                10 * MINUTE + RESET_SLACK_MS
             );
+            assert_eq!(paced(budget(remaining, 5, 50 * MINUTE)), MAX_PACED_WAIT_MS);
+            assert!(budget_low(budget(remaining, 5, 50 * MINUTE).unwrap(), now));
         }
-        // Never beyond the reset, even for one point of spendable budget.
+        // Never beyond the reset or the cap, even for one point of
+        // spendable budget.
         assert_eq!(
-            paced(budget(1_251, 5, 20 * MINUTE)),
-            20 * MINUTE + RESET_SLACK_MS
+            paced(budget(1_251, 5, 10 * MINUTE)),
+            10 * MINUTE + RESET_SLACK_MS
         );
+        assert_eq!(paced(budget(1_251, 5, 50 * MINUTE)), MAX_PACED_WAIT_MS);
+        // Above the reserve, or in a window that has closed, is not low.
+        assert!(!budget_low(budget(1_251, 5, 50 * MINUTE).unwrap(), now));
+        assert!(!budget_low(budget(0, 5, MINUTE).unwrap(), now + 2 * MINUTE));
         // A reply that reported no cost is paced as the cheapest read.
         assert_eq!(paced(budget(1_300, 0, 20 * MINUTE)), 48_000);
         // No budget reported (rate limiting off, an older server), a window
@@ -1622,8 +1650,9 @@ mod tests {
         assert_eq!(paced(budget(0, 5, 3 * 60 * MINUTE)), 10_000);
     }
 
-    /// With only the reserve left the daemon stops refreshing in the
-    /// background until the reset, and publishes the budget it saw.
+    /// With only the reserve left the daemon holds background refreshes
+    /// for the paced interval, and publishes the budget it saw and when it
+    /// may read next.
     #[tokio::test]
     async fn a_low_budget_holds_background_refreshes_until_the_reset() {
         let dir = TempDir::new().unwrap();
@@ -1648,6 +1677,11 @@ mod tests {
         assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
         let snapshot = read_snapshot(dir.path()).await.unwrap().unwrap();
         assert_eq!(snapshot.rate_limit, Some(budget));
+        let planned = snapshot.next_fetch_at_ms.unwrap() - snapshot.fetch_started_at_ms.unwrap();
+        assert!(
+            (9 * 60_000..=10 * 60_000 + RESET_SLACK_MS).contains(&planned),
+            "{planned}"
+        );
         cancel.cancel();
         daemon.shutdown().await;
     }

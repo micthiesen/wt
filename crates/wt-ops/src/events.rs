@@ -40,12 +40,16 @@ impl EventSource for AppEventSource {
                 .inventory(cancel)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(inventory
-                .into_iter()
-                .filter(|row| !row.is_main)
-                .map(|row| row.target.branch)
-                .filter(|branch| !branch.is_empty())
-                .collect())
+            // The board's GitHub leaf asks for the same set, recorded other
+            // branches included; a state that cannot be read fails the read
+            // rather than writing a snapshot the board would find short.
+            let state = self
+                .context
+                .database
+                .call(|store| Ok(store.read_wt_state()?))
+                .await
+                .map_err(|error| format!("cannot read wt's state: {error:#}"))?;
+            Ok(crate::other_branches::github_branches(&inventory, &state))
         })
     }
 

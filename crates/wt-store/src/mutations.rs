@@ -1162,7 +1162,10 @@ impl Store {
     /// Record the other branches seen for a worktree, and `recorded` as its
     /// own branch when none is recorded yet. A branch already recorded keeps
     /// its answer unless `seen` brings one from GitHub that differs or is
-    /// over two minutes newer. Returns whether anything was written.
+    /// over two minutes newer. An answer observed before the recorded one,
+    /// or not from GitHub at all, never replaces it: a stale snapshot's "no
+    /// PR" must not hide a pull request a later read found. Returns whether
+    /// anything was written.
     pub fn record_other_branches(
         &mut self,
         slug: &str,
@@ -1192,16 +1195,17 @@ impl Store {
                     .get(&other.branch)
                     .and_then(|stored| serde_json::from_value(stored.clone()).ok());
                 let keep = stored.is_some_and(|stored| {
+                    let same = stored.state == other.state
+                        && stored.number == other.number
+                        && stored.draft == other.draft;
                     other.state == wt_core::OtherPrState::Unknown
-                        || (stored.state == other.state
-                            && stored.number == other.number
-                            && stored.draft == other.draft
-                            && match (stored.checked_at_ms, other.checked_at_ms) {
-                                (Some(stored), Some(new)) => {
-                                    new.saturating_sub(stored) < RECHECK_MS
-                                }
-                                (stored, new) => stored == new,
-                            })
+                        || match (stored.checked_at_ms, other.checked_at_ms) {
+                            (Some(stored), Some(new)) => {
+                                new < stored || (same && new - stored < RECHECK_MS)
+                            }
+                            (Some(_), None) => true,
+                            (None, new) => same && new.is_none(),
+                        }
                 });
                 if !keep {
                     others.insert(other.branch.clone(), serde_json::to_value(other)?);
@@ -1214,6 +1218,56 @@ impl Store {
             if !others.is_empty() {
                 entry.insert(wt_core::OTHER_BRANCHES.to_owned(), Value::Object(others));
             }
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Drop the record of an other branch that no longer exists anywhere,
+    /// unless a newer answer was recorded for it since `seen` was read.
+    pub fn forget_other_branch(
+        &mut self,
+        slug: &str,
+        seen: &wt_core::OtherBranch,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            let Some(others) = entry
+                .get_mut(wt_core::OTHER_BRANCHES)
+                .and_then(Value::as_object_mut)
+            else {
+                return Ok((false, false));
+            };
+            let unchanged = others.get(&seen.branch).is_some_and(|stored| {
+                serde_json::from_value::<wt_core::OtherBranch>(stored.clone())
+                    .is_ok_and(|stored| stored.checked_at_ms <= seen.checked_at_ms)
+            });
+            if !unchanged {
+                return Ok((false, false));
+            }
+            others.remove(&seen.branch);
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Give back the claim on the notice for `branch` after it could not
+    /// be delivered, so a later observation sends it again.
+    pub fn release_off_branch_notice(
+        &mut self,
+        slug: &str,
+        branch: &str,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            if entry
+                .get(wt_core::OFF_BRANCH_NOTICE)
+                .and_then(Value::as_str)
+                != Some(branch)
+            {
+                return Ok((false, false));
+            }
+            entry.remove(wt_core::OFF_BRANCH_NOTICE);
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
             Ok((true, true))
         })

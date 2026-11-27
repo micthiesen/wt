@@ -217,7 +217,14 @@ impl Landing {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Check {
+    /// The check's text on one line. This is its identity: the same steps
+    /// are the same check, and builds from before `text` read only this.
     pub steps: String,
+    /// The same text with the author's line breaks, where it had any. An
+    /// older build carries it through untouched even when it replaces
+    /// `steps`, so read it through [`Self::text`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     /// The check is not due before this instant, even where its stage
     /// already has the change. Set when a check is put off (`wt done
     /// <stage> --again <time>`).
@@ -244,12 +251,31 @@ impl Check {
     pub fn new(steps: impl Into<String>) -> Self {
         Self {
             steps: steps.into(),
+            text: None,
             not_before_ms: None,
             since_ms: None,
             due_since_ms: None,
             due_pr: None,
             extra: BTreeMap::new(),
         }
+    }
+
+    /// The check as its author wrote it: `text` while it still says what
+    /// `steps` says, else `steps`. Surfaces with one line to give use
+    /// `steps` or a headline of this.
+    pub fn text(&self) -> &str {
+        self.text
+            .as_deref()
+            .filter(|text| sanitize_work_note(text) == self.steps)
+            .unwrap_or(&self.steps)
+    }
+
+    /// Keep `lines` as the text with line breaks, when it has any and says
+    /// what `steps` says.
+    fn set_text(&mut self, lines: &str) {
+        let lines = sanitize_terminal_lines(lines);
+        self.text = Some(lines)
+            .filter(|lines| lines.contains('\n') && sanitize_work_note(lines) == self.steps);
     }
 
     /// Since when the check has been due, where that was recorded: when it
@@ -343,11 +369,16 @@ impl Checks {
             .collect()
     }
 
-    /// The same checks with every step text passed through `clean`.
+    /// The same checks with every step text passed through `clean`, and
+    /// the text with line breaks cleaned line by line and dropped where it
+    /// no longer says the same.
     fn cleaned(mut self, clean: impl Fn(&str) -> String) -> Self {
         for stage in VerifyStage::ALL {
             if let Some(mut check) = self.take(stage) {
                 check.steps = clean(&check.steps);
+                if let Some(lines) = check.text.take() {
+                    check.set_text(&lines);
+                }
                 self.set(stage, check);
             }
         }
@@ -633,6 +664,25 @@ impl WorkStatusRecord {
         self.edit_checks(|checks| {
             if checks.get(stage).is_none_or(|check| check.steps != steps) {
                 checks.set(stage, Check::new(steps));
+            }
+        });
+    }
+
+    /// [`Self::set_check`], keeping `lines` as the text with the author's
+    /// line breaks (see [`Check::text`]). `None` leaves what a check with
+    /// the same steps already had.
+    pub fn set_check_lines(
+        &mut self,
+        stage: VerifyStage,
+        steps: impl Into<String>,
+        lines: Option<&str>,
+    ) {
+        self.set_check(stage, steps);
+        let Some(lines) = lines else { return };
+        self.edit_checks(|checks| {
+            if let Some(mut check) = checks.take(stage) {
+                check.set_text(lines);
+                checks.set(stage, check);
             }
         });
     }
@@ -1569,6 +1619,54 @@ mod tests {
 
     const STAGING: VerifyStage = VerifyStage::Staging;
     const PRODUCTION: VerifyStage = VerifyStage::Production;
+
+    /// The one line names the check, for every build and every comparison;
+    /// the author's lines ride beside it and are shown only while they
+    /// still say the same.
+    #[test]
+    fn a_check_keeps_its_authors_lines_beside_the_line_that_names_it() {
+        let lines =
+            "Proves it on staging\n  A local run cannot.\n\nSTEPS: 1. open 2. \u{1b}[31mlook";
+        let kept = "Proves it on staging\nA local run cannot.\n\nSTEPS: 1. open 2. look";
+        let flat = "Proves it on staging A local run cannot. STEPS: 1. open 2. look";
+        let mut record = WorkStatusRecord::new(WorkState::Ready, AT);
+        record.set_check_lines(STAGING, flat, Some(lines));
+        let check = record.open_check(STAGING).unwrap();
+        assert_eq!((check.steps.as_str(), check.text()), (flat, kept));
+        assert_eq!(record.verify_after_merge.as_deref(), Some(flat));
+        let written = serde_json::to_value(&record).unwrap();
+        assert_eq!(written["checks"]["staging"]["steps"], flat);
+        assert_eq!(written["checks"]["staging"]["text"], kept);
+        let read = parse_work_status(&written).unwrap();
+        assert_eq!(read, record);
+
+        // Dated, then restated: the same steps are the same check. No
+        // lines leaves them; one line drops them.
+        let mut dated = record.clone();
+        let mut check = dated.checks.take(STAGING).unwrap();
+        check.since_ms = Some(7);
+        dated.checks.set(STAGING, check);
+        dated.set_check_lines(STAGING, flat, None);
+        let check = dated.open_check(STAGING).unwrap();
+        assert_eq!((check.since_ms, check.text()), (Some(7), kept));
+        dated.set_check_lines(STAGING, flat, Some(flat));
+        let check = dated.open_check(STAGING).unwrap();
+        assert_eq!((check.since_ms, check.text.as_deref()), (Some(7), None));
+
+        // An older build that re-set the steps carried the lines of the
+        // check it replaced: they are not this check's.
+        let mut stale = written.clone();
+        stale["checks"]["staging"]["steps"] = json!("other steps");
+        stale["verifyAfterMerge"] = json!("other steps");
+        let read = parse_work_status(&stale).unwrap();
+        let check = read.open_check(STAGING).unwrap();
+        assert_eq!((check.text(), check.text.as_deref()), ("other steps", None));
+        // And one that set them through the field it knows made a new check.
+        let mut reset = written;
+        reset["verifyAfterMerge"] = json!("new steps");
+        let read = parse_work_status(&reset).unwrap();
+        assert_eq!(read.open_check(STAGING).unwrap().text(), "new steps");
+    }
 
     fn stages(record: &WorkStatusRecord) -> Vec<(VerifyStage, String)> {
         record

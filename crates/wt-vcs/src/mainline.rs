@@ -35,6 +35,51 @@ pub fn on_first_parent_line(rev_list_parents: &str, head: &str) -> bool {
     }
 }
 
+/// `git log` arguments whose output [`brought_in`] reads: the base's
+/// first-parent commits that hold `head`, newest first, each as its
+/// committer time and its parents.
+pub fn brought_in_args(base: &str, head: &str) -> Vec<String> {
+    vec![
+        "log".into(),
+        "--first-parent".into(),
+        "--ancestry-path".into(),
+        "--format=%ct %P".into(),
+        "-n".into(),
+        MAINLINE_WALK.to_string(),
+        format!("{head}..{base}"),
+    ]
+}
+
+/// What brought a contained `head` into its base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroughtIn {
+    /// A base commit, by its committer time in epoch seconds: the merge.
+    At(u64),
+    /// The base moved to `head` itself; its own commit time says when.
+    Head,
+}
+
+/// Read [`brought_in_args`] output, given that `head` is an ancestor of the
+/// base. The oldest listed commit is the first the base's own line made
+/// with `head` in it: a merge, unless `head` is its first parent, in which
+/// case the base sat at `head`. `None` for a walk cut at the limit.
+pub fn brought_in(log: &str, head: &str) -> Option<BroughtIn> {
+    let lines: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
+    let Some(oldest) = lines.last() else {
+        return Some(BroughtIn::Head);
+    };
+    if lines.len() >= MAINLINE_WALK {
+        return None;
+    }
+    let mut fields = oldest.split_whitespace();
+    let at = fields.next()?.parse().ok()?;
+    Some(if fields.next() == Some(head) {
+        BroughtIn::Head
+    } else {
+        BroughtIn::At(at)
+    })
+}
+
 /// `git reflog` arguments whose output [`committed_on_branch`] reads: each
 /// update of the branch as `<sha> <subject>`.
 pub fn branch_reflog_args(branch: &str) -> Vec<String> {
@@ -111,9 +156,105 @@ pub fn cherry_all_in_base(cherry: &str) -> bool {
     cherry.lines().next().is_some() && cherry_unmatched(cherry) == 0
 }
 
+/// What one Git command of [`base_holds_everything`] answered.
+pub struct GitRead {
+    pub code: Option<i32>,
+    pub stdout: String,
+}
+
+/// What a branch has that its base does not, as far as Git can prove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeyondBase {
+    /// The base holds all of it; so many commits were compared by patch.
+    Nothing(u32),
+    /// So many commits match no patch in the base.
+    Commits(u32),
+    /// A read failed, or patches match but the content may still differ.
+    Unknown,
+}
+
+/// Whether `base` holds everything `head` has beyond it (and beyond
+/// `pushed`, when the range is only what was never pushed).
+///
+/// `git cherry` alone is not that proof: it skips merge commits, whose
+/// resolution is content of their own, and it matches a patch the base
+/// applied and later reverted. So the range must also hold no merge commit,
+/// and merging `head` into `base` must change nothing (Git 2.38+).
+///
+/// `run` runs one Git command in the checkout and gives `None` when it
+/// could not run or its output was cut.
+pub async fn base_holds_everything<F, Fut>(
+    base: &str,
+    head: &str,
+    pushed: Option<&str>,
+    run: F,
+) -> BeyondBase
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Option<GitRead>>,
+{
+    let ok = |read: Option<GitRead>| {
+        read.filter(|read| read.code == Some(0))
+            .map(|read| read.stdout)
+    };
+    let mut cherry = cherry_args(base, head);
+    cherry.extend(pushed.map(str::to_owned));
+    let Some(cherry) = ok(run(cherry).await) else {
+        return BeyondBase::Unknown;
+    };
+    let unmatched = cherry_unmatched(&cherry);
+    if unmatched > 0 {
+        return BeyondBase::Commits(unmatched);
+    }
+    let mut merges: Vec<String> = ["rev-list", "--merges", "--max-count=1", head, "--not", base]
+        .map(str::to_owned)
+        .into();
+    merges.extend(pushed.map(str::to_owned));
+    if ok(run(merges).await).is_none_or(|merges| !merges.trim().is_empty()) {
+        return BeyondBase::Unknown;
+    }
+    let merged = ok(run(["merge-tree", "--write-tree", base, head]
+        .map(str::to_owned)
+        .into())
+    .await);
+    let base_tree = ok(run(vec![
+        "rev-parse".into(),
+        "--verify".into(),
+        "--quiet".into(),
+        "--end-of-options".into(),
+        format!("{base}^{{tree}}"),
+    ])
+    .await);
+    let merged_tree = merged
+        .as_deref()
+        .and_then(|merged| merged.lines().next())
+        .map(str::trim)
+        .filter(|tree| !tree.is_empty());
+    match (merged_tree, base_tree) {
+        (Some(merged), Some(base)) if merged == base.trim() => {
+            BeyondBase::Nothing(u32::try_from(cherry.lines().count()).unwrap_or(u32::MAX))
+        }
+        _ => BeyondBase::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_brought_a_branch_in_is_the_oldest_base_commit_holding_it() {
+        // Newest first: two later merges, then the merge of `head`.
+        let log = "300 m2 x\n200 m1 y\n100 base head\n";
+        assert_eq!(brought_in(log, "head"), Some(BroughtIn::At(100)));
+        // The base fast-forwarded to `head`: its own commit says when.
+        assert_eq!(brought_in("200 head\n", "head"), Some(BroughtIn::Head));
+        assert_eq!(brought_in("", "head"), Some(BroughtIn::Head));
+        // A walk cut at the limit did not reach the commit.
+        let long = "100 a b\n".repeat(MAINLINE_WALK);
+        assert_eq!(brought_in(&long, "head"), None);
+        assert_eq!(brought_in("garbage\n", "head"), None);
+    }
 
     #[test]
     fn only_a_branch_whose_every_commit_is_matched_reads_as_in_the_base() {

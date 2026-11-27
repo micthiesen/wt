@@ -134,6 +134,11 @@ pub struct ObservedRow {
     /// Whether the branch conflicts with its base.
     pub conflicted: Option<bool>,
     pub landed: Option<LandedOn>,
+    /// The HEAD `landed` was seen at, recorded with a new landing.
+    pub landed_head: Option<String>,
+    /// When the work landed, where the read could tell; recorded with a
+    /// new landing. See `WorktreeEventKind::Landed`.
+    pub landed_at_ms: Option<u64>,
     /// The stored work status as the metadata read showed it: `Some(None)`
     /// for no status, `None` when metadata is not confirmed. It only says
     /// that the status may have changed; [`status_transition`] compares the
@@ -169,7 +174,11 @@ impl ObservedRow {
             _ => {}
         }
         self.conflicted = self.conflicted.or(last.conflicted);
-        self.landed = self.landed.or(last.landed);
+        if self.landed.is_none() {
+            self.landed = last.landed;
+            self.landed_head.clone_from(&last.landed_head);
+            self.landed_at_ms = last.landed_at_ms;
+        }
         if self.work.is_none() {
             self.work.clone_from(&last.work);
         }
@@ -213,11 +222,15 @@ pub fn transitions(history: &[WorktreeEvent], observed: &ObservedRow) -> Vec<Wor
     }
     if let Some(on) = observed.landed
         && latest(&log, 0, |event| match event {
-            WorktreeEventKind::Landed { on } => Some(*on),
+            WorktreeEventKind::Landed { on, .. } => Some(*on),
             _ => None,
         }) != Some(on)
     {
-        log.push(WorktreeEventKind::Landed { on });
+        log.push(WorktreeEventKind::Landed {
+            on,
+            head: observed.landed_head.clone(),
+            landed_at_ms: observed.landed_at_ms,
+        });
     }
     log.split_off(known)
 }
@@ -493,6 +506,8 @@ mod tests {
             }),
             conflicted: Some(true),
             landed: None,
+            landed_head: None,
+            landed_at_ms: None,
             work: None,
         };
         assert_eq!(
@@ -701,10 +716,12 @@ mod tests {
             }]
         );
 
-        let git = |conflicted, landed| ObservedRow {
+        let git = |conflicted, landed: Option<LandedOn>| ObservedRow {
             pr: None,
             conflicted,
             landed,
+            landed_head: landed.map(|_| "abc".to_owned()),
+            landed_at_ms: landed.map(|_| 7_000),
             work: None,
         };
         assert_eq!(
@@ -716,15 +733,25 @@ mod tests {
             observe(&mut history, &git(Some(false), Some(LandedOn::Base))),
             [
                 WorktreeEventKind::Conflict { resolved: true },
-                WorktreeEventKind::Landed { on: LandedOn::Base }
+                WorktreeEventKind::Landed {
+                    on: LandedOn::Base,
+                    head: Some("abc".into()),
+                    landed_at_ms: Some(7_000),
+                }
             ]
         );
         assert_eq!(
             observe(&mut history, &git(Some(false), Some(LandedOn::Production))),
             [WorktreeEventKind::Landed {
-                on: LandedOn::Production
+                on: LandedOn::Production,
+                head: Some("abc".into()),
+                landed_at_ms: Some(7_000),
             }]
         );
+        // The same landing at a later HEAD is not news.
+        let mut moved = git(Some(false), Some(LandedOn::Production));
+        moved.landed_head = Some("def".into());
+        assert!(observe(&mut history, &moved).is_empty());
     }
 
     #[test]
@@ -753,6 +780,8 @@ mod tests {
             }),
             conflicted: Some(false),
             landed: Some(LandedOn::Base),
+            landed_head: Some("abc".into()),
+            landed_at_ms: Some(7_000),
             work: None,
         };
         // GitHub and the Git facts are both unavailable for a while.
@@ -765,6 +794,8 @@ mod tests {
             }),
             conflicted: Some(true),
             landed: None,
+            landed_head: None,
+            landed_at_ms: None,
             work: None,
         };
         let merged = partial.or_last_known(&known);

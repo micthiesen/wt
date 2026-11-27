@@ -107,7 +107,10 @@ pub struct StatusArgs {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Verify {
     stage: VerifyStage,
+    /// The text on one line, which is what names the check.
     steps: String,
+    /// The text as written, for its line breaks.
+    lines: String,
 }
 
 impl Verify {
@@ -115,6 +118,7 @@ impl Verify {
         wt_ops::status_checks::CheckEdit::Owe {
             stage: self.stage,
             steps: self.steps,
+            lines: Some(self.lines),
         }
     }
 }
@@ -355,7 +359,11 @@ fn parse_status_action(args: &StatusArgs) -> Action {
     ] {
         let Some(value) = value else { continue };
         match sanitize(value) {
-            Some(steps) => verify.push(Verify { stage, steps }),
+            Some(steps) => verify.push(Verify {
+                stage,
+                steps,
+                lines: value.to_owned(),
+            }),
             None => return Action::Error(format!("{flag} requires non-empty steps")),
         }
     }
@@ -1198,7 +1206,7 @@ async fn verify_checks(
     }
     // Under a landing that cannot be read nothing is known to be due, so
     // only the earliest check closes: never more than was asserted.
-    let landing = landing::read_one(ctx, record, state, landing::Want::Lists).await;
+    let landing = landing::read_one_live(ctx, record, state, landing::Want::Lists).await;
     if let Some(refusal) = super::owed::not_merged_refusal(
         &slug,
         landing,
@@ -2649,6 +2657,24 @@ mod tests {
         let stored = work().await;
         assert_eq!(stored["note"], "ships the fix.");
         assert_eq!(stored["checks"]["staging"]["steps"], "1. check");
+        assert_eq!(stored["checks"]["staging"]["text"], Value::Null);
+        // Line breaks are kept beside the one line that names the check.
+        let lined = StatusArgs {
+            verify_in_staging: Some("Proves it\nwhy\nSTEPS: 1. check".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &lined).await.unwrap(), 0);
+        let stored = work().await;
+        assert_eq!(
+            stored["checks"]["staging"]["steps"],
+            "Proves it why STEPS: 1. check"
+        );
+        assert_eq!(
+            stored["checks"]["staging"]["text"],
+            "Proves it\nwhy\nSTEPS: 1. check"
+        );
+        assert_eq!(stored["verifyAfterMerge"], "Proves it why STEPS: 1. check");
+        assert_eq!(run(ctx, &amend).await.unwrap(), 0);
         // Appending to it is judged by the appended text alone.
         let append = |text: &str| StatusArgs {
             note_only: Some(text.into()),

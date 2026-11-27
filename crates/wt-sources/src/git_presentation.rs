@@ -572,6 +572,7 @@ fn apply_facts(
         {
             applied = true;
             row.git.landed_on = fact.presentation.landed_on;
+            row.git.landed_at_ms = fact.presentation.landed_at_ms;
             row.git.deploys = fact.presentation.deploys;
             row.git.rebasing = fact.presentation.rebasing;
             row.git
@@ -968,21 +969,36 @@ async fn enrich(
                 Some(base_ref)
                     if merged_into_base && !pr_landed_on_base && !local_landed_on_base =>
                 {
-                    run_git(
-                        context,
-                        &path,
-                        wt_vcs::cherry_args(base_ref, head),
-                        cancellation,
-                    )
-                    .await
-                    .filter(|output| output.status.success() && !output.stdout_truncated)
-                    .is_some_and(|output| wt_vcs::cherry_all_in_base(&output.stdout_text()))
+                    let held = wt_vcs::base_holds_everything(base_ref, head, None, |args| async {
+                        let output = run_git(context, &path, args, cancellation).await?;
+                        (!output.stdout_truncated).then(|| wt_vcs::GitRead {
+                            code: output.status.code(),
+                            stdout: output.stdout_text(),
+                        })
+                    })
+                    .await;
+                    matches!(held, wt_vcs::BeyondBase::Nothing(commits) if commits > 0)
                 }
                 _ => false,
             };
+            let ancestry_landed_on_base = local_landed_on_base;
             let local_landed_on_base = local_landed_on_base || patch_landed_on_base;
             if pr_landed_on_base || local_landed_on_base {
                 result.landed_on = Some(LandingKind::Base);
+                // GitHub's merge time where it gave one. Otherwise the base
+                // commit that brought the branch in says when.
+                let merged_at = pr
+                    .filter(|_| merged_into_base)
+                    .and_then(|pr| pr.merged_at.as_deref())
+                    .and_then(wt_core::parse_iso_millis)
+                    .and_then(|at| u64::try_from(at).ok());
+                result.landed_at_ms = match (merged_at, base_ref.as_deref()) {
+                    (Some(at), _) => Some(at),
+                    (None, Some(base_ref)) if ancestry_landed_on_base => {
+                        brought_in_ms(context, &path, head, base_ref, cancellation).await
+                    }
+                    _ => None,
+                };
             }
             if let Some(production) = context.config.branch.production.as_deref() {
                 if production == configured_base && (pr_landed_on_base || local_landed_on_base) {
@@ -1539,6 +1555,41 @@ async fn contained_landed(
         .await
         .unwrap_or_default();
     wt_vcs::contained_head_landed(&mainline, &reflog, head)
+}
+
+/// Committer time, in epoch milliseconds, of the base commit that brought
+/// `head` in: the oldest commit on the base's first-parent line that holds
+/// it, which is the merge, or `head` itself when the base fast-forwarded to
+/// it. `None` when the walk is longer than [`wt_vcs::MAINLINE_WALK`] or
+/// cannot be read.
+async fn brought_in_ms(
+    context: &AppContext,
+    path: &Path,
+    head: &str,
+    base_ref: &str,
+    cancel: &CancellationToken,
+) -> Option<u64> {
+    let read = |args: Vec<String>| async move {
+        run_git(context, path, args, cancel)
+            .await
+            .filter(|output| output.status.success() && !output.stdout_truncated)
+            .map(|output| output.stdout_text().to_string())
+    };
+    let walk = read(wt_vcs::brought_in_args(base_ref, head)).await?;
+    let at = match wt_vcs::brought_in(&walk, head)? {
+        wt_vcs::BroughtIn::At(seconds) => seconds,
+        wt_vcs::BroughtIn::Head => read(vec![
+            "show".into(),
+            "-s".into(),
+            "--format=%ct".into(),
+            head.into(),
+        ])
+        .await?
+        .trim()
+        .parse()
+        .ok()?,
+    };
+    Some(at * 1000)
 }
 
 async fn is_ancestor(
@@ -2189,6 +2240,15 @@ mod tests {
         // One commit the base does not hold is work that has not landed.
         std::fs::write(worktree.join("own.txt"), "more\n").unwrap();
         git(&worktree, &["commit", "-qam", "after the merge"]);
+        assert_eq!(probe(anchored.clone(), Some(merged.clone())).await, None);
+        // Nor has a merge commit, whose resolution no patch comparison sees.
+        git(&worktree, &["reset", "-q", "--hard", "HEAD~1"]);
+        git(
+            &worktree,
+            &["merge", "-q", "--no-ff", "--no-commit", &pushed],
+        );
+        std::fs::write(worktree.join("own.txt"), "resolved by hand\n").unwrap();
+        git(&worktree, &["commit", "-qam", "merge the old head"]);
         assert_eq!(probe(anchored, Some(merged)).await, None);
         // Without an anchor, a head that is only the base's own tip is a
         // snapshot of the base, not work that landed.

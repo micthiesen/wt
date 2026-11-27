@@ -34,7 +34,7 @@ six failing names and counts the rest in a final `+N more` entry.
 | `restack` | a restack replays the branch or stops on a conflict | `restack_action::record_outcome` |
 | `skill` | a skill or slash command listed in `[history] skills` is used in the worktree's Claude Code session | `wt mark --claude-hook`, run by a Claude Code hook |
 | `mark` | someone adds a note, or the worktree earns a review stamp (the line reads `stamped <skill>`) | `wt mark`; the store's stamp write (`wt mark --stamp`, or the status write that earns a pending stamp) |
-| `pr`, `checks`, `review`, `merge_queue`, `conflict`, `landed` | the fact is observed to change | the host's observer |
+| `pr`, `checks`, `review`, `merge_queue`, `conflict`, `landed` | the fact is observed to change. A new `landed` event records the HEAD it was seen at (`head`, absent from events written before the field), which is what lets the commands that read a landing honour it later without GitHub, and when the work landed (`landed_at_ms`: the pull request's merge time, else the committer time of the base commit that brought the branch in; absent where neither was known and from older events), which orders the board's Landed block | the host's observer |
 | `status`, `status_cleared` (again) | a status was written by a build without the log | the host's observer |
 
 An `owed` event carries `change` (`due`, `done`, `again`, `dropped`), `what`

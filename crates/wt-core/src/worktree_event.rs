@@ -78,6 +78,17 @@ pub enum WorktreeEventKind {
     },
     Landed {
         on: LandedOn,
+        /// The worktree's HEAD when the landing was seen. Absent from
+        /// events recorded before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head: Option<String>,
+        /// When the work landed, as far as the first sighting could tell:
+        /// the pull request's merge time, else the committer time of the
+        /// base commit that brought the branch in. The event's own time is
+        /// only when wt saw it. Absent from events recorded before the
+        /// field existed and where neither was known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        landed_at_ms: Option<u64>,
     },
     Automation {
         rule: String,
@@ -651,6 +662,26 @@ pub enum AutomationOutcomeKind {
     Unconfirmed,
 }
 
+/// Whether `events` (one worktree's history since it was created, oldest
+/// first) say its pull request merged and its work was seen landed at
+/// exactly `head`. A merge is final, so this still proves the landing when
+/// a later GitHub read no longer returns the pull request. A landing
+/// recorded without its HEAD proves nothing about the current one.
+pub fn history_landed_at(events: &[WorktreeEvent], head: &str) -> bool {
+    let merged = events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.event {
+            WorktreeEventKind::Pr { change, .. } => Some(*change == PrChange::Merged),
+            _ => None,
+        })
+        .unwrap_or(false);
+    merged
+        && events.iter().any(|event| {
+            matches!(&event.event, WorktreeEventKind::Landed { head: Some(at), .. } if at == head)
+        })
+}
+
 /// The first line of `text`, trimmed and cut to [`EVENT_TEXT_MAX`] characters.
 pub fn event_text(text: &str) -> String {
     let line = text.lines().map(str::trim).find(|line| !line.is_empty());
@@ -691,6 +722,58 @@ mod tests {
 
     fn at(at_ms: u64, event: WorktreeEventKind) -> WorktreeEvent {
         WorktreeEvent { at_ms, event }
+    }
+
+    #[test]
+    fn a_landing_keeps_its_head_and_reads_without_one() {
+        // What a build before the field wrote, and what it reads of ours:
+        // serde ignores a key it does not know.
+        let old: WorktreeEventKind =
+            serde_json::from_str(r#"{"kind":"landed","on":"base"}"#).unwrap();
+        assert_eq!(
+            old,
+            WorktreeEventKind::Landed {
+                on: LandedOn::Base,
+                head: None,
+                landed_at_ms: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({"kind": "landed", "on": "base"})
+        );
+        let at = |event| WorktreeEvent { at_ms: 0, event };
+        let merged = at(WorktreeEventKind::Pr {
+            number: 7,
+            change: PrChange::Merged,
+        });
+        let landed = |head: Option<&str>| {
+            at(WorktreeEventKind::Landed {
+                on: LandedOn::Base,
+                head: head.map(str::to_owned),
+                landed_at_ms: None,
+            })
+        };
+        assert!(history_landed_at(
+            &[merged.clone(), landed(Some("abc"))],
+            "abc"
+        ));
+        assert!(!history_landed_at(
+            &[merged.clone(), landed(Some("abc"))],
+            "def"
+        ));
+        assert!(!history_landed_at(&[merged.clone(), landed(None)], "abc"));
+        // Landed by ancestry with no merged pull request on record, or with
+        // the pull request reopened since, is not this proof.
+        assert!(!history_landed_at(&[landed(Some("abc"))], "abc"));
+        let reopened = at(WorktreeEventKind::Pr {
+            number: 7,
+            change: PrChange::Reopened,
+        });
+        assert!(!history_landed_at(
+            &[merged, landed(Some("abc")), reopened],
+            "abc"
+        ));
     }
 
     #[test]

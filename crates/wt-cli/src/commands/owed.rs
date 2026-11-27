@@ -767,7 +767,7 @@ async fn close(
             .database
             .call(|store| Ok(store.read_wt_state()?))
             .await?;
-        let landing = landing::read_one(ctx, record, &state, Want::Lists).await;
+        let landing = landing::read_one_live(ctx, record, &state, Want::Lists).await;
         let stored = wt_core::parse_work_status(&state["slugs"][slug]["work"]);
         previous_note = stored.as_ref().and_then(|work| work.note.clone());
         let owed = stored.map(|work| work.open_checks()).unwrap_or_default();
@@ -1521,7 +1521,8 @@ mod tests {
             lines[2..],
             [
                 "  gate     mobile release (until a person clears it)",
-                "  waiting  check: 1. check prod 2. check logs (in production)",
+                // A list names a check by the first line its author wrote.
+                "  waiting  check: 1. check prod (in production)",
                 &format!("  {LANDING_UNKNOWN}"),
             ]
         );
