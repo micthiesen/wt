@@ -88,9 +88,42 @@ pub fn contained_head_landed(mainline: &str, reflog: &str, head: &str) -> bool {
     !on_first_parent_line(mainline, head) || committed_on_branch(reflog, head)
 }
 
+/// `git cherry <base> <head>` arguments: every commit of `head` the base
+/// does not contain, marked `-` when the base holds a commit with the same
+/// patch and `+` when it does not.
+pub fn cherry_args(base: &str, head: &str) -> Vec<String> {
+    vec!["cherry".into(), base.into(), head.into()]
+}
+
+/// The commits `git cherry` found in no form on the other side.
+pub fn cherry_unmatched(cherry: &str) -> u32 {
+    let unmatched = cherry
+        .lines()
+        .filter(|line| !line.starts_with("- "))
+        .count();
+    u32::try_from(unmatched).unwrap_or(u32::MAX)
+}
+
+/// Whether the branch has commits beyond the base and the base holds the
+/// patch of every one: it was rebased after its work merged. A squash merge
+/// never reads so, because a squashed patch matches none of its commits.
+pub fn cherry_all_in_base(cherry: &str) -> bool {
+    cherry.lines().next().is_some() && cherry_unmatched(cherry) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_branch_whose_every_commit_is_matched_reads_as_in_the_base() {
+        assert!(cherry_all_in_base("- a\n- b\n"));
+        assert!(!cherry_all_in_base(""));
+        assert!(!cherry_all_in_base("- a\n+ b\n"));
+        assert_eq!(cherry_unmatched("- a\n+ b\n+ c\n"), 2);
+        // An unreadable line is never a match.
+        assert_eq!(cherry_unmatched("garbage\n"), 1);
+    }
 
     #[test]
     fn only_a_branch_s_own_commit_counts_as_its_work() {

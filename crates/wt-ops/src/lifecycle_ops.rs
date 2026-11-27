@@ -178,6 +178,14 @@ pub async fn plan(ctx: &AppContext, rows: Vec<WorktreeRecord>) -> Result<Removal
             Err(error) => return Err(error.into()),
         }
     };
+    crate::other_branches::observe(
+        ctx,
+        &rows,
+        &state,
+        Some(&github),
+        crate::other_branches::Ask::Github,
+    )
+    .await;
     plan_with_evidence(ctx, rows, &state, &github, warning).await
 }
 
@@ -194,6 +202,16 @@ pub async fn plan_cached(
         .database
         .call(|store| Ok(store.read_wt_state()?))
         .await?;
+    // A person asked for this removal: the board's GitHub data covers each
+    // row's own branch, so its other branches get one read of their own.
+    crate::other_branches::observe(
+        ctx,
+        &rows,
+        &state,
+        github.map(|github| &**github),
+        crate::other_branches::Ask::Github,
+    )
+    .await;
     plan_with_facts(ctx, rows, &state, github, None).await
 }
 
@@ -245,6 +263,15 @@ pub async fn landing_facts(
     wants: &BTreeMap<String, WatchWants>,
 ) -> Result<AutomationLifecycleEvidence> {
     let lifecycle = service(ctx)?;
+    // Timer-driven: record what is at hand and ask GitHub nothing more.
+    crate::other_branches::observe(
+        ctx,
+        &rows,
+        state,
+        Some(github),
+        crate::other_branches::Ask::Nothing,
+    )
+    .await;
     let mut published_bases = BTreeMap::new();
     let mut warning = None;
     let mut evidence = AutomationLifecycleEvidence::default();
@@ -272,8 +299,13 @@ pub async fn landing_facts(
             Err(error) => return Err(error),
         };
         let clean_candidate = if landing.landed() && !wt_lifecycle::checkout_missing(&row).await {
+            let base_tip = landing
+                .on_published_base()
+                .then(|| published_bases.get(proof_repository(ctx, Path::new(&row.target.path))))
+                .flatten()
+                .and_then(Option::clone);
             match lifecycle
-                .removal_hazards(&row.target, true, &ctx.cancellation)
+                .removal_hazards_on(&row.target, true, base_tip.as_deref(), &ctx.cancellation)
                 .await
             {
                 Ok(hazards) => hazards.is_empty(),
@@ -312,7 +344,7 @@ pub async fn landing_facts(
         evidence.rows.insert(
             slug,
             LifecycleFacts {
-                local_merged: landing.local_merged.then_some(true),
+                local_merged: landing.on_published_base().then_some(true),
                 clean_candidate,
                 in_production,
                 deploys,
@@ -527,14 +559,25 @@ pub fn check_wants(state: &serde_json::Value) -> BTreeMap<String, WatchWants> {
         .collect()
 }
 
+#[derive(Default)]
 struct Landing {
     pr_landed: bool,
     local_merged: bool,
+    /// The pull request merged from an earlier head and the branch was
+    /// rebased since: every commit it has beyond the advertised base is one
+    /// whose patch that base already holds.
+    patch_merged: bool,
 }
 
 impl Landing {
     fn landed(&self) -> bool {
-        self.pr_landed || self.local_merged
+        self.pr_landed || self.local_merged || self.patch_merged
+    }
+
+    /// Whether the proof names the base tip origin advertised, which the
+    /// removal then carries as its witness.
+    fn on_published_base(&self) -> bool {
+        self.local_merged || self.patch_merged
     }
 }
 
@@ -553,10 +596,7 @@ async fn landing_evidence(
     if wt_vcs::operation_in_progress(row.git_dir.as_deref()).await
         || wt_lifecycle::checkout_missing(row).await
     {
-        return Ok(Landing {
-            pr_landed: false,
-            local_merged: false,
-        });
+        return Ok(Landing::default());
     }
     let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
         .await?
@@ -565,8 +605,8 @@ async fn landing_evidence(
         .trim()
         .to_owned();
     let own_work = if let Some(base_sha) = stored["baseSha"].as_str() {
-        // A missing or corrupted fork anchor is unknown, never evidence of
-        // landing. An empty branch must not inherit its parent's landing.
+        // A corrupted fork anchor is unknown, never evidence of landing. An
+        // empty branch must not inherit its parent's landing.
         let own = run_git(
             ctx,
             path,
@@ -575,12 +615,18 @@ async fn landing_evidence(
         .await?;
         own.status.success() && own.stdout_text().trim().parse::<u64>().is_ok_and(|n| n > 0)
     } else {
-        false
+        // A worktree adopted from an existing branch before adoption
+        // recorded an anchor has none. The proofs below are then all there
+        // is, and each is one an empty branch cannot give: a pull request
+        // merged at this HEAD, or a HEAD the base holds off its own line.
+        true
     };
-    let pr_landed = own_work
-        && github.prs.get(&row.target.branch).is_some_and(|pr| {
-            pr.state == "MERGED" && pr.head_ref_oid.as_deref() == Some(head.as_str())
-        });
+    let merged_pr = github
+        .prs
+        .get(&row.target.branch)
+        .filter(|pr| pr.state == "MERGED");
+    let pr_landed =
+        own_work && merged_pr.is_some_and(|pr| pr.head_ref_oid.as_deref() == Some(head.as_str()));
     let local_merged = own_work
         && !pr_landed
         && published_base_contains(
@@ -592,9 +638,15 @@ async fn landing_evidence(
             warning,
         )
         .await?;
+    let patch_merged = own_work
+        && !pr_landed
+        && !local_merged
+        && merged_pr.is_some()
+        && published_base_holds_patches(ctx, path, &head, published_bases, warning).await?;
     Ok(Landing {
         pr_landed,
         local_merged,
+        patch_merged,
     })
 }
 
@@ -626,11 +678,8 @@ async fn plan_with_evidence(
                 &mut warning,
             )
             .await?;
-            let Landing {
-                pr_landed,
-                local_merged,
-            } = landing;
-            let landed = pr_landed || local_merged;
+            let landed = landing.landed();
+            let pr_landed = landing.pr_landed;
             let mut extra = serde_json::Map::new();
             let pr = github.prs.get(&row.target.branch);
             if let Some(title) = stored["manualTitle"]
@@ -650,6 +699,14 @@ async fn plan_with_evidence(
             }
             if let Some(github_issue) = stored.get("githubIssue") {
                 extra.insert("githubIssue".into(), github_issue.clone());
+            }
+            // The removal record is where the worktree's other branches
+            // stay findable once its reflog is gone.
+            if let Some(others) = stored
+                .get(wt_core::OTHER_BRANCHES)
+                .filter(|others| others.as_object().is_some_and(|others| !others.is_empty()))
+            {
+                extra.insert(wt_core::OTHER_BRANCHES.into(), others.clone());
             }
             if landed {
                 extra.insert("gitState".into(), serde_json::json!("merged"));
@@ -677,24 +734,16 @@ async fn plan_with_evidence(
                 automations_paused: None,
                 extra,
             };
+            let base_tip = landing
+                .on_published_base()
+                .then(|| published_bases.get(proof_repository(ctx, path)))
+                .flatten()
+                .and_then(Option::clone);
             let mut revision = lifecycle
-                .removal_revision(&row.target, landed, &ctx.cancellation)
+                .removal_revision_on(&row.target, landed, base_tip.as_deref(), &ctx.cancellation)
                 .await?;
-            if local_merged {
-                let repository = match ctx.config.backend.kind {
-                    wt_config::BackendKind::GitWorktree => ctx.config.paths.main_clone.as_path(),
-                    wt_config::BackendKind::Rift => path,
-                };
-                revision.published_base = published_bases
-                    .get(repository)
-                    .and_then(Option::as_ref)
-                    .map(|tip| {
-                        Box::new((
-                            format!("refs/heads/{}", ctx.config.branch.base),
-                            tip.clone(),
-                        ))
-                    });
-            }
+            revision.published_base = base_tip
+                .map(|tip| Box::new((format!("refs/heads/{}", ctx.config.branch.base), tip)));
             let hazards = revision.hazards.clone();
             let stage_path = path.to_path_buf();
             let stage = row.target.stage.clone();
@@ -742,10 +791,74 @@ async fn published_base_contains(
     if !cached.status.success() {
         return Ok(false);
     }
-    let repository = match ctx.config.backend.kind {
+    let Some(tip) = published_tip(ctx, path, published, warning).await? else {
+        return Ok(false);
+    };
+    // A newly advertised object may not have been fetched yet. Missing objects
+    // are unknown, not a reason to trust the older local base.
+    if !run_git(ctx, path, ["merge-base", "--is-ancestor", head, &tip])
+        .await?
+        .status
+        .success()
+    {
+        return Ok(false);
+    }
+    // Contained is not landed when HEAD is only a snapshot of the base: a
+    // lagging fork anchor would otherwise count base commits as own work.
+    let line = run_git(ctx, path, wt_vcs::mainline_args(&tip, head)).await?;
+    if !line.status.success() || line.stdout_truncated {
+        return Ok(true);
+    }
+    let reflog = run_git(ctx, path, wt_vcs::branch_reflog_args(branch)).await?;
+    let reflog = if reflog.status.success() {
+        reflog.stdout_text().to_string()
+    } else {
+        String::new()
+    };
+    Ok(wt_vcs::contained_head_landed(
+        &line.stdout_text(),
+        &reflog,
+        head,
+    ))
+}
+
+/// Whether the base tip origin advertises holds, by patch, every commit
+/// `head` has beyond it, and there is at least one. A tip not fetched yet
+/// or a failed read is unknown, which is not landed.
+async fn published_base_holds_patches(
+    ctx: &AppContext,
+    path: &Path,
+    head: &str,
+    published: &mut BTreeMap<PathBuf, Option<String>>,
+    warning: &mut Option<String>,
+) -> Result<bool> {
+    let Some(tip) = published_tip(ctx, path, published, warning).await? else {
+        return Ok(false);
+    };
+    let cherry = run_git(ctx, path, wt_vcs::cherry_args(&tip, head)).await?;
+    Ok(cherry.status.success()
+        && !cherry.stdout_truncated
+        && wt_vcs::cherry_all_in_base(&cherry.stdout_text()))
+}
+
+/// The object store whose origin a landing proof is read from and rechecked
+/// against: linked worktrees share the main clone's, a Rift clone has its own.
+fn proof_repository<'a>(ctx: &'a AppContext, path: &'a Path) -> &'a Path {
+    match ctx.config.backend.kind {
         wt_config::BackendKind::GitWorktree => ctx.config.paths.main_clone.as_path(),
         wt_config::BackendKind::Rift => path,
-    };
+    }
+}
+
+/// The base tip origin advertises now, asked once per object store in a
+/// batch. `None` when origin could not say.
+async fn published_tip(
+    ctx: &AppContext,
+    path: &Path,
+    published: &mut BTreeMap<PathBuf, Option<String>>,
+    warning: &mut Option<String>,
+) -> Result<Option<String>> {
+    let repository = proof_repository(ctx, path);
     if !published.contains_key(repository) {
         let remote_ref = format!("refs/heads/{}", ctx.config.branch.base);
         let result = run_git(
@@ -777,35 +890,7 @@ async fn published_base_contains(
         }
         published.insert(repository.to_path_buf(), tip);
     }
-    let Some(tip) = published.get(repository).and_then(Option::as_deref) else {
-        return Ok(false);
-    };
-    // A newly advertised object may not have been fetched yet. Missing objects
-    // are unknown, not a reason to trust the older local base.
-    if !run_git(ctx, path, ["merge-base", "--is-ancestor", head, tip])
-        .await?
-        .status
-        .success()
-    {
-        return Ok(false);
-    }
-    // Contained is not landed when HEAD is only a snapshot of the base: a
-    // lagging fork anchor would otherwise count base commits as own work.
-    let line = run_git(ctx, path, wt_vcs::mainline_args(tip, head)).await?;
-    if !line.status.success() || line.stdout_truncated {
-        return Ok(true);
-    }
-    let reflog = run_git(ctx, path, wt_vcs::branch_reflog_args(branch)).await?;
-    let reflog = if reflog.status.success() {
-        reflog.stdout_text().to_string()
-    } else {
-        String::new()
-    };
-    Ok(wt_vcs::contained_head_landed(
-        &line.stdout_text(),
-        &reflog,
-        head,
-    ))
+    Ok(published.get(repository).cloned().flatten())
 }
 
 /// Re-plan the exact confirmed set. Never expand a user's confirmation because
@@ -1032,6 +1117,169 @@ mod tests {
             .stdout_text()
             .trim()
             .to_owned()
+    }
+
+    /// Worktree "one" with `origin` added and its HEAD pushed as the base.
+    /// Returns the origin path and that base commit.
+    async fn with_origin(fixture: &CommandFixture) -> (PathBuf, String) {
+        let ctx = &fixture.ctx;
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, &ctx.cwd, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(
+            ctx,
+            &ctx.cwd,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await;
+        git(ctx, &ctx.cwd, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        let base = git(ctx, &ctx.cwd, &["rev-parse", "HEAD"]).await;
+        (origin, base)
+    }
+
+    async fn row_one(ctx: &AppContext) -> WorktreeRecord {
+        ctx.repository
+            .inventory(&ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "one")
+            .unwrap()
+    }
+
+    /// Commits "feature work" on worktree "one" and pushes its branch, then
+    /// moves the base on and merges that pushed head into it with a merge
+    /// commit. Returns the pushed head and the base commit before the merge.
+    async fn merged_with_a_merge_commit(fixture: &CommandFixture, base: &str) -> (String, String) {
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        let branch = row_one(ctx).await.target.branch;
+        std::fs::write(path.join("work.txt"), "merged work\n").unwrap();
+        git(ctx, path, &["add", "work.txt"]).await;
+        git(ctx, path, &["commit", "-m", "feature work"]).await;
+        let pushed = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        git(
+            ctx,
+            path,
+            &["push", "origin", &format!("HEAD:refs/heads/{branch}")],
+        )
+        .await;
+        git(ctx, path, &["checkout", "-q", "--detach", base]).await;
+        std::fs::write(path.join("other.txt"), "base moved\n").unwrap();
+        git(ctx, path, &["add", "other.txt"]).await;
+        git(ctx, path, &["commit", "-m", "base moves"]).await;
+        let moved = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        git(ctx, path, &["merge", "--no-ff", "-m", "merge", &pushed]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        git(ctx, path, &["fetch", "-q", "origin"]).await;
+        git(ctx, path, &["checkout", "-q", &branch]).await;
+        (pushed, moved)
+    }
+
+    fn merged_pr(branch: &str, head: &str) -> GithubData {
+        let mut data = GithubData::default();
+        data.prs.insert(
+            branch.to_owned(),
+            serde_json::from_value(serde_json::json!({
+                "number": 42, "url": "https://example.invalid/pull/42",
+                "headRefName": branch, "headRefOid": head,
+                "baseRefName": "main", "mergeCommitOid": "f".repeat(40),
+                "title": "Feature", "isDraft": false, "state": "MERGED",
+                "checks": "pass", "failedChecks": [], "review": "none",
+                "reviewRequests": 0, "requestedReviewers": [], "suggestedReviewers": [],
+                "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0
+            }))
+            .unwrap(),
+        );
+        data.covered_branches.insert(branch.to_owned());
+        data
+    }
+
+    /// The pull request merged from the pushed head; the branch was then
+    /// rebased onto the newer base and never pushed. HEAD is a new commit
+    /// that no base contains, yet the base holds its patch.
+    #[tokio::test]
+    async fn a_branch_rebased_after_its_pull_request_merged_is_landed_and_removable() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        let (_origin, base) = with_origin(&fixture).await;
+        let anchor = base.clone();
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (pushed, moved) = merged_with_a_merge_commit(&fixture, &base).await;
+        git(ctx, path, &["rebase", "-q", &moved]).await;
+        let head = git(ctx, path, &["rev-parse", "HEAD"]).await;
+        assert_ne!(head, pushed);
+        let tip = git(ctx, path, &["rev-parse", "origin/main"]).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let row = row_one(ctx).await;
+        let github = merged_pr(&row.target.branch, &pushed);
+        let plan = || async {
+            plan_with_evidence(ctx, vec![row_one(ctx).await], &state, &github, None)
+                .await
+                .unwrap()
+                .rows
+                .remove(0)
+        };
+
+        let landed = plan().await;
+        assert!(landed.landed);
+        assert!(landed.hazards.is_empty(), "{:?}", landed.hazards);
+        assert_eq!(landed.revision.published_base.as_ref().unwrap().1, tip);
+        assert!(
+            row_landings(ctx, std::slice::from_ref(&row), &state, Some(&github)).await["one"].base
+        );
+        // The merge is the proof that the work is this branch's: without
+        // it, matching patches alone land nothing.
+        let unproven = plan_with_evidence(ctx, vec![row], &state, &GithubData::default(), None)
+            .await
+            .unwrap();
+        assert!(!unproven.rows[0].landed);
+
+        // One commit the base does not hold is work that has not landed.
+        std::fs::write(path.join("work.txt"), "after the merge\n").unwrap();
+        git(ctx, path, &["commit", "-am", "local only"]).await;
+        let advanced = plan().await;
+        assert!(!advanced.landed);
+        assert!(!advanced.hazards.is_empty());
+        fixture.close().await.unwrap();
+    }
+
+    /// A worktree adopted from an existing branch before adoption recorded
+    /// an anchor has no fork-base record. Its merged HEAD still lands, and
+    /// a branch with nothing of its own still does not.
+    #[tokio::test]
+    async fn a_worktree_without_a_fork_anchor_lands_by_what_the_base_holds() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let (_origin, base) = with_origin(&fixture).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(state["slugs"]["one"]["baseSha"].is_null());
+        let landed = || async {
+            plan_with_facts(ctx, vec![row_one(ctx).await], &state, None, None)
+                .await
+                .unwrap()
+                .rows[0]
+                .landed
+        };
+        // HEAD is the base tip itself: a snapshot, not work that landed.
+        assert!(!landed().await);
+        merged_with_a_merge_commit(&fixture, &base).await;
+        assert!(landed().await);
+        fixture.close().await.unwrap();
     }
 
     #[tokio::test]

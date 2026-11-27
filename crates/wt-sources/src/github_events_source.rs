@@ -115,6 +115,7 @@ fn validate(
     }
     let mut data: GithubData = serde_json::from_value(serde_json::json!({
         "prs": snapshot.prs, "mergeQueue": snapshot.merge_queue,
+        "rateLimit": snapshot.rate_limit,
     }))
     .ok()?;
     data.prs.retain(|branch, _| branches.contains(branch));

@@ -218,6 +218,8 @@ impl GithubClient {
         }
         let repo = self.repository(cancellation).await?;
         let groups = chunk_branches(branches, CHUNK_SIZE);
+        let requests = groups.len();
+        let started = Instant::now();
         let client = self.clone();
         let cancel = cancellation.clone();
         let fetch = async {
@@ -231,19 +233,71 @@ impl GithubClient {
             .try_collect::<Vec<_>>()
             .await?;
             let mut data = GithubData::default();
+            let mut unread = Vec::new();
             for mut chunk in chunks.drain(..) {
-                data.prs.append(&mut chunk.prs);
-                data.merge_queue.append(&mut chunk.merge_queue);
-                data.merge_queue_complete |= chunk.merge_queue_complete;
+                data.prs.append(&mut chunk.data.prs);
+                data.merge_queue.append(&mut chunk.data.merge_queue);
+                data.merge_queue_complete |= chunk.data.merge_queue_complete;
+                spend(&mut data.rate_limit, chunk.data.rate_limit);
+                unread.append(&mut chunk.unread);
+            }
+            // The batched query leaves thread authors out (they were most of
+            // its cost). A failure here fails the whole read like a chunk's.
+            if !unread.is_empty() {
+                let spent = self.read_thread_authors(&mut unread, &cancel).await?;
+                spend(&mut data.rate_limit, spent);
+                for node in &unread {
+                    let pr = parse_pr(node, &self.options).ok_or_else(|| {
+                        GithubError::Protocol("invalid GitHub PR payload after author read".into())
+                    })?;
+                    data.prs.insert(pr.head_ref_name.clone(), pr);
+                }
             }
             data.covered_branches = branches.iter().cloned().collect();
             Ok::<GithubData, GithubError>(data)
         };
-        timeout(Duration::from_secs(100), fetch)
+        let data = timeout(Duration::from_secs(100), fetch)
             .await
             .map_err(|_| GithubError::Transient {
                 message: "github fetch retry budget exhausted".into(),
-            })?
+            })??;
+        // One line per fetch, so GitHub budget use can be counted from the log.
+        tracing::info!(
+            branches = branches.len(),
+            requests,
+            cost = data.rate_limit.map(|rate| rate.cost),
+            remaining = data.rate_limit.map(|rate| rate.remaining),
+            limit = data.rate_limit.map(|rate| rate.limit),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "GitHub fetch"
+        );
+        Ok(data)
+    }
+
+    /// Fill in the first comment's author of every thread in `nodes` that
+    /// lacks one, in one request per [`THREAD_AUTHOR_PAGE`] threads.
+    async fn read_thread_authors(
+        &self,
+        nodes: &mut [Value],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RateLimit>, GithubError> {
+        let ids: Vec<String> = nodes.iter().flat_map(unread_thread_ids).collect();
+        let mut authors = HashMap::new();
+        let mut spent = None;
+        for page in ids.chunks(THREAD_AUTHOR_PAGE) {
+            let query = thread_authors_query(page);
+            let (found, rate) = self
+                .graphql_read(&query, &[], cancellation, |bytes| {
+                    parse_thread_authors(bytes, page)
+                })
+                .await?;
+            authors.extend(found);
+            spend(&mut spent, rate);
+        }
+        for node in nodes {
+            set_thread_authors(node, &authors);
+        }
+        Ok(spent)
     }
 
     async fn fetch_chunk(
@@ -252,40 +306,62 @@ impl GithubClient {
         branches: &[String],
         with_queue: bool,
         cancellation: &CancellationToken,
-    ) -> Result<GithubData, GithubError> {
+    ) -> Result<ChunkRead, GithubError> {
+        let (query, vars) = build_query(
+            branches,
+            with_queue,
+            &repo.owner,
+            &repo.name,
+            &self.options.base_branch,
+            if self.options.review_bot_mode == ReviewBotMode::Checklist {
+                30
+            } else {
+                10
+            },
+        );
+        self.graphql_read(&query, &vars, cancellation, |bytes| {
+            parse_chunk(bytes, branches, with_queue, &self.options)
+        })
+        .await
+    }
+
+    /// One GraphQL read with string variables, asking gh for the response
+    /// headers too: a rate-limited reply names its reset only there.
+    async fn graphql_read<T>(
+        &self,
+        query: &str,
+        vars: &[(String, String)],
+        cancellation: &CancellationToken,
+        parse: impl Fn(&[u8]) -> Result<T, GithubError>,
+    ) -> Result<T, GithubError> {
         for attempt in 0..MAX_ATTEMPTS {
-            let (query, vars) = build_query(
-                branches,
-                with_queue,
-                &repo.owner,
-                &repo.name,
-                &self.options.base_branch,
-                if self.options.review_bot_mode == ReviewBotMode::Checklist {
-                    30
-                } else {
-                    10
-                },
-            );
             let mut args = vec![
                 "api".to_owned(),
                 "graphql".to_owned(),
+                "--include".to_owned(),
                 "-f".to_owned(),
                 format!("query={query}"),
             ];
             for (key, value) in vars {
-                // All variables in this query are GraphQL strings. `-F`
+                // All variables in these queries are GraphQL strings. `-F`
                 // asks gh to coerce values such as `false` and `2026` to
                 // JSON booleans/numbers, which GraphQL then rejects.
                 args.extend(["-f".into(), format!("{key}={value}")]);
             }
             let error = match self.run(args, cancellation).await {
-                Ok(out) if out.status.success() => {
-                    match parse_chunk(&out.stdout, branches, with_queue, &self.options) {
-                        Ok(data) => return Ok(data),
-                        Err(error) => error,
-                    }
+                Ok(mut out) => {
+                    let reset = take_response_headers(&mut out.stdout)
+                        .and_then(|headers| header_reset_ms(&headers, epoch_ms()));
+                    let error = if out.status.success() {
+                        match parse(&out.stdout) {
+                            Ok(read) => return Ok(read),
+                            Err(error) => error,
+                        }
+                    } else {
+                        classify_output(&out)
+                    };
+                    with_reset(error, reset)
                 }
-                Ok(out) => classify_output(&out),
                 Err(error) => error,
             };
             // Only transport-level transients retry, and only at this chunk
@@ -386,11 +462,12 @@ impl GithubClient {
             return Ok(Default::default());
         }
         let repo = self.repository(cancellation).await?;
-        let out = self
+        let mut out = self
             .run(
                 [
                     "api".to_owned(),
                     "graphql".to_owned(),
+                    "--include".to_owned(),
                     "-f".to_owned(),
                     format!("query={}", pr_outcomes_query(numbers)),
                     "-f".to_owned(),
@@ -401,25 +478,15 @@ impl GithubClient {
                 cancellation,
             )
             .await?;
+        let reset = take_response_headers(&mut out.stdout)
+            .and_then(|headers| header_reset_ms(&headers, epoch_ms()));
         // gh exits non-zero when the reply carries errors, and still prints
         // the reply: an unknown number must not fail the other PRs.
         match parse_pr_outcomes(&out.stdout, numbers) {
             Ok(outcomes) => Ok(outcomes),
-            Err(_) if !out.status.success() => Err(classify_output(&out)),
-            Err(error) => Err(error),
+            Err(_) if !out.status.success() => Err(with_reset(classify_output(&out), reset)),
+            Err(error) => Err(with_reset(error, reset)),
         }
-    }
-
-    /// When the exhausted primary rate limit resets, in epoch milliseconds.
-    /// `None` when no primary limit is exhausted (a secondary limit names
-    /// no time) or the question itself fails. The endpoint is not counted
-    /// against any limit.
-    pub async fn rate_limit_reset_ms(&self, cancellation: &CancellationToken) -> Option<u64> {
-        let out = self.run(["api", "rate_limit"], cancellation).await.ok()?;
-        out.status
-            .success()
-            .then(|| exhausted_rate_limit_reset_ms(&out.stdout))
-            .flatten()
     }
 
     /// Numbers of the open PRs whose BASE is `branch`. Deleting a branch by
@@ -1293,23 +1360,72 @@ impl Drop for MergeGuard {
     }
 }
 
-/// The latest reset among the exhausted REST and GraphQL limits of a
-/// `rate_limit` reply.
-fn exhausted_rate_limit_reset_ms(bytes: &[u8]) -> Option<u64> {
-    let reply: Value = serde_json::from_slice(bytes).ok()?;
-    ["core", "graphql"]
-        .iter()
-        .filter_map(|name| reply.pointer(&format!("/resources/{name}")))
-        .filter(|limit| limit.get("remaining").and_then(Value::as_u64) == Some(0))
-        .filter_map(|limit| limit.get("reset").and_then(Value::as_u64))
-        .max()
+/// Split the status line and headers `gh api --include` prints off the
+/// front of `stdout`, leaving the body. `None` when there are none.
+fn take_response_headers(stdout: &mut Vec<u8>) -> Option<String> {
+    if !stdout.starts_with(b"HTTP/") {
+        return None;
+    }
+    let find = |gap: &[u8]| stdout.windows(gap.len()).position(|window| window == gap);
+    let (end, gap) = match (find(b"\r\n\r\n"), find(b"\n\n")) {
+        (Some(crlf), Some(lf)) if lf < crlf => (lf, 2),
+        (Some(crlf), _) => (crlf, 4),
+        (None, Some(lf)) => (lf, 2),
+        (None, None) => return None,
+    };
+    let headers = String::from_utf8_lossy(&stdout[..end]).into_owned();
+    stdout.drain(..end + gap);
+    Some(headers)
+}
+
+/// When the limit these response headers report exhausted lifts, in epoch
+/// milliseconds: `retry-after` for a secondary limit, else the reset of a
+/// primary limit with nothing remaining. `None` while budget remains.
+fn header_reset_ms(headers: &str, now_ms: u64) -> Option<u64> {
+    let number = |name: &str| {
+        headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .and_then(|(_, value)| value.trim().parse::<u64>().ok())
+    };
+    if let Some(seconds) = number("retry-after") {
+        return Some(now_ms.saturating_add(seconds.saturating_mul(1000)));
+    }
+    (number("x-ratelimit-remaining") == Some(0))
+        .then(|| number("x-ratelimit-reset"))
+        .flatten()
         .map(|seconds| seconds.saturating_mul(1000))
+}
+
+fn with_reset(error: GithubError, reset: Option<u64>) -> GithubError {
+    match error {
+        GithubError::RateLimit {
+            message,
+            reset_at_ms: None,
+        } => GithubError::RateLimit {
+            message,
+            reset_at_ms: reset,
+        },
+        other => other,
+    }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
 }
 
 fn classify_output(output: &ProcessOutput) -> GithubError {
     let (message, transient) = output_failure(output);
     if is_rate_limit(&message) {
-        GithubError::RateLimit(message)
+        GithubError::RateLimit {
+            message,
+            reset_at_ms: None,
+        }
     } else if transient {
         GithubError::Transient { message }
     } else {
@@ -1475,7 +1591,7 @@ fn build_query(
     };
     let fragment = PR_FRAGMENT.replace("COMMENT_FETCH_LIMIT", &comment_limit.to_string());
     let query = format!(
-        "query($owner:String!,$name:String!{merge_var},{var_decls}) {{ repository(owner:$owner,name:$name) {{ {aliases} {merge_queue} }} }} {fragment}"
+        "query($owner:String!,$name:String!{merge_var},{var_decls}) {{ repository(owner:$owner,name:$name) {{ {aliases} {merge_queue} }} {RATE_LIMIT_FIELD} }} {fragment}"
     );
     let mut vars = vec![("owner".into(), owner.into()), ("name".into(), repo.into())];
     if with_queue {
@@ -1565,10 +1681,178 @@ reviewRequests(first:20) { totalCount nodes { requestedReviewer { __typename ...
 suggestedReviewers { reviewer { login } isAuthor isCommenter }
 autoMergeRequest { enabledAt mergeMethod }
 commits(last:1) { nodes { commit { committedDate statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } }
-reviewThreads(first:50) { nodes { isResolved comments(first:1) { nodes { author { login __typename } } } } }
+reviewThreads(first:50) { nodes { id isResolved } }
 comments(last:COMMENT_FETCH_LIMIT) { nodes { author { login __typename } body createdAt updatedAt } }
 reviews(last:10) { nodes { author { login __typename } body state createdAt } }
 }"#;
+
+/// Asked in every read, so each reply says what it cost and what is left.
+const RATE_LIMIT_FIELD: &str = "rateLimit { cost remaining resetAt limit }";
+
+/// Threads one author read asks about. Each costs one of the hundred
+/// requests a GraphQL point buys.
+const THREAD_AUTHOR_PAGE: usize = 100;
+
+/// One chunk's data, and the selected PR nodes whose unresolved threads
+/// still need their author read.
+#[derive(Debug)]
+struct ChunkRead {
+    data: GithubData,
+    unread: Vec<Value>,
+}
+
+/// The reply's `rateLimit`. `None` when the server reports none or the
+/// values do not describe a budget.
+fn parse_rate_limit(reply: &Value) -> Option<RateLimit> {
+    let rate = reply.pointer("/data/rateLimit")?;
+    let number = |key: &str| rate.get(key).and_then(Value::as_u64);
+    let reset = OffsetDateTime::parse(rate.get("resetAt")?.as_str()?, &Rfc3339).ok()?;
+    Some(RateLimit {
+        limit: number("limit").filter(|limit| *limit > 0)?,
+        remaining: number("remaining")?,
+        cost: number("cost")?,
+        reset_at_ms: u64::try_from(reset.unix_timestamp_nanos() / 1_000_000).ok()?,
+    })
+}
+
+/// Add one request's budget reading to a read's total: costs add up, and
+/// what remains is the lowest figure of the newest window.
+fn spend(total: &mut Option<RateLimit>, next: Option<RateLimit>) {
+    let Some(next) = next else { return };
+    *total = Some(match *total {
+        None => next,
+        Some(seen) => RateLimit {
+            limit: next.limit,
+            cost: seen.cost.saturating_add(next.cost),
+            remaining: match next.reset_at_ms.cmp(&seen.reset_at_ms) {
+                std::cmp::Ordering::Greater => next.remaining,
+                std::cmp::Ordering::Equal => seen.remaining.min(next.remaining),
+                std::cmp::Ordering::Less => seen.remaining,
+            },
+            reset_at_ms: seen.reset_at_ms.max(next.reset_at_ms),
+        },
+    });
+}
+
+/// A reply's GraphQL errors as the failure they are, if it has any.
+fn graphql_errors(reply: &Value) -> Option<GithubError> {
+    let errors = reply
+        .get("errors")
+        .and_then(Value::as_array)
+        .filter(|errors| !errors.is_empty())?;
+    let message = errors
+        .iter()
+        .map(|e| {
+            e.get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("GraphQL error")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(if is_rate_limit(&message) {
+        GithubError::RateLimit {
+            message,
+            reset_at_ms: None,
+        }
+    } else if crate::checks::is_transient_failure("", &message, false) {
+        GithubError::Transient { message }
+    } else {
+        GithubError::Protocol(message)
+    })
+}
+
+/// An unresolved thread whose first comment's author the reply left out.
+fn thread_needs_author(thread: &Value) -> bool {
+    thread.get("isResolved").and_then(Value::as_bool) == Some(false)
+        && thread
+            .pointer("/comments/nodes")
+            .and_then(Value::as_array)
+            .is_none()
+}
+
+fn threads(pr: &Value) -> impl Iterator<Item = &Value> {
+    pr.pointer("/reviewThreads/nodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn unread_thread_ids(pr: &Value) -> Vec<String> {
+    threads(pr)
+        .filter(|thread| thread_needs_author(thread))
+        .filter_map(|thread| str_at(thread, "/id").map(str::to_owned))
+        .collect()
+}
+
+/// Node IDs are written into the author query, so only GitHub's ID alphabet
+/// may pass.
+fn is_node_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-=+/".contains(&b))
+}
+
+fn thread_authors_query(ids: &[String]) -> String {
+    let nodes = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!("t{i}: node(id:\"{id}\") {{ ... on PullRequestReviewThread {{ comments(first:1) {{ nodes {{ author {{ login __typename }} }} }} }} }}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("query {{ {nodes} {RATE_LIMIT_FIELD} }}")
+}
+
+/// Each asked thread's first-comment author (`null` for a deleted account),
+/// by thread ID. A thread the reply does not answer for fails the read.
+fn parse_thread_authors(
+    bytes: &[u8],
+    ids: &[String],
+) -> Result<(HashMap<String, Value>, Option<RateLimit>), GithubError> {
+    let reply: Value = serde_json::from_slice(bytes).map_err(|e| GithubError::Transient {
+        message: format!("unparseable GitHub JSON: {e}"),
+    })?;
+    if let Some(error) = graphql_errors(&reply) {
+        return Err(error);
+    }
+    let mut authors = HashMap::new();
+    for (i, id) in ids.iter().enumerate() {
+        let comments = reply
+            .pointer(&format!("/data/t{i}/comments/nodes"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                GithubError::Protocol(format!(
+                    "incomplete or invalid GitHub review thread payload for t{i}"
+                ))
+            })?;
+        let author = comments
+            .first()
+            .and_then(|comment| comment.get("author"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        authors.insert(id.clone(), author);
+    }
+    Ok((authors, parse_rate_limit(&reply)))
+}
+
+/// Give each thread its author in the shape the batched query used to
+/// return, so one parser reads both.
+fn set_thread_authors(pr: &mut Value, authors: &HashMap<String, Value>) {
+    let Some(threads) = pr
+        .pointer_mut("/reviewThreads/nodes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for thread in threads {
+        let Some(author) = str_at(thread, "/id").and_then(|id| authors.get(id)) else {
+            continue;
+        };
+        thread["comments"] = serde_json::json!({"nodes": [{"author": author}]});
+    }
+}
 
 /// Merge queue entries one read asks for. The query does not paginate, so a
 /// full page may not be the whole queue.
@@ -1579,36 +1863,21 @@ fn parse_chunk(
     branches: &[String],
     with_queue: bool,
     options: &GithubOptions,
-) -> Result<GithubData, GithubError> {
+) -> Result<ChunkRead, GithubError> {
     let value: Value = serde_json::from_slice(bytes).map_err(|e| GithubError::Transient {
         message: format!("unparseable GitHub JSON: {e}"),
     })?;
-    if let Some(errors) = value
-        .get("errors")
-        .and_then(Value::as_array)
-        .filter(|a| !a.is_empty())
-    {
-        let message = errors
-            .iter()
-            .map(|e| {
-                e.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("GraphQL error")
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if is_rate_limit(&message) {
-            return Err(GithubError::RateLimit(message));
-        }
-        if crate::checks::is_transient_failure("", &message, false) {
-            return Err(GithubError::Transient { message });
-        }
-        return Err(GithubError::Protocol(message));
+    if let Some(error) = graphql_errors(&value) {
+        return Err(error);
     }
     let repo = value
         .pointer("/data/repository")
         .ok_or_else(|| GithubError::Protocol("missing GitHub repository payload".into()))?;
-    let mut data = GithubData::default();
+    let mut data = GithubData {
+        rate_limit: parse_rate_limit(&value),
+        ..GithubData::default()
+    };
+    let mut unread = Vec::new();
     for (i, branch) in branches.iter().enumerate() {
         let invalid = || {
             GithubError::Protocol(format!(
@@ -1644,6 +1913,18 @@ fn parse_chunk(
             .collect::<Result<Vec<_>, _>>()?;
         let selected = prs.iter().position(|pr| pr.state == "OPEN").unwrap_or(0);
         if let Some(pr) = prs.into_iter().nth(selected) {
+            let node = &nodes[selected];
+            let mut pending = threads(node).filter(|thread| thread_needs_author(thread));
+            if let Some(first) = pending.next() {
+                // A thread that cannot be asked about would count as nobody's.
+                if !std::iter::once(first)
+                    .chain(pending)
+                    .all(|thread| str_at(thread, "/id").is_some_and(is_node_id))
+                {
+                    return Err(invalid());
+                }
+                unread.push(node.clone());
+            }
             data.prs.insert(pr.head_ref_name.clone(), pr);
         }
     }
@@ -1681,7 +1962,7 @@ fn parse_chunk(
             );
         }
     }
-    Ok(data)
+    Ok(ChunkRead { data, unread })
 }
 
 fn parse_pr(pr: &Value, options: &GithubOptions) -> Option<PullRequest> {
@@ -2100,6 +2381,16 @@ mod transport_tests {
     use tokio_util::sync::CancellationToken;
     use wt_platform::process::ProcessRunner;
 
+    /// The chunk's data alone, for tests that are not about thread authors.
+    fn parse_chunk(
+        bytes: &[u8],
+        branches: &[String],
+        with_queue: bool,
+        options: &GithubOptions,
+    ) -> Result<GithubData, GithubError> {
+        super::parse_chunk(bytes, branches, with_queue, options).map(|read| read.data)
+    }
+
     fn options() -> GithubOptions {
         GithubOptions {
             base_branch: "main".into(),
@@ -2168,28 +2459,6 @@ mod transport_tests {
         path
     }
 
-    #[test]
-    fn only_an_exhausted_primary_limit_names_a_reset() {
-        let reply = |core: u64, graphql: u64| {
-            serde_json::to_vec(&serde_json::json!({"resources": {
-                "core": {"remaining": core, "reset": 1_800_000_100u64},
-                "graphql": {"remaining": graphql, "reset": 1_800_000_200u64},
-                "search": {"remaining": 0, "reset": 1_800_009_999u64},
-            }}))
-            .unwrap()
-        };
-        assert_eq!(exhausted_rate_limit_reset_ms(&reply(10, 10)), None);
-        assert_eq!(
-            exhausted_rate_limit_reset_ms(&reply(10, 0)),
-            Some(1_800_000_200_000)
-        );
-        assert_eq!(
-            exhausted_rate_limit_reset_ms(&reply(0, 10)),
-            Some(1_800_000_100_000)
-        );
-        assert_eq!(exhausted_rate_limit_reset_ms(b"not json"), None);
-    }
-
     #[tokio::test]
     async fn repository_keeps_rate_limits_and_reuses_a_resolved_slug() {
         let dir = tempdir().unwrap();
@@ -2202,7 +2471,7 @@ mod transport_tests {
             ));
         assert!(matches!(
             limited.repository(&cancel).await,
-            Err(GithubError::RateLimit(_))
+            Err(GithubError::RateLimit { .. })
         ));
         let calls = dir.path().join("calls");
         let gh = fake_gh(
@@ -2246,7 +2515,7 @@ mod transport_tests {
         let rate_limited = view("rate-limited", "echo 'API rate limit exceeded' >&2; exit 1");
         assert!(matches!(
             rate_limited.view_pr("topic", &cancel).await,
-            Err(GithubError::RateLimit(_))
+            Err(GithubError::RateLimit { .. })
         ));
         let unknown_state = view(
             "unknown-state",
@@ -2313,16 +2582,40 @@ mod transport_tests {
         );
     }
 
+    /// One open PR with the given review threads, as the batched query
+    /// returns it.
+    fn pr_reply(threads: serde_json::Value) -> String {
+        serde_json::json!({"data":{"rateLimit":{"cost":1,"remaining":4990,"limit":5000,"resetAt":"2026-10-04T13:00:00Z"},"repository":{"wt_0":{"nodes":[{"id":"PR_node","number":17,"url":"https://github.com/acme/app/pull/17","title":"A title","headRefName":"feature/a","headRefOid":"abc1234","baseRefName":"main","isDraft":false,"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewRequests":{"totalCount":1,"nodes":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}}]},"suggestedReviewers":[{"reviewer":{"login":"suggested"},"isAuthor":false,"isCommenter":true}],"autoMergeRequest":null,"commits":{"nodes":[{"commit":{"committedDate":"2026-10-01T12:00:00Z","statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-02T12:00:00Z"}]}}}}]},"reviewThreads":{"nodes":threads},"comments":{"nodes":[{"author":{"login":"person","__typename":"User"},"body":"hello","createdAt":"2026-10-03T12:00:00Z"}]},"reviews":{"nodes":[]},"mergedAt":null,"closedAt":null}]}}}}).to_string()
+    }
+
+    /// A fake gh that answers the batched query with `prs` and the thread
+    /// author query with `authors`, and counts the author queries.
+    fn two_query_gh(dir: &std::path::Path, prs: &str, authors: &str) -> std::path::PathBuf {
+        fs::write(dir.join("prs.json"), prs).unwrap();
+        fs::write(dir.join("authors.json"), authors).unwrap();
+        fake_gh(
+            dir,
+            "fake-gh",
+            &format!(
+                "case \"$*\" in\n*PullRequestReviewThread*) echo asked >> '{0}/author-queries'; cat '{0}/authors.json';;\n*) cat '{0}/prs.json';;\nesac",
+                dir.display()
+            ),
+        )
+    }
+
     #[tokio::test]
     async fn fake_gh_graphql_fixture_preserves_pr_fields() {
         let dir = tempdir().unwrap();
-        let fixture = dir.path().join("response.json");
-        fs::write(&fixture,r#"{"data":{"repository":{"wt_0":{"nodes":[{"id":"PR_node","number":17,"url":"https://github.com/acme/app/pull/17","title":"A title","headRefName":"feature/a","headRefOid":"abc1234","baseRefName":"main","isDraft":false,"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED","reviewRequests":{"totalCount":1,"nodes":[{"requestedReviewer":{"__typename":"User","login":"reviewer"}}]},"suggestedReviewers":[{"reviewer":{"login":"suggested"},"isAuthor":false,"isCommenter":true}],"autoMergeRequest":null,"commits":{"nodes":[{"commit":{"committedDate":"2026-10-01T12:00:00Z","statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-02T12:00:00Z"}]}}}}]},"reviewThreads":{"nodes":[{"isResolved":false,"comments":{"nodes":[{"author":{"login":"person","__typename":"User"}}]}}]},"comments":{"nodes":[{"author":{"login":"person","__typename":"User"},"body":"hello","createdAt":"2026-10-03T12:00:00Z"}]},"reviews":{"nodes":[]},"mergedAt":null,"closedAt":null}]}}}}"#).unwrap();
-        let script = dir.path().join("fake-gh");
-        fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", fixture.display())).unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
+        let script = two_query_gh(
+            dir.path(),
+            &pr_reply(serde_json::json!([
+                {"id":"PRRT_human","isResolved":false},
+                {"id":"PRRT_bot","isResolved":false},
+                {"id":"PRRT_gone","isResolved":false},
+                {"id":"PRRT_done","isResolved":true}
+            ])),
+            r#"{"data":{"t0":{"comments":{"nodes":[{"author":{"login":"person","__typename":"User"}}]}},"t1":{"comments":{"nodes":[{"author":{"login":"coderabbitai","__typename":"Bot"}}]}},"t2":{"comments":{"nodes":[{"author":null}]}},"rateLimit":{"cost":1,"remaining":4989,"limit":5000,"resetAt":"2026-10-04T13:00:00Z"}}}"#,
+        );
         let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
             .with_gh_program(script)
             .with_repository(RepoSlug::parse("acme/app").unwrap());
@@ -2338,8 +2631,204 @@ mod transport_tests {
         assert_eq!(pr.requested_reviewers, ["reviewer"]);
         assert_eq!(pr.suggested_reviewers[0].login, "suggested");
         assert_eq!(pr.comments[0].body, "hello");
-        assert_eq!(pr.unresolved_threads_total, 1);
+        // Authors come from the follow-up read: one person, the review bot,
+        // and a deleted account that counts as neither.
+        assert_eq!(pr.unresolved_threads_total, 3);
         assert_eq!(pr.unresolved_threads, 1);
+        let bot = pr.review_bot.as_ref().unwrap();
+        assert_eq!((bot.state.as_str(), bot.unresolved), ("unresolved", 1));
+        // Both requests are counted in what the read cost.
+        assert_eq!(
+            data.rate_limit,
+            Some(RateLimit {
+                limit: 5000,
+                remaining: 4989,
+                cost: 2,
+                reset_at_ms: 1_791_118_800_000,
+            })
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("author-queries"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_authors_are_read_only_for_unresolved_threads_and_fail_closed() {
+        let cancel = CancellationToken::new();
+        let client = |dir: &std::path::Path, script| {
+            GithubClient::new(ProcessRunner::default(), dir.to_owned(), options())
+                .with_gh_program(script)
+                .with_repository(RepoSlug::parse("acme/app").unwrap())
+        };
+        // Nothing unresolved: the batched query is the whole read.
+        let dir = tempdir().unwrap();
+        let script = two_query_gh(
+            dir.path(),
+            &pr_reply(serde_json::json!([{"id":"PRRT_done","isResolved":true}])),
+            "{}",
+        );
+        let data = client(dir.path(), script)
+            .fetch_worktrees(&["feature/a".into()], &cancel)
+            .await
+            .unwrap();
+        assert_eq!(data.prs["feature/a"].unresolved_threads_total, 0);
+        assert_eq!(data.rate_limit.unwrap().cost, 1);
+        assert!(!dir.path().join("author-queries").exists());
+
+        // An author read that fails, or leaves a thread out, fails the read.
+        let unresolved = pr_reply(serde_json::json!([
+            {"id":"PRRT_a","isResolved":false},
+            {"id":"PRRT_b","isResolved":false}
+        ]));
+        for (authors, rate_limited) in [
+            (
+                r#"{"data":{"t0":{"comments":{"nodes":[]}},"t1":null}}"#,
+                false,
+            ),
+            (r#"{"data":{"t0":{"comments":{"nodes":[]}}}}"#, false),
+            (
+                r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+                true,
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let script = two_query_gh(dir.path(), &unresolved, authors);
+            let result = client(dir.path(), script)
+                .fetch_worktrees(&["feature/a".into()], &cancel)
+                .await;
+            match result {
+                Err(GithubError::RateLimit { .. }) if rate_limited => {}
+                Err(GithubError::Protocol(_)) if !rate_limited => {}
+                other => panic!("{authors} gave {other:?}"),
+            }
+        }
+
+        // A thread that cannot be asked about is not counted as nobody's.
+        for thread in [
+            serde_json::json!({"isResolved":false}),
+            serde_json::json!({"id":"x\") { id } evil: node(id:\"y","isResolved":false}),
+        ] {
+            let reply = pr_reply(serde_json::json!([thread]));
+            assert!(matches!(
+                super::parse_chunk(reply.as_bytes(), &["feature/a".into()], false, &options()),
+                Err(GithubError::Protocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn the_batched_query_asks_no_per_thread_connection_and_reports_its_cost() {
+        let branches: Vec<String> = (0..CHUNK_SIZE).map(|n| format!("feature/{n}")).collect();
+        let (query, _) = build_query(&branches, true, "owner", "repo", "main", 10);
+        assert_eq!(query.matches('{').count(), query.matches('}').count());
+        assert!(query.contains("reviewThreads(first:50) { nodes { id isResolved } }"));
+        assert!(query.ends_with(&PR_FRAGMENT.replace("COMMENT_FETCH_LIMIT", "10")));
+        assert!(query.contains("} rateLimit { cost remaining resetAt limit } }"));
+        // GitHub charges one point per hundred requests, and counts one
+        // request per connection per parent node. Per branch: the PR
+        // connection, then for each of its two PRs the review requests, the
+        // commit, its check contexts, the threads, the comments and the
+        // reviews. A chunk of eight, with the merge queue, rounds to a point.
+        let fragment = &PR_FRAGMENT[PR_FRAGMENT.find('{').unwrap()..];
+        let connections = fragment.matches("(first:").count() + fragment.matches("(last:").count();
+        assert_eq!(connections, 6);
+        let requests = CHUNK_SIZE * (1 + 2 * connections) + 1;
+        assert_eq!(requests, 105);
+        assert_eq!((requests as f64 / 100.0).round() as u64, 1);
+        // The author read asks one thread per alias, by ID.
+        let authors = thread_authors_query(&["PRRT_a".into(), "PRRT_b".into()]);
+        assert_eq!(authors.matches('{').count(), authors.matches('}').count());
+        assert!(authors.contains(
+            r#"t1: node(id:"PRRT_b") { ... on PullRequestReviewThread { comments(first:1)"#
+        ));
+        assert!(authors.ends_with("rateLimit { cost remaining resetAt limit } }"));
+    }
+
+    #[test]
+    fn a_reply_without_a_budget_reads_as_none_and_requests_add_up() {
+        let rate = |reply: serde_json::Value| parse_rate_limit(&serde_json::json!({"data": reply}));
+        // GitHub Enterprise with rate limiting off, and a server without the field.
+        assert_eq!(rate(serde_json::json!({"rateLimit": null})), None);
+        assert_eq!(rate(serde_json::json!({})), None);
+        assert_eq!(
+            rate(
+                serde_json::json!({"rateLimit":{"cost":1,"remaining":0,"limit":0,"resetAt":"2026-10-04T13:00:00Z"}})
+            ),
+            None
+        );
+        let read = |cost, remaining, reset_at_ms| RateLimit {
+            limit: 5000,
+            remaining,
+            cost,
+            reset_at_ms,
+        };
+        let mut total = None;
+        spend(&mut total, None);
+        assert_eq!(total, None);
+        // Chunks finish in any order: the lowest figure of a window stands.
+        spend(&mut total, Some(read(1, 90, 1_000)));
+        spend(&mut total, Some(read(1, 91, 1_000)));
+        spend(&mut total, None);
+        assert_eq!(total, Some(read(2, 90, 1_000)));
+        // A reply from the next window replaces what was left of the old one.
+        spend(&mut total, Some(read(1, 4_999, 2_000)));
+        assert_eq!(total, Some(read(3, 4_999, 2_000)));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_reply_names_its_reset_from_the_response_headers() {
+        let mut out = b"HTTP/2.0 200 OK\r\nX-Ratelimit-Remaining: 0\r\nX-Ratelimit-Reset: 1791118800\r\n\r\n{\"data\":null}".to_vec();
+        let headers = take_response_headers(&mut out).unwrap();
+        assert_eq!(out, b"{\"data\":null}");
+        assert_eq!(header_reset_ms(&headers, 5), Some(1_791_118_800_000));
+        // Budget left means no wait; a secondary limit says how long.
+        assert_eq!(
+            header_reset_ms("X-Ratelimit-Remaining: 12\nX-Ratelimit-Reset: 99", 5),
+            None
+        );
+        assert_eq!(header_reset_ms("Retry-After: 60", 5), Some(60_005));
+        // Output without headers (an older gh, a fixture) is all body.
+        let mut plain = b"{}".to_vec();
+        assert_eq!(take_response_headers(&mut plain), None);
+        assert_eq!(plain, b"{}");
+
+        let dir = tempdir().unwrap();
+        let limited = "printf 'HTTP/2.0 200 OK\\r\\nx-ratelimit-remaining: 0\\r\\nx-ratelimit-reset: 1791118800\\r\\n\\r\\n'; echo '{\"data\":null,\"errors\":[{\"type\":\"RATE_LIMITED\",\"message\":\"API rate limit exceeded for user ID 1.\"}]}'; echo 'gh: API rate limit exceeded for user ID 1.' >&2; exit 1";
+        let client = |name: &str, body: &str| {
+            GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+                .with_gh_program(fake_gh(dir.path(), name, body))
+                .with_repository(RepoSlug::parse("acme/app").unwrap())
+        };
+        let cancel = CancellationToken::new();
+        let error = client("limited-gh", limited)
+            .fetch_worktrees(&["feature/a".into()], &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.rate_limit_reset_ms(), Some(1_791_118_800_000));
+        let error = client("limited-gh", limited)
+            .fetch_pull_request_outcomes(&[7], &cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error.rate_limit_reset_ms(), Some(1_791_118_800_000));
+        // No headers: the limit is still recognised, its reset unknown.
+        let error = client(
+            "bare-gh",
+            "echo 'gh: API rate limit exceeded for user ID 1.' >&2; exit 1",
+        )
+        .fetch_worktrees(&["feature/a".into()], &cancel)
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GithubError::RateLimit {
+                reset_at_ms: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2404,7 +2893,7 @@ else:
             false,
             &options(),
         );
-        assert!(matches!(gql, Err(GithubError::RateLimit(_))));
+        assert!(matches!(gql, Err(GithubError::RateLimit { .. })));
     }
 
     #[test]

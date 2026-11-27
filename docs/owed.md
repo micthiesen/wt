@@ -112,6 +112,11 @@ wake of the row, any due step. Cleanup, `wt clean`, `builtin:clean` and the
 `wt rm` refuses without `--force`. A merge gate alone holds nothing, and
 neither does a notify-only watch. A landed row in phase `done` is cleanable.
 
+Not owed, but held the same way: a worktree whose checkout has been on
+another branch that carries an open pull request, or one GitHub has not
+answered for, stays until that branch has its own worktree
+([cli.md](cli.md#one-pr-per-worktree)).
+
 A removed worktree's checks and due steps move onto its removal record:
 `wt owed --slug <slug>` shows them, `wt done --slug <slug>` closes them
 there, and a restore carries back what is still open. Its deploys can no

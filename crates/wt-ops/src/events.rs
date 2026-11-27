@@ -9,7 +9,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio_util::sync::CancellationToken;
 use wt_config::Config;
-use wt_events::{EventDaemonConfig, EventFuture, EventGithubData, EventSource};
+use wt_events::{
+    EventDaemonConfig, EventFuture, EventGithubData, EventSource, GithubFetchError, RateBudget,
+};
 use wt_github::{GithubClient, GithubOptions};
 use wt_platform::process::CommandSpec;
 
@@ -73,12 +75,13 @@ impl EventSource for AppEventSource {
         &'a self,
         branches: Vec<String>,
         cancel: &'a CancellationToken,
-    ) -> EventFuture<'a, Result<EventGithubData, String>> {
+    ) -> EventFuture<'a, Result<EventGithubData, GithubFetchError>> {
         Box::pin(async move {
             if branches.is_empty() {
                 return Ok(EventGithubData {
                     prs: serde_json::json!({}),
                     merge_queue: serde_json::json!({}),
+                    budget: None,
                 });
             }
             let has_ci = tokio::fs::read_dir(
@@ -98,23 +101,27 @@ impl EventSource for AppEventSource {
             let data = github
                 .fetch_worktrees(&branches, cancel)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| GithubFetchError {
+                    rate_limit_reset_ms: error.rate_limit_reset_ms(),
+                    message: error.to_string(),
+                })?;
             Ok(EventGithubData {
                 prs: serde_json::to_value(data.prs).map_err(|error| error.to_string())?,
                 merge_queue: serde_json::to_value(data.merge_queue)
                     .map_err(|error| error.to_string())?,
+                budget: data.rate_limit.map(rate_budget),
             })
         })
     }
+}
 
-    fn rate_limit_reset<'a>(
-        &'a self,
-        cancel: &'a CancellationToken,
-    ) -> EventFuture<'a, Option<u64>> {
-        Box::pin(crate::watch_probe::rate_limit_reset_ms(
-            &self.context,
-            cancel,
-        ))
+/// A read's budget in the form every poller of GitHub paces itself by.
+pub fn rate_budget(rate: wt_github::RateLimit) -> RateBudget {
+    RateBudget {
+        limit: rate.limit,
+        remaining: rate.remaining,
+        cost: rate.cost,
+        reset_at_ms: rate.reset_at_ms,
     }
 }
 
@@ -736,6 +743,12 @@ pub async fn status(context: &AppContext) -> Result<()> {
             if snapshot.writer_sha.as_deref() != Some(wt_app_core::build_info::build_id()) {
                 println!("  snapshot build stale; live GitHub reads will be used until refreshed");
             }
+            if let Some(line) = snapshot
+                .rate_limit
+                .and_then(|budget| budget_line(budget, now_millis()))
+            {
+                println!("  budget       {line}");
+            }
         }
         None => println!("  snapshot     none"),
     }
@@ -1106,6 +1119,22 @@ fn ago(timestamp: u64) -> String {
         format!("{}d ago", seconds / 86_400)
     }
 }
+/// GitHub's GraphQL budget as a snapshot recorded it. `None` once that
+/// window has reset: the figure then describes nothing current.
+fn budget_line(budget: RateBudget, now_ms: u64) -> Option<String> {
+    let to_reset = budget
+        .reset_at_ms
+        .checked_sub(now_ms)
+        .filter(|ms| *ms > 0)?;
+    Some(format!(
+        "{} of {} GraphQL points left, resets in {}m (last read cost {})",
+        budget.remaining,
+        budget.limit,
+        to_reset.div_ceil(60_000),
+        budget.cost
+    ))
+}
+
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1127,6 +1156,21 @@ pub fn repository_identity(config: &wt_config::Config) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_status_budget_line_is_shown_only_for_the_current_window() {
+        let budget = RateBudget {
+            limit: 5_000,
+            remaining: 610,
+            cost: 5,
+            reset_at_ms: 1_000_000,
+        };
+        assert_eq!(
+            budget_line(budget, 1_000_000 - 14 * 60_000 - 1).as_deref(),
+            Some("610 of 5000 GraphQL points left, resets in 15m (last read cost 5)")
+        );
+        assert_eq!(budget_line(budget, 1_000_000), None);
+    }
 
     #[test]
     fn a_shell_installed_agent_still_belongs_to_a_session_that_pins_the_repo_config() {

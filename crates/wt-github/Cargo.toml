@@ -15,6 +15,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 time.workspace = true
+tracing.workspace = true
 wt-config.workspace = true
 wt-platform.workspace = true
 

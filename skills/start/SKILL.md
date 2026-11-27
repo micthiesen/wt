@@ -71,7 +71,8 @@ brief or user references, sibling PRs (`gh pr list --state all --search
   load-bearing unknowns keep appearing): settle the design first through the
   project's design-review flow, and record decisions in a GitHub issue.
 - **Separable pieces** get their own GitHub issues, referenced from PRs.
-  Attach one you work here with `wt issue <slug> --gh <n>`.
+  Attach one you work here with `wt issue <slug> --gh <n>`. This worktree
+  opens one PR: a piece that needs its own goes to a new worktree (`handoff`).
 
 ## 5. Implement, review, test
 

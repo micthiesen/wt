@@ -14,7 +14,9 @@ user_invocable: true
 
 Move one well-defined follow-up into a fresh worktree and start its agent. That
 agent runs the `start` skill: it reads `prompt.txt`, deletes it, and owns the
-task through testing and status.
+task through testing and status. This is also the route for a follow-up PR
+that must wait or stack on the current one: a worktree carries one PR, so
+never open the second from another branch here.
 
 An explicit request with a clear task authorizes creating one worktree and
 starting its agent. Ask one short question only when the task or its base is
@@ -72,6 +74,9 @@ queues it as `todo`, and starts its agent:
   brief either way. `--base` carries commits only: if the follow-up depends on
   uncommitted changes, commit them within the user's authorized workflow or
   ask; never claim they are there.
+- A follow-up that must not merge yet, such as a removal that waits a release:
+  name the gate under Dependencies, for its agent to set with
+  `wt status <state> --blocked-on "<gate>" --until <condition>`.
 - `--section` is the source worktree's section: find the source in
   `wt section ls --json` (entries have `name` and `slugs`; `name: null` is
   Inbox, written `-`). If sections can't be read, omit it and say so in the

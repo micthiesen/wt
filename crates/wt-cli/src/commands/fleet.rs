@@ -31,7 +31,9 @@ pub struct FleetArgs {
     /// edges, dirty, session, merge_queue, and pr (number,
     /// state, draft, checks, auto_merge, mergeable, merge_state, review_bot {state, unresolved,
     /// stale}, unresolved_threads, unresolved_human_threads). pr is null with
-    /// pr_note set when GitHub is unreachable.
+    /// pr_note set when GitHub is unreachable. pr_snapshot_age_seconds is the
+    /// age of the events daemon snapshot the PR data came from, or null
+    /// when GitHub was read live.
     #[arg(long)]
     pub json: bool,
 }
@@ -168,7 +170,36 @@ fn add_snake_case_aliases(work: &mut serde_json::Map<String, Value>) {
 struct Fleet {
     reports: Vec<Value>,
     pr_note: Option<String>,
+    /// How old the events daemon snapshot the PR data came from is.
+    pr_snapshot_age_ms: Option<u64>,
     session_note: Option<String>,
+}
+
+/// PR data for the report, which only displays it: the events daemon's
+/// snapshot while it is fresh and covers every branch (the rule `wt ls`
+/// follows), with its age in milliseconds, else one batched GitHub read.
+async fn pull_requests(
+    ctx: &AppContext,
+    branches: &[String],
+) -> (
+    Result<wt_github::GithubData, wt_github::GithubError>,
+    Option<u64>,
+) {
+    if let Some(read) = wt_sources::github_events_source::load(ctx, branches).await {
+        let age = u64::try_from(now_ms())
+            .unwrap_or(0)
+            .saturating_sub(read.written_ms);
+        return (Ok(read.data), Some(age));
+    }
+    let github = GithubClient::new(
+        ctx.processes.clone(),
+        ctx.config.paths.main_clone.clone(),
+        GithubOptions::from_config(&ctx.config, true),
+    );
+    (
+        github.fetch_worktrees(branches, &ctx.cancellation).await,
+        None,
+    )
 }
 
 /// The fleet report, or the exit code after saying why there is none.
@@ -188,11 +219,6 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
         .iter()
         .map(|row| row.worktree.target.branch.clone())
         .collect::<Vec<_>>();
-    let github = GithubClient::new(
-        ctx.processes.clone(),
-        ctx.config.paths.main_clone.clone(),
-        GithubOptions::from_config(&ctx.config, true),
-    );
     let tmux = TmuxClient::new(
         ctx.processes.clone(),
         TmuxServer::named(ctx.config.tmux.socket.clone()).with_cwd(ctx.home.clone()),
@@ -202,7 +228,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
     let live_slugs = head_by_slug.keys().cloned().collect::<BTreeSet<_>>();
     // One batched GitHub read for exactly the reported branches; the other
     // probes do not depend on it, so none waits behind the slowest.
-    let (stored, fetched, sessions, registry, (dev, dev_note), locks) = tokio::join!(
+    let (stored, (fetched, pr_snapshot_age_ms), sessions, registry, (dev, dev_note), locks) = tokio::join!(
         ctx.database.call(move |store| {
             let removed = if selected {
                 Vec::new()
@@ -211,19 +237,27 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             };
             Ok((store.read_wt_state()?, removed))
         }),
-        github.fetch_worktrees(&branches, &ctx.cancellation),
+        pull_requests(ctx, &branches),
         tmux.list_sessions(&ctx.cancellation),
         tokio::task::spawn_blocking(move || read_claude_registry(&registry_dir)),
         dev_status(ctx, &rows),
         operation_locks(ctx, &rows),
     );
-    let (state, reports_removed) = stored?;
+    let (mut state, reports_removed) = stored?;
     let registry = registry?;
     let records = rows
         .iter()
         .map(|row| row.worktree.clone())
         .collect::<Vec<_>>();
     // This command's own GitHub read, when it succeeded, proves PR landings.
+    wt_ops::other_branches::refresh(
+        ctx,
+        &records,
+        &mut state,
+        fetched.as_ref().ok(),
+        wt_ops::other_branches::Ask::Nothing,
+    )
+    .await;
     let landings = super::landing::read_with(ctx, &records, &state, fetched.as_ref().ok()).await;
     let separate_production = ctx.config.branch.separate_production();
     let (prs, queue, pr_note) = match fetched {
@@ -382,6 +416,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             "path":row.worktree.target.path, "head":row.worktree.head_sha,
             "base":worktree_state.and_then(|record| record.get("baseBranch")).and_then(Value::as_str).unwrap_or(&ctx.config.branch.base),
             "section":section, "work":work, "edges":edges,
+            "other_prs":wt_core::other_prs_json(worktree_state.unwrap_or(&Value::Null)),
             "watches":super::watch::watches_json(&watches, &slug, clock),
             "owes":super::owed::owes_json(&owed.items, clock),
             "owed_phase":super::owed::phase_json(owed.phase),
@@ -391,6 +426,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             "operation":operation,"operation_note":operation_note,
             "dev":{"status":dev_status,"error":dev_error,"note":dev_note,"slots":dev.as_ref().map(|snapshot| &snapshot.slots)},
             "pr":pr_json, "pr_note":pr_note,"merge_queue":pr_queue,
+            "pr_snapshot_age_seconds":pr_snapshot_age_ms.map(|age| age / 1000),
             "inventory_error":row.error
         });
         reports.push(report);
@@ -408,6 +444,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
     Ok(Ok(Fleet {
         reports,
         pr_note,
+        pr_snapshot_age_ms,
         session_note,
     }))
 }
@@ -416,6 +453,7 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
     let Fleet {
         reports,
         pr_note,
+        pr_snapshot_age_ms,
         session_note,
     } = match fleet(ctx, args).await? {
         Ok(fleet) => fleet,
@@ -453,6 +491,12 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         // Report failed sources even when no live row carries them.
         if let Some(note) = &pr_note {
             println!("PR data unavailable: {note}");
+        }
+        if let Some(age) = pr_snapshot_age_ms {
+            println!(
+                "PR data from the events daemon snapshot, {}s old",
+                age / 1000
+            );
         }
         if let Some(note) = &session_note {
             println!("Session data unavailable: {note}");
@@ -586,6 +630,54 @@ mod tests {
             assert!(plain.as_object().unwrap().contains_key(key), "{key}");
             assert!(plain[key].is_null(), "{key}");
         }
+    }
+
+    /// The report shows PRs from the events daemon's snapshot while that is
+    /// fresh and covers the branches, and says how old it is; only otherwise
+    /// does it read GitHub.
+    #[tokio::test]
+    async fn pr_data_comes_from_a_fresh_events_snapshot_with_its_age() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut ctx = fixture.ctx.clone();
+        let mut config = (*ctx.config).clone();
+        config.github.events = Some(Default::default());
+        ctx.config = std::sync::Arc::new(config);
+        let events = ctx.config.paths.cache_root.join("events");
+        fs::create_dir_all(&events).unwrap();
+        let write = |age_ms: i64| {
+            let written = now_ms() - age_ms;
+            let snapshot = json!({
+                "updatedAt": written, "fetchStartedAtMs": written - 1_000,
+                "branches": ["feature/a", "feature/b"],
+                "prs": {"feature/a": {
+                    "number": 7, "url": "https://github.com/acme/app/pull/7",
+                    "headRefName": "feature/a", "baseRefName": "main", "title": "A",
+                    "isDraft": false, "state": "OPEN", "checks": "pass", "failedChecks": [],
+                    "review": "none", "reviewRequests": 0, "requestedReviewers": [],
+                    "suggestedReviewers": [], "autoMerge": null, "comments": [],
+                    "unresolvedThreads": 0, "unresolvedThreadsTotal": 0,
+                    "mergedAt": null, "closedAt": null
+                }},
+                "mergeQueue": {},
+                "writerSha": wt_app_core::build_info::build_id(),
+                "repository": wt_ops::events::repository_identity(&ctx.config),
+            });
+            fs::write(events.join("github.json"), snapshot.to_string()).unwrap();
+        };
+        write(12_000);
+        let (read, age) = pull_requests(&ctx, &["feature/a".into()]).await;
+        assert_eq!(read.unwrap().prs["feature/a"].number, 7);
+        assert!(matches!(age, Some(12_000..14_000)), "{age:?}");
+        // A branch the snapshot does not cover, or a snapshot gone stale,
+        // is a live read with no age. `gh` has nothing to answer here.
+        let (_, age) = pull_requests(&ctx, &["feature/new".into()]).await;
+        assert_eq!(age, None);
+        write(10 * 60_000);
+        let (_, age) = pull_requests(&ctx, &["feature/a".into()]).await;
+        assert_eq!(age, None);
+        fixture.close().await.unwrap();
     }
 
     #[tokio::test]

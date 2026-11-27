@@ -136,6 +136,15 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         .collect();
     for (index, row) in board.rows.iter_mut().enumerate() {
         let entry = &state["slugs"][&row.key];
+        row.other_prs = wt_core::stored_other_branches(entry)
+            .into_iter()
+            .map(|other| wt_tui::OtherPrView {
+                branch: other.branch,
+                number: other.number,
+                state: other.state,
+                draft: other.draft,
+            })
+            .collect();
         row.filed_in = entry["section"]
             .as_str()
             .filter(|name| !name.is_empty())

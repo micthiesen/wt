@@ -258,6 +258,12 @@ fn row_lines(row: &BoardRow, model: &Model, width: usize) -> Vec<Line<'static>> 
         lines.extend(rebase);
     }
 
+    let others = other_prs_block(row, width);
+    if !others.is_empty() {
+        lines.push(Line::default());
+        lines.extend(others);
+    }
+
     if row.automations_paused && (policy.automations || !row.watches.is_empty()) {
         lines.push(Line::default());
         lines.push(fit_line(
@@ -950,6 +956,31 @@ fn rebase_block(row: &BoardRow, policy: &DisplayPolicy, width: usize) -> Vec<Lin
     ));
     files(conflicts, &mut lines);
     lines
+}
+
+/// The worktree holds more than its own pull request: the other branches
+/// its checkout has been on that carry, or may carry, one with no row.
+fn other_prs_block(row: &BoardRow, width: usize) -> Vec<Line<'static>> {
+    let others: Vec<String> = row
+        .other_prs
+        .iter()
+        .filter(|other| other.unsettled())
+        .map(crate::OtherPrView::label)
+        .collect();
+    if others.is_empty() {
+        return Vec::new();
+    }
+    wrap(
+        &format!(
+            "{} Holds more than one PR: also {}",
+            glyphs::PAUSE,
+            others.join(", ")
+        ),
+        width,
+    )
+    .into_iter()
+    .map(|line| Line::styled(line, theme::fg(theme::WARN)))
+    .collect()
 }
 
 /// The PR's human conversation, newest first, then a count of unresolved
@@ -2617,6 +2648,41 @@ mod tests {
         assert!(find(&lines, "src/login.rs").contains("   src/login.rs"));
         assert!(find(&lines, "@reviewer").contains("@reviewer · 3h ago"));
         find(&lines, "+2 unresolved threads");
+    }
+
+    #[test]
+    fn a_row_holding_another_pr_says_so_in_warn_colour() {
+        let mut holding = row();
+        assert!(other_prs_block(&holding, 80).is_empty());
+        holding.other_prs = vec![
+            crate::OtherPrView {
+                branch: "michael/retire-x".into(),
+                number: Some(12),
+                state: wt_core::OtherPrState::Open,
+                draft: true,
+            },
+            crate::OtherPrView {
+                branch: "michael/landed".into(),
+                number: Some(9),
+                state: wt_core::OtherPrState::Merged,
+                draft: false,
+            },
+            crate::OtherPrView {
+                branch: "michael/pushed".into(),
+                ..crate::OtherPrView::default()
+            },
+        ];
+        let block = other_prs_block(&holding, 200);
+        assert_eq!(block.len(), 1);
+        let text = block[0].to_string();
+        assert!(
+            text.ends_with(
+                "Holds more than one PR: also draft #12 on michael/retire-x, michael/pushed (PR unknown)"
+            ),
+            "{text}"
+        );
+        assert_eq!(block[0].style.fg, Some(theme::WARN));
+        find(&screen(holding, 120, 40), "Holds more than one PR");
     }
 
     #[test]

@@ -308,6 +308,16 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
         );
         return Ok(1);
     }
+    // The worktree is for the new branch now; the landed one was left on
+    // purpose and is not one of its other branches.
+    let record = (slug.clone(), branch.clone());
+    if let Err(error) = ctx
+        .database
+        .call(move |store| Ok(store.set_slug_branch(&record.0, &record.1)?))
+        .await
+    {
+        eprintln!("warning: {branch} was not recorded as {slug}'s branch ({error:#})");
+    }
     let issue_title = lookup.finish().await;
     let (new_title, source) = initial_title(title, TitleSource::Agent, issue_title)
         .context("wt next always has a title")?;

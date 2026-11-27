@@ -17,6 +17,7 @@ pub mod lifecycle_ops;
 pub mod managed;
 pub mod merge_arm;
 pub mod origin;
+pub mod other_branches;
 pub mod remote;
 pub mod restack_action;
 pub mod status_checks;

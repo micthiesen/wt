@@ -28,6 +28,9 @@ pub struct EventDaemonConfig {
     pub repository: Option<String>,
     pub debounce_ms: u64,
     pub min_fetch_interval_ms: u64,
+    /// The floor between fetch starts for a check or status delivery that is
+    /// not a completion.
+    pub progress_fetch_interval_ms: u64,
     pub inventory_ttl_ms: u64,
     pub max_body_bytes: usize,
     pub max_concurrent_requests: usize,
@@ -65,6 +68,7 @@ impl EventDaemonConfig {
             repository: None,
             debounce_ms: 1_500,
             min_fetch_interval_ms: 10_000,
+            progress_fetch_interval_ms: 45_000,
             inventory_ttl_ms: 10_000,
             max_body_bytes: 5 * 1024 * 1024,
             max_concurrent_requests: 64,
@@ -72,6 +76,17 @@ impl EventDaemonConfig {
             queue_capacity: 64,
         }
     }
+}
+
+/// GitHub's GraphQL point budget as one read left it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateBudget {
+    pub limit: u64,
+    pub remaining: u64,
+    /// Points the read that reported this spent.
+    pub cost: u64,
+    pub reset_at_ms: u64,
 }
 
 /// The GitHub data maps are JSON envelopes to retain additive fields written
@@ -90,6 +105,10 @@ pub struct GithubSnapshot {
     pub prs: Value,
     #[serde(default)]
     pub merge_queue: Value,
+    /// The budget after the read that produced this snapshot, when GitHub
+    /// reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateBudget>,
     #[serde(default)]
     pub writer_sha: Option<String>,
     /// The writer's repository identity (see `EventDaemonConfig::repository`).
@@ -125,6 +144,30 @@ pub struct EventDaemonState {
 pub struct EventGithubData {
     pub prs: Value,
     pub merge_queue: Value,
+    pub budget: Option<RateBudget>,
+}
+
+/// A failed GitHub read: what it said and, for a rate limit whose reply
+/// named one, when the limit resets in epoch milliseconds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GithubFetchError {
+    pub message: String,
+    pub rate_limit_reset_ms: Option<u64>,
+}
+
+impl From<String> for GithubFetchError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            rate_limit_reset_ms: None,
+        }
+    }
+}
+
+impl From<&str> for GithubFetchError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }
 
 /// Supplies current worktree and GitHub facts. `remote_branches` returning
@@ -147,15 +190,7 @@ pub trait EventSource: Send + Sync + 'static {
         &'a self,
         branches: Vec<String>,
         cancel: &'a CancellationToken,
-    ) -> EventFuture<'a, Result<EventGithubData, String>>;
-    /// When GitHub's exhausted rate limit resets, in epoch milliseconds, if
-    /// that can be told. Asked only after a read failed with a rate limit.
-    fn rate_limit_reset<'a>(
-        &'a self,
-        _cancel: &'a CancellationToken,
-    ) -> EventFuture<'a, Option<u64>> {
-        Box::pin(async { None })
-    }
+    ) -> EventFuture<'a, Result<EventGithubData, GithubFetchError>>;
 }
 
 #[derive(Debug, Error)]
@@ -258,7 +293,7 @@ pub async fn read_state(
 
 mod daemon;
 
-pub use daemon::{backoff_interval_ms, failure_wait_ms, rate_limited};
+pub use daemon::{backoff_interval_ms, failure_wait_ms, paced_interval_ms, rate_limited};
 
 #[cfg(test)]
 mod tests {

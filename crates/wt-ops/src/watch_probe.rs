@@ -191,32 +191,17 @@ pub async fn pull_requests(
     ctx: &AppContext,
     numbers: &[u64],
     cancel: &CancellationToken,
-) -> Result<BTreeMap<u64, PrFacts>, String> {
+) -> Result<BTreeMap<u64, PrFacts>, wt_github::GithubError> {
     let client = GithubClient::new(
         ctx.processes.clone(),
         ctx.config.paths.main_clone.clone(),
         GithubOptions::from_config(&ctx.config, false),
     );
-    let outcomes = client
-        .fetch_pull_request_outcomes(numbers, cancel)
-        .await
-        .map_err(|error| error.to_string())?;
+    let outcomes = client.fetch_pull_request_outcomes(numbers, cancel).await?;
     Ok(outcomes
         .into_iter()
         .map(|(number, outcome)| (number, pr_facts(&outcome.state, outcome.merge_commit_oid)))
         .collect())
-}
-
-/// When GitHub's exhausted rate limit resets, in epoch milliseconds, if it
-/// can be told. Asked after a read failed with a rate limit.
-pub async fn rate_limit_reset_ms(ctx: &AppContext, cancel: &CancellationToken) -> Option<u64> {
-    GithubClient::new(
-        ctx.processes.clone(),
-        ctx.config.paths.main_clone.clone(),
-        GithubOptions::from_config(&ctx.config, false),
-    )
-    .rate_limit_reset_ms(cancel)
-    .await
 }
 
 /// A pull request's state as a watch reads it. A state this build does not

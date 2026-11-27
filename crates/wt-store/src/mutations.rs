@@ -1113,6 +1113,134 @@ impl Store {
         })
     }
 
+    /// Record `branch` as the one the worktree is for. A different branch
+    /// recorded before was left behind on purpose (`wt next`): it is no
+    /// longer one of the worktree's other branches.
+    pub fn set_slug_branch(&mut self, slug: &str, branch: &str) -> Result<(), StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            let previous = entry
+                .get(wt_core::RECORDED_BRANCH)
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if previous.as_deref() == Some(branch) {
+                return Ok(((), false));
+            }
+            let mut left: Vec<Value> = entry
+                .get(wt_core::LEFT_BRANCHES)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            left.retain(|name| name.as_str() != Some(branch));
+            if let Some(previous) = previous.filter(|previous| !previous.is_empty())
+                && !left.iter().any(|name| name.as_str() == Some(&previous))
+            {
+                left.push(json!(previous));
+            }
+            if left.is_empty() {
+                entry.remove(wt_core::LEFT_BRANCHES);
+            } else {
+                entry.insert(
+                    wt_core::LEFT_BRANCHES.to_owned(),
+                    Value::Array(left.clone()),
+                );
+            }
+            if let Some(others) = entry
+                .get_mut(wt_core::OTHER_BRANCHES)
+                .and_then(Value::as_object_mut)
+            {
+                others.retain(|name, _| {
+                    name != branch && !left.iter().any(|left| left.as_str() == Some(name))
+                });
+            }
+            entry.insert(wt_core::RECORDED_BRANCH.to_owned(), json!(branch));
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok(((), true))
+        })
+    }
+
+    /// Record the other branches seen for a worktree, and `recorded` as its
+    /// own branch when none is recorded yet. A branch already recorded keeps
+    /// its answer unless `seen` brings one from GitHub that differs or is
+    /// over two minutes newer. Returns whether anything was written.
+    pub fn record_other_branches(
+        &mut self,
+        slug: &str,
+        recorded: Option<&str>,
+        seen: &[wt_core::OtherBranch],
+    ) -> Result<bool, StoreError> {
+        const RECHECK_MS: i64 = 2 * 60 * 1000;
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            let mut changed = false;
+            if let Some(recorded) = recorded.filter(|recorded| !recorded.is_empty())
+                && entry
+                    .get(wt_core::RECORDED_BRANCH)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            {
+                entry.insert(wt_core::RECORDED_BRANCH.to_owned(), json!(recorded));
+                changed = true;
+            }
+            let mut others = entry
+                .get(wt_core::OTHER_BRANCHES)
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            for other in seen {
+                let stored: Option<wt_core::OtherBranch> = others
+                    .get(&other.branch)
+                    .and_then(|stored| serde_json::from_value(stored.clone()).ok());
+                let keep = stored.is_some_and(|stored| {
+                    other.state == wt_core::OtherPrState::Unknown
+                        || (stored.state == other.state
+                            && stored.number == other.number
+                            && stored.draft == other.draft
+                            && match (stored.checked_at_ms, other.checked_at_ms) {
+                                (Some(stored), Some(new)) => {
+                                    new.saturating_sub(stored) < RECHECK_MS
+                                }
+                                (stored, new) => stored == new,
+                            })
+                });
+                if !keep {
+                    others.insert(other.branch.clone(), serde_json::to_value(other)?);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok((false, false));
+            }
+            if !others.is_empty() {
+                entry.insert(wt_core::OTHER_BRANCHES.to_owned(), Value::Object(others));
+            }
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
+    /// Claim the one notice a session gets for its worktree sitting on
+    /// `branch`. False when it was already told about that branch.
+    pub fn claim_off_branch_notice(
+        &mut self,
+        slug: &str,
+        branch: &str,
+    ) -> Result<bool, StoreError> {
+        self.mutate_wt_state(|state| {
+            let mut entry = slug_entry(state, slug);
+            if entry
+                .get(wt_core::OFF_BRANCH_NOTICE)
+                .and_then(Value::as_str)
+                == Some(branch)
+            {
+                return Ok((false, false));
+            }
+            entry.insert(wt_core::OFF_BRANCH_NOTICE.to_owned(), json!(branch));
+            object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
+            Ok((true, true))
+        })
+    }
+
     pub fn set_slug_base(
         &mut self,
         slug: &str,

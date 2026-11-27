@@ -67,8 +67,8 @@ only installs its build identity (`build_info.rs`) and calls it. It resolves one
 configuration for the process, opens the repository-scoped database, builds an
 `AppContext`, and starts either a CLI operation, the local host, or the remote
 worker protocol. `wt-sources`' `sources.rs` composes the host-local source
-graph; the GitHub leaf's fetch scheduling (rate floor, events-daemon
-arbitration, deferred reads) lives in `github_source.rs`. A remote
+graph; the GitHub leaf's fetch scheduling (rate floor, budget pacing,
+events-daemon arbitration, deferred reads) lives in `github_source.rs`. A remote
 host runs the same source and action pipeline as a local host; the controller
 combines the resulting snapshots for display.
 
@@ -487,7 +487,9 @@ either input changes. A watcher's missing-path error triggers at most one Git
 refresh and watch-list re-read per five seconds; other watcher errors keep
 their full refresh.
 Incomplete scans retain the 60-second full reconciliation backstop. GitHub reads remain batched and rate
-limited (10 s minimum interval measured from fetch start); the optional events
+limited (10 s minimum interval measured from fetch start, stretched for
+background reads as the GraphQL budget each read reports runs down; see
+[github-events.md](github-events.md#graphql-budget)); the optional events
 daemon supplies push updates stamped with its own fetch start, with a
 configured poll backstop for missed events or daemon downtime. An accepted
 GitHub write bypasses the events cache, and while any of the worker's writes is

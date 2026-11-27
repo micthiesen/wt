@@ -71,7 +71,17 @@ impl SharedRead {
         if now_ms < self.backoff_until_ms {
             return Plan::Hold;
         }
-        let interval = u64::try_from(PR_INTERVAL.as_millis()).unwrap_or(u64::MAX);
+        // Waits poll in the background, so a low GitHub budget stretches
+        // their interval as it does every other poller's. Judged as of the
+        // fetch that reported the budget, which the interval counts from.
+        let interval = wt_events::paced_interval_ms(
+            u64::try_from(PR_INTERVAL.as_millis()).unwrap_or(u64::MAX),
+            self.data
+                .as_ref()
+                .and_then(|data| data.rate_limit)
+                .map(wt_ops::events::rate_budget),
+            self.fetch_started_ms,
+        );
         // A start in the future is a clock that moved, not a fresh answer.
         let fresh = self.fetch_started_ms <= now_ms && now_ms - self.fetch_started_ms < interval;
         let covers = self.data.as_ref().is_some_and(|data| {
@@ -472,13 +482,9 @@ impl RowReader {
                 shared.data = Some(data);
             }
             Err(error) => {
+                let reset_at_ms = error.rate_limit_reset_ms();
                 let error = error.to_string();
                 let limited = wt_events::rate_limited(&error);
-                let reset_at_ms = if limited {
-                    wt_ops::watch_probe::rate_limit_reset_ms(ctx, &ctx.cancellation).await
-                } else {
-                    None
-                };
                 shared.failures = shared.failures.saturating_add(1);
                 let failed_at = epoch_ms();
                 shared.backoff_until_ms = failed_at.saturating_add(wt_events::failure_wait_ms(
@@ -634,6 +640,20 @@ mod tests {
             shared.plan(&["three".to_owned()], start + 1),
             Plan::Fetch(vec!["three".into(), "two".into()])
         );
+        // With only the reserve of GitHub's budget left, the stored answer
+        // serves every wait until the budget resets.
+        let mut low = covering(&["one"], start);
+        low.data.as_mut().unwrap().rate_limit = Some(wt_github::RateLimit {
+            limit: 5_000,
+            remaining: 1_000,
+            cost: 5,
+            reset_at_ms: start + 20 * minute,
+        });
+        assert_eq!(low.plan(&one, start + 19 * minute), Plan::Use);
+        assert!(matches!(
+            low.plan(&one, start + 21 * minute),
+            Plan::Fetch(_)
+        ));
         // A stored backoff holds a process that never saw the failure.
         let failed = SharedRead {
             fetch_started_ms: start,

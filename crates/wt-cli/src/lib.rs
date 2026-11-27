@@ -289,6 +289,12 @@ enum Command {
     Restack(commands::restack::RestackArgs),
     #[command(name = "_hello", hide = true)]
     Hello { args: Vec<String> },
+    /// Asked by wt's gh shim before `gh pr create`; ARGS are gh's own.
+    #[command(name = "_gh-guard", hide = true)]
+    GhGuard {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     #[command(name = "_snapshot", hide = true)]
     Snapshot { args: Vec<String> },
     #[command(name = "_session", hide = true)]
@@ -320,6 +326,8 @@ enum Command {
     Automations(commands::automations::AutomationsArgs),
     /// Initialize repository configuration without an existing wt installation.
     Init(commands::init::InitArgs),
+    /// List your open pull requests that no worktree row tracks.
+    Orphans(commands::orphans::OrphansArgs),
     /// Execute an acknowledged, durable background removal job.
     #[command(name = "_destroy", hide = true)]
     Destroy(wt_ops::commands::_destroy::DestroyWorkerArgs),
@@ -747,6 +755,7 @@ async fn dispatch_command(
         Command::Destroy(args) => wt_ops::commands::_destroy::run_worker(context, args).await,
         Command::New(args) => commands::new::run(context, args).await,
         Command::Next(args) => commands::next::run(context, args).await,
+        Command::Orphans(args) => commands::orphans::run(context, args).await,
         Command::Remove(args) => wt_ops::commands::remove::run(context, args).await,
         Command::Cleanup(args) => commands::cleanup::run(context, args).await,
         Command::List(args) => commands::list::run(context, args).await,
@@ -784,6 +793,7 @@ async fn dispatch_command(
         },
         Command::Restack(args) => commands::restack::run(context, args).await,
         Command::Hello { args } => commands::_hello::run(&context.config, args),
+        Command::GhGuard { args } => commands::_gh_guard::run(context, args).await,
         Command::Snapshot { args } => commands::_snapshot::run(context, args).await,
         Command::Session { args } => commands::_session::run(context, args).await,
         Command::WorkerDispatch { args } => Box::pin(commands::_remote::run(context, args)).await,

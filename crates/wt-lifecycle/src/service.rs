@@ -749,6 +749,7 @@ impl LifecycleService {
                 .as_ref()
                 .is_some_and(|removed| removed.branch == branch);
         let prior = progress.prior_state.insert(prior);
+        let restores_anchor = restoring && prior.base.is_some();
         // What the removed row still owed comes back with it. The removal
         // record is where a check or a step was closed after the removal,
         // so it says what is owed now; the slug's old status does not.
@@ -795,6 +796,11 @@ impl LifecycleService {
                 "record fork point",
             )
             .await?;
+        self.mutate_store(cancellation, {
+            let (slug, branch) = (slug.to_owned(), branch.to_owned());
+            move |store| store.set_slug_branch(&slug, &branch)
+        })
+        .await?;
         if let Some((base_reference, base_branch)) = logical_base {
             let anchor = self
                 .checked_text(
@@ -825,6 +831,8 @@ impl LifecycleService {
                 }
             })
             .await?;
+        } else if existing && !restores_anchor {
+            self.anchor_adopted_branch(slug, path, cancellation).await?;
         }
         let configured_base = logical_base.map(|(reference, _)| reference).or(base_ref);
         self.configure_branch(branch, path, configured_base, existing, cancellation)
@@ -895,6 +903,20 @@ impl LifecycleService {
         landed: bool,
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
+        self.removal_revision_on(target, landed, None, cancellation)
+            .await
+    }
+
+    /// [`Self::removal_revision`] for a landing proven against the base tip
+    /// origin advertises. The caller stores that tip as the revision's
+    /// `published_base`, so removal rechecks it and reads the same hazards.
+    pub async fn removal_revision_on(
+        &self,
+        target: &WorktreeTarget,
+        landed: bool,
+        base_tip: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<RemovalRevision, LifecycleError> {
         let row = self.find_live_target(target, cancellation).await?;
         if checkout_missing(&row).await {
             return Ok(RemovalRevision {
@@ -909,7 +931,7 @@ impl LifecycleService {
         }
         let phase = RemovalPhase::quiet(Path::new(&target.path), "prepare-revision");
         let result = self
-            .stable_removal_revision(&row, landed, cancellation)
+            .stable_removal_revision(&row, landed, base_tip, cancellation)
             .await;
         phase.lifecycle(&result);
         result
@@ -919,12 +941,13 @@ impl LifecycleService {
         &self,
         row: &WorktreeRecord,
         landed: bool,
+        base_tip: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<RemovalRevision, LifecycleError> {
         for _ in 0..2 {
             let before = self.capture_revision_for_row(row, cancellation).await?;
             let hazards = self
-                .collect_removal_hazards(row, landed, cancellation)
+                .collect_removal_hazards(row, landed, base_tip, cancellation)
                 .await?;
             let mut after = self
                 .capture_revision_like(row, &before, cancellation)
@@ -1198,7 +1221,15 @@ impl LifecycleService {
             timed(
                 trace,
                 "guard-hazards",
-                self.guard_removal(&row, options.landed || cleanup, cancellation),
+                self.guard_removal(
+                    &row,
+                    options.landed || cleanup,
+                    // Just rechecked against origin by the revision above.
+                    expected_revision
+                        .and_then(|expected| expected.published_base.as_deref())
+                        .map(|(_, tip)| tip.as_str()),
+                    cancellation,
+                ),
             )
             .await?;
         }
@@ -3118,7 +3149,15 @@ impl LifecycleService {
             ));
         }
         let hazards = self
-            .collect_removal_hazards(row, landed, cancellation)
+            .collect_removal_hazards(
+                row,
+                landed,
+                expected
+                    .published_base
+                    .as_deref()
+                    .map(|(_, tip)| tip.as_str()),
+                cancellation,
+            )
             .await?;
         let full = self
             .capture_revision_like(row, expected, cancellation)
@@ -3204,7 +3243,15 @@ impl LifecycleService {
             }
         }
         let hazards = self
-            .collect_removal_hazards(row, landed, cancellation)
+            .collect_removal_hazards(
+                row,
+                landed,
+                expected
+                    .published_base
+                    .as_deref()
+                    .map(|(_, tip)| tip.as_str()),
+                cancellation,
+            )
             .await?;
         // One capture, taken after every other read: the state it pins is
         // the latest one, and the hazards beside it were read no later.
@@ -3317,8 +3364,20 @@ impl LifecycleService {
         landed: bool,
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>, LifecycleError> {
+        self.removal_hazards_on(target, landed, None, cancellation)
+            .await
+    }
+
+    /// [`Self::removal_hazards`] for a landing proven against `base_tip`.
+    pub async fn removal_hazards_on(
+        &self,
+        target: &WorktreeTarget,
+        landed: bool,
+        base_tip: Option<&str>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, LifecycleError> {
         let row = self.find_live_target(target, cancellation).await?;
-        self.collect_removal_hazards(&row, landed, cancellation)
+        self.collect_removal_hazards(&row, landed, base_tip, cancellation)
             .await
     }
 
@@ -3326,10 +3385,11 @@ impl LifecycleService {
         &self,
         row: &WorktreeRecord,
         landed: bool,
+        base_tip: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<(), LifecycleError> {
         let hazards = self
-            .collect_removal_hazards(row, landed, cancellation)
+            .collect_removal_hazards(row, landed, base_tip, cancellation)
             .await?;
         if hazards.is_empty() {
             Ok(())
@@ -3350,9 +3410,154 @@ impl LifecycleService {
         row: &WorktreeRecord,
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>, LifecycleError> {
-        let (_, owed) = self.read_owed(row.target.slug(), cancellation).await?;
+        let (state, owed) = self.read_owed(row.target.slug(), cancellation).await?;
         let mut hazards = vec![MISSING_CHECKOUT_HAZARD.to_owned()];
         hazards.extend(owed);
+        // Its other branches' refs live on in the main clone.
+        if self.config.backend == BackendKind::GitWorktree {
+            hazards.extend(
+                self.other_branch_hazards(
+                    row,
+                    state.as_ref(),
+                    &self.config.main_clone,
+                    false,
+                    cancellation,
+                )
+                .await?,
+            );
+        }
+        Ok(hazards)
+    }
+
+    /// The branches other than its own that `row`'s checkout has been on:
+    /// those its slug state records, those its HEAD reflog names, and the
+    /// one checked out now, less any that another worktree has checked out
+    /// and the base branches every checkout visits. The flag is false when
+    /// the reflog exists and could not be read, which is not "none".
+    pub async fn other_branch_names(
+        &self,
+        row: &WorktreeRecord,
+        slug_state: Option<&Value>,
+        cancellation: &CancellationToken,
+    ) -> Result<(BTreeSet<String>, bool), LifecycleError> {
+        let (reflog, readable) = match &row.git_dir {
+            Some(git_dir) => match fs::read(git_dir.join("logs/HEAD")).await {
+                Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), true),
+                Err(_) => (String::new(), false),
+            },
+            None => (String::new(), true),
+        };
+        let mut names = wt_core::other_branch_names(
+            slug_state.unwrap_or(&Value::Null),
+            &row.target.branch,
+            &wt_core::reflog_branches(&reflog),
+        );
+        if names.is_empty() {
+            return Ok((names, readable));
+        }
+        let base = self.config.base_branch.as_str();
+        names.remove(base.strip_prefix("origin/").unwrap_or(base));
+        for kept in &self.config.keep_fresh {
+            names.remove(kept.strip_prefix("origin/").unwrap_or(kept));
+        }
+        if !names.is_empty() {
+            for other in self.repository.inventory(cancellation).await? {
+                if other.target != row.target {
+                    names.remove(&other.target.branch);
+                }
+            }
+        }
+        Ok((names, readable))
+    }
+
+    /// Hazards for the worktree's other branches (see
+    /// [`wt_core::other_branch_names`]). A pull request on one has no row,
+    /// so removing the worktree would leave it with nobody watching: an open
+    /// one, or one nothing recent vouches against, keeps the worktree.
+    /// `unpushed` also holds commits such a branch has nowhere else, and the
+    /// recorded branch's while the checkout sits on another.
+    async fn other_branch_hazards(
+        &self,
+        row: &WorktreeRecord,
+        slug_state: Option<&Value>,
+        repository: &Path,
+        unpushed: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, LifecycleError> {
+        let (names, readable) = self
+            .other_branch_names(row, slug_state, cancellation)
+            .await?;
+        let mut hazards = Vec::new();
+        if !readable {
+            hazards.push(UNREADABLE_BRANCH_HISTORY_HAZARD.to_owned());
+        }
+        let state = slug_state.unwrap_or(&Value::Null);
+        let recorded = wt_core::recorded_branch(state).unwrap_or(&row.target.branch);
+        let stored = wt_core::stored_other_branches(state);
+        let now = now_ms();
+        let mut check_unpushed = Vec::new();
+        if unpushed && recorded != row.target.branch {
+            check_unpushed.push(recorded.to_owned());
+        }
+        for branch in &names {
+            let on_origin = self
+                .ref_exists(
+                    repository,
+                    &format!("refs/remotes/origin/{branch}"),
+                    cancellation,
+                )
+                .await?;
+            let verdict = stored
+                .iter()
+                .find(|other| &other.branch == branch)
+                .map_or(wt_core::OtherPrVerdict::Unknown, |other| other.verdict(now));
+            match verdict {
+                wt_core::OtherPrVerdict::Open(number) => hazards.push(wt_core::open_pr_hazard(
+                    branch,
+                    number,
+                    (*branch == row.target.branch).then_some(recorded),
+                )),
+                // A branch origin never had cannot be a pull request's head.
+                wt_core::OtherPrVerdict::Unknown if on_origin => {
+                    hazards.push(wt_core::unknown_pr_hazard(branch));
+                }
+                _ => {}
+            }
+            if unpushed && *branch != row.target.branch {
+                check_unpushed.push(branch.clone());
+            }
+        }
+        for branch in check_unpushed {
+            let local = format!("refs/heads/{branch}");
+            if !self.ref_exists(repository, &local, cancellation).await? {
+                continue;
+            }
+            match self
+                .count_commits_beyond(
+                    repository,
+                    &[&local],
+                    &["HEAD"],
+                    Some("--remotes"),
+                    cancellation,
+                )
+                .await?
+            {
+                Some(0) => {}
+                Some(count) => {
+                    let tip = self
+                        .checked_text(
+                            repository,
+                            ["rev-parse", "--verify", local.as_str()],
+                            cancellation,
+                            "read other branch tip",
+                        )
+                        .await?;
+                    hazards.push(unpushed_branch_hazard(count, &branch, tip.trim()));
+                }
+                None => hazards.push(format!("could not verify pushed state of branch {branch}")),
+            }
+        }
         Ok(hazards)
     }
 
@@ -3360,6 +3565,7 @@ impl LifecycleService {
         &self,
         row: &WorktreeRecord,
         landed: bool,
+        base_tip: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<Vec<String>, LifecycleError> {
         let mut hazards = Vec::new();
@@ -3383,7 +3589,8 @@ impl LifecycleService {
         // the branch's own origin ref exist only here, landed or not, so a
         // planning-time `landed` claim never authorizes discarding them.
         let unpushed = if landed {
-            self.commits_beyond_origin_branch(row, cancellation).await?
+            self.commits_beyond_origin_branch(row, base_tip, cancellation)
+                .await?
         } else {
             self.unpushed_count(row, state.as_ref(), cancellation)
                 .await?
@@ -3393,10 +3600,22 @@ impl LifecycleService {
             Some(count) => hazards.push(unpushed_hazard(count)),
             None => hazards.push("could not verify pushed state".to_owned()),
         }
-        // A linked worktree's other branches live in the main clone's shared
+        // A linked worktree's branches live in the main clone's shared
         // database and survive it. An independent clone owns its refs, so
-        // deleting it deletes every branch and stash it alone holds.
-        if self.backend_for(Path::new(&row.target.path)).await? == BackendKind::Rift {
+        // deleting it deletes every branch and stash it alone holds, and
+        // that check covers the unpushed commits of every branch.
+        let clone = self.backend_for(Path::new(&row.target.path)).await? == BackendKind::Rift;
+        hazards.extend(
+            self.other_branch_hazards(
+                row,
+                state.as_ref(),
+                Path::new(&row.target.path),
+                !clone,
+                cancellation,
+            )
+            .await?,
+        );
+        if clone {
             match self.clone_only_ref_hazards(row, cancellation).await? {
                 Some(found) => hazards.extend(found),
                 None => hazards.push(UNVERIFIED_CLONE_REFS_HAZARD.to_owned()),
@@ -3582,9 +3801,64 @@ impl LifecycleService {
     /// Count commits on HEAD that the branch's origin ref lacks. A branch
     /// with no origin ref (deleted after merge, or local-only) relies on the
     /// caller's landing proof and counts as zero here.
+    /// An existing branch adopted into a worktree forked from somewhere wt
+    /// never saw. Its merge base with the configured base is where its own
+    /// work starts; without that record nothing could later tell its commits
+    /// from the base's. A base that cannot be read leaves it unrecorded.
+    async fn anchor_adopted_branch(
+        &self,
+        slug: &str,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LifecycleError> {
+        let configured = self.config.base_branch.as_str();
+        let base_branch = configured.strip_prefix("origin/").unwrap_or(configured);
+        let mut anchor = None;
+        for reference in [
+            format!("refs/remotes/origin/{base_branch}"),
+            format!("refs/heads/{base_branch}"),
+        ] {
+            if !self.ref_exists(path, &reference, cancellation).await? {
+                continue;
+            }
+            let found = self
+                .runner
+                .run(
+                    git_spec(
+                        path,
+                        ["merge-base", reference.as_str(), "HEAD"]
+                            .into_iter()
+                            .map(OsString::from)
+                            .collect(),
+                    ),
+                    cancellation,
+                )
+                .await
+                .map_err(|source| {
+                    process_error("record adopted branch fork point", path, source)
+                })?;
+            if found.status.success() {
+                anchor = Some(found.stdout_text().trim().to_owned());
+            }
+            break;
+        }
+        let Some(anchor) = anchor.filter(|anchor| !anchor.is_empty()) else {
+            return Ok(());
+        };
+        let slug = slug.to_owned();
+        let base_branch = base_branch.to_owned();
+        self.mutate_store(cancellation, move |store| {
+            store
+                .set_slug_base(&slug, Some((&base_branch, Some(&anchor))))
+                .map(|_| ())
+        })
+        .await
+    }
+
     async fn commits_beyond_origin_branch(
         &self,
         row: &WorktreeRecord,
+        base_tip: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<Option<u32>, LifecycleError> {
         let path = Path::new(&row.target.path);
@@ -3594,8 +3868,34 @@ impl LifecycleService {
         {
             return Ok(Some(0));
         }
-        self.count_commits_since(path, &origin_branch, cancellation)
+        let count = self
+            .count_commits_since(path, &origin_branch, cancellation)
+            .await?;
+        let (Some(beyond), Some(tip)) = (count.filter(|count| *count > 0), base_tip) else {
+            return Ok(count);
+        };
+        // A branch rebased after its pull request merged holds local commits
+        // whose changes the base already has. Only a commit the advertised
+        // base neither contains nor matches by patch exists here alone. A
+        // failed read proves nothing and keeps the plain count.
+        let spec = git_spec(
+            path,
+            ["cherry", tip, "HEAD", origin_branch.as_str()]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        );
+        let cherry = self
+            .runner
+            .run(spec, cancellation)
             .await
+            .map_err(|source| {
+                process_error("compare unpushed commits with the base", path, source)
+            })?;
+        if !cherry.status.success() || cherry.stdout_truncated {
+            return Ok(Some(beyond));
+        }
+        Ok(Some(wt_vcs::cherry_unmatched(&cherry.stdout_text())))
     }
 
     async fn count_commits_since(
@@ -4584,6 +4884,11 @@ pub fn unpushed_hazard(count: u32) -> String {
     format!("{count} unpushed commit{plural}")
 }
 
+/// Removal hazard for a checkout whose HEAD reflog could not be read, so the
+/// branches it has been on are unknown.
+const UNREADABLE_BRANCH_HISTORY_HAZARD: &str =
+    "could not read which other branches this worktree has been on";
+
 /// Removal hazard for an independent clone whose other branches and stashes
 /// could not be compared with origin and the main clone.
 const UNVERIFIED_CLONE_REFS_HAZARD: &str =
@@ -5409,7 +5714,19 @@ mod tests {
             )
             .await
             .unwrap();
-        run(&runner, &main, &["branch", "shared", "main"]).await;
+        // The adopted branch forks from a later trunk commit than the
+        // removed one did: its anchor is its own merge base, not the record.
+        fs::write(main.join("tracked.txt"), "trunk moved\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["commit", "-am", "advance trunk"]).await;
+        let fork = rev(&runner, &main, "refs/heads/main").await;
+        run(&runner, &main, &["checkout", "-q", "-b", "shared"]).await;
+        fs::write(main.join("tracked.txt"), "shared work\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["commit", "-am", "shared work"]).await;
+        run(&runner, &main, &["checkout", "-q", "main"]).await;
         let other = service
             .create("shared", options(), &cancellation)
             .await
@@ -5420,7 +5737,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(state.get("baseBranch").is_none(), "{state}");
+        assert_eq!(state["baseBranch"], "main", "{state}");
+        assert_eq!(state["baseSha"], fork.as_str(), "{state}");
     }
 
     #[test]
@@ -6620,6 +6938,91 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// A pull request merged from the pushed head and the branch was rebased
+    /// onto the newer base afterwards. Its local commits are the base's own
+    /// and a copy of the merged work, so only the advertised base tip can
+    /// show that nothing here exists nowhere else.
+    #[tokio::test]
+    async fn landed_cleanup_does_not_count_commits_the_published_base_holds_by_patch() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let remote = scratch.path().join("origin.git");
+        run(
+            &runner,
+            scratch.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        )
+        .await;
+        run(
+            &runner,
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        let branch = "michael/ENG-12-rebased";
+        let target = linked(&service, branch).await;
+        let path = PathBuf::from(&target.path);
+        fs::write(path.join("work.txt"), "merged work\n")
+            .await
+            .unwrap();
+        run(&runner, &path, &["add", "work.txt"]).await;
+        run(&runner, &path, &["commit", "-m", "merged work"]).await;
+        run(&runner, &path, &["push", "origin", branch]).await;
+        fs::write(main.join("tracked.txt"), "trunk moved\n")
+            .await
+            .unwrap();
+        run(&runner, &main, &["commit", "-am", "advance trunk"]).await;
+        let moved = rev(&runner, &main, "refs/heads/main").await;
+        run(&runner, &main, &["merge", "--no-ff", "-m", "merge", branch]).await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        let tip = rev(&runner, &main, "refs/heads/main").await;
+        run(&runner, &path, &["rebase", &moved]).await;
+
+        let hazards = |base_tip: Option<String>| {
+            let (service, target, cancellation) = (&service, &target, &cancellation);
+            async move {
+                service
+                    .removal_hazards_on(target, true, base_tip.as_deref(), cancellation)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(hazards(None).await, [unpushed_hazard(2)]);
+        assert!(hazards(Some(tip.clone())).await.is_empty());
+        // A base that cannot be read is not evidence: the plain count stands.
+        assert_eq!(hazards(Some("0".repeat(40))).await, [unpushed_hazard(2)]);
+
+        fs::write(path.join("work.txt"), "after the merge\n")
+            .await
+            .unwrap();
+        run(&runner, &path, &["commit", "-am", "local only"]).await;
+        assert_eq!(hazards(Some(tip.clone())).await, [unpushed_hazard(1)]);
+        run(&runner, &path, &["reset", "-q", "--hard", "HEAD~1"]).await;
+
+        // Removal reads the same hazards under its lock from the witness.
+        let mut revision = service
+            .removal_revision_on(&target, true, Some(&tip), &cancellation)
+            .await
+            .unwrap();
+        assert!(revision.hazards.is_empty(), "{:?}", revision.hazards);
+        revision.published_base = Some(Box::new(("refs/heads/main".into(), tip)));
+        let removed = service
+            .remove_with_revision(
+                &target,
+                RemoveOptions {
+                    landed: true,
+                    ..RemoveOptions::default()
+                },
+                &revision,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(removed.removed);
+        assert!(!path.exists());
+    }
+
     /// Without a caller witness, a successful SST removal must not turn the
     /// checkout removal into an unverified force that discards new edits.
     #[tokio::test]
@@ -7187,6 +7590,30 @@ mod tests {
             &["update-ref", "refs/remotes/origin/experiment", "experiment"],
         )
         .await;
+        // A branch origin has may carry a pull request: one more thing to
+        // know before the clone can go.
+        let pending = service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await;
+        assert!(
+            matches!(pending, Err(LifecycleError::Refused(ref message))
+                if message.contains(&wt_core::unknown_pr_hazard("experiment"))),
+            "{pending:?}"
+        );
+        let location = service.config.state.clone();
+        Store::open(location.path, location.identity)
+            .unwrap()
+            .record_other_branches(
+                target.slug(),
+                None,
+                &[wt_core::OtherBranch {
+                    branch: "experiment".into(),
+                    state: wt_core::OtherPrState::None,
+                    checked_at_ms: Some(now_ms()),
+                    ..wt_core::OtherBranch::default()
+                }],
+            )
+            .unwrap();
         service
             .remove(&target, RemoveOptions::default(), &cancellation)
             .await
@@ -7374,10 +7801,12 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// A linked worktree's sibling branches live in the main clone's shared
-    /// database and survive its removal, so they are no hazard.
+    /// A branch a linked worktree was switched to survives its removal in
+    /// the main clone, but nothing would show its commits again: they hold
+    /// the worktree until they are pushed or the branch is gone. A branch
+    /// the worktree was never on is no concern of its.
     #[tokio::test]
-    async fn linked_worktree_removal_ignores_other_unpushed_branches() {
+    async fn linked_worktree_removal_holds_for_unpushed_branches_it_was_on() {
         let (_scratch, service, runner, main, _root) = setup().await;
         let cancellation = CancellationToken::new();
         let created = service
@@ -7401,13 +7830,143 @@ mod tests {
             "michael/ENG-11-linked",
         )
         .await;
+        run(&runner, &main, &["branch", "never-here", "elsewhere"]).await;
         let tip = rev(&runner, &main, "elsewhere").await;
+        let refused = service
+            .remove(&created.target, RemoveOptions::default(), &cancellation)
+            .await;
+        assert!(
+            matches!(&refused, Err(LifecycleError::Refused(message))
+                if message.contains("1 unpushed commit on branch elsewhere")
+                    && !message.contains("never-here")),
+            "{refused:?}"
+        );
+        assert!(path.exists());
+        run(&runner, &main, &["branch", "-D", "elsewhere"]).await;
         service
             .remove(&created.target, RemoveOptions::default(), &cancellation)
             .await
             .unwrap();
         assert!(!path.exists());
-        assert_eq!(rev(&runner, &main, "elsewhere").await, tip);
+        assert_eq!(rev(&runner, &main, "never-here").await, tip);
+    }
+
+    /// Another branch the worktree was on, pushed to origin: an open pull
+    /// request on it, or no recent answer either way, keeps the worktree.
+    #[tokio::test]
+    async fn removal_holds_while_another_branch_of_the_worktree_may_have_an_open_pr() {
+        let (scratch, service, runner, main, _root) = setup().await;
+        let cancellation = CancellationToken::new();
+        let remote = scratch.path().join("origin.git");
+        run(
+            &runner,
+            scratch.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        )
+        .await;
+        run(
+            &runner,
+            &main,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await;
+        run(&runner, &main, &["push", "origin", "main"]).await;
+        let target = linked(&service, "michael/ENG-13-stop").await;
+        let path = PathBuf::from(&target.path);
+        run(
+            &runner,
+            &path,
+            &["push", "-q", "origin", "michael/ENG-13-stop"],
+        )
+        .await;
+        commit_on_side_branch(
+            &runner,
+            &path,
+            "michael/ENG-13-retire",
+            "the follow-up\n",
+            "michael/ENG-13-stop",
+        )
+        .await;
+        run(
+            &runner,
+            &path,
+            &["push", "-q", "origin", "michael/ENG-13-retire"],
+        )
+        .await;
+        let state = service
+            .read_slug_state("ENG-13-stop", &cancellation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state["branch"], "michael/ENG-13-stop");
+        let hazards = || async {
+            service
+                .removal_hazards(&target, false, &cancellation)
+                .await
+                .unwrap()
+        };
+        let answer = |state: wt_core::OtherPrState, number: Option<u64>, age_ms: i64| {
+            let other = wt_core::OtherBranch {
+                branch: "michael/ENG-13-retire".into(),
+                number,
+                state,
+                draft: true,
+                checked_at_ms: Some(now_ms() - age_ms),
+            };
+            let location = service.config.state.clone();
+            let mut store = Store::open(location.path, location.identity).unwrap();
+            store
+                .record_other_branches("ENG-13-stop", None, &[other])
+                .unwrap();
+        };
+
+        // Nothing has asked GitHub yet: unknown is not safety.
+        assert_eq!(
+            hazards().await,
+            [wt_core::unknown_pr_hazard("michael/ENG-13-retire")]
+        );
+        answer(wt_core::OtherPrState::Open, Some(77), 0);
+        let open = hazards().await;
+        assert_eq!(
+            open,
+            [
+                "holds open PR #77 on michael/ENG-13-retire: give it its own worktree with wt new michael/ENG-13-retire"
+            ]
+        );
+        let refused = service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await;
+        assert!(
+            matches!(&refused, Err(LifecycleError::Refused(message)) if message.contains("holds open PR #77")),
+            "{refused:?}"
+        );
+        // Checked out here, the branch cannot move until the worktree lets go.
+        run(&runner, &path, &["switch", "-q", "michael/ENG-13-retire"]).await;
+        assert!(
+            hazards().await[0].contains("run git switch michael/ENG-13-stop here, then"),
+            "{:?}",
+            hazards().await
+        );
+        run(&runner, &path, &["switch", "-q", "michael/ENG-13-stop"]).await;
+
+        // "No open pull request" is an answer only while it is recent.
+        answer(
+            wt_core::OtherPrState::Closed,
+            Some(77),
+            wt_core::PR_VERDICT_FRESH_MS + 5 * 60 * 1000,
+        );
+        assert_eq!(
+            hazards().await,
+            [wt_core::unknown_pr_hazard("michael/ENG-13-retire")]
+        );
+        answer(wt_core::OtherPrState::Closed, Some(77), 0);
+        assert!(hazards().await.is_empty());
+        answer(wt_core::OtherPrState::Merged, Some(77), 0);
+        service
+            .remove(&target, RemoveOptions::default(), &cancellation)
+            .await
+            .unwrap();
+        assert!(!path.exists());
     }
 
     #[tokio::test]

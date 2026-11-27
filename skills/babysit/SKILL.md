@@ -233,6 +233,8 @@ When asked for more work after the merge, run
 add `--issue none` or `--gh <N>|none` to change the links): it moves the
 worktree to a fresh branch from the latest base and keeps its sessions,
 section and history. Then `wt status working`, commit,
-`git push -u origin HEAD`, open the PR and run this loop. Never reset the
-merged branch onto the base by hand; the merged PR stays attached and the row
-can read as landed.
+`git push -u origin HEAD`, open the PR and run this loop. Never create the
+next branch in place or reset the merged branch onto the base by hand: wt
+refuses a PR from a branch it did not record, and after a reset the merged PR
+stays attached and the row can read as landed. Work that must stack on this PR
+before it merges goes to a new worktree (`handoff`), never a second PR here.

@@ -325,6 +325,19 @@ fn compose(
         });
     }
     if let Some(data) = github.data() {
+        if let Some(rate) = data.rate_limit {
+            board.usage.push(wt_tui::UsageItem {
+                harness: wt_tui::UsageItem::GITHUB.into(),
+                period: "gh".into(),
+                percent: Some(
+                    (100 - (rate.remaining.min(rate.limit) * 100)
+                        .checked_div(rate.limit)
+                        .unwrap_or(100)) as u8,
+                ),
+                resets_at_ms: Some(rate.reset_at_ms),
+                ..Default::default()
+            });
+        }
         for row in &mut board.rows {
             let Some(pr) = (if wt_core::is_remote_worktree_ledger_key(&row.key) {
                 data.prs.get(&row.branch)

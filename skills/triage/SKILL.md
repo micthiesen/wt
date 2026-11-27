@@ -58,7 +58,8 @@ worktrees, stacking) and get an explicit go.
 
 ## Mode: materialize
 
-1. **Group** tasks that share a code area into one reviewable worktree.
+1. **Group** tasks that share a code area into one reviewable worktree. A
+   worktree is one PR: parts that must land separately get stacked worktrees.
 2. **Create** each with `wt new <ID> --slug <short words> --no-open`, never
    raw `git worktree add`. The id leads the slug and the tracker supplies the
    title, which the worktree's agent replaces with its outcome; a second
@@ -91,6 +92,7 @@ worktrees, stacking) and get an explicit go.
   worktree health.
 - `gh pr list --state all --json number,title,headRefName,state,isDraft,reviewDecision`,
   filtered to the batch, plus the review bot's findings on open PRs.
+  `wt orphans` lists open PRs no worktree tracks.
 - Summarize merged / in review / open / in progress and what is next, and
   list ids that look done so the human can update the tracker.
 

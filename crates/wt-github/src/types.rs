@@ -150,6 +150,17 @@ pub struct PrOutcome {
     pub merge_commit_oid: Option<String>,
 }
 
+/// GitHub's GraphQL point budget as one read saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimit {
+    pub limit: u64,
+    pub remaining: u64,
+    /// Points the read spent, over every request it made.
+    pub cost: u64,
+    pub reset_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GithubData {
@@ -165,6 +176,10 @@ pub struct GithubData {
     /// An absent PR proves anything only for a covered branch.
     #[serde(default)]
     pub covered_branches: std::collections::BTreeSet<String>,
+    /// The budget after the read that produced this data. `None` when the
+    /// server reports none (rate limiting switched off, an older snapshot).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
 }
 
 impl GithubData {
@@ -357,8 +372,13 @@ pub enum GithubError {
     Command(String),
     #[error("GitHub returned invalid data: {0}")]
     Protocol(String),
-    #[error("GitHub rate limit: {0}")]
-    RateLimit(String),
+    #[error("GitHub rate limit: {message}")]
+    RateLimit {
+        message: String,
+        /// When the exhausted limit resets, in epoch milliseconds, when the
+        /// reply's headers said.
+        reset_at_ms: Option<u64>,
+    },
     #[error("transient GitHub failure: {message}")]
     Transient { message: String },
 }
@@ -366,6 +386,14 @@ pub enum GithubError {
 impl GithubError {
     pub fn retryable(&self) -> bool {
         matches!(self, Self::Transient { .. })
+    }
+
+    /// When a rate-limited read may be tried again, if GitHub said.
+    pub fn rate_limit_reset_ms(&self) -> Option<u64> {
+        match self {
+            Self::RateLimit { reset_at_ms, .. } => *reset_at_ms,
+            _ => None,
+        }
     }
 }
 

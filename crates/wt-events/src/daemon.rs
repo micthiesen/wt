@@ -39,7 +39,7 @@ const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
     EventDaemonConfig, EventDaemonError, EventDaemonState, EventSource, EventsDaemon,
-    GithubSnapshot,
+    GithubSnapshot, RateBudget,
 };
 
 #[derive(Clone)]
@@ -441,6 +441,24 @@ pub(super) fn changes_refs(event: &str, payload: &Value) -> bool {
     }
 }
 
+/// Whether a delivery only reports CI that has not finished: a check run or
+/// suite that was created or requested again, or a pending status. Such
+/// deliveries far outnumber results and change nothing but a progress badge,
+/// so they wait behind a longer floor. An action this build does not know
+/// is not assumed to be progress.
+pub(super) fn ci_progress(event: &str, payload: &Value) -> bool {
+    let field = |key: &str| payload.get(key).and_then(Value::as_str);
+    match event {
+        "check_run" => matches!(
+            field("action"),
+            Some("created" | "rerequested" | "requested_action")
+        ),
+        "check_suite" => matches!(field("action"), Some("requested" | "rerequested")),
+        "status" => field("state") == Some("pending"),
+        _ => false,
+    }
+}
+
 fn branch_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     path.iter()
         .try_fold(value, |node, key| node.get(*key))?
@@ -515,6 +533,46 @@ pub fn failure_wait_ms(
     backoff_interval_ms(min_fetch_interval_ms, failures, rate_limited)
 }
 
+/// The share of the hourly budget background reads leave alone: agents
+/// working through the same token spend about that much.
+const RESERVE_DIVISOR: u64 = 4;
+/// Background reads plan to use their share at half speed, because they are
+/// not its only spender and learn what others spent only at their next read.
+const PACE_SAFETY: u64 = 2;
+
+/// The floor between starts of background GitHub reads, given the budget
+/// the last one left: `floor_ms`, stretched so that reads costing what the
+/// last one did would use the unreserved budget evenly until it resets, and
+/// all the way to the reset once only the reserve is left. A budget that is
+/// unknown, already reset, or resetting implausibly far away leaves the
+/// floor as it is. User-initiated reads do not ask this.
+pub fn paced_interval_ms(floor_ms: u64, budget: Option<RateBudget>, now_ms: u64) -> u64 {
+    let Some(budget) = budget else {
+        return floor_ms;
+    };
+    let Some(to_reset) = budget
+        .reset_at_ms
+        .checked_sub(now_ms)
+        .filter(|wait| *wait > 0 && *wait <= MAX_RESET_WAIT_MS)
+    else {
+        return floor_ms;
+    };
+    let until_reset = to_reset.saturating_add(RESET_SLACK_MS);
+    let spendable = budget
+        .remaining
+        .saturating_sub(budget.limit / RESERVE_DIVISOR);
+    if spendable == 0 {
+        return until_reset.max(floor_ms);
+    }
+    let paced = budget
+        .cost
+        .max(1)
+        .saturating_mul(to_reset)
+        .saturating_mul(PACE_SAFETY)
+        / spendable;
+    paced.min(until_reset).max(floor_ms)
+}
+
 async fn scheduler(
     config: EventDaemonConfig,
     source: Arc<dyn EventSource>,
@@ -579,6 +637,11 @@ async fn scheduler(
                     }
                 };
                 if relevant {
+                    let floor_ms = if ci_progress(&event.name, &event.payload) {
+                        fetch_interval_ms.max(config.progress_fetch_interval_ms)
+                    } else {
+                        fetch_interval_ms
+                    };
                     if changes_refs(&event.name, &event.payload) {
                         origin_trigger.get_or_insert_with(|| (event.name.clone(), matched));
                     }
@@ -591,7 +654,7 @@ async fn scheduler(
                     let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                     let last_ms = last_fetch_start.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
                     let pending_ms = pending_deadline.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
-                    if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, fetch_interval_ms) {
+                    if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, floor_ms) {
                         pending_deadline = Some(started + Duration::from_millis(deadline));
                     }
                 }
@@ -674,12 +737,16 @@ async fn scheduler(
                 // began: a write accepted after this moment may be missing.
                 let fetch_started_at_ms = now_millis();
                 let fetched = source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await;
+                let mut budget = None;
+                let mut reset_at_ms = None;
                 let failure = match fetched {
                     Ok(data) => {
+                        budget = data.budget;
                         let snapshot = GithubSnapshot {
                             updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
                             branches: fetch_branches.into_iter().collect(), prs: data.prs,
-                            merge_queue: data.merge_queue, writer_sha: config.writer_sha.clone(),
+                            merge_queue: data.merge_queue, rate_limit: data.budget,
+                            writer_sha: config.writer_sha.clone(),
                             repository: config.repository.clone(),
                             extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
                         };
@@ -695,10 +762,15 @@ async fn scheduler(
                             Err(e) => Some(format!("cannot persist GitHub snapshot: {e}")),
                         }
                     }
-                    Err(e) => Some(format!("GitHub refresh failed: {e}")),
+                    Err(e) => {
+                        reset_at_ms = e.rate_limit_reset_ms;
+                        Some(format!("GitHub refresh failed: {}", e.message))
+                    }
                 };
                 match failure {
-                    None => (failures, fetch_interval_ms) = (0, config.min_fetch_interval_ms),
+                    // A busy hour stretches the floor instead of running the
+                    // budget out; the floor still counts from this fetch's start.
+                    None => (failures, fetch_interval_ms) = (0, paced_interval_ms(config.min_fetch_interval_ms, budget, now_millis())),
                     // A read cut short by shutdown says nothing about GitHub.
                     Some(message) if cancel.is_cancelled() => {
                         debug!(error = %message, "GitHub refresh interrupted by shutdown");
@@ -707,7 +779,6 @@ async fn scheduler(
                     Some(message) => {
                         failures = failures.saturating_add(1);
                         let limited = rate_limited(&message);
-                        let reset_at_ms = if limited { source.rate_limit_reset(&cancel).await } else { None };
                         fetch_interval_ms = failure_wait_ms(config.min_fetch_interval_ms, failures, limited, reset_at_ms, now_millis());
                         // No webhook may follow the one this refresh served
                         // (or the startup read), so the retry is scheduled
@@ -874,7 +945,7 @@ fn now_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{EventFuture, EventGithubData, read_snapshot, read_state};
+    use crate::{EventFuture, EventGithubData, GithubFetchError, read_snapshot, read_state};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -889,6 +960,8 @@ mod tests {
         /// request in flight at shutdown does.
         hang_until_cancelled: AtomicBool,
         fail: AtomicBool,
+        /// The budget each successful read reports.
+        budget: Option<RateBudget>,
         fetches: AtomicUsize,
         origin_fetches: AtomicUsize,
         remote_calls: AtomicUsize,
@@ -929,8 +1002,9 @@ mod tests {
             &'a self,
             branches: Vec<String>,
             cancel: &'a CancellationToken,
-        ) -> EventFuture<'a, Result<EventGithubData, String>> {
+        ) -> EventFuture<'a, Result<EventGithubData, GithubFetchError>> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
+            let budget = self.budget;
             let fail = self.fail.load(Ordering::SeqCst);
             let hang = self.hang_until_cancelled.load(Ordering::SeqCst);
             Box::pin(async move {
@@ -944,6 +1018,7 @@ mod tests {
                 Ok(EventGithubData {
                     prs: json!({"branches": branches}),
                     merge_queue: json!({}),
+                    budget,
                 })
             })
         }
@@ -960,6 +1035,7 @@ mod tests {
         );
         config.debounce_ms = 3;
         config.min_fetch_interval_ms = 15;
+        config.progress_fetch_interval_ms = 15;
         config.inventory_ttl_ms = 50;
         config
     }
@@ -1416,6 +1492,162 @@ mod tests {
         assert_eq!(signed(daemon.local_addr(), "push", push).await, 200);
         wait_for_fetches(&source, 3).await;
         assert_eq!(source.origin_fetches.load(Ordering::SeqCst), 2);
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    #[test]
+    fn only_unfinished_ci_deliveries_count_as_progress() {
+        for (event, payload, progress) in [
+            ("check_run", json!({"action":"created"}), true),
+            ("check_run", json!({"action":"rerequested"}), true),
+            ("check_run", json!({"action":"completed"}), false),
+            ("check_suite", json!({"action":"requested"}), true),
+            ("check_suite", json!({"action":"completed"}), false),
+            ("status", json!({"state":"pending"}), true),
+            ("status", json!({"state":"success"}), false),
+            ("status", json!({"state":"failure"}), false),
+            // Unknown is not assumed to be progress.
+            ("check_run", json!({}), false),
+            ("check_run", json!({"action":"something_new"}), false),
+            ("status", json!({}), false),
+            // Review, merge queue and push deliveries are never slowed.
+            ("pull_request", json!({"action":"created"}), false),
+            (
+                "pull_request_review",
+                json!({"action":"submitted","state":"pending"}),
+                false,
+            ),
+            ("merge_group", json!({"action":"checks_requested"}), false),
+            ("push", json!({}), false),
+        ] {
+            assert_eq!(ci_progress(event, &payload), progress, "{event} {payload}");
+        }
+    }
+
+    /// CI that has only started waits behind its own, longer floor; a result
+    /// and a review are fetched on the normal one, even with progress pending.
+    #[tokio::test]
+    async fn unfinished_ci_waits_behind_a_longer_floor_and_results_stay_prompt() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        let cancel = CancellationToken::new();
+        let mut config = test_config(&dir);
+        config.progress_fetch_interval_ms = 60_000;
+        let daemon = start(config, source.clone(), cancel.clone()).await.unwrap();
+        wait_for_fetches(&source, 1).await;
+        let run = |action: &str| {
+            json!({"action":action,"check_run":{"check_suite":{"head_branch":"feature-x"}}})
+                .to_string()
+                .into_bytes()
+        };
+        let status = |state: &str| {
+            json!({"state":state,"branches":[{"name":"feature-x"}]})
+                .to_string()
+                .into_bytes()
+        };
+        for (event, body) in [
+            ("check_run", run("created")),
+            ("status", status("pending")),
+            ("check_run", run("created")),
+        ] {
+            assert_eq!(signed(daemon.local_addr(), event, &body).await, 200);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            read_state(dir.path()).await.unwrap().unwrap().event_count,
+            3
+        );
+
+        let completed = run("completed");
+        assert_eq!(
+            signed(daemon.local_addr(), "check_run", &completed).await,
+            200
+        );
+        wait_for_fetches(&source, 2).await;
+        let review = br#"{"action":"submitted","pull_request":{"head":{"ref":"feature-x"},"base":{"ref":"main"}}}"#;
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request_review", review).await,
+            200
+        );
+        wait_for_fetches(&source, 3).await;
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    #[test]
+    fn the_fetch_floor_stretches_with_the_budget_left() {
+        const MINUTE: u64 = 60_000;
+        let now = 1_000 * MINUTE;
+        let budget = |remaining, cost, reset_in_ms: u64| {
+            Some(RateBudget {
+                limit: 5_000,
+                remaining,
+                cost,
+                reset_at_ms: now + reset_in_ms,
+            })
+        };
+        let paced = |budget| paced_interval_ms(10_000, budget, now);
+        // A full budget at the top of the hour: 5 points per read against
+        // 3,750 spendable is under the floor, which stands.
+        assert_eq!(paced(budget(5_000, 5, 60 * MINUTE)), 10_000);
+        // 500 spendable with half an hour to go: 5 * 30 min * 2 / 500.
+        assert_eq!(paced(budget(1_750, 5, 30 * MINUTE)), 36_000);
+        // What the old query cost per read would have had to wait.
+        assert_eq!(paced(budget(1_750, 42, 30 * MINUTE)), 302_400);
+        // Only the reserve is left, or nothing at all: wait for the reset.
+        for remaining in [1_250, 1_000, 0] {
+            assert_eq!(
+                paced(budget(remaining, 5, 20 * MINUTE)),
+                20 * MINUTE + RESET_SLACK_MS
+            );
+        }
+        // Never beyond the reset, even for one point of spendable budget.
+        assert_eq!(
+            paced(budget(1_251, 5, 20 * MINUTE)),
+            20 * MINUTE + RESET_SLACK_MS
+        );
+        // A reply that reported no cost is paced as the cheapest read.
+        assert_eq!(paced(budget(1_300, 0, 20 * MINUTE)), 48_000);
+        // No budget reported (rate limiting off, an older server), a window
+        // that has already reset, or a reset too far off to believe: the
+        // floor alone, as before budgets were read.
+        assert_eq!(paced(None), 10_000);
+        assert_eq!(paced_interval_ms(10_000, budget(0, 5, 0), now), 10_000);
+        assert_eq!(
+            paced_interval_ms(10_000, budget(0, 5, MINUTE), now + 2 * MINUTE),
+            10_000
+        );
+        assert_eq!(paced(budget(0, 5, 3 * 60 * MINUTE)), 10_000);
+    }
+
+    /// With only the reserve left the daemon stops refreshing in the
+    /// background until the reset, and publishes the budget it saw.
+    #[tokio::test]
+    async fn a_low_budget_holds_background_refreshes_until_the_reset() {
+        let dir = TempDir::new().unwrap();
+        let budget = RateBudget {
+            limit: 5_000,
+            remaining: 900,
+            cost: 5,
+            reset_at_ms: now_millis() + 10 * 60_000,
+        };
+        let source = Arc::new(MockSource {
+            budget: Some(budget),
+            ..MockSource::default()
+        });
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        wait_for_fetches(&source, 1).await;
+        let push = br#"{"ref":"refs/heads/feature-x"}"#;
+        assert_eq!(signed(daemon.local_addr(), "push", push).await, 200);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 1);
+        let snapshot = read_snapshot(dir.path()).await.unwrap().unwrap();
+        assert_eq!(snapshot.rate_limit, Some(budget));
         cancel.cancel();
         daemon.shutdown().await;
     }

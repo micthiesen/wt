@@ -35,7 +35,7 @@ pub use names::{
 };
 pub use registry::{RegistrySession, RegistryStatus};
 pub use sessions::{ClaudeHarness, ClaudeHarnessError, ClaudePaths};
-pub use shims::{ensure_inspect_shims, stale_harness_shims};
+pub use shims::{GH_GUARD_REFUSED, ensure_inspect_shims, stale_harness_shims};
 pub use summaries::read_session_summaries;
 pub use transcript::{
     ClaudeStatus, LastEntryKind, SessionContextUsage, SessionTail, TranscriptFollower,

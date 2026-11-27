@@ -29,6 +29,11 @@ message is about; a row you notice in passing is not a reason to act on it.
   `queued` receipt waits for the worker's turn to end; don't resend. Use
   `--steer` only for a time-bounded instruction to a busy Codex worker. Never
   edit another worktree. From the main clone you only read.
+- **One PR per worktree.** Never brief a worker to open a second PR from its
+  worktree, a draft "on top" included. A follow-up that must wait or stack
+  gets its own worktree with a brief:
+  `wt new <slug> --base <branch> --brief <file> --start`, gated with
+  `--blocked-on` and `--until` (below) when it must not merge yet.
 - **Never stop another worktree's dev server** or remove a worktree that still
   owes anything (`wt owed --slug <slug>`).
 
@@ -101,6 +106,9 @@ your whole mandate until they change it; with none, the fleet is.
   all-null column usually means a wrong path; spot-check `wt status <slug>`.
 - `pr: null` with a `pr_note` means GitHub was unreachable, not "no PR".
   `"computing"` merge fields: re-run once after a few seconds.
+- `other_prs` on a row lists other branches its checkout was on; wt tracks
+  none of their PRs, and the row cannot be removed while one is open or
+  unanswered. Have each adopted into its own worktree (`wt new <branch>`).
 - `base` naming another row's branch is a stack. A fresh `blocks` edge is a
   hard dependency, a stale edge steers nothing, and no edge is never proof of
   safety.
@@ -191,6 +199,7 @@ evidence; label theories, and verify a destructive remedy before proposing it.
 - what every worktree waits for → `wt watch --all`; `wt watch cancel <id>`
   cancels anyone's
 - what every worktree still owes → `wt owed --all`
+- open PRs no row tracks → `wt orphans`, which prints the adopting command
 - why a row is in its state, removed rows included → `wt history <slug>`
 - a loop that keeps the fleet moving → the `shepherd` skill
 - addressable targets and harnesses → `wt agent ls`

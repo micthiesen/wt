@@ -52,6 +52,9 @@ three ways:
   unstarted branch merged. `merged` closes GitHub issues and feeds the
   clean sweep, so an absent anchor there is not a stacking gap, it's a
   correctness one.
+- `wt new <existing branch>` records the merge base of that branch with the
+  configured base branch: the branch forked somewhere wt never saw, and its
+  own work starts there.
 - `wt base set <slug> <ref>` / the TUI's `b` picker — backfill or change it by
   hand (record only; nothing is rebased).
 - `wt base clear <slug>` returns the recorded parent to trunk while retaining

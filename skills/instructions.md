@@ -6,6 +6,9 @@ In a wt-managed worktree you own the task's status, testing, and dev server.
   lists the states): `working` when work begins, `review` when review begins.
 - Set the title on purpose: `wt title "<outcome>"` when work begins and again if
   the outcome changes (sentence case, about the PR title). A person's is final.
+- One worktree, one branch, one PR; wt refuses a `gh pr create` from another
+  branch. Next PR after the merge: `wt next --title "<outcome>"`; one that must
+  wait or stack: `wt new <slug> --base <this branch>` (the `handoff` skill).
 - Testing is yours: `needs-testing` means you owe verification, not the human.
 - `needs-human` is only for an action outside the repository with no defensible
   default (interactive auth, a human-only call). Keep doing independent work.
@@ -38,10 +41,8 @@ In a wt-managed worktree you own the task's status, testing, and dev server.
 
 ### Shared checkout safety
 
-The checkout is shared with other agents, the human, and hot-reloading servers.
-
-- Test a hypothesis against a copy, never with `git stash`, `checkout`,
-  `restore`, or `reset`.
+- Other agents, the human and hot-reloading servers share the checkout: test a
+  hypothesis on a copy, never `git stash`, `checkout`, `restore` or `reset`.
 - Announce any needed change to shared tree state; restore it before finishing.
 - Put scratch files in the harness scratch area, never in the checkout.
 
@@ -82,7 +83,7 @@ nothing is finished; the note never holds owed work:
 
 - Any other step, never a check: `wt wake <condition> -m "<step>"`, with
   `--before-release` when it must precede the next production release.
-- Each stage holds one check; a second check for the same stage (another PR
+- Each stage holds one check; a second check for the same stage (a later PR
   of this worktree) is a wake step: `wt wake pr:<n>:<stage> -m "<steps>"`.
 - A due check, and a wake delivered after the work merged, stay owed (and hold
   off cleanup) until closed, even when moot: do it on a deploy that contains
@@ -90,10 +91,9 @@ nothing is finished; the note never holds owed work:
 - Put off a due check with `wt done <stage> --again <time>`, never a `wt wake`.
 - `wt done <id> --again <condition>` puts off a due step, `wt watch cancel <id>`
   (or `--mine`) drops a wake, `wt status --no-verify-in-<stage>` drops a check.
-- Every op is yours: do it when due, asking approval where the action needs
-  it, never handing it to the human. Prefer automation that ships with the
-  change (a checked-in migration the normal deploy applies); a step the merge
-  and deploy flow already performs is not owed.
+- Every op is yours, never the human's: do it when due, asking approval where
+  needed. Prefer automation that ships with the change (a checked-in migration
+  the deploy applies); a step the merge and deploy flow performs is not owed.
 
 ### Completion status
 

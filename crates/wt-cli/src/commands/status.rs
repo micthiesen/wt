@@ -600,6 +600,15 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             let now = now_ms();
             if wants_json {
                 let rows = worktrees.iter().map(|w| (*w).clone()).collect::<Vec<_>>();
+                let mut state = state.clone();
+                wt_ops::other_branches::refresh(
+                    ctx,
+                    &rows,
+                    &mut state,
+                    None,
+                    wt_ops::other_branches::Ask::Nothing,
+                )
+                .await;
                 let landings = landing::read(ctx, &rows, &state, landing::Want::Phases).await;
                 let mut entries = Vec::with_capacity(worktrees.len());
                 for w in &worktrees {
@@ -677,6 +686,15 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             if wants_json {
+                let mut state = state.clone();
+                wt_ops::other_branches::refresh(
+                    ctx,
+                    std::slice::from_ref(&record),
+                    &mut state,
+                    None,
+                    wt_ops::other_branches::Ask::Nothing,
+                )
+                .await;
                 let landing = landing::read_one(ctx, &record, &state, landing::Want::Phases).await;
                 println!(
                     "{}",
@@ -1826,7 +1844,7 @@ async fn live_json(
         json!({"skill": stamp.skill, "sha": stamp.sha, "at": stamp.at, "current": stamp.current(head.as_deref())})
     });
     Ok(
-        json!({"stamp":stamp,"slug":slug,"branch":w.target.branch,"kind":"live","section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word(),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
+        json!({"stamp":stamp,"slug":slug,"branch":w.target.branch,"kind":"live","other_prs":wt_core::other_prs_json(record.unwrap_or(&Value::Null)),"section":if ctx.config.instance.role==InstanceRole::Worker {None}else{record.and_then(|r|r.get("section")).and_then(Value::as_str)},"state":work.as_ref().map(|x|x.state),"note":work.as_ref().and_then(|x|x.note.as_deref()),"risk":work.as_ref().and_then(|x|x.risk),"blocked_on":work.as_ref().and_then(|x|x.blocked_on.as_deref()),"verify_after_merge":work.as_ref().and_then(|x|x.verify_after_merge.as_deref()),"verify_in":work.as_ref().and_then(|x|x.verification()).map(|(stage,_)|stage),"at":work.as_ref().map(|x|x.at.as_str()),"watches":super::watch::watches_json(&wt_store::stored_watches(state), slug, clock),"owes":super::owed::owes_json(&owed.items, clock),"owed_phase":super::owed::phase_json(owed.phase),"landing":owed.landing.word(),"examined":examined,"examined_current":examined_current,"by":work.as_ref().and_then(|x|x.by.as_deref()),"stale":work.as_ref().is_some_and(|x|x.sha.as_deref().zip(head.as_deref()).is_some_and(|(old,new)|old!=new))}),
     )
 }
 

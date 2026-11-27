@@ -193,17 +193,10 @@ impl Externals {
             self.tasks.spawn(async move {
                 let cancel = &ctx.cancellation;
                 let read = wt_ops::watch_probe::pull_requests(&ctx, &prs, cancel).await;
-                Arrived::Prs(match read {
-                    Ok(prs) => Ok(prs),
-                    Err(error) => {
-                        let reset_at_ms = if wt_events::rate_limited(&error) {
-                            wt_ops::watch_probe::rate_limit_reset_ms(&ctx, cancel).await
-                        } else {
-                            None
-                        };
-                        Err(PrsFailed { error, reset_at_ms })
-                    }
-                })
+                Arrived::Prs(read.map_err(|error| PrsFailed {
+                    reset_at_ms: error.rate_limit_reset_ms(),
+                    error: error.to_string(),
+                }))
             });
         }
 

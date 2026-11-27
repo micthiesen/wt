@@ -1055,6 +1055,12 @@ pub struct UsageItem {
     pub cost: Option<String>,
 }
 
+impl UsageItem {
+    /// The `harness` of the item carrying GitHub's GraphQL budget, which the
+    /// header shows whatever the primary harness, and only when it is low.
+    pub const GITHUB: &'static str = "GitHub";
+}
+
 /// Render-time display policy prepared from configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -1131,8 +1137,42 @@ pub struct RemovalView {
     pub checkout_absent: bool,
 }
 
+/// A branch other than the row's own that its checkout has been on, with
+/// what is known of the pull request on it. Such a pull request has no row.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OtherPrView {
+    pub branch: String,
+    pub number: Option<u64>,
+    pub state: wt_core::OtherPrState,
+    pub draft: bool,
+}
+
+impl OtherPrView {
+    /// Whether the branch holds, or may hold, a pull request nobody sees.
+    pub fn unsettled(&self) -> bool {
+        matches!(
+            self.state,
+            wt_core::OtherPrState::Open | wt_core::OtherPrState::Unknown
+        )
+    }
+
+    pub fn label(&self) -> String {
+        match (self.state, self.number) {
+            (wt_core::OtherPrState::Open, Some(number)) if self.draft => {
+                format!("draft #{number} on {}", self.branch)
+            }
+            (wt_core::OtherPrState::Open, Some(number)) => format!("#{number} on {}", self.branch),
+            (wt_core::OtherPrState::Open, None) => format!("a PR on {}", self.branch),
+            _ => format!("{} (PR unknown)", self.branch),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BoardRow {
+    /// The row's other branches (see [`OtherPrView`]).
+    #[serde(default)]
+    pub other_prs: Vec<OtherPrView>,
     #[serde(default)]
     pub removal: Option<RemovalView>,
     /// Optimistic creation has no actionable inventory identity yet. Only the

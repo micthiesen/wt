@@ -219,6 +219,10 @@ fn header(frame: &mut Frame<'_>, model: &Model, area: Rect) {
             base.fg(theme::FG_DIM),
         ));
     }
+    if let Some(budget) = github_budget_text(board, text::now_ms()) {
+        right.push(Span::styled(budget, base.fg(theme::WARN)));
+        right.push(Span::styled(" · ", base.fg(theme::FG_DIM)));
+    }
     let usage = usage_spans(model, base, text::now_ms());
     if !usage.is_empty() {
         right.extend(usage);
@@ -253,6 +257,23 @@ pub(crate) fn refresh_header(frame: &mut Frame<'_>, model: &Model) {
     if area.width >= 20 && area.height >= 5 {
         header(frame, model, Rect::new(area.x, area.y, area.width, 1));
     }
+}
+
+/// GitHub's GraphQL budget is shown once less than this percentage is left:
+/// below it wt holds its background refreshes until the budget resets.
+const LOW_GITHUB_BUDGET: u8 = 25;
+
+/// `gh 12% left (23m)`: what is left of GitHub's GraphQL budget and how long
+/// until it resets. Nothing while the budget is healthy, unknown, or from a
+/// window that has since reset.
+fn github_budget_text(board: &crate::Board, now: u64) -> Option<String> {
+    let item = board
+        .usage
+        .iter()
+        .find(|item| item.harness == crate::UsageItem::GITHUB)?;
+    let left = 100u8.saturating_sub(item.percent?);
+    let reset = item.resets_at_ms.filter(|reset| *reset > now)?;
+    (left < LOW_GITHUB_BUDGET).then(|| format!("gh {left}% left ({})", text::remaining(now, reset)))
 }
 
 /// A Claude reading older than this means the outside fetch that writes it
@@ -688,6 +709,42 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(text, "7d 61% (1d13h)");
+    }
+
+    #[test]
+    fn the_github_budget_is_shown_only_while_it_is_low_and_current() {
+        const MINUTE: u64 = 60_000;
+        let now = 1_000 * MINUTE;
+        let text = |percent, resets_at_ms| {
+            let mut board = Board::default();
+            board.usage.push(UsageItem {
+                harness: UsageItem::GITHUB.into(),
+                period: "gh".into(),
+                percent,
+                resets_at_ms,
+                ..UsageItem::default()
+            });
+            github_budget_text(&board, now)
+        };
+        let reset = Some(now + 23 * MINUTE);
+        assert_eq!(text(Some(88), reset).as_deref(), Some("gh 12% left (23m)"));
+        assert_eq!(text(Some(100), reset).as_deref(), Some("gh 0% left (23m)"));
+        // A quarter or more left, a window already reset, or no reading.
+        assert_eq!(text(Some(75), reset), None);
+        assert_eq!(text(Some(88), Some(now)), None);
+        assert_eq!(text(Some(88), None), None);
+        assert_eq!(text(None, reset), None);
+        assert_eq!(github_budget_text(&Board::default(), now), None);
+        // It is not one of the primary harness's windows.
+        let mut model = Model::default();
+        Arc::make_mut(&mut model.board).usage.push(UsageItem {
+            harness: UsageItem::GITHUB.into(),
+            period: "gh".into(),
+            percent: Some(88),
+            resets_at_ms: reset,
+            ..UsageItem::default()
+        });
+        assert!(usage_spans(&model, Style::new(), now).is_empty());
     }
 
     #[test]

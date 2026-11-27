@@ -156,6 +156,9 @@ struct LaneClock {
     /// A `Request::Direct` has been made and no network read has started
     /// since: daemon snapshots are not served until one does.
     direct_owed: bool,
+    /// The floor between background network reads that the latest budget
+    /// reading asks for, when that is longer than [`GITHUB_MINIMUM`].
+    pace: Option<Duration>,
 }
 
 /// What one fetch does.
@@ -205,6 +208,7 @@ impl LaneClock {
             }
             let fetched = if newer {
                 let observed = read.stamp();
+                self.pace_by(read.data.rate_limit);
                 Fetched::new(read.data, observed)
             } else if let Some(shown) = &self.shown {
                 // The branch set changed but the shown data is newer: keep it
@@ -214,7 +218,7 @@ impl LaneClock {
                 Fetched::new(data, observed)
             } else {
                 // Nothing shown to keep: wait for a direct read.
-                return self.network(now);
+                return self.network(now, request);
             };
             self.served_daemon = Some(version);
             self.published = Some(branches.to_vec());
@@ -230,14 +234,21 @@ impl LaneClock {
         {
             return Plan::Skip;
         }
-        self.network(now)
+        self.network(now, request)
     }
 
-    /// Read GitHub now, or defer behind the rate floor.
-    fn network(&mut self, now: Instant) -> Plan {
+    /// Read GitHub now, or defer behind the rate floor. A read the user
+    /// asked for (an explicit refresh, or the one after a write) waits only for
+    /// [`GITHUB_MINIMUM`]; any other also keeps the budget's pace.
+    fn network(&mut self, now: Instant, request: Request) -> Plan {
+        let floor = if self.direct_owed || request == Request::Direct {
+            GITHUB_MINIMUM
+        } else {
+            self.pace.unwrap_or(GITHUB_MINIMUM).max(GITHUB_MINIMUM)
+        };
         if let Some(due) = self
             .live_started
-            .map(|at| at + GITHUB_MINIMUM)
+            .map(|at| at + floor)
             .filter(|due| *due > now)
         {
             self.deferred = Some(due);
@@ -250,8 +261,34 @@ impl LaneClock {
         Plan::Network
     }
 
+    /// Pace background reads by the budget a read just reported.
+    fn pace_by(&mut self, rate: Option<wt_github::RateLimit>) {
+        let floor = u64::try_from(GITHUB_MINIMUM.as_millis()).unwrap_or(u64::MAX);
+        self.pace = Some(Duration::from_millis(wt_events::paced_interval_ms(
+            floor,
+            rate.map(wt_ops::events::rate_budget),
+            epoch_ms(),
+        )));
+    }
+
+    /// A direct read was refused for the rate limit: background reads wait
+    /// for its reset when the reply named one.
+    fn rate_limited(&mut self, reset_at_ms: Option<u64>) {
+        let floor = u64::try_from(GITHUB_MINIMUM.as_millis()).unwrap_or(u64::MAX);
+        self.pace = reset_at_ms.map(|_| {
+            Duration::from_millis(wt_events::failure_wait_ms(
+                floor,
+                1,
+                true,
+                reset_at_ms,
+                epoch_ms(),
+            ))
+        });
+    }
+
     /// A direct read that started at `started` succeeded.
     fn live_read(&mut self, started: Instant, branches: Vec<String>, data: &GithubData) {
+        self.pace_by(data.rate_limit);
         self.live_observed = Some(started);
         self.published = Some(branches);
         self.shown = Some((data.clone(), Stamp::at(started)));
@@ -398,7 +435,15 @@ impl GithubLane {
                 "GitHub read"
             );
         }
-        let data = result?;
+        let data = match result {
+            Ok(data) => data,
+            Err(error) => {
+                if matches!(error, GithubError::RateLimit { .. }) {
+                    self.clock().rate_limited(error.rate_limit_reset_ms());
+                }
+                return Err(error);
+            }
+        };
         self.clock().live_read(now, branches, &data);
         Ok(Some(Fetched::new(data, started)))
     }
@@ -502,6 +547,14 @@ async fn has_workflows(root: &Path) -> bool {
             }
         }
     }
+}
+
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+        })
 }
 
 /// Branches GitHub is asked about: every linked worktree's branch.
@@ -653,6 +706,86 @@ mod tests {
         ));
         assert_eq!(clock.deferred, None);
         assert_eq!(clock.live_started, Some(due));
+    }
+
+    /// A budget down to its reserve holds the backstop and other background
+    /// reads until the reset, whether a direct read or the daemon's snapshot
+    /// reported it. A read the user asked for keeps the ordinary floor.
+    #[tokio::test(start_paused = true)]
+    async fn a_low_budget_defers_background_reads_but_not_requested_ones() {
+        let branches = branches();
+        let low = |reset_in: Duration| GithubData {
+            rate_limit: Some(wt_github::RateLimit {
+                limit: 5_000,
+                remaining: 800,
+                cost: 5,
+                reset_at_ms: epoch_ms() + reset_in.as_millis() as u64,
+            }),
+            ..GithubData::default()
+        };
+        let reset_in = Duration::from_secs(20 * 60);
+        let start = Instant::now();
+        let plan = |clock: &mut LaneClock, request, now| {
+            clock.plan(PlanInput {
+                request,
+                ..input(&branches, None, now)
+            })
+        };
+        let mut clock = LaneClock::default();
+        assert!(matches!(
+            plan(&mut clock, Request::Refresh, start),
+            Plan::Network
+        ));
+        clock.live_read(start, branches.clone(), &low(reset_in));
+        let later = start + Duration::from_secs(5 * 60);
+        assert!(matches!(
+            plan(&mut clock, Request::Refresh, later),
+            Plan::Defer
+        ));
+        let due = clock.deferred.unwrap();
+        assert!(due >= start + reset_in && due <= start + reset_in + Duration::from_secs(10));
+        assert!(matches!(
+            plan(&mut clock, Request::Direct, later),
+            Plan::Network
+        ));
+        // A healthy budget, or a server that reports none, changes nothing.
+        clock.live_read(later, branches.clone(), &GithubData::default());
+        assert!(matches!(
+            plan(&mut clock, Request::Refresh, later + GITHUB_MINIMUM),
+            Plan::Network
+        ));
+
+        // The daemon's snapshot carries the budget its read saw.
+        let mut clock = LaneClock {
+            live_started: Some(start),
+            ..LaneClock::default()
+        };
+        let mut read = daemon(Some(start), 1_000);
+        read.data = low(reset_in);
+        assert!(matches!(
+            clock.plan(input(&branches, Some(read), start)),
+            Plan::Publish(_)
+        ));
+        assert!(matches!(
+            plan(&mut clock, Request::Refresh, later),
+            Plan::Defer
+        ));
+
+        // A refused read waits for the reset its reply named, and only then.
+        let mut clock = LaneClock {
+            live_started: Some(start),
+            ..LaneClock::default()
+        };
+        clock.rate_limited(Some(epoch_ms() + reset_in.as_millis() as u64));
+        assert!(matches!(
+            plan(&mut clock, Request::Refresh, later),
+            Plan::Defer
+        ));
+        clock.rate_limited(None);
+        assert!(matches!(
+            plan(&mut clock, Request::Refresh, later),
+            Plan::Network
+        ));
     }
 
     #[tokio::test(start_paused = true)]

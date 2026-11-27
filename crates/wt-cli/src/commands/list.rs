@@ -83,6 +83,15 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
             .iter()
             .map(|snapshot| snapshot.worktree.clone())
             .collect::<Vec<_>>();
+        let mut state = state;
+        wt_ops::other_branches::refresh(
+            ctx,
+            &records,
+            &mut state,
+            None,
+            wt_ops::other_branches::Ask::Nothing,
+        )
+        .await;
         // A squash merge is proven only by its pull request: see `landing`.
         let landings =
             super::landing::read(ctx, &records, &state, super::landing::Want::Phases).await;
@@ -466,6 +475,7 @@ fn live_json(
         "stage": target.stage,
         "deployed": deployed,
         "kind": "live",
+        "other_prs": wt_core::other_prs_json(entry.unwrap_or(&Value::Null)),
         "section": if ctx.config.instance.role == wt_config::InstanceRole::Worker { None } else { entry.and_then(|entry| entry.get("section")).and_then(Value::as_str) },
         "base": base,
         "exists": true,

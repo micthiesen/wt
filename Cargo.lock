@@ -3069,6 +3069,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "tracing",
  "wt-config",
  "wt-platform",
 ]

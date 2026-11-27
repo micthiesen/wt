@@ -233,7 +233,9 @@ returns to the default. The feed is restored from the app log on startup.
 
 The header shows worktree and archive counts, refresh motion, paused or queued
 automations, a dim `↑` notice when a newer wt release is available or installed
-and awaiting a restart ([updates.md](updates.md)), the primary harness's rate-limit windows (colored as they near
+and awaiting a restart ([updates.md](updates.md)), GitHub's GraphQL budget once
+less than a quarter is left (`gh 12% left (23m)`, warn-colored; see
+[github-events.md](github-events.md#graphql-budget)), the primary harness's rate-limit windows (colored as they near
 the limit, with time to reset), and the primary harness glyph. Claude's
 windows come from `~/.cache/claude-statusline-usage.json`, written by a
 statusline outside wt, and read like Claude Code's status line:
@@ -281,6 +283,17 @@ never shows it back at the base. The `removal record` pane shows removal time, h
 what the record still owes (`owes`, one line an item, each ending with the command that closes it there: `wt done <id> --slug <slug>` for a due step, `wt done <stage> --slug <slug>` for a check), landing, notes, and the row's recorded history when it has one. `Enter` restores (a restore of a branch that still exists keeps its stack base and owed verification), `H` opens the row's history modal as on the board, `p` opens the PR, `i` opens
 the issue when known, and `y` copies the branch. `j`/`k`, `g`/`G`, and `PgUp`/`PgDn` move the cursor, `Ctrl+J`/`Ctrl+K` scroll the record pane, `r` refreshes, and `Esc` or `h` returns to the board. The activity pane's own keys also work: `x` marks attention seen, `"` toggles the attention and firehose feeds, and `Ctrl+E`/`Ctrl+Y` scroll it. Global keys (help, performance, create, manager and slot sessions, automations pause) work as on the board, and `q` quits the app. `p` and `i` toast when nothing is recorded, and `O`
 opens the main clone as it does on the board.
+
+### More than one pull request
+
+A worktree is for one branch and one pull request. When its checkout has
+been on another branch that carries an open pull request, or one GitHub has
+not answered for, the details pane says so in one warn-coloured line:
+`Holds more than one PR: also draft #12 on <branch>, <branch> (PR unknown)`.
+That pull request has no row, so nothing else on the board shows its checks
+or reviews, and the worktree cannot be removed until the branch has its own
+worktree ([cli.md](cli.md#one-pr-per-worktree)).
+
 
 ### What a row owes
 

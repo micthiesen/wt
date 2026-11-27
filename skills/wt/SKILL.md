@@ -41,6 +41,7 @@ wt done [<id>|staging|production] -m "<evidence>"   # close it; --again <cond>â€
 wt history [slug]                      # what happened to a row, removed ones too
 wt mark --stamp <name> [--slug <slug>] # give the row a review stamp by hand (a harness that reports no skill uses)
 wt next [branch] --title <outcome> [--issue <ID>|none] [--gh <n>|none]
+wt orphans                             # your open PRs no worktree row tracks, with the adopting command
 wt issue [slug] [--gh <n> | --clear-gh | --read]
 wt title [titleâ€¦] [-w slug]          # show, or set any but a person's title
 wt rm [slug] [--keep-branch]           # deletes the branch by default
@@ -101,9 +102,23 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   `wt owed` lists what a worktree owes (gate, checks per stage, steps), and
   anything but a gate keeps it from cleanup; a notification about a landed
   worktree outlives it.
-- **Another PR in the same worktree.** After its PR merged, run
-  `wt next --title "<outcome>"` there instead of a new worktree or a hand
-  reset, then push as below. `--issue <ID>` alone takes the tracker's title.
+- **One PR per worktree.** A worktree carries one branch and one PR. Never
+  `git switch -c` or `git checkout -b` inside it to open a second PR, and
+  never `gh pr create` from a branch other than its own: wt tracks only the
+  recorded branch, so another PR's checks, conflicts and reviews go unseen.
+  wt enforces it. `gh pr create` is refused when the current branch is not the
+  recorded one or that branch already has an open or merged PR. A worktree
+  that was on another branch whose PR is open, or that GitHub has not answered
+  for, cannot be removed until that branch has its own worktree
+  (`wt new <branch>` adopts an existing branch). `wt status --json`,
+  `wt ls --json` and `wt fleet` list such branches as `other_prs`.
+- **The next PR.** After this one merged, run `wt next --title "<outcome>"`
+  there instead of a new worktree or a hand reset, then push as below.
+  `--issue <ID>` alone takes the tracker's title. A follow-up that must wait
+  or stack on this PR is a new worktree, `wt new <slug> --base <this branch>`
+  (the `handoff` skill writes its brief and starts its agent). When it must
+  not merge yet, such as a removal that waits a release, gate it there:
+  `wt status <state> --blocked-on "<gate>" --until <condition>`.
 - **First push.** If `git push` says the upstream branch does not match the
   current branch, run `git push -u origin HEAD`. Never push to the
   `HEAD:<trunk>` it suggests.
@@ -123,8 +138,9 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
 
 - Status and coordination: `status`, `owed`, `done`, `wait`, `wake`, `notify`, `watch`, `history`, `mark`,
   `fleet`, `manager`, `hold`, `edge`, `guide`, `automations`
-- Worktrees: `new`, `next`, `restack`, `merge`, `ls`, `rm`, `clean`,
-  `archive`, `restore`, `open`, `doctor`, `logs`, `base`, `issue`, `section`
+- Worktrees: `new`, `next`, `orphans`, `restack`, `merge`, `ls`, `rm`,
+  `clean`, `archive`, `restore`, `open`, `doctor`, `logs`, `base`, `issue`,
+  `section`
 - Agents and servers: `agent`, `dev`, `perf`, `claude`, `codex`, `remote`,
   `auth`, `controller`, `events`, `stages`
 - Setup: `init`, `state migrate`, `skills`, `install`, `update`, `rollback`,

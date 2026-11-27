@@ -857,6 +857,24 @@ async fn enrich(
     let stored = state
         .get("slugs")
         .and_then(|slugs| slugs.get(target.slug()));
+    // This runs when the checkout's branch or HEAD changes, which is when
+    // a worktree's other branches appear.
+    if !cancellation.is_cancelled() {
+        wt_ops::other_branches::observe(
+            context,
+            std::slice::from_ref(&row.worktree),
+            state,
+            None,
+            wt_ops::other_branches::Ask::Nothing,
+        )
+        .await;
+        wt_ops::other_branches::notify_off_branch(
+            context,
+            &row.worktree,
+            stored.unwrap_or(&Value::Null),
+        )
+        .await;
+    }
     let configured_base = stored
         .and_then(|entry| entry.get("baseBranch"))
         .and_then(Value::as_str)
@@ -903,7 +921,12 @@ async fn enrich(
         // Mid-rebase HEAD is the rebase target (often the base tip itself),
         // so it would read as landed; wait for the rebase to finish.
         let mid_operation = wt_vcs::operation_in_progress(row.worktree.git_dir.as_deref()).await;
-        if own_commits > 0 && !mid_operation {
+        // A worktree adopted from an existing branch may have no recorded
+        // anchor. Counting from the base then reads zero once the base holds
+        // the branch, so the proofs below decide alone: each is one an empty
+        // branch cannot give.
+        let anchored = base_sha.is_some_and(|sha| !sha.is_empty());
+        if (own_commits > 0 || !anchored) && !mid_operation {
             let pr_is_for_current_head =
                 pr.is_some_and(|pr| pr.head_ref_oid.as_deref() == Some(head));
             let pr_landed_on_base = pr_is_for_current_head
@@ -935,6 +958,29 @@ async fn enrich(
                 }
                 None => false,
             };
+            // The pull request merged from an earlier head and the branch
+            // was rebased since: the base holds the patch of every commit it
+            // still has beyond it.
+            let merged_into_base = pr.is_some_and(|pr| {
+                pr.state.eq_ignore_ascii_case("MERGED") && pr.base_ref_name == configured_base
+            });
+            let patch_landed_on_base = match base_ref.as_deref() {
+                Some(base_ref)
+                    if merged_into_base && !pr_landed_on_base && !local_landed_on_base =>
+                {
+                    run_git(
+                        context,
+                        &path,
+                        wt_vcs::cherry_args(base_ref, head),
+                        cancellation,
+                    )
+                    .await
+                    .filter(|output| output.status.success() && !output.stdout_truncated)
+                    .is_some_and(|output| wt_vcs::cherry_all_in_base(&output.stdout_text()))
+                }
+                _ => false,
+            };
+            let local_landed_on_base = local_landed_on_base || patch_landed_on_base;
             if pr_landed_on_base || local_landed_on_base {
                 result.landed_on = Some(LandingKind::Base);
             }
@@ -2050,6 +2096,105 @@ mod tests {
         std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
         assert_eq!(probe().await, None);
         assert!(wt_vcs::operation_in_progress(Some(&git_dir)).await);
+    }
+
+    /// Two landings the anchor count alone misses: a branch rebased after
+    /// its pull request merged (a new head whose patch the base holds), and
+    /// a worktree adopted without a fork anchor whose head the base merged.
+    #[tokio::test]
+    async fn a_rebased_merged_branch_and_an_unanchored_merged_branch_are_landed() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let anchor = git(&main, &["rev-parse", "HEAD"]);
+        let find = || async {
+            fixture
+                .ctx
+                .repository
+                .inventory_status(&fixture.ctx.cancellation)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.worktree.target.branch == "feature/one")
+                .unwrap()
+        };
+        let row = find().await;
+        let worktree = PathBuf::from(&row.worktree.target.path);
+        let slug = row.worktree.target.slug().to_owned();
+        std::fs::write(worktree.join("own.txt"), "own\n").unwrap();
+        git(&worktree, &["add", "own.txt"]);
+        git(&worktree, &["commit", "-qm", "own work"]);
+        let pushed = git(&worktree, &["rev-parse", "HEAD"]);
+        std::fs::write(main.join("tracked.txt"), "trunk moved\n").unwrap();
+        git(&main, &["commit", "-qam", "trunk moved"]);
+        let moved = git(&main, &["rev-parse", "HEAD"]);
+        git(
+            &main,
+            &["merge", "-q", "--no-ff", "-m", "merge one", "feature/one"],
+        );
+        let merged: PullRequest = serde_json::from_value(serde_json::json!({
+            "number": 42, "url": "https://example.invalid/pull/42",
+            "headRefName": "feature/one", "headRefOid": pushed,
+            "baseRefName": "main", "mergeCommitOid": "f".repeat(40),
+            "title": "Feature", "isDraft": false, "state": "MERGED",
+            "checks": "pass", "failedChecks": [], "review": "none",
+            "reviewRequests": 0, "requestedReviewers": [], "suggestedReviewers": [],
+            "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0
+        }))
+        .unwrap();
+        let probe = |state: Value, pr: Option<PullRequest>| {
+            let (fixture, find) = (&fixture, &find);
+            async move {
+                enrich(
+                    &fixture.ctx,
+                    &find().await,
+                    &state,
+                    pr.as_ref(),
+                    &ConflictCache::default(),
+                    &fixture.ctx.cancellation,
+                )
+                .await
+                .0
+                .landed_on
+            }
+        };
+        let anchored =
+            serde_json::json!({"slugs": {&slug: {"baseBranch": "main", "baseSha": anchor}}});
+        let unanchored = serde_json::json!({"slugs": {&slug: {}}});
+
+        // Merged by a merge commit at the pushed head, with no anchor.
+        assert_eq!(
+            probe(unanchored.clone(), None).await,
+            Some(LandingKind::Base)
+        );
+        // Rebased since: the head is new, and only the merged pull request
+        // says the matching patch in the base is this branch's work.
+        git(&worktree, &["rebase", "-q", &moved]);
+        assert_ne!(git(&worktree, &["rev-parse", "HEAD"]), pushed);
+        assert_eq!(probe(anchored.clone(), None).await, None);
+        assert_eq!(
+            probe(anchored.clone(), Some(merged.clone())).await,
+            Some(LandingKind::Base)
+        );
+        // One commit the base does not hold is work that has not landed.
+        std::fs::write(worktree.join("own.txt"), "more\n").unwrap();
+        git(&worktree, &["commit", "-qam", "after the merge"]);
+        assert_eq!(probe(anchored, Some(merged)).await, None);
+        // Without an anchor, a head that is only the base's own tip is a
+        // snapshot of the base, not work that landed.
+        git(&worktree, &["reset", "-q", "--hard", "main"]);
+        assert_eq!(probe(unanchored, None).await, None);
+        fixture.close().await.unwrap();
     }
 
     /// A worktree started on a newer base tip than its recorded anchor has
