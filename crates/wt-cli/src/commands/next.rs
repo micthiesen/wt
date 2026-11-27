@@ -197,7 +197,39 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
     .await?
     .status
     .success();
-    match landed(&prs, &head, &trunk, contained) {
+    // A checkout rebased, or with trunk merged in, after the push that
+    // merged holds only copies of that work: judge it as the merged head.
+    let mut landed_head = head.clone();
+    if !contained {
+        for pr in prs.iter().filter(|pr| {
+            !pr.is_cross_repository
+                && pr.state == "MERGED"
+                && pr.base_ref_name == trunk
+                && pr.head_ref_oid != head
+        }) {
+            let held = wt_vcs::published_head_holds_everything(
+                &pr.head_ref_oid,
+                &head,
+                &trunk_tip,
+                |args| async {
+                    let output = run_git(ctx, &path, args).await.ok()?;
+                    (!output.stdout_truncated).then(|| wt_vcs::GitRead {
+                        code: output.status.code(),
+                        stdout: output.stdout_text(),
+                    })
+                },
+            )
+            .await;
+            if matches!(held, wt_vcs::BeyondBase::Nothing(_)) {
+                landed_head.clone_from(&pr.head_ref_oid);
+                break;
+            }
+        }
+    }
+    match landed(&prs, &landed_head, &trunk, contained) {
+        Landed::Yes(proof) if landed_head != head => {
+            println!("{old_branch} landed ({proof}; this checkout holds only copies of it)");
+        }
         Landed::Yes(proof) => println!("{old_branch} landed ({proof})"),
         Landed::Open(number) => {
             eprintln!(
@@ -321,7 +353,7 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
     // A check still owed belongs to the work being left: mark it, so the
     // next pull request's check cannot replace it unseen.
     let mut left_notes = Vec::new();
-    let left = left_for(&prs, &head, &trunk);
+    let left = left_for(&prs, &landed_head, &trunk);
     let label = left.label();
     let write_slug = slug.clone();
     match ctx

@@ -328,7 +328,15 @@ pub async fn landing_facts(
             in_production,
             deploys,
             commits,
-        } = stage_reach(ctx, &row, github, asked, watched.is_some()).await;
+        } = stage_reach(
+            ctx,
+            &row,
+            github,
+            landing.copy_of_merged_head,
+            asked,
+            watched.is_some(),
+        )
+        .await;
         // The merge commit when the PR merged at HEAD, else HEAD itself.
         if watched.is_some()
             && let Some(commit) = commits.as_ref().and_then(|commits| commits.last())
@@ -368,19 +376,20 @@ async fn stage_reach(
     ctx: &AppContext,
     row: &WorktreeRecord,
     github: &GithubData,
+    copy_of_merged_head: bool,
     asked: impl Fn(wt_core::VerifyStage) -> bool,
     want_commits: bool,
 ) -> StageReach {
     let separate_production = ctx.config.branch.separate_production();
     let in_production = separate_production
         && asked(wt_core::VerifyStage::Production)
-        && reached_production(ctx, row, github).await;
+        && reached_production(ctx, row, github, copy_of_merged_head).await;
     let probed = wt_core::VerifyStage::ALL
         .into_iter()
         .filter(|stage| asked(*stage) && ctx.config.environments.get(*stage).is_some())
         .collect::<Vec<_>>();
     let commits = if want_commits || !probed.is_empty() {
-        landing_commits(ctx, row, github).await
+        landing_commits(ctx, row, github, copy_of_merged_head).await
     } else {
         None
     };
@@ -427,25 +436,26 @@ pub async fn row_landings(
 ) -> BTreeMap<String, wt_core::Landing> {
     let empty = GithubData::default();
     let github = github.unwrap_or(&empty);
-    let read: Vec<(&WorktreeRecord, bool)> = stream::iter(rows.iter().filter(|row| !row.is_main))
-        .map(|row| async move {
-            let stored = &state["slugs"][row.target.slug()];
-            let mut warning = None;
-            landing_evidence(ctx, row, stored, github, published_bases, &mut warning)
-                .await
-                .ok()
-                .map(|landing| (row, landing.landed()))
-        })
-        .buffer_unordered(ROW_READS)
-        .filter_map(std::future::ready)
-        .collect()
-        .await;
+    let read: Vec<(&WorktreeRecord, bool, bool)> =
+        stream::iter(rows.iter().filter(|row| !row.is_main))
+            .map(|row| async move {
+                let stored = &state["slugs"][row.target.slug()];
+                let mut warning = None;
+                landing_evidence(ctx, row, stored, github, published_bases, &mut warning)
+                    .await
+                    .ok()
+                    .map(|landing| (row, landing.landed(), landing.copy_of_merged_head))
+            })
+            .buffer_unordered(ROW_READS)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
     // GitHub not returning a pull request is no answer about it. One that
     // it returns open or closed is, and stands against the history.
     let silent: Vec<String> = read
         .iter()
-        .filter(|(row, landed)| !landed && !github.prs.contains_key(&row.target.branch))
-        .map(|(row, _)| row.target.slug().to_owned())
+        .filter(|(row, landed, _)| !landed && !github.prs.contains_key(&row.target.branch))
+        .map(|(row, _, _)| row.target.slug().to_owned())
         .collect();
     let history = if silent.is_empty() {
         BTreeMap::new()
@@ -457,7 +467,7 @@ pub async fn row_landings(
     };
     let history = &history;
     stream::iter(read)
-        .map(|(row, landed)| async move {
+        .map(|(row, landed, copy_of_merged_head)| async move {
             let slug = row.target.slug();
             let stored = &state["slugs"][slug];
             let landed = landed
@@ -467,7 +477,7 @@ pub async fn row_landings(
                 };
             let owed = landed.then(|| owed_check_stages(stored));
             let asked = |stage| owed.is_some_and(|owed| owed.stage(stage));
-            let reach = stage_reach(ctx, row, github, asked, false).await;
+            let reach = stage_reach(ctx, row, github, copy_of_merged_head, asked, false).await;
             (
                 slug.to_owned(),
                 wt_core::Landing::new(
@@ -516,11 +526,16 @@ async fn history_landed(
     head.is_some_and(|head| wt_core::history_landed_at(events, &head))
 }
 
-/// The board's "in production" proof: HEAD, or the exact merge commit of the
-/// PR merged at HEAD, is contained in the production branch. The production
+/// The board's "in production" proof: HEAD, or the merge commit of the PR
+/// its work merged through, is contained in the production branch. The production
 /// branch is in `keep_fresh`, so its local head is current; its remote-tracking
 /// ref is the fallback. Any failure is unknown, which reads as not yet.
-async fn reached_production(ctx: &AppContext, row: &WorktreeRecord, github: &GithubData) -> bool {
+async fn reached_production(
+    ctx: &AppContext,
+    row: &WorktreeRecord,
+    github: &GithubData,
+    copy_of_merged_head: bool,
+) -> bool {
     let Some(production) = ctx.config.branch.production.as_deref() else {
         return false;
     };
@@ -543,7 +558,7 @@ async fn reached_production(ctx: &AppContext, row: &WorktreeRecord, github: &Git
         );
         return false;
     };
-    let Some(commits) = landing_commits(ctx, row, github).await else {
+    let Some(commits) = landing_commits(ctx, row, github, copy_of_merged_head).await else {
         return false;
     };
     for commit in commits {
@@ -561,12 +576,14 @@ async fn reached_production(ctx: &AppContext, row: &WorktreeRecord, github: &Git
     false
 }
 
-/// The commits that prove where the row's work landed: HEAD, and the exact
-/// merge commit of the PR merged at HEAD. `None` when HEAD cannot be read.
+/// The commits that prove where the row's work landed: HEAD, and the merge
+/// commit of the PR merged at HEAD or at a head HEAD is a copy of
+/// (`copy_of_merged_head`). `None` when HEAD cannot be read.
 async fn landing_commits(
     ctx: &AppContext,
     row: &WorktreeRecord,
     github: &GithubData,
+    copy_of_merged_head: bool,
 ) -> Option<Vec<String>> {
     let path = Path::new(&row.target.path);
     let head = run_git(ctx, path, ["rev-parse", "--verify", "HEAD"])
@@ -577,9 +594,10 @@ async fn landing_commits(
         .trim()
         .to_owned();
     let merge = github.prs.get(&row.target.branch).and_then(|pr| {
-        wt_core::exact_merged_pr_oid(
+        wt_core::merged_pr_oid(
             pr.head_ref_oid.as_deref(),
             &head,
+            copy_of_merged_head,
             &pr.state,
             pr.merge_commit_oid.as_deref(),
         )
@@ -655,11 +673,15 @@ struct Landing {
     /// rebased since: every commit it has beyond the advertised base is one
     /// whose patch that base already holds.
     patch_merged: bool,
+    /// The pull request merged from an earlier head and HEAD holds nothing
+    /// beyond that head and the base: it was rebased, or had the base merged
+    /// in, after the push. Its work went where the merge commit went.
+    copy_of_merged_head: bool,
 }
 
 impl Landing {
     fn landed(&self) -> bool {
-        self.pr_landed || self.local_merged || self.patch_merged
+        self.pr_landed || self.local_merged || self.patch_merged || self.copy_of_merged_head
     }
 
     /// Whether the proof names the base tip origin advertised, which the
@@ -726,16 +748,56 @@ async fn landing_evidence(
             warning,
         )
         .await?;
+    let copy_of_merged_head = match merged_pr.and_then(|pr| pr.head_ref_oid.as_deref()) {
+        Some(merged_head) if own_work && !pr_landed && !local_merged => {
+            copy_of_published_head(ctx, path, merged_head, &head, base_branch(ctx, stored)).await
+        }
+        _ => false,
+    };
     let patch_merged = own_work
         && !pr_landed
         && !local_merged
+        && !copy_of_merged_head
         && merged_pr.is_some()
         && published_base_holds_patches(ctx, path, &head, published_bases, warning).await?;
     Ok(Landing {
         pr_landed,
         local_merged,
         patch_merged,
+        copy_of_merged_head,
     })
+}
+
+/// The base the row forked from, as recorded, else the configured one.
+fn base_branch<'a>(ctx: &'a AppContext, stored: &'a serde_json::Value) -> &'a str {
+    stored["baseBranch"]
+        .as_str()
+        .filter(|base| !base.is_empty())
+        .unwrap_or(&ctx.config.branch.base)
+}
+
+/// Whether `head` holds nothing beyond the head a pull request merged from
+/// and the base as origin was last fetched (see
+/// [`wt_vcs::published_head_holds_everything`]). It asks origin nothing: the
+/// merge is GitHub's word, and the base only discounts commits the branch
+/// picked up from it, which origin had when they were fetched.
+async fn copy_of_published_head(
+    ctx: &AppContext,
+    path: &Path,
+    merged_head: &str,
+    head: &str,
+    base: &str,
+) -> bool {
+    let base = format!("refs/remotes/origin/{base}");
+    let held = wt_vcs::published_head_holds_everything(merged_head, head, &base, |args| async {
+        let output = run_git(ctx, path, args).await.ok()?;
+        (!output.stdout_truncated).then(|| wt_vcs::GitRead {
+            code: output.status.code(),
+            stdout: output.stdout_text(),
+        })
+    })
+    .await;
+    matches!(held, wt_vcs::BeyondBase::Nothing(_))
 }
 
 /// `github` is either this process's fresh fetch or confirmed leaf data; the
@@ -1322,7 +1384,9 @@ mod tests {
             .await
             .unwrap();
         let row = row_one(ctx).await;
-        let github = merged_pr(&row.target.branch, &pushed);
+        // GitHub names a merged head this store does not have (pushed from
+        // another clone), so only what the base holds can prove the landing.
+        let github = merged_pr(&row.target.branch, &"e".repeat(40));
         let plan = || async {
             plan_with_evidence(ctx, vec![row_one(ctx).await], &state, &github, None)
                 .await
@@ -1373,6 +1437,78 @@ mod tests {
         let reverted = plan().await;
         assert!(!reverted.landed);
         assert!(!reverted.hazards.is_empty());
+        fixture.close().await.unwrap();
+    }
+
+    /// The same rebase, with the merged head at hand: HEAD is a copy of it,
+    /// which stays true after the base changes the same file and after it
+    /// reverts the work, as it does for a checkout still at the merged head.
+    /// Before, merging HEAD into the base had to change nothing, so a later
+    /// edit on the base left the row unlanded with "unpushed commits".
+    #[tokio::test]
+    async fn a_copy_of_the_merged_head_is_landed_whatever_the_base_did_next() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let path = &ctx.cwd;
+        let (_origin, base) = with_origin(&fixture).await;
+        let anchor = base.clone();
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (pushed, moved) = merged_with_a_merge_commit(&fixture, &base).await;
+        git(ctx, path, &["rebase", "-q", &moved]).await;
+        let branch = row_one(ctx).await.target.branch;
+        // The base edits the file the work added.
+        git(ctx, path, &["checkout", "-q", "--detach", "origin/main"]).await;
+        std::fs::write(path.join("work.txt"), "edited on the base\n").unwrap();
+        git(ctx, path, &["commit", "-am", "base edits the work"]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        git(ctx, path, &["fetch", "-q", "origin"]).await;
+        git(ctx, path, &["checkout", "-q", &branch]).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let github = merged_pr(&branch, &pushed);
+        let plan = || async {
+            plan_with_evidence(ctx, vec![row_one(ctx).await], &state, &github, None)
+                .await
+                .unwrap()
+                .rows
+                .remove(0)
+        };
+
+        let landed = plan().await;
+        assert!(landed.landed);
+        assert!(landed.hazards.is_empty(), "{:?}", landed.hazards);
+        // The proof is the merge and the pushed branch, not a base tip.
+        assert!(landed.revision.published_base.is_none());
+
+        // A follow-up nobody pushed is not a copy of anything.
+        std::fs::write(path.join("later.txt"), "later\n").unwrap();
+        git(ctx, path, &["add", "later.txt"]).await;
+        git(ctx, path, &["commit", "-m", "local only"]).await;
+        let advanced = plan().await;
+        assert!(!advanced.landed);
+        assert!(
+            advanced
+                .hazards
+                .iter()
+                .any(|hazard| hazard.contains("unpushed"))
+        );
+        git(ctx, path, &["reset", "-q", "--hard", "HEAD~1"]).await;
+
+        git(ctx, path, &["checkout", "-q", "--detach", "origin/main"]).await;
+        git(ctx, path, &["revert", "--no-edit", "HEAD"]).await;
+        git(ctx, path, &["push", "origin", "HEAD:refs/heads/main"]).await;
+        git(ctx, path, &["fetch", "-q", "origin"]).await;
+        git(ctx, path, &["checkout", "-q", &branch]).await;
+        assert!(plan().await.landed);
         fixture.close().await.unwrap();
     }
 

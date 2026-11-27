@@ -965,9 +965,48 @@ async fn enrich(
             let merged_into_base = pr.is_some_and(|pr| {
                 pr.state.eq_ignore_ascii_case("MERGED") && pr.base_ref_name == configured_base
             });
+            // The same pull request, with HEAD compared against the head it
+            // merged from: whatever HEAD has beyond that head and the base
+            // is a copy of the merged work. This also names the merge commit
+            // as where the work went, which the production and deploy
+            // proofs below follow.
+            let merged_head = pr
+                .filter(|_| merged_into_base && !pr_landed_on_base && !local_landed_on_base)
+                .and_then(|pr| pr.head_ref_oid.as_deref());
+            let copy_of_merged_head = match (merged_head, base_ref.as_deref()) {
+                (Some(merged_head), Some(base_ref)) => {
+                    let held = wt_vcs::published_head_holds_everything(
+                        merged_head,
+                        head,
+                        base_ref,
+                        |args| async {
+                            let output = run_git(context, &path, args, cancellation).await?;
+                            (!output.stdout_truncated).then(|| wt_vcs::GitRead {
+                                code: output.status.code(),
+                                stdout: output.stdout_text(),
+                            })
+                        },
+                    )
+                    .await;
+                    matches!(held, wt_vcs::BeyondBase::Nothing(_))
+                }
+                _ => false,
+            };
+            let merge_oid = pr.and_then(|pr| {
+                wt_core::merged_pr_oid(
+                    pr.head_ref_oid.as_deref(),
+                    head,
+                    copy_of_merged_head,
+                    &pr.state,
+                    pr.merge_commit_oid.as_deref(),
+                )
+            });
             let patch_landed_on_base = match base_ref.as_deref() {
                 Some(base_ref)
-                    if merged_into_base && !pr_landed_on_base && !local_landed_on_base =>
+                    if merged_into_base
+                        && !pr_landed_on_base
+                        && !local_landed_on_base
+                        && !copy_of_merged_head =>
                 {
                     let held = wt_vcs::base_holds_everything(base_ref, head, None, |args| async {
                         let output = run_git(context, &path, args, cancellation).await?;
@@ -982,7 +1021,8 @@ async fn enrich(
                 _ => false,
             };
             let ancestry_landed_on_base = local_landed_on_base;
-            let local_landed_on_base = local_landed_on_base || patch_landed_on_base;
+            let local_landed_on_base =
+                local_landed_on_base || patch_landed_on_base || copy_of_merged_head;
             if pr_landed_on_base || local_landed_on_base {
                 result.landed_on = Some(LandingKind::Base);
                 // GitHub's merge time where it gave one. Otherwise the base
@@ -1021,14 +1061,6 @@ async fn enrich(
                             failures.push("production ancestry");
                         }
                         head_on_production = landed;
-                        let merge_oid = pr.and_then(|pr| {
-                            wt_core::exact_merged_pr_oid(
-                                pr.head_ref_oid.as_deref(),
-                                head,
-                                &pr.state,
-                                pr.merge_commit_oid.as_deref(),
-                            )
-                        });
                         if let Some(merge_oid) = merge_oid {
                             let (landed, failed) = is_ancestor(
                                 context,
@@ -1050,14 +1082,6 @@ async fn enrich(
                 }
             }
             if result.landed_on.is_some() && !context.config.environments.is_empty() {
-                let merge_oid = pr.and_then(|pr| {
-                    wt_core::exact_merged_pr_oid(
-                        pr.head_ref_oid.as_deref(),
-                        head,
-                        &pr.state,
-                        pr.merge_commit_oid.as_deref(),
-                    )
-                });
                 let commits = std::iter::once(head).chain(merge_oid).collect::<Vec<_>>();
                 let separate_production = context.config.branch.separate_production();
                 for (stage, _) in context.config.environments.probed() {

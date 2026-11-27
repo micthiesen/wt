@@ -3942,22 +3942,45 @@ impl LifecycleService {
         let count = self
             .count_commits_since(path, &origin_branch, cancellation)
             .await?;
-        let (Some(beyond), Some(tip)) = (count.filter(|count| *count > 0), base_tip) else {
+        let Some(beyond) = count.filter(|count| *count > 0) else {
             return Ok(count);
         };
-        // A branch rebased after its pull request merged holds local commits
-        // whose changes the base already has. They count for nothing only
-        // when the advertised base provably holds all of it; a failed read
-        // proves nothing and keeps the plain count.
-        let held = wt_vcs::base_holds_everything(tip, "HEAD", Some(&origin_branch), |args| async {
+        let read = |args: Vec<String>| async move {
             let spec = git_spec(path, args.into_iter().map(OsString::from).collect());
             let output = self.runner.run(spec, cancellation).await.ok()?;
             (!output.stdout_truncated).then(|| wt_vcs::GitRead {
                 code: output.status.code(),
                 stdout: output.stdout_text(),
             })
-        })
-        .await;
+        };
+        // A branch that moved after its last push (rebased onto a newer
+        // base, or with the base merged in) holds commits origin never saw
+        // under these names. They are nothing to lose when each is a copy of
+        // a commit the pushed branch has, or came from the base as origin
+        // had it. This needs no claim from the caller: both sides are refs
+        // origin gave.
+        let configured = self.config.base_branch.as_str();
+        let origin_base = format!(
+            "refs/remotes/origin/{}",
+            configured.strip_prefix("origin/").unwrap_or(configured)
+        );
+        if self.ref_exists(path, &origin_base, cancellation).await?
+            && matches!(
+                wt_vcs::published_head_holds_everything(&origin_branch, "HEAD", &origin_base, read)
+                    .await,
+                wt_vcs::BeyondBase::Nothing(_)
+            )
+        {
+            return Ok(Some(0));
+        }
+        let Some(tip) = base_tip else {
+            return Ok(Some(beyond));
+        };
+        // A branch rebased after its pull request merged holds local commits
+        // whose changes the base already has. They count for nothing only
+        // when the advertised base provably holds all of it; a failed read
+        // proves nothing and keeps the plain count.
+        let held = wt_vcs::base_holds_everything(tip, "HEAD", Some(&origin_branch), read).await;
         Ok(Some(match held {
             wt_vcs::BeyondBase::Nothing(_) => 0,
             wt_vcs::BeyondBase::Commits(unmatched) => unmatched,

@@ -16,6 +16,7 @@ pub use mainline::{
     BeyondBase, BroughtIn, GitRead, MAINLINE_WALK, base_holds_everything, branch_reflog_args,
     brought_in, brought_in_args, cherry_all_in_base, cherry_args, cherry_unmatched,
     committed_on_branch, contained_head_landed, mainline_args, on_first_parent_line,
+    published_head_holds_everything,
 };
 pub use origin::{FetchOriginOptions, FetchOriginReport};
 pub use repository::{

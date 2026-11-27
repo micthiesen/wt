@@ -95,6 +95,24 @@ pub fn exact_merged_pr_oid<'a>(
         .flatten()
 }
 
+/// [`exact_merged_pr_oid`], also for a `current_head` proven to hold nothing
+/// beyond the head the PR merged from (`copy_of_merged_head`: it was rebased
+/// or had the base merged in after the push, see
+/// `wt_vcs::published_head_holds_everything`). Its work went where that
+/// merge commit went.
+pub fn merged_pr_oid<'a>(
+    pr_head: Option<&'a str>,
+    current_head: &str,
+    copy_of_merged_head: bool,
+    pr_state: &str,
+    merge_oid: Option<&'a str>,
+) -> Option<&'a str> {
+    ((pr_head == Some(current_head) || (copy_of_merged_head && pr_head.is_some()))
+        && pr_state.eq_ignore_ascii_case("MERGED"))
+    .then_some(merge_oid)
+    .flatten()
+}
+
 /// An unknown stage (from a newer writer) reads as absent rather than
 /// failing the whole record.
 fn lenient_stage<'de, D: serde::Deserializer<'de>>(

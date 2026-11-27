@@ -238,6 +238,114 @@ where
     }
 }
 
+/// The most merge commits [`published_head_holds_everything`] re-creates.
+const REPRODUCED_MERGES: usize = 8;
+
+/// Whether `head` holds nothing that `published` and `base` lack, where
+/// `published` is a commit known to exist elsewhere (the head a pull request
+/// merged from, or the branch's own origin ref).
+///
+/// This is the proof for a branch that moved after it was published: rebased
+/// onto a newer base, or with the base merged in, and never pushed again. It
+/// compares with the published head itself, so it holds for a squash merge
+/// and when the base has since changed the same files, where
+/// [`base_holds_everything`] cannot answer.
+///
+/// Every commit `head` has beyond `base` and `published` must be either a
+/// copy, by patch, of a commit `published` has, or a merge Git reproduces
+/// exactly from its two parents, which therefore carries no resolution of
+/// its own. With no such commit at all, `head` must be off the base: it is
+/// then history of `published`. A `head` the base contains is left to the
+/// containment proof, which knows a base snapshot from landed work.
+///
+/// `run` runs one Git command in the checkout and gives `None` when it
+/// could not run or its output was cut.
+pub async fn published_head_holds_everything<F, Fut>(
+    published: &str,
+    head: &str,
+    base: &str,
+    run: F,
+) -> BeyondBase
+where
+    F: Fn(Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = Option<GitRead>>,
+{
+    let ok = |read: Option<GitRead>| {
+        read.filter(|read| read.code == Some(0))
+            .map(|read| read.stdout)
+    };
+    let args = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    // An object this store does not have (pushed from another clone and
+    // never fetched) proves nothing.
+    let commit = format!("{published}^{{commit}}");
+    if ok(run(args(&["cat-file", "-e", "--end-of-options", &commit])).await).is_none() {
+        return BeyondBase::Unknown;
+    }
+    let Some(cherry) = ok(run(args(&["cherry", published, head, base])).await) else {
+        return BeyondBase::Unknown;
+    };
+    let unmatched = cherry_unmatched(&cherry);
+    if unmatched > 0 {
+        return BeyondBase::Commits(unmatched);
+    }
+    let copies = cherry.lines().count();
+    let limit = (REPRODUCED_MERGES + 1).to_string();
+    let Some(merges) = ok(run(args(&[
+        "rev-list",
+        "--merges",
+        "--parents",
+        "-n",
+        &limit,
+        head,
+        "--not",
+        base,
+        published,
+    ]))
+    .await) else {
+        return BeyondBase::Unknown;
+    };
+    let merges: Vec<&str> = merges.lines().filter(|line| !line.is_empty()).collect();
+    if merges.len() > REPRODUCED_MERGES {
+        return BeyondBase::Unknown;
+    }
+    for merge in &merges {
+        let fields: Vec<&str> = merge.split_whitespace().collect();
+        let [merge, ours, theirs] = fields[..] else {
+            return BeyondBase::Unknown;
+        };
+        let reproduced = ok(run(args(&["merge-tree", "--write-tree", ours, theirs])).await);
+        let tree = format!("{merge}^{{tree}}");
+        let recorded = ok(run(args(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &tree,
+        ]))
+        .await);
+        let reproduced = reproduced
+            .as_deref()
+            .and_then(|tree| tree.lines().next())
+            .map(str::trim)
+            .filter(|tree| !tree.is_empty());
+        match (reproduced, recorded.as_deref().map(str::trim)) {
+            (Some(reproduced), Some(recorded)) if reproduced == recorded => {}
+            _ => return BeyondBase::Unknown,
+        }
+    }
+    if copies == 0 && merges.is_empty() {
+        // Nothing beyond the two: `head` is history of one of them.
+        match run(args(&["merge-base", "--is-ancestor", head, base]))
+            .await
+            .and_then(|read| read.code)
+        {
+            Some(1) => {}
+            _ => return BeyondBase::Unknown,
+        }
+    }
+    BeyondBase::Nothing(u32::try_from(copies).unwrap_or(u32::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +439,167 @@ mod tests {
         // A walk that hit the bound proves nothing.
         let long = "x y\n".repeat(MAINLINE_WALK);
         assert!(!on_first_parent_line(&long, "y"));
+    }
+    /// A scratch repository for the published-head proof: `main` with one
+    /// file, and a `work` branch one commit ahead that was "published" at
+    /// the returned head.
+    struct Repo(tempfile::TempDir);
+
+    impl Repo {
+        fn new() -> (Self, String) {
+            let repo = Self(tempfile::tempdir().unwrap());
+            repo.git(&["init", "-q", "-b", "main"]);
+            repo.write("shared.txt", "one\ntwo\nthree\n");
+            repo.commit("base");
+            repo.git(&["checkout", "-q", "-b", "work"]);
+            repo.write("work.txt", "work\n");
+            repo.commit("work");
+            let published = repo.head();
+            (repo, published)
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(self.0.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
+        fn write(&self, name: &str, text: &str) {
+            std::fs::write(self.0.path().join(name), text).unwrap();
+        }
+
+        fn commit(&self, message: &str) {
+            self.git(&["add", "-A"]);
+            self.git(&["commit", "-q", "-m", message]);
+        }
+
+        fn head(&self) -> String {
+            self.git(&["rev-parse", "HEAD"])
+        }
+
+        /// A commit on `main` changing `name`, leaving `work` checked out.
+        fn advance_main(&self, name: &str, text: &str) {
+            self.git(&["checkout", "-q", "main"]);
+            self.write(name, text);
+            self.commit("main moves");
+            self.git(&["checkout", "-q", "work"]);
+        }
+
+        async fn run(&self, args: Vec<String>) -> Option<GitRead> {
+            let output = std::process::Command::new("git")
+                .current_dir(self.0.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(&args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .ok()?;
+            Some(GitRead {
+                code: output.status.code(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            })
+        }
+
+        async fn published(&self, published: &str) -> BeyondBase {
+            published_head_holds_everything(published, "HEAD", "main", |args| self.run(args)).await
+        }
+    }
+
+    /// The pull request merged from the pushed head while the checkout had
+    /// been rebased onto a newer base and not pushed, and the base later
+    /// changed the same file: the row stayed "not landed" with unpushed
+    /// commits, because merging it into the base no longer changed nothing.
+    #[tokio::test]
+    async fn a_copy_of_the_published_head_is_held_even_after_the_base_moved_on() {
+        let (repo, published) = Repo::new();
+        repo.advance_main("other.txt", "other\n");
+        repo.git(&["rebase", "-q", "main"]);
+        assert_ne!(repo.head(), published);
+        // The merge, then a later change to the file the work added.
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["merge", "-q", "--no-ff", "-m", "merge work", &published]);
+        repo.write("work.txt", "work, edited on main\n");
+        repo.commit("main edits the work");
+        repo.git(&["checkout", "-q", "work"]);
+
+        assert_eq!(repo.published(&published).await, BeyondBase::Nothing(1));
+        let by_base = base_holds_everything("main", "HEAD", None, |args| repo.run(args)).await;
+        assert_eq!(by_base, BeyondBase::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_squash_merged_branch_rebased_afterwards_is_held() {
+        let (repo, published) = Repo::new();
+        repo.write("more.txt", "more\n");
+        repo.commit("more work");
+        let published_two = repo.head();
+        repo.git(&["checkout", "-q", "main"]);
+        repo.git(&["merge", "-q", "--squash", &published_two]);
+        repo.commit("squash of work");
+        repo.write("other.txt", "other\n");
+        repo.commit("main moves");
+        repo.git(&["checkout", "-q", "work"]);
+        // Replayed onto the commit before the squash, as a rebase that ran
+        // while the pull request sat in the merge queue would.
+        repo.git(&["rebase", "-q", "--onto", "main~2", &published, "work"]);
+        assert_eq!(repo.published(&published_two).await, BeyondBase::Nothing(1));
+        // The first commit is history of the published head too.
+        repo.git(&["reset", "-q", "--hard", &published]);
+        assert_eq!(repo.published(&published_two).await, BeyondBase::Nothing(0));
+    }
+
+    #[tokio::test]
+    async fn work_the_published_head_never_had_counts() {
+        let (repo, published) = Repo::new();
+        repo.advance_main("other.txt", "other\n");
+        repo.git(&["rebase", "-q", "main"]);
+        repo.write("later.txt", "later\n");
+        repo.commit("a follow-up nobody pushed");
+        assert_eq!(repo.published(&published).await, BeyondBase::Commits(1));
+        // A revert of the published work is work of its own.
+        repo.git(&["reset", "-q", "--hard", &published]);
+        repo.git(&["revert", "--no-edit", "HEAD"]);
+        assert_eq!(repo.published(&published).await, BeyondBase::Commits(1));
+    }
+
+    #[tokio::test]
+    async fn a_merge_of_the_base_counts_only_when_it_holds_a_resolution() {
+        let (repo, published) = Repo::new();
+        repo.advance_main("other.txt", "other\n");
+        repo.git(&["merge", "-q", "--no-ff", "-m", "merge main", "main"]);
+        assert_eq!(repo.published(&published).await, BeyondBase::Nothing(0));
+        // The same merge with a change Git would not have made.
+        repo.write("other.txt", "other, resolved by hand\n");
+        repo.git(&["add", "-A"]);
+        repo.git(&["commit", "-q", "--amend", "--no-edit"]);
+        assert_eq!(repo.published(&published).await, BeyondBase::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_head_the_base_contains_and_an_unknown_object_prove_nothing() {
+        let (repo, published) = Repo::new();
+        // A snapshot of the base is the containment proof's to judge.
+        repo.git(&["reset", "-q", "--hard", "main"]);
+        assert_eq!(repo.published(&published).await, BeyondBase::Unknown);
+        repo.git(&["reset", "-q", "--hard", &published]);
+        let absent = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(repo.published(absent).await, BeyondBase::Unknown);
     }
 }
