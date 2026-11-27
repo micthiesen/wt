@@ -318,6 +318,28 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
     {
         eprintln!("warning: {branch} was not recorded as {slug}'s branch ({error:#})");
     }
+    // A check still owed belongs to the work being left: mark it, so the
+    // next pull request's check cannot replace it unseen.
+    let mut left_notes = Vec::new();
+    let left = left_for(&prs, &head, &trunk);
+    let label = left.label();
+    let write_slug = slug.clone();
+    match ctx
+        .database
+        .call(move |store| Ok(store.leave_checks(&write_slug, &left)?))
+        .await
+    {
+        Ok(marked) => left_notes.extend(marked.into_iter().map(|(stage, check)| {
+            let stage = stage.as_str();
+            format!(
+                "  still owed for {label}, the {stage} check: {}\n    --verify-in-{stage} with other steps keeps it as a step; the same steps take it up for the next PR",
+                wt_app_core::watch_view::headline(&check.steps)
+            )
+        })),
+        Err(error) => left_notes.push(format!(
+            "  warning: the checks still owed were not marked as {label}'s ({error:#}); a new --verify-in-<stage> would replace them"
+        )),
+    }
     let issue_title = lookup.finish().await;
     let (new_title, source) = initial_title(title, TitleSource::Agent, issue_title)
         .context("wt next always has a title")?;
@@ -382,6 +404,9 @@ pub async fn run(ctx: &AppContext, args: &NextArgs) -> Result<i32> {
     if let Some(note) = issue_note {
         println!("{note}");
     }
+    for note in left_notes {
+        println!("{note}");
+    }
     println!(
         "next: `wt status working -m <what this PR does>`, commit, then `git push -u origin HEAD` and open the PR"
     );
@@ -416,7 +441,30 @@ fn landed(prs: &[BranchPr], head: &str, trunk: &str, contained: bool) -> Landed 
     }
 }
 
+/// The landed work a branch is left for: the pull request merged into
+/// trunk at exactly this head, else the head itself, which trunk then
+/// contains (see [`landed`]). A pull request merged at another head is not
+/// taken for this work: its number could name something long deployed.
+fn left_for(prs: &[BranchPr], head: &str, trunk: &str) -> wt_core::LeftFor {
+    prs.iter()
+        .find(|pr| {
+            !pr.is_cross_repository
+                && pr.state == "MERGED"
+                && pr.base_ref_name == trunk
+                && pr.head_ref_oid == head
+        })
+        .map_or_else(
+            || wt_core::LeftFor::Commit(head.to_owned()),
+            |pr| wt_core::LeftFor::Pr(pr.number),
+        )
+}
+
+/// The branch's pull requests; none with GitHub switched off, where a
+/// landing rests on trunk containing the head.
 async fn branch_prs(ctx: &AppContext, path: &Path, branch: &str) -> Result<Vec<BranchPr>> {
+    if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
+        return Ok(Vec::new());
+    }
     let output = ctx
         .processes
         .run(
@@ -635,5 +683,30 @@ mod tests {
             landed(&fork_open, "h", staging, true),
             Landed::Yes(_)
         ));
+    }
+
+    #[test]
+    fn the_checks_still_owed_belong_to_the_pull_request_merged_at_this_head_or_to_the_head() {
+        use wt_core::LeftFor;
+        let staging = "staging";
+        // A branch that landed without a pull request is named by its head.
+        assert_eq!(left_for(&[], "h", staging), LeftFor::Commit("h".into()));
+        let prs = [
+            pr(5, "MERGED", "old", staging, false),
+            pr(8, "CLOSED", "h", staging, false),
+            pr(9, "MERGED", "h", "parent", false),
+            pr(12, "MERGED", "h", staging, true),
+            pr(7, "MERGED", "h", staging, false),
+        ];
+        assert_eq!(left_for(&prs, "h", staging), LeftFor::Pr(7));
+        // No pull request merged at this head: an older one is not this work.
+        assert_eq!(
+            left_for(&prs, "moved", staging),
+            LeftFor::Commit("moved".into())
+        );
+        assert_eq!(
+            left_for(&prs[..4], "h", staging),
+            LeftFor::Commit("h".into())
+        );
     }
 }

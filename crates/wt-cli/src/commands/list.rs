@@ -33,7 +33,7 @@ pub struct ListArgs {
 }
 
 pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
-    let snapshots = ctx.repository.inventory_status(&ctx.cancellation).await?;
+    let snapshots = wt_ops::worktree_facts::inventory_status(ctx).await?;
     let live = snapshots
         .iter()
         .filter(|snapshot| !snapshot.worktree.is_main)

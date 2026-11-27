@@ -1046,11 +1046,11 @@ fn live_log_closes_on_its_key_and_refresh_keeps_scroll() {
 fn edges_scroll_the_list_and_wheel_never_moves_the_cursor() {
     let mut model = model_with(&["a", "b"]);
     ch(&mut model, 'j');
-    assert_eq!(ch(&mut model, 'j'), InputResult::Draw);
-    assert!(model.list_free_scroll);
+    // The cursor stops at an edge and the viewport keeps following it.
+    assert_eq!(ch(&mut model, 'j'), InputResult::Unchanged);
+    assert!(!model.list_free_scroll);
     assert_eq!(model.selected_row().unwrap().key, "b");
     ch(&mut model, 'k');
-    assert!(!model.list_free_scroll);
 
     model.offset = 0;
     let area = ratatui::layout::Rect::new(0, 0, 100, 30);

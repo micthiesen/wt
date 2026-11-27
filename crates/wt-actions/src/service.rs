@@ -909,6 +909,22 @@ impl ActionService {
         Ok(runs)
     }
 
+    /// The metadata of every run an automation launched at or after
+    /// `since_ms`, newest first, however many other runs there are since:
+    /// a bounded listing can leave a run out that is still awaited.
+    pub async fn automation_runs_since(
+        &self,
+        since_ms: u64,
+    ) -> Result<Vec<ActionMeta>, ActionServiceError> {
+        Ok(self
+            .run_metas()
+            .await?
+            .into_iter()
+            .map(|(meta, _)| meta)
+            .filter(|meta| !meta.auto_fire_keys.is_empty() && meta.started_at >= since_ms)
+            .collect())
+    }
+
     /// Every run's metadata, newest first. No job file is opened.
     async fn run_metas(&self) -> Result<Vec<(ActionMeta, PathBuf)>, ActionServiceError> {
         let root = self.config.log_dir.join("actions");

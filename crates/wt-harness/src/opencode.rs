@@ -313,8 +313,12 @@ impl OpenCodeHarness {
             service.url,
         ]
         .into_iter()
-        .chain(command.args)
-        .collect();
+        .chain(command.args);
+        // This reaches the terminal client only. OpenCode runs the model's
+        // shells in its per-home service, which keeps the environment it was
+        // started with, so `gh` there is not behind the shim.
+        let launch =
+            crate::shims::session_command(&self.paths.cache_dir, &self.tmux, &request.slug, launch);
 
         let result = self
             .tmux

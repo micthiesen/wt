@@ -5,6 +5,23 @@ use std::sync::Arc;
 
 use super::{ARCHIVED_SECTION, Board, BoardRow, BoardSection, INBOX_SECTION, InputResult, Model};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ItemId {
+    Row(String),
+    Section(String),
+    ReviewHeader,
+    Review(String),
+}
+
+/// Where one thing sat on screen in the last drawn frame, so a refreshed
+/// board can be drawn with it on the same line. `item` is `None` while the
+/// viewport follows the cursor: the cursor's line is what holds still.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ListAnchor {
+    pub item: Option<ItemId>,
+    pub screen_row: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum VisualItem {
     Section(usize),
@@ -83,6 +100,10 @@ impl Model {
             && owed_block.is_none()
             && previous_section.as_deref().is_some_and(|old| {
                 old != ARCHIVED_SECTION
+                    // A named section that is gone was renamed or deleted:
+                    // the row did not leave it, so the cursor stays on the row.
+                    && (old.starts_with('\0')
+                        || self.board.sections.iter().any(|section| section.key == old))
                     && !self.board.sections.iter().any(|section| {
                         section.key == old
                             && section.rows.iter().any(|&index| {
@@ -154,6 +175,8 @@ impl Model {
         {
             self.selected = Some(index);
             self.pending_selection = None;
+            // A selection the user asked for is one they must see.
+            self.list_free_scroll = false;
         }
         if first_rows
             && !requested_selection
@@ -345,22 +368,18 @@ impl Model {
         self.section_first_position(key)
     }
 
-    pub fn keep_selection_visible(&mut self, height: usize) {
-        let Some(selected) = self.selected else {
-            self.offset = 0;
-            return;
-        };
-        if height == 0 {
-            self.offset = selected;
-            return;
-        }
-        let margin = 3.min(height.saturating_sub(1) / 2);
-        if selected < self.offset.saturating_add(margin) {
-            self.offset = selected.saturating_sub(margin);
-        } else if selected >= self.offset.saturating_add(height.saturating_sub(margin)) {
-            self.offset = selected.saturating_add(margin + 1).saturating_sub(height);
-        }
-        self.offset = self.offset.min(self.item_count().saturating_sub(height));
+    /// What a cursor stop is, in terms that survive a new board.
+    pub(crate) fn item_id(&self, position: usize) -> Option<ItemId> {
+        Some(match self.item(position)? {
+            VisualItem::Row(index) => ItemId::Row(self.board.rows.get(index)?.key.clone()),
+            VisualItem::Section(index) => {
+                ItemId::Section(self.board.sections.get(index)?.key.clone())
+            }
+            VisualItem::ReviewHeader => ItemId::ReviewHeader,
+            VisualItem::ReviewRequest(index) => {
+                ItemId::Review(self.board.review_requests.get(index)?.url.clone())
+            }
+        })
     }
 
     pub(super) fn select(&mut self, index: usize) -> InputResult {
@@ -376,11 +395,12 @@ impl Model {
         }
         self.selected = selected;
         self.details_scroll = 0;
+        self.list_reveal = false;
         InputResult::Draw
     }
 
-    /// Move the cursor one stop; at an edge, scroll the list to that edge
-    /// instead (TS `normal-keys.ts:545-570`).
+    /// Move the cursor one stop and stop at the edges. Following the cursor
+    /// already shows the first and last lines there.
     pub(super) fn step(&mut self, forward: bool) -> InputResult {
         let Some(current) = self.selected else {
             return self.select(0);
@@ -392,33 +412,44 @@ impl Model {
             current == 0
         };
         if at_edge {
-            self.pending_selection = None;
-            self.list_free_scroll = true;
-            self.offset = if forward { usize::MAX } else { 0 };
-            return InputResult::Draw;
+            return self.select(current);
         }
         self.select(if forward { current + 1 } else { current - 1 })
     }
 
+    /// Jump between the list's blocks: each section and the requested
+    /// reviews. Backward stops at the first stop of the cursor's own block
+    /// before going to the block above.
     pub(super) fn jump_section(&mut self, forward: bool) -> InputResult {
-        let Some(current) = self.selected_section().and_then(|section| {
-            self.board
-                .sections
-                .iter()
-                .position(|candidate| candidate.key == section.key)
-        }) else {
+        let Some(current) = self.selected else {
             return InputResult::Unchanged;
         };
-        let mut candidates: Box<dyn Iterator<Item = usize>> = if forward {
-            Box::new(current + 1..self.board.sections.len())
+        let section_of_row: std::collections::HashMap<usize, usize> = self
+            .board
+            .sections
+            .iter()
+            .enumerate()
+            .flat_map(|(index, section)| section.rows.iter().map(move |&row| (row, index)))
+            .collect();
+        // `None` is the reviews block, or the whole of a board with no sections.
+        let block = |position: usize| match self.item(position) {
+            Some(VisualItem::Section(index)) => Some(index),
+            Some(VisualItem::Row(row)) => section_of_row.get(&row).copied(),
+            _ => None,
+        };
+        let starts = |position: &usize| *position == 0 || block(*position) != block(*position - 1);
+        let target = if forward {
+            (current + 1..self.item_count()).find(starts)
         } else {
-            Box::new((0..current).rev())
+            (0..=current)
+                .rev()
+                .find(starts)
+                .filter(|&start| start < current)
+                .or_else(|| (0..current).rev().find(starts))
         };
-        let Some(position) = candidates
-            .find_map(|index| self.section_first_position(&self.board.sections[index].key))
-        else {
-            return InputResult::Unchanged;
-        };
-        self.select(position)
+        match target {
+            Some(position) => self.select(position),
+            None => InputResult::Unchanged,
+        }
     }
 }

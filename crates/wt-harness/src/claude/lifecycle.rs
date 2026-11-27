@@ -20,8 +20,8 @@ use super::{
     inspector_socket_path,
     names::reap_claude_names,
     registry::read_registry,
-    shims::{ensure_inspect_shims_at, stale_harness_shims},
 };
+use crate::shims::{session_path, stale_harness_shims};
 
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 const START_POLL: Duration = Duration::from_millis(200);
@@ -610,10 +610,9 @@ impl ClaudeSessionManager {
             .spawn_path
             .clone()
             .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
-        // Shims are advisory (see `ensure_inspect_shims`): without them a child
+        // Shims are advisory (see `session_path`): without them a child
         // Bun program may contend for the Inspector socket, but Claude starts.
-        let _ = ensure_inspect_shims_at(&self.paths.cache_dir.join("shims"), &path);
-        let shim_path = prepend_path(&self.paths.cache_dir.join("shims"), &path);
+        let shim_path = session_path(&self.paths.cache_dir, &path, &self.tmux);
         let socket = inspector_socket_path(&self.paths.cache_dir, tmux_name);
         fs::create_dir_all(socket.parent().unwrap_or(Path::new(".")))?;
         #[cfg(unix)]
@@ -826,15 +825,6 @@ fn bash_env_file(cache_dir: &Path) -> std::io::Result<PathBuf> {
     Ok(file)
 }
 
-fn prepend_path(shims: &Path, path: &str) -> String {
-    // A trailing ':' would add an empty entry, which shells read as the
-    // current directory.
-    if path.is_empty() {
-        shims.to_string_lossy().into_owned()
-    } else {
-        format!("{}:{path}", shims.to_string_lossy())
-    }
-}
 /// RFC 3986 unreserved characters plus `/`. `~` must pass: named sessions
 /// (`manager~manager`) put it in their socket path, and a session launched
 /// without `BUN_INSPECT` can only be reached by typing into its pane.
@@ -898,16 +888,11 @@ mod tests {
     use super::super::TOKEN_HELPER_TIMEOUT;
 
     #[test]
-    fn claude_environment_url_safety_and_path_prepend_are_deterministic() {
+    fn claude_environment_url_safety_is_deterministic() {
         assert!(url_path_safe("/tmp/cache/insp/demo.sock"));
         assert!(!url_path_safe("/tmp/cache with spaces/insp/demo.sock"));
         let named = inspector_socket_path(Path::new("/tmp/cache"), "manager~manager");
         assert!(url_path_safe(named.to_str().unwrap()));
-        assert_eq!(
-            prepend_path(Path::new("/cache/shims"), "/usr/bin:/bin"),
-            "/cache/shims:/usr/bin:/bin"
-        );
-        assert_eq!(prepend_path(Path::new("/cache/shims"), ""), "/cache/shims");
     }
 
     #[test]

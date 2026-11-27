@@ -15,7 +15,7 @@ pub(crate) struct CreationPhase {
 
 impl CreationPhase {
     pub(crate) fn new(path: &Path, phase: &'static str) -> Self {
-        tracing::info!(target: "wt::creation", phase, path = %path.display(), "creation phase started");
+        tracing::info!(target: "wt::creation", phase, slug = slug_of(path), path = %path.display(), "creation phase started");
         Self {
             phase,
             path: path.to_owned(),
@@ -51,11 +51,18 @@ impl CreationPhase {
     }
 
     fn finish(&mut self, outcome: &'static str, exit_code: Option<i32>) {
-        tracing::info!(target: "wt::creation", phase = self.phase, path = %self.path.display(),
+        tracing::info!(target: "wt::creation", phase = self.phase, slug = slug_of(&self.path), path = %self.path.display(),
             elapsed_ms = self.start.elapsed().as_secs_f64() * 1000.0, outcome, exit_code,
             "creation phase finished");
         self.finished = true;
     }
+}
+
+/// A worktree's slug is its directory name.
+fn slug_of(path: &Path) -> &str {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
 }
 
 impl Drop for CreationPhase {
@@ -134,6 +141,7 @@ mod tests {
             assert_eq!(event["fields"]["phase"], event["fields"]["outcome"]);
             assert!(event["fields"]["elapsed_ms"].as_f64().unwrap() >= 0.0);
             assert_eq!(event["fields"]["path"], "/fixture");
+            assert_eq!(event["fields"]["slug"], "fixture");
         }
     }
 }

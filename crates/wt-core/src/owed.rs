@@ -586,6 +586,48 @@ impl OwedBlock {
                 .unwrap_or(Self::WaitingOther),
         }
     }
+
+    /// What a landed row in this block waits for next, in the few words the
+    /// board's Landed block and `wt clean` give it: `due staging`,
+    /// `staging`, `production`, a time (`22:32`, `Fri 18:12`),
+    /// `other work`, `done`. `due_stage` is the stage of the row's first
+    /// due item when that is a check, and `at` the time a scheduled row
+    /// comes due, already in words.
+    pub fn waits_for(self, due_stage: Option<VerifyStage>, at: Option<&str>) -> String {
+        match self {
+            Self::Due => match due_stage {
+                Some(VerifyStage::Staging) => "due staging",
+                Some(VerifyStage::Production) => "due production",
+                None => "due",
+            },
+            Self::WaitingStaging => "staging",
+            Self::WaitingProduction => "production",
+            Self::Scheduled => at.filter(|at| !at.is_empty()).unwrap_or("scheduled"),
+            Self::WaitingOther => "other work",
+            Self::Done => "done",
+        }
+        .to_owned()
+    }
+
+    /// [`Self::waits_for`] of a landed row in `phase`, from its own list.
+    pub fn row_waits_for(phase: OwedPhase, items: &[OwedItem], clock: LocalClock) -> String {
+        // The list is ordered most urgent first: due checks by stage, then
+        // due steps.
+        let due_stage = items
+            .iter()
+            .find(|item| item.state == OwedState::Due)
+            .and_then(|item| {
+                (item.kind == OwedKind::Check)
+                    .then_some(item.stage)
+                    .flatten()
+            });
+        let at = items
+            .iter()
+            .filter_map(|item| item.next_at_ms)
+            .min()
+            .map(|at_ms| watch::terse_instant(at_ms, clock));
+        Self::of_row(phase, items).waits_for(due_stage, at.as_deref())
+    }
 }
 
 /// Where a row stands with what it owes. `None` while its own work has not

@@ -212,6 +212,10 @@ impl StackService {
             Ok(landed) => landed,
             Err(error) => return Ok(RestackOutcome::Refused { error }),
         };
+        let mut landed = landed;
+        let queued = self
+            .settled_members(&chain, &mut landed, cancellation, on_event)
+            .await?;
         let mut candidates = chain
             .steps
             .iter()
@@ -249,9 +253,12 @@ impl StackService {
             // A landed member can still sit in a surviving ancestor's layout
             // (it merged into a non-trunk parent). Replaying it would re-apply
             // its merged commits and force-push, resurrecting the branch.
+            // A queued member cannot be pushed at all: GitHub rejects any
+            // update of a branch in the merge queue, after the local branch
+            // was already rewritten.
             candidate_chain
                 .steps
-                .retain(|step| !landed.contains(&step.branch));
+                .retain(|step| !landed.contains(&step.branch) && !queued.contains(&step.branch));
             let result = replay_chain(
                 &ReplayContext {
                     service: self,
@@ -492,6 +499,59 @@ impl StackService {
             )));
         }
         Ok(Ok(landed))
+    }
+
+    /// Members whose pull request has settled their branch: one that merged
+    /// (added to `landed`, as [`Self::reconcile_locked`] does for parents)
+    /// and, returned, those in the merge queue. Neither is replayed; what is
+    /// stacked on a queued member replays onto its tip as it stands.
+    async fn settled_members(
+        &self,
+        chain: &RestackChain,
+        landed: &mut BTreeSet<String>,
+        cancellation: &CancellationToken,
+        on_event: &mut (dyn FnMut(StackEvent) + Send),
+    ) -> Result<BTreeSet<String>, StackError> {
+        let mut open = BTreeMap::new();
+        for step in &chain.steps {
+            if landed.contains(&step.branch) {
+                continue;
+            }
+            let Some(pr) = self.github.view_pr(&step.branch, cancellation).await? else {
+                continue;
+            };
+            if pr.state == "OPEN" {
+                if !pr.id.is_empty() {
+                    open.insert(pr.id, (step.branch.clone(), pr.number));
+                }
+            } else if pr.state == "MERGED"
+                && self
+                    .merged_head_covers_branch(
+                        std::path::Path::new(&step.worktree_path),
+                        &step.branch,
+                        &pr.head_ref_oid,
+                        cancellation,
+                    )
+                    .await?
+            {
+                on_event(StackEvent::Log(format!(
+                    "{} merged (#{}); not replayed",
+                    step.branch, pr.number
+                )));
+                landed.insert(step.branch.clone());
+            }
+        }
+        let ids = open.keys().cloned().collect::<Vec<_>>();
+        let mut queued = BTreeSet::new();
+        for id in self.github.queued_pull_requests(&ids, cancellation).await? {
+            if let Some((branch, number)) = open.remove(&id) {
+                on_event(StackEvent::Log(format!(
+                    "{branch} is in the merge queue (#{number}); left as it is"
+                )));
+                queued.insert(branch);
+            }
+        }
+        Ok(queued)
     }
 
     /// Whether a merged PR head contains the branch's current tip. A branch

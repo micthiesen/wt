@@ -72,6 +72,9 @@ impl OutputState {
             let next = self.last_top.saturating_add(3);
             (next < self.last_max).then_some(next)
         };
+        // Several scrolls can share one frame; each starts where the last
+        // one left the viewport, not where the last frame drew it.
+        self.last_top = self.top.unwrap_or(self.last_max);
     }
     fn viewport(&mut self, lines: usize, height: usize) -> usize {
         self.last_max = lines.saturating_sub(height);

@@ -753,6 +753,15 @@ pub struct ManagerConfig {
 pub struct UpdateConfig {
     pub startup_check: bool,
 }
+/// What the pass that removes leftover files may do unasked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaintenanceConfig {
+    /// Whether a running wt makes the pass once a day.
+    pub enabled: bool,
+    /// Whether that daily pass also drops slug records of long-removed
+    /// worktrees from the repository state.
+    pub state_records: bool,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackendConfig {
     pub kind: BackendKind,
@@ -815,6 +824,7 @@ pub struct Config {
     pub skills: SkillsConfig,
     pub manager: ManagerConfig,
     pub update: UpdateConfig,
+    pub maintenance: MaintenanceConfig,
     /// Problems that skip part of the configuration instead of rejecting it,
     /// such as an automation whose trigger this build does not know.
     pub warnings: Vec<String>,

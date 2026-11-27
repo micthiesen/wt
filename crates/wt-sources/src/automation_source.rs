@@ -127,13 +127,26 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     let task = scope.spawn(async move {
         let ledger = AutomationLedger::new(context.config.paths.cache_root.join("automations.json"));
         let mut engine = AutomationEngine::new(ledger, token.clone());
-        let delivered = match wt_app_core::actions::service(&context) {
-            Ok(service) => match service.list_runs_bounded(500).await {
-                Ok(runs) => runs.into_iter().flat_map(|run| run.meta.auto_fire_keys).collect::<BTreeSet<_>>(),
-                Err(error) => { tracing::warn!(%error, "cannot inspect prior action runs during automation startup"); BTreeSet::new() }
-            },
-            Err(error) => { tracing::warn!(%error, "cannot open action service during automation startup"); BTreeSet::new() }
+        let restored_runs = match wt_app_core::actions::service(&context) {
+            Ok(service) => restore_runs(&mut engine, now_ms(), |since_ms| async move {
+                Ok(service.automation_runs_since(since_ms).await?)
+            })
+            .await
+            .unwrap_or_else(|error| {
+                // Without the records nothing is known, so nothing is ended.
+                tracing::warn!(%error, "cannot read back automation runs launched before this start");
+                None
+            }),
+            Err(_) => None,
         };
+        let prior_runs = match wt_app_core::actions::service(&context) {
+            Ok(service) => match service.list_runs_bounded(500).await {
+                Ok(runs) => Some(runs),
+                Err(error) => { tracing::warn!(%error, "cannot inspect prior action runs during automation startup"); None }
+            },
+            Err(error) => { tracing::warn!(%error, "cannot open action service during automation startup"); None }
+        };
+        let delivered = prior_runs.iter().flatten().flat_map(|run| run.meta.auto_fire_keys.iter().cloned()).collect::<BTreeSet<_>>();
         if let Err(error) = engine.reconcile_boot(&delivered, now_ms()).await {
             tracing::warn!(%error, "cannot reconcile automation ledger at startup");
         }
@@ -141,6 +154,12 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             Ok(0) => {}
             Ok(restored) => tracing::info!(restored, "requeued deferred automation fires"),
             Err(error) => tracing::warn!(%error, "cannot restore deferred automation fires"),
+        }
+        if let Some(runs) = restored_runs {
+            tracing::info!(runs = runs.len(), "awaiting automation runs launched before this start");
+            if let Err(error) = settle(&context, &accepted_context, &mut engine, runs, true).await {
+                tracing::warn!(%error, "cannot settle automation runs launched before this start");
+            }
         }
 
         let mut git_rx = sources.git.subscribe();
@@ -485,6 +504,16 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                         Err(error) => latest_error = Some(format!("cannot record what a watch saw: {error:#}")),
                     }
                 }
+                // A build from before displaced checks closes such a check's
+                // wake on delivery; the kept record brings it back as owed.
+                if wt_store::kept_checks_lost(state) {
+                    match context.database.call(move |store| Ok(store.restore_kept_checks(now)?)).await {
+                        Ok(restored) => for step in restored {
+                            tracing::info!(step = %step.id, slug = %step.slug, "restored a check whose wake an older wt closed");
+                        },
+                        Err(error) => latest_error = Some(format!("cannot restore a check an older wt closed: {error:#}")),
+                    }
+                }
                 // Only an inventory this process read says a worktree is gone.
                 let inventory_read_at = confirmed_git
                     .as_ref()
@@ -674,20 +703,65 @@ async fn settle_runs(
     let runs = wt_app_core::actions::service(context)?
         .list_runs_bounded(RUN_CHECK_LIMIT)
         .await?;
-    for run in runs {
-        let meta = &run.meta;
-        if meta.auto_fire_keys.is_empty()
-            || matches!(
-                meta.status,
-                wt_actions::ActionRunStatus::Running | wt_actions::ActionRunStatus::Ambiguous
-            )
-        {
+    let runs = runs.into_iter().map(|run| run.meta).collect();
+    settle(context, accepted, engine, runs, false).await
+}
+
+/// Await again the runs a process that has quit launched, and look up
+/// their records: `None` when there are none. `lookup` returns every
+/// automation run started at or after the time it is given.
+///
+/// The ledger is read before the runs. A run's record is written before
+/// its launch and its awaited entry after, so every entry read here has its
+/// record in a lookup made later, unless the record is gone. Read the other
+/// way round, a run another live process launched in between would have an
+/// entry and no record, and be ended as unknown under its owner. The lookup
+/// is by time, not a count of runs: an awaited run is at most a day old,
+/// and maintenance removes only finished runs older than 30 days.
+async fn restore_runs<F, Fut>(
+    engine: &mut AutomationEngine,
+    now_ms: i64,
+    lookup: F,
+) -> Result<Option<Vec<wt_actions::ActionMeta>>>
+where
+    F: FnOnce(u64) -> Fut,
+    Fut: Future<Output = Result<Vec<wt_actions::ActionMeta>>>,
+{
+    engine.restore_awaited(now_ms).await?;
+    let Some(since_ms) = engine.restored_since_ms() else {
+        return Ok(None);
+    };
+    Ok(Some(lookup(u64::try_from(since_ms).unwrap_or(0)).await?))
+}
+
+/// [`settle_runs`] over `runs`. `restored` says they came from
+/// [`restore_runs`], so they hold the record of every restored run that
+/// still has one: a restored run with no record is then ended with an
+/// unknown outcome instead of waited for.
+async fn settle(
+    context: &AppContext,
+    accepted: &AppContext,
+    engine: &mut AutomationEngine,
+    runs: Vec<wt_actions::ActionMeta>,
+    restored: bool,
+) -> Result<()> {
+    let mut running = Vec::new();
+    for meta in &runs {
+        if meta.auto_fire_keys.is_empty() {
+            continue;
+        }
+        let started_at_ms = i64::try_from(meta.started_at).unwrap_or(i64::MAX);
+        if matches!(
+            meta.status,
+            wt_actions::ActionRunStatus::Running | wt_actions::ActionRunStatus::Ambiguous
+        ) {
+            running.push((meta.auto_fire_keys.clone(), started_at_ms));
             continue;
         }
         let failed = engine
             .run_ended(
                 &meta.auto_fire_keys,
-                i64::try_from(meta.started_at).unwrap_or(i64::MAX),
+                started_at_ms,
                 run_end(meta),
                 now_ms(),
                 &accepted.cancellation,
@@ -727,12 +801,43 @@ async fn settle_runs(
             "automation run failed; it will run again"
         );
     }
+    if restored {
+        engine
+            .end_lost_runs(&running, now_ms(), &accepted.cancellation)
+            .await?;
+    }
+    // Told once, here: the ledger records the outcome for one process only.
+    for unknown in engine.take_unknown_runs() {
+        let text = format!(
+            "auto {}: outcome unknown, not run again: {}",
+            unknown.rule, unknown.reason
+        );
+        tracing::warn!(
+            target: "wt_attention",
+            event_channel = "attention",
+            event_source = %unknown.slug,
+            event_text = %text,
+            "automation outcome unknown"
+        );
+        if unknown.slug != wt_automations::FLEET_SLUG {
+            let event = wt_core::WorktreeEventKind::Automation {
+                rule: unknown.rule,
+                outcome: wt_core::AutomationOutcomeKind::Unconfirmed,
+                reason: Some(wt_core::event_text(&format!(
+                    "outcome unknown: {}",
+                    unknown.reason
+                ))),
+            };
+            wt_app_core::worktree_history::record(context, &unknown.slug, event).await;
+        }
+    }
     Ok(())
 }
 
 /// Only a shell command that ran to its end and exited non-zero is a
-/// definite failure. A killed run, one that never reported an exit code, and
-/// an agent run (which may have acted before it exited) are not.
+/// definite failure. One whose worker died before recording an exit code
+/// may have succeeded: its outcome is unknown. A killed run and an agent
+/// run (which may have acted before it exited) are neither.
 fn run_end(meta: &wt_actions::ActionMeta) -> wt_app_core::automation_engine::RunEnd {
     use wt_app_core::automation_engine::RunEnd;
     match (meta.kind, meta.status, meta.exit_code) {
@@ -740,6 +845,9 @@ fn run_end(meta: &wt_actions::ActionMeta) -> wt_app_core::automation_engine::Run
             if code != 0 =>
         {
             RunEnd::ShellFailed { exit_code: code }
+        }
+        (wt_actions::ActionRunKind::Shell, wt_actions::ActionRunStatus::Failed, None) => {
+            RunEnd::ShellUnknown
         }
         _ => RunEnd::Other,
     }
@@ -1427,6 +1535,98 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use wt_runtime::SourceSnapshot;
+
+    #[test]
+    fn only_a_recorded_non_zero_shell_exit_is_a_definite_failure() {
+        use wt_app_core::automation_engine::RunEnd;
+        let end = |kind: &str, status: &str, exit: Option<i32>| {
+            let meta: wt_actions::ActionMeta = serde_json::from_value(serde_json::json!({
+                "version": 1, "slug": "row", "runId": "r", "kind": kind, "actionId": "a",
+                "actionName": "A", "prompt": "", "affects": [], "startedAt": 1,
+                "status": status, "exitCode": exit,
+            }))
+            .unwrap();
+            run_end(&meta)
+        };
+        assert_eq!(
+            end("shell", "failed", Some(2)),
+            RunEnd::ShellFailed { exit_code: 2 }
+        );
+        // The worker died before recording an exit: it may have succeeded.
+        assert_eq!(end("shell", "failed", None), RunEnd::ShellUnknown);
+        for (kind, status, exit) in [
+            ("shell", "succeeded", Some(0)),
+            ("shell", "killed", None),
+            ("claude", "failed", Some(1)),
+            ("claude", "failed", None),
+        ] {
+            assert_eq!(end(kind, status, exit), RunEnd::Other, "{kind} {status}");
+        }
+    }
+
+    /// Another live process may launch a run while this one starts. Its
+    /// awaited entry must never be read without its run record, or the run
+    /// would be ended as unknown under its owner.
+    #[tokio::test]
+    async fn awaited_runs_are_read_back_before_their_records_are_looked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let now = now_ms();
+        let write = |keys: &[&str]| {
+            let mut root = serde_json::json!({"version": 1, "fired": {}, "awaited": {}});
+            for key in keys {
+                let mut fire = fire("row");
+                fire.fire_keys = vec![(*key).to_owned()];
+                root["fired"][key] = serde_json::json!({
+                    "state": "delivered", "claimId": format!("claim-{key}"),
+                    "ruleId": "nudge", "slug": "row", "at": now - 1_000,
+                });
+                root["awaited"][format!("id-{key}")] = serde_json::json!({
+                    "claim": {
+                        "claimId": format!("claim-{key}"), "keys": [key], "ruleId": "nudge",
+                        "slug": "row", "kind": "headlessAction", "claimedAtMs": now - 1_000,
+                        "breakerReserved": false,
+                    },
+                    "fire": fire, "queuedAtMs": now - 2_000, "deliveredAtMs": now - 1_000,
+                    "failedRuns": 0, "retryOnFailure": true,
+                });
+            }
+            std::fs::write(&path, root.to_string()).unwrap();
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // Nothing awaited: no run is looked up.
+        write(&[]);
+        let mut idle = AutomationEngine::new(AutomationLedger::new(&path), cancel.clone());
+        let none = restore_runs(&mut idle, now, |_| async { panic!("nothing to look up") })
+            .await
+            .unwrap();
+        assert!(none.is_none());
+
+        write(&["first"]);
+        let ledger = AutomationLedger::new(&path);
+        let mut engine = AutomationEngine::new(ledger.clone(), cancel.clone());
+        let runs = restore_runs(&mut engine, now, |since_ms| {
+            // The lookup reaches back to the restored run's claim, however
+            // many runs there are since.
+            assert_eq!(since_ms, u64::try_from(now - 1_000).unwrap());
+            // Meanwhile another process launches a run and records it.
+            write(&["first", "second"]);
+            async { Ok(Vec::new()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runs, Some(Vec::new()));
+        // No record is left of the first run: it is ended as unknown. The
+        // second was never read back, so it stays its owner's to settle.
+        engine.end_lost_runs(&[], now, &cancel).await.unwrap();
+        let unknown = engine.take_unknown_runs();
+        assert_eq!(unknown.len(), 1, "{unknown:?}");
+        assert!(!engine.awaits_runs());
+        let awaited = ledger.awaited().await.unwrap();
+        assert_eq!(awaited.keys().collect::<Vec<_>>(), ["id-second"]);
+        assert_eq!(ledger.snapshot().await.unwrap().unknown_outcomes().len(), 1);
+    }
 
     fn fire(slug: &str) -> wt_automations::AutomationFire {
         wt_automations::AutomationFire {

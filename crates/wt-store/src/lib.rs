@@ -5,6 +5,7 @@
 //! than hold an async mutex while SQLite performs I/O.
 
 mod events;
+mod maintenance;
 mod migrations;
 mod mutations;
 mod owed;
@@ -18,6 +19,7 @@ pub use events::{
     WORKTREE_EVENT_CHECKS_MAX, WORKTREE_EVENT_MAX_AGE_MS, WORKTREE_EVENTS_PER_SLUG,
     bound_worktree_event,
 };
+pub use maintenance::{RedatedCheck, SLUG_RECORD_MAX_AGE_MS, prunable_slug_records};
 pub use migrations::{
     CURRENT_WT_STATE_VERSION, MigrationOutcome, migrate_wt_state, raw_wt_state_version,
 };
@@ -26,8 +28,8 @@ pub use mutations::{
     verification_owed_at_removal, work_status_event,
 };
 pub use owed::{
-    CheckTargets, ChecksClosed, OwedClosed, RemovedChecksClosed, WakeCompletion,
-    removed_due_untold, removed_landing, removed_owed_items, stored_owed,
+    CheckTargets, ChecksClosed, DisplacedCheck, OwedClosed, RemovedChecksClosed, WakeCompletion,
+    kept_checks_lost, removed_due_untold, removed_landing, removed_owed_items, stored_owed,
 };
 pub use stamps::{stored_pending_stamp, stored_stamp};
 pub use store::{Store, StoreError};

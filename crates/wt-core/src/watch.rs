@@ -553,6 +553,7 @@ pub struct Watch {
 // that does not know them carries them through a rewrite like any other.
 const LANDING_COMMIT: &str = "landingCommit";
 const BEFORE_RELEASE: &str = "beforeRelease";
+const OWED_ON_DELIVERY: &str = "owedOnDelivery";
 const EVALUATED_AT: &str = "evaluatedAtMs";
 /// How often an engine records again that it judged a watch. Every stamp
 /// rewrites the state and wakes every process that reads it, and the
@@ -599,6 +600,23 @@ impl Watch {
                 .insert(BEFORE_RELEASE.to_owned(), Value::Bool(true));
         } else {
             self.extra.remove(BEFORE_RELEASE);
+        }
+    }
+
+    /// Whether the wake stays owed as a due step once delivered, wherever
+    /// the worktree's current work stands. Set on the wake an earlier pull
+    /// request's check becomes: that work has landed, whatever the
+    /// worktree is on now.
+    pub fn owed_on_delivery(&self) -> bool {
+        self.extra.get(OWED_ON_DELIVERY).and_then(Value::as_bool) == Some(true)
+    }
+
+    pub fn set_owed_on_delivery(&mut self, owed: bool) {
+        if owed {
+            self.extra
+                .insert(OWED_ON_DELIVERY.to_owned(), Value::Bool(true));
+        } else {
+            self.extra.remove(OWED_ON_DELIVERY);
         }
     }
 

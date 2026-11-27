@@ -324,18 +324,27 @@ impl PiHarness {
         }
         self.tmux
             .create_session_with_options(
-                &CreateSession {
-                    name,
-                    cwd: request.worktree_path.clone(),
-                    command: std::iter::once("pi".into()).chain(command.args).collect(),
-                    width: None,
-                    height: None,
-                },
+                &self.pane(name, &request.worktree_path, &request.slug, command.args),
                 &[("@wt-harness-session-id", id.as_str())],
                 cancel,
             )
             .await?;
         Ok(true)
+    }
+
+    fn pane(&self, name: String, cwd: &Path, agent: &str, args: Vec<String>) -> CreateSession {
+        CreateSession {
+            name,
+            cwd: cwd.to_owned(),
+            command: crate::shims::session_command(
+                &self.paths.cache_dir,
+                &self.tmux,
+                agent,
+                std::iter::once("pi".into()).chain(args),
+            ),
+            width: None,
+            height: None,
+        }
     }
 
     /// Another caller's cold start creates the slot before Pi binds its
@@ -1188,6 +1197,38 @@ mod tests {
         server.abort();
         let _ = fs::remove_file(socket);
         assert!(!started.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_pi_session_runs_gh_behind_the_pull_request_guard() {
+        use crate::shims::fixture;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fixture::refusing_bin(dir.path());
+        let report = dir.path().join("report");
+        fixture::reporting_harness(&bin, "pi", &report);
+        let runner = ProcessRunner::default();
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            wt_tmux::TmuxServer::at(dir.path().join("tmux.sock"))
+                .with_cwd(dir.path())
+                .with_config_file("/dev/null"),
+        )
+        .with_session_environment(fixture::session_environment(&bin));
+        let harness = PiHarness::new(
+            PiPaths::new(dir.path(), dir.path().join("cache")),
+            runner,
+            tmux.clone(),
+        );
+        let cancel = CancellationToken::new();
+        let created = tmux
+            .create_session(
+                &harness.pane("fixture-pi".into(), dir.path(), "fixture", Vec::new()),
+                &cancel,
+            )
+            .await;
+        let reported = created.map(|_| fixture::await_report(&report));
+        let _ = tmux.kill_server(&cancel).await;
+        assert_eq!(reported.unwrap(), fixture::REPORT);
     }
 
     fn transcript(root: &Path, id: &str, cwd: &str, name: &str) -> PathBuf {

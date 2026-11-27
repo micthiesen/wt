@@ -359,9 +359,13 @@ impl CodexHarness {
                 &CreateSession {
                     name,
                     cwd: request.worktree_path.clone(),
-                    command: std::iter::once(command.program.to_string_lossy().into_owned())
-                        .chain(command.args)
-                        .collect(),
+                    command: crate::shims::session_command(
+                        &self.paths.cache_dir,
+                        &self.tmux,
+                        &request.slug,
+                        std::iter::once(command.program.to_string_lossy().into_owned())
+                            .chain(command.args),
+                    ),
                     width: None,
                     height: None,
                 },
@@ -1248,5 +1252,40 @@ mod tests {
             .find(|session| session.name == "fixture-codex")
             .expect("slot");
         assert_eq!(slot.harness_session_id.as_deref(), Some("thread-1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_codex_session_runs_gh_behind_the_pull_request_guard() {
+        use crate::shims::fixture;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fixture::refusing_bin(dir.path());
+        let report = dir.path().join("report");
+        fixture::reporting_harness(&bin, "codex", &report);
+        let runner = ProcessRunner::new(NonZeroUsize::new(2).unwrap());
+        let tmux = TmuxClient::new(
+            runner.clone(),
+            TmuxServer::at(dir.path().join("tmux.sock"))
+                .with_cwd(dir.path())
+                .with_config_file("/dev/null"),
+        )
+        .with_session_environment(fixture::session_environment(&bin));
+        let cancel = CancellationToken::new();
+        let paths = CodexPaths::new(dir.path(), dir.path().join("cache"));
+        let started = CodexHarness::new(paths, runner, tmux.clone())
+            .start(
+                &HarnessSpawnRequest {
+                    worktree_path: dir.path().into(),
+                    slug: "fixture".into(),
+                    managed_name: None,
+                    resume_session_id: None,
+                    display_label: None,
+                },
+                &cancel,
+            )
+            .await;
+        let reported = started.map(|_| fixture::await_report(&report));
+        let _ = tmux.kill_server(&cancel).await;
+        assert_eq!(reported.unwrap(), fixture::REPORT);
     }
 }

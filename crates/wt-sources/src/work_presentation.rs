@@ -196,6 +196,7 @@ fn pr_presentation(pr: &PullRequest) -> wt_tui::PrPresentation {
             stale: bot.stale.unwrap_or(false),
         }),
         unresolved_threads: pr.unresolved_threads_total,
+        unresolved_threads_more: pr.unresolved_threads_more,
         merge_queue: None,
         auto_merge_armed: pr.auto_merge.is_some(),
         comments: Vec::new(),
@@ -357,7 +358,11 @@ fn detail_group(row: &BoardRow, id: &str, config: &Config) -> Option<PreparedDet
                 lines.push(format!("reviewers: {}", pr.reviewers.join(", ")));
             }
             if pr.unresolved_threads > 0 {
-                lines.push(format!("unresolved threads: {}", pr.unresolved_threads));
+                lines.push(format!(
+                    "unresolved threads: {}{}",
+                    pr.unresolved_threads,
+                    if pr.unresolved_threads_more { "+" } else { "" }
+                ));
             }
             if let Some(queue) = &pr.merge_queue {
                 lines.push(format!(

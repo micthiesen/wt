@@ -61,6 +61,16 @@ pub use wt_ops::commands::new::CREATE_INSTALL_ACTION_ID;
 /// Spacing of follow-up tracker reads while an expectation is unconfirmed.
 const CONFIRM_POLL: Duration = Duration::from_secs(5);
 
+/// How a restack that stopped on a conflict reads. Its worker has already
+/// handed the conflict to the failing worktree's session, so the run ended
+/// the way a conflict is meant to, not in a failure of the action.
+const CONFLICT_LABEL: &str = "stopped on a conflict";
+
+fn restack_conflict(meta: &wt_actions::ActionMeta) -> bool {
+    meta.action_id == wt_ops::restack_action::ACTION_ID
+        && meta.exit_code == Some(wt_ops::restack_action::CONFLICT_EXIT)
+}
+
 /// Sources an action's declared effects refresh on completion. The issue
 /// statuses leaf also settles issue-status expectations, so it must be the
 /// confirmable leaf, not a display view.
@@ -580,6 +590,7 @@ impl Tracker {
                     && self.retrying.contains(&meta.action_id);
                 let label = match meta.status {
                     ActionRunStatus::Succeeded => "succeeded",
+                    ActionRunStatus::Failed if restack_conflict(meta) => CONFLICT_LABEL,
                     ActionRunStatus::Failed => "failed",
                     ActionRunStatus::Killed => "killed",
                     ActionRunStatus::Running | ActionRunStatus::Ambiguous => "uncertain",
@@ -802,6 +813,7 @@ fn compose(
                 ActionRunStatus::Running => "running",
                 ActionRunStatus::Ambiguous => "start uncertain",
                 ActionRunStatus::Succeeded => "succeeded",
+                ActionRunStatus::Failed if restack_conflict(&run.meta) => CONFLICT_LABEL,
                 ActionRunStatus::Failed => "failed",
                 ActionRunStatus::Killed => "killed",
             };
@@ -860,6 +872,7 @@ fn compose(
     data.attention.retain(|line| {
         !line.text.starts_with("Action succeeded:")
             && !line.text.starts_with("Action failed:")
+            && !line.text.starts_with(&format!("Action {CONFLICT_LABEL}:"))
             && !line.text.starts_with("Action killed:")
             && !line.text.starts_with("Action uncertain:")
     });
@@ -937,6 +950,31 @@ mod tests {
         let mut plain = Tracker::new(100);
         plain.observe(&[failed(&["key"])], now);
         assert_eq!(plain.attention.len(), 1);
+    }
+
+    #[test]
+    fn a_restack_conflict_is_not_reported_as_a_failed_action() {
+        let mut conflict = run("new", "failed", 110);
+        conflict.meta.action_id = wt_ops::restack_action::ACTION_ID.into();
+        conflict.meta.action_name = "Restack stack".into();
+        conflict.meta.exit_code = Some(wt_ops::restack_action::CONFLICT_EXIT);
+        let mut refused = conflict.clone();
+        refused.meta.run_id = "refused".into();
+        refused.meta.exit_code = Some(1);
+        let mut tracker = Tracker::new(100);
+        tracker.observe(&[conflict, refused], tokio::time::Instant::now());
+        let lines: Vec<&str> = tracker
+            .attention
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "Action stopped on a conflict: row / Restack stack",
+                "Action failed: row / Restack stack"
+            ]
+        );
     }
 
     fn expected_runs(tracker: &Tracker) -> Vec<String> {

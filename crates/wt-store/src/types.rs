@@ -359,6 +359,9 @@ pub struct WorkStatusWrite {
     pub cancelled_watches: Vec<wt_core::watch::Watch>,
     /// The review stamp this status earned; see `Store::set_pending_stamp`.
     pub stamped: Option<wt_core::Stamp>,
+    /// Checks of an earlier pull request this write kept as steps instead
+    /// of replacing.
+    pub displaced: Vec<crate::DisplacedCheck>,
 }
 
 /// One removed worktree, as `removed[]` keeps it.

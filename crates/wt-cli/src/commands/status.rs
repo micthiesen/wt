@@ -886,6 +886,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 wrote,
                 cancelled,
                 stamped,
+                displaced,
             } = match write {
                 Ok(write) => write,
                 Err(refusal) => {
@@ -914,6 +915,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 println!("{line}");
             }
             report_cancelled_watches(&cancelled);
+            report_displaced_checks(&displaced);
             report_replaced_note(previous_note.as_deref(), next.note.as_deref(), append);
             if let Some(note) = &next.note {
                 println!("  note: {note}");
@@ -1016,6 +1018,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 wrote,
                 cancelled,
                 stamped: _,
+                displaced,
             } = match write {
                 Ok(write) => write,
                 Err(refusal) => {
@@ -1047,6 +1050,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
             for (stage, check) in next.open_checks() {
                 println!("  verify in {}: {}", stage.as_str(), check.steps);
             }
+            report_displaced_checks(&displaced);
             if let Some(note) = &next.note {
                 println!("  note: {note}");
             }
@@ -1369,6 +1373,25 @@ struct StatusWrite {
     cancelled: Vec<wt_core::watch::Watch>,
     /// The review stamp this assertion earned.
     stamped: Option<wt_core::Stamp>,
+    /// Checks of an earlier pull request the write kept as steps.
+    displaced: Vec<wt_store::DisplacedCheck>,
+}
+
+/// A check set where an earlier pull request's check was still owed does
+/// not replace it: say what became of the earlier one and how to end it.
+fn report_displaced_checks(displaced: &[wt_store::DisplacedCheck]) {
+    for kept in displaced {
+        let (stage, id) = (kept.stage.as_str(), &kept.watch.id);
+        println!(
+            "  the {stage} check of {} is still owed, now as step {id} ({}): {}",
+            kept.left.label(),
+            kept.watch.when_summary(),
+            wt_app_core::watch_view::headline(&kept.check.steps)
+        );
+        println!(
+            "    once it is due: wt done {id} -m \"<evidence>\"; if the new check covers it: wt watch cancel {id}"
+        );
+    }
 }
 
 /// A status write that changes the gate cancels the watch that was to clear
@@ -1409,22 +1432,24 @@ async fn update_status(
         Failed(anyhow::Error),
     }
     let slug = slug.to_owned();
+    let utc_offset_minutes = super::watch::clock().utc_offset_minutes;
     database
         .call(move |store| {
             let mut built = None;
-            let write = store.update_slug_work_status(&slug, |stored| {
-                let previous = stored
-                    .and_then(|stored| serde_json::to_value(stored).ok())
-                    .as_ref()
-                    .and_then(parse_work_status);
-                let next = build(previous.clone()).map_err(Refusal::Usage)?;
-                let stored: StoredWorkStatusRecord = serde_json::to_value(&next)
-                    .and_then(serde_json::from_value)
-                    .context("encode status record")
-                    .map_err(Refusal::Failed)?;
-                built = Some((previous, next));
-                Ok(Some(stored))
-            })?;
+            let write =
+                store.update_slug_work_status_local(&slug, utc_offset_minutes, |stored| {
+                    let previous = stored
+                        .and_then(|stored| serde_json::to_value(stored).ok())
+                        .as_ref()
+                        .and_then(parse_work_status);
+                    let next = build(previous.clone()).map_err(Refusal::Usage)?;
+                    let stored: StoredWorkStatusRecord = serde_json::to_value(&next)
+                        .and_then(serde_json::from_value)
+                        .context("encode status record")
+                        .map_err(Refusal::Failed)?;
+                    built = Some((previous, next));
+                    Ok(Some(stored))
+                })?;
             match write {
                 Ok(write) => {
                     let (previous, next) = built.expect("a written status was built");
@@ -1434,6 +1459,7 @@ async fn update_status(
                         wrote: write.changed,
                         cancelled: write.cancelled_watches,
                         stamped: write.stamped,
+                        displaced: write.displaced,
                     }))
                 }
                 Err(Refusal::Usage(message)) => Ok(Err(message)),
@@ -2610,6 +2636,71 @@ mod tests {
             parsed(&["verified", "-m", "ok", "--no-verify-in-staging"]),
             Action::Error(_)
         ));
+    }
+
+    /// `wt next` marks a merged pull request's open checks as its own. The
+    /// next pull request's check takes the stage, and the earlier check
+    /// stays owed as a step instead of being replaced unseen.
+    #[tokio::test]
+    async fn a_check_for_the_next_pr_keeps_the_earlier_prs_check_as_a_step() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let ready = |staging: &str, production: &str| StatusArgs {
+            positionals: vec!["ready".into()],
+            risk: Some("low".into()),
+            note: Some("ships".into()),
+            verify_in_staging: Some(staging.into()),
+            verify_in_production: Some(production.into()),
+            ..Default::default()
+        };
+        let leave = |pr: u64| async move {
+            ctx.database
+                .call(move |store| Ok(store.leave_checks("one", &wt_core::LeftFor::Pr(pr))?))
+                .await
+                .unwrap()
+        };
+        let state = || async { read_state(&ctx.database).await.unwrap() };
+        let first = ready("1. open the page", "1. watch the logs");
+        assert_eq!(run(ctx, &first).await.unwrap(), 0);
+        assert_eq!(leave(7).await.len(), 2);
+
+        // The same staging steps are taken up for the next PR; the other
+        // production steps are its own check, beside the earlier one.
+        let second = ready("1. open the page", "1. watch the other logs");
+        assert_eq!(run(ctx, &second).await.unwrap(), 0);
+        let stored = state().await;
+        let checks = &stored["slugs"]["one"]["work"]["checks"];
+        assert_eq!(checks["staging"]["steps"], "1. open the page");
+        assert_eq!(checks["staging"]["forPr"], Value::Null);
+        assert_eq!(checks["production"]["steps"], "1. watch the other logs");
+        assert_eq!(checks["production"]["forPr"], Value::Null);
+        let watches = stored["watches"].as_array().unwrap();
+        assert_eq!(watches.len(), 1, "{watches:?}");
+        assert_eq!(watches[0]["when"][0]["cond"], "#7:production");
+        assert_eq!(watches[0]["owedOnDelivery"], true);
+        assert!(
+            watches[0]["then"]["wake"]
+                .as_str()
+                .unwrap()
+                .starts_with("#7 production check: 1. watch the logs\n")
+        );
+
+        // An amendment keeps the earlier check the same way.
+        assert_eq!(leave(9).await.len(), 2);
+        let amend = StatusArgs {
+            verify_in_staging: Some("2. open the next page".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &amend).await.unwrap(), 0);
+        let stored = state().await;
+        let checks = &stored["slugs"]["one"]["work"]["checks"];
+        assert_eq!(checks["staging"]["steps"], "2. open the next page");
+        assert_eq!(checks["production"]["forPr"], 9);
+        let watches = stored["watches"].as_array().unwrap();
+        assert_eq!(watches.len(), 2, "{watches:?}");
+        assert_eq!(watches[1]["when"][0]["cond"], "#9:staging");
+        fixture.close().await.unwrap();
     }
 
     /// The note is judged by what this command supplies. Text carried from

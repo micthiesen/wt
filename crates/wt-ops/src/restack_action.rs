@@ -14,7 +14,11 @@ use wt_tui::{Board, UiReply};
 
 use wt_app_core::{context::AppContext, harness::AppHarness};
 
-const ACTION_ID: &str = "wt-restack";
+pub const ACTION_ID: &str = "wt-restack";
+
+/// The worker's exit code for a replay that stopped on a conflict and was
+/// handed to the failing worktree's session.
+pub const CONFLICT_EXIT: i32 = 3;
 
 /// Validate the selected local row, then enqueue a durable action worker.
 /// The worker owns the stack operation and its conflict handoff, so neither is
@@ -205,7 +209,7 @@ pub async fn worker(context: &AppContext, branch: &str) -> Result<i32> {
             eprintln!("backup branch: {backup_ref}");
             let handoff = handoff_conflict(context, &branch, &error, &backup_ref).await;
             eprintln!("{}", handoff_report(&handoff));
-            Ok(3)
+            Ok(CONFLICT_EXIT)
         }
         RestackOutcome::Refused { error } => {
             eprintln!("restack refused: {error}");

@@ -783,6 +783,7 @@ impl Config {
         let skills_raw: SkillsSection = section(&raw, "skills", &mut errors);
         let manager_raw: ManagerSection = section(&raw, "manager", &mut errors);
         let update_raw: StartupCheckSection = section(&raw, "update", &mut errors);
+        let maintenance_raw: MaintenanceSection = section(&raw, "maintenance", &mut errors);
 
         if !errors.is_empty() {
             return Err(ConfigError::invalid(source_path, errors));
@@ -839,6 +840,10 @@ impl Config {
             },
             update: UpdateConfig {
                 startup_check: update_raw.startup_check,
+            },
+            maintenance: MaintenanceConfig {
+                enabled: maintenance_raw.enabled,
+                state_records: maintenance_raw.state_records,
             },
             warnings,
         })
@@ -1981,6 +1986,20 @@ impl Default for SkillsSection {
         Self {
             startup_check: true,
             claude_instructions: Default::default(),
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(default)]
+struct MaintenanceSection {
+    enabled: bool,
+    state_records: bool,
+}
+impl Default for MaintenanceSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            state_records: false,
         }
     }
 }

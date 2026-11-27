@@ -376,10 +376,9 @@ enum Command {
     /// Show what a worktree still owes: its merge gate, the checks owed
     /// once deployed, and the steps it comes back for.
     ///
-    /// One list per worktree; `--all` groups the fleet's by what is due now,
-    /// what must happen before the next production release, and what is
-    /// waiting. Watches that only tell the person are not owed and stay
-    /// under `wt watch`.
+    /// One list per worktree; `--all` groups the fleet's by what each item
+    /// waits for: due, staging, production, a time, other work. Watches
+    /// that only tell the person are not owed and stay under `wt watch`.
     Owed(commands::owed::OwedArgs),
     /// Close something the worktree owes, with the evidence for it.
     ///
@@ -681,6 +680,7 @@ async fn run_application(
     }
     let (actions, controller_port) = wt_tui::action_channel();
     let caches = wt_app_core::query_cache::store(&config);
+    let install = wt_ops::updates::install_paths(&options).ok();
     let context = wt_app_core::context::AppContext {
         config,
         home: options.home,
@@ -695,6 +695,11 @@ async fn run_application(
         caches,
     };
     wt_app_core::skills::startup_check(&context).await?;
+    scope.spawn(wt_ops::maintenance::daily(
+        context.clone(),
+        install,
+        scope.token(),
+    ));
     let events_context = context.clone();
     scope.spawn(async move {
         if let Err(error) = wt_ops::events::reconcile(&events_context).await {
@@ -719,6 +724,11 @@ async fn run_application(
     // Even a failed drain consumed its full grace period. The outer error path
     // must report it without waiting through that same grace period again.
     *scope_drained = true;
+    // Short-lived commands come and go without ever emptying the log; the
+    // long-lived process does it on the way out.
+    if let Err(error) = database.call(|store| Ok(store.checkpoint()?)).await {
+        tracing::debug!(%error, "state database checkpoint at shutdown failed");
+    }
     let database_closed = database.shutdown().await;
     if let Err(error) = &database_closed {
         tracing::error!(%error, "state database shutdown failed");

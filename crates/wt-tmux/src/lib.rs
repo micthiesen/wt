@@ -481,6 +481,14 @@ impl TmuxClient {
         self
     }
 
+    /// The value new sessions get for `key`, when this client sets one.
+    pub fn session_environment_value(&self, key: &str) -> Option<&str> {
+        self.session_environment
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
     /// Wrap the command inside the pane, including retained-command retries.
     /// An empty command keeps tmux's normal default-shell behavior.
     pub fn with_command_prefix(mut self, prefix: Vec<String>) -> Self {

@@ -11,7 +11,7 @@ mod snapshot;
 mod source;
 mod stamp;
 
-pub use cache::{CacheStore, DiskCache, MAX_CACHE_AGE, MAX_CACHE_BYTES};
+pub use cache::{CacheStore, DiskCache, MAX_CACHE_AGE, MAX_CACHE_BYTES, scope_difference};
 pub use pending::{
     Deadlines, Expired, Mutation, Pending, PendingLimits, PendingPhase, PendingView, Target,
 };

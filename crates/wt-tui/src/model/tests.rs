@@ -1250,19 +1250,6 @@ fn selection_tracks_identity_across_reorder_and_neighbor_after_removal() {
 }
 
 #[test]
-fn viewport_keeps_selection_visible_after_shrinking() {
-    let mut model = Model::default();
-    model.apply(snapshot(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]));
-    model.select(6);
-    for height in [8, 3, 1, 0, 6] {
-        model.keep_selection_visible(height);
-        let selected = model.selected.unwrap();
-        assert!(selected >= model.offset);
-        assert!(height == 0 || selected < model.offset + height);
-    }
-}
-
-#[test]
 fn overlays_consume_navigation_and_cancel_before_global_keys() {
     let mut model = Model::default();
     model.apply(snapshot(&["a", "b"]));

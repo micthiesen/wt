@@ -138,6 +138,13 @@ if len(args) >= 3 and args[:2] == ['pr', 'view']:
     sys.exit(1)
 if len(args) >= 2 and args[:2] == ['pr', 'edit']:
     sys.exit(0)
+if args[:2] == ['api', 'graphql']:
+    ids = [arg[len('ids[]='):] for arg in args if arg.startswith('ids[]=')]
+    queued = 'QUEUED_IDS'.split(',')
+    print(json.dumps({'data': {'nodes': [
+        {'id': i, 'mergeQueueEntry': {'id': 'MQE'} if i in queued else None} for i in ids
+    ]}}))
+    sys.exit(0)
 sys.exit(1)
 "##
             .replace("PARENT_HEAD", &parent_head),
@@ -508,6 +515,47 @@ async fn landed_member_inside_a_surviving_ancestor_stack_is_not_replayed() -> Re
         store.read_wt_state()?["slugs"]["child"]["baseBranch"],
         "root"
     );
+    Ok(())
+}
+
+/// GitHub rejects any push to a branch whose pull request is in the merge
+/// queue, and by then the local branch is already rewritten. A queued member
+/// is left exactly as it is and its child stays on its tip.
+#[tokio::test]
+async fn member_in_the_merge_queue_is_not_replayed_or_pushed() -> Result<()> {
+    let fixture = Fixture::squash_parent()?;
+    let script = fs::read_to_string(&fixture.fake_gh)?
+        .replace("'state': 'MERGED'", "'state': 'OPEN'")
+        .replace("QUEUED_IDS", "PR_parent");
+    fs::write(&fixture.fake_gh, script)?;
+    let parent = fixture.worktrees.join("parent");
+    let parent_tip = output(&parent, ["rev-parse", "HEAD"])?;
+    let child_tip = output(&fixture.child, ["rev-parse", "HEAD"])?;
+    let mut events = Vec::new();
+    let result = fixture
+        .service
+        .restack(
+            "child",
+            RestackOptions::default(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .await?;
+    assert!(
+        matches!(result, RestackOutcome::Complete { replayed: 0, .. }),
+        "{result:?}"
+    );
+    assert_eq!(output(&parent, ["rev-parse", "HEAD"])?, parent_tip);
+    assert_eq!(output(&fixture.child, ["rev-parse", "HEAD"])?, child_tip);
+    git(&fixture.main, ["fetch", "origin"])?;
+    assert_eq!(
+        output(&fixture.main, ["rev-parse", "refs/remotes/origin/parent"])?,
+        parent_tip
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StackEvent::Log(line) if line.contains("parent is in the merge queue (#1)")
+    )));
     Ok(())
 }
 

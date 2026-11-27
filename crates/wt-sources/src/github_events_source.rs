@@ -3,6 +3,7 @@
 //! rereading the same file never makes old data look fresher, and a snapshot
 //! whose request began before a local write can never confirm that write.
 use std::{
+    collections::BTreeMap,
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -28,6 +29,11 @@ pub struct DaemonRead {
     /// when the writer did not record it; such data never orders against
     /// local writes.
     pub started: Option<Instant>,
+    /// Branches the daemon read again after `started`, with when that read
+    /// of each began on this process clock. Only these are newer than
+    /// `started`; a branch here without an entry in `data` had no pull
+    /// request when it was read.
+    pub scoped: BTreeMap<String, Instant>,
     /// When the daemon wrote the snapshot, in wall-clock milliseconds as
     /// recorded in the file. Identifies the file version: unlike a moment
     /// converted onto the process clock, it is identical on every reread.
@@ -140,7 +146,13 @@ async fn read(context: &AppContext, branches: &[String], display: bool) -> Optio
 
 /// The snapshot's age and why it may still be shown at `now`, if it may.
 fn held(snapshot: &GithubSnapshot, now: u64) -> Option<(u64, Held)> {
-    let age = now.checked_sub(snapshot.updated_at)?;
+    // A write after a read of a few branches leaves the rest as old as the
+    // last read of every branch, and the snapshot is as old as that.
+    let read_at = snapshot
+        .swept_at_ms
+        .map_or(snapshot.updated_at, |swept| swept.min(snapshot.updated_at));
+    now.checked_sub(snapshot.updated_at)?;
+    let age = now.checked_sub(read_at)?;
     if age <= FRESH.as_millis() as u64 {
         return Some((age, Held::Fresh));
     }
@@ -194,12 +206,28 @@ fn admit(
         .fetch_started_at_ms
         .filter(|started| *started <= snapshot.updated_at);
     data.observed_at_ms = fetch_started;
-    let started = fetch_started
-        .and_then(|started| local_now.checked_sub(Duration::from_millis(now - started)));
+    let on_process_clock =
+        |at_ms: u64| local_now.checked_sub(Duration::from_millis(now.checked_sub(at_ms)?));
+    let started = fetch_started.and_then(on_process_clock);
+    // A scoped read began after the read of every branch and before this
+    // write. An entry that says otherwise orders nothing.
+    let scoped = fetch_started
+        .map(|swept| {
+            snapshot
+                .branch_reads
+                .iter()
+                .filter(|(branch, read_at)| {
+                    (swept..=snapshot.updated_at).contains(*read_at) && branches.contains(*branch)
+                })
+                .filter_map(|(branch, read_at)| Some((branch.clone(), on_process_clock(*read_at)?)))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(DisplayRead {
         read: DaemonRead {
             data,
             started,
+            scoped,
             written_ms: snapshot.updated_at,
         },
         age_ms,
@@ -331,6 +359,82 @@ mod tests {
         assert!(validate(malformed, &branches, at(101_000), "current", "repo").is_none());
         assert!(snapshot_event(Path::new("/events/.github.json.123.tmp")));
         assert!(!snapshot_event(Path::new("/events/state.json")));
+    }
+
+    /// A write after a read of one branch does not make the other branches
+    /// fresh: the snapshot is as old as its last read of every branch, and
+    /// keeps that read's start as its stamp. The branch read again is named
+    /// with its own, later start.
+    #[test]
+    fn a_scoped_write_keeps_the_age_and_stamp_of_the_last_read_of_every_branch() {
+        let branches = vec!["feature".to_owned()];
+        let scoped = |swept_at_ms, updated_at, reads: &[(&str, u64)]| GithubSnapshot {
+            updated_at,
+            swept_at_ms: Some(swept_at_ms),
+            branch_reads: reads
+                .iter()
+                .map(|(branch, at)| ((*branch).to_owned(), *at))
+                .collect(),
+            ..snapshot()
+        };
+        let now = at(180_000);
+        let local_now = now.1;
+        let read = validate(
+            scoped(100_000, 179_000, &[("feature", 170_000), ("gone", 170_000)]),
+            &branches,
+            now,
+            "current",
+            "repo",
+        )
+        .unwrap();
+        assert_eq!(read.data.observed_at_ms, Some(98_000));
+        assert_eq!(
+            read.started,
+            local_now.checked_sub(Duration::from_millis(82_000))
+        );
+        assert_eq!(read.written_ms, 179_000);
+        // Only a branch that was asked for is named.
+        assert_eq!(
+            read.scoped,
+            BTreeMap::from([(
+                "feature".to_owned(),
+                local_now
+                    .checked_sub(Duration::from_millis(10_000))
+                    .unwrap()
+            )])
+        );
+        // Written a second ago, but its other branches were read 95 seconds
+        // ago: the board reads GitHub instead.
+        assert!(
+            validate(
+                scoped(100_000, 194_000, &[("feature", 190_000)]),
+                &branches,
+                at(195_000),
+                "current",
+                "repo"
+            )
+            .is_none()
+        );
+        // A scoped read cannot have begun before the read of every branch
+        // or after the write.
+        let odd = validate(
+            scoped(100_000, 179_000, &[("feature", 97_999)]),
+            &branches,
+            now,
+            "current",
+            "repo",
+        )
+        .unwrap();
+        assert!(odd.scoped.is_empty());
+        let odd = validate(
+            scoped(100_000, 179_000, &[("feature", 179_001)]),
+            &branches,
+            now,
+            "current",
+            "repo",
+        )
+        .unwrap();
+        assert!(odd.scoped.is_empty());
     }
 
     /// A display takes a snapshot the board would not: one the daemon's

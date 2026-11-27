@@ -39,9 +39,24 @@ state, `waiting` or `due`.
   first saw the check due (`due_at` in JSON, an `owed` history event) and
   the check is `overdue` the configured days after that, however often the
   status is asserted again.
-- Each stage holds one check. A second check for the same stage (another
-  pull request of the same worktree) is a wake step: `wt wake pr:<n>:<stage>
-  -m "<steps>"`.
+- Each stage holds one check: the current pull request's. A worktree can
+  carry several pull requests (`wt next`), and a check an earlier one still
+  owes is never replaced unseen. `wt next` marks every open check as the
+  landed work's: the pull request merged at the branch's head (`forPr`),
+  or that head itself where no pull request merged there (`forCommit`).
+  Asserting the same steps again takes the check up for the next pull
+  request. Other steps in that stage become the next pull request's check,
+  and the earlier one becomes a wake step in the same write, waiting for
+  `pr:<n>:<stage>` or `commit:<oid>:<stage>` (and for the time it was put
+  off to); `wt status` names its id and how to end it, and the history
+  says `again when ...: <stage> check: ...`. That wake stays owed once
+  delivered whatever the worktree is on by then, due since the check was
+  first seen due. A status write that cannot set every such wake (the
+  worktree is at its watch limit) is refused whole, before any is set.
+  Steps edited in the board's status menu rewrite the check in place: it
+  stays the earlier work's and nothing is set beside it.
+  A further check for a stage is set by hand the same way:
+  `wt wake pr:<n>:<stage> -m "<steps>"`.
 - A pending wake is a `waiting` step, even when its conditions held and it is
   only waiting for delivery.
 - Watches that only tell the person (`wt notify`, `W`) are **not owed**. They
@@ -60,7 +75,9 @@ A wake is a promise to come back. What delivering it means depends on whether
 the worktree's own work had landed when it fired:
 
 - **Not landed:** the wake closes on delivery, as coordination does (rebase
-  when a parent merges, test at 17:00).
+  when a parent merges, test at 17:00). The wake an earlier pull request's
+  check became is the exception: that work has landed, so it becomes a due
+  step like the next case.
 - **Landed, or unknown to the engine** (a PR exists, GitHub data is stale and
   there is no local proof): the wake becomes a **due step**. It stays owed until
   `wt done <id> -m "<what you did and what you saw>"` closes it with
@@ -198,7 +215,7 @@ when the status is asserted again. A new round replaces it;
 Sessions keep the build that started them for days and share the state.
 
 - **Checks.** The status record gains `checks` (per stage: `steps`, optional
-  `text`, `notBeforeMs`, `sinceMs`, `dueSinceMs`, `duePr`; an older build carries
+  `text`, `notBeforeMs`, `sinceMs`, `dueSinceMs`, `duePr`, `forPr`; an older build carries
   the ones it does not know through its writes) and `checksMirror`. `steps`
   is the check's text on one line and is what names it: the same steps are
   the same check, in every build. `text` is the same text with its author's
@@ -216,6 +233,22 @@ Sessions keep the build that started them for days and share the state.
   because an older build replaces the entry's whole status.
 - **Due steps** are a top-level `owed` array, not watches: an older engine
   deletes a watch that has no action left. At most 20 per worktree.
+- **Earlier pull requests' checks.** An older `wt next` does not set
+  `forPr` or `forCommit`, so a check set after it replaces the one in its
+  stage, as before. The wake a check became carries `owedOnDelivery`, which
+  an older engine carries but does not read: the engine is the running wt
+  (the TUI process), which keeps its build until it is restarted, and one
+  from before this delivers the wake to a worktree whose current work has
+  not landed and closes it. So each such check is also kept in a top-level
+  `keptChecks` array (the wake's id, the check, the step's text), which
+  older builds carry untouched. Only a build that knows the key removes a
+  record: when the step is closed, cancelled or pushed out, and it follows
+  a step that is put off to its new wake. A current engine that finds a
+  record with neither its wake nor its due step owes the step again, with
+  the same id and due date and a `due: restored, ...` history event,
+  once. It forgets the record instead when the worktree is gone or the
+  history shows the step closed, dropped or its wake cancelled, which is
+  how an older build's `wt done` and `wt watch cancel` are honoured.
 - **History** gains the `owed` event, unknown to older builds. No existing
   JSON key changed meaning: `verify_in` and `verify_after_merge` follow the
   legacy mirror, so read `owes` instead.

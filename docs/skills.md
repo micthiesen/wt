@@ -253,8 +253,8 @@ worker invocations and provisioning failures.
 Session creation prepends the running native wt directory to every harness's
 `PATH` and pins the process's absolute config selectors in that session.
 These values belong to the session, so a pre-existing tmux server cannot lend
-it another configuration's environment. Claude's inspection shims remain first
-on its PATH. A provisioned worker can therefore launch an agent that runs bare
+it another configuration's environment. wt's shim directory (the `gh` guard
+and the inspection shims) goes first on every harness session's PATH. A provisioned worker can therefore launch an agent that runs bare
 `wt status` even when the runtime directory is absent from SSH's initial PATH.
 
 ## Keeping your own versions

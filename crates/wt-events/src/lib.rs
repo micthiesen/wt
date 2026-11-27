@@ -31,6 +31,11 @@ pub struct EventDaemonConfig {
     /// The floor between fetch starts for a check or status delivery that is
     /// not a completion.
     pub progress_fetch_interval_ms: u64,
+    /// The longest a read of only the branches a check or status delivery
+    /// names may stand in for a read of every branch. Readers stop using a
+    /// snapshot whose whole-fleet read is 90 seconds old, so this stays
+    /// well under that with a slow read on top.
+    pub full_sweep_interval_ms: u64,
     pub inventory_ttl_ms: u64,
     pub max_body_bytes: usize,
     pub max_concurrent_requests: usize,
@@ -69,6 +74,7 @@ impl EventDaemonConfig {
             debounce_ms: 1_500,
             min_fetch_interval_ms: 10_000,
             progress_fetch_interval_ms: 45_000,
+            full_sweep_interval_ms: 45_000,
             inventory_ttl_ms: 10_000,
             max_body_bytes: 5 * 1024 * 1024,
             max_concurrent_requests: 64,
@@ -89,6 +95,56 @@ pub struct RateBudget {
     pub reset_at_ms: u64,
 }
 
+/// The budget readings a poller has seen, one per window still open.
+///
+/// GitHub counts one token's GraphQL requests against more than one window
+/// at a time, each with its own reset, and a reply reports only the window
+/// that counted it. A read can therefore report plenty left while most
+/// requests are being counted against a window that is nearly spent. A
+/// window's figure only falls until it resets, so an older reading of it is
+/// an upper bound that still holds.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BudgetWindows {
+    by_reset: BTreeMap<u64, RateBudget>,
+}
+
+impl BudgetWindows {
+    /// Record what a read reported and return the budget to pace by: the
+    /// open window with the least left, at that read's cost.
+    pub fn observe(&mut self, read: RateBudget, now_ms: u64) -> Option<RateBudget> {
+        self.by_reset.retain(|reset, _| *reset > now_ms);
+        if read.reset_at_ms > now_ms {
+            self.by_reset
+                .entry(read.reset_at_ms)
+                .and_modify(|seen| {
+                    seen.remaining = seen.remaining.min(read.remaining);
+                    seen.limit = read.limit;
+                })
+                .or_insert(read);
+        }
+        self.lowest(now_ms).map(|lowest| RateBudget {
+            cost: read.cost,
+            ..lowest
+        })
+    }
+
+    /// The open window with the least left.
+    pub fn lowest(&self, now_ms: u64) -> Option<RateBudget> {
+        self.open(now_ms)
+            .into_iter()
+            .min_by_key(|budget| (budget.remaining, budget.reset_at_ms))
+    }
+
+    /// Every window still open, soonest reset first.
+    pub fn open(&self, now_ms: u64) -> Vec<RateBudget> {
+        self.by_reset
+            .values()
+            .filter(|budget| budget.reset_at_ms > now_ms)
+            .copied()
+            .collect()
+    }
+}
+
 /// The GitHub data maps are JSON envelopes to retain additive fields written
 /// by newer GitHub API selections.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -100,6 +156,15 @@ pub struct GithubSnapshot {
     /// against their own writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fetch_started_at_ms: Option<u64>,
+    /// When the last read of every branch finished. `updated_at` moves on
+    /// each write, and a write after a read of a few branches leaves the
+    /// rest as old as this. Absent when every write is a whole read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swept_at_ms: Option<u64>,
+    /// Branches read again since `fetch_started_at_ms`, with the start of
+    /// the read that last covered each. Only these are newer than the rest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub branch_reads: BTreeMap<String, u64>,
     pub branches: Vec<String>,
     #[serde(default)]
     pub prs: Value,
@@ -109,9 +174,14 @@ pub struct GithubSnapshot {
     /// reported one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateBudget>,
+    /// Every budget window the daemon has a reading of, when there is more
+    /// than the one in `rate_limit` (the lowest).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rate_windows: Vec<RateBudget>,
     /// Wall-clock epoch ms before which the daemon starts no background
-    /// read after this one: this read's start plus the interval its budget
-    /// asks for. A reader that only displays the data may use it until then.
+    /// read of every branch: the last such read's start plus the interval
+    /// its budget asks for. A reader that only displays the data may use it
+    /// until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_fetch_at_ms: Option<u64>,
     #[serde(default)]

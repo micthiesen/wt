@@ -1159,6 +1159,13 @@ entry remains last.
 |---|---|---|---|
 | `startup_check` | no | `true` | Check for a newer verified native release when the TUI starts and offer to install it. `false` disables the startup offer; `wt update` remains available. `WT_UPDATE=off` disables native update checks and activation for one run. See [updates.md](updates.md). |
 
+## `[maintenance]`
+
+| key | required | default | meaning |
+|---|---|---|---|
+| `enabled` | no | `true` | A running wt removes its leftovers once a day: installed versions nothing runs, old finished action runs, and dev-server files, inspector sockets and session logs of worktrees that are gone. `false` stops the daily pass; `wt doctor --prune` still runs it on demand. See [updates.md](updates.md#leftovers-and-the-daily-maintenance-pass). |
+| `state_records` | no | `false` | Let the daily pass also drop the slug records of long-removed worktrees from the repository state. Off, those records go only when you run `wt doctor --prune`. |
+
 ## `[[actions]]` — the `!` menu
 
 Pre-built actions surfaced by the `!` picker (and available as automation targets). Two kinds, distinguished by which field you set:

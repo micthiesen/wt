@@ -1485,9 +1485,24 @@ impl Store {
     /// from the previous record cannot be overtaken by another process
     /// before the write lands. An `Err` from `update` refuses: nothing is
     /// written.
+    ///
+    /// A check an earlier pull request left owed is never replaced by other
+    /// steps: it becomes a wake in the same transaction, returned as
+    /// [`WorkStatusWrite::displaced`].
     pub fn update_slug_work_status<E>(
         &mut self,
         slug: &str,
+        update: impl FnOnce(Option<&WorkStatusRecord>) -> Result<Option<WorkStatusRecord>, E>,
+    ) -> Result<Result<WorkStatusWrite, E>, StoreError> {
+        self.update_slug_work_status_local(slug, 0, update)
+    }
+
+    /// [`Self::update_slug_work_status`] for a writer that knows its local
+    /// UTC offset, which a wake set by the write shows its times in.
+    pub fn update_slug_work_status_local<E>(
+        &mut self,
+        slug: &str,
+        utc_offset_minutes: i32,
         update: impl FnOnce(Option<&WorkStatusRecord>) -> Result<Option<WorkStatusRecord>, E>,
     ) -> Result<Result<WorkStatusWrite, E>, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
@@ -1503,6 +1518,17 @@ impl Store {
             };
             let written = write_work_status(state, slug, previous.as_ref(), record.as_ref())?;
             let changed = written.changed;
+            let displaced = match record.as_ref().filter(|_| changed) {
+                Some(record) => crate::owed::displace_checks(
+                    state,
+                    log,
+                    slug,
+                    previous.as_ref(),
+                    record,
+                    utc_offset_minutes,
+                )?,
+                None => Vec::new(),
+            };
             if changed {
                 log.best_effort(|log| {
                     log_incarnation(log, state, slug)?;
@@ -1534,6 +1560,7 @@ impl Store {
                     changed,
                     cancelled_watches: written.cancelled_watches,
                     stamped,
+                    displaced,
                 }),
                 wrote,
             ))

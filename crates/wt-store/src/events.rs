@@ -304,6 +304,39 @@ impl<'a> EventLog<'a> {
         Ok(false)
     }
 
+    /// Whether the slug's history since `since_ms` says the owed item `id`
+    /// was ended on purpose: its step closed, dropped or put off to a new
+    /// wake, or its watch cancelled. Read from the stored JSON, so an event
+    /// written by another build counts whatever else it holds. An `again`
+    /// that names a stage is a check becoming this item, not its end.
+    pub(crate) fn ended(&self, slug: &str, id: &str, since_ms: i64) -> Result<bool, StoreError> {
+        let mut events = self.db.prepare(
+            "SELECT data FROM worktree_events WHERE repo_id = ?1 AND slug = ?2 \
+             AND kind IN ('owed', 'watch') AND at_ms >= ?3",
+        )?;
+        let rows = events.query_map(params![self.repo_id, slug, since_ms], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for data in rows {
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&data?) else {
+                continue;
+            };
+            let field = |key: &str| event.get(key).and_then(serde_json::Value::as_str);
+            let put_off = field("change") == Some("again") && field("stage").is_none();
+            if field("id") == Some(id)
+                && (put_off
+                    || matches!(
+                        (field("kind"), field("change")),
+                        (Some("owed"), Some("done" | "dropped"))
+                            | (Some("watch"), Some("cancelled"))
+                    ))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether the slug's latest lifecycle event says it was removed.
     pub(crate) fn removed(&self, slug: &str) -> Result<bool, StoreError> {
         Ok(self.lifecycle(slug)?.is_some_and(|latest| latest.removed))

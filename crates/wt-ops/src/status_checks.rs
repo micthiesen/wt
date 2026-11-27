@@ -16,6 +16,11 @@ pub enum CheckEdit {
         steps: String,
         lines: Option<String>,
     },
+    /// Rewrite the steps of the check owed there in place: the same check,
+    /// with its dates and the work it was left for (`wt next`), as someone
+    /// editing the check they were shown means. Other steps given with
+    /// [`Self::Owe`] are another check.
+    Reword { stage: VerifyStage, steps: String },
     /// Stop owing the check there.
     Drop { stage: VerifyStage },
 }
@@ -43,6 +48,7 @@ pub fn assert_checks(
                 steps,
                 lines,
             } => next.set_check_lines(stage, steps, lines.as_deref()),
+            CheckEdit::Reword { stage, steps } => next.reword_check(stage, steps),
             CheckEdit::Drop { stage } => {
                 next.drop_check(stage);
             }

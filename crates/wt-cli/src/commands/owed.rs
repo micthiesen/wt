@@ -311,8 +311,8 @@ pub(crate) async fn print_record_list(ctx: &AppContext, record: &WorktreeRecord)
 
 #[derive(Debug, Clone, Args)]
 pub struct OwedArgs {
-    /// Every worktree's list, grouped: due now, before the next production
-    /// release, then waiting by what it waits for.
+    /// Every worktree's list, grouped by what each item waits for: due,
+    /// staging, production, a time, other work.
     #[arg(long)]
     pub all: bool,
     /// Print JSON: the worktree (slug, kind, landing, owed_phase, owes),

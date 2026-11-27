@@ -3443,6 +3443,19 @@ impl LifecycleService {
         slug_state: Option<&Value>,
         cancellation: &CancellationToken,
     ) -> Result<(BTreeSet<String>, bool), LifecycleError> {
+        self.other_branch_names_among(row, slug_state, None, cancellation)
+            .await
+    }
+
+    /// [`Self::other_branch_names`] against an inventory the caller already
+    /// read, for a pass over many rows.
+    pub async fn other_branch_names_among(
+        &self,
+        row: &WorktreeRecord,
+        slug_state: Option<&Value>,
+        inventory: Option<&[WorktreeRecord]>,
+        cancellation: &CancellationToken,
+    ) -> Result<(BTreeSet<String>, bool), LifecycleError> {
         let (reflog, mut readable) = match &row.git_dir {
             Some(git_dir) => match fs::read(git_dir.join("logs/HEAD")).await {
                 Ok(bytes) => (String::from_utf8_lossy(&bytes).into_owned(), true),
@@ -3465,7 +3478,15 @@ impl LifecycleService {
             names.remove(kept.strip_prefix("origin/").unwrap_or(kept));
         }
         if !names.is_empty() {
-            for other in self.repository.inventory(cancellation).await? {
+            let read;
+            let inventory = match inventory {
+                Some(inventory) => inventory,
+                None => {
+                    read = self.repository.inventory(cancellation).await?;
+                    &read
+                }
+            };
+            for other in inventory {
                 if other.target != row.target {
                     names.remove(&other.target.branch);
                 }

@@ -12,7 +12,7 @@ pub use checks::{
     CHUNK_SIZE, checks_still_pending, is_transient_failure, missing_workflow_scope,
     not_yet_enqueueable, rollup_checks,
 };
-pub use client::{GithubClient, GithubOptions};
+pub use client::{GithubClient, GithubOptions, ROLES};
 pub use mutations::{
     AsyncMergeEndpoint, AsyncMergeOutcome, merge_arm_kind, parse_async_merge_response,
 };

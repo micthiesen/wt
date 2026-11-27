@@ -19,11 +19,12 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use wt_core::{
-    Check, Checks, Landing, OWED_PER_SLUG_MAX, OwedChange, OwedRecord, VerifyStage,
+    Check, Checks, Landing, LeftFor, OWED_PER_SLUG_MAX, OwedChange, OwedRecord, VerifyStage,
     WorktreeEventKind,
-    watch::{Watch, WatchActions, WatchCondition},
+    watch::{Condition, PrGoal, Watch, WatchActions, WatchCondition},
 };
 
 use crate::{
@@ -156,6 +157,7 @@ impl Store {
                     None => return Ok((None, false)),
                 },
             };
+            forget_kept(state, [id]);
             log.best_effort(|log| {
                 if removed && superseded(log, slug)? {
                     return Ok(());
@@ -200,14 +202,33 @@ impl Store {
                 },
                 before_release: step.before_release,
             };
-            let watch =
-                match crate::watches::insert_watch(state, log, new, now_ms, None, &candidates)? {
-                    Ok(watch) => watch,
-                    Err(refusal) => return Ok((Some(Err(refusal)), false)),
-                };
+            // A displaced check put off is still that check: its wake stays
+            // owed on delivery and takes the kept record with it.
+            let is_kept = kept(state).iter().any(|kept| kept.id == id);
+            let watch = match crate::watches::insert_watch_marked(
+                state,
+                log,
+                new,
+                now_ms,
+                None,
+                &candidates,
+                is_kept,
+            )? {
+                Ok(watch) => watch,
+                Err(refusal) => return Ok((Some(Err(refusal)), false)),
+            };
             take_where(state, |entry| {
                 text(entry, "id") == Some(id) && text(entry, "slug") == Some(slug)
             });
+            if let Some(entries) = state.get_mut(KEPT).and_then(Value::as_array_mut) {
+                for entry in entries
+                    .iter_mut()
+                    .filter(|entry| text(entry, "id") == Some(id))
+                {
+                    entry["id"] = Value::String(watch.id.clone());
+                    entry["held"] = Value::String(watch.summary());
+                }
+            }
             log.best_effort(|log| {
                 let when = watch.when_summary();
                 record_step(log, &step, OwedChange::Again, None, Some(by), Some(&when))
@@ -441,6 +462,311 @@ impl Store {
     }
 }
 
+/// A check an earlier `wt next` left owed, which a status write took out of
+/// its stage for another check, and the wake it became.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplacedCheck {
+    pub stage: VerifyStage,
+    /// The landed work the check belongs to.
+    pub left: LeftFor,
+    pub check: Check,
+    pub watch: Watch,
+}
+
+/// `state["keptChecks"]`: one record per displaced check, beside the wake
+/// or due step that carries it. A build from before displaced checks closes
+/// that wake on delivery, with nothing left owed; it carries this key
+/// untouched, so the check can be restored. Only a build that knows the key
+/// removes a record: when the step is closed, cancelled or pushed out.
+const KEPT: &str = "keptChecks";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeptCheck {
+    /// The id of the wake, and of the due step it becomes.
+    id: String,
+    slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    incarnation: Option<String>,
+    stage: VerifyStage,
+    check: Check,
+    /// The step's text: the wake's prompt.
+    what: String,
+    /// What the wake waited for, as a due step says it.
+    held: String,
+    by: String,
+    #[serde(default)]
+    utc_offset_minutes: i32,
+    at_ms: i64,
+    #[serde(flatten)]
+    extra: Map<String, Value>,
+}
+
+fn kept(state: &WtState) -> Vec<KeptCheck> {
+    state
+        .get(KEPT)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| serde_json::from_value(entry.clone()).ok())
+        .collect()
+}
+
+/// Stop keeping the checks of these wake or step ids: a build that knows
+/// them ended each on purpose.
+pub(crate) fn forget_kept<'a>(state: &mut WtState, ids: impl IntoIterator<Item = &'a str>) {
+    let ids: Vec<&str> = ids.into_iter().collect();
+    if ids.is_empty() {
+        return;
+    }
+    if let Some(entries) = state.get_mut(KEPT).and_then(Value::as_array_mut) {
+        entries.retain(|entry| !text(entry, "id").is_some_and(|id| ids.contains(&id)));
+    }
+}
+
+/// Since when the check behind the wake `id` had been due, where it had.
+pub(crate) fn kept_due_since(state: &WtState, id: &str) -> Option<i64> {
+    kept(state)
+        .into_iter()
+        .find(|kept| kept.id == id)?
+        .check
+        .due_since_ms
+}
+
+fn carried(state: &WtState, kept: &KeptCheck) -> bool {
+    crate::watches::wake_pending(state, &kept.id)
+        || entries(state)
+            .iter()
+            .any(|entry| text(entry, "id") == Some(kept.id.as_str()))
+}
+
+/// Whether a kept check has neither its wake nor its due step: an older
+/// build delivered or removed the wake. [`Store::restore_kept_checks`]
+/// settles each.
+pub fn kept_checks_lost(state: &WtState) -> bool {
+    kept(state).iter().any(|kept| !carried(state, kept))
+}
+
+/// Settle every kept check whose wake and step are both gone. One whose
+/// worktree is gone, or whose history says the step was closed, dropped or
+/// cancelled (by a build that does not know this key), is forgotten. Any
+/// other is owed again as a due step with the id it had, due since its
+/// check was, with a history event saying so. Returns the restored steps.
+pub(crate) fn restore_kept(
+    state: &mut WtState,
+    log: &EventLog<'_>,
+    now_ms: i64,
+) -> Result<Vec<OwedRecord>, StoreError> {
+    let lost: Vec<KeptCheck> = kept(state)
+        .into_iter()
+        .filter(|kept| !carried(state, kept))
+        .collect();
+    let mut restored = Vec::new();
+    for kept in lost {
+        let owned = state
+            .get("slugs")
+            .and_then(|slugs| slugs.get(&kept.slug))
+            .is_some()
+            && created_at(state, &kept.slug) == kept.incarnation.as_deref();
+        // An unreadable history proves no ending: the check stays owed.
+        let ended = log.ended(&kept.slug, &kept.id, kept.at_ms).unwrap_or(false);
+        if !owned || ended {
+            forget_kept(state, [kept.id.as_str()]);
+            continue;
+        }
+        let step = OwedRecord {
+            id: kept.id.clone(),
+            slug: kept.slug.clone(),
+            incarnation: kept.incarnation.clone(),
+            by: kept.by.clone(),
+            what: kept.what.clone(),
+            when_text: kept.held.clone(),
+            due_at_ms: kept
+                .check
+                .due_since_ms
+                .map_or(now_ms, |since| since.min(now_ms)),
+            utc_offset_minutes: kept.utc_offset_minutes,
+            unconfirmed: false,
+            before_release: false,
+            extra: Map::new(),
+        };
+        let evicted = push_due(state, &step)?;
+        log.best_effort(|log| {
+            log_incarnation(log, state, &step.slug)?;
+            let mut event = WorktreeEventKind::Owed {
+                id: Some(step.id.clone()),
+                change: OwedChange::Due,
+                what: format!(
+                    "restored, an older wt ended its wake without closing it: {}",
+                    wt_core::watch::headline(&step.what)
+                ),
+                evidence: None,
+                by: None,
+                stage: None,
+                when: None,
+                unconfirmed: false,
+            };
+            crate::bound_worktree_event(&mut event);
+            log.append(&step.slug, &event)?;
+            evicted.iter().try_for_each(|evicted| {
+                let reason = Some("pushed out by a newer step");
+                record_step(log, evicted, OwedChange::Dropped, reason, None, None)
+            })
+        });
+        restored.push(step);
+    }
+    Ok(restored)
+}
+
+/// The wake text of a displaced check. It names the work first, so a
+/// list's one line says whose check it is.
+fn displaced_text(stage: VerifyStage, left: &LeftFor, check: &Check) -> String {
+    format!(
+        "{} {} check: {}\nIt stays owed until it is closed; `wt owed` lists it with the command.",
+        left.label(),
+        stage.as_str(),
+        check.text()
+    )
+}
+
+/// Keep every check `record` is about to replace that an earlier `wt next`
+/// left owed: one `previous` owes with [`Check::left_for`] set, in a stage
+/// where `record` owes other steps that are not that work's. Each becomes
+/// a wake for that work reaching the stage, which stays owed once
+/// delivered, and is kept beside it (see [`KEPT`]). A check the record
+/// drops, closes by ending, or rewrites in place is not replaced and is
+/// left alone.
+///
+/// A wake that cannot be set refuses the whole write, before anything is
+/// set: the check would otherwise be lost without a word.
+pub(crate) fn displace_checks(
+    state: &mut WtState,
+    log: &EventLog<'_>,
+    slug: &str,
+    previous: Option<&WorkStatusRecord>,
+    record: &WorkStatusRecord,
+    utc_offset_minutes: i32,
+) -> Result<Vec<DisplacedCheck>, StoreError> {
+    let Some(previous) = previous else {
+        return Ok(Vec::new());
+    };
+    let replaced: Vec<(VerifyStage, LeftFor, Check)> = previous
+        .open_checks()
+        .into_iter()
+        .filter_map(|(stage, check)| Some((stage, check.left_for()?, check)))
+        .filter(|(stage, left, check)| {
+            record.open_check(*stage).is_some_and(|next| {
+                next.steps != check.steps && next.left_for().as_ref() != Some(left)
+            })
+        })
+        .collect();
+    if replaced.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Err(refusal) = crate::watches::room_for(state, slug, replaced.len()) {
+        let stages = replaced
+            .iter()
+            .map(|(stage, left, _)| format!("the {} check of {}", stage.as_str(), left.label()))
+            .collect::<Vec<_>>()
+            .join(" and ");
+        return Err(StoreError::Io(std::io::Error::other(format!(
+            "{slug} still owes {stages}, which cannot be kept as a step: {refusal}. Close it (wt done <stage> -m \"<evidence>\") or drop it (wt status --no-verify-in-<stage>) first"
+        ))));
+    }
+    let now_ms = crate::store::now_ms();
+    let by = record
+        .by
+        .as_deref()
+        .map(str::trim)
+        .filter(|by| !by.is_empty())
+        .unwrap_or("human");
+    let mut displaced = Vec::new();
+    for (stage, left, check) in replaced {
+        let reached = match &left {
+            LeftFor::Pr(number) => Condition::Pr {
+                number: *number,
+                goal: PrGoal::Reached(stage),
+            },
+            LeftFor::Commit(oid) => Condition::Commit {
+                oid: oid.clone(),
+                stage,
+            },
+        };
+        let mut when = vec![WatchCondition::new(reached, None)];
+        if let Some(at_ms) = check.not_before_ms.filter(|at| *at > now_ms) {
+            when.push(WatchCondition::new(Condition::At { at_ms }, None));
+        }
+        let what = displaced_text(stage, &left, &check);
+        let new = NewWatch {
+            slug: slug.to_owned(),
+            by: by.to_owned(),
+            utc_offset_minutes,
+            when,
+            then: WatchActions {
+                wake: Some(what.clone()),
+                ..WatchActions::default()
+            },
+            before_release: false,
+        };
+        let candidates = crate::watches::candidate_ids()?;
+        let watch = match crate::watches::insert_watch_marked(
+            state,
+            log,
+            new,
+            now_ms,
+            None,
+            &candidates,
+            true,
+        )? {
+            Ok(watch) => watch,
+            // The same write, made again: its wake already holds the check.
+            Err(WatchRefusal::AlreadySet { watch }) => *watch,
+            Err(refusal) => {
+                return Err(StoreError::Io(std::io::Error::other(format!(
+                    "{slug} still owes the {} check of {}, which cannot be kept as a step: {refusal}",
+                    stage.as_str(),
+                    left.label()
+                ))));
+            }
+        };
+        forget_kept(state, [watch.id.as_str()]);
+        array_mut(state, KEPT).push(serde_json::to_value(KeptCheck {
+            id: watch.id.clone(),
+            slug: slug.to_owned(),
+            incarnation: watch.incarnation.clone(),
+            stage,
+            check: check.clone(),
+            what,
+            held: watch.summary(),
+            by: by.to_owned(),
+            utc_offset_minutes,
+            at_ms: now_ms,
+            extra: Map::new(),
+        })?);
+        log.best_effort(|log| {
+            let mut event = WorktreeEventKind::Owed {
+                id: Some(watch.id.clone()),
+                change: OwedChange::Again,
+                what: wt_core::watch::headline(&check.steps),
+                evidence: None,
+                by: author(Some(by)),
+                stage: Some(stage.as_str().to_owned()),
+                when: Some(watch.when_summary()),
+                unconfirmed: false,
+            };
+            crate::bound_worktree_event(&mut event);
+            log.append(slug, &event)
+        });
+        displaced.push(DisplacedCheck {
+            stage,
+            left,
+            check,
+            watch,
+        });
+    }
+    Ok(displaced)
+}
+
 /// Date the checks a status begins to owe. A check the previous status
 /// already owed with the same steps is the same check and keeps its date;
 /// one owed again after it was closed is a new one, and is prompted for
@@ -548,6 +874,48 @@ fn told_key(item: &wt_core::OwedItem) -> Option<String> {
 }
 
 impl Store {
+    /// The worktree is leaving landed work for its next pull request
+    /// (`wt next`): mark every check it still owes, and that no earlier
+    /// work already claims, as that work's. Returns the checks marked.
+    pub fn leave_checks(
+        &mut self,
+        slug: &str,
+        left: &LeftFor,
+    ) -> Result<Vec<(VerifyStage, Check)>, StoreError> {
+        self.mutate_wt_state(|state| {
+            let Some(previous) = stored_work_status(state, slug) else {
+                return Ok((Vec::new(), false));
+            };
+            let mut checks = previous.open_checks();
+            let mut marked = Vec::new();
+            for (stage, check) in &mut checks {
+                if check.left_for().is_none() {
+                    check.set_left_for(Some(left.clone()));
+                    marked.push((*stage, check.clone()));
+                }
+            }
+            if marked.is_empty() {
+                return Ok((marked, false));
+            }
+            let mut next = previous.clone();
+            next.set_checks(checks);
+            write_work_status(state, slug, Some(&previous), Some(&next))?;
+            Ok((marked, true))
+        })
+    }
+
+    /// Owe again, as due steps, the displaced checks whose wake a build
+    /// from before them delivered and closed; see [`kept_checks_lost`].
+    /// Returns the restored steps.
+    pub fn restore_kept_checks(&mut self, now_ms: i64) -> Result<Vec<OwedRecord>, StoreError> {
+        self.mutate_wt_state_logged(|state, log| {
+            let before = state.get(KEPT).cloned();
+            let restored = restore_kept(state, log, now_ms)?;
+            let changed = !restored.is_empty() || state.get(KEPT) != before.as_ref();
+            Ok((restored, changed))
+        })
+    }
+
     /// Record when each of these checks was first seen due, with a history
     /// event. A check already dated is left alone, unless it is due for a
     /// later pull request than the one it was dated for: then it is a new
@@ -858,6 +1226,7 @@ pub(crate) fn push_due(
             .iter()
             .any(|evicted| text(entry, "id") == Some(evicted.id.as_str()))
     });
+    forget_kept(state, evicted.iter().map(|evicted| evicted.id.as_str()));
     entries_mut(state).push(serde_json::to_value(step)?);
     Ok(evicted)
 }

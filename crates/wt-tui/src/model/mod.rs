@@ -44,7 +44,7 @@ pub use interaction::{
     TitlePrompt,
 };
 pub(crate) use interaction::{digit_rows, overlay_scroll};
-pub(crate) use selection::VisualItem;
+pub(crate) use selection::{ListAnchor, VisualItem};
 
 /// How a footer toast reads: plain feedback, a notice that the key had
 /// nothing to act on (yellow), or a failure.
@@ -164,6 +164,19 @@ pub struct Model {
     /// The list viewport was scrolled independently of the cursor (mouse
     /// wheel, or `j`/`k` pressed at an edge). Any cursor move clears it.
     pub list_free_scroll: bool,
+    /// Written by each list draw and dropped by any key or wheel event, so
+    /// it is only ever used to redraw a board that changed on its own.
+    pub(crate) list_anchor: Option<ListAnchor>,
+    /// A refreshed board arrived since the last draw: hold the anchor's line.
+    pub(crate) list_reanchor: bool,
+    /// The cursor just opened a section: bring its rows into view.
+    pub(crate) list_reveal: bool,
+    /// Lines the list pane had in the last drawn frame; 0 before the first.
+    pub(crate) list_height: usize,
+    /// The furthest the last drawn list could scroll, unbounded before the
+    /// first draw. Wheel events that share a frame clamp to it, so a
+    /// reversal at the end still counts.
+    pub(crate) list_max_offset: usize,
     /// Mouse drag selection, in screen cells, while a button is held.
     pub(crate) mouse_selection: Option<crate::mouse::Selection>,
     /// Screen cells the last frame showed as links. Written by the driver
@@ -239,6 +252,11 @@ impl Default for Model {
             log_close_key: None,
             log_refresh: None,
             list_free_scroll: false,
+            list_anchor: None,
+            list_reanchor: false,
+            list_reveal: false,
+            list_height: 0,
+            list_max_offset: usize::MAX,
             mouse_selection: None,
             hyperlinks: Vec::new(),
             refresh_wave: Default::default(),

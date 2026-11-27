@@ -6,12 +6,12 @@
 //! section that has a matching entry.
 pub(crate) const LINES: &[&str] = &[
     "Navigation",
-    "  j / k, arrows      Move cursor; at an edge, scroll the list",
+    "  j / k, arrows      Move cursor",
     "  g / G, Home / End  First / last item",
     "  PgUp / PgDn        Move half a page",
     "  Space              Next row needing you (status, checks, review, failed action)",
     "  Tab                Fold / unfold the section under the cursor",
-    "  Ctrl+D / Ctrl+U    Next / previous section",
+    "  Ctrl+D / Ctrl+U    Next section / start of this one, then previous",
     "  Ctrl+J / Ctrl+K    Scroll details",
     "",
     "Worktree",

@@ -23,7 +23,12 @@ about to investigate may already have a known signature there.
   configuration's log directory (`wt-native.YYYY-MM-DD.log`). These measure
   input receipt through terminal draw completion; no restart flag is needed.
   They exclude terminal transport before input receipt and physical display
-  latency. The renderer is `crates/wt-tui/src/terminal.rs`.
+  latency. `coalesced` counts input events that shared a frame with an
+  earlier one: high values mean frames cost more than the gap between
+  events. The renderer is `crates/wt-tui/src/terminal.rs`.
+- For the CPU cost of one frame, run `cargo test -p wt-tui --release
+  frame_cost -- --ignored --nocapture`: it steps the cursor through a
+  60 and a 150 row board and prints per-frame and per-pane times.
 - Use `scripts/native-ui-check.py --binary target/debug/wt --sections
   --output /tmp/<unique-fixture>` for an isolated PTY check with delayed Git,
   external edits, metadata-only writes, and shutdown. Its key-to-output sample

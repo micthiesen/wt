@@ -83,8 +83,8 @@ nothing is finished; the note never holds owed work:
 
 - Any other step, never a check: `wt wake <condition> -m "<step>"`, with
   `--before-release` when it must precede the next production release.
-- Each stage holds one check; a second check for the same stage (a later PR
-  of this worktree) is a wake step: `wt wake pr:<n>:<stage> -m "<steps>"`.
+- A stage's check is the current PR's. After `wt next`, other steps there keep
+  the earlier PR's check as a step (`wt done <id>`); the same steps reuse it.
 - A due check, and a wake delivered after the work merged, stay owed (and hold
   off cleanup) until closed, even when moot: do it on a deploy that contains
   the change, then `wt done <id|staging|production> -m "<evidence>"`.

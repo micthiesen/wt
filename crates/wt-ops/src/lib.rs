@@ -14,6 +14,7 @@ pub mod fork_base;
 pub mod host_cleanup;
 pub mod install;
 pub mod lifecycle_ops;
+pub mod maintenance;
 pub mod managed;
 pub mod merge_arm;
 pub mod origin;

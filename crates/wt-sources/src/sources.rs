@@ -356,7 +356,9 @@ fn compose(
             if pr.state == "OPEN" {
                 row.needs_attention |= pr.checks == PrChecks::Fail
                     || pr.review == PrReview::ChangesRequested
-                    || pr.unresolved_threads > 0;
+                    || pr.unresolved_threads > 0
+                    // Threads left unread may be unresolved ones.
+                    || pr.unresolved_threads_more;
             }
         }
     }

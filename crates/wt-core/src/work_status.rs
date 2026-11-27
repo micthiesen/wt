@@ -243,6 +243,16 @@ pub struct Check {
     /// The merged pull request the check came due for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_pr: Option<u64>,
+    /// The merged pull request the worktree left with this check still
+    /// owed (`wt next`). Such a check belongs to that pull request: a
+    /// different check set in its stage does not replace it. Asserting the
+    /// same steps again takes it up for the current pull request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_pr: Option<u64>,
+    /// [`Self::for_pr`] for work that landed with no pull request to
+    /// name: the landed head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_commit: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -256,6 +266,8 @@ impl Check {
             since_ms: None,
             due_since_ms: None,
             due_pr: None,
+            for_pr: None,
+            for_commit: None,
             extra: BTreeMap::new(),
         }
     }
@@ -278,6 +290,22 @@ impl Check {
             .filter(|lines| lines.contains('\n') && sanitize_work_note(lines) == self.steps);
     }
 
+    /// The landed work an earlier `wt next` left this check for.
+    pub fn left_for(&self) -> Option<LeftFor> {
+        self.for_pr
+            .map(LeftFor::Pr)
+            .or_else(|| self.for_commit.clone().map(LeftFor::Commit))
+    }
+
+    /// Mark the check as left for `work`, or as the current work's own.
+    pub fn set_left_for(&mut self, work: Option<LeftFor>) {
+        (self.for_pr, self.for_commit) = match work {
+            Some(LeftFor::Pr(number)) => (Some(number), None),
+            Some(LeftFor::Commit(oid)) => (None, Some(oid)),
+            None => (None, None),
+        };
+    }
+
     /// Since when the check has been due, where that was recorded: when it
     /// was first seen due, or the time it was put off to when that is later.
     pub fn due_at_ms(&self) -> Option<i64> {
@@ -288,6 +316,25 @@ impl Check {
     /// Whether the check was put off to a time that has not come.
     pub fn deferred(&self, now_ms: i64) -> bool {
         self.not_before_ms.is_some_and(|at| at > now_ms)
+    }
+}
+
+/// Landed work a worktree moved on from with a check still owed for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeftFor {
+    /// A merged pull request.
+    Pr(u64),
+    /// A head that landed without a pull request to name.
+    Commit(String),
+}
+
+impl LeftFor {
+    /// How lists name it: `#7`, or the commit's short id.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Pr(number) => format!("#{number}"),
+            Self::Commit(oid) => oid.chars().take(7).collect(),
+        }
     }
 }
 
@@ -657,14 +704,32 @@ impl WorkStatusRecord {
     }
 
     /// Owe a check in `stage` with these steps, leaving any other stage's
-    /// check alone. The same steps keep a not-before the check had; new
+    /// check alone. The same steps keep a not-before the check had, and
+    /// take a check left from an earlier pull request up for this one; new
     /// steps are a new check.
     pub fn set_check(&mut self, stage: VerifyStage, steps: impl Into<String>) {
         let steps = steps.into();
-        self.edit_checks(|checks| {
-            if checks.get(stage).is_none_or(|check| check.steps != steps) {
+        self.edit_checks(|checks| match checks.take(stage) {
+            Some(mut check) if check.steps == steps => {
+                check.set_left_for(None);
+                checks.set(stage, check);
+            }
+            _ => {
                 checks.set(stage, Check::new(steps));
             }
+        });
+    }
+
+    /// Rewrite the steps of the check owed in `stage` in place: the same
+    /// check, with its dates and the work it was left for, as someone
+    /// editing it means. With none owed there this is [`Self::set_check`].
+    pub fn reword_check(&mut self, stage: VerifyStage, steps: impl Into<String>) {
+        let steps = steps.into();
+        self.edit_checks(|checks| {
+            let mut check = checks.take(stage).unwrap_or_default();
+            check.steps = steps;
+            check.text = None;
+            checks.set(stage, check);
         });
     }
 
@@ -2025,6 +2090,60 @@ mod tests {
         );
         ready.set_check(STAGING, "open the other page");
         assert_eq!(ready.open_check(STAGING).unwrap().not_before_ms, None);
+    }
+
+    #[test]
+    fn a_check_left_from_an_earlier_pull_request_says_so_until_it_is_asserted_again() {
+        let stored = serde_json::json!({
+            "state": "ready", "at": AT,
+            "checks": {
+                "staging": { "steps": "open the page", "forPr": 7, "dueSinceMs": 5 },
+                "production": { "steps": "watch the logs", "forPr": 7 },
+            },
+        });
+        let left = parse_work_status(&stored).unwrap();
+        assert_eq!(left.open_check(STAGING).unwrap().for_pr, Some(7));
+        // A build that does not know the key carries it through its writes.
+        #[derive(Serialize, Deserialize)]
+        struct OldCheck {
+            steps: String,
+            #[serde(flatten)]
+            extra: BTreeMap<String, Value>,
+        }
+        let old: OldCheck = serde_json::from_value(
+            serde_json::to_value(left.open_check(STAGING).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&old).unwrap()["forPr"], 7);
+        // A status that only carries it leaves it as it is.
+        let mut carried = record(WorkState::Ready);
+        carried.carry_checks(&left);
+        assert_eq!(carried.open_check(STAGING).unwrap().for_pr, Some(7));
+        // The same steps asserted again are this pull request's check now,
+        // with the dates it had; the other stage's check is not touched.
+        carried.set_check(STAGING, "open the page");
+        let taken_up = carried.open_check(STAGING).unwrap();
+        assert_eq!((taken_up.for_pr, taken_up.due_since_ms), (None, Some(5)));
+        assert_eq!(carried.open_check(PRODUCTION).unwrap().for_pr, Some(7));
+        // Rewritten in place it is the same check, still that pull request's.
+        carried.reword_check(PRODUCTION, "watch the logs closely");
+        let reworded = carried.open_check(PRODUCTION).unwrap();
+        assert_eq!(reworded.steps, "watch the logs closely");
+        assert_eq!(reworded.left_for(), Some(LeftFor::Pr(7)));
+        // Other steps are another check, which was never left anywhere.
+        carried.set_check(PRODUCTION, "watch the other logs");
+        assert_eq!(carried.open_check(PRODUCTION).unwrap().left_for(), None);
+        // Work that landed without a pull request is named by its head.
+        let mut bare = Check::new("open the page");
+        bare.set_left_for(Some(LeftFor::Commit("0123456789abcdef".into())));
+        assert_eq!(
+            (bare.for_pr, bare.left_for().unwrap().label().as_str()),
+            (None, "0123456")
+        );
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap()["forCommit"],
+            "0123456789abcdef"
+        );
     }
 
     #[test]

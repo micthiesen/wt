@@ -5,6 +5,23 @@ use std::path::Path;
 use crate::commands::resolve::run_git;
 use wt_app_core::context::AppContext;
 
+/// Checkout statuses a one-shot command reads at once: the process runner's
+/// own bound. The board keeps the repository's lower default because it
+/// rereads for as long as it runs.
+const COMMAND_STATUS_READS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
+
+/// Every checkout with its Git status, for a command that reads them once
+/// and exits.
+pub async fn inventory_status(
+    context: &AppContext,
+) -> Result<Vec<wt_vcs::WorktreeSnapshot>, wt_vcs::RepositoryError> {
+    (*context.repository)
+        .clone()
+        .with_max_concurrent_status(COMMAND_STATUS_READS)
+        .inventory_status(&context.cancellation)
+        .await
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PushFacts {
     pub unpushed: Option<u64>,

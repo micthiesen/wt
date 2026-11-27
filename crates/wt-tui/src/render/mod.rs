@@ -2,6 +2,8 @@
 //! Rendering reads only the prepared snapshot and model state.
 
 pub(crate) mod details;
+#[cfg(test)]
+pub(crate) mod frame_cost;
 mod list;
 mod overlays;
 pub(crate) use overlays::automation_line_count;

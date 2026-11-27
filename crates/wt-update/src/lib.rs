@@ -9,6 +9,7 @@ mod channel;
 mod engine;
 mod installer;
 mod paths;
+mod prune;
 mod state;
 mod store;
 
@@ -21,6 +22,7 @@ pub use channel::{Channel, ReleaseRepository};
 pub use engine::{BootTransitionError, InstallError, InstallManager};
 pub use installer::{InstallOutcome, InstallerError, activate_existing, install_verified};
 pub use paths::{InstallPaths, PathError, VersionId, validate_component};
+pub use prune::{KEEP_NEWEST_VERSIONS, prunable_versions, prune_versions};
 pub use state::{
     InstallState, PendingBoot, StateError, StateHistoryEntry, UpdateOffer, update_check_due,
     update_offer,

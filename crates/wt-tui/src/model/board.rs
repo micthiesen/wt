@@ -926,6 +926,8 @@ pub struct PrPresentation {
     pub reviewers: Vec<String>,
     pub review_bot: Option<ReviewBotView>,
     pub unresolved_threads: u32,
+    /// GitHub has more threads than were read, so the count is a lower bound.
+    pub unresolved_threads_more: bool,
     pub merge_queue: Option<MergeQueueView>,
     pub auto_merge_armed: bool,
     pub comments: Vec<PrCommentView>,

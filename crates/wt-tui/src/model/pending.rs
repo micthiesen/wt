@@ -25,6 +25,7 @@ impl Model {
         self.local_domains = snapshot.domains().clone();
         if let Some(board) = snapshot.data() {
             self.source_board = board.clone();
+            self.list_reanchor = true;
             self.reproject(tokio::time::Instant::now());
         }
     }

@@ -22,8 +22,9 @@ use wt_app_core::context::AppContext;
 
 /// Network reads of GitHub, measured from the prior read's start.
 const GITHUB_MINIMUM: Duration = Duration::from_secs(10);
-/// A direct read at least this long is logged at info level.
-const SLOW_READ: Duration = Duration::from_secs(5);
+/// A direct read at least this long is logged at info level. An ordinary
+/// read of a few dozen branches takes six to ten seconds.
+const SLOW_READ: Duration = Duration::from_secs(15);
 /// Rereads of the events daemon's local snapshot file.
 const DAEMON_MINIMUM: Duration = Duration::from_millis(100);
 
@@ -173,6 +174,12 @@ struct LaneClock {
     /// The floor between background network reads that the latest budget
     /// reading asks for, when that is longer than [`GITHUB_MINIMUM`].
     pace: Option<Duration>,
+    /// The budget windows the reads so far reported: the pace follows the
+    /// one with the least left, not the one the latest read happened to see.
+    budget: wt_events::BudgetWindows,
+    /// The daemon file version whose scoped reads were last merged into the
+    /// shown data.
+    merged_daemon: Option<u64>,
 }
 
 /// What one fetch does.
@@ -213,8 +220,22 @@ impl LaneClock {
                 (None, Some(_)) => false,
             };
             if !newer && same_branches {
-                // Fresh daemon data exists and the shown data is newer still.
-                return Plan::Skip;
+                // Fresh daemon data exists and the shown data is newer still,
+                // except for branches the daemon has read again since.
+                if self.merged_daemon == Some(read.written_ms) {
+                    return Plan::Skip;
+                }
+                self.merged_daemon = Some(read.written_ms);
+                let merged = match (&self.shown, self.live_observed) {
+                    (Some(shown), Some(live)) => merge_newer(shown, &read, live),
+                    _ => None,
+                };
+                let Some((data, observed)) = merged else {
+                    return Plan::Skip;
+                };
+                self.pace_by(data.rate_limit);
+                self.shown = Some((data.clone(), observed));
+                return Plan::Publish(Fetched::new(data, observed));
             }
             let version = (read.written_ms, branches.to_vec());
             if self.served_daemon.as_ref() == Some(&version) {
@@ -278,10 +299,17 @@ impl LaneClock {
     /// Pace background reads by the budget a read just reported.
     fn pace_by(&mut self, rate: Option<wt_github::RateLimit>) {
         let floor = u64::try_from(GITHUB_MINIMUM.as_millis()).unwrap_or(u64::MAX);
+        let now = epoch_ms();
+        let budget = match rate {
+            Some(rate) => self.budget.observe(wt_ops::events::rate_budget(rate), now),
+            // A server that reports no budget has none to keep to.
+            None => {
+                self.budget = wt_events::BudgetWindows::default();
+                None
+            }
+        };
         self.pace = Some(Duration::from_millis(wt_events::paced_interval_ms(
-            floor,
-            rate.map(wt_ops::events::rate_budget),
-            epoch_ms(),
+            floor, budget, now,
         )));
     }
 
@@ -305,6 +333,9 @@ impl LaneClock {
         self.live_observed = Some(started);
         self.published = Some(branches);
         self.shown = Some((data.clone(), Stamp::at(started)));
+        // This read may have begun before a scoped read the daemon's file
+        // already holds, and has just replaced what was merged from it.
+        self.merged_daemon = None;
     }
 }
 
@@ -342,6 +373,34 @@ fn merge_older(
     // The shown read's repository-wide merge queue is the newer one.
     data.covered_branches = branches.iter().cloned().collect();
     (data, observed)
+}
+
+/// The shown data with the branches the daemon has read again since the
+/// shown read began at `live`: each takes the daemon's newer answer, a
+/// missing pull request included. Every other branch, and the merge queue,
+/// stay as the shown read left them, and so does its stamp: nothing here is
+/// older than that read, and nothing claims to be newer. `None` when the
+/// daemon has nothing newer or it changes nothing.
+fn merge_newer(
+    (shown, shown_at): &(GithubData, Stamp),
+    read: &DaemonRead,
+    live: Instant,
+) -> Option<(GithubData, Stamp)> {
+    let mut data = shown.clone();
+    for (branch, read_at) in &read.scoped {
+        if *read_at < live || !shown.covered_branches.contains(branch) {
+            continue;
+        }
+        match read.data.prs.get(branch) {
+            Some(pr) => data.prs.insert(branch.clone(), pr.clone()),
+            None => data.prs.remove(branch),
+        };
+    }
+    if data.prs == shown.prs {
+        return None;
+    }
+    data.rate_limit = read.data.rate_limit.or(shown.rate_limit);
+    Some((data, *shown_at))
 }
 
 impl GithubLane {
@@ -448,11 +507,12 @@ impl GithubLane {
             finished: Some(Stamp::now()),
         });
         let failed = result.as_ref().err().map(ToString::to_string);
+        let started_at = started_at(elapsed);
         if elapsed >= SLOW_READ {
             tracing::info!(
                 branches = branches.len(),
                 elapsed_ms = elapsed.as_millis() as u64,
-                ?started,
+                started_at,
                 error = failed.as_deref(),
                 "slow GitHub read"
             );
@@ -460,7 +520,7 @@ impl GithubLane {
             tracing::debug!(
                 branches = branches.len(),
                 elapsed_ms = elapsed.as_millis() as u64,
-                ?started,
+                started_at,
                 error = failed.as_deref(),
                 "GitHub read"
             );
@@ -585,6 +645,18 @@ async fn has_workflows(root: &Path) -> bool {
             }
         }
     }
+}
+
+/// When a read that has run for `elapsed` began, as a UTC time of day.
+fn started_at(elapsed: Duration) -> String {
+    let ms = epoch_ms().saturating_sub(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .ok()
+        .and_then(|at| {
+            at.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| ms.to_string())
 }
 
 fn epoch_ms() -> u64 {
@@ -806,6 +878,7 @@ mod tests {
         DaemonRead {
             data: GithubData::default(),
             started,
+            scoped: Default::default(),
             written_ms,
         }
     }
@@ -1025,6 +1098,159 @@ mod tests {
         assert!(!fetched.data.prs["feature"].is_draft);
         assert!(!fetched.data.prs.contains_key("another"));
         assert_eq!(fetched.observed, Stamp::at(live));
+    }
+
+    /// After a live read, the daemon's snapshot is older as a whole, but a
+    /// branch whose check finished since has been read again on its own.
+    /// That branch takes the daemon's newer answer; every other branch and
+    /// the stamp stay the live read's, so the result confirms nothing the
+    /// live read did not, and no branch goes back to an older answer.
+    #[tokio::test(start_paused = true)]
+    async fn branches_the_daemon_read_again_after_a_live_read_are_merged_without_a_newer_stamp() {
+        use crate::github_actions::tests::pr;
+        let branches = vec!["feature".to_owned(), "other".to_owned()];
+        let mut clock = LaneClock::default();
+        let swept = Instant::now();
+        let live = swept + Duration::from_secs(5);
+        let mut live_data = GithubData::default();
+        let mut feature = pr("feature");
+        feature.is_draft = false;
+        live_data.prs.insert("feature".into(), feature);
+        let mut other = pr("other");
+        other.is_draft = false;
+        live_data.prs.insert("other".into(), other);
+        live_data.covered_branches = branches.iter().cloned().collect();
+        clock.live_read(live, branches.clone(), &live_data);
+
+        // The daemon's sweep predates the live read and still shows both as
+        // drafts. Its scoped read of `feature` began after the live read
+        // and found a different head.
+        let snapshot = |written_ms, feature_read: Option<Instant>, head: Option<&str>| {
+            let mut read = daemon(Some(swept), written_ms);
+            if let Some(head) = head {
+                let mut feature = pr("feature");
+                feature.head_ref_oid = Some(head.into());
+                read.data.prs.insert("feature".into(), feature);
+            }
+            read.data.prs.insert("other".into(), pr("other"));
+            read.data.covered_branches = branches.iter().cloned().collect();
+            read.scoped = feature_read
+                .map(|at| ("feature".to_owned(), at))
+                .into_iter()
+                .collect();
+            read
+        };
+        let after = live + Duration::from_secs(20);
+        let Plan::Publish(fetched) = clock.plan(input(
+            &branches,
+            Some(snapshot(1_000, Some(after), Some("cafe"))),
+            after,
+        )) else {
+            panic!("the branch read again is published");
+        };
+        assert_eq!(
+            fetched.data.prs["feature"].head_ref_oid.as_deref(),
+            Some("cafe")
+        );
+        assert!(
+            !fetched.data.prs["other"].is_draft,
+            "the live read regressed"
+        );
+        assert_eq!(fetched.observed, Stamp::at(live));
+        // The same file is not merged twice.
+        assert!(matches!(
+            clock.plan(input(
+                &branches,
+                Some(snapshot(1_000, Some(after), Some("cafe"))),
+                after
+            )),
+            Plan::Skip
+        ));
+        // A direct read that began before the scoped read finishes after
+        // it and replaces the shown data with its older answer. The same
+        // file is then merged again.
+        clock.live_read(after - Duration::from_secs(1), branches.clone(), &live_data);
+        let Plan::Publish(fetched) = clock.plan(input(
+            &branches,
+            Some(snapshot(1_000, Some(after), Some("cafe"))),
+            after,
+        )) else {
+            panic!("the scoped read is merged over the slower direct read");
+        };
+        assert_eq!(
+            fetched.data.prs["feature"].head_ref_oid.as_deref(),
+            Some("cafe")
+        );
+        assert_eq!(fetched.observed, Stamp::at(after - Duration::from_secs(1)));
+        // A scoped read that found no pull request removes the branch's.
+        let Plan::Publish(fetched) = clock.plan(input(
+            &branches,
+            Some(snapshot(2_000, Some(after), None)),
+            after,
+        )) else {
+            panic!("the closed branch is published");
+        };
+        assert!(!fetched.data.prs.contains_key("feature"));
+        assert!(fetched.data.prs.contains_key("other"));
+        assert_eq!(fetched.observed, Stamp::at(after - Duration::from_secs(1)));
+
+        // A scoped read that began before the live read is older than what
+        // is shown, and a snapshot with none changes nothing.
+        let mut clock = LaneClock::default();
+        clock.live_read(live, branches.clone(), &live_data);
+        let before = live - Duration::from_secs(1);
+        assert!(matches!(
+            clock.plan(input(
+                &branches,
+                Some(snapshot(3_000, Some(before), Some("cafe"))),
+                after
+            )),
+            Plan::Skip
+        ));
+        assert!(matches!(
+            clock.plan(input(
+                &branches,
+                Some(snapshot(4_000, None, Some("cafe"))),
+                after
+            )),
+            Plan::Skip
+        ));
+    }
+
+    /// The pace follows the window with the least left, also when a later
+    /// read reports only the roomier one.
+    #[tokio::test(start_paused = true)]
+    async fn the_pace_keeps_to_the_window_that_runs_out_first() {
+        let branches = branches();
+        let rate = |remaining, reset_in: Duration| GithubData {
+            rate_limit: Some(wt_github::RateLimit {
+                limit: 5_000,
+                remaining,
+                cost: 5,
+                reset_at_ms: epoch_ms() + reset_in.as_millis() as u64,
+            }),
+            ..GithubData::default()
+        };
+        let start = Instant::now();
+        let mut clock = LaneClock {
+            live_started: Some(start),
+            ..LaneClock::default()
+        };
+        clock.live_read(
+            start,
+            branches.clone(),
+            &rate(800, Duration::from_secs(20 * 60)),
+        );
+        clock.live_read(
+            start,
+            branches.clone(),
+            &rate(4_900, Duration::from_secs(40 * 60)),
+        );
+        let later = start + Duration::from_secs(5 * 60);
+        assert!(matches!(
+            clock.plan(input(&branches, None, later)),
+            Plan::Defer
+        ));
     }
 
     #[tokio::test(start_paused = true)]

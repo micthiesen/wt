@@ -208,6 +208,53 @@ impl GithubClient {
         Ok((!login.is_empty()).then_some(login))
     }
 
+    /// The GraphQL budget windows GitHub counts this token against right
+    /// now, soonest reset first, from `probes` queries for `rateLimit`
+    /// alone, which cost no points. GitHub answers each from one window, so
+    /// a few probes may still miss one. For diagnostics: reads report their
+    /// own budget.
+    pub async fn budget_windows(
+        &self,
+        probes: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RateLimit>, GithubError> {
+        let query = format!("query={{ {RATE_LIMIT_FIELD} }}");
+        let replies: Vec<Result<Option<RateLimit>, GithubError>> =
+            stream::iter((0..probes).map(|_| async {
+                let out = self
+                    .run(["api", "graphql", "-f", &query], cancellation)
+                    .await?;
+                if !out.status.success() {
+                    return Err(classify_output(&out));
+                }
+                let reply: Value = serde_json::from_slice(&out.stdout)
+                    .map_err(|e| GithubError::Protocol(format!("invalid rateLimit JSON: {e}")))?;
+                Ok(parse_rate_limit(&reply))
+            }))
+            .buffer_unordered(MAX_CHUNK_CONCURRENCY)
+            .collect()
+            .await;
+        let mut windows = std::collections::BTreeMap::new();
+        let mut failure = None;
+        for reply in replies {
+            match reply {
+                Ok(Some(rate)) => {
+                    let seen = windows.entry(rate.reset_at_ms).or_insert(rate);
+                    seen.remaining = seen.remaining.min(rate.remaining);
+                }
+                Ok(None) => {}
+                Err(error) => failure = Some(error),
+            }
+        }
+        match failure {
+            Some(error) if windows.is_empty() => Err(error),
+            _ => Ok(windows
+                .into_values()
+                .map(|rate| RateLimit { cost: 0, ..rate })
+                .collect()),
+        }
+    }
+
     pub async fn fetch_worktrees(
         &self,
         branches: &[String],
@@ -242,9 +289,12 @@ impl GithubClient {
                 spend(&mut data.rate_limit, chunk.data.rate_limit);
                 unread.append(&mut chunk.unread);
             }
-            // The batched query leaves thread authors out (they were most of
-            // its cost). A failure here fails the whole read like a chunk's.
+            // The batched query reads one page of threads and leaves their
+            // authors out (they were most of its cost). A failed author
+            // read fails the whole read like a chunk's.
             if !unread.is_empty() {
+                let spent = self.read_more_threads(&mut unread, &cancel).await?;
+                spend(&mut data.rate_limit, spent);
                 let spent = self.read_thread_authors(&mut unread, &cancel).await?;
                 spend(&mut data.rate_limit, spent);
                 for node in &unread {
@@ -271,9 +321,72 @@ impl GithubClient {
             remaining = data.rate_limit.map(|rate| rate.remaining),
             limit = data.rate_limit.map(|rate| rate.limit),
             elapsed_ms = started.elapsed().as_millis() as u64,
+            role = process_role(),
+            pid = std::process::id(),
             "GitHub fetch"
         );
         Ok(data)
+    }
+
+    /// Read the review threads past the first page of each open pull
+    /// request in `nodes` that has more, up to [`THREADS_PER_PR_MAX`]
+    /// threads each. Only a rate limit or a cancellation fails the read.
+    /// After any other failure a pull request keeps the threads read so far
+    /// and still says more follow, so its counts are lower bounds: the page
+    /// is a refinement, and the batched answer stands without it.
+    async fn read_more_threads(
+        &self,
+        nodes: &mut [Value],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RateLimit>, GithubError> {
+        let mut spent = None;
+        // Each round reads one page per pull request; the cap bounds them.
+        for _ in 0..=THREADS_PER_PR_MAX / THREAD_PAGE {
+            let pending: Vec<(usize, (String, String, usize))> = nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, node)| str_at(node, "/state") == Some("OPEN"))
+                .filter_map(|(index, node)| {
+                    let (id, cursor, first) = next_thread_page(node)?;
+                    Some((index, (id.to_owned(), cursor.to_owned(), first)))
+                })
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for group in pending.chunks(THREAD_PAGE_PRS) {
+                let asked: Vec<_> = group.iter().map(|(_, page)| page.clone()).collect();
+                let query = more_threads_query(&asked);
+                let read = self
+                    .graphql_read(&query, &[], cancellation, Reply::Clean, |bytes, _| {
+                        parse_more_threads(bytes, asked.len())
+                    })
+                    .await;
+                match read {
+                    Ok((pages, rate)) => {
+                        spend(&mut spent, rate);
+                        for ((index, _), page) in group.iter().zip(pages) {
+                            append_threads(&mut nodes[*index], page);
+                        }
+                    }
+                    Err(error)
+                        if matches!(error, GithubError::RateLimit { .. })
+                            || cancellation.is_cancelled() =>
+                    {
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            pull_requests = group.len(),
+                            "cannot read more review threads; thread counts are lower bounds"
+                        );
+                        return Ok(spent);
+                    }
+                }
+            }
+        }
+        Ok(spent)
     }
 
     /// Fill in the first comment's author of every thread in `nodes` that
@@ -472,6 +585,34 @@ impl GithubClient {
             };
         }
         parse_live_pr(&out.stdout).map(Some)
+    }
+
+    /// Which of the pull requests `ids` (node IDs) sit in the merge queue.
+    /// One read for all of them; an answer that leaves any out is an error,
+    /// never "not queued".
+    pub async fn queued_pull_requests(
+        &self,
+        ids: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<std::collections::BTreeSet<String>, GithubError> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        let query = "query($ids: [ID!]!) { nodes(ids:$ids) { ... on PullRequest { id mergeQueueEntry { id } } } }";
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".to_owned(),
+            "-f".to_owned(),
+            format!("query={query}"),
+        ];
+        for id in ids {
+            args.extend(["-f".to_owned(), format!("ids[]={id}")]);
+        }
+        let out = self.run(args, cancellation).await?;
+        if !out.status.success() {
+            return Err(classify_output(&out));
+        }
+        parse_queued_pull_requests(&out.stdout, ids)
     }
 
     /// How each named pull request ended, in one request. A number the
@@ -1583,6 +1724,41 @@ fn parse_live_pr(bytes: &[u8]) -> Result<LivePrInfo, GithubError> {
     })
 }
 
+fn parse_queued_pull_requests(
+    bytes: &[u8],
+    ids: &[String],
+) -> Result<std::collections::BTreeSet<String>, GithubError> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|e| GithubError::Protocol(format!("invalid merge queue reply: {e}")))?;
+    if value
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err(GithubError::Protocol(
+            "merge queue reply carried errors".into(),
+        ));
+    }
+    let nodes = value
+        .pointer("/data/nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| GithubError::Protocol("merge queue reply has no nodes".into()))?;
+    let mut queued = std::collections::BTreeSet::new();
+    for id in ids {
+        let node = nodes
+            .iter()
+            .find(|node| str_at(node, "/id") == Some(id))
+            .filter(|node| node.get("mergeQueueEntry").is_some())
+            .ok_or_else(|| {
+                GithubError::Protocol(format!("merge queue reply omitted pull request {id}"))
+            })?;
+        if str_at(node, "/mergeQueueEntry/id").is_some_and(|entry| !entry.is_empty()) {
+            queued.insert(id.clone());
+        }
+    }
+    Ok(queued)
+}
+
 fn str_at<'a>(value: &'a Value, ptr: &str) -> Option<&'a str> {
     value.pointer(ptr).and_then(Value::as_str)
 }
@@ -1705,7 +1881,7 @@ reviewRequests(first:20) { totalCount nodes { requestedReviewer { __typename ...
 suggestedReviewers { reviewer { login } isAuthor isCommenter }
 autoMergeRequest { enabledAt mergeMethod }
 commits(last:1) { nodes { commit { committedDate statusCheckRollup { contexts(first:50) { nodes { __typename ... on CheckRun { name status conclusion startedAt checkSuite { workflowRun { databaseId workflow { databaseId } } } } ... on StatusContext { context state createdAt } } } } } } }
-reviewThreads(first:50) { nodes { id isResolved } }
+reviewThreads(first:50) { pageInfo { hasNextPage endCursor } nodes { id isResolved } }
 comments(last:COMMENT_FETCH_LIMIT) { nodes { author { login __typename } body createdAt updatedAt } }
 reviews(last:10) { nodes { author { login __typename } body state createdAt } }
 }"#;
@@ -1717,8 +1893,19 @@ const RATE_LIMIT_FIELD: &str = "rateLimit { cost remaining resetAt limit }";
 /// requests a GraphQL point buys.
 const THREAD_AUTHOR_PAGE: usize = 100;
 
-/// One chunk's data, and the selected PR nodes whose unresolved threads
-/// still need their author read.
+/// Review threads one follow-up page asks for.
+const THREAD_PAGE: usize = 100;
+
+/// Review threads read for one pull request, over every page. One with more
+/// reports its thread counts as lower bounds.
+const THREADS_PER_PR_MAX: usize = 300;
+
+/// Pull requests one follow-up page request asks about.
+const THREAD_PAGE_PRS: usize = 20;
+
+/// One chunk's data, and the selected PR nodes that need a follow-up read:
+/// more review threads than the first page holds, or unresolved threads
+/// whose author is still unread.
 #[derive(Debug)]
 struct ChunkRead {
     data: GithubData,
@@ -1739,22 +1926,136 @@ fn parse_rate_limit(reply: &Value) -> Option<RateLimit> {
     })
 }
 
+/// Which wt process this is, so the log says who spent the budget: the
+/// subcommand it was started with, or `tui` for none.
+fn process_role() -> &'static str {
+    static ROLE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    ROLE.get_or_init(|| role_of(std::env::args().skip(1)))
+}
+
+/// Every wt subcommand and alias. Only these reach the log as a role: a
+/// flag's value (a path, a directory, a message) is none of them. The
+/// command line's own test keeps this in step with it.
+pub const ROLES: &[&str] = &[
+    "_action-worker",
+    "_claude-hook",
+    "_destroy",
+    "_dev-giveup",
+    "_dev-supervise",
+    "_gh-guard",
+    "_hello",
+    "_host",
+    "_inventory",
+    "_managed",
+    "_remote",
+    "_restack-worker",
+    "_session",
+    "_snapshot",
+    "_workload",
+    "agent",
+    "archive",
+    "auth",
+    "automations",
+    "base",
+    "claude",
+    "clean",
+    "cleanup",
+    "codex",
+    "controller",
+    "dev",
+    "doctor",
+    "done",
+    "edge",
+    "events",
+    "fleet",
+    "guide",
+    "help",
+    "history",
+    "hold",
+    "init",
+    "install",
+    "issue",
+    "list",
+    "logs",
+    "ls",
+    "manager",
+    "mark",
+    "merge",
+    "new",
+    "next",
+    "notify",
+    "open",
+    "orphans",
+    "owed",
+    "perf",
+    "remote",
+    "remove",
+    "restack",
+    "restore",
+    "rm",
+    "rollback",
+    "section",
+    "skills",
+    "stages",
+    "state",
+    "status",
+    "title",
+    "update",
+    "version",
+    "wait",
+    "wake",
+    "watch",
+];
+
+/// The first argument that is a subcommand; `tui` when there are no
+/// arguments but flags, and `wt` when there are and none is a subcommand.
+fn role_of(args: impl Iterator<Item = String>) -> &'static str {
+    let mut words = false;
+    for arg in args {
+        if let Some(role) = ROLES.iter().find(|role| **role == arg) {
+            return role;
+        }
+        words |= !arg.starts_with('-');
+    }
+    if words { "wt" } else { "tui" }
+}
+
 /// Add one request's budget reading to a read's total: costs add up, and
-/// what remains is the lowest figure of the newest window.
+/// what remains is the lowest figure among the windows still open.
 fn spend(total: &mut Option<RateLimit>, next: Option<RateLimit>) {
+    spend_at(total, next, epoch_ms());
+}
+
+/// GitHub counts one token's requests against more than one window at a
+/// time, each with its own reset, and answers from whichever counted the
+/// request. The window that runs out first is the one with the least left,
+/// so that reading stands; a window whose reset has passed says nothing.
+fn spend_at(total: &mut Option<RateLimit>, next: Option<RateLimit>, now_ms: u64) {
     let Some(next) = next else { return };
     *total = Some(match *total {
         None => next,
-        Some(seen) => RateLimit {
-            limit: next.limit,
-            cost: seen.cost.saturating_add(next.cost),
-            remaining: match next.reset_at_ms.cmp(&seen.reset_at_ms) {
-                std::cmp::Ordering::Greater => next.remaining,
-                std::cmp::Ordering::Equal => seen.remaining.min(next.remaining),
-                std::cmp::Ordering::Less => seen.remaining,
-            },
-            reset_at_ms: seen.reset_at_ms.max(next.reset_at_ms),
-        },
+        Some(seen) => {
+            let open = |rate: RateLimit| rate.reset_at_ms > now_ms;
+            let lowest = if seen.reset_at_ms == next.reset_at_ms || (open(seen) && open(next)) {
+                if next.remaining < seen.remaining {
+                    next
+                } else {
+                    seen
+                }
+            } else if open(seen) != open(next) {
+                if open(next) { next } else { seen }
+            } else if next.reset_at_ms > seen.reset_at_ms {
+                next
+            } else {
+                seen
+            };
+            RateLimit {
+                limit: lowest.limit,
+                cost: seen.cost.saturating_add(next.cost),
+                remaining: lowest.remaining,
+                reset_at_ms: lowest.reset_at_ms,
+            }
+        }
     });
 }
 
@@ -1799,6 +2100,103 @@ fn threads(pr: &Value) -> impl Iterator<Item = &Value> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+}
+
+/// Whether GitHub holds review threads of `pr` that were not read.
+fn has_more_threads(pr: &Value) -> bool {
+    pr.pointer("/reviewThreads/pageInfo/hasNextPage")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// The pull request's ID, the cursor after its last thread read and how
+/// many threads to ask for next, while more follow and the cap leaves room.
+/// The ID and the cursor are written into the page query, so only GitHub's
+/// ID alphabet may pass.
+fn next_thread_page(pr: &Value) -> Option<(&str, &str, usize)> {
+    let room = THREADS_PER_PR_MAX.saturating_sub(threads(pr).count());
+    if !has_more_threads(pr) || room == 0 {
+        return None;
+    }
+    Some((
+        str_at(pr, "/id").filter(|id| is_node_id(id))?,
+        str_at(pr, "/reviewThreads/pageInfo/endCursor").filter(|cursor| is_node_id(cursor))?,
+        room.min(THREAD_PAGE),
+    ))
+}
+
+fn more_threads_query(pages: &[(String, String, usize)]) -> String {
+    let nodes = pages
+        .iter()
+        .enumerate()
+        .map(|(i, (id, cursor, first))| {
+            format!("p{i}: node(id:\"{id}\") {{ ... on PullRequest {{ reviewThreads(first:{first}, after:\"{cursor}\") {{ pageInfo {{ hasNextPage endCursor }} nodes {{ id isResolved }} }} }} }}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("query {{ {nodes} {RATE_LIMIT_FIELD} }}")
+}
+
+/// The next page of review threads of each of the `asked` pull requests,
+/// in order. A page that is missing, or holds an unresolved thread that
+/// cannot be asked about, fails the whole reply.
+fn parse_more_threads(
+    bytes: &[u8],
+    asked: usize,
+) -> Result<(Vec<Value>, Option<RateLimit>), GithubError> {
+    let mut reply: Value = serde_json::from_slice(bytes).map_err(|e| GithubError::Transient {
+        message: format!("unparseable GitHub JSON: {e}"),
+    })?;
+    if let Some(error) = graphql_errors(&reply) {
+        return Err(error);
+    }
+    let rate = parse_rate_limit(&reply);
+    let mut pages = Vec::with_capacity(asked);
+    for i in 0..asked {
+        let page = reply
+            .pointer_mut(&format!("/data/p{i}/reviewThreads"))
+            .map(Value::take)
+            .filter(|page| {
+                page.pointer("/pageInfo/hasNextPage")
+                    .is_some_and(Value::is_boolean)
+                    && page
+                        .get("nodes")
+                        .and_then(Value::as_array)
+                        .is_some_and(|nodes| {
+                            nodes.iter().all(|thread| {
+                                match thread.get("isResolved").and_then(Value::as_bool) {
+                                    Some(true) => true,
+                                    Some(false) => str_at(thread, "/id").is_some_and(is_node_id),
+                                    None => false,
+                                }
+                            })
+                        })
+            })
+            .ok_or_else(|| {
+                GithubError::Protocol(format!(
+                    "incomplete or invalid GitHub review thread page for p{i}"
+                ))
+            })?;
+        pages.push(page);
+    }
+    Ok((pages, rate))
+}
+
+/// Add a follow-up page to the threads of `pr`; its page info replaces the
+/// one before it.
+fn append_threads(pr: &mut Value, mut page: Value) {
+    let more = page
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let Some(threads) = pr.get_mut("reviewThreads") else {
+        return;
+    };
+    if let Some(nodes) = threads.get_mut("nodes").and_then(Value::as_array_mut) {
+        nodes.extend(more);
+    }
+    threads["pageInfo"] = page["pageInfo"].take();
 }
 
 fn unread_thread_ids(pr: &Value) -> Vec<String> {
@@ -1980,7 +2378,7 @@ fn parse_chunk(
         if let Some(pr) = prs.into_iter().nth(selected) {
             let node = &nodes[selected];
             let mut pending = threads(node).filter(|thread| thread_needs_author(thread));
-            if let Some(first) = pending.next() {
+            let unread_authors = if let Some(first) = pending.next() {
                 // A thread that cannot be asked about would count as nobody's.
                 if !std::iter::once(first)
                     .chain(pending)
@@ -1988,6 +2386,12 @@ fn parse_chunk(
                 {
                     return Err(invalid());
                 }
+                true
+            } else {
+                false
+            };
+            // Only an open pull request's threads still ask for anyone.
+            if unread_authors || (pr.state == "OPEN" && next_thread_page(node).is_some()) {
                 unread.push(node.clone());
             }
             data.prs.insert(pr.head_ref_name.clone(), pr);
@@ -2151,6 +2555,7 @@ fn parse_pr(pr: &Value, options: &GithubOptions) -> Option<PullRequest> {
         comments,
         unresolved_threads,
         unresolved_threads_total,
+        unresolved_threads_more: has_more_threads(pr),
         merged_at: str_at(pr, "/mergedAt").map(str::to_owned),
         closed_at: str_at(pr, "/closedAt").map(str::to_owned),
     })
@@ -2425,6 +2830,14 @@ fn review_bot_status(
     }
     match bot_context_state(contexts, options) {
         Some(true) => ReviewBotStatus {
+            state: "pending".into(),
+            unresolved: 0,
+            stale: None,
+        },
+        // The bot finished and none of the threads read is its own, but
+        // GitHub holds threads that were not read: a finding may be among
+        // them, so this is not a clean review.
+        Some(false) if has_more_threads(pr) => ReviewBotStatus {
             state: "pending".into(),
             unresolved: 0,
             stale: None,
@@ -2785,6 +3198,147 @@ mod transport_tests {
         }
     }
 
+    /// [`pr_reply`] whose thread connection says more threads follow.
+    fn paged_pr_reply(threads: serde_json::Value, cursor: &str) -> String {
+        let mut reply: serde_json::Value = serde_json::from_str(&pr_reply(threads)).unwrap();
+        reply["data"]["repository"]["wt_0"]["nodes"][0]["reviewThreads"]["pageInfo"] =
+            serde_json::json!({"hasNextPage": true, "endCursor": cursor});
+        reply.to_string()
+    }
+
+    #[tokio::test]
+    async fn threads_past_the_first_page_are_read_only_when_github_says_more_follow() {
+        let cancel = CancellationToken::new();
+        let authors = r#"{"data":{"t0":{"comments":{"nodes":[{"author":{"login":"person","__typename":"User"}}]}},"t1":{"comments":{"nodes":[{"author":{"login":"other","__typename":"User"}}]}}}}"#;
+        let first = serde_json::json!([
+            {"id":"PRRT_a","isResolved":false},
+            {"id":"PRRT_done","isResolved":true}
+        ]);
+        // `page` answers the follow-up page query.
+        let read = |prs: String, page: &'static str| {
+            let cancel = cancel.clone();
+            async move {
+                let dir = tempdir().unwrap();
+                fs::write(dir.path().join("prs.json"), prs).unwrap();
+                fs::write(dir.path().join("page.json"), page).unwrap();
+                fs::write(dir.path().join("authors.json"), authors).unwrap();
+                let script = fake_gh(
+                    dir.path(),
+                    "fake-gh",
+                    &format!(
+                        "cd '{}'\ncase \"$*\" in\n*PullRequestReviewThread*) echo \"$*\" >> author-queries; cat authors.json;;\n*after:*) echo \"$*\" >> page-queries; cat page.json;;\n*) cat prs.json;;\nesac",
+                        dir.path().display()
+                    ),
+                );
+                let result =
+                    GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+                        .with_gh_program(script)
+                        .with_repository(RepoSlug::parse("acme/app").unwrap())
+                        .fetch_worktrees(&["feature/a".into()], &cancel)
+                        .await;
+                let asked =
+                    |name: &str| fs::read_to_string(dir.path().join(name)).unwrap_or_default();
+                (result, asked("page-queries"), asked("author-queries"))
+            }
+        };
+        let whole = r#"{"data":{"p0":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":"Y3Vyc29yOjUx"},"nodes":[{"id":"PRRT_b","isResolved":false},{"id":"PRRT_c","isResolved":true}]}},"rateLimit":{"cost":1,"remaining":4989,"limit":5000,"resetAt":"2026-10-04T13:00:00Z"}}}"#;
+
+        // One page holds every thread: no page is asked for.
+        let (result, pages, _) = read(pr_reply(first.clone()), whole).await;
+        let data = result.unwrap();
+        let pr = &data.prs["feature/a"];
+        assert_eq!(
+            (pr.unresolved_threads_total, pr.unresolved_threads_more),
+            (1, false)
+        );
+        assert_eq!(pages, "");
+
+        // More follow: the next page is asked for by cursor, and its threads
+        // are counted and have their authors read like the first page's.
+        let (result, pages, authors_asked) =
+            read(paged_pr_reply(first.clone(), "Y3Vyc29yOjUw"), whole).await;
+        let data = result.unwrap();
+        let pr = &data.prs["feature/a"];
+        assert_eq!(
+            (
+                pr.unresolved_threads_total,
+                pr.unresolved_threads,
+                pr.unresolved_threads_more
+            ),
+            (2, 2, false)
+        );
+        assert_eq!(pages.lines().count(), 1);
+        assert!(
+            pages.contains(r#"p0: node(id:"PR_node") { ... on PullRequest { reviewThreads(first:100, after:"Y3Vyc29yOjUw")"#),
+            "{pages}"
+        );
+        assert!(authors_asked.contains("PRRT_a") && authors_asked.contains("PRRT_b"));
+        assert_eq!(data.rate_limit.unwrap().cost, 2);
+
+        // A page that cannot be read does not fail the fleet's read: the
+        // count stands as a lower bound.
+        for page in [
+            r#"{"data":{"p0":null}}"#,
+            r#"{"data":{"p0":{"reviewThreads":{"pageInfo":{"hasNextPage":false},"nodes":[{"isResolved":false}]}}}}"#,
+        ] {
+            let (result, pages, _) =
+                read(paged_pr_reply(first.clone(), "Y3Vyc29yOjUw"), page).await;
+            let data = result.unwrap();
+            let pr = &data.prs["feature/a"];
+            assert_eq!(
+                (pr.unresolved_threads_total, pr.unresolved_threads_more),
+                (1, true),
+                "{page}"
+            );
+            assert_eq!(pages.lines().count(), 1);
+            assert_eq!(data.covered_branches, ["feature/a".to_owned()].into());
+        }
+
+        // A rate limit still fails the read, so the caller backs off.
+        let (result, ..) = read(
+            paged_pr_reply(first.clone(), "Y3Vyc29yOjUw"),
+            r#"{"data":null,"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}"#,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(GithubError::RateLimit { .. })),
+            "{result:?}"
+        );
+
+        // A cursor that cannot be written into a query is never sent.
+        let (result, pages, _) = read(
+            paged_pr_reply(first, "x\") { id } evil: node(id:\"y"),
+            whole,
+        )
+        .await;
+        assert!(result.unwrap().prs["feature/a"].unresolved_threads_more);
+        assert_eq!(pages, "");
+    }
+
+    #[test]
+    fn thread_pages_stop_at_the_cap_and_leave_the_count_a_lower_bound() {
+        let node = |count: usize| {
+            let threads: Vec<_> = (0..count)
+                .map(|n| serde_json::json!({"id": format!("PRRT_{n}"), "isResolved": true}))
+                .collect();
+            serde_json::json!({"id":"PR_node","reviewThreads":{"pageInfo":{"hasNextPage":true,"endCursor":"abc"},"nodes":threads}})
+        };
+        assert_eq!(next_thread_page(&node(50)), Some(("PR_node", "abc", 100)));
+        assert_eq!(next_thread_page(&node(250)), Some(("PR_node", "abc", 50)));
+        let full = node(THREADS_PER_PR_MAX);
+        assert_eq!(next_thread_page(&full), None);
+        assert!(has_more_threads(&full));
+        // The last page read replaces the page info.
+        let mut read = node(50);
+        append_threads(
+            &mut read,
+            serde_json::json!({"pageInfo":{"hasNextPage":false,"endCursor":"def"},"nodes":[{"id":"PRRT_x","isResolved":false}]}),
+        );
+        assert_eq!(threads(&read).count(), 51);
+        assert!(!has_more_threads(&read));
+        assert_eq!(next_thread_page(&read), None);
+    }
+
     /// A thread deleted between the two requests comes back `null` with a
     /// NOT_FOUND error, and gh exits non-zero for it.
     #[tokio::test]
@@ -2869,7 +3423,9 @@ mod transport_tests {
         let branches: Vec<String> = (0..CHUNK_SIZE).map(|n| format!("feature/{n}")).collect();
         let (query, _) = build_query(&branches, true, "owner", "repo", "main", 10);
         assert_eq!(query.matches('{').count(), query.matches('}').count());
-        assert!(query.contains("reviewThreads(first:50) { nodes { id isResolved } }"));
+        assert!(query.contains(
+            "reviewThreads(first:50) { pageInfo { hasNextPage endCursor } nodes { id isResolved } }"
+        ));
         assert!(query.ends_with(&PR_FRAGMENT.replace("COMMENT_FETCH_LIMIT", "10")));
         assert!(query.contains("} rateLimit { cost remaining resetAt limit } }"));
         // GitHub charges one point per hundred requests, and counts one
@@ -2911,16 +3467,74 @@ mod transport_tests {
             reset_at_ms,
         };
         let mut total = None;
-        spend(&mut total, None);
+        spend_at(&mut total, None, 500);
         assert_eq!(total, None);
         // Chunks finish in any order: the lowest figure of a window stands.
-        spend(&mut total, Some(read(1, 90, 1_000)));
-        spend(&mut total, Some(read(1, 91, 1_000)));
-        spend(&mut total, None);
+        spend_at(&mut total, Some(read(1, 90, 1_000)), 500);
+        spend_at(&mut total, Some(read(1, 91, 1_000)), 500);
+        spend_at(&mut total, None, 500);
         assert_eq!(total, Some(read(2, 90, 1_000)));
-        // A reply from the next window replaces what was left of the old one.
-        spend(&mut total, Some(read(1, 4_999, 2_000)));
-        assert_eq!(total, Some(read(3, 4_999, 2_000)));
+        // A second window open at the same time does not hide the one that
+        // runs out first, whichever of them resets later.
+        spend_at(&mut total, Some(read(1, 4_999, 2_000)), 500);
+        assert_eq!(total, Some(read(3, 90, 1_000)));
+        spend_at(&mut total, Some(read(1, 40, 800)), 500);
+        assert_eq!(total, Some(read(4, 40, 800)));
+        // Once a window has reset, a reply from an open one replaces it.
+        spend_at(&mut total, Some(read(1, 4_999, 2_000)), 900);
+        assert_eq!(total, Some(read(5, 4_999, 2_000)));
+        spend_at(&mut total, Some(read(1, 3, 850)), 900);
+        assert_eq!(total, Some(read(6, 4_999, 2_000)));
+    }
+
+    /// With threads left unread, a finished bot with no finding among the
+    /// threads that were read has not been shown to be clean.
+    #[test]
+    fn a_finished_bot_is_not_clean_while_threads_are_unread() {
+        let contexts = [serde_json::json!({
+            "__typename": "CheckRun", "name": "CodeRabbit", "status": "COMPLETED"
+        })];
+        let pr = |more: bool| serde_json::json!({"reviewThreads": {"nodes": [], "pageInfo": {"hasNextPage": more}}});
+        let state = |more| review_bot_status(&pr(more), "OPEN", &contexts, &options()).state;
+        assert_eq!(state(false), "clean");
+        assert_eq!(state(true), "pending");
+    }
+
+    #[test]
+    fn a_read_is_logged_under_the_subcommand_that_made_it() {
+        let role = |args: &[&str]| role_of(args.iter().map(|arg| (*arg).to_owned()));
+        assert_eq!(role(&[]), "tui");
+        assert_eq!(role(&["events", "serve"]), "events");
+        assert_eq!(role(&["--json", "wait", "green"]), "wait");
+        // A flag's value is skipped, and never logged.
+        assert_eq!(role(&["--config", "/Users/a/wt.toml", "ls"]), "ls");
+        assert_eq!(role(&["-C", "dir", "status"]), "status");
+        assert_eq!(role(&["--config", "foo"]), "wt");
+        assert_eq!(role(&["--verbose"]), "tui");
+    }
+
+    /// The probe asks for nothing but the budget, and reports each window
+    /// once at its lowest figure.
+    #[tokio::test]
+    async fn budget_probes_report_each_window_once() {
+        let dir = tempdir().unwrap();
+        let body = r#"case "$*" in *viewer*|*repository*) exit 9;; esac
+n=0; until mkdir "$0.$n" 2>/dev/null; do n=$((n + 1)); done
+if [ $((n % 2)) = 0 ]; then
+  echo '{"data":{"rateLimit":{"cost":1,"remaining":'$((4000 - n))',"limit":5000,"resetAt":"2026-10-04T13:00:00Z"}}}'
+else
+  echo '{"data":{"rateLimit":{"cost":1,"remaining":4900,"limit":5000,"resetAt":"2026-10-04T13:20:00Z"}}}'
+fi"#;
+        let client = GithubClient::new(ProcessRunner::default(), dir.path().to_owned(), options())
+            .with_gh_program(fake_gh(dir.path(), "probe-gh", body));
+        let windows = client
+            .budget_windows(4, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].reset_at_ms < windows[1].reset_at_ms);
+        assert!(windows[0].remaining <= 3_998, "{windows:?}");
+        assert_eq!((windows[1].remaining, windows[1].cost), (4_900, 0));
     }
 
     #[tokio::test]
@@ -3676,6 +4290,24 @@ esac
             br#"{"data":{"repository":{"mergeQueue":null}},"errors":[{"message":"not authorized"}]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn queued_pull_requests_need_an_answer_for_every_id() {
+        let ids = ["PR_a".to_owned(), "PR_b".to_owned()];
+        let queued = parse_queued_pull_requests(
+            br#"{"data":{"nodes":[{"id":"PR_a","mergeQueueEntry":{"id":"Q"}},{"id":"PR_b","mergeQueueEntry":null}]}}"#,
+            &ids,
+        )
+        .unwrap();
+        assert_eq!(queued.into_iter().collect::<Vec<_>>(), ["PR_a"]);
+        for partial in [
+            br#"{"data":{"nodes":[{"id":"PR_a","mergeQueueEntry":null},null]}}"#.as_slice(),
+            br#"{"data":{"nodes":[{"id":"PR_a","mergeQueueEntry":null},{"id":"PR_b"}]}}"#,
+            br#"{"data":{"nodes":[{"id":"PR_a","mergeQueueEntry":null},{"id":"PR_b","mergeQueueEntry":null}]},"errors":[{"message":"partial"}]}"#,
+        ] {
+            assert!(parse_queued_pull_requests(partial, &ids).is_err());
+        }
     }
 
     #[test]

@@ -475,6 +475,33 @@ fn an_item_and_a_landed_row_are_filed_by_what_they_wait_for() {
             "Done"
         ]
     );
+    // What a landed row waits for next, as the board and `wt clean` say it.
+    let waits = |ids: &[&str]| {
+        let own: Vec<Watch> = watches
+            .iter()
+            .filter(|watch| ids.contains(&watch.id.as_str()))
+            .cloned()
+            .collect();
+        let items = owed_items(None, &STAGED, &own, &[], NOON);
+        OwedBlock::row_waits_for(owed_phase(&items, true).unwrap(), &items, UTC)
+    };
+    assert_eq!(waits(&[]), "done");
+    assert_eq!(waits(&["time22"]), "17:00");
+    assert_eq!(waits(&["pull22", "rels22"]), "staging");
+    assert_eq!(waits(&["time22", "pull22"]), "production");
+    assert_eq!(waits(&["mrge22"]), "other work");
+    assert_eq!(
+        OwedBlock::row_waits_for(OwedPhase::Waiting, &deferred, UTC),
+        "13:00"
+    );
+    let mut due_check = ready();
+    due_check.set_check(VerifyStage::Staging, "open the page");
+    let due_items = owed_items(Some(&due_check), &STAGED, &[], &[], NOON);
+    assert_eq!(
+        OwedBlock::row_waits_for(owed_phase(&due_items, true).unwrap(), &due_items, UTC),
+        "due staging"
+    );
+    assert_eq!(OwedBlock::Scheduled.waits_for(None, None), "scheduled");
     // The fewest words that name each condition.
     let labels: Vec<String> = watches
         .iter()

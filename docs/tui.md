@@ -27,7 +27,9 @@ checks. `[ui].hidden_badges` removes slots by name (`watch`, `action`, `dirty`,
 `rebase`, `deploy`, `session`, `review_bot`, `review`, `pr`, `checks`).
 Archived rows render dimmed. Review requests and the archive sit at the bottom
 of the list. The cursor keeps three rows of context while scrolling and the
-list border carries a scrollbar when rows overflow.
+list border carries a scrollbar when rows overflow. When the board changes on
+its own (a refresh adds, removes or moves rows), the cursor's row stays on the
+same screen line, and a viewport scrolled with the wheel keeps its top row.
 
 Work-status markers use color for state: red for needs-human, yellow for
 needs-testing or blocked, cyan for working, purple for review, green for ready
@@ -68,11 +70,15 @@ local row is drawn in one derived block, **Landed**, instead of its section.
 The block sits after the manual sections and the Inbox and before the rows
 being removed and the archive, is hidden while empty, and folds like a
 section. Its header counts its rows by where they stand, leaving out a count
-of zero, open or folded. The counts outrank the rule: a pane too narrow for
-the whole header first shortens and then drops the rule's dashes, then says
-`wait` for `waiting` (`Landed · 3 due · 24 wait · 2 done`), and the folded
-header last drops the name (`[×29] 3 due · 24 wait · 2 done`). A count is
-never cut.
+of zero, open or folded; only `N due` is coloured, as its rows' own `due`
+labels are (red once anything is overdue). Folded, the name is on the left
+and the counts are at the right edge (`[×29] Landed      3 due · 24 waiting ·
+2 done`); it shows no marker tally, since a landed row's marker says only
+what the counts already do. The counts outrank the rule: a pane too narrow
+for the whole header first shortens and then drops the rule's dashes, then
+says `wait` for `waiting` (`Landed · 3 due · 24 wait · 2 done`), and the
+folded header last drops the name (`[×29] 3 due · 24 wait · 2 done`). A
+count is cut only in a pane narrower than that shortest form.
 
     ── Landed · 3 due · 24 waiting · 2 done ──────────────
        Renew the add-on expiry             due staging  …
@@ -151,7 +157,8 @@ unavailable fact shows `—` rather than reading as clean.
 Below the rows come a rebase block when the branch would not rebase cleanly
 onto its base (listing up to eight conflicting files from a `git merge-tree`
 pre-flight), paused automations, the session summary, PR comments, and the
-unresolved thread count. The status line wraps only between its ` · `
+unresolved thread count (`+N or more unresolved threads` when GitHub holds
+more threads than one read returns, so N is a lower bound). The status line wraps only between its ` · `
 separated items, so a continuation line starts under the first line's text
 and never with a separator. A folded section's details show its rollup, member
 rows, a red "blocked on you" group with each needs-human member's note, and a
@@ -544,12 +551,12 @@ same summary and timeline for a removed row that has recorded events.
 
 | Key | Action |
 |---|---|
-| `j` / `k`, arrows | Move the selection; at the first or last item, scroll the list to that edge |
+| `j` / `k`, arrows | Move the selection; it stops at the first and last item |
 | `g` / `G`, `Home` / `End` | First / last visible item |
-| `PgUp` / `PgDn` | Move half a page |
+| `PgUp` / `PgDn` | Move half of the list pane's height |
 | `Space` | Next row needing you: saved work states plus failing checks, changes requested, unresolved threads, and failed actions; toasts when nothing needs you |
-| `Tab` | Fold / unfold the section; unfolding lands on its first row. Review requests fold too |
-| `Ctrl+D` / `Ctrl+U` | Next / previous section |
+| `Tab` | Fold / unfold the section; unfolding lands on its first row and scrolls as many of its rows into view as fit under the cursor's three rows of context. Review requests fold too |
+| `Ctrl+D` / `Ctrl+U` | Next section / the first row of this section, then the previous section. Review requests count as a section |
 | `Ctrl+J` / `Ctrl+K` | Scroll details |
 | `Ctrl+E` / `Ctrl+Y` | Scroll output |
 | `r` / `Ctrl+R` | Refresh / ask for confirmation, then clear derived caches and refresh |
@@ -832,7 +839,8 @@ custom `! c` prompt keeps pasted line breaks.
 ## Mouse
 
 The wheel scrolls the pane under the pointer. Over the list it scrolls the
-viewport without moving the cursor; the next cursor move scrolls back to it.
+viewport without moving the cursor; the next cursor move, or any key that acts
+on the selection or opens a menu, scrolls back to it.
 Dragging selects text within one pane and copies it to the clipboard on
 release.
 

@@ -91,8 +91,9 @@ impl HarnessService {
     }
 
     /// Set the base PATH embedded in newly started sessions. Claude prepends
-    /// its per-session inspection shims to this path; other harnesses inherit
-    /// it through their tmux session environment.
+    /// the shim directory to this path; other harnesses inherit it through
+    /// their tmux session environment and prepend the same directory in the
+    /// pane.
     pub fn with_spawn_path(mut self, path: impl Into<String>) -> Self {
         self.claude_sessions = self.claude_sessions.with_spawn_path(path);
         self.rebuild_claude_messenger()

@@ -183,6 +183,87 @@ binary will merge writes made after the rollback. Older binaries may not know
 about newer fields or migrations. Keep migration backups and restart long-lived
 wt processes when changing versions that alter storage contracts.
 
+## Leftovers and the daily maintenance pass
+
+wt writes files that outlive what they were for, and one pass removes them. A
+running wt (the TUI process) runs it five minutes after it starts and then at
+most once a day for each repository, whichever process gets there first
+(`<cache root>/maintenance.json` records when, and a pass holds the
+`__maintenance__` lock so two never run together). `wt doctor` counts what
+`wt doctor --prune` would remove, and `wt doctor --prune` runs the pass now:
+it takes the same lock (a pass already running makes it say so and do
+nothing) and counts as the day's pass. Each pass writes one `maintenance pass
+removed leftovers` line to the app log with the counts, the version
+directories and slug records it removed, the checks it re-dated, and the
+classes it could not judge.
+
+[`[maintenance]`](configuration.md#maintenance) switches the daily pass off
+(`enabled = false`) and decides whether it may touch the repository state
+(`state_records`, off by default: neither the slug records nor the one-time
+check re-dating below is written without it). `wt doctor --prune` ignores
+both: a person asked.
+
+Every rule needs proof that nothing owns the file. A worktree is alive when
+`git worktree list` names its directory, wherever it is, or the inventory
+holds it. When the worktree list, the tmux sessions or the process list
+cannot be read, the classes that depend on it are skipped, never guessed, and
+`wt doctor` counts only what a pass would in fact remove.
+
+| What | Removed when |
+|---|---|
+| Installed versions (`<install root>/versions/<key>`) | not the current or last-good build, not part of a pending boot, not named by any running process (its executable or its environment) or by the environment of any session on wt's tmux server (a session stays pinned through its `PATH` to the build that started it, even while nothing runs in it), and not one of the three most recently installed of the rest. If `ps`, the session list or any session's environment cannot be read, no version is removed that pass. Done under the install state's lock; a busy lock removes nothing. `wt rollback` reaches only versions still installed |
+| Action runs (`<log dir>/actions/<run id>`) | finished, started over 30 days ago, not among the newest 500 runs, and its worker's lock is free |
+| Dev-server files (`<cache root>/dev/<slug>.state`, `.state.attempts`, `.crash.log`) | the slug has no worktree and the file is 7 days old |
+| Inspector sockets and session logs (`<cache root>/insp/<session>.sock`, `sessions/<session>.err`) | no tmux session has that name, no worktree's slug starts it, and the file is 7 days old |
+| Slug records in the repository state | only by `wt doctor --prune`, or daily with `state_records = true`; see below |
+
+A repository without its own `.wt.toml` shares its cache root, tmux socket
+and lock directory with every other such repository. There the dev-server
+files, inspector sockets and session logs are never removed, because they are
+named by slug or session alone and another repository's would look ownerless;
+`wt doctor` says so. Installed versions and finished action runs are still
+pruned: neither rule asks whose they are. Each repository then has its own
+stamp (`maintenance.<repo id>.json`) and lock, so every one gets its daily
+pass.
+
+Lock files are never removed. A lock is its file's inode, a locker keeps the
+file after release and does not look at it again once open, so unlinking one
+could let two processes hold "the same" lock. They are empty files.
+
+A worktree's record in the repository state outlives the worktree on purpose:
+restoring its branch reads the recorded fork base, and a pause is remembered
+on it. A record is dropped only when all of these hold: the slug has no
+worktree in a list read immediately before the write, is not reserved
+(`main`, `manager`, `wt`, `dotfiles`) and is not a remote row's; no removal
+record names it (so not while the Landed block, cleanup or a restore can
+still read it); its status carries no check, gate or verification, no due
+step names it, and no watch is on it or was set by it; its automations are
+not paused; no live worktree's fork base names its branch; it has a
+`createdAt` (a record being created does not yet); and the newest time
+anywhere in it is over 30 days old. The decision is made on the state as it
+is inside the write transaction. A record that still carries an old check
+keeps the record forever: nothing proves that check moot.
+
+The first pass that may write the state also corrects one thing, once (the state records that it
+ran). A production check that was already due when wt began recording when
+checks come due (v0.1.77) was dated with the time that build first started,
+so its "due for" read short. Such a check (it has no `sinceMs`) is moved
+back to the last time its history shows the work in production at or after
+the check was last owed. Where history cannot say, the check is left as it
+is: a check closed and owed again, one owed only after the work had shipped,
+one no status event names, and every staging check, which with a deploy probe
+came due at a deploy that history does not record. The log line and
+`wt doctor --prune` name each check moved.
+
+Every pass checkpoints the state database. Each writable connection sets
+`journal_size_limit` to 1 MiB, so the write-ahead log is cut back once a
+checkpoint has emptied it instead of keeping the size of its largest burst,
+and the TUI process checkpoints once more as it exits.
+
+Never removed, and sized once by `wt doctor`: the dated `wt-YYYY-MM-DD.log`
+files and `state.json.bak*` / `archive.json.bak*` backups from before the
+native rewrite, and the migration archive under `<install root>/migrations`.
+
 ## Moving an existing source installation to native wt
 
 Close the old wt boards and stop their events service before importing state;

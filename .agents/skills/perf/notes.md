@@ -1,5 +1,37 @@
 # Performance notes
 
+### Cursor trailing a held j or k in a long list (2026-11-26)
+
+Report: holding `j` or `k` in a list of 60+ rows, the cursor lags and keeps
+moving after release. The guess was that each key blocks on the details pane.
+
+It does not. `frame_cost` (release build, 200x60 terminal, 60 and 150 busy
+rows): a whole frame costs 0.9 to 1.1 ms of CPU, of which the list is 0.22 to
+0.35 ms, the activity pane 0.19 ms and the details pane 0.07 to 0.09 ms; key
+handling is under 1 µs. The live log disagreed only in the tail: `input-latency`
+windows on cozee-dev (v0.1.76 and v0.1.77) had p50 1 to 3 ms but p90 20 to 80 ms
+and max 100 to 270 ms, with the daily median p90 rising from 1.7 ms to 21.7 ms
+over five days. Load average was 46 to 57 on 12 cores (agent fleets and
+builds); under it the same 1 ms benchmark frame spiked to 100 to 220 ms.
+
+The cause was structural: the loop drew one frame per input event, so every
+frame slower than the key-repeat gap pushed the rest of the queue back. With
+an 80 ms frame forced in an isolated 46 row fixture and 44 `j` presses 40 to
+60 ms apart, the screen kept moving 4.2 to 4.5 s after the last key. The loop
+now applies every event that has already arrived before drawing
+(`apply_waiting_input`): the same run settles 13 to 27 ms after the last key
+on the same final screen, and a 600 key burst draws about 100 frames instead
+of 600. Frames also go to the terminal in one write instead of 1 KiB pieces.
+
+Reading the metric afterwards: one sample is now one batch, and each batch
+starts with the thread waking from sleep, so under load p50 reads higher than
+before (3 to 6 ms against 2.6 ms with 60 synthetic busy loops) although no
+frame got slower. Compare `coalesced` and how long the screen takes to settle,
+not p50 across the change.
+
+Unresolved: what the slow frames wait on (preemption mid-frame or a blocked
+write to a starved terminal) was not separated; both are outside the process.
+
 ### Claude Code startup freezes from an overloaded fseventsd (2026-11-20)
 
 Report: a new F12 Claude session draws, then ignores typing for seconds at a

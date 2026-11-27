@@ -25,6 +25,10 @@ use wt_runtime::SourceHandle;
 
 use crate::{Board, Model, TerminalHandoff, UiActions, model::InputResult, render::render};
 
+/// Room for a whole frame's escape sequences; a full repaint of a large
+/// terminal is a few tens of kilobytes.
+const FRAME_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Terminal modes the UI thread has entered. They live in a thread-local,
 /// not in the guard, so the panic hook can leave them before the panic
 /// message prints: a message written to the alternate screen in raw mode is
@@ -226,6 +230,57 @@ where
 type PaletteCallback<'a> =
     Box<dyn FnOnce(Option<(String, String)>) -> Pin<Box<dyn Future<Output = ()> + 'a>> + 'a>;
 
+/// What the loop does after one input event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Batch {
+    /// Take the next event that has already arrived, if any.
+    More,
+    /// Draw before any later input is applied.
+    Frame,
+    Quit,
+}
+
+/// Apply `first` and then every input event that has already arrived, so
+/// the frame that follows shows where the last of them left the model. A
+/// frame per event would let input queue behind drawing whenever a frame
+/// costs more than the gap between events (a held key, a wheel flick, a
+/// loaded machine), and the cursor would trail the keyboard. Never waits
+/// for an event. Returns how the batch ended and how many events it applied.
+async fn apply_waiting_input<S>(
+    first: Event,
+    replay: &mut VecDeque<Event>,
+    events: &mut S,
+    mut apply: impl FnMut(Event) -> io::Result<Batch>,
+) -> io::Result<(Batch, usize)>
+where
+    S: futures_util::Stream<Item = io::Result<Event>> + Unpin,
+{
+    let mut event = first;
+    let mut applied = 0;
+    loop {
+        applied += 1;
+        let batch = apply(event)?;
+        if batch != Batch::More {
+            return Ok((batch, applied));
+        }
+        let next = match replay.pop_front() {
+            Some(event) => Some(Ok(event)),
+            // Polled with this task's own waker, never a throwaway one:
+            // crossterm keeps the waker of the first poll that found
+            // nothing and ignores later ones until an event arrives.
+            None => tokio::select! {
+                biased;
+                next = events.next() => next,
+                () = std::future::ready(()) => None,
+            },
+        };
+        match next {
+            Some(next) => event = next?,
+            None => return Ok((Batch::More, applied)),
+        }
+    }
+}
+
 async fn run_inner<'a>(
     source: SourceHandle<Board>,
     mut actions: UiActions,
@@ -238,7 +293,12 @@ async fn run_inner<'a>(
         ));
     }
     let mut guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    // One write per frame: stdout's own buffer would hand the terminal a
+    // frame in 1 KiB pieces, each a chance to block on a busy terminal.
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::BufWriter::with_capacity(
+        FRAME_BUFFER_BYTES,
+        io::stdout(),
+    )))?;
     let mut pending_events = VecDeque::new();
     if let Some(on_palette) = on_palette {
         match crate::terminal_probe::query().await {
@@ -260,6 +320,7 @@ async fn run_inner<'a>(
     let mut dirty = true;
     let mut input_at = None;
     let mut latencies = Vec::with_capacity(1024);
+    let mut coalesced = 0;
     let mut metric_at = Instant::now();
     let mut controller_open = true;
     let mut toast_until = None;
@@ -337,7 +398,7 @@ async fn run_inner<'a>(
                 let elapsed: Duration = Instant::now().duration_since(at);
                 latencies.push(elapsed.as_secs_f64() * 1000.0);
                 if latencies.len() >= 1024 || metric_at.elapsed() >= Duration::from_secs(60) {
-                    log_latencies(&mut latencies);
+                    log_latencies(&mut latencies, &mut coalesced);
                     metric_at = Instant::now();
                 }
             }
@@ -366,60 +427,76 @@ async fn run_inner<'a>(
                 }
             } => {
                 let Some(event) = event else { break; };
-                match event? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        let received = Instant::now();
-                        let toast_before = model.toast.clone();
-                        let result = model.input(key, terminal.size()?.height.saturating_sub(4) as usize);
-                        send_background(&mut model, &actions.requests);
-                        if model.toast.is_some() && model.toast != toast_before {
-                            // Input-side feedback ("nothing needs you") expires
-                            // like any other toast.
-                            toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-                        }
-                        match result {
-                            InputResult::Quit => break,
-                            InputResult::Refresh => {
-                                source.refresh();
-                                model.toast = Some(("refreshing…".into(), ToastTone::Info));
+                let mut apply = |event: Event| -> io::Result<Batch> {
+                    match event {
+                        Event::Key(key) if key.kind != KeyEventKind::Release => {
+                            let received = Instant::now();
+                            let toast_before = model.toast.clone();
+                            let result = model.input(key, terminal.size()?.height.saturating_sub(4) as usize);
+                            send_background(&mut model, &actions.requests);
+                            if model.toast.is_some() && model.toast != toast_before {
+                                // Input-side feedback ("nothing needs you") expires
+                                // like any other toast.
                                 toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-                                dirty = true;
-                                input_at = Some(received);
                             }
-                            InputResult::Draw => { dirty = true; input_at = Some(received); }
-                            InputResult::Unchanged => {}
-                            InputResult::Action(action) => {
-                                let id = model.next_op_id();
-                                let action = model.resolve(action);
-                                let feedback = action.clone();
-                                let cancellation = action.is_cancellable().then(CancellationToken::new);
-                                match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }) {
-                                    Ok(()) => {
-                                        model.begin_action(id, &feedback);
-                                        if let Some(request) = &mut model.pending_request {
-                                            request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
-                                        }
-                                        model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "loading menu… Esc cancels" } else { "working…" }.into(), ToastTone::Info));
-                                    },
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { model.request_not_sent(); model.toast = Some(("actions are busy; try again when one finishes".into(), ToastTone::Failed)) },
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { model.request_not_sent(); model.toast = Some(("action worker stopped; restart wt".into(), ToastTone::Failed)) },
+                            match result {
+                                InputResult::Quit => return Ok(Batch::Quit),
+                                InputResult::Refresh => {
+                                    source.refresh();
+                                    model.toast = Some(("refreshing…".into(), ToastTone::Info));
+                                    toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+                                    dirty = true;
+                                    input_at.get_or_insert(received);
+                                    return Ok(Batch::Frame);
                                 }
-                                dirty = true;
-                                toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
-                                input_at = Some(received);
+                                InputResult::Draw => { dirty = true; input_at.get_or_insert(received); }
+                                InputResult::Unchanged => {}
+                                InputResult::Action(action) => {
+                                    let id = model.next_op_id();
+                                    let action = model.resolve(action);
+                                    let feedback = action.clone();
+                                    let cancellation = action.is_cancellable().then(CancellationToken::new);
+                                    match actions.requests.try_send(crate::UiRequest { id, generation: model.ui_generation, action, cancellation: cancellation.clone() }) {
+                                        Ok(()) => {
+                                            model.begin_action(id, &feedback);
+                                            if let Some(request) = &mut model.pending_request {
+                                                request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
+                                            }
+                                            model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "loading menu… Esc cancels" } else { "working…" }.into(), ToastTone::Info));
+                                        },
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { model.request_not_sent(); model.toast = Some(("actions are busy; try again when one finishes".into(), ToastTone::Failed)) },
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { model.request_not_sent(); model.toast = Some(("action worker stopped; restart wt".into(), ToastTone::Failed)) },
+                                    }
+                                    dirty = true;
+                                    toast_until = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+                                    input_at.get_or_insert(received);
+                                    return Ok(Batch::Frame);
+                                }
                             }
                         }
+                        Event::Resize(_, _) => dirty = true,
+                        Event::Mouse(mouse) => {
+                            let area = terminal.size()?.into();
+                            dirty |= crate::mouse::select(&mut model, mouse, area);
+                            dirty |= crate::mouse::scroll(&mut model, mouse, area);
+                            // The wheel can move a picker or history selection; plan its prefetch.
+                            send_background(&mut model, &actions.requests);
+                            // A released drag copies what the next frame
+                            // draws under it, so nothing later may change it.
+                            if model.mouse_selection.is_some_and(|selection| selection.finished) {
+                                return Ok(Batch::Frame);
+                            }
+                        }
+                        Event::Paste(text) => dirty |= model.paste(&text),
+                        _ => {}
                     }
-                    Event::Resize(_, _) => dirty = true,
-                    Event::Mouse(mouse) => {
-                        let area = terminal.size()?.into();
-                        dirty |= crate::mouse::select(&mut model, mouse, area);
-                        dirty |= crate::mouse::scroll(&mut model, mouse, area);
-                        // A click can move the selection; plan its prefetch.
-                        send_background(&mut model, &actions.requests);
-                    }
-                    Event::Paste(text) => dirty |= model.paste(&text),
-                    _ => {}
+                    Ok(Batch::More)
+                };
+                let (batch, applied) =
+                    apply_waiting_input(event?, &mut pending_events, &mut events, &mut apply).await?;
+                coalesced += applied - 1;
+                if batch == Batch::Quit {
+                    break;
                 }
             }
             reply = actions.replies.recv(), if controller_open => {
@@ -561,7 +638,7 @@ async fn run_inner<'a>(
             }
         }
     }
-    log_latencies(&mut latencies);
+    log_latencies(&mut latencies, &mut coalesced);
     tracing::info!(frames = model.frame_count, "terminal stopped");
     Ok(())
 }
@@ -711,7 +788,8 @@ async fn wait_for_handoff(
     }
 }
 
-fn log_latencies(samples: &mut Vec<f64>) {
+/// `coalesced` counts input events that shared a frame with an earlier one.
+fn log_latencies(samples: &mut Vec<f64>, coalesced: &mut usize) {
     if samples.is_empty() {
         return;
     }
@@ -721,9 +799,11 @@ fn log_latencies(samples: &mut Vec<f64>) {
         p50_ms = samples[samples.len() / 2],
         p90_ms = samples[(samples.len() * 9 / 10).min(samples.len() - 1)],
         max_ms = samples[samples.len() - 1],
+        coalesced = *coalesced,
         "input-latency"
     );
     samples.clear();
+    *coalesced = 0;
 }
 
 /// Queue slots background reads leave free for foreground requests.
@@ -790,6 +870,120 @@ fn send_background(model: &mut Model, requests: &tokio::sync::mpsc::Sender<crate
         if !sent {
             model.background_not_sent(&action, now);
         }
+    }
+}
+
+#[cfg(test)]
+mod input_batch_tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use futures_util::{FutureExt, stream};
+
+    use super::*;
+
+    fn key(code: char) -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE))
+    }
+
+    /// Events that have arrived, followed by a terminal with nothing more
+    /// to say.
+    fn arrived(codes: &str) -> impl futures_util::Stream<Item = io::Result<Event>> + Unpin + use<> {
+        let waiting: Vec<_> = codes.chars().map(|code| Ok(key(code))).collect();
+        stream::iter(waiting).chain(stream::pending())
+    }
+
+    #[tokio::test]
+    async fn held_keys_that_have_arrived_all_move_the_cursor_before_one_frame() {
+        let mut model = crate::render::frame_cost::busy_model(60);
+        let before = model.selected.unwrap();
+        let mut events = arrived(&"j".repeat(24));
+        let (batch, applied) =
+            apply_waiting_input(key('j'), &mut VecDeque::new(), &mut events, |event| {
+                let Event::Key(key) = event else {
+                    unreachable!()
+                };
+                assert!(matches!(model.input(key, 40), InputResult::Draw));
+                Ok(Batch::More)
+            })
+            .await
+            .unwrap();
+        assert_eq!((batch, applied), (Batch::More, 25));
+        assert_eq!(model.selected, Some(before + 25));
+        // The one frame the loop now draws shows the row the last key chose.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        terminal.draw(|frame| render(frame, &mut model)).unwrap();
+        let slug = model.selected_row().unwrap().slug.clone();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains(&slug), "details pane names {slug}");
+    }
+
+    #[tokio::test]
+    async fn a_batch_never_waits_and_stops_where_a_frame_is_owed() {
+        let mut seen = String::new();
+        let mut note = |event: Event, stop: char| {
+            let Event::Key(KeyEvent {
+                code: KeyCode::Char(code),
+                ..
+            }) = event
+            else {
+                unreachable!()
+            };
+            seen.push(code);
+            Ok(if code == stop {
+                Batch::Frame
+            } else {
+                Batch::More
+            })
+        };
+        // Replayed probe input goes first, then what the terminal holds.
+        let mut replay = VecDeque::from([key('b')]);
+        let mut events = arrived("cXde");
+        let (batch, applied) =
+            apply_waiting_input(key('a'), &mut replay, &mut events, |event| note(event, 'X'))
+                .await
+                .unwrap();
+        assert_eq!((batch, applied), (Batch::Frame, 4));
+        // What followed the stop is still the terminal's, in order.
+        let (batch, applied) = apply_waiting_input(
+            events.next().now_or_never().unwrap().unwrap().unwrap(),
+            &mut replay,
+            &mut events,
+            |event| note(event, 'q'),
+        )
+        .await
+        .unwrap();
+        assert_eq!((batch, applied), (Batch::More, 2));
+        assert_eq!(seen, "abcXde");
+        assert!(events.next().now_or_never().is_none());
+    }
+
+    #[test]
+    fn output_scrolls_that_share_a_frame_each_count() {
+        let mut model = crate::render::frame_cost::busy_model(8);
+        let view = |model: &mut Model| model.output_view(10, 80).1;
+        let newest = view(&mut model);
+        for _ in 0..3 {
+            model.output.scroll(true);
+        }
+        let batched = view(&mut model);
+        model.output.mark_seen();
+        view(&mut model);
+        for _ in 0..3 {
+            model.output.scroll(true);
+            view(&mut model);
+        }
+        assert_eq!(batched, view(&mut model));
+        assert_ne!(batched, newest);
+        // Back down past the end follows the newest lines again.
+        for _ in 0..4 {
+            model.output.scroll(false);
+        }
+        assert_eq!(view(&mut model), newest);
     }
 }
 

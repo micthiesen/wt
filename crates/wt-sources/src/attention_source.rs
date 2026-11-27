@@ -657,6 +657,7 @@ mod tests {
             comments,
             unresolved_threads: 0,
             unresolved_threads_total: 0,
+            unresolved_threads_more: false,
             merged_at: None,
             closed_at: None,
         }

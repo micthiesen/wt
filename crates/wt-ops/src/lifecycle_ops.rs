@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use futures_util::{StreamExt, stream};
 use wt_github::{GithubClient, GithubData, GithubOptions};
 use wt_lifecycle::{LifecycleService, ServiceConfig};
 use wt_runtime::Confirmed;
@@ -272,7 +273,7 @@ pub async fn landing_facts(
         crate::other_branches::Ask::Nothing,
     )
     .await;
-    let mut published_bases = BTreeMap::new();
+    let published_bases = PublishedBases::default();
     let mut warning = None;
     let mut evidence = AutomationLifecycleEvidence::default();
     for row in rows {
@@ -281,15 +282,8 @@ pub async fn landing_facts(
         }
         let slug = row.target.slug().to_owned();
         let stored = &state["slugs"][row.target.slug()];
-        let landing = landing_evidence(
-            ctx,
-            &row,
-            stored,
-            github,
-            &mut published_bases,
-            &mut warning,
-        )
-        .await;
+        let landing =
+            landing_evidence(ctx, &row, stored, github, &published_bases, &mut warning).await;
         let landing = match landing {
             Ok(landing) => landing,
             Err(error) if !ctx.cancellation.is_cancelled() => {
@@ -299,11 +293,13 @@ pub async fn landing_facts(
             Err(error) => return Err(error),
         };
         let clean_candidate = if landing.landed() && !wt_lifecycle::checkout_missing(&row).await {
-            let base_tip = landing
-                .on_published_base()
-                .then(|| published_bases.get(proof_repository(ctx, Path::new(&row.target.path))))
-                .flatten()
-                .and_then(Option::clone);
+            let base_tip = if landing.on_published_base() {
+                published_bases
+                    .known(proof_repository(ctx, Path::new(&row.target.path)))
+                    .await
+            } else {
+                None
+            };
             match lifecycle
                 .removal_hazards_on(&row.target, true, base_tip.as_deref(), &ctx.cancellation)
                 .await
@@ -427,22 +423,23 @@ pub async fn row_landings(
     rows: &[WorktreeRecord],
     state: &serde_json::Value,
     github: Option<&GithubData>,
+    published_bases: &PublishedBases,
 ) -> BTreeMap<String, wt_core::Landing> {
     let empty = GithubData::default();
     let github = github.unwrap_or(&empty);
-    let mut published_bases = BTreeMap::new();
-    let mut warning = None;
-    let mut landings = BTreeMap::new();
-    let mut read = Vec::new();
-    for row in rows.iter().filter(|row| !row.is_main) {
-        let stored = &state["slugs"][row.target.slug()];
-        let Ok(landing) =
-            landing_evidence(ctx, row, stored, github, &mut published_bases, &mut warning).await
-        else {
-            continue;
-        };
-        read.push((row, landing.landed()));
-    }
+    let read: Vec<(&WorktreeRecord, bool)> = stream::iter(rows.iter().filter(|row| !row.is_main))
+        .map(|row| async move {
+            let stored = &state["slugs"][row.target.slug()];
+            let mut warning = None;
+            landing_evidence(ctx, row, stored, github, published_bases, &mut warning)
+                .await
+                .ok()
+                .map(|landing| (row, landing.landed()))
+        })
+        .buffer_unordered(ROW_READS)
+        .filter_map(std::future::ready)
+        .collect()
+        .await;
     // GitHub not returning a pull request is no answer about it. One that
     // it returns open or closed is, and stands against the history.
     let silent: Vec<String> = read
@@ -458,29 +455,37 @@ pub async fn row_landings(
             .await
             .unwrap_or_default()
     };
-    for (row, landed) in read {
-        let slug = row.target.slug();
-        let stored = &state["slugs"][slug];
-        let landed = landed
-            || match history.get(slug) {
-                Some(events) => history_landed(ctx, row, events).await,
-                None => false,
-            };
-        let owed = landed.then(|| owed_check_stages(stored));
-        let asked = |stage| owed.is_some_and(|owed| owed.stage(stage));
-        let reach = stage_reach(ctx, row, github, asked, false).await;
-        landings.insert(
-            slug.to_owned(),
-            wt_core::Landing::new(
-                landed,
-                reach.in_production,
-                ctx.config.branch.separate_production(),
+    let history = &history;
+    stream::iter(read)
+        .map(|(row, landed)| async move {
+            let slug = row.target.slug();
+            let stored = &state["slugs"][slug];
+            let landed = landed
+                || match history.get(slug) {
+                    Some(events) => history_landed(ctx, row, events).await,
+                    None => false,
+                };
+            let owed = landed.then(|| owed_check_stages(stored));
+            let asked = |stage| owed.is_some_and(|owed| owed.stage(stage));
+            let reach = stage_reach(ctx, row, github, asked, false).await;
+            (
+                slug.to_owned(),
+                wt_core::Landing::new(
+                    landed,
+                    reach.in_production,
+                    ctx.config.branch.separate_production(),
+                )
+                .with_deploys(reach.deploys),
             )
-            .with_deploys(reach.deploys),
-        );
-    }
-    landings
+        })
+        .buffer_unordered(ROW_READS)
+        .collect()
+        .await
 }
+
+/// How many rows [`row_landings`] reads at once. Each read is a handful of
+/// short Git calls; the process runner bounds the subprocesses themselves.
+const ROW_READS: usize = 8;
 
 /// How much of a row's newest history is read for [`history_landed`].
 const HISTORY_PROOF_EVENTS: usize = 200;
@@ -615,6 +620,33 @@ pub fn check_wants(state: &serde_json::Value) -> BTreeMap<String, WatchWants> {
         .collect()
 }
 
+/// The base tip a landing is proven against, per object store, for one batch
+/// of rows. By default it is the tip origin advertises now, which is what a
+/// removal or any other write is decided from.
+#[derive(Default)]
+pub struct PublishedBases {
+    tips: tokio::sync::Mutex<BTreeMap<PathBuf, Option<String>>>,
+    last_fetched: bool,
+}
+
+impl PublishedBases {
+    /// For a command that only prints the landing: the base as origin was
+    /// last fetched, with no round trip to it. It differs from the advertised
+    /// tip only while a fetch is due, where a landing reads as not yet, or
+    /// after the base was rewound.
+    pub fn last_fetched() -> Self {
+        Self {
+            tips: Default::default(),
+            last_fetched: true,
+        }
+    }
+
+    /// The tip a proof in this batch read, if one did.
+    async fn known(&self, repository: &Path) -> Option<String> {
+        self.tips.lock().await.get(repository).cloned().flatten()
+    }
+}
+
 #[derive(Default)]
 struct Landing {
     pr_landed: bool,
@@ -643,7 +675,7 @@ async fn landing_evidence(
     row: &WorktreeRecord,
     stored: &serde_json::Value,
     github: &GithubData,
-    published_bases: &mut BTreeMap<PathBuf, Option<String>>,
+    published_bases: &PublishedBases,
     warning: &mut Option<String>,
 ) -> Result<Landing> {
     let path = Path::new(&row.target.path);
@@ -717,7 +749,7 @@ async fn plan_with_evidence(
 ) -> Result<RemovalPlans> {
     let lifecycle = service(ctx)?;
     let mut plans = Vec::with_capacity(rows.len());
-    let mut published_bases = BTreeMap::new();
+    let published_bases = PublishedBases::default();
     for row in rows {
         if row.is_main {
             continue;
@@ -725,15 +757,8 @@ async fn plan_with_evidence(
         let result: Result<RemovalPlan> = async {
             let path = Path::new(&row.target.path);
             let stored = &state["slugs"][row.target.slug()];
-            let landing = landing_evidence(
-                ctx,
-                &row,
-                stored,
-                github,
-                &mut published_bases,
-                &mut warning,
-            )
-            .await?;
+            let landing =
+                landing_evidence(ctx, &row, stored, github, &published_bases, &mut warning).await?;
             let landed = landing.landed();
             let pr_landed = landing.pr_landed;
             let mut extra = serde_json::Map::new();
@@ -790,11 +815,11 @@ async fn plan_with_evidence(
                 automations_paused: None,
                 extra,
             };
-            let base_tip = landing
-                .on_published_base()
-                .then(|| published_bases.get(proof_repository(ctx, path)))
-                .flatten()
-                .and_then(Option::clone);
+            let base_tip = if landing.on_published_base() {
+                published_bases.known(proof_repository(ctx, path)).await
+            } else {
+                None
+            };
             let mut revision = lifecycle
                 .removal_revision_on(&row.target, landed, base_tip.as_deref(), &ctx.cancellation)
                 .await?;
@@ -839,7 +864,7 @@ async fn published_base_contains(
     path: &Path,
     head: &str,
     branch: &str,
-    published: &mut BTreeMap<PathBuf, Option<String>>,
+    published: &PublishedBases,
     warning: &mut Option<String>,
 ) -> Result<bool> {
     let reference = format!("refs/remotes/origin/{}", ctx.config.branch.base);
@@ -885,7 +910,7 @@ async fn published_base_holds_patches(
     ctx: &AppContext,
     path: &Path,
     head: &str,
-    published: &mut BTreeMap<PathBuf, Option<String>>,
+    published: &PublishedBases,
     warning: &mut Option<String>,
 ) -> Result<bool> {
     let Some(tip) = published_tip(ctx, path, published, warning).await? else {
@@ -911,33 +936,47 @@ fn proof_repository<'a>(ctx: &'a AppContext, path: &'a Path) -> &'a Path {
     }
 }
 
-/// The base tip origin advertises now, asked once per object store in a
-/// batch. `None` when origin could not say.
+/// The base tip of this batch (see [`PublishedBases`]), read once per object
+/// store. `None` when it could not be read.
 async fn published_tip(
     ctx: &AppContext,
     path: &Path,
-    published: &mut BTreeMap<PathBuf, Option<String>>,
+    published: &PublishedBases,
     warning: &mut Option<String>,
 ) -> Result<Option<String>> {
     let repository = proof_repository(ctx, path);
-    if !published.contains_key(repository) {
-        let remote_ref = format!("refs/heads/{}", ctx.config.branch.base);
-        let result = run_git(
-            ctx,
-            repository,
-            ["ls-remote", "--exit-code", "--refs", "origin", &remote_ref],
-        )
-        .await?;
-        let tip = if result.status.success() {
-            result.stdout_text().lines().find_map(|line| {
-                let (oid, name) = line.split_once('\t')?;
-                (name == remote_ref
-                    && matches!(oid.len(), 40 | 64)
-                    && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
-                .then(|| oid.to_owned())
-            })
+    // Held across the read, so rows asking at once share one answer.
+    let mut tips = published.tips.lock().await;
+    if !tips.contains_key(repository) {
+        let is_oid = |oid: &str| {
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+        };
+        let tip = if published.last_fetched {
+            let fetched = format!("refs/remotes/origin/{}^{{commit}}", ctx.config.branch.base);
+            let result = run_git(
+                ctx,
+                repository,
+                ["rev-parse", "--verify", "--quiet", &fetched],
+            )
+            .await?;
+            Some(result.stdout_text().trim().to_owned())
+                .filter(|oid| result.status.success() && is_oid(oid))
         } else {
-            None
+            let remote_ref = format!("refs/heads/{}", ctx.config.branch.base);
+            let result = run_git(
+                ctx,
+                repository,
+                ["ls-remote", "--exit-code", "--refs", "origin", &remote_ref],
+            )
+            .await?;
+            if result.status.success() {
+                result.stdout_text().lines().find_map(|line| {
+                    let (oid, name) = line.split_once('\t')?;
+                    (name == remote_ref && is_oid(oid)).then(|| oid.to_owned())
+                })
+            } else {
+                None
+            }
         };
         if tip.is_none() {
             let detail = format!(
@@ -949,9 +988,9 @@ async fn published_tip(
                 None => detail,
             });
         }
-        published.insert(repository.to_path_buf(), tip);
+        tips.insert(repository.to_path_buf(), tip);
     }
-    Ok(published.get(repository).cloned().flatten())
+    Ok(tips.get(repository).cloned().flatten())
 }
 
 /// Re-plan the exact confirmed set. Never expand a user's confirmation because
@@ -1297,7 +1336,15 @@ mod tests {
         assert!(landed.hazards.is_empty(), "{:?}", landed.hazards);
         assert_eq!(landed.revision.published_base.as_ref().unwrap().1, tip);
         assert!(
-            row_landings(ctx, std::slice::from_ref(&row), &state, Some(&github)).await["one"].base
+            row_landings(
+                ctx,
+                std::slice::from_ref(&row),
+                &state,
+                Some(&github),
+                &PublishedBases::default(),
+            )
+            .await["one"]
+                .base
         );
         // The merge is the proof that the work is this branch's: without
         // it, matching patches alone land nothing.
@@ -1329,6 +1376,45 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// A command that only prints a landing proves Git ancestry against the
+    /// base as last fetched, so it makes no round trip to origin. A write
+    /// still asks origin for its tip. Every row of the batch is read.
+    #[tokio::test]
+    async fn a_printed_landing_is_read_without_asking_origin() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let (origin, base) = with_origin(&fixture).await;
+        let anchor = base.clone();
+        ctx.database
+            .call(move |store| {
+                store.set_slug_base("one", Some(("main", Some(&anchor))))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        merged_with_a_merge_commit(&fixture, &base).await;
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let rows = ctx.repository.inventory(&ctx.cancellation).await.unwrap();
+        let landings = |bases: PublishedBases| {
+            let (rows, state) = (&rows, &state);
+            async move { row_landings(ctx, rows, state, None, &bases).await }
+        };
+        let asked = landings(PublishedBases::default()).await;
+        assert!(asked["one"].base);
+        assert!(asked.contains_key("two") && !asked.contains_key("main"));
+
+        std::fs::rename(&origin, origin.with_extension("gone")).unwrap();
+        let printed = landings(PublishedBases::last_fetched()).await;
+        assert!(printed["one"].base);
+        assert_eq!(printed.len(), asked.len());
+        assert!(!landings(PublishedBases::default()).await["one"].base);
+        fixture.close().await.unwrap();
+    }
+
     /// A squash merge leaves no ancestry, and a later GitHub read may not
     /// return the merged pull request. The row's own history then proves
     /// the landing, at the HEAD it recorded and nowhere else, and never
@@ -1354,7 +1440,14 @@ mod tests {
             let row = row.clone();
             let state = state.clone();
             async move {
-                row_landings(ctx, std::slice::from_ref(&row), &state, github.as_ref()).await["one"]
+                row_landings(
+                    ctx,
+                    std::slice::from_ref(&row),
+                    &state,
+                    github.as_ref(),
+                    &PublishedBases::default(),
+                )
+                .await["one"]
                     .base
             }
         };

@@ -18,6 +18,7 @@ use serde_json::Value;
 use wt_app_core::context::AppContext;
 use wt_core::Landing;
 use wt_github::{GithubClient, GithubData, GithubOptions};
+use wt_ops::lifecycle_ops::PublishedBases;
 use wt_vcs::WorktreeRecord;
 
 /// How long one command waits for GitHub before calling a landing unknown.
@@ -113,6 +114,18 @@ enum Use {
     Decide,
 }
 
+impl Use {
+    /// The base tip Git ancestry is proven against, read once for every
+    /// pass of one command: origin's own for a write, the base as last
+    /// fetched for a printed landing, which costs no round trip.
+    fn bases(self) -> PublishedBases {
+        match self {
+            Self::Display => PublishedBases::last_fetched(),
+            Self::Decide => PublishedBases::default(),
+        }
+    }
+}
+
 /// One batched read for exactly these branches: the events daemon's
 /// snapshot while it covers them and `usage` accepts its age, else GitHub
 /// itself. `None` when neither answers in time; a partial answer is no
@@ -171,9 +184,15 @@ async fn read_for(
     .await
     .ok()
     .flatten();
-    resolve(ctx, rows, state, want, saved, |branches| async move {
-        fresh_github(ctx, &branches, usage).await
-    })
+    resolve(
+        ctx,
+        rows,
+        state,
+        want,
+        saved,
+        &usage.bases(),
+        |branches| async move { fresh_github(ctx, &branches, usage).await },
+    )
     .await
 }
 
@@ -192,6 +211,7 @@ pub(crate) async fn read_with(
         state,
         Want::Phases,
         None,
+        &Use::Display.bases(),
         |_| async move { fetched },
     )
     .await
@@ -203,13 +223,14 @@ async fn resolve<F>(
     state: &Value,
     want: Want,
     saved: Option<GithubData>,
+    bases: &PublishedBases,
     fresh: impl FnOnce(Vec<String>) -> F,
 ) -> BTreeMap<String, RowLanding>
 where
     F: Future<Output = Option<GithubData>>,
 {
     let landings = |rows: Vec<WorktreeRecord>, github: Option<GithubData>| async move {
-        wt_ops::lifecycle_ops::row_landings(ctx, &rows, state, github.as_ref()).await
+        wt_ops::lifecycle_ops::row_landings(ctx, &rows, state, github.as_ref(), bases).await
     };
     let rows: Vec<WorktreeRecord> = rows.iter().filter(|row| !row.is_main).cloned().collect();
     let local = landings(rows.clone(), None).await;
@@ -378,6 +399,7 @@ mod tests {
             state,
             want,
             saved,
+            &PublishedBases::default(),
             |branches| async move {
                 assert_eq!(branches, std::slice::from_ref(&row.target.branch));
                 fresh.expect("no GitHub read is needed here")

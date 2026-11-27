@@ -46,6 +46,8 @@ duplicates.
   protocol, lane classification, feeds and small shared helpers.
 - `wt-ops`: operations the CLI and the host both run, and the command
   implementations they reuse (`wt_ops::commands::{_destroy, new, remove, ...}`).
+  `wt_ops::maintenance` is the only code that removes leftover files and old
+  slug records, and never a lock file; the TUI process runs it daily ([updates.md](updates.md#leftovers-and-the-daily-maintenance-pass)).
 - `wt-sources`: the source graph that prepares the board.
 - `wt-host`: the controller, host service and dispatch, remote hosts, palettes.
 - `wt-cli`: `wt::main` and the remaining CLI commands.
@@ -195,6 +197,17 @@ cross a typed `UiAction` boundary into the application controller. This keeps
 terminal rendering separate from I/O and lets the same host service handle
 local and SSH-routed requests.
 
+The driver draws once per batch of input, not once per event: after an input
+event it applies every event that has already arrived and then draws the
+frame they leave. A frame that costs more than the gap between events (a held
+key or a wheel flick on a loaded machine or a slow terminal) is skipped
+instead of queued, so the cursor never trails the keyboard, and the last
+event of a batch is always drawn. A batch ends early at a key that sends a
+request and at a released drag selection. Because events share frames, input
+handlers must not read a position only the last frame computed; state a
+frame derives (a clamp, a viewport top) has to stay correct across several
+events.
+
 Menus are presentation of the board, not host requests. `UiAction::menu`
 (`wt-tui/src/menus`) declares for every action, without a wildcard arm,
 whether its menu is built from the presented board, needs host-only data
@@ -334,9 +347,13 @@ unless a live publish arrived first. They save live, ready data at most every
 10 seconds and once at shutdown within a one-second budget that never fails
 shutdown. A fetch shows its lane as refreshing only if it runs longer than 100
 ms, so a skipped or quick refresh causes no redraw. Files live under `<cache root>/query/<name>.json` in an envelope
-whose scope hashes the repository id, canonical main clone, merged
-configuration and build (plus the executable's size and mtime for `dev-`
-builds). Remote host display snapshots use `<cache root>/remote-query/` instead:
+whose scope is a list of named fingerprints: the build (plus the executable's
+size and mtime for `dev-` builds), the canonical main clone, and each
+configuration section a source's data can depend on. Sections that only decide
+presentation or what wt does with the board (`[ui]`, `[[actions]]`,
+`[[automations]]`, `[update]` and the like) are left out, so editing them
+keeps the cache. The `discarding source cache` log line names the components
+that changed. Remote host display snapshots use `<cache root>/remote-query/` instead:
 their scope binds the repository, main clone, selected repository config,
 endpoint, host protocol, and explicit display-cache schema. Compatible binary
 updates and unrelated local settings do not discard remembered remote rows.

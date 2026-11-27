@@ -15,6 +15,9 @@ pub const MAX_CACHE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Where cache files live and which configuration they belong to. The scope
 /// string must change whenever restored data could mean something different:
 /// another repository, configuration or build.
+///
+/// A scope built [from parts](Self::from_parts) names each thing it depends
+/// on, so a file it rejects can say which of them changed.
 #[derive(Clone, Debug)]
 pub struct CacheStore {
     inner: Arc<StoreInner>,
@@ -34,6 +37,20 @@ impl CacheStore {
                 scope: scope.into(),
             }),
         }
+    }
+
+    /// A scope of named components, each `value` already a fingerprint with
+    /// no whitespace. Order does not matter to [`scope_difference`].
+    pub fn from_parts<'a>(
+        directory: PathBuf,
+        parts: impl IntoIterator<Item = (&'a str, String)>,
+    ) -> Self {
+        let scope = parts
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self::new(directory, scope)
     }
 
     pub fn directory(&self) -> &Path {
@@ -73,8 +90,27 @@ pub enum Rejected {
     Missing,
     TooLarge,
     Corrupt(String),
-    Mismatched,
+    /// Saved under another identity; the text names what differed.
+    Mismatched(String),
     Expired,
+}
+
+/// The components of two scopes that differ, comma separated. Scopes that
+/// were not built from parts can only be told apart as a whole.
+pub fn scope_difference(saved: &str, current: &str) -> String {
+    fn parts(scope: &str) -> Option<std::collections::BTreeMap<&str, &str>> {
+        scope.split(' ').map(|part| part.split_once('=')).collect()
+    }
+    let (Some(saved), Some(current)) = (parts(saved), parts(current)) else {
+        return "scope".into();
+    };
+    let names: std::collections::BTreeSet<&str> = saved
+        .keys()
+        .chain(current.keys())
+        .filter(|name| saved.get(*name) != current.get(*name))
+        .copied()
+        .collect();
+    names.into_iter().collect::<Vec<_>>().join(",")
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -162,8 +198,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T> for S
             && *reason != Rejected::Missing
         {
             // Every new build or config changes the scope: routine, not a fault.
-            if *reason == Rejected::Mismatched {
-                tracing::info!(source = name, path = %path.display(), "discarding source cache");
+            if let Rejected::Mismatched(changed) = reason {
+                tracing::info!(source = name, %changed, path = %path.display(), "discarding source cache");
             } else {
                 tracing::warn!(source = name, ?reason, path = %path.display(), "discarding source cache");
             }
@@ -271,8 +307,14 @@ fn read_envelope<T: DeserializeOwned>(
     }
     let header: Header =
         serde_json::from_slice(&bytes).map_err(|error| Rejected::Corrupt(error.to_string()))?;
-    if header.format != FORMAT || header.name != name || header.scope != scope {
-        return Err(Rejected::Mismatched);
+    if header.format != FORMAT {
+        return Err(Rejected::Mismatched("format".into()));
+    }
+    if header.name != name {
+        return Err(Rejected::Mismatched("name".into()));
+    }
+    if header.scope != scope {
+        return Err(Rejected::Mismatched(scope_difference(&header.scope, scope)));
     }
     if header.saved_at_ms > now_ms
         || Duration::from_millis(now_ms - header.saved_at_ms) > MAX_CACHE_AGE
@@ -315,6 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_scope_names_the_components_that_changed() {
+        let directory = tempfile::tempdir().unwrap();
+        let scoped = |build: &str, branch: &str| -> DiskCache<Vec<String>> {
+            DiskCache::new(&CacheStore::from_parts(
+                directory.path().to_path_buf(),
+                [("build", build.to_owned()), ("branch", branch.to_owned())],
+            ))
+        };
+        scoped("v1", "a").write("git", &vec!["row".into()]).unwrap();
+        assert!(scoped("v1", "a").peek("git").is_some());
+        assert_eq!(
+            scoped("v2", "a").slot().peek("git").unwrap_err(),
+            Rejected::Mismatched("build".into())
+        );
+        assert_eq!(
+            scoped("v2", "b").slot().peek("git").unwrap_err(),
+            Rejected::Mismatched("branch,build".into())
+        );
+        // A component only one side has, and a scope with no components.
+        assert_eq!(scope_difference("a=1", "a=1 b=2"), "b");
+        assert_eq!(scope_difference("0f3a", "a=1"), "scope");
+    }
+
+    #[test]
     fn round_trip_and_every_rejection_deletes_the_file() {
         let directory = tempfile::tempdir().unwrap();
         let cache = store(directory.path(), "scope-a");
@@ -333,7 +399,7 @@ mod tests {
         // Another configuration or build cannot read it, and discards it.
         assert_eq!(
             store(directory.path(), "scope-b").read("git").unwrap_err(),
-            Rejected::Mismatched
+            Rejected::Mismatched("scope".into())
         );
         assert!(!directory.path().join("git.json").exists());
 

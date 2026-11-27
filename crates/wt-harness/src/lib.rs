@@ -11,6 +11,7 @@ mod output;
 mod persist;
 mod pi;
 mod service;
+mod shims;
 mod status;
 mod types;
 
@@ -24,11 +25,11 @@ pub use claude::{
     LAUNCH_AUTH_OPTION, LastEntryKind, OVERRIDING_AUTH_ENV, RegistrySession, RegistryStatus,
     SessionContextUsage, SessionTail, TOKEN_HELPER_TIMEOUT, TranscriptFollower, TrustError,
     UsagePeriod, add_claude_name, build_claude_session_entries, claude_session_id,
-    claude_tmux_name, ensure_inspect_shims, ensure_trusted_paths, ensure_trusted_paths_retry,
-    inspector_socket_path, list_claude_names, next_auto_name, parse_claude_tmux_name,
-    parse_claude_usage, project_dir, read_claude_usage, read_session_summaries, reap_claude_names,
-    remove_claude_name, session_jsonl_path, sibling_paths_to_repair, stale_harness_shims,
-    usage_window_key, validate_session_name,
+    claude_tmux_name, ensure_trusted_paths, ensure_trusted_paths_retry, inspector_socket_path,
+    list_claude_names, next_auto_name, parse_claude_tmux_name, parse_claude_usage, project_dir,
+    read_claude_usage, read_session_summaries, reap_claude_names, remove_claude_name,
+    session_jsonl_path, sibling_paths_to_repair, stale_harness_shims, usage_window_key,
+    validate_session_name,
 };
 pub use codex::{
     CodexActivityBatch, CodexActivityTracker, CodexAppServerError, CodexAppServerFailureKind,

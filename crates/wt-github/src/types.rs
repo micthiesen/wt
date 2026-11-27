@@ -138,6 +138,10 @@ pub struct PullRequest {
     pub comments: Vec<PrComment>,
     pub unresolved_threads: u32,
     pub unresolved_threads_total: u32,
+    /// GitHub holds more review threads than were read: past the cap, or
+    /// on a follow-up page that failed. Both counts are then lower bounds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unresolved_threads_more: bool,
     pub merged_at: Option<String>,
     pub closed_at: Option<String>,
 }

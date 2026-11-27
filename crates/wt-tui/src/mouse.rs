@@ -218,10 +218,11 @@ pub(crate) fn scroll(model: &mut Model, event: MouseEvent, area: Rect) -> bool {
             // The wheel scrolls the viewport; the cursor stays put (TS
             // `scroll-list.tsx`). Rendering clamps the offset.
             model.list_free_scroll = true;
+            model.list_anchor = None;
             model.offset = if up {
                 model.offset.saturating_sub(3)
             } else {
-                model.offset.saturating_add(3)
+                model.offset.saturating_add(3).min(model.list_max_offset)
             };
             true
         }

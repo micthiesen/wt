@@ -106,7 +106,15 @@ it does the right thing for the shape under the cursor:
    force-push, resurrecting the landed branch. Landed members are `c`'s job, and a landed cleanup still refuses commits that are not present on the branch's origin ref.
    So pressing `R` on a surviving sibling is safe while a merged member is
    still on disk (and the `stack.parent_merged` automation's clean-then-restack
-   is unaffected by the order the two land in).
+   is unaffected by the order the two land in). The same holds for a member
+   with no children whose own PR merged and whose branch has nothing beyond
+   the merged head. A member whose PR is **in the merge queue** is left
+   exactly as it is too: GitHub rejects any push to a queued branch, and by
+   then the local branch would already be rewritten. What is stacked on it
+   replays onto its tip as it stands, and the restack log says
+   `<branch> is in the merge queue (#N); left as it is`. Both are read before
+   any rewrite (one `gh pr view` per member and one query for the queue), and
+   an answer that cannot be read refuses the restack.
 
 Cleaning a merged member (`c`, or the `wt.merged`/`stack.parent_merged`
 automations) reparents its children automatically when the branch is deleted —
@@ -147,7 +155,10 @@ automatically — the bundled `/restack` skill, which knows the full recovery
 loop, is sent to the failing worktree's harness session (cold-started if
 needed) with the bail context. The handoff is sent once: if delivery cannot be
 confirmed, the restack log says the instructions may have reached the worktree
-and nothing is resent, so check that session before sending them again. From the CLI, run it yourself or resolve by
+and nothing is resent, so check that session before sending them again. A
+bail is the restack ending the way a conflict is meant to, so the attention
+feed and the row's details say `Action stopped on a conflict: <slug> / Restack
+stack`, where a refused restack still reads `Action failed`. From the CLI, run it yourself or resolve by
 hand, then re-run; the anchor logic self-heals around hand-rebases. Leftover
 backups: `wt restack prune-backups --days <n>` removes recognized backups
 older than the cutoff; omitting `--days` removes all recognized restack

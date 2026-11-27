@@ -80,6 +80,12 @@ fn orphans(
 }
 
 pub async fn run(ctx: &AppContext, args: &OrphansArgs) -> Result<i32> {
+    if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
+        eprintln!(
+            "wt orphans reads open pull requests, and GitHub is switched off (WT_GITHUB=off)"
+        );
+        return Ok(1);
+    }
     let listed = ctx
         .processes
         .run(

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -38,8 +38,8 @@ const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
-    EventDaemonConfig, EventDaemonError, EventDaemonState, EventSource, EventsDaemon,
-    GithubSnapshot, RateBudget,
+    BudgetWindows, EventDaemonConfig, EventDaemonError, EventDaemonState, EventSource,
+    EventsDaemon, GithubSnapshot, RateBudget,
 };
 
 #[derive(Clone)]
@@ -459,6 +459,140 @@ pub(super) fn ci_progress(event: &str, payload: &Value) -> bool {
     }
 }
 
+/// Whether a delivery reports only the checks of the branches it names.
+/// Nothing else a read returns moves with it, so a read of those branches
+/// alone serves it. Pull request, review, push and merge queue deliveries
+/// can move other pull requests (a retarget, a merge, a queue position) and
+/// follow this host's own writes, which only a read of every branch settles.
+pub(super) fn scoped_event(event: &str) -> bool {
+    matches!(event, "check_run" | "check_suite" | "status")
+}
+
+/// The most branches a scoped read asks about. The reader batches eight
+/// branches to a request, so this is one request's worth.
+const SCOPED_BRANCH_LIMIT: usize = 8;
+
+/// What one read asks GitHub about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ReadScope {
+    /// Every branch.
+    Full,
+    /// Only these, merged into the last read of every branch.
+    Branches(BTreeSet<String>),
+}
+
+/// What the deliveries waiting on the next read ask for, and what there is
+/// to merge a scoped read into.
+pub(super) struct ScopeInput<'a> {
+    /// A delivery that a scoped read cannot serve is waiting.
+    pub full_asked: bool,
+    /// Branches named by check and status deliveries.
+    pub named: &'a BTreeSet<String>,
+    /// The last snapshot this process wrote.
+    pub base: Option<&'a GithubSnapshot>,
+    /// The branches a read of every branch would ask about now.
+    pub branches: &'a BTreeSet<String>,
+    /// Time since the last read of every branch started.
+    pub sweep_age_ms: Option<u64>,
+    pub max_sweep_age_ms: u64,
+}
+
+/// A scoped read is taken only when it loses nothing: every waiting
+/// delivery names its branches, the last read of every branch covers
+/// exactly today's branches and is recent, and the named branches fit one
+/// request. Anything else reads every branch.
+pub(super) fn read_scope(input: ScopeInput<'_>) -> ReadScope {
+    let ScopeInput {
+        full_asked,
+        named,
+        base,
+        branches,
+        sweep_age_ms,
+        max_sweep_age_ms,
+    } = input;
+    let covered = base.is_some_and(|base| {
+        base.prs.is_object()
+            && base.branches.len() == branches.len()
+            && base.branches.iter().all(|branch| branches.contains(branch))
+    });
+    if full_asked
+        || !covered
+        || named.is_empty()
+        || named.len() > SCOPED_BRANCH_LIMIT
+        || !named.is_subset(branches)
+        || sweep_age_ms.is_none_or(|age| age >= max_sweep_age_ms)
+    {
+        ReadScope::Full
+    } else {
+        ReadScope::Branches(named.clone())
+    }
+}
+
+/// How old the last read of every branch is. The snapshot's own wall-clock
+/// record decides when it has one: the process clock stops while the machine
+/// sleeps, and a base from before a long sleep must not pass for recent.
+pub(super) fn sweep_age_ms(
+    base: Option<&GithubSnapshot>,
+    wall_now_ms: u64,
+    since_start_ms: Option<u64>,
+) -> Option<u64> {
+    // A wall clock behind the stamp was set back and measures nothing.
+    base.and_then(|base| base.swept_at_ms)
+        .and_then(|swept| wall_now_ms.checked_sub(swept))
+        .or(since_start_ms)
+}
+
+/// How long a read of every branch must still wait for the pace its budget
+/// asks for, counted from the start of the last one, on the wall clock when
+/// the snapshot records that start.
+pub(super) fn full_wait_ms(
+    base: Option<&GithubSnapshot>,
+    wall_now_ms: u64,
+    since_start_ms: Option<u64>,
+    full_paced_ms: u64,
+) -> u64 {
+    base.and_then(|base| base.fetch_started_at_ms)
+        .and_then(|started| wall_now_ms.checked_sub(started))
+        .or(since_start_ms)
+        .map_or(0, |since| full_paced_ms.saturating_sub(since))
+}
+
+/// A deadline no earlier than the postponed read of every branch it would
+/// only be postponed to again.
+fn held_deadline(deadline: Option<Instant>, hold: Option<Instant>) -> Option<Instant> {
+    match (deadline, hold) {
+        (Some(deadline), Some(hold)) => Some(deadline.max(hold)),
+        (deadline, _) => deadline,
+    }
+}
+
+/// `base` with the pull requests of `named` replaced by what a read of
+/// exactly those branches returned: a branch the read found no pull request
+/// for loses its entry, and no other branch is touched. The merge queue is
+/// repository-wide and every read returns it, so the newer one stands. The
+/// snapshot keeps the read start of its oldest data; `branch_reads` records
+/// which branches are newer. `None` when either side is not a branch map.
+pub(super) fn merge_scoped(
+    base: &GithubSnapshot,
+    named: &BTreeSet<String>,
+    prs: &Value,
+    merge_queue: Value,
+    started_ms: u64,
+) -> Option<GithubSnapshot> {
+    let read = prs.as_object()?;
+    let mut merged = base.clone();
+    let shown = merged.prs.as_object_mut()?;
+    for branch in named {
+        match read.get(branch) {
+            Some(pr) => shown.insert(branch.clone(), pr.clone()),
+            None => shown.remove(branch),
+        };
+        merged.branch_reads.insert(branch.clone(), started_ms);
+    }
+    merged.merge_queue = merge_queue;
+    Some(merged)
+}
+
 fn branch_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     path.iter()
         .try_fold(value, |node, key| node.get(*key))?
@@ -614,6 +748,21 @@ async fn scheduler(
     // first refresh, and a coalesced overflow whose events are unknown,
     // always fetch.
     let mut origin_trigger: Option<(String, Option<String>)> = Some(("startup".into(), None));
+    // What the waiting deliveries ask of the next read. The first read, a
+    // retry and anything a scoped read cannot serve read every branch.
+    let mut full_asked = true;
+    let mut named_branches: BTreeSet<String> = BTreeSet::new();
+    // The last snapshot this process wrote, which a scoped read merges into.
+    let mut base: Option<GithubSnapshot> = None;
+    let mut last_full_start: Option<Instant> = None;
+    // The floor between reads of every branch that the budget asks for, and
+    // what the last such read cost.
+    let mut full_paced_ms = config.min_fetch_interval_ms;
+    let mut full_cost = 0u64;
+    // A read of every branch that its pace postponed is due then. Deliveries
+    // arriving meanwhile wait for it instead of waking the scheduler early.
+    let mut full_hold: Option<Instant> = None;
+    let mut windows = BudgetWindows::default();
     loop {
         let sleep = async {
             match pending_deadline {
@@ -644,18 +793,23 @@ async fn scheduler(
                     cached_inventory_at = Some(now);
                 }
                 let candidates = extract_event_branches(&event.name, &event.payload, &config.base_branch);
-                let (relevant, matched) = match candidates {
+                let (relevant, known) = match candidates {
                     Some(names) if names.is_empty() => (false, None),
                     None => (true, None),
                     Some(_) if !(local_known && remote_known) => (true, None),
                     Some(names) => {
-                        let matched = names.into_iter().find(|branch| {
+                        let known: Vec<String> = names.into_iter().filter(|branch| {
                             local_branches.contains(branch) || remote_branches.contains(branch)
-                        });
-                        (matched.is_some(), matched)
+                        }).collect();
+                        (!known.is_empty(), Some(known))
                     }
                 };
+                let matched = known.as_ref().and_then(|known| known.first().cloned());
                 if relevant {
+                    match known {
+                        Some(known) if scoped_event(&event.name) => named_branches.extend(known),
+                        _ => full_asked = true,
+                    }
                     let floor_ms = if ci_progress(&event.name, &event.payload) {
                         fetch_interval_ms.max(config.progress_fetch_interval_ms)
                     } else {
@@ -676,9 +830,11 @@ async fn scheduler(
                     if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, floor_ms) {
                         pending_deadline = Some(started + Duration::from_millis(deadline));
                     }
+                    pending_deadline = held_deadline(pending_deadline, full_asked.then_some(full_hold).flatten());
                 }
             }
             _ = coalesced_rx.recv() => {
+                full_asked = true;
                 origin_trigger.get_or_insert_with(|| ("coalesced overflow".into(), None));
                 let now_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
                 let last_ms = last_fetch_start.map(|instant| instant.duration_since(started).as_millis().min(u64::MAX as u128) as u64);
@@ -686,10 +842,12 @@ async fn scheduler(
                 if let Some(deadline) = next_fetch_at(now_ms, last_ms, pending_ms, config.debounce_ms, fetch_interval_ms) {
                     pending_deadline = Some(started + Duration::from_millis(deadline));
                 }
+                pending_deadline = held_deadline(pending_deadline, full_hold);
             }
             _ = sleep => {
                 pending_deadline = None;
                 let now = Instant::now();
+                let prior_fetch_start = last_fetch_start;
                 last_fetch_start = Some(now);
                 let branch_refresh = async {
                     source.local_branches(&cancel).await
@@ -737,6 +895,30 @@ async fn scheduler(
                     fetch_branches.extend(remote_branches.iter().cloned());
                 }
                 cached_inventory_at = Some(now);
+                let wall_now_ms = now_millis();
+                let since_full_ms = last_full_start.map(|at| now.duration_since(at).as_millis().min(u64::MAX as u128) as u64);
+                let scope = read_scope(ScopeInput {
+                    full_asked,
+                    named: &named_branches,
+                    base: base.as_ref(),
+                    branches: &fetch_branches,
+                    sweep_age_ms: sweep_age_ms(base.as_ref(), wall_now_ms, since_full_ms),
+                    max_sweep_age_ms: config.full_sweep_interval_ms,
+                });
+                // Scoped reads cost a fraction of a read of every branch, so
+                // their pace does not hold one of those to the budget.
+                let wait_ms = full_wait_ms(base.as_ref(), wall_now_ms, since_full_ms, full_paced_ms);
+                if scope == ReadScope::Full && wait_ms > 0 {
+                    let due = now + Duration::from_millis(wait_ms);
+                    full_asked = true;
+                    full_hold = Some(due);
+                    last_fetch_start = prior_fetch_start;
+                    pending_deadline = Some(due);
+                    continue;
+                }
+                full_hold = None;
+                full_asked = false;
+                named_branches.clear();
                 if let Some((trigger, branch)) = origin_trigger.take() {
                     let branch_name = branch.as_deref().unwrap_or("");
                     let origin_started = Instant::now();
@@ -755,33 +937,72 @@ async fn scheduler(
                 // Readers order this observation by when the GitHub read
                 // began: a write accepted after this moment may be missing.
                 let fetch_started_at_ms = now_millis();
-                let fetched = source.fetch_github(fetch_branches.iter().cloned().collect(), &cancel).await;
+                let asked: Vec<String> = match &scope {
+                    ReadScope::Full => fetch_branches.iter().cloned().collect(),
+                    ReadScope::Branches(named) => named.iter().cloned().collect(),
+                };
+                let fetched = source.fetch_github(asked, &cancel).await;
                 let mut paced_ms = config.min_fetch_interval_ms;
                 let mut reset_at_ms = None;
                 let failure = match fetched {
                     Ok(data) => {
+                        let finished_ms = now_millis();
+                        let budget = data.budget.and_then(|read| windows.observe(read, finished_ms));
                         // A busy hour stretches the floor instead of running the
                         // budget out; the floor still counts from this fetch's start.
-                        paced_ms = paced_interval_ms(config.min_fetch_interval_ms, data.budget, now_millis());
-                        let snapshot = GithubSnapshot {
-                            updated_at: now_millis(), fetch_started_at_ms: Some(fetch_started_at_ms),
-                            branches: fetch_branches.into_iter().collect(), prs: data.prs,
-                            merge_queue: data.merge_queue, rate_limit: data.budget,
-                            next_fetch_at_ms: Some(fetch_started_at_ms.saturating_add(paced_ms)),
-                            writer_sha: config.writer_sha.clone(),
-                            repository: config.repository.clone(),
-                            extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
+                        paced_ms = paced_interval_ms(config.min_fetch_interval_ms, budget, finished_ms);
+                        let rate_windows = Some(windows.open(finished_ms)).filter(|open| open.len() > 1).unwrap_or_default();
+                        let snapshot = match &scope {
+                            ReadScope::Full => {
+                                full_cost = budget.map_or(0, |budget| budget.cost);
+                                full_paced_ms = paced_ms;
+                                Some(GithubSnapshot {
+                                    updated_at: finished_ms, fetch_started_at_ms: Some(fetch_started_at_ms),
+                                    swept_at_ms: Some(finished_ms), branch_reads: BTreeMap::new(),
+                                    branches: fetch_branches.into_iter().collect(), prs: data.prs,
+                                    merge_queue: data.merge_queue, rate_limit: budget, rate_windows,
+                                    next_fetch_at_ms: Some(fetch_started_at_ms.saturating_add(paced_ms)),
+                                    writer_sha: config.writer_sha.clone(),
+                                    repository: config.repository.clone(),
+                                    extra: read_json::<GithubSnapshot>(config.events_dir.join("github.json")).await.ok().flatten().map(|snapshot| snapshot.extra).unwrap_or_default(),
+                                })
+                            }
+                            ReadScope::Branches(named) => base.as_ref()
+                                .and_then(|base| merge_scoped(base, named, &data.prs, data.merge_queue, fetch_started_at_ms))
+                                .map(|mut merged| {
+                                    // The next read of every branch is paced by what one costs.
+                                    full_paced_ms = paced_interval_ms(
+                                        config.min_fetch_interval_ms,
+                                        budget.map(|budget| RateBudget { cost: full_cost.max(budget.cost), ..budget }),
+                                        finished_ms,
+                                    );
+                                    merged.updated_at = finished_ms;
+                                    // Readers pace their own reads of every
+                                    // branch by this cost, not a scoped read's.
+                                    merged.rate_limit = budget.map(|budget| RateBudget { cost: full_cost.max(budget.cost), ..budget });
+                                    merged.rate_windows = rate_windows;
+                                    merged.next_fetch_at_ms = merged.fetch_started_at_ms.map(|started| started.saturating_add(full_paced_ms));
+                                    merged
+                                }),
                         };
-                        match durable.write_snapshot(&snapshot).await {
-                            Ok(()) => {
+                        let written = match snapshot {
+                            Some(snapshot) => durable.write_snapshot(&snapshot).await.map(|()| snapshot).map_err(|e| format!("cannot persist GitHub snapshot: {e}")),
+                            None => Err("a scoped GitHub read had nothing to merge into".to_owned()),
+                        };
+                        match written {
+                            Ok(snapshot) => {
+                                if scope == ReadScope::Full {
+                                    last_full_start = Some(now);
+                                }
                                 let mut state = durable.state.lock().await;
                                 state.last_fetch_at = Some(snapshot.updated_at);
                                 state.last_error = None;
                                 let _ = durable.write_state_locked(&state).await;
                                 if let Err(e) = atomic_write(&config.events_dir.join("github.touch"), snapshot.updated_at.to_string().as_bytes()).await { warn!(error = %e, "cannot write GitHub snapshot marker"); }
+                                base = Some(snapshot);
                                 None
                             }
-                            Err(e) => Some(format!("cannot persist GitHub snapshot: {e}")),
+                            Err(message) => Some(message),
                         }
                     }
                     Err(e) => {
@@ -797,6 +1018,10 @@ async fn scheduler(
                         break;
                     }
                     Some(message) => {
+                        // Nothing was merged or written, and what a read of
+                        // a few branches would have shown is unknown: the
+                        // retry reads every branch.
+                        full_asked = true;
                         failures = failures.saturating_add(1);
                         let limited = rate_limited(&message);
                         fetch_interval_ms = failure_wait_ms(config.min_fetch_interval_ms, failures, limited, reset_at_ms, now_millis());
@@ -982,7 +1207,16 @@ mod tests {
         fail: AtomicBool,
         /// The budget each successful read reports.
         budget: Option<RateBudget>,
+        /// Budgets successive reads report, before `budget` takes over.
+        budgets: std::sync::Mutex<std::collections::VecDeque<RateBudget>>,
+        /// Report pull requests keyed by branch, each naming the read that
+        /// returned it, for every branch asked about except these.
+        by_branch: AtomicBool,
+        without_pr: std::sync::Mutex<BTreeSet<String>>,
+        /// The branches each read asked about.
+        asked: std::sync::Mutex<Vec<Vec<String>>>,
         fetches: AtomicUsize,
+        local_calls: AtomicUsize,
         origin_fetches: AtomicUsize,
         remote_calls: AtomicUsize,
         remote_failure_after: Option<usize>,
@@ -993,6 +1227,7 @@ mod tests {
             &'a self,
             _: &'a CancellationToken,
         ) -> EventFuture<'a, Result<Vec<String>, String>> {
+            self.local_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(vec!["feature-x".to_owned()]) })
         }
         fn remote_branches<'a>(
@@ -1023,8 +1258,11 @@ mod tests {
             branches: Vec<String>,
             cancel: &'a CancellationToken,
         ) -> EventFuture<'a, Result<EventGithubData, GithubFetchError>> {
-            self.fetches.fetch_add(1, Ordering::SeqCst);
-            let budget = self.budget;
+            let read = self.fetches.fetch_add(1, Ordering::SeqCst) + 1;
+            self.asked.lock().unwrap().push(branches.clone());
+            let budget = self.budgets.lock().unwrap().pop_front().or(self.budget);
+            let by_branch = self.by_branch.load(Ordering::SeqCst);
+            let without_pr = self.without_pr.lock().unwrap().clone();
             let fail = self.fail.load(Ordering::SeqCst);
             let hang = self.hang_until_cancelled.load(Ordering::SeqCst);
             Box::pin(async move {
@@ -1034,6 +1272,18 @@ mod tests {
                 }
                 if fail {
                     return Err("fixture failure".into());
+                }
+                if by_branch {
+                    let prs: serde_json::Map<String, Value> = branches
+                        .iter()
+                        .filter(|branch| !without_pr.contains(*branch))
+                        .map(|branch| (branch.clone(), json!({"read": read})))
+                        .collect();
+                    return Ok(EventGithubData {
+                        prs: Value::Object(prs),
+                        merge_queue: json!({"read": read}),
+                        budget,
+                    });
                 }
                 Ok(EventGithubData {
                     prs: json!({"branches": branches}),
@@ -1488,6 +1738,526 @@ mod tests {
         })
         .await
         .expect("GitHub refresh ran");
+    }
+
+    async fn wait_for_snapshot(
+        dir: &TempDir,
+        ready: impl Fn(&GithubSnapshot) -> bool,
+    ) -> GithubSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(snapshot) = read_snapshot(dir.path()).await.unwrap()
+                    && ready(&snapshot)
+                {
+                    return snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the snapshot was written")
+    }
+
+    fn names(branches: &[&str]) -> BTreeSet<String> {
+        branches.iter().map(|branch| (*branch).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_scoped_read_is_taken_only_when_it_loses_nothing() {
+        let base = GithubSnapshot {
+            branches: vec!["a".into(), "b".into()],
+            prs: json!({"a": {}}),
+            ..GithubSnapshot::default()
+        };
+        let all = names(&["a", "b"]);
+        let named = names(&["a"]);
+        let scope = |full_asked,
+                     named: &BTreeSet<String>,
+                     base: Option<&GithubSnapshot>,
+                     branches: &BTreeSet<String>,
+                     sweep_age_ms| {
+            read_scope(ScopeInput {
+                full_asked,
+                named,
+                base,
+                branches,
+                sweep_age_ms,
+                max_sweep_age_ms: 45_000,
+            })
+        };
+        assert_eq!(
+            scope(false, &named, Some(&base), &all, Some(44_999)),
+            ReadScope::Branches(named.clone())
+        );
+        // A delivery a scoped read cannot serve, or none naming a branch.
+        assert_eq!(
+            scope(true, &named, Some(&base), &all, Some(0)),
+            ReadScope::Full
+        );
+        assert_eq!(
+            scope(false, &names(&[]), Some(&base), &all, Some(0)),
+            ReadScope::Full
+        );
+        // Nothing to merge into, or a read of every branch that is too old.
+        assert_eq!(scope(false, &named, None, &all, Some(0)), ReadScope::Full);
+        assert_eq!(
+            scope(false, &named, Some(&base), &all, None),
+            ReadScope::Full
+        );
+        assert_eq!(
+            scope(false, &named, Some(&base), &all, Some(45_000)),
+            ReadScope::Full
+        );
+        // The branches changed since the last read of every branch, in
+        // either direction, or the named branch is not one of them.
+        assert_eq!(
+            scope(
+                false,
+                &named,
+                Some(&base),
+                &names(&["a", "b", "c"]),
+                Some(0)
+            ),
+            ReadScope::Full
+        );
+        assert_eq!(
+            scope(false, &named, Some(&base), &names(&["a"]), Some(0)),
+            ReadScope::Full
+        );
+        assert_eq!(
+            scope(false, &names(&["z"]), Some(&base), &all, Some(0)),
+            ReadScope::Full
+        );
+        // More branches than one request reads.
+        let many: BTreeSet<String> = (0..=SCOPED_BRANCH_LIMIT).map(|n| format!("b{n}")).collect();
+        let wide = GithubSnapshot {
+            branches: many.iter().cloned().collect(),
+            prs: json!({}),
+            ..GithubSnapshot::default()
+        };
+        assert_eq!(
+            scope(false, &many, Some(&wide), &many, Some(0)),
+            ReadScope::Full
+        );
+        // A snapshot whose pull requests are not a branch map cannot be merged into.
+        let odd = GithubSnapshot {
+            prs: json!([]),
+            ..base.clone()
+        };
+        assert_eq!(
+            scope(false, &named, Some(&odd), &all, Some(0)),
+            ReadScope::Full
+        );
+    }
+
+    /// The process clock stops while the machine sleeps. After a long sleep
+    /// the last read of every branch is as old as the wall clock says, so a
+    /// check delivery does not merge into an hours-old base, and the pace of
+    /// the next read of every branch has long passed.
+    #[test]
+    fn the_age_of_the_last_sweep_is_taken_from_the_wall_clock() {
+        const HOUR: u64 = 3_600_000;
+        let base = GithubSnapshot {
+            fetch_started_at_ms: Some(10_000),
+            swept_at_ms: Some(18_000),
+            ..GithubSnapshot::default()
+        };
+        // Five seconds on the process clock, three hours on the wall.
+        let now = 18_000 + 3 * HOUR;
+        assert_eq!(sweep_age_ms(Some(&base), now, Some(5_000)), Some(3 * HOUR));
+        assert_eq!(full_wait_ms(Some(&base), now, Some(5_000), 600_000), 0);
+        // Awake, both clocks agree and the pace still holds.
+        assert_eq!(sweep_age_ms(Some(&base), 20_000, Some(10_000)), Some(2_000));
+        assert_eq!(
+            full_wait_ms(Some(&base), 20_000, Some(10_000), 600_000),
+            590_000
+        );
+        // A wall clock set back an hour measures nothing, so the process
+        // clock does: the postponed read waits out what is left of one
+        // pace and is then due, instead of being postponed by a whole pace
+        // each time it comes up, and the sweep still ages.
+        let late = GithubSnapshot {
+            fetch_started_at_ms: Some(2 * HOUR),
+            swept_at_ms: Some(2 * HOUR + 8_000),
+            ..GithubSnapshot::default()
+        };
+        let set_back = HOUR;
+        let mut since_start = 10_000;
+        let mut postponed = 0;
+        loop {
+            let wait = full_wait_ms(
+                Some(&late),
+                set_back + since_start,
+                Some(since_start),
+                600_000,
+            );
+            if wait == 0 {
+                break;
+            }
+            postponed += 1;
+            since_start += wait;
+        }
+        assert_eq!((postponed, since_start), (1, 600_000));
+        assert_eq!(
+            sweep_age_ms(Some(&late), set_back + since_start, Some(since_start)),
+            Some(600_000)
+        );
+        assert_eq!(sweep_age_ms(Some(&late), set_back, None), None);
+        // No wall-clock record: the process clock, or nothing to wait for.
+        let bare = GithubSnapshot::default();
+        assert_eq!(sweep_age_ms(Some(&bare), now, Some(5_000)), Some(5_000));
+        assert_eq!(
+            full_wait_ms(Some(&bare), now, Some(5_000), 600_000),
+            595_000
+        );
+        assert_eq!(sweep_age_ms(None, now, None), None);
+        assert_eq!(full_wait_ms(None, now, None, 600_000), 0);
+    }
+
+    /// A read of every branch that its pace postponed is taken once, when it
+    /// is due: deliveries arriving meanwhile neither read GitHub nor wake
+    /// the scheduler to list the worktrees and postpone it again.
+    #[tokio::test]
+    async fn deliveries_during_a_postponed_sweep_cause_one_read_when_it_is_due() {
+        let dir = TempDir::new().unwrap();
+        let now = now_millis();
+        // The first read of every branch finds the budget full and paces
+        // by 0.15 seconds. The scoped read finds 200 points left to spend
+        // with 40 seconds to go: 0.4 seconds between one-point reads, and
+        // 2.8 between seven-point reads of every branch.
+        let budget = |cost, remaining| RateBudget {
+            limit: 5_000,
+            remaining,
+            cost,
+            reset_at_ms: now + 40_000,
+        };
+        let source = Arc::new(MockSource::default());
+        source.budgets.lock().unwrap().extend([
+            budget(7, 5_000),
+            budget(1, 1_450),
+            budget(7, 1_450),
+        ]);
+        let cancel = CancellationToken::new();
+        let mut config = test_config(&dir);
+        config.inventory_ttl_ms = 60_000;
+        let daemon = start(config, source.clone(), cancel.clone()).await.unwrap();
+        let swept = wait_for_snapshot(&dir, |_| true).await;
+        let check =
+            br#"{"action":"completed","check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        wait_for_snapshot(&dir, |snapshot| snapshot.updated_at > swept.updated_at).await;
+        assert_eq!(source.local_calls.load(Ordering::SeqCst), 2);
+
+        let review = br#"{"action":"submitted","pull_request":{"head":{"ref":"feature-x"},"base":{"ref":"main"}}}"#;
+        // The first review wakes the scheduler on the scoped read's floor,
+        // 0.4 seconds on, where the read of every branch is not yet due.
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request_review", review).await,
+            200
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(source.local_calls.load(Ordering::SeqCst), 3);
+        for _ in 0..5 {
+            assert_eq!(
+                signed(daemon.local_addr(), "pull_request_review", review).await,
+                200
+            );
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        // The rest waited for it.
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(source.local_calls.load(Ordering::SeqCst), 3);
+        let full = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(snapshot) = read_snapshot(dir.path()).await.unwrap()
+                    && snapshot.fetch_started_at_ms > swept.fetch_started_at_ms
+                {
+                    return snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the postponed read ran");
+        let paced = full.fetch_started_at_ms.unwrap() - swept.fetch_started_at_ms.unwrap();
+        assert!(paced >= 2_000, "{paced}");
+        assert_eq!(source.fetches.load(Ordering::SeqCst), 3);
+        assert_eq!(source.local_calls.load(Ordering::SeqCst), 4);
+        assert_eq!(source.asked.lock().unwrap()[2].len(), 2);
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    #[test]
+    fn only_check_and_status_deliveries_are_served_by_a_scoped_read() {
+        for event in ["check_run", "check_suite", "status"] {
+            assert!(scoped_event(event), "{event}");
+        }
+        for event in [
+            "pull_request",
+            "pull_request_review",
+            "pull_request_review_thread",
+            "issue_comment",
+            "merge_group",
+            "push",
+            "something_new",
+        ] {
+            assert!(!scoped_event(event), "{event}");
+        }
+    }
+
+    #[test]
+    fn a_scoped_merge_touches_only_the_named_branches_and_keeps_the_oldest_stamp() {
+        let base = GithubSnapshot {
+            updated_at: 1_100,
+            fetch_started_at_ms: Some(1_000),
+            swept_at_ms: Some(1_100),
+            branches: vec!["a".into(), "b".into(), "c".into()],
+            prs: json!({"a": {"n": 1}, "b": {"n": 1}, "c": {"n": 1}}),
+            merge_queue: json!({"a": 1}),
+            ..GithubSnapshot::default()
+        };
+        // The read asked about a and b and found a pull request only for a.
+        // An entry for a branch it was not asked about is not taken.
+        let merged = merge_scoped(
+            &base,
+            &names(&["a", "b"]),
+            &json!({"a": {"n": 2}, "c": {"n": 2}}),
+            json!({"a": 2}),
+            5_000,
+        )
+        .unwrap();
+        assert_eq!(merged.prs, json!({"a": {"n": 2}, "c": {"n": 1}}));
+        assert_eq!(merged.merge_queue, json!({"a": 2}));
+        // The snapshot is still only as recent as its oldest part.
+        assert_eq!(merged.fetch_started_at_ms, Some(1_000));
+        assert_eq!(merged.swept_at_ms, Some(1_100));
+        assert_eq!(
+            merged.branch_reads,
+            BTreeMap::from([("a".to_owned(), 5_000), ("b".to_owned(), 5_000)])
+        );
+        assert_eq!(merged.branches, base.branches);
+        // A later scoped read of another branch keeps the first one's stamp.
+        let again = merge_scoped(&merged, &names(&["c"]), &json!({}), json!({}), 6_000).unwrap();
+        assert_eq!(again.prs, json!({"a": {"n": 2}}));
+        assert_eq!(again.branch_reads.get("a"), Some(&5_000));
+        assert_eq!(again.branch_reads.get("c"), Some(&6_000));
+        // Without a branch map on both sides nothing is merged.
+        assert!(merge_scoped(&base, &names(&["a"]), &json!([]), json!({}), 1).is_none());
+        let odd = GithubSnapshot {
+            prs: json!(null),
+            ..base.clone()
+        };
+        assert!(merge_scoped(&odd, &names(&["a"]), &json!({}), json!({}), 1).is_none());
+    }
+
+    #[test]
+    fn the_window_with_the_least_left_is_the_budget() {
+        let at = |remaining, cost, reset_at_ms| RateBudget {
+            limit: 5_000,
+            remaining,
+            cost,
+            reset_at_ms,
+        };
+        let mut windows = BudgetWindows::default();
+        // One window: the reading as it is.
+        assert_eq!(
+            windows.observe(at(4_900, 7, 9_000), 1_000),
+            Some(at(4_900, 7, 9_000))
+        );
+        // A second, nearly spent window is the one that runs out, wherever
+        // its reset falls; the answer carries the cost of the latest read.
+        assert_eq!(
+            windows.observe(at(300, 1, 5_000), 1_000),
+            Some(at(300, 1, 5_000))
+        );
+        // A later read that saw only the roomy window does not hide it.
+        assert_eq!(
+            windows.observe(at(4_890, 7, 9_000), 2_000),
+            Some(at(300, 7, 5_000))
+        );
+        assert_eq!(
+            windows.open(2_000),
+            vec![at(300, 1, 5_000), at(4_890, 7, 9_000)]
+        );
+        // A window's figure only falls: a higher reading of it is older.
+        assert_eq!(
+            windows.observe(at(310, 1, 5_000), 2_500),
+            Some(at(300, 1, 5_000))
+        );
+        // Once it resets it says nothing, and a reading of a closed window
+        // is not kept.
+        assert_eq!(
+            windows.observe(at(4_880, 7, 9_000), 5_000),
+            Some(at(4_880, 7, 9_000))
+        );
+        assert_eq!(
+            windows.observe(at(0, 1, 4_000), 5_001),
+            Some(at(4_880, 1, 9_000))
+        );
+        assert_eq!(windows.lowest(9_000), None);
+    }
+
+    /// A finished check on one branch reads that branch alone and merges it
+    /// into the last read of every branch, which keeps its own stamps. A
+    /// review reads every branch again.
+    #[tokio::test]
+    async fn a_check_delivery_reads_only_its_branch_and_a_review_reads_them_all() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        source.by_branch.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        let swept = wait_for_snapshot(&dir, |_| true).await;
+        assert_eq!(
+            swept.prs,
+            json!({"feature-x": {"read": 1}, "remote-only": {"read": 1}})
+        );
+        assert_eq!(swept.swept_at_ms, Some(swept.updated_at));
+        assert!(swept.branch_reads.is_empty());
+
+        // The branch's pull request is gone by the time its check finishes.
+        source.without_pr.lock().unwrap().insert("feature-x".into());
+        let check =
+            br#"{"action":"completed","check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        let scoped =
+            wait_for_snapshot(&dir, |snapshot| snapshot.updated_at > swept.updated_at).await;
+        assert_eq!(
+            source.asked.lock().unwrap()[1],
+            vec!["feature-x".to_owned()]
+        );
+        assert_eq!(scoped.prs, json!({"remote-only": {"read": 1}}));
+        assert_eq!(scoped.merge_queue, json!({"read": 2}));
+        assert_eq!(scoped.branches, swept.branches);
+        assert_eq!(scoped.fetch_started_at_ms, swept.fetch_started_at_ms);
+        assert_eq!(scoped.swept_at_ms, swept.swept_at_ms);
+        let read_at = scoped.branch_reads["feature-x"];
+        assert!(
+            read_at >= swept.updated_at && read_at <= scoped.updated_at,
+            "{read_at}"
+        );
+        assert_eq!(scoped.branch_reads.len(), 1);
+
+        source.without_pr.lock().unwrap().clear();
+        let review = br#"{"action":"submitted","pull_request":{"head":{"ref":"feature-x"},"base":{"ref":"main"}}}"#;
+        assert_eq!(
+            signed(daemon.local_addr(), "pull_request_review", review).await,
+            200
+        );
+        let full =
+            wait_for_snapshot(&dir, |snapshot| snapshot.updated_at > scoped.updated_at).await;
+        assert_eq!(source.asked.lock().unwrap()[2].len(), 2);
+        assert_eq!(
+            full.prs,
+            json!({"feature-x": {"read": 3}, "remote-only": {"read": 3}})
+        );
+        assert!(full.fetch_started_at_ms > swept.fetch_started_at_ms);
+        assert_eq!(full.swept_at_ms, Some(full.updated_at));
+        assert!(full.branch_reads.is_empty());
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// Once the last read of every branch is as old as the sweep interval,
+    /// a check delivery reads every branch, so readers never hold a
+    /// snapshot whose other branches have aged out.
+    #[tokio::test]
+    async fn a_check_delivery_reads_every_branch_once_the_last_sweep_is_old() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        let cancel = CancellationToken::new();
+        let mut config = test_config(&dir);
+        config.full_sweep_interval_ms = 1;
+        let daemon = start(config, source.clone(), cancel.clone()).await.unwrap();
+        wait_for_fetches(&source, 1).await;
+        let check =
+            br#"{"action":"completed","check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        wait_for_fetches(&source, 2).await;
+        assert_eq!(source.asked.lock().unwrap()[1].len(), 2);
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// A scoped read that fails merges nothing: the last good snapshot
+    /// stands, and the retry reads every branch.
+    #[tokio::test]
+    async fn a_failed_scoped_read_changes_nothing_and_the_retry_reads_every_branch() {
+        let dir = TempDir::new().unwrap();
+        let source = Arc::new(MockSource::default());
+        source.by_branch.store(true, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        let swept = wait_for_snapshot(&dir, |_| true).await;
+        source.fail.store(true, Ordering::SeqCst);
+        let check =
+            br#"{"action":"completed","check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        wait_for_fetches(&source, 2).await;
+        assert_eq!(
+            source.asked.lock().unwrap()[1],
+            vec!["feature-x".to_owned()]
+        );
+        assert_eq!(read_snapshot(dir.path()).await.unwrap().unwrap(), swept);
+        source.fail.store(false, Ordering::SeqCst);
+        let retried =
+            wait_for_snapshot(&dir, |snapshot| snapshot.updated_at > swept.updated_at).await;
+        assert!(
+            source.asked.lock().unwrap()[2..]
+                .iter()
+                .all(|asked| asked.len() == 2)
+        );
+        assert!(retried.branch_reads.is_empty());
+        assert_eq!(retried.swept_at_ms, Some(retried.updated_at));
+        cancel.cancel();
+        daemon.shutdown().await;
+    }
+
+    /// The daemon paces and publishes by the window with the least left,
+    /// including when a later read reports only the roomier one.
+    #[tokio::test]
+    async fn the_snapshot_reports_the_window_that_runs_out_first() {
+        let dir = TempDir::new().unwrap();
+        let now = now_millis();
+        // Short windows keep the paced floor near the test's. The first
+        // read is of every branch and costs what one does.
+        let spent = RateBudget {
+            limit: 5_000,
+            remaining: 4_000,
+            cost: 7,
+            reset_at_ms: now + 60_000,
+        };
+        let roomy = RateBudget {
+            limit: 5_000,
+            remaining: 4_900,
+            cost: 1,
+            reset_at_ms: now + 120_000,
+        };
+        let source = Arc::new(MockSource::default());
+        source.budgets.lock().unwrap().extend([spent, roomy]);
+        let cancel = CancellationToken::new();
+        let daemon = start(test_config(&dir), source.clone(), cancel.clone())
+            .await
+            .unwrap();
+        let first = wait_for_snapshot(&dir, |_| true).await;
+        assert_eq!(first.rate_limit, Some(spent));
+        assert!(first.rate_windows.is_empty());
+        let check =
+            br#"{"action":"completed","check_run":{"check_suite":{"head_branch":"feature-x"}}}"#;
+        assert_eq!(signed(daemon.local_addr(), "check_run", check).await, 200);
+        let second =
+            wait_for_snapshot(&dir, |snapshot| snapshot.updated_at > first.updated_at).await;
+        // The scoped read cost one point, and the snapshot still says what
+        // a read of every branch costs: readers pace theirs by it.
+        assert_eq!(second.rate_limit, Some(spent));
+        assert_eq!(second.rate_windows, vec![spent, roomy]);
+        cancel.cancel();
+        daemon.shutdown().await;
     }
 
     /// A check event refreshes GitHub without fetching origin; a push does

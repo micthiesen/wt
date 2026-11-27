@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value, json};
 use tempfile::{TempDir, tempdir};
 use wt_core::{
-    Landing, OWED_PER_SLUG_MAX, OwedRecord, OwnerLanding, VerifyStage, WatchChange,
+    Landing, LeftFor, OWED_PER_SLUG_MAX, OwedRecord, OwnerLanding, VerifyStage, WatchChange,
     WorktreeEventKind,
     watch::{LocalClock, WatchActions, parse},
 };
@@ -1494,4 +1494,390 @@ fn a_stamp_is_earned_by_the_status_that_ends_the_round_and_then_stays() {
         None
     );
     assert_eq!(pending(&mut store).as_deref(), Some("check"));
+}
+
+/// 2100-01-01 00:00:00 UTC: later than any clock a test runs under.
+const FAR: i64 = 4_102_444_800_000;
+
+fn stored_check(store: &Store, stage: &str) -> Value {
+    raw(store)["slugs"]["one"]["work"]["checks"][stage].clone()
+}
+
+#[test]
+fn a_check_an_earlier_pull_request_left_becomes_a_step_instead_of_being_replaced() {
+    let (_temp, mut store) = store();
+    let mut first = both();
+    assert!(first.defer_check(PRODUCTION, Some(FAR)));
+    assert_status(&mut store, first);
+    // Nothing was left anywhere yet: other steps replace the check.
+    let reworded = assert_status(&mut store, status("ready").with_check(STAGING, "open it"));
+    assert!(reworded.displaced.is_empty());
+    assert_eq!(store.list_watches(None).unwrap(), []);
+
+    let left = store.leave_checks("one", &LeftFor::Pr(7)).unwrap();
+    assert_eq!(
+        left.iter().map(|(stage, _)| *stage).collect::<Vec<_>>(),
+        [STAGING, PRODUCTION]
+    );
+    assert_eq!(stored_check(&store, "staging")["forPr"], 7);
+    // A later pull request does not claim what an earlier one left.
+    assert!(
+        store
+            .leave_checks("one", &LeftFor::Pr(8))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(stored_check(&store, "production")["forPr"], 7);
+
+    // A status that only carries the checks, or drops one, displaces none.
+    assert!(
+        assert_status(&mut store, status("working"))
+            .displaced
+            .is_empty()
+    );
+    assert_eq!(stored_check(&store, "staging")["forPr"], 7);
+
+    // Other steps in a stage: the next pull request's check takes the
+    // stage and the earlier one becomes a wake for its own pull request.
+    let write = assert_status(
+        &mut store,
+        status("ready")
+            .with_check(STAGING, "open the other page")
+            .with_check(PRODUCTION, "watch the other logs"),
+    );
+    assert_eq!(write.displaced.len(), 2);
+    let staging = &write.displaced[0];
+    assert_eq!(
+        (staging.stage, &staging.left, staging.check.steps.as_str()),
+        (STAGING, &LeftFor::Pr(7), "open it")
+    );
+    assert_eq!(
+        staging
+            .watch
+            .when
+            .iter()
+            .map(|cond| cond.cond.to_string())
+            .collect::<Vec<_>>(),
+        ["pr:7:staging"]
+    );
+    assert!(staging.watch.owed_on_delivery());
+    assert!(
+        staging
+            .watch
+            .then
+            .wake
+            .as_deref()
+            .unwrap()
+            .starts_with("#7 staging check: open it\n")
+    );
+    // A check that was put off is still not due before its time.
+    assert_eq!(
+        write.displaced[1]
+            .watch
+            .when
+            .iter()
+            .map(|cond| cond.cond.to_string())
+            .collect::<Vec<_>>(),
+        ["pr:7:production".to_owned(), format!("at:{FAR}")]
+    );
+    assert_eq!(
+        stored_check(&store, "staging")["steps"],
+        "open the other page"
+    );
+    assert!(stored_check(&store, "staging").get("forPr").is_none());
+    assert_eq!(raw(&store)["watches"][0]["owedOnDelivery"], true);
+    assert_eq!(store.list_watches(Some("one")).unwrap().len(), 2);
+
+    // Its pull request reaching the stage leaves it owed, although the
+    // worktree's current work has not landed.
+    let WakeCompletion::Due(step) = store
+        .complete_wake(&staging.watch.id, OwnerLanding::NotLanded, false, NOON)
+        .unwrap()
+    else {
+        panic!("an earlier pull request's check must stay owed");
+    };
+    assert_eq!(step.id, staging.watch.id);
+    assert_eq!(store.list_owed(Some("one")).unwrap(), [*step]);
+}
+
+#[test]
+fn a_check_that_cannot_be_kept_refuses_the_status_that_would_replace_it() {
+    let (_temp, mut store) = store();
+    assert_status(&mut store, both());
+    store.leave_checks("one", &LeftFor::Pr(7)).unwrap();
+    // Room for one more wake, where two checks need keeping.
+    for n in 1..wt_core::watch::WATCHES_PER_SLUG_MAX {
+        wake(&mut store, &["17:00"], &format!("step {n}"), false);
+    }
+    let sets = |store: &Store| {
+        store
+            .read_worktree_events("one", 500)
+            .unwrap()
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event,
+                    WorktreeEventKind::Watch {
+                        change: WatchChange::Set,
+                        ..
+                    }
+                )
+            })
+            .count()
+    };
+    let (before, set_before) = (raw(&store), sets(&store));
+    let refused = store
+        .update_slug_work_status("one", |_| {
+            Ok::<_, ()>(Some(
+                status("ready")
+                    .with_check(STAGING, "open the other page")
+                    .with_check(PRODUCTION, "watch the other logs"),
+            ))
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("the staging check of #7 and the production check of #7")
+            && refused.contains("wt done <stage>"),
+        "{refused}"
+    );
+    // Neither wake was set, and the history says nothing of one.
+    assert_eq!(raw(&store), before);
+    assert_eq!(sets(&store), set_before);
+}
+
+fn owed_lines(store: &Store) -> Vec<String> {
+    store
+        .read_worktree_events("one", 500)
+        .unwrap()
+        .iter()
+        .filter_map(|event| wt_core::owed_sentence(&event.event))
+        .collect()
+}
+
+/// A displaced staging check that had been due since `NOON`, and its wake.
+fn displaced_due(store: &mut Store) -> String {
+    assert_status(store, status("ready").with_check(STAGING, "open the page"));
+    assert_eq!(
+        store
+            .note_checks_due(&[seen_due(7, NOON)], NOON + 1)
+            .unwrap(),
+        1
+    );
+    store.leave_checks("one", &LeftFor::Pr(7)).unwrap();
+    let write = assert_status(
+        store,
+        status("ready").with_check(STAGING, "open the other page"),
+    );
+    write.displaced[0].watch.id.clone()
+}
+
+#[test]
+fn a_displaced_check_keeps_its_due_date_and_says_in_history_that_it_became_a_step() {
+    let (_temp, mut store) = store();
+    let id = displaced_due(&mut store);
+    assert!(
+        owed_lines(&store)
+            .contains(&"again when #7 on staging: staging check: open the page".to_owned()),
+        "{:?}",
+        owed_lines(&store)
+    );
+    let WakeCompletion::Due(step) = store
+        .complete_wake(&id, OwnerLanding::NotLanded, false, NOON + 100)
+        .unwrap()
+    else {
+        panic!("an earlier pull request's check must stay owed");
+    };
+    assert_eq!(step.due_at_ms, NOON);
+    // Put off, it is still that check: its new wake stays owed too.
+    let later = LocalClock {
+        now_ms: NOON + 200,
+        utc_offset_minutes: 0,
+    };
+    let again = store
+        .rearm_owed(
+            "one",
+            &id,
+            vec![parse("17:00", later).unwrap()],
+            "one",
+            0,
+            NOON + 200,
+        )
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(again.owed_on_delivery());
+    assert_eq!(raw(&store)["keptChecks"][0]["id"], again.id.as_str());
+    // Closed by this build, nothing is kept and nothing comes back.
+    let WakeCompletion::Due(_) = store
+        .complete_wake(&again.id, OwnerLanding::NotLanded, false, NOON + 300)
+        .unwrap()
+    else {
+        panic!("put off, it stays owed");
+    };
+    assert!(
+        store
+            .close_owed("one", &again.id, "saw it", Some("one"))
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(raw(&store)["keptChecks"], json!([]));
+    assert!(store.restore_kept_checks(NOON + 400).unwrap().is_empty());
+}
+
+#[test]
+fn a_displaced_check_an_older_build_closed_on_delivery_is_owed_again_exactly_once() {
+    let (_temp, mut store) = store();
+    let id = displaced_due(&mut store);
+    // Writes that know nothing of kept checks, and a whole-state read and
+    // write back, carry the record.
+    let before = raw(&store)["keptChecks"].clone();
+    assert_eq!(before[0]["id"], id.as_str());
+    store.set_branch_tip("trunk", "sha").unwrap();
+    let state = store.read_wt_state().unwrap();
+    store
+        .write_repository_state_json(&state.to_string())
+        .unwrap();
+    assert_eq!(raw(&store)["keptChecks"], before);
+    assert!(!crate::kept_checks_lost(&raw(&store)));
+    assert!(store.restore_kept_checks(NOON + 5).unwrap().is_empty());
+
+    // A build from before displaced checks delivers the wake to a worktree
+    // whose current work has not landed: it closes, and nothing is owed.
+    assert!(
+        store
+            .complete_action(&id, wt_core::watch::WatchAction::Wake)
+            .unwrap()
+    );
+    assert!(store.list_owed(Some("one")).unwrap().is_empty());
+    assert!(crate::kept_checks_lost(&raw(&store)));
+
+    let restored = store.restore_kept_checks(NOON + 50).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(
+        (
+            restored[0].id.as_str(),
+            restored[0].due_at_ms,
+            restored[0].when_text.as_str()
+        ),
+        (id.as_str(), NOON, "#7 on staging")
+    );
+    assert!(
+        restored[0]
+            .what
+            .starts_with("#7 staging check: open the page\n")
+    );
+    assert_eq!(store.list_owed(Some("one")).unwrap(), restored);
+    assert!(!crate::kept_checks_lost(&raw(&store)));
+    assert!(store.restore_kept_checks(NOON + 60).unwrap().is_empty());
+    let said: Vec<String> = owed_lines(&store)
+        .into_iter()
+        .filter(|line| line.contains("restored"))
+        .collect();
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(said[0].ends_with(&format!("(wt done {id})")), "{said:?}");
+
+    // That older build closing the step leaves the record behind; its
+    // history event is what says the step was ended on purpose.
+    let mut state = raw(&store);
+    state["owed"] = json!([]);
+    store
+        .write_repository_state_json(&state.to_string())
+        .unwrap();
+    store
+        .append_worktree_event(
+            "one",
+            u64::try_from(crate::store::now_ms()).unwrap(),
+            &WorktreeEventKind::Owed {
+                id: Some(id.clone()),
+                change: wt_core::OwedChange::Done,
+                what: "#7 staging check".into(),
+                evidence: Some("saw it".into()),
+                by: None,
+                stage: None,
+                when: None,
+                unconfirmed: false,
+            },
+        )
+        .unwrap();
+    assert!(crate::kept_checks_lost(&raw(&store)));
+    assert!(store.restore_kept_checks(NOON + 70).unwrap().is_empty());
+    assert_eq!(raw(&store)["keptChecks"], json!([]));
+    assert!(store.list_owed(Some("one")).unwrap().is_empty());
+}
+
+#[test]
+fn a_displaced_step_an_older_build_put_off_is_not_owed_twice() {
+    let (_temp, mut store) = store();
+    let id = displaced_due(&mut store);
+    let WakeCompletion::Due(step) = store
+        .complete_wake(&id, OwnerLanding::NotLanded, false, NOON + 100)
+        .unwrap()
+    else {
+        panic!("an earlier pull request's check must stay owed");
+    };
+    // `wt done <id> --again` in a build from before kept checks: the step
+    // goes, a wake with another id carries its prompt, the record stays.
+    let mut state = raw(&store);
+    state["owed"] = json!([]);
+    store
+        .write_repository_state_json(&state.to_string())
+        .unwrap();
+    let again = wake(&mut store, &["17:00"], &step.what, false);
+    store
+        .append_worktree_event(
+            "one",
+            u64::try_from(crate::store::now_ms()).unwrap(),
+            &WorktreeEventKind::Owed {
+                id: Some(id.clone()),
+                change: wt_core::OwedChange::Again,
+                what: "#7 staging check".into(),
+                evidence: None,
+                by: None,
+                stage: None,
+                when: Some("at 17:00".into()),
+                unconfirmed: false,
+            },
+        )
+        .unwrap();
+    assert!(crate::kept_checks_lost(&raw(&store)));
+    assert!(store.restore_kept_checks(NOON + 200).unwrap().is_empty());
+    assert_eq!(raw(&store)["keptChecks"], json!([]));
+    assert!(store.list_owed(Some("one")).unwrap().is_empty());
+    assert_eq!(store.list_watches(Some("one")).unwrap()[0].id, again);
+    assert!(
+        !owed_lines(&store)
+            .iter()
+            .any(|line| line.contains("restored"))
+    );
+}
+
+#[test]
+fn work_that_landed_without_a_pull_request_keeps_its_check_by_its_head() {
+    let (_temp, mut store) = store();
+    assert_status(
+        &mut store,
+        status("ready").with_check(STAGING, "open the page"),
+    );
+    let head = "0123456789abcdef0123456789abcdef01234567";
+    store
+        .leave_checks("one", &LeftFor::Commit(head.into()))
+        .unwrap();
+    let write = assert_status(
+        &mut store,
+        status("ready").with_check(STAGING, "open the other page"),
+    );
+    let kept = &write.displaced[0];
+    assert_eq!(
+        kept.watch.when[0].cond.to_string(),
+        format!("commit:{head}:staging")
+    );
+    assert!(
+        kept.watch
+            .then
+            .wake
+            .as_deref()
+            .unwrap()
+            .starts_with("0123456 staging check: open the page\n")
+    );
 }

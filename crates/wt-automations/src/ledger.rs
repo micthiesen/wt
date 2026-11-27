@@ -123,7 +123,8 @@ pub enum DispatchKind {
     ExternalSend,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DispatchClaim {
     claim_id: String,
     keys: Vec<String>,
@@ -168,6 +169,7 @@ struct LedgerView {
     last_dispatch: Map<String, Value>,
     breaker: Map<String, Value>,
     deferred: Map<String, Value>,
+    awaited: Map<String, Value>,
     check_wakes_from: Option<i64>,
 }
 
@@ -183,6 +185,7 @@ impl LedgerView {
             last_dispatch: take("lastDispatch"),
             breaker: take("breaker"),
             deferred: take("deferred"),
+            awaited: take("awaited"),
             check_wakes_from,
         }
     }
@@ -239,26 +242,35 @@ impl LedgerSnapshot {
             .iter()
             // A note that a check's prompt was sent is not a fire to list.
             .filter(|(key, _)| !key.starts_with("check-prompt:"))
-            .filter_map(|(key, entry)| {
-                Some(LedgerRecord {
-                    key: key.clone(),
-                    rule_id: entry.get("ruleId")?.as_str()?.to_owned(),
-                    slug: entry
-                        .get("slug")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    state: entry_state(entry).unwrap_or("unknown").to_owned(),
-                    at_ms: number(entry.get("at"))?,
-                    reason: entry
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                })
-            })
+            .filter_map(|(key, entry)| ledger_record(key, entry))
             .collect::<Vec<_>>();
         records.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.key.cmp(&b.key)));
         records.truncate(limit);
+        records
+    }
+
+    /// Fires whose launched run ended with an exit nobody could recover,
+    /// newest first: delivered, never run again, and worth a person's look.
+    /// One record a fire, under the first of its keys.
+    pub fn unknown_outcomes(&self) -> Vec<LedgerRecord> {
+        let mut claims = BTreeSet::new();
+        let mut records = self
+            .view
+            .fired
+            .iter()
+            .filter(|(_, entry)| outcome_unknown(entry))
+            .filter(|(key, entry)| {
+                claims.insert(
+                    entry
+                        .get("claimId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(key.as_str())
+                        .to_owned(),
+                )
+            })
+            .filter_map(|(key, entry)| ledger_record(key, entry))
+            .collect::<Vec<_>>();
+        records.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.key.cmp(&b.key)));
         records
     }
 
@@ -604,8 +616,102 @@ impl AutomationLedger {
         now_ms: i64,
         cancellation: &CancellationToken,
     ) -> Result<(), LedgerError> {
-        self.transition_claim(claim, "delivered", None, now_ms, cancellation)
+        self.transition_claim(claim, "delivered", None, None, now_ms, cancellation)
             .await
+    }
+
+    /// [`Self::mark_delivered`] for a launched run whose exit decides how
+    /// its fire ends: in the same write, `record` is kept under `id` until
+    /// the exit is reported, so a process that starts after this one quit
+    /// can still report it. See [`Self::awaited`].
+    pub async fn mark_delivered_awaited(
+        &self,
+        claim: &DispatchClaim,
+        now_ms: i64,
+        id: &str,
+        record: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.transition_claim(
+            claim,
+            "delivered",
+            None,
+            Some((id, record)),
+            now_ms,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Launched runs whose exit no process has reported, by fire identity.
+    /// Only those whose claim still holds its delivered entry: one ended
+    /// another way (cancelled, pruned, failed) awaits nothing.
+    pub async fn awaited(&self) -> Result<BTreeMap<String, Value>, LedgerError> {
+        let view = self.view().await?;
+        Ok(view
+            .awaited
+            .iter()
+            .filter(|(_, record)| {
+                let claim = &record["claim"];
+                let keys = claim["keys"].as_array().filter(|keys| !keys.is_empty());
+                claim["claimId"].as_str().is_some_and(|claim_id| {
+                    keys.is_some_and(|keys| {
+                        keys.iter().any(|key| {
+                            key.as_str().is_some_and(|key| {
+                                delivered_by(&view.fired, key, claim_id)
+                                    && !outcome_unknown(&view.fired[key])
+                            })
+                        })
+                    })
+                })
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    /// Stop awaiting the run of `claim`: its exit was reported and leaves
+    /// its fire delivered, or nobody will report it.
+    pub async fn clear_awaited(
+        &self,
+        claim: &DispatchClaim,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.mutate("settle dispatch", cancellation, |root| {
+            forget_awaited(root, &claim.claim_id);
+        })
+        .await
+    }
+
+    /// End a delivered claim whose run's exit cannot be recovered: the run
+    /// may have succeeded, so it is never run again. The key stays handled
+    /// and `delivered`, with `unknown` and the reason beside it. Returns
+    /// whether this call recorded it, so it is reported once however many
+    /// processes notice.
+    pub async fn mark_unknown(
+        &self,
+        claim: &DispatchClaim,
+        now_ms: i64,
+        reason: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, LedgerError> {
+        self.mutate("end dispatch unknown", cancellation, |root| {
+            forget_awaited(root, &claim.claim_id);
+            let fired = ensure_object(root, "fired");
+            let mut marked = false;
+            for key in &claim.keys {
+                if !delivered_by(fired, key, &claim.claim_id) || outcome_unknown(&fired[key]) {
+                    continue;
+                }
+                if let Some(entry) = fired.get_mut(key).and_then(Value::as_object_mut) {
+                    entry.insert("unknown".into(), Value::Bool(true));
+                    entry.insert("at".into(), json!(now_ms));
+                    entry.insert("reason".into(), Value::String(reason.to_owned()));
+                    marked = true;
+                }
+            }
+            marked
+        })
+        .await
     }
 
     pub async fn mark_ambiguous(
@@ -615,7 +721,7 @@ impl AutomationLedger {
         reason: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), LedgerError> {
-        self.transition_claim(claim, "ambiguous", Some(reason), now_ms, cancellation)
+        self.transition_claim(claim, "ambiguous", Some(reason), None, now_ms, cancellation)
             .await
     }
 
@@ -713,10 +819,12 @@ impl AutomationLedger {
         let claim_id = claim.claim_id.clone();
         let keys = claim.keys.clone();
         self.mutate("retry failed dispatch", cancellation, move |root| {
+            forget_awaited(root, &claim_id);
             let fired = ensure_object(root, "fired");
             let mut released = false;
             for key in &keys {
-                if delivered_by(fired, key, &claim_id) {
+                // An exit recorded as unknown is final: never run again.
+                if delivered_by(fired, key, &claim_id) && !outcome_unknown(&fired[key]) {
                     fired.remove(key);
                     released = true;
                 }
@@ -732,7 +840,9 @@ impl AutomationLedger {
     /// End a delivered claim as failed: its run exited non-zero and will not
     /// be tried again. The key stays handled. The entry stays `delivered`
     /// with `failed` beside it, because a build that does not know a state
-    /// holds its key as a claim forever; see [`entry_state`].
+    /// holds its key as a claim forever; see [`entry_state`]. Returns
+    /// whether this call ended it: a second process that reads the same
+    /// run's exit ends nothing, and reports nothing.
     pub async fn mark_failed(
         &self,
         claim: &DispatchClaim,
@@ -740,11 +850,14 @@ impl AutomationLedger {
         reason: &str,
         failed_runs: u32,
         cancellation: &CancellationToken,
-    ) -> Result<(), LedgerError> {
+    ) -> Result<bool, LedgerError> {
         self.mutate("fail dispatch", cancellation, |root| {
+            forget_awaited(root, &claim.claim_id);
             let fired = ensure_object(root, "fired");
+            let mut ended = false;
             for key in &claim.keys {
-                if !delivered_by(fired, key, &claim.claim_id) {
+                // `delivered_by` reads a failed entry as failed, not delivered.
+                if !delivered_by(fired, key, &claim.claim_id) || outcome_unknown(&fired[key]) {
                     continue;
                 }
                 if let Some(entry) = fired.get_mut(key).and_then(Value::as_object_mut) {
@@ -752,8 +865,10 @@ impl AutomationLedger {
                     entry.insert("failedRuns".into(), json!(failed_runs));
                     entry.insert("at".into(), json!(now_ms));
                     entry.insert("reason".into(), Value::String(reason.to_owned()));
+                    ended = true;
                 }
             }
+            ended
         })
         .await
     }
@@ -1083,6 +1198,7 @@ impl AutomationLedger {
         claim: &DispatchClaim,
         state: &str,
         reason: Option<&str>,
+        awaited: Option<(&str, Value)>,
         now_ms: i64,
         cancellation: &CancellationToken,
     ) -> Result<(), LedgerError> {
@@ -1110,6 +1226,9 @@ impl AutomationLedger {
                 transitioned
             };
             if transitioned {
+                if let Some((id, record)) = awaited {
+                    ensure_object(root, "awaited").insert(id.to_owned(), record);
+                }
                 set_last_dispatch_max(root, &claim.rule_id, &claim.slug, claim.claimed_at_ms);
                 if claim.breaker_reserved {
                     finalize_breaker(root, &claim.rule_id, &claim.slug, now_ms);
@@ -1210,7 +1329,7 @@ impl AutomationLedger {
                         message: "root must be an object".into(),
                     });
                 }
-                for field in ["fired", "breaker", "lastDispatch", "deferred"] {
+                for field in ["fired", "breaker", "lastDispatch", "deferred", "awaited"] {
                     if value.get(field).is_some_and(|entry| !entry.is_object()) {
                         return Err(LedgerError::Invalid {
                             path: self.path.clone(),
@@ -1349,6 +1468,37 @@ fn delivered_by(fired: &Map<String, Value>, key: &str, claim_id: &str) -> bool {
     })
 }
 
+fn ledger_record(key: &str, entry: &Value) -> Option<LedgerRecord> {
+    Some(LedgerRecord {
+        key: key.to_owned(),
+        rule_id: entry.get("ruleId")?.as_str()?.to_owned(),
+        slug: entry
+            .get("slug")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        state: entry_state(entry).unwrap_or("unknown").to_owned(),
+        at_ms: number(entry.get("at"))?,
+        reason: entry
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Whether the run of a delivered entry ended with an exit nobody could
+/// recover.
+fn outcome_unknown(entry: &Value) -> bool {
+    entry.get("unknown").and_then(Value::as_bool) == Some(true)
+}
+
+/// Drop the awaited-run record of the claim `claim_id`, if one is kept.
+fn forget_awaited(root: &mut Value, claim_id: &str) {
+    if let Some(awaited) = root.get_mut("awaited").and_then(Value::as_object_mut) {
+        awaited.retain(|_, record| record["claim"]["claimId"].as_str() != Some(claim_id));
+    }
+}
+
 /// An entry's state as this build reads it. A run that ended failed is
 /// stored as `delivered` with `failed: true`; `failed` as a state of its
 /// own is read too.
@@ -1410,6 +1560,10 @@ fn prune(root: &mut Value, now_ms: i64) {
     // that will not change (an unreachable GitHub, an abandoned child PR).
     if let Some(deferred) = root.get_mut("deferred").and_then(Value::as_object_mut) {
         deferred.retain(|_, entry| number(entry.get("queuedAtMs")).is_none_or(|at| at >= cutoff));
+    }
+    if let Some(awaited) = root.get_mut("awaited").and_then(Value::as_object_mut) {
+        awaited
+            .retain(|_, entry| number(entry.get("deliveredAtMs")).is_some_and(|at| at >= cutoff));
     }
 }
 

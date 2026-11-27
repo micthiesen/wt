@@ -1020,9 +1020,14 @@ fn comment_lines(pr: &PrPresentation, width: usize) -> Vec<Line<'static>> {
         lines.push(Line::default());
         lines.push(Line::styled(
             format!(
-                "+{} unresolved {}",
+                "+{}{} unresolved {}",
                 pr.unresolved_threads,
-                if pr.unresolved_threads == 1 {
+                if pr.unresolved_threads_more {
+                    " or more"
+                } else {
+                    ""
+                },
+                if pr.unresolved_threads == 1 && !pr.unresolved_threads_more {
                     "thread"
                 } else {
                     "threads"
@@ -2850,6 +2855,10 @@ mod tests {
         assert!(find(&lines, "src/login.rs").contains("   src/login.rs"));
         assert!(find(&lines, "@reviewer").contains("@reviewer · 3h ago"));
         find(&lines, "+2 unresolved threads");
+        // A count GitHub cut short is a lower bound.
+        let mut more = row();
+        more.pr.as_mut().unwrap().unresolved_threads_more = true;
+        find(&screen(more, 70, 40), "+2 or more unresolved threads");
     }
 
     #[test]

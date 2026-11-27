@@ -137,7 +137,20 @@ impl Model {
         let toast_before = self.toast.clone();
         self.ui_generation = self.ui_generation.wrapping_add(1);
         let menu_before = self.local_menu.clone();
+        // A key that changes nothing draws nothing, so the anchor the last
+        // draw recorded must outlive it.
+        let anchor = self.list_anchor.take();
         let result = self.input_inner(key, height);
+        if matches!(result, InputResult::Unchanged) {
+            self.list_anchor = anchor;
+        }
+        // A key that acts or opens a menu shows what it acts on.
+        if matches!(result, InputResult::Action(_))
+            || !matches!(self.interaction, Interaction::None)
+            || self.yank.is_some()
+        {
+            self.list_free_scroll = false;
+        }
         self.track_local_menu(menu_before, &result);
         let result = match result {
             InputResult::Action(action) => self.open_board_menu(action),
@@ -572,6 +585,7 @@ impl Model {
                         .and_then(|&index| self.board.rows.get(index))
                 {
                     self.pending_selection = Some(row.key.clone());
+                    self.list_reveal = true;
                 }
                 InputResult::Action(UiAction::FoldSection { key, folded })
             }
@@ -830,8 +844,21 @@ impl Model {
             KeyCode::Up | KeyCode::Char('k') if !control => self.step(false),
             KeyCode::Home | KeyCode::Char('g') => self.select(0),
             KeyCode::End | KeyCode::Char('G') => self.select(self.item_count().saturating_sub(1)),
-            KeyCode::PageDown => self.select(self.selected.unwrap_or(0).saturating_add(height / 2)),
-            KeyCode::PageUp => self.select(self.selected.unwrap_or(0).saturating_sub(height / 2)),
+            KeyCode::PageDown | KeyCode::PageUp => {
+                // The list as last drawn: the stacked and full-width-activity
+                // layouts give it less than the terminal's height.
+                let page = match self.list_height {
+                    0 => height,
+                    drawn => drawn,
+                };
+                let half = (page / 2).max(1);
+                let current = self.selected.unwrap_or(0);
+                self.select(if key.code == KeyCode::PageDown {
+                    current.saturating_add(half)
+                } else {
+                    current.saturating_sub(half)
+                })
+            }
             KeyCode::Char(' ') => {
                 let length = self.item_count();
                 let next = (1..=length)

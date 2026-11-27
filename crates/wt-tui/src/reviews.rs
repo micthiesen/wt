@@ -26,6 +26,8 @@ impl Model {
             // Folding keeps the cursor on the review header; unfolding lands
             // on the first requested review.
             self.reviews_folded = !self.reviews_folded;
+            self.list_free_scroll = false;
+            self.list_reveal = !self.reviews_folded;
             self.rebuild_items();
             self.selected = (0..self.item_count())
                 .find(|&position| {

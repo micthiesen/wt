@@ -40,6 +40,10 @@ pub enum StoreError {
     TitleRevisionExhausted { slug: String },
 }
 
+/// The size the write-ahead log is cut back to once a checkpoint has emptied
+/// it. One rewrite of a repository's state is a few hundred kilobytes.
+const WAL_SIZE_LIMIT: i64 = 1024 * 1024;
+
 /// A synchronous owner of a single repository's rows in the shared wt DB.
 ///
 /// Methods requiring mutations take `&mut self`; this intentionally makes the
@@ -63,6 +67,9 @@ impl Store {
         enable_wal(&db, Duration::from_secs(3))?;
         db.busy_timeout(Duration::from_secs(3))?;
         db.pragma_update(None, "foreign_keys", "ON")?;
+        // Without a limit the log keeps the size of its largest burst for
+        // good: SQLite reuses the file and never shrinks it.
+        db.pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT)?;
         initialize_schema(&mut db)?;
         register_repository(&mut db, &identity)?;
         Ok(Self {
@@ -479,6 +486,20 @@ impl Store {
             | Err(rusqlite::Error::InvalidQuery) => Ok(Vec::new()),
             Err(err) => Err(StoreError::Sqlite(err)),
         }
+    }
+
+    /// Move what the write-ahead log holds into the database without
+    /// waiting for any reader or writer, and return the frames left in the
+    /// log. A log that was moved whole is cut to [`WAL_SIZE_LIMIT`] by the
+    /// next write.
+    pub fn checkpoint(&mut self) -> Result<i64, StoreError> {
+        let db = self.writable_db()?;
+        let (busy, log, moved): (i64, i64, i64) =
+            db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        tracing::debug!(busy, log, moved, "state database checkpoint");
+        Ok(log.saturating_sub(moved).max(0))
     }
 
     pub(crate) fn connection(&self) -> Option<&Connection> {

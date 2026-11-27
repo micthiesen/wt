@@ -1010,65 +1010,94 @@ async fn set_status(
             Some(wt_store::ChecksClosed::Missing | wt_store::ChecksClosed::NotOwed) => {}
         }
     }
-    ctx.database
+    let utc_offset_minutes =
+        wt_app_core::display_time::local_utc_offset_minutes(wt_app_core::feeds::epoch_ms())
+            .unwrap_or(0);
+    let displaced = ctx
+        .database
         .call(move |store| {
             // The compare and the carry-over read the record under the
             // write's own transaction: `wt status` in another process can
             // otherwise land between them and be overwritten.
-            store.update_slug_work_status(&slug, |previous| {
-                // Another writer (often the worktree's agent) may have claimed a
-                // status since the menu opened. Never overwrite a claim unseen.
-                // The note and owed check are carried into the new claim, so a
-                // change to either is as unseen as a change of state.
-                if let Some(wt_tui::Seen(seen)) = &seen {
-                    let current = previous.map(status_claim);
-                    if current != *seen {
-                        return Err(stale_status(current));
-                    }
-                }
-                let Some(state) = state else {
-                    return Ok(None);
-                };
-                let before = previous.and_then(wt_store::WorkStatusRecord::to_core);
-                let mut next = wt_core::WorkStatusRecord::new(state, at);
-                next.note = note
-                    .map(|text| wt_core::sanitize_work_note(&text))
-                    .filter(|text| !text.is_empty());
-                next.risk = before
-                    .as_ref()
-                    .filter(|_| state == wt_core::WorkState::Ready)
-                    .and_then(|work| work.risk);
-                next.sha = Some(head);
-                next.by = Some("human".into());
-                // The menu edits the one check it showed: the first still
-                // owed. Steps set that stage's check and empty steps drop
-                // it; a check owed in the other stage is carried either way.
-                let edit = verify.map(|text| {
-                    let steps = wt_core::sanitize_work_note(&text);
-                    let shown = before
-                        .as_ref()
-                        .and_then(|work| work.verification().map(|(stage, _)| stage));
-                    let stage = wt_core::VerifyStage::or_default(verify_in.or(shown));
-                    if steps.is_empty() {
-                        wt_ops::status_checks::CheckEdit::Drop { stage }
-                    } else {
-                        wt_ops::status_checks::CheckEdit::Owe {
-                            stage,
-                            steps,
-                            lines: None,
+            let write =
+                store.update_slug_work_status_local(&slug, utc_offset_minutes, |previous| {
+                    // Another writer (often the worktree's agent) may have claimed a
+                    // status since the menu opened. Never overwrite a claim unseen.
+                    // The note and owed check are carried into the new claim, so a
+                    // change to either is as unseen as a change of state.
+                    if let Some(wt_tui::Seen(seen)) = &seen {
+                        let current = previous.map(status_claim);
+                        if current != *seen {
+                            return Err(stale_status(current));
                         }
                     }
-                });
-                wt_ops::status_checks::assert_checks(&mut next, before.as_ref(), edit);
-                let stored = serde_json::to_value(&next)
-                    .and_then(serde_json::from_value::<wt_store::WorkStatusRecord>)
-                    .context("encode status record")?;
-                Ok(Some(stored))
-            })??;
-            Ok(())
+                    let Some(state) = state else {
+                        return Ok(None);
+                    };
+                    let before = previous.and_then(wt_store::WorkStatusRecord::to_core);
+                    let mut next = wt_core::WorkStatusRecord::new(state, at);
+                    next.note = note
+                        .map(|text| wt_core::sanitize_work_note(&text))
+                        .filter(|text| !text.is_empty());
+                    next.risk = before
+                        .as_ref()
+                        .filter(|_| state == wt_core::WorkState::Ready)
+                        .and_then(|work| work.risk);
+                    next.sha = Some(head);
+                    next.by = Some("human".into());
+                    // The menu edits the one check it showed: the first still
+                    // owed. Steps set that stage's check and empty steps drop
+                    // it; a check owed in the other stage is carried either way.
+                    let edit = verify.map(|text| {
+                        let steps = wt_core::sanitize_work_note(&text);
+                        let shown = before
+                            .as_ref()
+                            .and_then(|work| work.verification().map(|(stage, _)| stage));
+                        let stage = wt_core::VerifyStage::or_default(verify_in.or(shown));
+                        // Steps edited here on a check an earlier pull request
+                        // left owed are that check rewritten, not the next
+                        // pull request's check beside it.
+                        let left = before
+                            .as_ref()
+                            .and_then(|work| work.open_check(stage))
+                            .filter(|check| check.left_for().is_some() && check.steps != steps);
+                        if steps.is_empty() {
+                            wt_ops::status_checks::CheckEdit::Drop { stage }
+                        } else if left.is_some() {
+                            wt_ops::status_checks::CheckEdit::Reword { stage, steps }
+                        } else {
+                            wt_ops::status_checks::CheckEdit::Owe {
+                                stage,
+                                steps,
+                                lines: None,
+                            }
+                        }
+                    });
+                    wt_ops::status_checks::assert_checks(&mut next, before.as_ref(), edit);
+                    let stored = serde_json::to_value(&next)
+                        .and_then(serde_json::from_value::<wt_store::WorkStatusRecord>)
+                        .context("encode status record")?;
+                    Ok(Some(stored))
+                })??;
+            Ok(write.displaced)
         })
         .await?;
-    Ok(message("Work status updated"))
+    if displaced.is_empty() {
+        return Ok(message("Work status updated"));
+    }
+    let kept = displaced
+        .iter()
+        .map(|kept| {
+            format!(
+                "the {} check of {} is still owed, as step {}",
+                kept.stage.as_str(),
+                kept.left.label(),
+                kept.watch.id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(message(format!("Work status updated; {kept}")))
 }
 
 async fn set_base(
@@ -1183,6 +1212,50 @@ mod tests {
             verify_in,
             seen,
         }
+    }
+
+    /// The menu shows one check and edits it where it stands. A check an
+    /// earlier pull request left owed stays that pull request's when its
+    /// steps are rewritten here, and no step is set beside it.
+    #[tokio::test]
+    async fn steps_edited_in_the_menu_rewrite_a_left_check_in_place() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let row = wt_ops::commands::resolve::resolve_named_worktree(ctx, "one")
+            .await
+            .unwrap();
+        let key = wt_core::worktree_target_key(&row.target);
+        let ready = |steps: &str| {
+            status(
+                Some("ready".into()),
+                None,
+                Some(steps.into()),
+                Some(wt_core::VerifyStage::Staging),
+                None,
+            )
+        };
+        set_status(ctx, None, &key, ready("open the page"))
+            .await
+            .unwrap();
+        ctx.database
+            .call(|store| Ok(store.leave_checks("one", &wt_core::LeftFor::Pr(7))?))
+            .await
+            .unwrap();
+        let reply = set_status(ctx, None, &key, ready("open the page twice"))
+            .await
+            .unwrap();
+        assert_eq!(reply.message, "Work status updated");
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let check = &state["slugs"]["one"]["work"]["checks"]["staging"];
+        assert_eq!(check["steps"], "open the page twice");
+        assert_eq!(check["forPr"], 7);
+        assert!(state["watches"].as_array().is_none_or(Vec::is_empty));
     }
 
     #[tokio::test]

@@ -19,6 +19,9 @@ use crate::commands::resolve::run_git;
 /// branches before leaving them unknown.
 const GITHUB_WAIT: Duration = Duration::from_secs(8);
 
+/// How many rows one pass reads at a time.
+const ROWS_AT_ONCE: usize = 8;
+
 /// Whether the caller may spend a GitHub read on branches the data it holds
 /// does not cover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,7 +139,9 @@ pub fn github_branches<'a>(
 /// answer that is open, or older than [`wt_core::PR_VERDICT_FRESH_MS`],
 /// while its branch still exists: a pull request merged or closed by hand
 /// stops holding, and a second one on a merged branch is seen. An open
-/// answer whose branch is gone here and from origin is forgotten.
+/// answer whose branch is gone here and from origin is forgotten, and so is
+/// any recorded branch that another worktree now has checked out: its pull
+/// request has a row of its own.
 pub async fn observe(
     ctx: &AppContext,
     rows: &[WorktreeRecord],
@@ -144,6 +149,16 @@ pub async fn observe(
     github: Option<&GithubData>,
     ask: Ask,
 ) -> BTreeMap<String, Vec<OtherBranch>> {
+    observe_asking(ctx, rows, state, github, ask).await.others
+}
+
+async fn observe_asking(
+    ctx: &AppContext,
+    rows: &[WorktreeRecord],
+    state: &Value,
+    github: Option<&GithubData>,
+    ask: Ask,
+) -> Observed {
     observe_with(ctx, rows, state, github, ask, |branches| async move {
         if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
             return None;
@@ -164,6 +179,145 @@ pub async fn observe(
     .await
 }
 
+#[derive(Debug, Default)]
+struct Observed {
+    others: BTreeMap<String, Vec<OtherBranch>>,
+    /// The (slug, branch) records dropped by this pass.
+    forgotten: Vec<(String, String)>,
+}
+
+/// What one row's pass found.
+#[derive(Default)]
+struct RowSeen {
+    /// `None` when the row has nothing to record.
+    others: Option<Vec<OtherBranch>>,
+    again: Vec<String>,
+    /// Recorded branches deleted here and on origin.
+    gone: Vec<OtherBranch>,
+    /// Recorded branches another worktree has checked out.
+    adopted: Vec<OtherBranch>,
+}
+
+/// Whether `inventory` shows a worktree other than `slug` on `branch`.
+fn adopted_elsewhere(inventory: &[WorktreeRecord], slug: &str, branch: &str) -> bool {
+    inventory
+        .iter()
+        .any(|owner| owner.target.slug() != slug && owner.target.branch == branch)
+}
+
+/// The whole inventory, read at most once per pass and only when a row has
+/// a candidate to check against it.
+type Inventory = tokio::sync::OnceCell<Option<Vec<WorktreeRecord>>>;
+
+struct Pass<'a> {
+    ctx: &'a AppContext,
+    lifecycle: &'a wt_lifecycle::LifecycleService,
+    inventory: Inventory,
+    github: Option<&'a GithubData>,
+    ask: Ask,
+    now: i64,
+    /// Several rows share one inventory read; a single row with nothing
+    /// recorded reads it only if its reflog names a candidate.
+    shared: bool,
+}
+
+async fn observe_row(pass: &Pass<'_>, row: &WorktreeRecord, slug_state: &Value) -> RowSeen {
+    let Pass {
+        ctx,
+        lifecycle,
+        github,
+        ask,
+        now,
+        ..
+    } = *pass;
+    let mut seen = RowSeen::default();
+    let stored = wt_core::stored_other_branches(slug_state);
+    let all = if pass.shared || !stored.is_empty() {
+        pass.inventory
+            .get_or_init(|| async { ctx.repository.inventory(&ctx.cancellation).await.ok() })
+            .await
+            .as_deref()
+    } else {
+        None
+    };
+    let Ok((names, _)) = lifecycle
+        .other_branch_names_among(row, Some(slug_state), all, &ctx.cancellation)
+        .await
+    else {
+        return seen;
+    };
+    // An unknown inventory proves no adoption, and neither does one that
+    // disagrees with `row` about the row itself: the adopter and the row
+    // have to be seen in the same listing.
+    if let Some(all) = all
+        && all.iter().any(|same| same.target == row.target)
+    {
+        seen.adopted.extend(
+            stored
+                .iter()
+                .filter(|other| adopted_elsewhere(all, row.target.slug(), &other.branch))
+                .cloned(),
+        );
+    }
+    let unrecorded = wt_core::recorded_branch(slug_state).is_none()
+        && !row.detached
+        && !row.target.branch.is_empty();
+    if names.is_empty() && !unrecorded {
+        return seen;
+    }
+    let path = Path::new(&row.target.path);
+    let mut others = Vec::new();
+    for branch in names {
+        let stored = stored.iter().find(|other| other.branch == branch);
+        if let Some(answered) = github
+            .and_then(|github| answer(&branch, github))
+            .filter(|answered| not_older(answered, stored))
+        {
+            others.push(answered);
+            continue;
+        }
+        // GitHub's own answer stands until it is asked again. "None"
+        // without one was read off a branch origin did not have, which
+        // a push changes.
+        let settled = stored.is_some_and(|other| {
+            other.number.is_some()
+                || (other.state == OtherPrState::None && other.checked_at_ms.is_some())
+        });
+        if let Some(stored) = stored.filter(|_| settled) {
+            let stale = stored
+                .checked_at_ms
+                .is_none_or(|at| now.saturating_sub(at) > wt_core::PR_VERDICT_FRESH_MS);
+            if ask == Ask::Github && (stale || stored.state == OtherPrState::Open) {
+                match whereabouts(ctx, path, row.target.slug(), &branch).await {
+                    Whereabouts::Nowhere if stored.state != OtherPrState::Open => {}
+                    Whereabouts::Nowhere
+                        if gone_from_origin(ctx, path, &branch).await == Some(true) =>
+                    {
+                        seen.gone.push(stored.clone());
+                        continue;
+                    }
+                    _ => seen.again.push(branch.clone()),
+                }
+            }
+            others.push(stored.clone());
+            continue;
+        }
+        match whereabouts(ctx, path, row.target.slug(), &branch).await {
+            Whereabouts::Origin => others.push(OtherBranch::unknown(branch)),
+            // A branch origin never had cannot be a pull request's head.
+            Whereabouts::LocalOnly => others.push(OtherBranch {
+                state: OtherPrState::None,
+                ..OtherBranch::unknown(branch)
+            }),
+            // A name the reflog kept of a branch that exists nowhere
+            // any more holds nothing and is not recorded.
+            Whereabouts::Nowhere => others.extend(stored.cloned()),
+        }
+    }
+    seen.others = Some(others);
+    seen
+}
+
 /// [`observe`] with the GitHub read given by the caller.
 async fn observe_with<F, Fut>(
     ctx: &AppContext,
@@ -172,85 +326,56 @@ async fn observe_with<F, Fut>(
     github: Option<&GithubData>,
     ask: Ask,
     read: F,
-) -> BTreeMap<String, Vec<OtherBranch>>
+) -> Observed
 where
     F: FnOnce(Vec<String>) -> Fut,
     Fut: Future<Output = Option<GithubData>>,
 {
+    use futures_util::StreamExt as _;
+
     let Ok(lifecycle) = crate::lifecycle_ops::service(ctx) else {
-        return BTreeMap::new();
+        return Observed::default();
     };
     let now = now_ms();
+    let pass = Pass {
+        ctx,
+        lifecycle: &lifecycle,
+        inventory: Inventory::new(),
+        github,
+        ask,
+        now,
+        shared: rows.len() > 1,
+    };
+    let pass = &pass;
+    // Each row costs a reflog read and a few Git calls of its own; a fleet
+    // listing passes every row at once.
+    let mut passes = Vec::new();
+    for row in rows {
+        if !row.is_main {
+            let slug_state = &state["slugs"][row.target.slug()];
+            passes.push(async move { (row, observe_row(pass, row, slug_state).await) });
+        }
+    }
+    let seen: Vec<(&WorktreeRecord, RowSeen)> = futures_util::stream::iter(passes)
+        .buffered(ROWS_AT_ONCE)
+        .collect()
+        .await;
     let mut found: Vec<(&WorktreeRecord, Vec<OtherBranch>)> = Vec::new();
     let mut again = BTreeSet::new();
-    let mut gone: Vec<(String, OtherBranch)> = Vec::new();
-    for row in rows.iter().filter(|row| !row.is_main) {
-        let slug_state = &state["slugs"][row.target.slug()];
-        let Ok((names, _)) = lifecycle
-            .other_branch_names(row, Some(slug_state), &ctx.cancellation)
-            .await
-        else {
-            continue;
-        };
-        let unrecorded = wt_core::recorded_branch(slug_state).is_none()
-            && !row.detached
-            && !row.target.branch.is_empty();
-        if names.is_empty() && !unrecorded {
-            continue;
+    let mut forget: Vec<(String, OtherBranch)> = Vec::new();
+    let mut adopted: Vec<(String, OtherBranch)> = Vec::new();
+    for (row, seen) in seen {
+        again.extend(seen.again);
+        let slug = row.target.slug();
+        forget.extend(seen.gone.into_iter().map(|other| (slug.to_owned(), other)));
+        adopted.extend(
+            seen.adopted
+                .into_iter()
+                .map(|other| (slug.to_owned(), other)),
+        );
+        if let Some(others) = seen.others {
+            found.push((row, others));
         }
-        let stored = wt_core::stored_other_branches(slug_state);
-        let path = Path::new(&row.target.path);
-        let mut others = Vec::new();
-        for branch in names {
-            let stored = stored.iter().find(|other| other.branch == branch);
-            if let Some(answered) = github
-                .and_then(|github| answer(&branch, github))
-                .filter(|answered| not_older(answered, stored))
-            {
-                others.push(answered);
-                continue;
-            }
-            // GitHub's own answer stands until it is asked again. "None"
-            // without one was read off a branch origin did not have, which
-            // a push changes.
-            let settled = stored.is_some_and(|other| {
-                other.number.is_some()
-                    || (other.state == OtherPrState::None && other.checked_at_ms.is_some())
-            });
-            if let Some(stored) = stored.filter(|_| settled) {
-                let stale = stored
-                    .checked_at_ms
-                    .is_none_or(|at| now.saturating_sub(at) > wt_core::PR_VERDICT_FRESH_MS);
-                if ask == Ask::Github && (stale || stored.state == OtherPrState::Open) {
-                    match whereabouts(ctx, path, row.target.slug(), &branch).await {
-                        Whereabouts::Nowhere if stored.state != OtherPrState::Open => {}
-                        Whereabouts::Nowhere
-                            if gone_from_origin(ctx, path, &branch).await == Some(true) =>
-                        {
-                            gone.push((row.target.slug().to_owned(), stored.clone()));
-                            continue;
-                        }
-                        _ => {
-                            again.insert(branch.clone());
-                        }
-                    }
-                }
-                others.push(stored.clone());
-                continue;
-            }
-            match whereabouts(ctx, path, row.target.slug(), &branch).await {
-                Whereabouts::Origin => others.push(OtherBranch::unknown(branch)),
-                // A branch origin never had cannot be a pull request's head.
-                Whereabouts::LocalOnly => others.push(OtherBranch {
-                    state: OtherPrState::None,
-                    ..OtherBranch::unknown(branch)
-                }),
-                // A name the reflog kept of a branch that exists nowhere
-                // any more holds nothing and is not recorded.
-                Whereabouts::Nowhere => others.extend(stored.cloned()),
-            }
-        }
-        found.push((row, others));
     }
     if ask == Ask::Github {
         let mut unanswered = again;
@@ -273,16 +398,35 @@ where
             }
         }
     }
-    for (slug, other) in gone {
+    // Asked again right before the record goes: the adopter may have let
+    // the branch go while GitHub was being read.
+    if !adopted.is_empty()
+        && let Ok(current) = ctx.repository.inventory(&ctx.cancellation).await
+    {
+        forget.extend(
+            adopted
+                .into_iter()
+                .filter(|(slug, other)| adopted_elsewhere(&current, slug, &other.branch)),
+        );
+    }
+    let mut observed = Observed::default();
+    for (slug, other) in forget {
+        let key = (slug.clone(), other.branch.clone());
         let forgotten = ctx
             .database
             .call(move |store| Ok(store.forget_other_branch(&slug, &other)?))
             .await;
-        if let Err(error) = forgotten {
-            tracing::warn!(%error, "could not forget a worktree's deleted other branch");
+        match forgotten {
+            Ok(true) => {
+                tracing::info!(slug = %key.0, branch = %key.1, "forgot a worktree's other branch");
+                observed.forgotten.push(key);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not forget a worktree's other branch");
+            }
         }
     }
-    let mut result = BTreeMap::new();
     for (row, others) in found {
         let slug = row.target.slug().to_owned();
         let recorded = (!row.detached).then(|| row.target.branch.clone());
@@ -297,10 +441,10 @@ where
             tracing::warn!(%slug, %error, "could not record a worktree's other branches");
         }
         if !others.is_empty() {
-            result.insert(slug, others);
+            observed.others.insert(slug, others);
         }
     }
-    result
+    observed
 }
 
 /// [`observe`], then `state` brought up to date with what it recorded, for a
@@ -312,18 +456,29 @@ pub async fn refresh(
     github: Option<&GithubData>,
     ask: Ask,
 ) {
-    for (slug, others) in observe(ctx, rows, state, github, ask).await {
+    let observed = observe_asking(ctx, rows, state, github, ask).await;
+    let Some(slugs) = state.get_mut("slugs").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (slug, branch) in observed.forgotten {
+        if let Some(others) = slugs
+            .get_mut(&slug)
+            .and_then(|entry| entry.get_mut(wt_core::OTHER_BRANCHES))
+            .and_then(Value::as_object_mut)
+        {
+            others.remove(&branch);
+        }
+    }
+    for (slug, others) in observed.others {
         let entries: serde_json::Map<String, Value> = others
             .iter()
             .filter_map(|other| Some((other.branch.clone(), serde_json::to_value(other).ok()?)))
             .collect();
-        if let Some(slugs) = state.get_mut("slugs").and_then(Value::as_object_mut) {
-            let entry = slugs
-                .entry(slug)
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if let Some(entry) = entry.as_object_mut() {
-                entry.insert(wt_core::OTHER_BRANCHES.to_owned(), Value::Object(entries));
-            }
+        let entry = slugs
+            .entry(slug)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(entry) = entry.as_object_mut() {
+            entry.insert(wt_core::OTHER_BRANCHES.to_owned(), Value::Object(entries));
         }
     }
 }
@@ -587,9 +742,44 @@ mod tests {
         git(ctx, &["push", "-q", "origin", "--delete", "second-pr"]).await;
         git(ctx, &["branch", "-q", "-D", "second-pr"]).await;
         let seen = observe_with(ctx, &rows, &state(ctx).await, None, Ask::Github, never).await;
-        assert!(seen.is_empty(), "{seen:?}");
+        assert!(seen.others.is_empty(), "{seen:?}");
         assert!(wt_core::stored_other_branches(&state(ctx).await["slugs"]["one"]).is_empty());
         assert!(hazards().await.is_empty(), "{:?}", hazards().await);
+        fixture.close().await.unwrap();
+    }
+
+    /// A recorded other branch that gets a worktree of its own has a row to
+    /// show its pull request, so the first worktree stops listing it.
+    #[tokio::test]
+    async fn a_branch_adopted_by_another_worktree_is_forgotten() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let origin = fixture._root.path().join("origin.git");
+        git(ctx, &["init", "--bare", origin.to_str().unwrap()]).await;
+        git(ctx, &["remote", "add", "origin", origin.to_str().unwrap()]).await;
+        let own = row_one(ctx).await.target.branch;
+        git(ctx, &["switch", "-q", "-c", "second-pr"]).await;
+        git(ctx, &["push", "-q", "origin", "second-pr"]).await;
+        git(ctx, &["switch", "-q", &own]).await;
+        let rows = [row_one(ctx).await];
+        let open = open_pr("second-pr", 3961);
+        observe(ctx, &rows, &state(ctx).await, Some(&open), Ask::Nothing).await;
+        let before = state(ctx).await;
+        assert_eq!(
+            wt_core::stored_other_branches(&before["slugs"]["one"]).len(),
+            1
+        );
+
+        let two = fixture._root.path().join("worktrees/two");
+        git(
+            ctx,
+            &["-C", two.to_str().unwrap(), "switch", "-q", "second-pr"],
+        )
+        .await;
+        let mut shown = before.clone();
+        refresh(ctx, &rows, &mut shown, Some(&open), Ask::Nothing).await;
+        assert!(wt_core::stored_other_branches(&shown["slugs"]["one"]).is_empty());
+        assert!(wt_core::stored_other_branches(&state(ctx).await["slugs"]["one"]).is_empty());
         fixture.close().await.unwrap();
     }
 

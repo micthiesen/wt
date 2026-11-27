@@ -17,7 +17,7 @@ use crate::{
     BoardRow, BoardSection, Model, ReviewRequestRow, badges,
     cleanup::{CleanupMark, CleanupPreview},
     glyphs,
-    model::{ARCHIVED_SECTION, REMOVING_SECTION, VisualItem},
+    model::{ARCHIVED_SECTION, ListAnchor, REMOVING_SECTION, VisualItem},
     theme,
 };
 
@@ -74,6 +74,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     }
     let lines = build(model, inner.width as usize, inner.height as usize);
     let height = inner.height as usize;
+    model.list_height = height;
+    model.list_max_offset = lines.len().saturating_sub(height);
     let selected_line = model
         .selected
         .and_then(|selected| lines.iter().position(|line| line.item == Some(selected)));
@@ -83,7 +85,59 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     } else {
         selected_line
     };
-    model.offset = scroll_offset(model.offset, follow, lines.len(), height);
+    let line_of = |item: Option<usize>| {
+        item.and_then(|item| lines.iter().position(|line| line.item == Some(item)))
+    };
+    let mut offset = model.offset;
+    // A board that changed on its own is drawn around what the user was
+    // looking at: the cursor's line, or the top row of a scrolled viewport.
+    if std::mem::take(&mut model.list_reanchor)
+        && let Some(anchor) = model.list_anchor.take()
+    {
+        let line = match &anchor.item {
+            None => follow,
+            Some(id) => line_of(
+                (0..model.item_count())
+                    .find(|&position| model.item_id(position).as_ref() == Some(id)),
+            ),
+        };
+        if let Some(line) = line {
+            offset = line.saturating_sub(anchor.screen_row);
+        }
+    }
+    offset = scroll_offset(offset, follow, lines.len(), height);
+    // An opened section shows as many of its rows as fit below the
+    // cursor's usual context, so the next frame has nothing to scroll back.
+    if std::mem::take(&mut model.list_reveal)
+        && let Some(first) = follow
+    {
+        let rows = lines[first..]
+            .iter()
+            .take_while(|line| line.item.is_some())
+            .count();
+        let top = first.saturating_sub(scroll_margin(height));
+        offset = offset.max((first + rows).saturating_sub(height)).min(top);
+    }
+    model.offset = offset;
+    model.list_anchor = match follow {
+        Some(line) => (offset..offset + height)
+            .contains(&line)
+            .then(|| ListAnchor {
+                item: None,
+                screen_row: line - offset,
+            }),
+        None => lines
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(height)
+            .find_map(|(line, entry)| {
+                Some(ListAnchor {
+                    item: Some(model.item_id(entry.item?)?),
+                    screen_row: line - offset,
+                })
+            }),
+    };
     let total = lines.len();
     let visible: Vec<_> = lines
         .into_iter()
@@ -111,12 +165,16 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
     }
 }
 
+fn scroll_margin(height: usize) -> usize {
+    3.min(height.saturating_sub(1) / 2)
+}
+
 /// Keep the selected line in view with three lines of context (vim's
 /// scrolloff), and never scroll past the end.
 fn scroll_offset(offset: usize, selected: Option<usize>, total: usize, height: usize) -> usize {
     let mut offset = offset;
     if let Some(selected) = selected {
-        let margin = 3.min(height.saturating_sub(1) / 2);
+        let margin = scroll_margin(height);
         if selected < offset.saturating_add(margin) {
             offset = selected.saturating_sub(margin);
         } else if selected + margin >= offset.saturating_add(height) {
@@ -184,7 +242,7 @@ fn build(model: &Model, width: usize, height: usize) -> Vec<ListLine> {
         if model.reviews_folded {
             let item = positions.get(&VisualItem::ReviewHeader).copied();
             bottom.push(folded_header(
-                &["Review requests".to_owned()],
+                "Review requests",
                 board.review_requests.len(),
                 &FoldSummary::default(),
                 item == model.selected && item.is_some(),
@@ -275,21 +333,21 @@ impl RowContext<'_> {
         }
         let landed = section.key == crate::LANDED_SECTION;
         let members: Vec<&BoardRow> = rows.iter().map(|(_, row)| *row).collect();
-        let titles = if landed {
-            landed_titles(&section.title, &members)
-        } else {
-            vec![section.title.clone()]
-        };
         if section.folded {
             let item = positions.get(&VisualItem::Section(index)).copied();
-            let mut header = folded_header(
-                &titles,
-                rows.len(),
-                &FoldSummary::of(&members, &self.model.board.display),
-                item.is_some() && item == self.model.selected,
-                self.width,
-                item,
-            );
+            let selected = item.is_some() && item == self.model.selected;
+            let mut header = if landed {
+                folded_landed_header(&section.title, &members, selected, self.width, item)
+            } else {
+                folded_header(
+                    &section.title,
+                    rows.len(),
+                    &FoldSummary::of(&members, &self.model.board.display),
+                    selected,
+                    self.width,
+                    item,
+                )
+            };
             // A candidate hidden by a fold must still show.
             if rows
                 .iter()
@@ -304,9 +362,9 @@ impl RowContext<'_> {
         }
         lines.push(ListLine {
             line: if landed {
-                counted_rule(&titles, self.width)
+                counted_rule(&landed_labels(&section.title, &members), self.width)
             } else {
-                rule(&titles[0], self.width, false)
+                rule(&section.title, self.width, false)
             },
             item: None,
         });
@@ -445,42 +503,27 @@ impl RowContext<'_> {
 /// the controller's clock (`22:32`, `Fri 18:12`), `other work`, `done`.
 fn waits_for(row: &BoardRow, board: &crate::Board) -> Option<(String, Color)> {
     use crate::OwedBlock;
-    let text = match row.owed_block? {
-        OwedBlock::Due => {
-            let color = if row.owes.iter().any(|item| item.overdue) {
-                theme::ERR
-            } else {
-                theme::WARN
-            };
-            // The list is ordered most urgent first: due checks by stage,
-            // then due steps.
-            let stage = row.owes.iter().find(|item| item.due()).and_then(|item| {
-                (item.kind == wt_core::OwedKind::Check)
-                    .then_some(item.stage)
-                    .flatten()
-            });
-            let text = match stage {
-                Some(wt_core::VerifyStage::Staging) => "due staging",
-                Some(wt_core::VerifyStage::Production) => "due production",
-                None => "due",
-            };
-            return Some((text.to_owned(), color));
-        }
-        OwedBlock::WaitingStaging => "staging".to_owned(),
-        OwedBlock::WaitingProduction => "production".to_owned(),
-        OwedBlock::Scheduled => row
-            .owes
-            .iter()
-            .filter_map(|item| item.next_at_ms)
-            .min()
-            .and_then(|at_ms| board.history_times.get(&at_ms))
-            .map(|stamp| stamp.terse.clone())
-            .filter(|terse| !terse.is_empty())
-            .unwrap_or_else(|| "scheduled".to_owned()),
-        OwedBlock::WaitingOther => "other work".to_owned(),
-        OwedBlock::Done => "done".to_owned(),
+    let block = row.owed_block?;
+    // The list is ordered most urgent first: due checks by stage, then due
+    // steps.
+    let due_stage = row.owes.iter().find(|item| item.due()).and_then(|item| {
+        (item.kind == wt_core::OwedKind::Check)
+            .then_some(item.stage)
+            .flatten()
+    });
+    let at = row
+        .owes
+        .iter()
+        .filter_map(|item| item.next_at_ms)
+        .min()
+        .and_then(|at_ms| board.history_times.get(&at_ms))
+        .map(|stamp| stamp.terse.as_str());
+    let color = match block {
+        OwedBlock::Due if row.owes.iter().any(|item| item.overdue) => theme::ERR,
+        OwedBlock::Due => theme::WARN,
+        _ => theme::FG_DIM,
     };
-    Some((text, theme::FG_DIM))
+    Some((block.waits_for(due_stage, at), color))
 }
 
 /// How many rows of the Landed block have something due, wait, and are
@@ -499,33 +542,81 @@ pub(crate) fn landed_counts(rows: &[&BoardRow]) -> [usize; 3] {
     ]
 }
 
-/// The counts in words, `3 due · 24 waiting · 2 done`, without those that
-/// are zero; `short` says `wait`.
-pub(crate) fn landed_counts_text(counts: [usize; 3], short: bool) -> String {
-    let waiting = if short { "wait" } else { "waiting" };
-    counts
-        .into_iter()
-        .zip(["due", waiting, "done"])
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, word)| format!("{count} {word}"))
-        .collect::<Vec<_>>()
-        .join(" · ")
+/// One form of the Landed header: its pieces and their colours.
+type LandedLabel = Vec<(String, Color)>;
+
+fn label_width(label: &LandedLabel) -> usize {
+    label.iter().map(|(text, _)| text.width()).sum()
 }
 
-/// The Landed block's header, open or folded, from the fullest form to the
-/// shortest: `Landed · 3 due · 24 waiting · 2 done`, the same with `wait`,
-/// and the counts alone. A header takes the first that fits: it gives up
-/// its rule and then its words before it cuts a count.
-fn landed_titles(title: &str, rows: &[&BoardRow]) -> Vec<String> {
-    let counts = landed_counts(rows);
-    if counts == [0; 3] {
-        return vec![title.to_owned()];
+/// `label` cut to `room` cells, each piece keeping its colour.
+fn cut_label(label: &LandedLabel, room: usize) -> LandedLabel {
+    let text: String = label.iter().map(|(text, _)| text.as_str()).collect();
+    let mut left = truncate_end(&text, room);
+    let mut cut = LandedLabel::new();
+    for (piece, color) in label {
+        if left.is_empty() {
+            break;
+        }
+        let taken = if left.starts_with(piece.as_str()) {
+            piece.clone()
+        } else {
+            std::mem::take(&mut left)
+        };
+        left = left.strip_prefix(taken.as_str()).unwrap_or("").to_owned();
+        cut.push((taken, *color));
     }
-    vec![
-        format!("{title} · {}", landed_counts_text(counts, false)),
-        format!("{title} · {}", landed_counts_text(counts, true)),
-        landed_counts_text(counts, true),
-    ]
+    cut
+}
+
+/// The counts as coloured pieces. Only `N due` is loud, in the colour its
+/// rows' own `due` labels take; the rest stay as quiet as theirs.
+fn landed_count_label(rows: &[&BoardRow], short: bool) -> LandedLabel {
+    let due = if rows
+        .iter()
+        .any(|row| row.owes.iter().any(|item| item.overdue))
+    {
+        theme::ERR
+    } else {
+        theme::WARN
+    };
+    let waiting = if short { "wait" } else { "waiting" };
+    let mut label = LandedLabel::new();
+    for (count, (word, color)) in landed_counts(rows).into_iter().zip([
+        ("due", due),
+        (waiting, theme::FG_DIM),
+        ("done", theme::FG_DIM),
+    ]) {
+        if count == 0 {
+            continue;
+        }
+        if !label.is_empty() {
+            label.push((" · ".to_owned(), theme::FG_DIM));
+        }
+        label.push((format!("{count} {word}"), color));
+    }
+    label
+}
+
+/// The open Landed header from the fullest form to the shortest:
+/// `Landed · 3 due · 24 waiting · 2 done`, the same with `wait`, and the
+/// counts alone. It gives up its rule and then its words before it cuts a
+/// count.
+fn landed_labels(title: &str, rows: &[&BoardRow]) -> Vec<LandedLabel> {
+    let named = |short| {
+        let counts = landed_count_label(rows, short);
+        let mut label = vec![(title.to_owned(), theme::FG_DIM)];
+        if !counts.is_empty() {
+            label.push((" · ".to_owned(), theme::FG_DIM));
+            label.extend(counts);
+        }
+        label
+    };
+    let short = landed_count_label(rows, true);
+    if short.is_empty() {
+        return vec![named(false)];
+    }
+    vec![named(false), named(true), short]
 }
 
 /// The row's title exactly as named. Issue identity, removal progress and
@@ -581,34 +672,38 @@ fn rule(label: &str, width: usize, selected: bool) -> Line<'static> {
 /// the shortest. Each is tried with the whole rule, then with one leading
 /// dash, then with none, before the next shorter one. Only a pane narrower
 /// than the shortest form cuts it.
-fn counted_rule(labels: &[String], width: usize) -> Line<'static> {
+fn counted_rule(labels: &[LandedLabel], width: usize) -> Line<'static> {
     let body = width.saturating_sub(3);
     let dashes = theme::fg(theme::BORDER_DIM);
-    let line = |lead: usize, label: String, trail: usize| {
-        Line::from(vec![
+    let line = |lead: usize, pad: (&str, &str), label: &LandedLabel, trail: usize| {
+        let mut spans = vec![
             Span::raw(" "),
             Span::styled("─".repeat(lead), dashes),
-            Span::styled(label, theme::dim()),
-            Span::styled("─".repeat(trail), dashes),
-        ])
+            Span::raw(pad.0.to_owned()),
+        ];
+        spans.extend(
+            label
+                .iter()
+                .map(|(text, color)| Span::styled(text.clone(), theme::fg(*color))),
+        );
+        spans.push(Span::raw(pad.1.to_owned()));
+        spans.push(Span::styled("─".repeat(trail), dashes));
+        Line::from(spans)
     };
     for label in labels {
-        let cells = label.width();
+        let cells = label_width(label);
         if cells + 4 <= body {
-            return line(2, format!(" {label} "), body - cells - 4);
+            return line(2, (" ", " "), label, body - cells - 4);
         }
         if cells + 2 <= body {
-            return line(1, format!(" {label}"), 0);
+            return line(1, (" ", ""), label, 0);
         }
         if cells <= body {
-            return line(0, label.clone(), 0);
+            return line(0, ("", ""), label, 0);
         }
     }
-    line(
-        0,
-        truncate_end(labels.last().map_or("", String::as_str), body),
-        0,
-    )
+    let shortest = labels.last().cloned().unwrap_or_default();
+    line(0, ("", ""), &cut_label(&shortest, body), 0)
 }
 
 fn divider(label: &str, width: usize) -> ListLine {
@@ -631,7 +726,7 @@ fn empty_section(label: &str, selected: bool, width: usize, item: Option<usize>)
 /// and on the right the hidden rows' markers, counted, so folding a section
 /// never hides that something inside needs attention.
 fn folded_header(
-    labels: &[String],
+    label: &str,
     count: usize,
     fold: &FoldSummary,
     selected: bool,
@@ -671,9 +766,8 @@ fn folded_header(
     // when the name would otherwise be cut; alarms always stay.
     let cells =
         |spans: &[Span<'static>]| spans.iter().map(|span| span.content.width()).sum::<usize>();
-    let full = labels.first().map_or("", String::as_str);
     while !states.is_empty()
-        && width.saturating_sub(2 + chip.width() + cells(&states) + cells(&alarms)) < full.width()
+        && width.saturating_sub(2 + chip.width() + cells(&states) + cells(&alarms)) < label.width()
     {
         states.pop();
     }
@@ -681,12 +775,6 @@ fn folded_header(
     right.extend(alarms);
     let right_width: usize = right.iter().map(|span| span.content.width()).sum();
     let room = width.saturating_sub(2 + chip.width() + right_width);
-    // A header with shorter forms takes the first that fits whole.
-    let label = labels
-        .iter()
-        .find(|label| label.width() <= room)
-        .or(labels.last())
-        .map_or("", String::as_str);
     let label = truncate_end(label, room);
     let filler = room.saturating_sub(label.width());
     let mut spans = vec![
@@ -704,6 +792,83 @@ fn folded_header(
         Span::styled(" ".repeat(filler), style(theme::FG)),
     ];
     spans.extend(right);
+    spans.push(Span::styled(" ", style(theme::FG)));
+    ListLine {
+        line: Line::from(spans),
+        item,
+    }
+}
+
+/// The folded Landed block: the count chip, its name, and on the right
+/// the same counts its open header carries. Its rows' markers say only what
+/// the counts already do, so it shows no marker tally. The name goes before
+/// a count is cut.
+fn folded_landed_header(
+    title: &str,
+    rows: &[&BoardRow],
+    selected: bool,
+    width: usize,
+    item: Option<usize>,
+) -> ListLine {
+    let background = selected.then_some(theme::SELECTED_BG);
+    let style = |color: Color| {
+        let style = Style::new().fg(color);
+        background.map_or(style, |bg| style.bg(bg))
+    };
+    let modifier = if selected {
+        Modifier::BOLD
+    } else {
+        Modifier::empty()
+    };
+    let chip = format!("[×{:02}] ", rows.len());
+    let room = width.saturating_sub(2 + chip.width());
+    let name_cells = title.width();
+    let (named, counts) = [false, true]
+        .into_iter()
+        .map(|short| landed_count_label(rows, short))
+        .find(|counts| counts.is_empty() || name_cells + 2 + label_width(counts) <= room)
+        .map_or_else(
+            || (false, landed_count_label(rows, true)),
+            |counts| (true, counts),
+        );
+    let mut spans = vec![
+        Span::styled(" ", style(theme::FG)),
+        Span::styled(chip, style(theme::ACCENT).add_modifier(modifier)),
+    ];
+    let count_spans = |spans: &mut Vec<Span<'static>>| {
+        spans.extend(
+            counts
+                .iter()
+                .map(|(text, color)| Span::styled(text.clone(), style(*color))),
+        );
+    };
+    if named {
+        let name = truncate_end(title, room);
+        let filler = room.saturating_sub(name.width() + label_width(&counts));
+        spans.push(Span::styled(
+            name,
+            style(if selected {
+                theme::FG_BRIGHT
+            } else {
+                theme::FG_DIM
+            })
+            .add_modifier(modifier),
+        ));
+        spans.push(Span::styled(" ".repeat(filler), style(theme::FG)));
+        count_spans(&mut spans);
+    } else {
+        let cells = label_width(&counts);
+        if cells <= room {
+            count_spans(&mut spans);
+            spans.push(Span::styled(" ".repeat(room - cells), style(theme::FG)));
+        } else {
+            spans.extend(
+                cut_label(&counts, room)
+                    .into_iter()
+                    .map(|(text, color)| Span::styled(text, style(color))),
+            );
+        }
+    }
     spans.push(Span::styled(" ", style(theme::FG)));
     ListLine {
         line: Line::from(spans),
@@ -765,6 +930,9 @@ fn review_row(
         item,
     }
 }
+
+#[cfg(test)]
+mod scroll_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1380,7 +1548,8 @@ mod tests {
     }
 
     /// The Landed header gives up its rule, then says `wait`, and folded
-    /// then drops its name, before any count is cut.
+    /// then drops its name, before any count is cut. Folded, the counts sit
+    /// at the right edge and there is no marker tally.
     #[test]
     fn the_landed_header_never_cuts_a_count() {
         let board = landed_board();
@@ -1408,14 +1577,26 @@ mod tests {
             " Landed · 3 due · 4 wait · 1 done"
         );
         assert_eq!(
+            header(&folded, 50).trim_end(),
+            " [×08] Landed          3 due · 4 waiting · 1 done"
+        );
+        assert_eq!(
             header(&folded, 43).trim_end(),
-            " [×08] Landed · 3 due · 4 waiting · 1 done"
+            " [×08] Landed   3 due · 4 waiting · 1 done"
         );
         assert_eq!(
             header(&folded, 42).trim_end(),
-            " [×08] Landed · 3 due · 4 wait · 1 done"
+            " [×08] Landed  3 due · 4 waiting · 1 done"
         );
-        for width in [39, 35] {
+        assert_eq!(
+            header(&folded, 41).trim_end(),
+            " [×08] Landed    3 due · 4 wait · 1 done"
+        );
+        assert_eq!(
+            header(&folded, 39).trim_end(),
+            " [×08] Landed  3 due · 4 wait · 1 done"
+        );
+        for width in [38, 35] {
             assert_eq!(
                 header(&folded, width).trim_end(),
                 " [×08] 3 due · 4 wait · 1 done"
@@ -1499,7 +1680,10 @@ mod tests {
         let lines = drawn(&folded, 70);
         assert_eq!(lines.len(), 1);
         assert!(
-            plain(&lines[0]).starts_with(" [×08] Landed · 3 due · 4 waiting · 1 done"),
+            plain(&lines[0])
+                .trim_end()
+                .ends_with("  3 due · 4 waiting · 1 done")
+                && plain(&lines[0]).starts_with(" [×08] Landed  "),
             "{}",
             plain(&lines[0])
         );
@@ -1558,7 +1742,7 @@ mod tests {
             ..Default::default()
         });
         let fold = fold_of(&rows, &Default::default());
-        let line = folded_header(&["Statuses".to_owned()], 8, &fold, false, 30, None);
+        let line = folded_header("Statuses", 8, &fold, false, 30, None);
         let text: String = line
             .line
             .spans
@@ -1582,7 +1766,7 @@ mod tests {
         ]
         .map(state_row);
         let fold = fold_of(&rows, &Default::default());
-        let line = folded_header(&["Batch".to_owned()], 4, &fold, false, 60, None);
+        let line = folded_header("Batch", 4, &fold, false, 60, None);
         let colors = line
             .line
             .spans
@@ -1654,7 +1838,7 @@ mod tests {
                     "{badge:?}"
                 );
             }
-            let line = folded_header(&["All".to_owned()], rows.len(), &fold, false, 400, None);
+            let line = folded_header("All", rows.len(), &fold, false, 400, None);
             for (badge, count) in &fold.markers {
                 assert!(line.line.spans.iter().any(|span| {
                     span.content == format!("{} {count} ", badge.glyph)

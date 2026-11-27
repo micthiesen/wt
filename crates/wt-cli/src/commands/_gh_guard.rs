@@ -1,6 +1,8 @@
 //! `wt _gh-guard`: what the `gh` shim asks before `gh pr create`. One pull
 //! request per worktree: the pull request comes from the worktree's recorded
-//! branch, and that branch does not already have one. Only an explicit
+//! branch, and that branch does not already have one. A pull request for a
+//! repository that is none of the worktree's remotes is not the worktree's
+//! and is not checked. Only an explicit
 //! refusal exits [`wt_harness::GH_GUARD_REFUSED`]; whatever cannot be
 //! established lets `gh` run.
 
@@ -40,6 +42,66 @@ fn head_flag(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// The repository a `gh pr create` command line names with `--repo` or `-R`.
+fn repo_flag(args: &[String]) -> Option<String> {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let value = if arg == "--repo" || arg == "-R" {
+            args.next().cloned()
+        } else {
+            arg.strip_prefix("--repo=")
+                .or_else(|| arg.strip_prefix("-R").filter(|rest| !rest.is_empty()))
+                .map(str::to_owned)
+        };
+        if value.is_some() {
+            return value;
+        }
+    }
+    None
+}
+
+/// `owner/name` of a repository however it is written: `OWNER/REPO`,
+/// `HOST/OWNER/REPO`, or an HTTPS or SSH URL, with or without `.git`.
+fn repo_key(repository: &str) -> Option<String> {
+    let trimmed = repository.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let mut parts = trimmed.rsplit(['/', ':']);
+    let (name, owner) = (parts.next()?, parts.next()?);
+    (!name.is_empty() && !owner.is_empty()).then(|| format!("{owner}/{name}").to_ascii_lowercase())
+}
+
+/// Whether `named` is a repository other than every one of `remotes`.
+/// `None` when either side cannot be read, which decides nothing.
+fn names_another_repository(named: &str, remotes: &[String]) -> Option<bool> {
+    let named = repo_key(named)?;
+    let own: Vec<String> = remotes.iter().filter_map(|url| repo_key(url)).collect();
+    (!own.is_empty()).then(|| !own.contains(&named))
+}
+
+/// The URLs of the remotes of the checkout at `cwd`.
+async fn remote_urls(
+    processes: &ProcessRunner,
+    cancellation: &tokio_util::sync::CancellationToken,
+    cwd: &Path,
+) -> Vec<String> {
+    let spec = CommandSpec::new("git")
+        .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+        .cwd(cwd);
+    processes
+        .run(spec, cancellation)
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            output
+                .stdout_text()
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The pull requests of `branch`, or `None` when GitHub did not say within
@@ -92,6 +154,29 @@ fn second_pr(recorded: &str, head: &str, slug: &str, prs: &[HeadPr]) -> Option<S
         })
 }
 
+/// What the guard decided about one `gh pr create` in a worktree it knows.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    Allowed,
+    /// gh runs although the check could not be made.
+    Unchecked(String),
+    Refused(String),
+}
+
+/// One application log line for each refusal and each unchecked run, so
+/// both can be reviewed after the session that met them is gone.
+fn log_verdict(slug: &str, branch: &str, verdict: &Verdict) {
+    match verdict {
+        Verdict::Allowed => {}
+        Verdict::Unchecked(reason) => {
+            tracing::warn!(slug, branch, reason, "gh pr create ran unchecked");
+        }
+        Verdict::Refused(reason) => {
+            tracing::warn!(slug, branch, reason, "gh pr create refused");
+        }
+    }
+}
+
 pub async fn run(ctx: &AppContext, args: &[String]) -> Result<i32> {
     let Ok(row) = resolve_worktree(ctx, None).await else {
         return Ok(0);
@@ -100,12 +185,42 @@ pub async fn run(ctx: &AppContext, args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     let slug = row.target.slug().to_owned();
+    let named = repo_flag(args).or_else(|| {
+        std::env::var("GH_REPO")
+            .ok()
+            .filter(|repo| !repo.is_empty())
+    });
+    if let Some(named) = named {
+        let remotes = remote_urls(
+            &ctx.processes,
+            &ctx.cancellation,
+            Path::new(&row.target.path),
+        )
+        .await;
+        match names_another_repository(&named, &remotes) {
+            Some(true) => return Ok(0),
+            Some(false) => {}
+            None => {
+                let reason =
+                    format!("could not tell whether {named} is this worktree's repository");
+                log_verdict(&slug, &row.target.branch, &Verdict::Unchecked(reason));
+                return Ok(0);
+            }
+        }
+    }
     let lookup = slug.clone();
-    let state = ctx
+    let state = match ctx
         .database
         .call(move |store| Ok(store.read_slug_state(&lookup)?))
-        .await?
-        .unwrap_or_default();
+        .await
+    {
+        Ok(state) => state.unwrap_or_default(),
+        Err(error) => {
+            let reason = format!("could not read the worktree's recorded branch: {error}");
+            log_verdict(&slug, &row.target.branch, &Verdict::Unchecked(reason));
+            return Ok(0);
+        }
+    };
     let recorded = wt_core::recorded_branch(&state)
         .unwrap_or(&row.target.branch)
         .to_owned();
@@ -127,18 +242,23 @@ pub async fn run(ctx: &AppContext, args: &[String]) -> Result<i32> {
                 eprintln!(
                     "wt: could not list the pull requests of {recorded}; not checking for a second one"
                 );
+                let reason = format!("GitHub did not list the pull requests of {recorded}");
+                log_verdict(&slug, &head, &Verdict::Unchecked(reason));
                 return Ok(0);
             }
         }
     } else {
         Vec::new()
     };
-    match second_pr(&recorded, &head, &slug, &prs) {
-        Some(reason) => {
+    let verdict =
+        second_pr(&recorded, &head, &slug, &prs).map_or(Verdict::Allowed, Verdict::Refused);
+    log_verdict(&slug, &head, &verdict);
+    match verdict {
+        Verdict::Refused(reason) => {
             eprintln!("{}", wt_core::second_pr_refusal(&reason, &recorded));
             Ok(wt_harness::GH_GUARD_REFUSED)
         }
-        None => Ok(0),
+        Verdict::Allowed | Verdict::Unchecked(_) => Ok(0),
     }
 }
 
@@ -170,6 +290,137 @@ mod tests {
         ] {
             assert_eq!(head_flag(&args(spelling)).as_deref(), Some("michael/x"));
         }
+    }
+
+    #[test]
+    fn refusals_and_unchecked_runs_each_leave_one_log_line() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_verdict("one", "michael/one", &Verdict::Allowed);
+            log_verdict(
+                "one",
+                "michael/retire",
+                &Verdict::Refused("this PR would come from michael/retire".into()),
+            );
+            log_verdict(
+                "two",
+                "michael/two",
+                &Verdict::Unchecked("GitHub did not list the pull requests".into()),
+            );
+        });
+        let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        let logged: Vec<serde_json::Value> = logged
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(logged.len(), 2, "{logged:?}");
+        let fields = |line: &serde_json::Value| {
+            ["message", "slug", "branch", "reason"].map(|key| line["fields"][key].clone())
+        };
+        assert_eq!(
+            fields(&logged[0]),
+            [
+                "gh pr create refused",
+                "one",
+                "michael/retire",
+                "this PR would come from michael/retire"
+            ]
+        );
+        assert_eq!(
+            fields(&logged[1]),
+            [
+                "gh pr create ran unchecked",
+                "two",
+                "michael/two",
+                "GitHub did not list the pull requests"
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_repository_that_is_none_of_the_remotes_is_another_one() {
+        for spelling in [
+            &["pr", "create", "--repo", "o/r"][..],
+            &["pr", "create", "-R", "o/r"],
+            &["pr", "create", "--repo=o/r", "--draft"],
+            &["-Ro/r", "pr", "create"],
+        ] {
+            assert_eq!(repo_flag(&args(spelling)).as_deref(), Some("o/r"));
+        }
+        assert_eq!(repo_flag(&args(&["pr", "create", "--draft"])), None);
+
+        let remotes = [
+            "git@github.com:Acme/App.git".to_owned(),
+            "https://github.com/upstream/app".to_owned(),
+        ];
+        // The session's own repository, however it is spelled, is guarded.
+        for own in [
+            "acme/app",
+            "github.com/acme/app",
+            "https://github.com/Acme/App.git",
+            "https://github.com/acme/app/",
+            "upstream/app",
+        ] {
+            assert_eq!(
+                names_another_repository(own, &remotes),
+                Some(false),
+                "{own}"
+            );
+        }
+        assert_eq!(names_another_repository("acme/other", &remotes), Some(true));
+        // Nothing to compare decides nothing.
+        assert_eq!(names_another_repository("acme/app", &[]), None);
+        assert_eq!(names_another_repository("app", &remotes), None);
+    }
+
+    #[tokio::test]
+    async fn the_remotes_of_a_checkout_are_read_from_its_git_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "{args:?}");
+        };
+        git(&["init", "-q"]);
+        let processes = ProcessRunner::default();
+        let token = tokio_util::sync::CancellationToken::new();
+        assert!(remote_urls(&processes, &token, tmp.path()).await.is_empty());
+        git(&["remote", "add", "origin", "git@github.com:acme/app.git"]);
+        git(&[
+            "remote",
+            "add",
+            "upstream",
+            "https://github.com/upstream/app",
+        ]);
+        let mut urls = remote_urls(&processes, &token, tmp.path()).await;
+        urls.sort();
+        assert_eq!(
+            urls,
+            [
+                "git@github.com:acme/app.git",
+                "https://github.com/upstream/app"
+            ]
+        );
     }
 
     #[tokio::test]

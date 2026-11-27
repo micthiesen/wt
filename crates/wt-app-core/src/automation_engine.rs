@@ -30,7 +30,8 @@ pub const DEFER_REPORT_AFTER_MS: i64 = 60 * 60 * 1000;
 /// run that fails after the last of these ends the fire as failed.
 const RUN_RETRY_DELAYS_MS: [i64; 3] = [60 * 1000, 5 * 60 * 1000, 30 * 60 * 1000];
 /// A launched run whose end nobody reported for this long is no longer
-/// waited for; its fire stays delivered.
+/// waited for, by this process or one started later; its fire stays
+/// delivered.
 const AWAIT_RUN_MAX_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -219,6 +220,35 @@ struct AwaitedRun {
     delivered_at_ms: i64,
     failed_runs: u32,
     retry_on_failure: bool,
+    /// Read back from the ledger: a process that has since quit launched
+    /// it, and no run record has been matched to it yet.
+    restored: bool,
+}
+
+impl AwaitedRun {
+    /// What the ledger keeps so a later process can report the run's exit.
+    fn record(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "claim": serde_json::to_value(&self.claim).context("encode awaited claim")?,
+            "fire": serde_json::to_value(&self.fire).context("encode awaited fire")?,
+            "queuedAtMs": self.queued_at_ms,
+            "deliveredAtMs": self.delivered_at_ms,
+            "failedRuns": self.failed_runs,
+            "retryOnFailure": self.retry_on_failure,
+        }))
+    }
+
+    fn from_record(record: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            claim: serde_json::from_value(record["claim"].clone()).ok()?,
+            fire: serde_json::from_value(record["fire"].clone()).ok()?,
+            queued_at_ms: record["queuedAtMs"].as_i64()?,
+            delivered_at_ms: record["deliveredAtMs"].as_i64()?,
+            failed_runs: u32::try_from(record["failedRuns"].as_u64()?).unwrap_or(u32::MAX),
+            retry_on_failure: record["retryOnFailure"].as_bool()?,
+            restored: true,
+        })
+    }
 }
 
 /// How a launched run ended, as its durable record shows.
@@ -229,7 +259,25 @@ pub enum RunEnd {
     ShellFailed {
         exit_code: i32,
     },
+    /// A shell command's worker died before it recorded an exit code: the
+    /// command may have succeeded.
+    ShellUnknown,
     Other,
+}
+
+/// What is said of a run whose worker died before recording an exit code.
+pub const RUN_EXIT_UNRECORDED: &str = "its run ended without recording an exit code";
+/// What is said of a run a process that has quit launched, when no record
+/// of the run is left.
+pub const RUN_RECORD_MISSING: &str = "no record of its run is left";
+
+/// A fire whose action retries on failure and whose run's exit cannot be
+/// recovered. It may have succeeded, so it is not run again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnknownRun {
+    pub slug: String,
+    pub rule: String,
+    pub reason: String,
 }
 
 /// A fire whose shell action exited non-zero.
@@ -268,6 +316,9 @@ pub struct AutomationEngine {
     awaited: BTreeMap<String, AwaitedRun>,
     /// Fires ended as skipped since the last [`AutomationEngine::take_skipped`].
     skipped: Vec<SkippedFire>,
+    /// Runs ended with an unknown exit since the last
+    /// [`AutomationEngine::take_unknown_runs`].
+    unknown_runs: Vec<UnknownRun>,
     /// Quit arriving right after this many claims of one pass: timing alone
     /// cannot place a cancellation between two claims on every platform.
     #[cfg(test)]
@@ -287,6 +338,7 @@ impl AutomationEngine {
             deferrals: BTreeMap::new(),
             awaited: BTreeMap::new(),
             skipped: Vec::new(),
+            unknown_runs: Vec::new(),
             #[cfg(test)]
             quit_after_claims: None,
         }
@@ -428,6 +480,114 @@ impl AutomationEngine {
             restored += 1;
         }
         Ok(restored)
+    }
+
+    /// Await again the launched runs whose exit no process reported: the
+    /// one that launched them quit first. Their run records outlive it, so
+    /// the caller reports each exit through [`Self::run_ended`] as usual and
+    /// then calls [`Self::end_lost_runs`] for those with no record left.
+    pub async fn restore_awaited(&mut self, now_ms: i64) -> Result<usize> {
+        let records = self
+            .ledger
+            .awaited()
+            .await
+            .context("read awaited automation runs")?;
+        let mut restored = 0;
+        for (id, record) in records {
+            let Some(run) = AwaitedRun::from_record(&record) else {
+                tracing::warn!(%id, "skipping an unreadable awaited automation run");
+                continue;
+            };
+            if now_ms.saturating_sub(run.delivered_at_ms) > AWAIT_RUN_MAX_MS
+                || self.awaited.contains_key(&id)
+            {
+                continue;
+            }
+            self.awaited.insert(id, run);
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
+    /// When the earliest restored run still unmatched was claimed: its run
+    /// record, and every later one's, started no earlier.
+    pub fn restored_since_ms(&self) -> Option<i64> {
+        self.awaited
+            .values()
+            .filter(|run| run.restored)
+            .map(|run| run.claim.claimed_at_ms())
+            .min()
+    }
+
+    /// End the restored runs that have no run record. `running` names the
+    /// fire keys and start time of every run still in progress; the ended
+    /// ones were already reported. With `retry_on_failure` the fire is
+    /// recorded as ended with an unknown outcome and reported once; it is
+    /// never run again, because the lost run may have succeeded.
+    pub async fn end_lost_runs(
+        &mut self,
+        running: &[(Vec<String>, i64)],
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        let mut lost = Vec::new();
+        for (id, run) in &mut self.awaited {
+            if !run.restored {
+                continue;
+            }
+            if running.iter().any(|(keys, started_at_ms)| {
+                *keys == run.fire.fire_keys && *started_at_ms >= run.claim.claimed_at_ms()
+            }) {
+                run.restored = false;
+            } else {
+                lost.push(id.clone());
+            }
+        }
+        for id in lost {
+            let Some(run) = self.awaited.remove(&id) else {
+                continue;
+            };
+            self.end_unreported(run, RUN_RECORD_MISSING, now_ms, cancellation)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Runs ended with an unknown exit since the last call, for the caller
+    /// to report once.
+    pub fn take_unknown_runs(&mut self) -> Vec<UnknownRun> {
+        std::mem::take(&mut self.unknown_runs)
+    }
+
+    /// Stop awaiting a run that ended without a definite failure. One whose
+    /// action retries and whose exit is unknown is recorded as such.
+    async fn end_unreported(
+        &mut self,
+        run: AwaitedRun,
+        unknown: &str,
+        now_ms: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<()> {
+        if !run.retry_on_failure {
+            return self
+                .ledger
+                .clear_awaited(&run.claim, cancellation)
+                .await
+                .context("stop awaiting automation run");
+        }
+        let recorded = self
+            .ledger
+            .mark_unknown(&run.claim, now_ms, unknown, cancellation)
+            .await
+            .context("mark automation outcome unknown")?;
+        if recorded {
+            self.unknown_runs.push(UnknownRun {
+                slug: run.fire.slug,
+                rule: run.fire.rule.id,
+                reason: unknown.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn tick(&mut self, input: AutomationPassInput<'_>) -> Result<AutomationTick> {
@@ -1204,30 +1364,47 @@ impl AutomationEngine {
                 );
             }
             AutomationOutcome::Delivered { slot } => {
-                self.ledger
-                    .mark_delivered(&ledger_claim, now_ms, cancellation)
-                    .await
-                    .context("mark automation delivered")?;
                 let failed_runs = self
                     .deferrals
                     .get(&claim.id)
                     .map_or(0, |deferral| deferral.failed_runs);
+                let awaited = (slot == DeliverySlot::Headless
+                    && ledger_claim.kind() == DispatchKind::HeadlessAction)
+                    .then(|| self.active.get(&claim.id))
+                    .flatten()
+                    .map(|active| AwaitedRun {
+                        claim: ledger_claim.clone(),
+                        fire: active.fire.clone(),
+                        queued_at_ms: active.queued_at_ms,
+                        delivered_at_ms: now_ms,
+                        failed_runs,
+                        retry_on_failure: active.retry_on_failure,
+                        restored: false,
+                    });
+                match &awaited {
+                    // Kept in the delivery's own write: a process that quits
+                    // before the run ends leaves its exit to the next one.
+                    Some(run) => {
+                        self.ledger
+                            .mark_delivered_awaited(
+                                &ledger_claim,
+                                now_ms,
+                                &claim.id,
+                                run.record()?,
+                                cancellation,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.ledger
+                            .mark_delivered(&ledger_claim, now_ms, cancellation)
+                            .await
+                    }
+                }
+                .context("mark automation delivered")?;
                 self.forget_deferral(&claim.id, cancellation).await?;
-                if slot == DeliverySlot::Headless
-                    && ledger_claim.kind() == DispatchKind::HeadlessAction
-                    && let Some(active) = self.active.get(&claim.id)
-                {
-                    self.awaited.insert(
-                        claim.id.clone(),
-                        AwaitedRun {
-                            claim: ledger_claim,
-                            fire: active.fire.clone(),
-                            queued_at_ms: active.queued_at_ms,
-                            delivered_at_ms: now_ms,
-                            failed_runs,
-                            retry_on_failure: active.retry_on_failure,
-                        },
-                    );
+                if let Some(run) = awaited {
+                    self.awaited.insert(claim.id.clone(), run);
                 }
                 self.finish_slot(&claim.id, slot, now_ms);
             }
@@ -1277,8 +1454,21 @@ impl AutomationEngine {
         let Some(run) = self.awaited.remove(&id) else {
             return Ok(None);
         };
-        let RunEnd::ShellFailed { exit_code } = end else {
-            return Ok(None);
+        let exit_code = match end {
+            RunEnd::ShellFailed { exit_code } => exit_code,
+            RunEnd::ShellUnknown | RunEnd::Other => {
+                let unknown = if end == RunEnd::ShellUnknown {
+                    RUN_EXIT_UNRECORDED
+                } else {
+                    ""
+                };
+                let mut run = run;
+                // Any other end is an answer: the fire stays delivered.
+                run.retry_on_failure &= end == RunEnd::ShellUnknown;
+                self.end_unreported(run, unknown, now_ms, cancellation)
+                    .await?;
+                return Ok(None);
+            }
         };
         let runs = run.failed_runs.saturating_add(1);
         let failed = |retry_in_ms| FailedRun {
@@ -1294,7 +1484,8 @@ impl AutomationEngine {
             .then(|| RUN_RETRY_DELAYS_MS.get(run.failed_runs as usize).copied())
             .flatten();
         let Some(delay) = delay else {
-            self.ledger
+            let ended = self
+                .ledger
                 .mark_failed(
                     &run.claim,
                     now_ms,
@@ -1304,7 +1495,8 @@ impl AutomationEngine {
                 )
                 .await
                 .context("mark automation failed")?;
-            return Ok(Some(failed(None)));
+            // Another process read the same exit first and reported it.
+            return Ok(ended.then(|| failed(None)));
         };
         let reason = format!(
             "retry {runs} of {} after exit {exit_code}",
@@ -1399,6 +1591,30 @@ impl AutomationEngine {
             }
         });
     }
+}
+
+/// Each fire in the ledger at `path` whose run's exit could not be
+/// recovered, newest first, as `(slug, what to say of it)`: `wt doctor`
+/// lists them until the ledger forgets the fire.
+pub async fn unknown_outcomes(path: &std::path::Path) -> Result<Vec<(String, String)>> {
+    let snapshot = AutomationLedger::new(path)
+        .snapshot()
+        .await
+        .context("read automation ledger")?;
+    Ok(snapshot
+        .unknown_outcomes()
+        .into_iter()
+        .map(|record| {
+            let reason = record.reason.unwrap_or_default();
+            (
+                record.slug,
+                format!(
+                    "{}: outcome unknown, not run again: {reason}",
+                    record.rule_id
+                ),
+            )
+        })
+        .collect())
 }
 
 /// A prompt into the worktree's own session that no rule asked for: a
@@ -3409,6 +3625,214 @@ mod tests {
         let after = engine.tick(pass(start + 2)).await.unwrap();
         assert!(after.claims.is_empty());
         assert_eq!(engine.pending_count(), 0);
+    }
+
+    /// The process that launched a run may quit before the run ends. The
+    /// next one awaits it again and acts on the exit its record shows; a
+    /// run whose exit cannot be recovered is ended as unknown, told once
+    /// and never run again.
+    #[tokio::test]
+    async fn a_run_that_outlives_its_engine_is_settled_by_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [AutomationDef {
+            on: AutomationTrigger::WtMerged,
+            ..rule("tracker", 0.0)
+        }];
+        let rows = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        let mut context = AutomationEvalContext::default();
+        context.actions.insert(
+            "tracker".into(),
+            wt_automations::ActionTraits {
+                shell: true,
+                external: false,
+                audience: wt_automations::ActionAudience::None,
+                retry_on_failure: true,
+            },
+        );
+        let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+        let (quiescence, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let cancel = CancellationToken::new();
+        let launched = AutomationOutcome::Delivered {
+            slot: DeliverySlot::Headless,
+        };
+        let failed = RunEnd::ShellFailed { exit_code: 7 };
+        let mut at = now_ms();
+        let pass = |at| {
+            input(
+                &rules,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+        let tick = engine.tick(pass(at)).await.unwrap();
+        let claim = tick.claims.first().unwrap().clone();
+        let keys = claim.fire().fire_keys.clone();
+        engine.finish(&claim, launched.clone(), at).await.unwrap();
+
+        // A new process awaits the run again. While its record shows it
+        // running it is not lost.
+        let mut next = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert!(!next.awaits_runs());
+        assert_eq!(next.restore_awaited(at + 1).await.unwrap(), 1);
+        assert_eq!(next.restore_awaited(at + 1).await.unwrap(), 0);
+        next.end_lost_runs(&[(keys.clone(), at)], at + 1, &cancel)
+            .await
+            .unwrap();
+        assert!(next.awaits_runs());
+        // The record then shows a definite failure: the fire is retried,
+        // by one process only.
+        let report = next
+            .run_ended(&keys, at, failed, at + 1, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (report.runs, report.retry_in_ms),
+            (1, Some(RUN_RETRY_DELAYS_MS[0]))
+        );
+        assert_eq!(
+            engine
+                .run_ended(&keys, at, failed, at + 1, &cancel)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(ledger.awaited().await.unwrap().is_empty());
+        assert_eq!(ledger.deferred().await.unwrap().len(), 1);
+
+        // The retry is launched, and that process quits too. Nothing is
+        // left of the run: it may have succeeded, so it is not run again.
+        at += 1 + RUN_RETRY_DELAYS_MS[0].max(DEFER_RETRY_MS);
+        let tick = next.tick(pass(at)).await.unwrap();
+        let claim = tick.claims.first().unwrap().clone();
+        next.finish(&claim, launched.clone(), at).await.unwrap();
+        let mut third = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert_eq!(third.restore_awaited(at + 1).await.unwrap(), 1);
+        third.end_lost_runs(&[], at + 1, &cancel).await.unwrap();
+        assert!(!third.awaits_runs());
+        assert_eq!(
+            third.take_unknown_runs(),
+            [UnknownRun {
+                slug: "worktree".into(),
+                rule: "test".into(),
+                reason: RUN_RECORD_MISSING.into(),
+            }]
+        );
+        assert!(third.take_unknown_runs().is_empty());
+        let snapshot = ledger.snapshot().await.unwrap();
+        let unknown = snapshot.unknown_outcomes();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(
+            (unknown[0].state.as_str(), unknown[0].reason.as_deref()),
+            ("delivered", Some(RUN_RECORD_MISSING))
+        );
+        assert!(snapshot.has_handled(&keys[0], at + 2));
+        assert!(ledger.awaited().await.unwrap().is_empty());
+        // The outcome is final for every process: a failure read later
+        // neither retries the fire nor reports it again.
+        assert_eq!(
+            next.run_ended(&keys, at, failed, at + 2, &cancel)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(ledger.deferred().await.unwrap().is_empty());
+        let mut fourth = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert_eq!(fourth.restore_awaited(at + 2).await.unwrap(), 0);
+        assert_eq!(fourth.restore_deferred(at + 2).await.unwrap(), 0);
+        let after = fourth.tick(pass(at + 3)).await.unwrap();
+        assert!(after.claims.is_empty());
+        assert_eq!(fourth.pending_count(), 0);
+    }
+
+    /// A run whose worker died before recording an exit code may have
+    /// succeeded. With `retry_on_failure` that is told once and the fire
+    /// is not run again; without it the fire simply stays delivered, as
+    /// does a run that ended any other way.
+    #[tokio::test]
+    async fn a_run_without_a_recorded_exit_is_unknown_and_not_retried() {
+        for retry_on_failure in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+            let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+            let rules = [AutomationDef {
+                on: AutomationTrigger::WtMerged,
+                ..rule("tracker", 0.0)
+            }];
+            let rows = [AutomationRow {
+                local_merged: Some(true),
+                clean_candidate: true,
+                ..row()
+            }];
+            let mut context = AutomationEvalContext::default();
+            context.actions.insert(
+                "tracker".into(),
+                wt_automations::ActionTraits {
+                    shell: true,
+                    external: false,
+                    audience: wt_automations::ActionAudience::None,
+                    retry_on_failure,
+                },
+            );
+            let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+            let (quiescence, activity) = (BTreeMap::new(), RuntimeActivity::default());
+            let cancel = CancellationToken::new();
+            let at = now_ms();
+            let pass = |at| {
+                input(
+                    &rules,
+                    &rows,
+                    &context,
+                    &requirements,
+                    &quiescence,
+                    &activity,
+                    at,
+                )
+            };
+            let tick = engine.tick(pass(at)).await.unwrap();
+            let claim = tick.claims.first().unwrap().clone();
+            let keys = claim.fire().fire_keys.clone();
+            let launched = AutomationOutcome::Delivered {
+                slot: DeliverySlot::Headless,
+            };
+            engine.finish(&claim, launched, at).await.unwrap();
+            assert_eq!(ledger.awaited().await.unwrap().len(), 1);
+            assert_eq!(
+                engine
+                    .run_ended(&keys, at, RunEnd::ShellUnknown, at + 1, &cancel)
+                    .await
+                    .unwrap(),
+                None
+            );
+            let told = engine.take_unknown_runs();
+            assert_eq!(told.len(), usize::from(retry_on_failure));
+            if let Some(told) = told.first() {
+                assert_eq!(told.reason, RUN_EXIT_UNRECORDED);
+            }
+            let snapshot = ledger.snapshot().await.unwrap();
+            assert_eq!(
+                snapshot.unknown_outcomes().len(),
+                usize::from(retry_on_failure)
+            );
+            assert!(snapshot.has_handled(&keys[0], at + 2));
+            assert!(ledger.awaited().await.unwrap().is_empty());
+            assert!(ledger.deferred().await.unwrap().is_empty());
+            // Nothing is left for a later process to settle or run.
+            let mut next = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+            assert_eq!(next.restore_awaited(at + 2).await.unwrap(), 0);
+            let after = next.tick(pass(at + 2)).await.unwrap();
+            assert!(after.claims.is_empty());
+        }
     }
 
     /// A run that succeeded, was killed, or is not a shell command leaves

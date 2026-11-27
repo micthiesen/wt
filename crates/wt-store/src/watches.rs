@@ -181,6 +181,7 @@ impl Store {
             });
             let changed = !removed.is_empty();
             let cancelled: Vec<Watch> = removed.iter().filter_map(read).collect();
+            crate::owed::forget_kept(state, cancelled.iter().map(|watch| watch.id.as_str()));
             log.best_effort(|log| {
                 cancelled
                     .iter()
@@ -211,6 +212,7 @@ impl Store {
                     && text(entry, "by") == Some(by)
             });
             let cancelled = removed.first().and_then(read);
+            crate::owed::forget_kept(state, cancelled.iter().map(|watch| watch.id.as_str()));
             log.best_effort(|log| match &cancelled {
                 Some(watch) => record(log, watch, WatchChange::Cancelled, None, None),
                 None => Ok(()),
@@ -273,7 +275,8 @@ impl Store {
     /// until it is closed with [`Self::close_owed`]. The wake leaves the
     /// watch and the step is stored in one transaction, so no crash loses
     /// both, and a second call finds nothing owed. A wake delivered before
-    /// landing closes here, as coordination always has.
+    /// landing closes here, as coordination always has, unless it is what
+    /// an earlier pull request's check became ([`Watch::owed_on_delivery`]).
     ///
     /// `unconfirmed` is a wake sent without proof it reached the session;
     /// it is not sent again and the step and its history say so. `now_ms`
@@ -285,8 +288,7 @@ impl Store {
         unconfirmed: bool,
         now_ms: i64,
     ) -> Result<WakeCompletion, StoreError> {
-        let due = landing.owes().then_some(now_ms);
-        self.finish_action(id, WatchAction::Wake, unconfirmed, due)
+        self.finish_action(id, WatchAction::Wake, unconfirmed, Some((landing, now_ms)))
     }
 
     fn finish_action(
@@ -294,7 +296,7 @@ impl Store {
         id: &str,
         action: WatchAction,
         unconfirmed: bool,
-        due_at_ms: Option<i64>,
+        delivered: Option<(OwnerLanding, i64)>,
     ) -> Result<WakeCompletion, StoreError> {
         self.mutate_wt_state_logged(|state, log| {
             let Some(index) = entries(state)
@@ -306,6 +308,15 @@ impl Store {
             let Some(mut watch) = read(&entries(state)[index]) else {
                 return Ok((WakeCompletion::NotOwed, false));
             };
+            // An earlier pull request's check stays owed wherever the
+            // worktree's current work stands.
+            // It has been due since its check was, where that was seen.
+            let due_at_ms = delivered
+                .filter(|(landing, _)| landing.owes() || watch.owed_on_delivery())
+                .map(|(_, now_ms)| {
+                    crate::owed::kept_due_since(state, &watch.id)
+                        .map_or(now_ms, |since| since.min(now_ms))
+                });
             // A watch that outlived its worktree has no row left to owe it.
             let step = due_at_ms
                 .filter(|_| !watch.owner_gone)
@@ -477,16 +488,56 @@ impl Store {
     }
 }
 
+/// Whether `slug` and the repository have room for `more` watches.
+pub(crate) fn room_for(state: &WtState, slug: &str, more: usize) -> Result<(), WatchRefusal> {
+    let of_slug = entries(state)
+        .iter()
+        .filter(|entry| text(entry, "slug") == Some(slug))
+        .count();
+    if of_slug + more > WATCHES_PER_SLUG_MAX {
+        return Err(WatchRefusal::TooManyForSlug {
+            slug: slug.to_owned(),
+        });
+    }
+    if entries(state).len() + more > WATCHES_MAX {
+        return Err(WatchRefusal::TooMany);
+    }
+    Ok(())
+}
+
+/// Whether `id` names a watch that still owes its wake.
+pub(crate) fn wake_pending(state: &WtState, id: &str) -> bool {
+    entries(state)
+        .iter()
+        .filter(|entry| text(entry, "id") == Some(id))
+        // One this build cannot read is still someone's pending watch.
+        .any(|entry| read(entry).is_none_or(|watch| watch.then.wake.is_some()))
+}
+
 /// Add a watch to `state` after every check [`Store::add_watch`] makes; the
 /// one place a watch is created. `seen` is the incarnation a menu showed,
 /// when the watch comes from one. Nothing is written when it refuses.
 pub(crate) fn insert_watch(
     state: &mut WtState,
     log: &EventLog<'_>,
+    new: NewWatch,
+    now_ms: i64,
+    seen: Option<Option<&str>>,
+    candidates: &[String],
+) -> Result<Result<Watch, WatchRefusal>, StoreError> {
+    insert_watch_marked(state, log, new, now_ms, seen, candidates, false)
+}
+
+/// [`insert_watch`] for a wake that stays owed once delivered whatever its
+/// worktree has landed; see [`Watch::owed_on_delivery`].
+pub(crate) fn insert_watch_marked(
+    state: &mut WtState,
+    log: &EventLog<'_>,
     mut new: NewWatch,
     now_ms: i64,
     seen: Option<Option<&str>>,
     candidates: &[String],
+    owed_on_delivery: bool,
 ) -> Result<Result<Watch, WatchRefusal>, StoreError> {
     let refuse = |refusal| Ok(Err(refusal));
     if new.when.is_empty() {
@@ -571,6 +622,7 @@ pub(crate) fn insert_watch(
         extra: Map::new(),
     };
     watch.set_before_release(new.before_release);
+    watch.set_owed_on_delivery(owed_on_delivery);
     let replaced = remove_where(state, &replaces);
     entries_mut(state).push(serde_json::to_value(&watch)?);
     log.best_effort(|log| {

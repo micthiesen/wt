@@ -52,7 +52,7 @@ async fn select_rows(
             .collect::<Heads>()
     };
     if wanted.is_empty() {
-        let mut rows = ctx.repository.inventory_status(&ctx.cancellation).await?;
+        let mut rows = wt_ops::worktree_facts::inventory_status(ctx).await?;
         rows.retain(|row| !row.worktree.is_main);
         let heads = heads(&mut rows.iter().map(|row| &row.worktree));
         return Ok(Ok((rows, heads)));
@@ -177,16 +177,16 @@ struct Fleet {
 
 /// What the report says of a snapshot it showed in place of a GitHub read.
 #[derive(Clone, Debug)]
-struct PrSnapshot {
+pub(super) struct PrSnapshot {
     age_ms: u64,
     /// Why data older than the board would use was shown.
-    held: Option<String>,
+    pub(super) held: Option<String>,
 }
 
-/// PR data for the report, which only displays it: the events daemon's
+/// PR data for a report that only displays it: the events daemon's
 /// snapshot while it covers every branch and is fresh or held back by
 /// GitHub's budget (the rule `wt ls` follows), else one batched GitHub read.
-async fn pull_requests(
+pub(super) async fn pull_requests(
     ctx: &AppContext,
     branches: &[String],
 ) -> (
@@ -409,6 +409,7 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
             "merge_state":merge_field(pr.merge_state_status.as_deref(), &pr.state),
             "mergeable":merge_field(pr.mergeable.as_deref(), &pr.state),
             "unresolved_threads":pr.unresolved_threads_total,"unresolved_human_threads":pr.unresolved_threads,
+            "unresolved_threads_more":pr.unresolved_threads_more,
             "review_bot":pr.review_bot.as_ref().map(|status| json!({"state":status.state,"unresolved":status.unresolved,"stale":status.stale.unwrap_or(false)})),
         }));
         let pr_queue = queue
@@ -476,11 +477,11 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
         println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
         println!(
-            "SLUG                 BRANCH                         WORK       AGENT   DIRTY    PR"
+            "SLUG                 BRANCH                         WORK          AGENT   DIRTY    PR"
         );
         for row in &reports {
             println!(
-                "{:<20} {:<30} {:<10} {:<7} {:<8} {}",
+                "{:<20} {:<30} {:<13} {:<7} {:<8} {}",
                 row["slug"].as_str().unwrap_or("?"),
                 row["branch"].as_str().unwrap_or("?"),
                 work_label(row),
