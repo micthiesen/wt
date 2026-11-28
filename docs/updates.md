@@ -151,7 +151,9 @@ run's complete checks, so a failure publishes nothing. If the tag run fails,
 fix forward on `main`, delete the unpublished tag (`git push --delete origin
 vX.Y.Z`), and tag the fixed commit with the same version. A flaky check can be
 re-run on the same run. `workflow_dispatch` with `publish=false` remains for
-validating a branch without publishing.
+validating a branch without publishing; dispatched on `main`, its publish job
+prints the draft notes for the next stable release in its log and its run
+summary.
 
 ## Durable application data
 

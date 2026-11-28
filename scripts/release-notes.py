@@ -234,11 +234,13 @@ def main() -> int:
                   file=sys.stderr)
     result = shown if stable else empty
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    if args.summary:
-        heading = f"wt {args.release}" if stable else "Draft notes for the next stable release"
-        if shown["title"]:
-            heading += f": {shown['title']}"
-        if shown["notes"]:
+    heading = f"wt {args.release}" if stable else "Draft notes for the next stable release"
+    if shown["title"]:
+        heading += f": {shown['title']}"
+    if shown["notes"]:
+        # The job log too: a run's summary page cannot be read through the API.
+        print(f"## {heading}\n\n{shown['notes']}")
+        if args.summary:
             with args.summary.open("a") as summary:
                 summary.write(f"## {heading}\n\n{shown['notes']}\n")
     return 0
