@@ -75,17 +75,21 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
     let (state, removed) = stored?;
     let locks = collect_operation_locks(ctx, &live).await?;
     if args.json {
-        let remote_url = run_git(
-            ctx,
-            &ctx.config.paths.main_clone,
-            ["remote", "get-url", "origin"],
-        )
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-        let pushes = collect_push_facts(ctx, &live, &state).await?;
-        let dev = collect_dev_status(ctx, &live).await?;
+        let (remote_url, pushes, dev) = tokio::join!(
+            run_git(
+                ctx,
+                &ctx.config.paths.main_clone,
+                ["remote", "get-url", "origin"],
+            ),
+            collect_push_facts(ctx, &live, &state),
+            collect_dev_status(ctx, &live),
+        );
+        let remote_url = remote_url
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let pushes = pushes?;
+        let dev = dev?;
         let records = live
             .iter()
             .map(|snapshot| snapshot.worktree.clone())
