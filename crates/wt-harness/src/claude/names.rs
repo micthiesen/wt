@@ -236,8 +236,14 @@ pub fn build_claude_session_entries(
             }
         })
         .collect();
+    // The unnamed primary is listed once it has a conversation to resume. A
+    // worktree that never had a session has none: its picker offers a new
+    // one, not a dead primary.
     out.retain(|e| {
-        e.is_live || e.state != DerivedState::Idle || e.last_entry_ms.is_some() || e.name.is_none()
+        e.is_live
+            || e.state != DerivedState::Idle
+            || e.last_entry_ms.is_some()
+            || (e.name.is_none() && tails.get(&e.name).is_some_and(|tail| tail.has_jsonl))
     });
     out.sort_by(|a, b| {
         state_rank(a.state)
@@ -279,6 +285,42 @@ fn state_rank(state: DerivedState) -> u8 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// A worktree that never had a Claude session has no primary to resume:
+    /// its picker offers a new session, and its details do not change to
+    /// "idle" because someone opened the picker.
+    #[test]
+    fn a_primary_that_never_ran_is_not_listed() {
+        let path = Path::new("/worktrees/demo");
+        let entries = |tails: &HashMap<Option<String>, SessionTail>, live: &[Option<String>]| {
+            build_claude_session_entries(
+                "demo",
+                path,
+                &[],
+                live,
+                tails,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
+        };
+        assert!(entries(&HashMap::new(), &[]).is_empty());
+        let never_ran = HashMap::from([(None, SessionTail::empty(None))]);
+        assert!(entries(&never_ran, &[]).is_empty());
+        // One with a conversation is listed, running or not, and so is one
+        // that is running before it has written anything.
+        let mut resumable = SessionTail::empty(None);
+        resumable.has_jsonl = true;
+        let resumable = HashMap::from([(None, resumable)]);
+        let listed = entries(&resumable, &[]);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].name.as_deref(), listed[0].is_live),
+            (None, false)
+        );
+        let started = entries(&never_ran, &[None]);
+        assert_eq!(started.len(), 1);
+        assert!(started[0].is_live);
+    }
 
     #[test]
     fn names_mutate_atomically_without_discarding_future_fields() {

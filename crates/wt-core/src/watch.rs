@@ -1388,7 +1388,7 @@ pub struct RowFacts {
 }
 
 impl RowFacts {
-    fn get(&self, state: RowState) -> Option<bool> {
+    pub fn get(&self, state: RowState) -> Option<bool> {
         match state {
             RowState::Merged => self.merged,
             RowState::Staging => self.staging,
@@ -1442,6 +1442,94 @@ pub struct WatchFacts {
     pub releases: HashMap<VerifyStage, String>,
     /// `Ok(holds)`, or the probe's error.
     pub checks: BTreeMap<CheckKey, Result<bool, String>>,
+    /// The commit that carried a removed worktree's work onto the base
+    /// branch, by slug, where its removal record names one.
+    pub removed_landings: BTreeMap<String, String>,
+}
+
+/// Why a condition on another worktree can no longer hold: that worktree is
+/// gone, and its removal record says its work never merged, or the
+/// condition asks for something only a live worktree has. `None` for every
+/// other condition, a live worktree, and a slug with no removal record. A
+/// later worktree with the same slug is a live row and starts over.
+pub fn never_holds(cond: &WatchCondition, facts: &WatchFacts) -> Option<String> {
+    let Condition::Worktree { slug, state } = &cond.cond else {
+        return None;
+    };
+    let row = facts.rows.get(slug).filter(|row| !row.exists)?;
+    let landed = row.merged?;
+    let follows_landing = matches!(
+        state,
+        RowState::Merged | RowState::Staging | RowState::Production
+    );
+    if cond.latched {
+        return None;
+    }
+    if landed && follows_landing {
+        // A stage is followed through the commit that landed the work. A
+        // record that names none (a merge Git proved, with no pull request)
+        // leaves nothing to follow.
+        let told = *state == RowState::Merged
+            || row.get(*state) == Some(true)
+            || facts.removed_landings.contains_key(slug);
+        return (!told).then(|| {
+            format!(
+                "{slug} was removed after merging and the commit that landed it was not recorded, so whether it reached {} cannot be told",
+                state.as_str()
+            )
+        });
+    }
+    Some(if follows_landing {
+        format!(
+            "{slug} was removed without merging, so this cannot hold unless a worktree named {slug} is created again and merges"
+        )
+    } else {
+        format!(
+            "{slug} was removed and can no longer become {}",
+            state.as_str()
+        )
+    })
+}
+
+/// A condition on a worktree that is gone, read from its removal record
+/// (`row.merged` is known only where there is one). Its landing stands for
+/// good; a stage is followed through the commit that landed it.
+fn observe_removed(
+    slug: &str,
+    state: RowState,
+    row: &RowFacts,
+    next: &mut WatchCondition,
+    facts: &WatchFacts,
+    commit: impl Fn(&str, VerifyStage) -> Truth,
+) -> Truth {
+    if let Some(reason) = never_holds(next, facts) {
+        return Truth::Unknown(reason);
+    }
+    let stage = match state {
+        RowState::Staging => VerifyStage::Staging,
+        RowState::Production => VerifyStage::Production,
+        _ => {
+            return Truth::known(row.get(state), || {
+                format!("not known whether {slug} is {}", state.as_str())
+            });
+        }
+    };
+    if row.get(state) == Some(true) {
+        return Truth::Holds;
+    }
+    let Some(oid) = facts
+        .removed_landings
+        .get(slug)
+        .filter(|_| row.merged == Some(true))
+    else {
+        return Truth::Unknown(format!("not known whether {slug} is {}", state.as_str()));
+    };
+    // The landing commit says everything the removed row still could.
+    next.cond = Condition::Commit {
+        oid: oid.clone(),
+        stage,
+    };
+    commit(oid, stage)
 }
 
 /// The facts pending watches depend on that are not on the board.
@@ -1740,6 +1828,7 @@ fn observe(
         },
         Condition::Worktree { slug, state } => match facts.rows.get(&slug) {
             None => no_data(&slug),
+            Some(row) if !row.exists => observe_removed(&slug, state, row, next, facts, commit),
             Some(row) => Truth::known(row.get(state), || {
                 format!("not known whether {slug} is {}", state.as_str())
             }),

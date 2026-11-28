@@ -239,9 +239,6 @@ pub enum UiAction {
         key: String,
         seen: Seen<FailedRemovalSeen>,
     },
-    Cleanup {
-        revisions: Vec<RemovalRevision>,
-    },
     CleanupTargets {
         targets: Vec<CleanupTarget>,
     },
@@ -556,9 +553,6 @@ pub enum ConfirmAction {
     DeleteSection {
         section: String,
         seen: Seen<Vec<String>>,
-    },
-    Cleanup {
-        revisions: Vec<RemovalRevision>,
     },
     ManagedSignIn {
         provider: String,

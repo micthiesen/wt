@@ -125,7 +125,7 @@ it expires on its own:
 | fact | command |
 |---|---|
 | you changed or learned a row's state | `wt status <slug> <state> -m "<note>"` |
-| deliberately not started, because X | `wt status <slug> todo --blocked-on "X"` |
+| deliberately not started, because X | `wt status <slug> todo --blocked-on "X"` (a start gate: the status that starts the work clears it) |
 | finished but must not merge yet | `wt status <slug> ready --risk <r> --blocked-on "X"` |
 | the gate waits on something wt can observe | add `--until <condition>` (`pr:3806:production`, `wt:<slug>:merged`, `release:production`), or `wt status <slug> --until <condition>` on a gate already set; it clears itself |
 | a worker must act when something happens | `wt wake --slug <slug> <condition> -m "<what to do then>"` (after its work landed, it stays owed until the worker runs `wt done`) |

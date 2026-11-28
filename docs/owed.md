@@ -31,7 +31,10 @@ state, `waiting` or `due`.
 | `step` | anything else the worktree comes back for | `wt wake <condition>... -m "<what to do>"` | see [Delivery is not completion](#delivery-is-not-completion) |
 
 - A gate is always `waiting` and is owed only until the row's own work
-  lands: a landed row lists no gate. Its `--then` wake is part of the gate
+  lands: a landed row lists no gate. A status change keeps it. A gate
+  asserted on `todo` is a start gate, why the work has not started, and the
+  status that starts the work clears it
+  ([cli.md](cli.md#wt-status-slug-state--m-note---risk-r---blocked-on-gate---verify-in-staging-steps---verify-in-production-steps)). Its `--then` wake is part of the gate
   item until then, and a step of its own after.
 - A check is `due` once the change is deployed to its stage (the landing
   reached the stage's branch and, where the stage has a deploy probe, the

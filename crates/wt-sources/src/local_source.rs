@@ -57,7 +57,11 @@ struct GitReader {
     /// reads that confirm a change the user is waiting on.
     confirming: GitRepository,
     coverage: freshness::Coverage,
+    probe: Option<ReadProbe>,
 }
+
+/// Test seam: the slug of every checkout whose status was read, in order.
+type ReadProbe = Arc<std::sync::Mutex<Vec<String>>>;
 
 impl GitReader {
     fn repository(&self, urgent: bool) -> &GitRepository {
@@ -111,6 +115,11 @@ impl KeyedReader for GitReader {
         urgent: bool,
         cancel: CancellationToken,
     ) -> Self::Value {
+        if let Some(probe) = &self.probe
+            && let Ok(mut reads) = probe.lock()
+        {
+            reads.push(entry.target.slug().to_owned());
+        }
         match self.repository(urgent).status(&entry, &cancel).await {
             Ok(status) => (Some(status), None),
             Err(error) => (None, Some(error.to_string())),
@@ -134,6 +143,7 @@ fn start_git(
     scope: &TaskScope,
     context: &AppContext,
     coverage: freshness::Coverage,
+    probe: Option<ReadProbe>,
 ) -> LeafHandle<Vec<WorktreeSnapshot>> {
     start_keyed_source(
         scope,
@@ -148,13 +158,18 @@ fn start_git(
                 .repository
                 .with_process_class(wt_platform::process::ProcessClass::Confirming),
             coverage,
+            probe,
         },
     )
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
+    start_probed(scope, context, None)
+}
+
+fn start_probed(scope: &TaskScope, context: &AppContext, probe: Option<ReadProbe>) -> LocalSources {
     let (coverage, covering) = freshness::coverage();
-    let git = start_git(scope, context, coverage);
+    let git = start_git(scope, context, coverage, probe);
     let metadata = start_source(scope, metadata_spec(), {
         let context = context.clone();
         move |_cancel| {
@@ -1008,17 +1023,6 @@ mod tests {
                         head: String::new(),
                     }],
                 },
-                wt_tui::UiAction::Cleanup {
-                    revisions: vec![wt_tui::RemovalRevision {
-                        key: key.clone(),
-                        path: row.path.clone(),
-                        branch: String::new(),
-                        head: String::new(),
-                        digest: String::new(),
-                        hazards: Vec::new(),
-                        published_base: None,
-                    }],
-                },
             ];
             for action in actions {
                 let rows = action
@@ -1221,6 +1225,119 @@ mod tests {
             lone[lone.len() / 2]
         );
         counting.abort();
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_reads_each_checkout_once_and_a_fetch_only_the_rows_it_moved() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let caches = tempfile::tempdir().unwrap();
+        fixture.ctx.caches = wt_runtime::CacheStore::new(caches.path().to_path_buf(), "test");
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let git = move |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&main)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        // "one" tracks origin/feature/one, which a fetch is about to move.
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ]);
+        git(&["update-ref", "refs/remotes/origin/feature/one", "HEAD"]);
+        git(&["config", "branch.feature/one.remote", "origin"]);
+        git(&[
+            "config",
+            "branch.feature/one.merge",
+            "refs/heads/feature/one",
+        ]);
+        git(&["commit", "-q", "--allow-empty", "-m", "upstream moved"]);
+        let behind = |local: &LocalSources| {
+            local.git.snapshot().data().and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.worktree.target.slug() == "one")
+                    .and_then(|row| row.status.as_ref()?.behind)
+            })
+        };
+        let count = |probe: &ReadProbe, slug: &str| {
+            probe
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|read| *read == slug)
+                .count()
+        };
+
+        // A cold start: the host asks for the first load, the terminal asks
+        // again a moment later, and wt's own origin fetch lands meanwhile.
+        let probe = ReadProbe::default();
+        let scope = TaskScope::new();
+        let local = start_probed(&scope, &fixture.ctx, Some(probe.clone()));
+        local.board.refresh();
+        // What the fetch and its ref maintenance do in the main clone: move
+        // a remote-tracking ref, take and drop a lock beside it, and rewrite
+        // the config with the bytes it already had.
+        git(&["update-ref", "refs/remotes/origin/feature/one", "HEAD"]);
+        git(&["config", "branch.feature/one.remote", "origin"]);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        local.board.refresh();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(*local.git.snapshot().state(), SourceState::Ready);
+        assert_eq!(count(&probe, "main"), 1, "{:?}", probe.lock().unwrap());
+        assert_eq!(count(&probe, "two"), 1, "{:?}", probe.lock().unwrap());
+        // The row tracking the moved ref is read again only if its first
+        // read started before the ref moved; either way it shows the move.
+        assert!(
+            (1..=2).contains(&count(&probe, "one")),
+            "{:?}",
+            probe.lock().unwrap()
+        );
+        assert_eq!(behind(&local), Some(1));
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+
+        // A warm start, with the inventory restored from the cache and its
+        // checkouts watched before the first listing returns.
+        assert!(caches.path().join("git.json").exists());
+        let probe = ReadProbe::default();
+        let scope = TaskScope::new();
+        let local = start_probed(&scope, &fixture.ctx, Some(probe.clone()));
+        local.board.refresh();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        local.board.refresh();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(*local.git.snapshot().state(), SourceState::Ready);
+        for slug in ["main", "one", "two"] {
+            assert_eq!(
+                count(&probe, slug),
+                1,
+                "{slug}: {:?}",
+                probe.lock().unwrap()
+            );
+        }
+        // A later fetch that moves the ref reads the row that tracks it and
+        // no other.
+        git(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "upstream moved again",
+        ]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let before = probe.lock().unwrap().len();
+        git(&["update-ref", "refs/remotes/origin/feature/one", "HEAD"]);
+        git(&["config", "branch.feature/one.remote", "origin"]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(probe.lock().unwrap()[before..], ["one"]);
+        assert_eq!(behind(&local), Some(2));
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();
     }

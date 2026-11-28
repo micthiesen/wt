@@ -48,6 +48,16 @@ when they exist in that tree, but wt does not synchronize package installs as
 part of the native worktree lifecycle. A `.rift.toml` postcreate hook can run
 project-specific setup when required.
 
+The main clone's own packages are kept current by the origin fetch: after a
+pull that moves the main clone's HEAD and changes a lockfile, wt runs the
+install there ([architecture.md](architecture.md#external-effects-and-failures)).
+`rift create` runs under that install's lock (`main-dependency-sync` in
+`<git common dir>/wt-locks`), so the copy waits for an install in progress
+and an install waits for the copy: a clone never copies a half-installed
+package tree. wt takes the lock under the slug lock just before `rift
+create` and releases it when the create returns; a stale-registry `rift gc`
+and the retried create run inside it.
+
 ## Setup
 
 The `rift` binary must be available on the process or login-shell PATH, and the main clone must be

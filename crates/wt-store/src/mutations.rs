@@ -438,10 +438,11 @@ impl Store {
 
     pub fn clear_slug_state(&mut self, slug: &str) -> Result<bool, StoreError> {
         self.mutate_wt_state(|state| {
-            let slugs = object_mut(state, "slugs");
-            if slugs.remove(slug).is_none() {
+            if state["slugs"].get(slug).is_none() {
                 return Ok((false, false));
             }
+            release_followers(state, slug);
+            object_mut(state, "slugs").remove(slug);
             Ok((true, true))
         })
     }
@@ -453,6 +454,9 @@ impl Store {
         at_top: bool,
     ) -> Result<(), StoreError> {
         self.mutate_wt_state(|state| {
+            if stored_section(state, slug) != section {
+                release_followers(state, slug);
+            }
             if let Some(section) = section {
                 ensure_section(state, section);
             }
@@ -490,6 +494,9 @@ impl Store {
             return self.place_slug(key, section, false);
         }
         self.mutate_wt_state(|state| {
+            if stored_section(state, key) != section {
+                release_followers(state, key);
+            }
             if let Some(section) = section {
                 ensure_section(state, section);
             }
@@ -778,18 +785,20 @@ impl Store {
         past: &str,
     ) -> Result<Result<(), LayoutChanged>, StoreError> {
         self.mutate_wt_state(|state| {
-            let at = |key: &str| shown.drawn.iter().position(|drawn| drawn.key == key);
+            let drawn = as_stored(state, shown.drawn);
+            let at = |key: &str| drawn.iter().position(|drawn| drawn.key == key);
             let (Some(unit_at), Some(past_at)) = (at(unit), at(past)) else {
                 return Ok((Err(LayoutChanged::Filed(unit.to_owned())), false));
             };
-            if let Err(changed) = check_shown(state, &shown, shown.drawn[unit_at].band) {
+            let band = drawn[unit_at].band;
+            if let Err(changed) = check_shown(state, shown.name, &drawn, band) {
                 return Ok((Err(changed), false));
             }
             if unit_at == past_at {
                 return Ok((Ok(()), false));
             }
             // The section as it is drawn once the unit has passed.
-            let mut after: Vec<&ShownUnit> = shown.drawn.iter().collect();
+            let mut after: Vec<&ShownUnit> = drawn.iter().collect();
             let moved = after.remove(unit_at);
             let behind = usize::from(unit_at < past_at);
             let past_now = after
@@ -799,14 +808,14 @@ impl Store {
             after.insert(past_now + behind, moved);
             // A unit at its creation position has no order to exchange: the
             // anchors restated below are what carries the move.
-            if !shown.drawn[unit_at].anchored && !shown.drawn[past_at].anchored {
+            if !drawn[unit_at].anchored && !drawn[past_at].anchored {
                 let placed: Vec<&ShownUnit> = after
                     .iter()
                     .copied()
                     .filter(|drawn| !drawn.anchored)
                     .collect();
                 if !trade_orders(state, &placed, unit, past) {
-                    let sequence = manual_order(state, &placed, Some(unit));
+                    let sequence = manual_order(state, &placed, band, Some(unit));
                     let sequence = with_unlisted(state, shown.name, sequence, Some(unit));
                     write_sequence(state, shown.name, &sequence);
                 }
@@ -843,16 +852,16 @@ impl Store {
             {
                 return Ok((Err(LayoutChanged::Section(name.to_owned())), false));
             }
-            let Some(band) = from
-                .drawn
+            let (leaving, entering) = (as_stored(state, from.drawn), as_stored(state, to.drawn));
+            let Some(band) = leaving
                 .iter()
                 .find(|drawn| drawn.key == unit)
                 .map(|drawn| drawn.band)
             else {
                 return Ok((Err(LayoutChanged::Filed(unit.to_owned())), false));
             };
-            if let Err(changed) =
-                check_shown(state, &from, band).and_then(|()| check_shown(state, &to, band))
+            if let Err(changed) = check_shown(state, from.name, &leaving, band)
+                .and_then(|()| check_shown(state, to.name, &entering, band))
             {
                 return Ok((Err(changed), false));
             }
@@ -863,15 +872,18 @@ impl Store {
             // and may change the band it is drawn in. Read before the rows
             // arrive, so they are not taken for rows filed there.
             let numbered = (at_top
-                && to
-                    .drawn
+                && entering
                     .iter()
                     .any(|drawn| !drawn.anchored && stored_order(state, &drawn.key).is_none()))
             .then(|| {
                 let placed: Vec<&ShownUnit> =
-                    to.drawn.iter().filter(|drawn| !drawn.anchored).collect();
-                let mut sequence =
-                    with_unlisted(state, to.name, manual_order(state, &placed, None), None);
+                    entering.iter().filter(|drawn| !drawn.anchored).collect();
+                let mut sequence = with_unlisted(
+                    state,
+                    to.name,
+                    manual_order(state, &placed, band, None),
+                    None,
+                );
                 sequence.retain(|placed| placed != unit);
                 sequence.insert(0, unit.to_owned());
                 sequence
@@ -888,11 +900,8 @@ impl Store {
             // drawn before it, which may be the one that left. Where the
             // caller lists it as any other unit (manual sort), it takes an
             // order with the rest of its section instead.
-            let staying: Vec<&ShownUnit> = from
-                .drawn
-                .iter()
-                .filter(|drawn| drawn.key != unit)
-                .collect();
+            let staying: Vec<&ShownUnit> =
+                leaving.iter().filter(|drawn| drawn.key != unit).collect();
             if staying.iter().any(|drawn| {
                 !drawn.anchored
                     && stored_order(state, &drawn.key).is_none()
@@ -905,8 +914,8 @@ impl Store {
                     .copied()
                     .filter(|drawn| !drawn.anchored)
                     .collect();
-                let sequence =
-                    with_unlisted(state, from.name, manual_order(state, &placed, None), None);
+                let sequence = manual_order(state, &placed, band, None);
+                let sequence = with_unlisted(state, from.name, sequence, None);
                 write_sequence(state, from.name, &sequence);
             }
             restate_anchors(state, &staying);
@@ -1002,7 +1011,13 @@ impl Store {
             if !changed {
                 return Ok((false, false));
             }
-            let kept = slugs
+            for gone in slugs.keys().filter(|slug| !live_slugs.contains(*slug)) {
+                release_followers(state, gone);
+            }
+            let kept = state["slugs"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default()
                 .into_iter()
                 .filter(|(slug, _)| live_slugs.contains(slug))
                 .collect::<Map<_, _>>();
@@ -1033,6 +1048,10 @@ impl Store {
             if stale.is_empty() {
                 return Ok((false, false));
             }
+            for key in &stale {
+                release_followers(state, key);
+            }
+            let layouts = object_mut(state, "remoteLayouts");
             for key in stale {
                 layouts.remove(&key);
             }
@@ -2467,7 +2486,16 @@ fn remove_section_from(state: &mut WtState, name: &str) -> (usize, bool) {
         return (0, false);
     }
     let mut order = max_layout_order(state, None).map_or(0.0, |max| max + 1.0);
-    for (is_remote, key, _) in local.iter().chain(remote.iter()) {
+    // In the order they had in the section: a row never ordered first.
+    let mut rows: Vec<_> = local.iter().chain(remote.iter()).collect();
+    rows.sort_by(|a, b| {
+        let (a, b) = (stored_order(state, &a.1), stored_order(state, &b.1));
+        match (a, b) {
+            (Some(a), Some(b)) => a.total_cmp(&b),
+            (a, b) => a.is_some().cmp(&b.is_some()),
+        }
+    });
+    for (is_remote, key, _) in rows {
         let collection = if *is_remote { "remoteLayouts" } else { "slugs" };
         if let Some(layout) = state
             .get_mut(collection)
@@ -2476,6 +2504,13 @@ fn remove_section_from(state: &mut WtState, name: &str) -> (usize, bool) {
             .and_then(Value::as_object_mut)
         {
             layout.insert("section".to_owned(), Value::Null);
+            // A row at its creation position goes on following the row it
+            // was created after, which moves with it.
+            if layout.contains_key("creationAfter")
+                && !layout.get("order").is_some_and(Value::is_number)
+            {
+                continue;
+            }
             layout.insert("order".to_owned(), number(order));
             order += 1.0;
         }
@@ -2506,6 +2541,7 @@ pub(crate) fn move_to_section(
         if layout.get("section").and_then(Value::as_str) == section {
             continue;
         }
+        release_followers(state, key);
         if let Some(section) = section {
             ensure_section(state, section);
         }
@@ -2611,9 +2647,6 @@ pub enum LayoutChanged {
     Order(String, String),
     /// This named section is no longer stored.
     Section(String),
-    /// This row was shown at its creation position and has since been
-    /// given a stored order.
-    Ordered(String),
 }
 
 fn layout_collection(key: &str) -> &'static str {
@@ -2665,8 +2698,22 @@ pub struct ShownUnit {
     pub band: u8,
     /// Drawn behind the unit it was created after instead of by its band
     /// and order. A reorder leaves it without an order and restates which
-    /// unit it follows.
+    /// unit it follows. The caller's board can be behind a write that gave
+    /// the unit an order, and then it is drawn by that.
     pub anchored: bool,
+}
+
+/// The units shown with what the store knows better than the board that
+/// listed them: a unit with a stored order is drawn by it, whatever the
+/// board still showed of its creation.
+fn as_stored(state: &Value, drawn: &[ShownUnit]) -> Vec<ShownUnit> {
+    drawn
+        .iter()
+        .map(|drawn| ShownUnit {
+            anchored: drawn.anchored && stored_order(state, &drawn.key).is_none(),
+            ..drawn.clone()
+        })
+        .collect()
 }
 
 /// A section as its caller was shown it.
@@ -2679,30 +2726,26 @@ pub struct ShownSection<'a> {
 }
 
 /// Whether the stored layout of a section is the one shown: every unit
-/// drawn is filed in it, none shown at its creation position has been given
-/// an order since, and the stored orders of the units of `band` do not
-/// fall along the order they were drawn in. Other bands are not compared: a
-/// press moves within one, and a status that changed since the look would
-/// refuse it for rows it does not touch. A unit never ordered is drawn by
-/// what the store does not hold (its stack), so its place is not compared.
-fn check_shown(state: &Value, shown: &ShownSection<'_>, band: u8) -> Result<(), LayoutChanged> {
-    if let Some(moved) = shown
-        .drawn
+/// drawn is filed in it, and the stored orders of the units of `band` do
+/// not fall along the order they were drawn in. Other bands are not
+/// compared: a press moves within one, and a status that changed since the
+/// look would refuse it for rows it does not touch. A unit never ordered is
+/// drawn by what the store does not hold (its stack), so its place is not
+/// compared.
+fn check_shown(
+    state: &Value,
+    name: Option<&str>,
+    drawn: &[ShownUnit],
+    band: u8,
+) -> Result<(), LayoutChanged> {
+    if let Some(moved) = drawn
         .iter()
-        .find(|drawn| stored_section(state, &drawn.key) != shown.name)
+        .find(|drawn| stored_section(state, &drawn.key) != name)
     {
         return Err(LayoutChanged::Filed(moved.key.clone()));
     }
-    if let Some(placed) = shown
-        .drawn
-        .iter()
-        .find(|drawn| drawn.anchored && stored_order(state, &drawn.key).is_some())
-    {
-        return Err(LayoutChanged::Ordered(placed.key.clone()));
-    }
     let mut last: Option<(f64, &String)> = None;
-    for drawn in shown
-        .drawn
+    for drawn in drawn
         .iter()
         .filter(|drawn| drawn.band == band && !drawn.anchored)
     {
@@ -2746,14 +2789,21 @@ fn trade_orders(state: &mut Value, placed: &[&ShownUnit], unit: &str, past: &str
     }
 }
 
-/// One manual order for every unit of `placed`, which lists them as they
-/// are to be drawn. The board draws each band by stored order, so numbering
-/// the result draws exactly `placed`: within a band it keeps their order.
-/// Across bands, which the board never draws against each other, it keeps
-/// the stored orders: a unit never ordered, and `moved`, whose stored order
-/// is the place it left, go where the ordered unit next to them in their
-/// band goes.
-fn manual_order(state: &Value, placed: &[&ShownUnit], moved: Option<&str>) -> Vec<String> {
+/// One manual order for every unit of `placed`. The units of `band`, the
+/// one the press is in and the one compared with the store, keep the order
+/// they are listed in, which is how they are to be drawn. The other bands
+/// were not compared: a status may have changed since the caller looked, or
+/// another writer reordered them. They keep their stored order, with a unit
+/// never ordered first, as the board draws it. Across bands, which the
+/// board never draws against each other, the stored orders decide: a unit
+/// never ordered, and `moved`, whose stored order is the place it left, go
+/// where the ordered unit next to them in their band goes.
+fn manual_order(
+    state: &Value,
+    placed: &[&ShownUnit],
+    band: u8,
+    moved: Option<&str>,
+) -> Vec<String> {
     let mut bands: std::collections::BTreeMap<u8, Vec<(&str, Option<f64>)>> = Default::default();
     for drawn in placed {
         let order = stored_order(state, &drawn.key).filter(|_| moved != Some(drawn.key.as_str()));
@@ -2761,6 +2811,12 @@ fn manual_order(state: &Value, placed: &[&ShownUnit], moved: Option<&str>) -> Ve
             .entry(drawn.band)
             .or_default()
             .push((drawn.key.as_str(), order));
+    }
+    for (_, units) in bands.iter_mut().filter(|(other, _)| **other != band) {
+        units.sort_by(|a, b| match (a.1, b.1) {
+            (Some(a), Some(b)) => a.total_cmp(&b),
+            (a, b) => a.is_some().cmp(&b.is_some()),
+        });
     }
     // Each unit with the order it is merged by: its own, else that of the
     // next ordered unit of its band, else of the one before.
@@ -2802,6 +2858,57 @@ fn manual_order(state: &Value, placed: &[&ShownUnit], moved: Option<&str>) -> Ve
     sequence
 }
 
+/// Where the row a new row was created after used to be, kept on the new
+/// row once that row has left their section.
+const CREATION_SLOT: &str = "creationSlot";
+
+/// Call before `leaving` leaves its section or is forgotten. A row created
+/// from the board and never ordered is drawn behind the row it was created
+/// after. With that row gone it would be drawn first in the section, so
+/// each such row takes what says where the leaving row was: the row that
+/// one follows in turn, or its stored order, behind which the board then
+/// draws the follower.
+fn release_followers(state: &mut Value, leaving: &str) {
+    let section = stored_section(state, leaving).map(str::to_owned);
+    let left = state[layout_collection(leaving)][leaving].clone();
+    let followers: Vec<String> = ["slugs", "remoteLayouts"]
+        .into_iter()
+        .filter_map(|collection| Some((collection, state[collection].as_object()?)))
+        .flat_map(|(collection, layouts)| {
+            layouts
+                .iter()
+                .filter(move |(key, _)| layout_collection(key) == collection)
+        })
+        .filter(|(key, layout)| {
+            key.as_str() != leaving
+                && layout["creationAfter"].as_str() == Some(leaving)
+                && !layout["order"].is_number()
+        })
+        .map(|(key, _)| key.clone())
+        .filter(|key| stored_section(state, key).map(str::to_owned) == section)
+        .collect();
+    for follower in followers {
+        let collection = layout_collection(&follower);
+        let Some(mut entry) = state[collection][&follower].as_object().cloned() else {
+            continue;
+        };
+        if left["order"].is_number() || left.get("creationAfter").is_none() {
+            entry.insert(
+                CREATION_SLOT.to_owned(),
+                json!({ "order": left["order"].as_f64(), "key": leaving }),
+            );
+        } else {
+            // The row that left was at its creation position itself.
+            entry.insert("creationAfter".to_owned(), left["creationAfter"].clone());
+            match left.get(CREATION_SLOT) {
+                Some(slot) => entry.insert(CREATION_SLOT.to_owned(), slot.clone()),
+                None => entry.remove(CREATION_SLOT),
+            };
+        }
+        object_mut(state, collection).insert(follower, Value::Object(entry));
+    }
+}
+
 /// Store, for each unit drawn at its creation position, the unit it is
 /// drawn behind in `drawn`; the first of a section follows none.
 fn restate_anchors(state: &mut Value, drawn: &[&ShownUnit]) {
@@ -2818,6 +2925,7 @@ fn restate_anchors(state: &mut Value, drawn: &[&ShownUnit]) {
             .cloned()
             .unwrap_or_default();
         entry.insert("creationAfter".to_owned(), after);
+        entry.remove(CREATION_SLOT);
         object_mut(state, collection).insert(unit.key.clone(), Value::Object(entry));
     }
 }
@@ -3251,6 +3359,13 @@ pub(crate) fn log_status(
     }
 }
 
+/// The key under which a status record keeps where its gate was asserted:
+/// `{"state": <the state then>, "gate": <the gate's text>}`. Written beside
+/// `blockedOn` by every build that knows it; a build that does not may
+/// rewrite or clear `blockedOn` and leave this behind, which is why it
+/// names the gate it is about and counts only while that is the gate set.
+pub const GATE_ORIGIN: &str = "blockedOnState";
+
 /// wt clears `slug`'s merge gate, keeping everything else of its status.
 pub(crate) fn clear_gate(
     state: &mut WtState,
@@ -3262,6 +3377,7 @@ pub(crate) fn clear_gate(
     };
     let mut next = previous.clone();
     next.blocked_on = None;
+    next.extra.remove(GATE_ORIGIN);
     if write_work_status(state, slug, Some(&previous), Some(&next))?.changed {
         log.best_effort(|log| {
             log_incarnation(log, state, slug)?;
@@ -3318,6 +3434,8 @@ pub(crate) fn write_work_status(
                 "verifyIn",
                 "checks",
                 "checksMirror",
+                // The writer's to keep or drop with the gate it is about.
+                GATE_ORIGIN,
             ],
         );
         entry.insert("work".to_owned(), next_work);

@@ -534,7 +534,7 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::Create { .. } | A::CreateResolved { .. } => "create worktree",
         A::Remove { .. } => "remove worktree",
         A::DismissFailedRemoval { .. } => "dismiss failed removal",
-        A::Cleanup { .. } | A::CleanupTargets { .. } => "clean worktrees",
+        A::CleanupTargets { .. } => "clean worktrees",
         A::PrepareCreate { .. } => "prepare worktree creation",
         A::PrepareRemove { .. } => "prepare worktree removal",
         A::PrepareGithub { .. } => "prepare GitHub action",
@@ -668,7 +668,7 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::StopSession { selection }
         | A::KillSession { selection } => selection.key.clone()?,
         A::CreateResolved { plan } => plan.key.clone(),
-        A::Cleanup { .. } | A::CleanupTargets { .. } => {
+        A::CleanupTargets { .. } => {
             return cleanup_target_summary(action);
         }
         A::ReviewCheckout { branch, .. } | A::PrepareReviewCheckout { branch, .. } => {
@@ -2350,7 +2350,7 @@ mod tests {
     #[test]
     fn cleanup_owns_only_the_checkouts_it_removes() {
         assert_eq!(
-            lane_for(&UiAction::Cleanup { revisions: vec![] }).unwrap(),
+            lane_for(&UiAction::CleanupTargets { targets: vec![] }).unwrap(),
             Lane::FleetCleanup(BTreeSet::new())
         );
     }
@@ -2649,25 +2649,19 @@ mod tests {
 
     #[test]
     fn fleet_cleanup_lane_owns_exactly_its_local_and_remote_targets() {
-        let action = UiAction::Cleanup {
-            revisions: vec![
-                wt_tui::RemovalRevision {
+        let action = UiAction::CleanupTargets {
+            targets: vec![
+                wt_tui::CleanupTarget {
                     key: "local-row".into(),
                     path: "/local/row".into(),
                     branch: "local-row".into(),
                     head: "head".into(),
-                    digest: "digest".into(),
-                    hazards: vec![],
-                    published_base: None,
                 },
-                wt_tui::RemovalRevision {
+                wt_tui::CleanupTarget {
                     key: wt_core::remote_worktree_ledger_key("builder", "remote-row"),
                     path: "/remote/row".into(),
                     branch: "remote-row".into(),
                     head: "head".into(),
-                    digest: "digest".into(),
-                    hazards: vec![],
-                    published_base: None,
                 },
             ],
         };

@@ -4,7 +4,7 @@
 
 This page explains the runtime semantics — what "fires", when, and why it won't fire twice. The native implementation keeps pure condition evaluation and the durable fire ledger in `wt-automations`, tracked action execution in `wt-actions`, and source preparation in `wt-sources` and dispatch in `wt-ops`.
 
-The native evaluator is deliberately I/O-free. Its caller supplies one source snapshot, including the per-session GitHub freshness bit, lifecycle clean-candidate evidence, local-day bucket, current pause flags, branch watermarks, and frozen template values. The durable ledger then serializes dispatch claims with a sibling file lock and atomic replacement while retaining fields it does not understand. A dispatched durable prompt whose send reply is lost becomes `ambiguous` and is never blindly replayed.
+The native evaluator is deliberately I/O-free. Its caller supplies one source snapshot, including the per-session GitHub freshness bit, lifecycle clean-candidate evidence, local-day bucket, current pause flags, branch watermarks, and frozen template values. The durable ledger then serializes dispatch claims with a sibling file lock and atomic replacement while retaining fields it does not understand. A dispatched durable prompt whose send reply is lost becomes `ambiguous` and is never blindly replayed. The file is compact JSON. Fire keys are kept for 30 days; an entry in a known ended state keeps its outcome and drops `owner`, `kind` and `breakerReserved`, which are read only for a claim still in flight.
 
 ## Level-triggered, ledger-deduped
 
@@ -178,8 +178,10 @@ or 30 when both stages have deploy probes). Configuration cannot use the id.
   wait for the manager to be idle, and while no manager session can be
   reached it is tried again every five minutes. It gives up once the manager
   has waited on a person for 5 seconds, or after 90 seconds behind another
-  message being delivered. A manager that defers one such prompt is not asked
-  about the other rows until the next look.
+  message being delivered. After a deferred prompt no other row's prompt is
+  tried for five minutes, whatever changes in the state meanwhile. Only a
+  prompt that was delivered, or that may have been submitted, marks its items
+  told.
 - **Like a wake.** It waits for the session to be idle and resumes a stopped
   one, is held (not consumed) while the worktree or everything is paused, and
   skips archived rows.
@@ -272,6 +274,7 @@ When a condition holds and its fire key is unseen, the rule creates an **intent*
 - **Settle window** (`settle_seconds`): the intent must be at least this old AND the worktree free of edits for this long. This is also your window to cancel by just… doing something in the worktree. Merge triggers, `branch.advanced` and `stage.deployed` default to 10s (a merge can't un-happen); `status.verification_due` defaults to 600s, or 30s when both stages have deploy probes; `wt.created` and the other status triggers default to 0s; everything else (`pr.merge_dropped` included: GitHub's reads lag an arming) defaults to 120s to ride out CI/review churn.
 - **Quiescence**: if the worktree has a live session that's working or asking, or an action already running, the `busy` policy decides. `queue` (default) holds the intent until things settle, while `skip` marks the fire handled and drops it. There is deliberately no "force" so automations do not collide with an active or blocked turn, regardless of harness transport.
 - **Cooldown** (`cooldown_minutes`): minimum spacing between dispatches per (rule, worktree).
+- **A slot of its class.** Running fires are counted in two budgets. At most 2 heavy fires run at once: a prompt into a worktree's session, a watch's or a due check's wake, a headless agent run, `builtin:restack`, `builtin:clean`, and any action the configuration does not define. At most 4 light fires run at once: shell actions, `builtin:notify`, `builtin:close-issue`, `builtin:delete-branch`, manager prompts (one is sent at a time), and a watch's gate clearing and notification. A light fire never waits behind an agent's turn. A fire that waits for a slot says `2 agent or stack automations already running` or `4 shell or built-in automations already running`. One fire per worktree and one restack per stack still apply.
 
 The queue event includes any remaining settle delay. A queued review or CI
 remediation normally waits two minutes before delivery; it may wait longer for
@@ -288,9 +291,16 @@ behavior because their inputs cannot change.
 The title bar shows `auto N queued` (or a paused chip), and
 [`wt automations`](cli.md#wt-automations---json) lists each queued fire with
 what it is waiting for, or says the engine is not running. The app log records
-each fire as it queues (with its first wait reason) and as it leaves the queue,
-whether dispatched or dropped because its condition cleared, so a fire that
-waited on a busy session until it was no longer needed is visible afterward.
+each fire as it queues (`automation queued`, with its first wait reason) and as
+it leaves the queue (`automation left the queue`), so a fire that waited on a
+busy session until it was no longer needed is visible afterward. Both records
+carry `engine`, `fire` (the fire's identity) and `queued_at_ms`, so each
+queued record has exactly one left record, and two fires of one rule for one
+worktree are two pairs. The left record adds `waited_ms` and `outcome`:
+`dispatched`, `held`, `dropped` (its condition cleared) or `engine stopped`.
+A clean stop logs every queued fire as left and rewrites the queue report
+empty. An `automation engine started` record ends any queued record a crashed
+engine left unpaired.
 
 Dispatch goes through the exact same paths keystrokes use (the action launcher, the clean flow, the restack flow) — automations have no special powers.
 
@@ -302,7 +312,9 @@ Dispatch goes through the exact same paths keystrokes use (the action launcher, 
 - A launched run's exit is acted on even when the wt process that launched it has quit. The delivery records the awaited run in the ledger, in the same write, and the next process to start reads it back, then looks up the run's own record (the action worker writes it, and outlives wt) among every automation run started since, however many, and treats its exit as above: a non-zero exit ends the fire as `failed`, or requeues it under `retry_on_failure` with the failed-run count carried over. The ledger decides which process acts, so two that read the same exit retry or report it once. A run still in progress is waited for as before. A run that ends more than 24 hours after launch stays `delivered` and is not reported.
 - A shell run whose exit cannot be recovered is an **unknown outcome**: its worker died before recording an exit code, or the process that launched it quit and no record of the run is left. It may have succeeded, so it is never run again. Without `retry_on_failure` the fire stays `delivered` and the action's own failure line is the report. With it, the fire is ended in the ledger as `delivered` with `unknown: true` and the reason, and is told once: one attention line (`auto <rule>: outcome unknown, not run again: its run ended without recording an exit code`, or `... no record of its run is left`), an `unconfirmed` entry in the worktree's history, and an `automation` warning in [`wt doctor`](cli.md#wt-doctor-slug) for as long as the ledger keeps the fire.
 - A failed fire is stored as `delivered` with `failed: true`, the reason and `failedRuns`, because sessions keep the build that started them and a build from before failed fires treats a state it does not know as a claim that never expires. Such a build reads the entry as delivered and handled; it also reads a pending retry as an ordinary deferred fire and runs it once more without retrying after that.
-- A builtin that proves it wrote nothing may instead **defer**: its claim is released and the same fire requeued with a later re-check (30 s, then 5 min after 10 minutes), keeping its frozen inputs and any facts it proved, so it survives its worktree's removal, restarts and pauses, and never counts toward the breaker. One attention warning is raised if it is still deferred after an hour. Only `builtin:delete-branch` defers today.
+- A builtin that proves it wrote nothing may instead **defer**: its claim is released and the same fire requeued with a later re-check (30 s, then 5 min after 10 minutes), keeping its frozen inputs and any facts it proved, so it survives its worktree's removal, restarts and pauses, and never counts toward the breaker. One attention warning is raised if it is still deferred after an hour. `builtin:delete-branch` defers this way.
+- A rule's prompt that **cannot reach its session** defers the same way: the session could not be started, its slot name is held by another harness, a person is attached to it, or the send was refused before anything was submitted. Nothing was sent, so nothing is recorded as delivered and the breaker does not count it. The fire shows in the queue as waiting for `cannot reach its session: <why>` (`cannot reach the manager: <why>` for a manager prompt) and is tried again every 30 seconds, then every 5 minutes after 10 minutes, with one attention notice after an hour. Each attempt is recorded in the worktree's history as a message that was not delivered. The deferral ends when a send succeeds or ends ambiguous, or when the fire leaves the queue.
+- A deferred fire that leaves the queue because its worktree is gone or its condition cleared takes its stored deferral with it. A deferred built-in that must outlive its row (an external post-merge run) keeps its intent and its deferral.
 - A per-(rule, worktree) **circuit breaker** counts consecutive dispatches after which the condition still held. At 2, the rule trips for that worktree and stops dispatching; it re-arms only when the condition is observed false (i.e. something actually got fixed, by hand or otherwise). Fleet `branch.advanced` fires bypass it because no row can provide that clearing observation. A fire suppressed by a breaker or another terminal pre-dispatch guard is recorded as skipped, so it does not requeue on every pass.
 
 ## Watching the queue

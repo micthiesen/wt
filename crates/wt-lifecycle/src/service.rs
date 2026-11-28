@@ -1585,7 +1585,8 @@ impl LifecycleService {
                 Err(error) if dev_stop_hook_failed(&error) => {
                     return Err(LifecycleError::Refused(format!(
                         "the dev server's stop_command failed, so nothing was removed: {}; \
-                         fix the hook, or remove the worktree anyway with `wt rm {slug} --force`",
+                         fix the hook, or run `wt rm {slug} --force` to remove the worktree \
+                         anyway and leave behind whatever the hook would have cleaned up",
                         dev_stop_failure(&error)
                     )));
                 }
@@ -2032,12 +2033,26 @@ impl LifecycleService {
             }
         }
         if let Some(dev) = &self.dev {
-            timed(trace, "dev-server-stop", async {
-                dev.stop_under_lifecycle_lock(&wt_dev::DevWorktree::from(row), lock, cancellation)
-                    .await
-                    .map_err(LifecycleError::from)
+            // Its `stop_command` runs inside the checkout like the two
+            // below, so it is skipped the same way: failing the removal for
+            // a hook that cannot even start would keep the row for good.
+            let skipped = timed(trace, "dev-server-stop", async {
+                dev.end_session_under_lifecycle_lock(
+                    &wt_dev::DevWorktree::from(row),
+                    lock,
+                    cancellation,
+                )
+                .await
+                .map_err(LifecycleError::from)
             })
             .await?;
+            if skipped {
+                warnings.push(
+                    "skipped the dev server's stop_command: the checkout is already gone; \
+                     whatever that hook cleans up may be left behind"
+                        .into(),
+                );
+            }
         }
         // Both run inside the checkout; without it they can't run safely.
         if self.config.destroy_command.is_some() {

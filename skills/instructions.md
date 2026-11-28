@@ -57,9 +57,9 @@ In a wt-managed worktree you own the task's status, testing, and dev server.
   end the turn; "tell me when X" is `wt notify`. Never sleep or poll. A wake
   fires only while wt is running.
 - Conditions (all must hold; `wt watch` lists them): a time (`3h`); `merged`,
-  `production`, `green`, `settled`, `reviewed`, `evicted`; `pr:3806:merged`;
-  `wt:<slug>:merged`; `release:production`; `check:<id>=<arg>`. All but a
-  time take a delay (`release:production+24h`).
+  `production`, `green`, `settled`, `reviewed`, `evicted` (says why GitHub
+  dropped the merge); `pr:3806:merged`; `wt:<slug>:merged`; `check:<id>=<arg>`;
+  `release:production`. All but a time take a delay (`release:production+24h`).
 
 ### What you still owe
 
@@ -68,9 +68,9 @@ nothing is finished; the note never holds owed work:
 
 - A prerequisite before merging is `--blocked-on "<gate>"`, only when merging
   now would make things worse (a manual deploy or follow-up that leaves the
-  status quo unchanged is a step). A status change keeps the gate. It clears by
-  `--until <condition>` once wt observes the prerequisite (`--then "<prompt>"`
-  acts then), by `wt status --unblock`, or with `verified` or `dropped`.
+  status quo unchanged is a step). A status change keeps it and a new gate
+  replaces it. It clears by `--until <condition>` once wt sees the prerequisite
+  (`--then "<prompt>"` acts then), `--unblock`, `verified` or `dropped`.
 - A check only a deployed environment can run is `--verify-in-staging` and/or
   `--verify-in-production` (both may be owed), set as soon as you know it. It
   never blocks merging; the row returns as `needs-testing` once the change is

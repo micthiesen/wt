@@ -850,7 +850,7 @@ async fn serve_connection(
                     if preparation && reply.is_closed() { continue; }
                     *command_id = command_id.saturating_add(1);
                     let id = *command_id;
-                    let reply_timeout = if matches!(action, UiAction::Remove { .. } | UiAction::Cleanup { .. } | UiAction::CleanupTargets { .. }) { REMOVAL_REPLY_TIMEOUT } else { COMMAND_REPLY_TIMEOUT };
+                    let reply_timeout = if matches!(action, UiAction::Remove { .. } | UiAction::CleanupTargets { .. }) { REMOVAL_REPLY_TIMEOUT } else { COMMAND_REPLY_TIMEOUT };
                     let frame = ClientFrame::Command { id, action };
                     let encoded = match protocol::encode(&frame) {
                         Ok(bytes) => bytes,

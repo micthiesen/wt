@@ -74,6 +74,9 @@ impl Model {
             (ActionSurface::Row { key }, AUTO_MERGE_ACTION_ID) => {
                 let pr = scope.row.and_then(|row| row.pr.as_ref());
                 if !pr.is_some_and(|pr| pr.number.is_some()) {
+                    if scope.display.github_off {
+                        return self.github_off("merge when ready");
+                    }
                     return self.unavailable("merge when ready: no PR".into());
                 }
                 // The direction comes from what the palette showed.
@@ -100,6 +103,9 @@ impl Model {
             return self.unavailable("that action is no longer available".into());
         };
         match palette::blocker(entry, surface, scope.facts()) {
+            Some(Blocker::PrUnconfirmed) if scope.display.github_off => {
+                self.github_off(&entry.name)
+            }
             Some(Blocker::PrUnconfirmed) => {
                 self.palette_wait = Some(PaletteWait {
                     surface: surface.clone(),
@@ -188,6 +194,20 @@ impl Model {
         }
         self.show_modal(palette::extras_modal(surface, entry, arg, seen), None);
         InputResult::Draw
+    }
+
+    /// An entry that needs a pull request was chosen where GitHub reads are
+    /// switched off. No read can change that, so none is asked for and
+    /// nothing waits.
+    fn github_off(&mut self, name: &str) -> Pick {
+        self.toast = Some((
+            format!("{name}: {}", crate::menus::github::GITHUB_OFF),
+            ToastTone::Notice,
+        ));
+        Pick {
+            result: InputResult::Draw,
+            keep_open: true,
+        }
     }
 
     /// An entry the palette lists as unavailable was chosen. The sources

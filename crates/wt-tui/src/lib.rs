@@ -33,7 +33,8 @@ pub use editor::LineEditor;
 pub use menus::palette::{
     ActionCatalog, ActionDelivery, ActionEntry, ActionFacts, ActionRequirement, ActionRowSeen,
     ActionSeen, ActionState, ActiveRunView, ArgValue, Blocker, CUSTOM_ACTION_ID,
-    DEV_LOGS_ACTION_ID, OPEN_EDITOR_ACTION_ID, PrFact, blocker, slot_name,
+    DEV_LOGS_ACTION_ID, OPEN_EDITOR_ACTION_ID, PrFact, blocker,
+    reserved_keys as reserved_action_keys, slot_name,
 };
 pub use menus::sessions::{harness_label, session_value, terminal_label};
 pub use menus::{LoadingOverlay, LocalMenu, Menu, session_menu_key};

@@ -40,8 +40,10 @@ red. A yellow hourglass replaces the marker while a
 worktree initializes: from the creation request until its checkout exists, and
 then while the dependency install that creation started is still running. The
 ordinary marker returns when the worktree is ready for a session. A row with a review stamp ([`[history] stamps`](configuration.md#history-which-skill-uses-a-worktrees-history-records)) wears a star in place of its status circle, ✦ while HEAD is the stamped commit and ✧ once it has moved; gated, dropped, initializing and landed rows keep their own marker, and the details status line ends `· ✦ <skill>`. A landed row's marker follows what it still owes, not its asserted state: a yellow dot while something is due (red once anything is overdue), a dim dot while everything it owes waits, and the green merge glyph when it owes nothing. Landed
-means the branch's own commits reached the base: its PR merged, or its HEAD is
-in the base and was either merged in or committed on the branch itself. A
+means the branch's own commits reached the base: its PR merged at this HEAD,
+or at a head this checkout holds only copies of (rebased onto a newer base,
+or with the base merged in, after the push), or its HEAD is in the base and
+was either merged in or committed on the branch itself. A
 worktree only fast-forwarded (or reset) to a base commit is never landed, even
 when its recorded fork anchor is older. The same
 answer drives the glyph and `c`, and `c` never offers a row whose status is
@@ -61,7 +63,8 @@ shows exactly the glyphs you would see expanded (dim markers such as todo,
 finished and archived are left out), plus conflicts and failing checks. Selecting it shows the full rollup and blocker notes (for the Landed block, [what its header counts](#the-landed-blocks-pane)) in the
 details pane. `[ui].sort = "status"` orders rows by work status; manual section
 placement remains separate. Within a section, rows without a manual order sort
-first, and a stack sorts as one unit under its root's identity. A stack member
+first, and the rows of a stack drawn in the same section sort as one unit,
+placed by the shallowest of them. A stack member
 whose own work has landed is drawn as a single row and its children as roots,
 so moving a merged head (`l`, `J`/`K`) moves only that row.
 
@@ -158,8 +161,13 @@ session, the F12 target first), and `git` (dirty or clean, diff against the
 merge-base, last commit and creation ages, upstream counts in parentheses, base
 counts in brackets). The pane no longer shows a `path` row: the id is ignored
 where it is still listed, as unknown group names are. On narrow panes the `pr` and `git` rows drop their least important
-parts first. A GitHub or host error remains visible as an error, and an
-unavailable fact shows `—` rather than reading as clean.
+parts first. When GitHub removed the pull request from the merge queue after
+wt armed it and nothing holds the merge, the `pr` row says `removed from the
+merge queue: <reason>` in the warning colour, with GitHub's own word for the
+reason (`removed` in a narrow pane). It is the rule `wt wait` and `wt fleet`
+use, and it is shown only from a live GitHub read. A GitHub or host error
+remains visible as an error, and an unavailable fact shows `—` rather than
+reading as clean.
 
 Below the rows come a rebase block when the branch would not rebase cleanly
 onto its base (listing up to eight conflicting files from a `git merge-tree`
@@ -177,8 +185,13 @@ Creation uses the section where the name prompt opened, including Inbox.
 The new row appears below the selected row or stack. A folded section opens
 and receives the new row at the top. This position is stored on the controller,
 including for a remote checkout. An unstarted row keeps this position across
-restarts. Under status sorting, its work status takes precedence once assigned;
-manual reordering also replaces the initial position. An existing worktree keeps
+restarts. Under status sorting, its work status takes precedence once
+assigned. Until then the row keeps its place behind the row it was created
+after through `J`/`K` presses, its own and its neighbours', and takes a
+stored order only when it crosses into another section. Under manual sorting
+the first reorder in a section stores an order for every row drawn there, in
+the order drawn, so rows still at their creation position stay where they
+are. An existing worktree keeps
 its section when its name is entered again.
 
 Creation immediately selects one optimistic row with its title and the
@@ -256,10 +269,11 @@ request of yours is shown even while a later one is pending; the failure then
 stays beside that request's progress and result until your next action. The
 board's own background reads never interrupt. A change that a fresh read still does
 not show after its deadline (30 seconds for GitHub, reviews and issue statuses;
-12 seconds for local state; 10 minutes for creating or removing a worktree) is
-dropped with a notice; nothing is resent automatically. A key that turns out to
-have nothing to do (for example, moving a row that is already at the top) ends
-its marker at once. Toggles act on what the row shows, and GitHub writes are refused
+12 seconds for local state; 10 minutes for creating a worktree and 30 for
+removing one) is dropped with a notice; nothing is resent automatically. While
+no read that started after the change has finished, a GitHub change waits up
+to 120 seconds and a local one up to 60. A key that turns out to
+have nothing to do ends its marker at once. Toggles act on what the row shows, and GitHub writes are refused
 if the PR or its head commit changed since you saw it.
 
 The bottom pane shows the attention feed, all activity, session output, or
@@ -598,7 +612,8 @@ items fit. When the list is taller than the pane, it scrolls with the list.
 
 Clean and delete use the host's existing GitHub data. They do not refetch PRs
 when you press the key or confirm. A merged PR must match the current worktree
-commit. Local file changes, unpushed work, and checkout identity are checked
+commit, or the checkout must hold only copies of the head it merged from
+([cli.md](cli.md#wt-rm-slug)). Local file changes, unpushed work, and checkout identity are checked
 again before removal. When landing evidence comes only from Git ancestry,
 WT still checks the published base. Missing evidence does not mean merged.
 
@@ -616,12 +631,12 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
-| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). A status picked here keeps the row's merge gate and its `--until` watch, as `wt status` does; only verified and dropped clear them. Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
+| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). A status picked here keeps the row's merge gate and its `--until` watch, as `wt status` does; only verified and dropped clear them. A pick that starts work a gate asserted on `todo` held back clears that gate and replies `Work status updated; start gate cleared (was: <gate>)`. Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
 | `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
 | `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists every section in board order with its size |
 | `D` | Delete the current section; its worktrees move to the Inbox (confirmation when it has any) |
-| `J` / `K` | Reorder the selected row, stack, or folded or empty section; the cursor follows the row across sections, including into an empty one on screen, never into a hidden group |
+| `J` / `K` | Reorder the selected row, stack, or folded or empty section. The move shows at the keypress; the cursor follows the row across sections, including into an empty one on screen, never into a hidden group. A press that can move nothing says why and sends nothing. When the stored order differs from the one on screen, nothing is written and the reply reads `Changed since you looked: …`. Rows in **Removing**, the archive and the Landed block do not reorder, and nothing moves into them. Under `[ui] sort = "status"` a row passes only neighbours of its own status, and a row that crosses a section edge enters first or last among the rows of its status |
 | `b` | Record a fork base without rebasing: another worktree's branch (never the row or its descendants) or none; `b b` confirms |
 | `R` | Restack or rebase the selected branch |
 | `H` | Open the selected row's history: a timeline of how it got here. `j`/`k`, arrows, page keys and `g`/`G` scroll; `H`, `Esc` or `q` closes |
@@ -763,33 +778,58 @@ Dismiss (Enter or Esc) and Copy details (`c`). Dismiss returns control to the
 board. The copied details include the local build, remote platform, and release
 lookup error, including GitHub 404 when that is the cause.
 
-Most menus open at once from the board on screen: status `u`, notify `W`,
-fork base `b`, section move, sessions `;`, start agent Shift+F12, stop a running terminal
-Shift+F10/F11, GitHub `e`/`E`, review checkout `w`, history restore, hard
-refresh, create, removal of a clean worktree `d`, and an action palette that
-was prefetched for the selected row. An open menu updates as newer data
+Every menu opens at the keypress, from the board on screen, for local and
+remote rows: status `u`, notify `W`, fork base `b`, section move, sessions
+`;`, start agent Shift+F12, stop a terminal Shift+F10/F11 (including one kept
+after its process exited), reviewers `v`, GitHub `e`/`E`, review checkout
+`w`, history restore, hard refresh, create (on this machine, a chosen host or
+a remote row's host), removal `d`, cleanup `c`, and the action palettes (`!`,
+`M`, `<` `>` `\`). An open menu updates as newer data
 arrives and keeps the highlighted choice. If the highlighted choice
 disappears, the cursor stays in place, a notice names it, and the next key is
 ignored unless it moves the cursor or cancels. If what the menu showed changed
 before the host applied the choice (a PR moved, a session was replaced, an
 agent set a status), nothing is written: the menu reopens with the current
-data and the toast says what changed.
+data and the toast says what changed. An open confirmation never changes
+what it will do: when its subject changes on the board (another run in the
+slot, another pull request or checkout), it stays as shown and the host
+refuses it.
 
-Menus that need host-only data (removal hazards, an unprefetched palette,
-action arguments, reviewers, failed checks, fleet cleanup, retained or remote
-terminals) show
-`loading menu… Esc cancels`. Keys typed meanwhile belong to that menu, never to
-the board: they replay in order once it opens, so a fast `; d` or `! m` acts
-inside the menu. Escape, `q`, Ctrl+C, or the menu's own key cancels it; for
-a text prompt (an action's argument or extra instructions, a new worktree on
-another host) the menu's own key is text instead. After a cancel, keys are
-still dropped, with a notice, until the cancelled request answers or two
-seconds have passed since it was sent, so the rest of what was typed for the
-menu cannot act on the board.
-Replay stops if the menu closes. Keys are dropped, with a notice, when the
-menu fails, takes longer than two seconds, or answers with a confirmation
-instead of the menu that was asked for. Mouse wheel input still acts
-where the pointer is and abandons the loading menu.
+A key whose menu the board cannot build answers at once in the footer
+instead of opening one. `e`, `E`, `v` or `f` on a row with no shown pull
+request reads `GitHub data is unavailable: <error>` when the row's GitHub
+read failed, `no PR for this branch` when the read covered the branch, and
+`GitHub data is still loading for this branch` otherwise. `v` reads
+`reviewer list is still loading` until the reviewer list has been read once;
+it is read again about once a day and on a hard refresh. A remote row reads
+`session list not loaded yet` before its host's lists arrive, and `session
+list unknown: <error>` while that host is disconnected. An answer about
+data that is unavailable or still loading also asks the sources to read
+again.
+
+Two keys fetch content only a host has: failed checks `f` and dev logs
+`! l`. The overlay opens at the keypress reading `loading…`, and the reply
+fills it. While it loads, every key belongs to the overlay: Esc, `q`, Ctrl+C
+or the overlay's own key (`f`, `l`) closes it and cancels the fetch, and
+nothing else typed is kept or replayed. `f` answers at once, with no fetch,
+when the board shows no failing check (`no failing checks`), no pull
+request, or one that is not open.
+
+In an action palette, choosing an unavailable entry says why in the footer
+and keeps the palette open. An entry that needs a pull request, chosen before
+GitHub has confirmed the row's branch, waits in the open palette marked
+`waiting for GitHub… Esc cancels`, for up to 12 seconds, and the footer reads
+`<name>: waiting for GitHub to confirm <branch>… Esc cancels`. Closing the palette
+or any later key that does something ends the wait. When GitHub confirms, a
+command runs; an entry whose next step is a prompt stays highlighted and the
+footer reads `<name>: GitHub confirmed; Enter continues`, so no prompt opens
+without a key. An entry for a pull request the board does not show yet reads
+`<name>: the board does not show its pull request yet`. Recent values in an
+argument picker for a remote row arrive with that host's live data; before
+that the prompt is a plain text field.
+
+A key pressed while 64 requests already wait for the host is refused with
+`actions are busy; try again when one finishes`, and shows no change.
 Host replies are still applied while a session holds the terminal, so a
 worktree created just before entering a session starts its checkout without
 waiting for you to come back.
@@ -909,9 +949,11 @@ new-session choices. Attachment rechecks the selected live identity; a
 new session chosen beside a live slot the picker did not show is refused and
 the picker reopens. A picker cursor that has not moved follows the newest
 default, so a picker opened before a live slot appeared selects it once it
-does. Shift+F10 and Shift+F11 confirm a running terminal from the board; a
-terminal retained after its process exited, or one on a remote host, is read
-from tmux by its host.
+does. Shift+F10 and Shift+F11 confirm from the board for local and remote
+rows, including a terminal kept after its process exited (`Its process has
+exited; closing it discards the output kept for inspection.`). The stop
+names the terminal the board showed by its tmux id and creation time; a
+terminal replaced since is not stopped, and the confirmation reopens.
 
 The `d` delete menu opens from cached worktree data, including dirty and remote
 rows. It shows current cached warnings. After confirmation, the host checks

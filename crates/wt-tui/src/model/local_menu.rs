@@ -14,6 +14,18 @@ fn identity(option: &PickerOption) -> OptionIdentity {
     (option.value.clone(), option.chord)
 }
 
+/// How a host's stale refusal reads (`wt_app_core::host_errors`), and the
+/// first line of a confirmation reopened after one.
+const CHANGED: &str = "Changed since you looked";
+
+fn changed_line(message: &str) -> String {
+    if message.starts_with(CHANGED) {
+        message.to_owned()
+    } else {
+        format!("{CHANGED}: {message}")
+    }
+}
+
 impl Model {
     /// Answer a requested action from the board when it is a board menu.
     pub(super) fn open_board_menu(&mut self, action: UiAction) -> InputResult {
@@ -38,6 +50,7 @@ impl Model {
         };
         // The opening key is not a commit that the host could find stale.
         self.committed_menu = None;
+        self.menu_refused = !matches!(menu, LocalMenu::Modal { .. });
         self.show_local_menu(action, menu);
         InputResult::Draw
     }
@@ -104,6 +117,22 @@ impl Model {
         let Menu::Local(LocalMenu::Modal { modal, .. }) = action.menu(&self.board) else {
             return;
         };
+        // The run a stop confirmation names has ended, so its palette is a
+        // list again. The confirmation still names that run and no other;
+        // it says the run is over, and committing it then only closes it.
+        if let Interaction::Confirm(confirm) = &mut self.interaction
+            && let crate::ConfirmAction::KillAction { run_id, .. } = &confirm.action
+            && !self.board.run_active(run_id)
+            && let Some(name) = confirm
+                .title
+                .strip_prefix("Stop ")
+                .and_then(|title| title.strip_suffix('?'))
+        {
+            confirm.title = format!("{name} has finished");
+            confirm.lines = vec!["Nothing is left to stop. Enter closes this.".into()];
+            confirm.selected = 0;
+            return;
+        }
         match (&mut self.interaction, *modal) {
             (
                 Interaction::Picker(picker),
@@ -177,6 +206,15 @@ impl Model {
                     cancel_key,
                 },
             ) if confirm.action == action => {
+                // A confirmation reopened after a refusal keeps saying so.
+                let mut lines = lines;
+                if let Some(changed) = confirm
+                    .lines
+                    .first()
+                    .filter(|line| line.starts_with(CHANGED))
+                {
+                    lines.insert(0, changed.clone());
+                }
                 *confirm = ConfirmPrompt {
                     action,
                     title,
@@ -203,6 +241,12 @@ impl Model {
     /// A commit was refused because what its menu showed changed. Reopen the
     /// menu from the current board and ask the sources for fresher data; the
     /// open menu rebuilds when it arrives.
+    ///
+    /// The reopened menu answers a reply, not a key, and names the newer
+    /// state. A confirmation says so in its first line and waits out the
+    /// settle delay, so a key already on its way cannot commit what the
+    /// person has not read: that would be the retry with newer state the
+    /// refusal exists to prevent.
     pub(super) fn reopen_stale_menu(&mut self, operation_id: Option<u64>, message: String) {
         let Some((id, action)) = self.last_menu.take() else {
             return;
@@ -212,6 +256,11 @@ impl Model {
         }
         if let Menu::Local(menu) = action.menu(&self.board) {
             self.show_local_menu(action, menu);
+            if let Interaction::Confirm(confirm) = &mut self.interaction {
+                confirm.lines.insert(0, changed_line(&message));
+                self.confirm_settles_at =
+                    Some(tokio::time::Instant::now() + super::reply::CONFIRM_SETTLE);
+            }
         }
         self.toast = Some((message, ToastTone::Failed));
     }

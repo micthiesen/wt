@@ -320,12 +320,6 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 keys: targets.iter().map(|target| target.key.clone()).collect(),
             },
         ),
-        UiAction::Cleanup { revisions } => on_board(
-            host,
-            LifecycleChange::Remove {
-                keys: revisions.iter().map(|r| r.key.clone()).collect(),
-            },
-        ),
         UiAction::ToggleArchive { key, seen } => {
             let archived = seen.as_ref().map_or_else(
                 || row(board, key).is_some_and(|row| row.archived),

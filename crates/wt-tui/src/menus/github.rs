@@ -18,6 +18,10 @@ enum GithubPrompt {
 
 const ROW_GONE: &str = "worktree is no longer on the board";
 
+/// What every pull-request key and palette entry says on a host whose
+/// GitHub reads are switched off.
+pub(crate) const GITHUB_OFF: &str = "GitHub is off (WT_GITHUB=off)";
+
 /// The pull request the board shows for a row, with its number.
 fn shown_pr(row: &BoardRow) -> Option<(&PrPresentation, u64)> {
     let pr = row.pr.as_ref()?;
@@ -26,13 +30,19 @@ fn shown_pr(row: &BoardRow) -> Option<(&PrPresentation, u64)> {
 
 /// The answer for a row whose pull request the board does not show. Its
 /// host's last live read of the branch tells a branch without one from a
-/// read that has not happened yet; only the second is worth asking again.
-fn no_shown_pr(row: &BoardRow) -> LocalMenu {
+/// read that has not happened yet. Both ask the sources to read again: a
+/// pull request opened since that read is absent only until the next one,
+/// and the person pressing the key may know of it.
+fn no_shown_pr(board: &Board, row: &BoardRow) -> LocalMenu {
+    // Nothing will load, and asking again cannot help.
+    if row_display(board, row).github_off {
+        return LocalMenu::Notice(GITHUB_OFF.into());
+    }
     if let Some(error) = row.pr.as_ref().and_then(|pr| pr.error.as_ref()) {
         return LocalMenu::NotYet(format!("GitHub data is unavailable: {error}"));
     }
     match row.action_facts.pr {
-        PrFact::Absent => LocalMenu::Notice("no PR for this branch".into()),
+        PrFact::Absent => LocalMenu::NotYet("no PR for this branch".into()),
         PrFact::Unknown | PrFact::Present { .. } => {
             LocalMenu::NotYet("GitHub data is still loading for this branch".into())
         }
@@ -44,11 +54,11 @@ pub(super) fn menu(board: &Board, key: &str, ship: bool) -> LocalMenu {
         return LocalMenu::Notice(ROW_GONE.into());
     };
     let Some((pr, number)) = shown_pr(row) else {
-        return no_shown_pr(row);
+        return no_shown_pr(board, row);
     };
     // A pin without a head could never match confirmed data.
     let Some(head_sha) = pr.head_sha.as_deref() else {
-        return no_shown_pr(row);
+        return no_shown_pr(board, row);
     };
     if !pr.is_open() {
         return LocalMenu::Notice(format!("PR #{number} is not open"));
@@ -123,7 +133,7 @@ pub(super) fn reviewers(board: &Board, key: &str) -> LocalMenu {
         return LocalMenu::Notice("reviewers are disabled for this repository".into());
     }
     let Some((pr, number)) = shown_pr(row) else {
-        return no_shown_pr(row);
+        return no_shown_pr(board, row);
     };
     if !pr.is_open() {
         return LocalMenu::Notice(format!("PR #{number} is not open"));
@@ -216,7 +226,7 @@ pub(super) fn failed_checks(board: &Board, key: &str) -> Menu {
         return overlay("pull request");
     };
     let Some((pr, number)) = shown_pr(row) else {
-        return Menu::Local(no_shown_pr(row));
+        return Menu::Local(no_shown_pr(board, row));
     };
     if !pr.is_open() {
         return Menu::Local(LocalMenu::Notice(format!("PR #{number} is not open")));
@@ -403,7 +413,7 @@ mod tests {
         for ship in [false, true] {
             assert_eq!(
                 menu(&absent, "one", ship),
-                LocalMenu::Notice("no PR for this branch".into())
+                LocalMenu::NotYet("no PR for this branch".into())
             );
             assert_eq!(
                 menu(&board(None, None), "one", ship),

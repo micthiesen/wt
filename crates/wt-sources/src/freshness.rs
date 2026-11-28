@@ -293,6 +293,11 @@ impl Layout {
                 let relative = path.strip_prefix(common).unwrap_or(path);
                 let mut parts = relative.components().map(|part| part.as_os_str());
                 match parts.next().and_then(|part| part.to_str()) {
+                    // The directory itself changes with every lock file made
+                    // in it, and the object store with every commit. What a
+                    // status reads there (HEAD, the index, operation state)
+                    // is reported as its own path.
+                    None | Some("objects") => {}
                     // A linked checkout's own administration directory. One
                     // that is not listed is a checkout arriving or leaving.
                     Some("worktrees") => {
@@ -320,15 +325,10 @@ impl Layout {
                             }
                         };
                         let name = fold(&name);
-                        // A directory under refs stands for every ref in it.
-                        let names = |candidate: &str| {
-                            let candidate = fold(candidate);
-                            !name.is_empty()
-                                && (candidate == name
-                                    || candidate
-                                        .strip_prefix(name.as_str())
-                                        .is_some_and(|rest| rest.starts_with('/')))
-                        };
+                        // A directory under refs changes with every lock
+                        // file made in it; the refs that really moved are
+                        // reported as their own paths.
+                        let names = |candidate: &str| !name.is_empty() && fold(candidate) == name;
                         for row in &self.rows {
                             if row.common_dir.as_deref() != Some(common) {
                                 continue;
@@ -449,10 +449,84 @@ struct Router {
     /// The main clone and the worktree root.
     checkout_roots: [PathBuf; 2],
     layout: RwLock<Layout>,
+    contents: Mutex<Contents>,
+}
+
+/// Files Git rewrites in place with the bytes they already had (the config
+/// on every `git branch --force`, packed refs on a fetch that moved
+/// nothing), each of which would otherwise read every checkout again.
+const REWRITTEN_FILES: [&str; 2] = ["config", "packed-refs"];
+
+/// What those files held when last looked at, per watch root.
+#[derive(Default)]
+struct Contents {
+    roots: BTreeSet<PathBuf>,
+    hashes: BTreeMap<PathBuf, Option<u64>>,
+}
+
+fn content_hash(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 impl Router {
+    /// Remember what the rewritten files of new roots hold, before the roots
+    /// are sampled: a change after this differs from it.
+    async fn baseline(self: Arc<Self>, roots: Vec<PathBuf>) {
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok(mut contents) = self.contents.lock() else {
+                return;
+            };
+            for root in roots {
+                if !contents.roots.insert(root.clone()) {
+                    continue;
+                }
+                for name in REWRITTEN_FILES {
+                    let path = root.join(name);
+                    let hash = content_hash(&path);
+                    contents.hashes.insert(path, hash);
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Whether a changed path is one of the rewritten files holding exactly
+    /// what it held before.
+    fn rewritten_unchanged(&self, path: &Path) -> bool {
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| REWRITTEN_FILES.contains(&name))
+        {
+            return false;
+        }
+        let Ok(mut contents) = self.contents.lock() else {
+            return false;
+        };
+        if !path
+            .parent()
+            .is_some_and(|parent| contents.roots.contains(parent))
+        {
+            return false;
+        }
+        let now = content_hash(path);
+        contents.hashes.insert(path.to_path_buf(), now) == Some(now)
+    }
+
     fn invalidate(&self, paths: &[PathBuf]) {
+        let changed: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| !self.rewritten_unchanged(path))
+            .cloned()
+            .collect();
+        if changed.is_empty() && !paths.is_empty() {
+            return;
+        }
+        let paths = changed.as_slice();
         let (git, metadata) = invalidations(paths, &self.state_db, &self.checkout_roots);
         tracing::debug!(?paths, git, metadata, "filesystem invalidation");
         if metadata {
@@ -678,6 +752,7 @@ fn start_with_notifications(
                 canonical_watch_path(&config.paths.worktree_root).await,
             ],
             layout: RwLock::default(),
+            contents: Mutex::default(),
         });
         let watcher = if notifications {
             let callback_router = router.clone();
@@ -812,6 +887,7 @@ fn start_with_notifications(
                 match desired_paths(&config, &records).await {
                     Ok((paths, missing)) => {
                         inputs_missing = missing;
+                        router.clone().baseline(paths.keys().cloned().collect()).await;
                         let fresh = watch.apply(paths).await;
                         if cancellation.is_cancelled() {
                             break;
@@ -819,7 +895,19 @@ fn start_with_notifications(
                         // A root that was not watched until now may have
                         // changed since its rows were read, and no sample
                         // will ever show that. Read what it can reach again.
-                        if !fresh.is_empty() {
+                        //
+                        // That needs rows read before now. A listing waits
+                        // for its checkouts to be covered before reading
+                        // them, so until the leaf has published live rows
+                        // there are none: the first load is still to come or
+                        // is waiting on this very baseline, and asking again
+                        // would only read every checkout twice at start.
+                        let read_before = git
+                            .snapshot()
+                            .domains()
+                            .get(&Domain::Git)
+                            .is_some_and(|meta| meta.is_live());
+                        if !fresh.is_empty() && read_before {
                             let rows: Option<Vec<String>> = fresh
                                 .iter()
                                 .map(|root| {
@@ -936,6 +1024,7 @@ fn start_with_notifications(
                     match desired_paths(&config, &records).await {
                         Ok((paths, missing)) => {
                             inputs_missing |= missing;
+                            router.clone().baseline(paths.keys().cloned().collect()).await;
                             watch.apply(paths).await;
                             if cancellation.is_cancelled() {
                                 break;
@@ -1001,7 +1090,10 @@ fn start_with_notifications(
                     if changed.is_empty() {
                         continue;
                     }
-                    router.invalidate(&changed);
+                    // Routing may read a rewritten file to see whether its
+                    // bytes changed.
+                    let routing = (router.clone(), changed.clone());
+                    let _ = tokio::task::spawn_blocking(move || routing.0.invalidate(&routing.1)).await;
                     // Without notifications the scan is also what dates edits.
                     if watch.watcher.is_none()
                         && let Ok(roots) = edit_roots.read()
@@ -2222,18 +2314,21 @@ mod tests {
         assert_eq!(touch("/repo/main/.git/worktrees/one/index"), rows(&["one"]));
         assert_eq!(touch("/repo/main/.git/worktrees/one"), rows(&["one"]));
         assert_eq!(touch("/repo/main/.git/index"), rows(&["main"]));
-        assert_eq!(touch("/repo/main/.git"), rows(&["main"]));
+        assert_eq!(touch("/repo/main/.git/HEAD"), rows(&["main"]));
         assert_eq!(touch("/repo/main/tracked.txt"), rows(&["main"]));
-        // A ref reaches the checkouts on it or tracking it; a directory of
-        // refs stands for all of them.
+        // The Git directory itself and its object store change with every
+        // lock file and commit; nothing a status reads is in that.
+        assert_eq!(touch("/repo/main/.git"), rows(&[]));
+        assert_eq!(touch("/repo/main/.git/objects"), rows(&[]));
+        // A ref reaches the checkouts on it or tracking it. A directory of
+        // refs reaches none: it changes with every lock file made in it, and
+        // the refs that moved are reported themselves.
         assert_eq!(
             touch("/repo/main/.git/refs/heads/feature/one"),
             rows(&["one"])
         );
-        assert_eq!(
-            touch("/repo/main/.git/refs/heads/feature"),
-            rows(&["one", "two"])
-        );
+        assert_eq!(touch("/repo/main/.git/refs/heads/feature"), rows(&[]));
+        assert_eq!(touch("/repo/main/.git/refs/remotes/origin"), rows(&[]));
         assert_eq!(
             touch("/repo/main/.git/refs/remotes/origin/feature/one"),
             rows(&["one"])
@@ -2547,6 +2642,64 @@ mod tests {
         tokio::time::sleep(interval).await;
         paced.signal();
         assert!(asked(&mut publisher));
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_file_git_rewrites_with_the_same_bytes_is_not_a_change() {
+        let root = tempfile::tempdir().unwrap();
+        let git_dir = std::fs::canonicalize(root.path()).unwrap();
+        let config = git_dir.join("config");
+        std::fs::write(&config, "[branch \"main\"]\n\tremote = origin\n").unwrap();
+        let scope = TaskScope::new();
+        fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
+            SourceSpec {
+                name,
+                domain,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            }
+        }
+        let (git, mut git_publisher) =
+            leaf_channel::<Vec<WorktreeSnapshot>>(&scope, spec("test-git", Domain::Git));
+        let (metadata, _metadata_publisher) = leaf_channel::<crate::local_source::Metadata>(
+            &scope,
+            spec("test-metadata", Domain::Metadata),
+        );
+        let router = Arc::new(Router {
+            git: git.view(),
+            metadata: Arc::new(Paced::new(metadata.view(), METADATA_PACE)),
+            state_db: "/state/wt.sqlite".into(),
+            checkout_roots: ["/repo/main".into(), "/wt".into()],
+            layout: RwLock::default(),
+            contents: Mutex::default(),
+        });
+        router.clone().baseline(vec![git_dir.clone()]).await;
+        // What \`git branch --force\` does on every origin fetch: a new file
+        // with the bytes the old one had.
+        let rewrite = |bytes: &str| {
+            let next = git_dir.join("config.lock");
+            std::fs::write(&next, bytes).unwrap();
+            std::fs::rename(&next, &config).unwrap();
+        };
+        rewrite("[branch \"main\"]\n\tremote = origin\n");
+        router.invalidate(std::slice::from_ref(&config));
+        assert!(git_publisher.take_demand().whole.is_none());
+        // Alongside a path that did change, only that path counts.
+        router.invalidate(&[config.clone(), git_dir.join("packed-refs.absent")]);
+        assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        // New bytes are a change, once.
+        rewrite("[branch \"main\"]\n\tremote = upstream\n");
+        router.invalidate(std::slice::from_ref(&config));
+        assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        router.invalidate(std::slice::from_ref(&config));
+        assert!(git_publisher.take_demand().whole.is_none());
+        // A file with no baseline is always a change.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = elsewhere.path().join("config");
+        std::fs::write(&other, "x").unwrap();
+        router.invalidate(std::slice::from_ref(&other));
+        assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }

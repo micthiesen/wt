@@ -164,6 +164,10 @@ pub fn overlay(
 
 /// Why the origin lane's next fetch runs. Requests through the leaf handle
 /// itself (a Git-affecting action, the hard refresh) leave it unset.
+/// A board refresh this soon after the last fetch was asked for is the same
+/// request.
+const REFRESH_BURST: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Default)]
 struct Trigger(Arc<std::sync::Mutex<Option<&'static str>>>);
 
@@ -207,13 +211,22 @@ fn spawn_overlay(
             tokio::time::interval_at(tokio::time::Instant::now() + backstop, backstop);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         trigger.request(&origin, "startup");
+        let mut asked = tokio::time::Instant::now();
         let mut failures = wt_app_core::feeds::FailureClock::default();
         loop {
             tokio::select! { biased;
                 _ = cancellation.cancelled() => break,
                 request = publisher.requested() => {
                     if request.is_none() { break; }
-                    board.refresh(); trigger.request(&origin, "refresh"); continue;
+                    board.refresh();
+                    // The terminal asks for its first board moments after
+                    // the startup fetch was asked for. That is one request,
+                    // not a second fetch waiting out the leaf's floor.
+                    if asked.elapsed() >= REFRESH_BURST {
+                        trigger.request(&origin, "refresh");
+                        asked = tokio::time::Instant::now();
+                    }
+                    continue;
                 }
                 changed = board_updates.changed() => {
                     if changed.is_err() { break; }
@@ -229,7 +242,11 @@ fn spawn_overlay(
                         local.request_keys(wt_runtime::Request::Recheck, Vec::<String>::new());
                     }
                 }
-                _ = interval.tick() => { trigger.request(&origin, "backstop"); continue; }
+                _ = interval.tick() => {
+                    trigger.request(&origin, "backstop");
+                    asked = tokio::time::Instant::now();
+                    continue;
+                }
             }
             let snapshot = board_updates.borrow().clone();
             let origin = origin_updates.borrow().clone();
@@ -299,6 +316,17 @@ mod tests {
         // Startup fetches once.
         assert_eq!(origin_requests.requested().await, Some(()));
         assert_eq!(trigger.take(), "startup");
+        // The terminal's first refresh, moments later, rereads the board
+        // and joins the startup fetch.
+        output.refresh();
+        assert_eq!(board_requests.requested().await, Some(()));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), origin_requests.requested())
+                .await
+                .is_err(),
+            "a second fetch was asked for at start"
+        );
+        tokio::time::advance(REFRESH_BURST).await;
         output.refresh();
         assert_eq!(board_requests.requested().await, Some(()));
         assert_eq!(origin_requests.requested().await, Some(()));

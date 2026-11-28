@@ -1485,19 +1485,179 @@ fn a_unit_at_its_creation_position_keeps_no_order_and_follows_what_is_drawn_befo
     );
     assert!(anchor(&mut store, "new").is_null());
     assert_eq!(by_stored_order(&mut store, &["t", "x"]), ["t", "x"]);
-    // Shown at its creation position, ordered since: not the layout shown.
+    // Shown at its creation position by a board that is behind the write
+    // which gave it an order: it is drawn by that order, and moves by it.
     store
         .write_repository_state_json(
             r#"{"slugs":{"x":{"section":"S","order":1},"new":{"section":"S","order":3,"creationAfter":"x"}}}"#,
         )
         .unwrap();
-    let drawn = [placed("x"), anchored("new")];
+    let drawn = [
+        ShownUnit {
+            band: 5,
+            ..placed("x")
+        },
+        anchored("new"),
+    ];
     assert_eq!(
         store
             .swap_shown_units(as_shown(Some("S"), &drawn), "x", "new")
             .unwrap(),
-        Err(LayoutChanged::Ordered("new".into()))
+        Ok(())
     );
+    assert_eq!(by_stored_order(&mut store, &["x", "new"]), ["new", "x"]);
+}
+
+#[test]
+fn a_press_leaves_the_statuses_it_did_not_move_within_in_their_stored_order() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    // The caller lists "y" before "x", as its board drew them. Since then a
+    // status changed or another writer reordered them: stored, "x" is first.
+    store
+        .write_repository_state_json(
+            r#"{"sectionsOrder":["S","T"],"slugs":{
+                "a":{"section":"S","order":1},"b":{"section":"S"},
+                "x":{"section":"S","order":2},"y":{"section":"S","order":5},
+                "never":{"section":"S"},
+                "t":{"section":"T"},"u":{"section":"T","order":4},"v":{"section":"T","order":1}}}"#,
+        )
+        .unwrap();
+    let drawn = banded(&[("b", 0), ("a", 0), ("y", 1), ("never", 1), ("x", 1)]);
+    // "b" was never ordered, so the section is numbered.
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &drawn), "b", "a")
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(by_stored_order(&mut store, &["a", "b"]), ["a", "b"]);
+    // Not in the order listed: in the order stored, a row never ordered
+    // first, as the board draws it.
+    assert_eq!(
+        by_stored_order(&mut store, &["never", "x", "y"]),
+        ["never", "x", "y"]
+    );
+    // The same for the section a unit enters and the one it leaves.
+    let leaving = banded(&[("a", 0), ("b", 0), ("y", 1), ("x", 1)]);
+    let entering = banded(&[("t", 0), ("u", 1), ("v", 1)]);
+    assert!(
+        store
+            .move_shown_unit(
+                &keys(&["a"]),
+                "a",
+                as_shown(Some("S"), &leaving),
+                as_shown(Some("T"), &entering),
+                true
+            )
+            .unwrap()
+            .is_ok()
+    );
+    assert_eq!(
+        by_stored_order(&mut store, &["a", "t", "v", "u"]),
+        ["a", "t", "v", "u"]
+    );
+    assert_eq!(by_stored_order(&mut store, &["x", "y"]), ["x", "y"]);
+}
+
+#[test]
+fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let remote = "@remote/server/far";
+    let state = r#"{"sectionsOrder":["S","T"],"slugs":{
+        "x":{"section":"S","order":4},
+        "new":{"section":"S","order":null,"creationAfter":"x"},
+        "newer":{"section":"S","order":null,"creationAfter":"new"},
+        "ordered":{"section":"S","order":9,"creationAfter":"x"},
+        "elsewhere":{"section":"T","order":null,"creationAfter":"x"}},
+        "remoteLayouts":{"@remote/server/far":{"section":"S","order":null,"creationAfter":"x"}}}"#;
+    let slot = json!({ "order": 4.0, "key": "x" });
+    type Leave = fn(&mut Store);
+    let leaves: [Leave; 4] = [
+        |store| {
+            store
+                .move_worktrees_to_section(&["x".to_owned()], Some("T"))
+                .unwrap();
+        },
+        |store| store.place_slug("x", None, true).unwrap(),
+        |store| {
+            store.clear_slug_state("x").unwrap();
+        },
+        |store| {
+            let live = ["new", "newer", "ordered", "elsewhere"].map(str::to_owned);
+            store.reap_wt_state(&live.into()).unwrap();
+        },
+    ];
+    for leave in leaves {
+        store.write_repository_state_json(state).unwrap();
+        leave(&mut store);
+        let after = store.read_wt_state().unwrap();
+        assert_eq!(after["slugs"]["new"]["creationSlot"], slot);
+        assert_eq!(after["remoteLayouts"][remote]["creationSlot"], slot);
+        // Not rows it does not place: one with an order of its own, one
+        // filed in another section, one that follows another row.
+        for other in ["ordered", "elsewhere", "newer"] {
+            assert!(
+                after["slugs"][other].get("creationSlot").is_none(),
+                "{other}"
+            );
+        }
+    }
+    // A row at its creation position leaves: what follows it follows what
+    // it followed, and where that was.
+    store.write_repository_state_json(state).unwrap();
+    store
+        .move_worktrees_to_section(&["x".to_owned()], Some("T"))
+        .unwrap();
+    store
+        .move_worktrees_to_section(&["new".to_owned()], Some("T"))
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    assert_eq!(after["slugs"]["newer"]["creationAfter"], "x");
+    assert_eq!(after["slugs"]["newer"]["creationSlot"], slot);
+    // A press restates what the row follows, and the slot is done with.
+    let drawn = [
+        ShownUnit {
+            key: remote.to_owned(),
+            band: 0,
+            anchored: true,
+        },
+        ShownUnit {
+            key: "newer".to_owned(),
+            band: 0,
+            anchored: true,
+        },
+    ];
+    store
+        .swap_shown_units(as_shown(Some("S"), &drawn), "newer", remote)
+        .unwrap()
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    assert!(after["slugs"]["newer"].get("creationSlot").is_none());
+    assert!(after["slugs"]["newer"]["creationAfter"].is_null());
+    assert_eq!(after["remoteLayouts"][remote]["creationAfter"], "newer");
+    // A deleted section's rows keep their order in the Inbox, and a row at
+    // its creation position goes on following its row.
+    store.write_repository_state_json(state).unwrap();
+    store.place_slug("first", Some("S"), true).unwrap();
+    store.remove_section("S").unwrap();
+    let after = store.read_wt_state().unwrap();
+    assert_eq!(
+        by_stored_order(&mut store, &["first", "x", "ordered"]),
+        ["first", "x", "ordered"]
+    );
+    assert_eq!(after["slugs"]["new"]["creationAfter"], "x");
+    assert!(after["slugs"]["new"]["order"].is_null());
+    assert!(after["slugs"]["new"]["section"].is_null());
 }
 
 #[test]

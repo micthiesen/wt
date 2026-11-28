@@ -2549,6 +2549,16 @@ mod tests {
         assert_eq!(after["slugs"]["one"]["work"]["state"], "todo");
         assert_eq!(after["slugs"]["one"]["work"]["at"], at);
         assert!(after["slugs"]["one"]["work"].get("blockedOn").is_none());
+        // Where the gate was asserted is stored with it and goes with it.
+        assert_eq!(
+            before["slugs"]["one"]["work"][wt_store::GATE_ORIGIN],
+            json!({"state": "todo", "gate": "release train lands"})
+        );
+        assert!(
+            after["slugs"]["one"]["work"]
+                .get(wt_store::GATE_ORIGIN)
+                .is_none()
+        );
         fixture.close().await.unwrap();
     }
     #[tokio::test]

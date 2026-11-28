@@ -676,9 +676,6 @@ fn every_declared_domain_can_settle() {
             revision: Some(revision.clone()),
             seen: None,
         },
-        UiAction::Cleanup {
-            revisions: vec![revision],
-        },
         UiAction::ToggleArchive {
             key: "a".into(),
             seen: None,

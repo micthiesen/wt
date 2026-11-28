@@ -32,8 +32,9 @@ pub struct FleetArgs {
     /// state, draft, checks, auto_merge, mergeable, merge_state, review_bot {state, unresolved,
     /// stale}, unresolved_threads, unresolved_human_threads). pr is null with
     /// pr_note set when GitHub is unreachable. pr_snapshot_age_seconds is the
-    /// age of the events daemon snapshot the PR data came from, or null
-    /// when GitHub was read live.
+    /// age of the events daemon snapshot the PR data came from, or of a newer
+    /// shared wt wait read that covers the row's branch; null when GitHub was
+    /// read live.
     #[arg(long)]
     pub json: bool,
 }

@@ -1024,11 +1024,17 @@ async fn plan_row(
         extra.insert("prNumber".into(), serde_json::json!(pr.number));
         extra.insert("prUrl".into(), serde_json::json!(pr.url));
         extra.insert("prState".into(), serde_json::json!(pr.state));
-        if pr_landed && let Some(merge_oid) = &pr.merge_commit_oid {
+        // The merge commit is where the work went whenever the proof rests
+        // on the merged pull request: merged at this HEAD, at a head this
+        // one is a copy of, or with every patch here already in the base.
+        if (pr_landed || landing.copy_of_merged_head || landing.patch_merged)
+            && pr.state == "MERGED"
+            && let Some(merge_oid) = &pr.merge_commit_oid
+        {
             extra.insert("prMergeCommitOid".into(), serde_json::json!(merge_oid));
         }
     }
-    let removed_snapshot = wt_store::RemovedWorktree {
+    let mut removed_snapshot = wt_store::RemovedWorktree {
         slug: row.target.slug().to_owned(),
         branch: row.target.branch.clone(),
         removed_at: String::new(),
@@ -1046,6 +1052,16 @@ async fn plan_row(
         .await?;
     revision.published_base =
         base_tip.map(|tip| Box::new((format!("refs/heads/{}", ctx.config.branch.base), tip)));
+    // Landed by Git alone, the base contains HEAD itself: that is the commit
+    // a watch on the removed worktree follows to a stage. A landing proven
+    // only by matching patches, with no merge commit recorded above, names
+    // no commit: none of the branch's own is in the base.
+    if landing.local_merged && !revision.head.is_empty() {
+        removed_snapshot.extra.insert(
+            wt_store::LANDING_COMMIT_OID.into(),
+            serde_json::json!(revision.head),
+        );
+    }
     let hazards = revision.hazards.clone();
     let stage_path = path.to_path_buf();
     let stage = row.target.stage.clone();
@@ -1213,16 +1229,6 @@ pub async fn cleanup_confirmed(
     confirmed: &[wt_tui::RemovalRevision],
 ) -> Result<String> {
     cleanup_with_evidence(ctx, confirmed, Evidence::Fresh, None).await
-}
-
-/// Re-plan with the host's confirmed GitHub evidence instead of a new fetch.
-/// `None` proves nothing, so PR-only landings are kept.
-pub async fn cleanup_cached(
-    ctx: &AppContext,
-    confirmed: &[wt_tui::RemovalRevision],
-    github: Option<&Confirmed<GithubData>>,
-) -> Result<String> {
-    cleanup_with_evidence(ctx, confirmed, Evidence::Cached(github), None).await
 }
 
 /// Check the exact board-selected rows after confirmation. Only confirmed
@@ -1665,6 +1671,11 @@ mod tests {
         assert!(landed.landed);
         assert!(landed.hazards.is_empty(), "{:?}", landed.hazards);
         assert_eq!(landed.revision.published_base.as_ref().unwrap().1, tip);
+        // The base holds the patches, not this rebased HEAD: the merge
+        // commit is the only commit that says where the work went.
+        let record = &landed.removed_snapshot.extra;
+        assert_eq!(record["prMergeCommitOid"], "f".repeat(40));
+        assert!(!record.contains_key(wt_store::LANDING_COMMIT_OID));
         assert!(
             row_landings(
                 ctx,
@@ -1754,6 +1765,12 @@ mod tests {
         assert!(landed.hazards.is_empty(), "{:?}", landed.hazards);
         // The proof is the merge and the pushed branch, not a base tip.
         assert!(landed.revision.published_base.is_none());
+        // A watch on the removed worktree follows the merge commit, which
+        // used to be recorded only for a pull request merged at this HEAD.
+        assert_eq!(
+            landed.removed_snapshot.extra["prMergeCommitOid"],
+            "f".repeat(40)
+        );
 
         // A follow-up nobody pushed is not a copy of anything.
         std::fs::write(path.join("later.txt"), "later\n").unwrap();
@@ -1924,8 +1941,27 @@ mod tests {
         };
         // HEAD is the base tip itself: a snapshot, not work that landed.
         assert!(!landed().await);
-        merged_with_a_merge_commit(&fixture, &base).await;
+        let unlanded = plan_with_facts(ctx, vec![row_one(ctx).await], &state, None, None)
+            .await
+            .unwrap();
+        assert!(
+            !unlanded.rows[0]
+                .removed_snapshot
+                .extra
+                .contains_key(wt_store::LANDING_COMMIT_OID)
+        );
+        let (pushed, _) = merged_with_a_merge_commit(&fixture, &base).await;
         assert!(landed().await);
+        // No pull request names a merge commit here. The base contains the
+        // head itself, so that is the commit the removal record keeps for a
+        // watch that follows the removed worktree to a stage.
+        let plan = plan_with_facts(ctx, vec![row_one(ctx).await], &state, None, None)
+            .await
+            .unwrap();
+        let record = &plan.rows[0].removed_snapshot.extra;
+        assert_eq!(record["gitState"], "merged");
+        assert_eq!(record[wt_store::LANDING_COMMIT_OID], pushed);
+        assert!(!record.contains_key("prMergeCommitOid"));
         fixture.close().await.unwrap();
     }
 
@@ -2437,10 +2473,10 @@ mod tests {
         // The readable row was judged on its own evidence, in the order asked.
         let (first, second) = refused.split_once("; two: ").expect(&refused);
         assert!(
-            first.contains("one: landing no longer proven") && !first.contains("git:"),
+            first.contains("one: landing no longer proven") && !first.contains("git exited"),
             "{refused}"
         );
-        assert!(second.contains("git:"), "{refused}");
+        assert!(second.contains("git exited with status 128"), "{refused}");
         assert!(!second.contains("no longer present"), "{refused}");
         assert!(Path::new(&targets[0].path).exists() && broken.exists());
         fixture.close().await.unwrap();
@@ -2695,6 +2731,63 @@ mod tests {
         assert_eq!(
             uncertain.0,
             "Removed 1; unresolved: b: removal job did not report holding the worktree"
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// With the checkout gone the stop hook has nowhere to run. It is
+    /// skipped like the destroy command, so the row is not kept for a hook
+    /// that cannot start.
+    #[tokio::test]
+    async fn a_missing_checkout_is_removed_without_running_the_dev_stop_command() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).dev_server =
+            Some(wt_config::DevServerConfig {
+                command: "true".into(),
+                stop_command: Some("touch ../stop-hook-ran; exit 1".into()),
+                ..Default::default()
+            });
+        let ctx = &fixture.ctx;
+        let path = ctx.cwd.clone();
+        std::fs::remove_dir_all(&path).unwrap();
+        let row = ctx
+            .repository
+            .inventory(&ctx.cancellation)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.target.slug() == "one")
+            .unwrap();
+        assert!(wt_lifecycle::checkout_missing(&row).await);
+        let removed = service(ctx)
+            .unwrap()
+            .remove(
+                &row.target,
+                wt_lifecycle::RemoveOptions {
+                    force: true,
+                    ..Default::default()
+                },
+                &ctx.cancellation,
+            )
+            .await
+            .unwrap();
+        assert!(removed.removed);
+        assert!(
+            removed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("skipped the dev server's stop_command")),
+            "{:?}",
+            removed.warnings
+        );
+        assert!(!path.parent().unwrap().join("stop-hook-ran").exists());
+        assert!(
+            !ctx.repository
+                .inventory(&ctx.cancellation)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.target.slug() == "one")
         );
         fixture.close().await.unwrap();
     }

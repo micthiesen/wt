@@ -120,7 +120,10 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   or stack on this PR is a new worktree, `wt new <slug> --base <this branch>`
   (the `handoff` skill writes its brief and starts its agent). When it must
   not merge yet, such as a removal that waits a release, gate it there:
-  `wt status <state> --blocked-on "<gate>" --until <condition>`.
+  `wt status <state> --blocked-on "<gate>" --until <condition>`. A status
+  change keeps a merge gate; `--unblock`, its `--until` watch, `verified` or
+  `dropped` clears it and a new gate replaces it. A gate set on `todo` says
+  why work has not started, and the status that starts the work clears it.
 - **First push.** If `git push` says the upstream branch does not match the
   current branch, run `git push -u origin HEAD`. Never push to the
   `HEAD:<trunk>` it suggests.

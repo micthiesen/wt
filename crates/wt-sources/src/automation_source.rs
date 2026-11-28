@@ -499,7 +499,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 // Reads start here and arrive through the select above;
                 // this pass uses what has arrived so far.
                 externals.request(&context, &wt_core::watch::needs(&watches), &facts.watch_prs, &facts.branches);
-                let known = crate::watch_facts::facts(&watches, &facts.watch_rows, facts.state_ready, &facts.watch_prs, &externals);
+                let known = crate::watch_facts::facts(&watches, &facts.watch_rows, facts.state_ready, &facts.watch_prs, &externals, &crate::watch_facts::removed_rows(state, context.config.branch.separate_production()));
                 let stamps = crate::watch_facts::stamps(&watches, &known, &row_landings, now);
                 if !stamps.is_empty() && applied_stamps.as_ref() != Some(&(revision, stamps.clone())) {
                     let write = stamps.clone();

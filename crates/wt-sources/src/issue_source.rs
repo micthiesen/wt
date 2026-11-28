@@ -142,6 +142,11 @@ const OUTAGE_RETRY: Duration = Duration::from_secs(60);
 /// Single issues tried after a refused batch to tell one bad id from a
 /// tracker that answers nothing.
 const OUTAGE_PROBES: usize = 3;
+/// A refusal reads the same whether the tracker is down or does not know
+/// the id. When every issue on the board was tried alone and refused, this
+/// many such passes in a row over the same issues charge the issues after
+/// all: a board whose only issues are dead must not rerun on every pass.
+const BLIND_PASSES: u32 = 3;
 
 /// The issues the tracker could not read, and when each is tried again. A
 /// failing issue is read on its own, off the batch it would fail, and at
@@ -156,6 +161,9 @@ struct Unavailable {
     /// Rotates which issues are probed, so ids that fail on their own
     /// cannot pass for an outage on every pass.
     probes: std::sync::atomic::AtomicUsize,
+    /// The issues of the latest passes in which each was refused alone and
+    /// nothing was read, and how many such passes ran in a row.
+    blind: std::sync::Mutex<(Vec<String>, u32)>,
 }
 
 impl Unavailable {
@@ -193,6 +201,42 @@ impl Unavailable {
         if self.outage().take().is_some() {
             tracing::info!("issue tracker available again");
         }
+        self.blind().1 = 0;
+    }
+
+    fn blind(&self) -> std::sync::MutexGuard<'_, (Vec<String>, u32)> {
+        self.blind
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Every one of `ids` was refused alone and nothing was read. Returns
+    /// whether that has now happened often enough to charge the issues.
+    fn refused_blind(&self, ids: &[String]) -> bool {
+        let mut blind = self.blind();
+        if blind.0 == ids {
+            blind.1 = blind.1.saturating_add(1);
+        } else {
+            *blind = (ids.to_vec(), 1);
+        }
+        blind.1 >= BLIND_PASSES
+    }
+
+    /// Charge an issue without proof that the tracker works: it waits the
+    /// base time and no longer, so a tracker that was down after all costs
+    /// its board minutes, not an hour. Returns whether it is news.
+    fn failed_blind(&self, id: &str, error: &str, now: tokio::time::Instant) -> bool {
+        let mut seen = self.seen();
+        let news = seen.get(id).is_none_or(|failing| failing.error != error);
+        let failing = seen.entry(id.to_owned()).or_insert(Failing {
+            error: String::new(),
+            delay: RETRY_BASE,
+            retry_at: now,
+            reported: RETRY_BASE,
+        });
+        failing.error = error.to_owned();
+        failing.retry_at = now + RETRY_BASE.min(failing.delay.max(RETRY_BASE));
+        news
     }
 
     /// Record a failed read. Returns whether it is news: the issue's first
@@ -313,19 +357,23 @@ async fn read_with_fallback(
             let first = unavailable
                 .probes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let at = first % healthy.len();
-            healthy.rotate_left(at);
-            for _ in 0..OUTAGE_PROBES.min(healthy.len()) {
-                let probe = [healthy.remove(0)];
-                if pass.read(&probe).await? {
+            let mut probed = Vec::new();
+            for index in probe_order(healthy.len(), first) {
+                let probe = std::slice::from_ref(&healthy[index]);
+                probed.push(index);
+                if pass.read(probe).await? {
                     break;
                 }
                 pass.alone(&probe[0]);
             }
-            if !pass.working {
-                return Err(pass.down());
+            if pass.working {
+                let mut index = 0;
+                healthy.retain(|_| {
+                    index += 1;
+                    !probed.contains(&(index - 1))
+                });
+                groups.push(healthy);
             }
-            groups.push(healthy);
         }
     }
     while let Some(mut group) = groups.pop() {
@@ -349,12 +397,37 @@ async fn read_with_fallback(
         }
     }
     if !pass.working {
-        // Nothing read: no id is to blame, and none waits longer for it.
-        return match waiting {
-            _ if pass.refused.is_some() => Err(pass.down()),
-            Some(error) => Err(anyhow::Error::msg(error)),
-            None => Ok(pass.statuses),
-        };
+        if pass.refused.is_none() {
+            return match waiting {
+                Some(error) => Err(anyhow::Error::msg(error)),
+                None => Ok(pass.statuses),
+            };
+        }
+        // Nothing read. Unless every issue was refused on its own, pass
+        // after pass, no id is to blame and none waits longer for it.
+        let charged = unavailable.seen();
+        let every_id_alone = ids
+            .iter()
+            .all(|id| pass.alone.iter().any(|(alone, _)| alone == id) || charged.contains_key(id));
+        let known = pass.alone.iter().all(|(id, _)| charged.contains_key(id));
+        drop(charged);
+        if !(every_id_alone && (known || unavailable.refused_blind(ids))) {
+            if !every_id_alone {
+                unavailable.blind().1 = 0;
+            }
+            return Err(pass.down());
+        }
+        let now = tokio::time::Instant::now();
+        for (id, error) in &pass.alone {
+            if unavailable.failed_blind(id, error, now) {
+                tracing::warn!(issue = %id, %error, "issue status unavailable");
+            }
+        }
+        *unavailable.outage() = None;
+        return Err(match pass.refused {
+            Some((error, _)) => error,
+            None => anyhow::anyhow!("issue tracker unavailable"),
+        });
     }
     unavailable.up();
     let now = tokio::time::Instant::now();
@@ -364,6 +437,21 @@ async fn read_with_fallback(
         }
     }
     Ok(pass.statuses)
+}
+
+/// Which of `len` issues to try alone, in order: spread across the set and
+/// starting one further along each time. Issues sort by id, and dead ones
+/// tend to sort together; adjacent probes would all land on them.
+fn probe_order(len: usize, first: usize) -> Vec<usize> {
+    let mut order = Vec::new();
+    let step = (len / OUTAGE_PROBES).max(1);
+    for probe in 0..OUTAGE_PROBES.min(len) {
+        let index = (first + probe * step) % len;
+        if !order.contains(&index) {
+            order.push(index);
+        }
+    }
+    order
 }
 
 /// One pass over the tracker: what it read, and what it refused.
@@ -780,6 +868,113 @@ mod tests {
         assert_eq!(read().await.unwrap().len(), 8);
         assert_eq!(runs(), 1);
         assert!(unavailable.outage().is_none());
+        fixture.close().await.unwrap();
+    }
+
+    /// Refuses the ids named in `dead`; logs each run's ids to `log`.
+    fn tracker(fixture: &wt_app_core::test_support::CommandFixture, dead: &str) -> Vec<String> {
+        let script = fixture.ctx.config.paths.main_clone.join("statuses.sh");
+        let log = fixture.ctx.config.paths.main_clone.join("runs");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {log:?}\nfor id in \"$@\"; do case ' {dead} ' in *\" $id \"*) echo \"not accessible: $id\" >&2; exit 1;; esac; done\nprintf '{{\"issues\":['\nsep=''\nfor id in \"$@\"; do printf '%s{{\"id\":\"%s\",\"status\":\"Done\"}}' \"$sep\" \"$id\"; sep=','; done\nprintf ']}}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        vec![script.to_string_lossy().into_owned(), "{ids}".into()]
+    }
+
+    fn runs(fixture: &wt_app_core::test_support::CommandFixture) -> usize {
+        let log = fixture.ctx.config.paths.main_clone.join("runs");
+        let all = std::fs::read_to_string(&log).unwrap_or_default();
+        std::fs::write(&log, "").unwrap();
+        all.lines().count()
+    }
+
+    /// Issues sort by id and dead ones sort together. Probes spread over
+    /// the set find a live issue on the first pass, so the dead ones are
+    /// charged at once instead of the pass reading as an outage.
+    #[tokio::test]
+    async fn dead_issues_that_sort_first_do_not_pass_for_an_outage() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let command = tracker(&fixture, "COZ-1 COZ-2 COZ-3 COZ-4");
+        let ids = (1..=9).map(|n| format!("COZ-{n}")).collect::<Vec<_>>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let unavailable = Unavailable::default();
+        let read = read_with_fallback(
+            &fixture.ctx,
+            &command,
+            &ids,
+            READ_TIMEOUT,
+            &cancel,
+            &unavailable,
+        )
+        .await
+        .expect("a pass with live issues is not an outage");
+        assert_eq!(
+            read.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["COZ-5", "COZ-6", "COZ-7", "COZ-8", "COZ-9"]
+        );
+        assert_eq!(unavailable.seen().len(), 4);
+        assert!(unavailable.outage().is_none());
+        fixture.close().await.unwrap();
+        assert_eq!(probe_order(9, 0), [0, 3, 6]);
+        assert_eq!(probe_order(9, 1), [1, 4, 7]);
+        assert_eq!(probe_order(2, 5), [1, 0]);
+        assert_eq!(probe_order(1, 7), [0]);
+    }
+
+    /// A refusal does not say whether the tracker is down or the id is
+    /// dead. A board whose only issue is refused pass after pass backs off
+    /// like any dead issue instead of rerunning on every pass as an outage.
+    #[tokio::test]
+    async fn a_board_of_only_dead_issues_backs_off_after_a_few_passes() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let command = tracker(&fixture, "COZ-2");
+        let ids = ["COZ-2".to_owned()];
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let unavailable = Unavailable::default();
+        let read = || {
+            read_with_fallback(
+                &fixture.ctx,
+                &command,
+                &ids,
+                READ_TIMEOUT,
+                &cancel,
+                &unavailable,
+            )
+        };
+        for pass in 1..BLIND_PASSES {
+            assert!(read().await.is_err());
+            assert_eq!(runs(&fixture), 1);
+            assert!(unavailable.seen().is_empty(), "charged on pass {pass}");
+            // The next pass comes after the outage wait.
+            unavailable.outage().as_mut().unwrap().0 = tokio::time::Instant::now();
+        }
+        let error = read().await.unwrap_err();
+        assert!(format!("{error:#}").contains("COZ-2"));
+        assert_eq!(runs(&fixture), 1);
+        assert_eq!(unavailable.seen()["COZ-2"].delay, RETRY_BASE);
+        assert!(unavailable.outage().is_none(), "not a tracker outage");
+        // It now waits like any failing issue: no run until it is due.
+        assert!(read().await.is_err());
+        assert_eq!(runs(&fixture), 0);
+        // Due again and still refused: the same wait, never a longer one
+        // on a guess, and still no outage.
+        unavailable.seen().get_mut("COZ-2").unwrap().retry_at = tokio::time::Instant::now();
+        assert!(read().await.is_err());
+        assert_eq!(runs(&fixture), 1);
+        assert_eq!(unavailable.seen()["COZ-2"].delay, RETRY_BASE);
+        assert!(unavailable.outage().is_none());
+        assert!(read().await.is_err());
+        assert_eq!(runs(&fixture), 0);
         fixture.close().await.unwrap();
     }
 

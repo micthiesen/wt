@@ -533,6 +533,58 @@ fn an_unknown_trigger_skips_its_rule_with_a_warning_instead_of_rejecting_the_con
     assert!(error.contains("automations[0].on is required"), "{error}");
 }
 
+/// A key the palettes keep for themselves used to be swapped for another
+/// letter without a word. The config still loads, and says so.
+#[test]
+fn an_action_key_a_palette_keeps_is_said_and_never_silently_replaced() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let action = |id: &str, key: &str, body: &str| {
+        format!("\n[[actions]]\nid='{id}'\nname='{id}'\nkey='{key}'\n{body}\n")
+    };
+    let shell = "shell='true'";
+    let load =
+        |text: &str| Config::from_raw(toml_value(text), &options(root.path(), &home, &[])).unwrap();
+    let mut text = minimal_config(root.path());
+    for (id, key) in [("quit", "q"), ("merge", "m"), ("free", "x"), ("again", "x")] {
+        text.push_str(&action(id, key, shell));
+    }
+    // d and s are the palette's only where a dev server is configured.
+    text.push_str(&action("deploy", "d", shell));
+    // A slot's action is listed on no palette that takes configured keys.
+    text.push_str(&action("slot", "q", "prompt='go'\ntarget='slot'"));
+    let config = load(&text);
+    assert_eq!(config.actions.len(), 6, "a warning never drops an action");
+    let warned = |id: &str| {
+        config
+            .warnings
+            .iter()
+            .find(|warning| warning.contains(&format!("(\"{id}\")")))
+    };
+    let quit = warned("quit").expect("q closes the palette");
+    assert!(quit.contains("key = \"q\" is not used"), "{quit}");
+    assert!(quit.contains("closing the palette"), "{quit}");
+    assert!(warned("merge").unwrap().contains("merge when ready"));
+    assert!(warned("again").unwrap().contains("\"free\" already has it"));
+    for id in ["free", "deploy", "slot"] {
+        assert!(warned(id).is_none(), "{id}: {:?}", config.warnings);
+    }
+    assert_eq!(config.warnings.len(), 3);
+
+    text.push_str("\n[dev_server]\ncommand='true'\n");
+    let config = load(&text);
+    assert!(
+        config
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("(\"deploy\")")
+                && warning.contains("starting the dev server")),
+        "{:?}",
+        config.warnings
+    );
+}
+
 #[test]
 fn action_and_automation_aliases_normalize_with_defaults_and_constraints() {
     let root = tempfile::tempdir().unwrap();

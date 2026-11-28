@@ -25,8 +25,11 @@ each one (`docs/configuration.md`); a setup with no repository `.wt.toml` uses
 | `$ROOT/logs/<slug>-<time>.log` | Worktree removal logs |
 | `$ROOT/query/*.json`, `$ROOT/remote-query/` | Last snapshot of each board source (`git`, `github`, ...); display-only cache |
 | `$ROOT/events/` | Events daemon: `state.json`, `github.json`, `daemon.out.log`, `daemon.err.log` |
-| `$ROOT/locks/*.lock` | Held operation locks, per slug or `__name__` |
-| `$ROOT/automations.json` | Automation ledger (handled fires, breakers, deferrals) |
+| `$ROOT/locks/*.lock` | Lock files: one per slug operation, numbered slot files (`__process-heavy-<n>`, `__fleet-scan-<n>`, `__dependency-install-<n>`, `__quarantine-delete-<n>`), and for action runs `action-<hash>`, `action-worker-<hash>` (one worktree's running worker) and `action-state-00` to `3f`. Files are never deleted, so a file is not a held lock. `action-run-<run id>` and `action-state-<run id>` are leftovers of older builds |
+| `<git common dir>/wt-locks/` | Repository locks: the origin fetch lock, `main-dependency-sync` and its `.stamp` (the commit the main clone's packages were installed at) |
+| `$ROOT/automations.json` | Automation ledger (handled fires, breakers, deferrals); compact JSON |
+| `$ROOT/automations-queue.<repo-id>.json` | The engine's queue as `wt automations` prints it; rewritten on change and at least once a minute |
+| `$ROOT/wait-github-<repo-id>.json` | The GitHub answer every `wt wait` of the repository shares |
 | `$ROOT/dev/`, `$ROOT/manager/`, `$ROOT/harness.json`, `$ROOT/*-sessions.json` | Dev servers, manager reports, agent session records |
 | `~/.local/state/wt/wt.sqlite` | Authoritative state for all repositories, partitioned by `repo_id` |
 
@@ -46,6 +49,14 @@ level is `info`; `WT_LOG=debug` (a tracing filter) at launch records more.
     jq -r 'select(.fields.event_text) | "\(.timestamp) \(.fields.event_text)"' "$LOG" | tail -50
     jq -r '.target' "$LOG" | sort | uniq -c | sort -rn | head    # what is noisy
     grep -h '<slug>' "$ROOT"/logs/app/wt-native.*.log | jq -c '[.timestamp, .level, .fields]'
+    jq -c 'select(.fields.message == "controller request") | .fields' "$LOG" | tail    # each key that reached the host: lane, queued_ms, run_ms, outcome
+    jq -c 'select(.fields.message | test("^automation (queued|left the queue|engine started)")) | .fields' "$LOG" | tail -40
+
+An automation's `queued` and `left the queue` records pair on `fire` and
+`queued_at_ms`; the left record's `outcome` is `dispatched`, `held`, `dropped`
+or `engine stopped`, and `waited_ms` is how long it queued. `host overlay
+answered` (`load_ms`, `filled`) is a failed-check or dev-log overlay being
+filled. `GitHub fetch` lines say what each read cost and which process made it.
 
 ## State database
 

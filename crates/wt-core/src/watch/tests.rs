@@ -1156,3 +1156,105 @@ fn a_pull_requests_progress_reads_as_states_of_its_worktree() {
     );
     assert!(!watch.is_met());
 }
+
+/// A worktree merged and removed before anything judged the watch: its
+/// removal record answers for it, and a stage follows its landing commit.
+#[test]
+fn a_removed_worktree_answers_from_its_removal_record() {
+    let removed = |merged: bool, production: bool| {
+        let mut facts = WatchFacts::default();
+        facts.rows.insert(
+            "two".into(),
+            RowFacts {
+                merged: Some(merged),
+                production: production.then_some(true),
+                ..RowFacts::default()
+            },
+        );
+        facts
+    };
+    let mut landed = removed(true, false);
+    let mut merged = watch(&["wt:two:merged"]);
+    assert_eq!(pass(&mut merged, &landed, NOON).truths, [Truth::Holds]);
+    assert!(merged.is_met());
+
+    // A stage with no landing commit on the record cannot be followed.
+    let mut staged = watch(&["wt:two:staging"]);
+    assert!(matches!(
+        &pass(&mut staged, &landed, NOON).truths[..],
+        [Truth::Unknown(reason)] if reason.contains("commit that landed it was not recorded")
+    ));
+    assert!(never_holds(&staged.when[0], &landed).is_some());
+    // With one, the condition becomes that commit reaching the stage.
+    landed
+        .removed_landings
+        .insert("two".into(), "c0ffee1".into());
+    assert_eq!(
+        pass(&mut staged, &landed, NOON).truths,
+        [Truth::Unknown(
+            "not known whether c0ffee1 reached staging".into()
+        )]
+    );
+    assert_eq!(
+        staged.when[0].cond,
+        Condition::Commit {
+            oid: "c0ffee1".into(),
+            stage: VerifyStage::Staging
+        }
+    );
+    landed
+        .commits
+        .insert(("c0ffee1".into(), VerifyStage::Staging), true);
+    assert_eq!(pass(&mut staged, &landed, NOON).truths, [Truth::Holds]);
+    // The record itself may already say production.
+    let mut shipped = watch(&["wt:two:production"]);
+    assert_eq!(
+        pass(&mut shipped, &removed(true, true), NOON).truths,
+        [Truth::Holds]
+    );
+
+    // Removed without merging: never merged, and the reason says why.
+    for arg in ["wt:two:merged", "wt:two:production"] {
+        let mut waiting = watch(&[arg]);
+        let unlanded = removed(false, false);
+        let truths = pass(&mut waiting, &unlanded, NOON).truths;
+        assert!(
+            matches!(&truths[..], [Truth::Unknown(reason)] if reason.contains("removed without merging")),
+            "{arg}: {truths:?}"
+        );
+        assert!(never_holds(&waiting.when[0], &unlanded).is_some());
+        assert!(!waiting.is_met());
+    }
+    // Nothing but a landing outlives the worktree.
+    let ready = cond("wt:two:ready");
+    assert_eq!(
+        never_holds(&ready, &removed(true, false)).as_deref(),
+        Some("two was removed and can no longer become ready")
+    );
+    assert_eq!(
+        never_holds(&cond("wt:two:merged"), &removed(true, false)),
+        None
+    );
+
+    // A later worktree with the slug is a live row: the old record is not
+    // asked, and a slug with no record is only unknown.
+    let mut reborn = WatchFacts::default();
+    reborn.rows.insert(
+        "two".into(),
+        RowFacts {
+            exists: true,
+            merged: Some(false),
+            ..RowFacts::default()
+        },
+    );
+    let mut again = watch(&["wt:two:merged"]);
+    assert_eq!(pass(&mut again, &reborn, NOON).truths, [Truth::NotYet]);
+    assert_eq!(never_holds(&again.when[0], &reborn), None);
+    let mut gone = WatchFacts::default();
+    gone.rows.insert("two".into(), RowFacts::default());
+    assert!(matches!(
+        &pass(&mut again, &gone, NOON).truths[..],
+        [Truth::Unknown(reason)] if reason == "not known whether two is merged"
+    ));
+    assert_eq!(never_holds(&again.when[0], &gone), None);
+}

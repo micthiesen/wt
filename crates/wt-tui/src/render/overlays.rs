@@ -59,17 +59,18 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         help(frame, model, area);
     }
     let primary = model.primary_harness().to_owned();
+    let log_close_key = model.log_close_key;
     match &mut model.interaction {
         Interaction::Reviewers(picker) => reviewers(frame, area, picker),
         Interaction::Log {
             title,
             lines,
             scroll,
-        } => log(frame, area, title, lines, scroll),
+        } => log(frame, area, title, lines, scroll, log_close_key),
         Interaction::Confirm(confirm) => confirmation(frame, area, confirm),
         Interaction::Automations { scroll } => automations(frame, area, &model.board, scroll),
         Interaction::Timeline(view) => super::timeline::modal(frame, area, &model.board, view),
-        Interaction::Loading(loading) => self::loading(frame, area, &loading.title),
+        Interaction::Loading(loading) => self::loading(frame, area, loading),
         Interaction::Picker(picker) => {
             let summary = session_summary(&model.board, picker);
             self::picker(frame, area, picker, &primary, summary.as_deref())
@@ -889,7 +890,7 @@ fn confirm_verb(action: &ConfirmAction) -> &'static str {
         ConfirmAction::Remove { .. } => "remove",
         ConfirmAction::DeleteSection { .. } => "delete",
         ConfirmAction::DismissFailedRemoval { .. } => "dismiss",
-        ConfirmAction::Cleanup { .. } | ConfirmAction::CleanupTargets { .. } => "clean",
+        ConfirmAction::CleanupTargets { .. } => "clean",
         ConfirmAction::ManagedSignIn { .. } => "sign in",
         #[allow(unreachable_patterns)]
         _ => "confirm",
@@ -945,10 +946,7 @@ fn confirm_line_kind(line: &str) -> (Option<(&'static str, Color)>, Style) {
 /// Wrapped confirmation body: one entry of styled visual rows per logical
 /// line. The first line names the subject, so it is bright.
 fn confirm_rows(confirm: &ConfirmPrompt, width: usize) -> Vec<Vec<Line<'static>>> {
-    if matches!(
-        confirm.action,
-        ConfirmAction::CleanupTargets { .. } | ConfirmAction::Cleanup { .. }
-    ) {
+    if matches!(confirm.action, ConfirmAction::CleanupTargets { .. }) {
         return cleanup_rows(&confirm.lines, width);
     }
     confirm
@@ -1161,10 +1159,35 @@ fn max_entry_offset(rows: &[Vec<Line<'static>>], visible: usize) -> usize {
 
 // ── Logs and performance ────────────────────────────────────────────────
 
+/// How long a load runs before its overlay says for how long. The
+/// controller reports on a running request every few seconds, and each
+/// report redraws the frame, so the figure moves without a timer.
+const LOADING_SAID_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The keys that close an overlay, its own included.
+fn close_keys(own: Option<char>) -> String {
+    match own {
+        Some(key) => format!("esc / q / {key}"),
+        None => "esc / q".into(),
+    }
+}
+
+/// What a loading overlay reads after `elapsed`.
+fn loading_text(elapsed: std::time::Duration) -> String {
+    if elapsed < LOADING_SAID_AFTER {
+        "loading…".into()
+    } else {
+        format!("loading… {}s", elapsed.as_secs())
+    }
+}
+
 /// A log overlay whose content is still being fetched: the frame the log
 /// will fill, so the key shows at once and Esc has something to close.
-fn loading(frame: &mut Frame<'_>, area: Rect, title: &str) {
-    let modal = Modal::new(title, vec![hint("esc / q", "cancel")]);
+fn loading(frame: &mut Frame<'_>, area: Rect, loading: &crate::model::LoadingPrompt) {
+    let modal = Modal::new(
+        loading.title.as_str(),
+        vec![hint(close_keys(loading.close_key), "cancel")],
+    );
     let outer = if area.width < NARROW_WIDTH {
         modal.place(area, area.width as usize, 1, true)
     } else {
@@ -1175,10 +1198,23 @@ fn loading(frame: &mut Frame<'_>, area: Rect, title: &str) {
     if body.width == 0 || body.height == 0 {
         return;
     }
-    frame.render_widget(Paragraph::new(Line::styled("loading…", theme::dim())), body);
+    frame.render_widget(
+        Paragraph::new(Line::styled(
+            loading_text(loading.started.elapsed()),
+            theme::dim(),
+        )),
+        body,
+    );
 }
 
-fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll: &mut usize) {
+fn log(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    scroll: &mut usize,
+    close_key: Option<char>,
+) {
     if title == cleanup::LOG_TITLE {
         cleanup_log(frame, area, title, lines, scroll);
         return;
@@ -1188,7 +1224,7 @@ fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll:
         vec![
             hint("j/k", "scroll"),
             hint("g/G", "top / bottom"),
-            hint("esc / q", "close"),
+            hint(close_keys(close_key), "close"),
         ],
     );
     let outer = if area.width < NARROW_WIDTH {
@@ -2957,8 +2993,8 @@ mod tests {
         assert_eq!(max_entry_offset(&[], 3), 0);
     }
 
-    #[test]
-    fn a_loading_overlay_shows_its_title_and_how_to_leave() {
+    #[tokio::test(start_paused = true)]
+    async fn a_loading_overlay_shows_its_title_and_how_to_leave() {
         let mut model = Model {
             interaction: Interaction::Loading(crate::model::LoadingPrompt {
                 title: "Failed checks: feature/one".into(),
@@ -2974,8 +3010,24 @@ mod tests {
             let text = rows(&buffer).join("\n");
             assert!(text.contains("Failed checks: feature/one"), "{text}");
             assert!(text.contains("loading…"), "{text}");
-            assert!(text.contains("esc / q cancel"), "{text}");
+            // Its own key closes it too, and the hint says so.
+            assert!(text.contains("esc / q / f cancel"), "{text}");
+            assert!(!text.contains("loading… 0s"), "{text}");
         }
+        // A load that is taking a while says for how long, so a slow host
+        // does not look like a hung terminal.
+        tokio::time::advance(std::time::Duration::from_secs(7)).await;
+        let text = rows(&draw(&mut model, 120, 40)).join("\n");
+        assert!(text.contains("loading… 7s"), "{text}");
+        // The filled log names the same keys.
+        model.log_close_key = Some('f');
+        model.interaction = Interaction::Log {
+            title: "Failed checks: feature/one #9".into(),
+            lines: vec!["a".into()],
+            scroll: 0,
+        };
+        let text = rows(&draw(&mut model, 120, 40)).join("\n");
+        assert!(text.contains("esc / q / f close"), "{text}");
     }
 
     #[test]

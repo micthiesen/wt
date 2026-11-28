@@ -570,9 +570,6 @@ pub async fn execute_with_shutdown(
         UiAction::CleanupTargets { targets } => Ok(message(
             lifecycle_ops::cleanup_targets_cached(ctx, &targets, github).await?,
         )),
-        UiAction::Cleanup { revisions } => Ok(message(
-            lifecycle_ops::cleanup_cached(ctx, &revisions, github).await?,
-        )),
         UiAction::ToggleArchive { key, seen } => {
             if wt_core::is_remote_worktree_ledger_key(&key) {
                 let row = board

@@ -145,7 +145,9 @@ struct State {
 pub(crate) struct Admission {
     budget: ProcessBudget,
     state: Mutex<State>,
-    /// Cross-process slots a heavy command also takes after local admission.
+    /// Cross-process slots for heavy commands. `ProcessRunner::admit` tries
+    /// one only while it holds the local permit and waits for one only with
+    /// no permit in hand, so neither is held idle behind the other.
     heavy: OnceLock<MachineSlots>,
     /// Cross-process slots held for the length of one whole-fleet read.
     fleet_scans: OnceLock<MachineSlots>,

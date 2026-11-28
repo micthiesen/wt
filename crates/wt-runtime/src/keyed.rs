@@ -108,6 +108,23 @@ pub struct KeyedPolicy {
 /// (with the turn it holds across processes) would never be read.
 const SWEEP_PATIENCE: Duration = Duration::from_secs(5);
 
+/// Whole refreshes this close together are one request. Several owners ask
+/// for the first load within moments of each other at start (the host, then
+/// the terminal), and a refresh is a repair, not a confirmation: nothing
+/// waits on its reads having started after it, which is what `Direct` is
+/// for. A whole `Recheck` reports a change at a moment and is never folded.
+const REFRESH_BURST: Duration = Duration::from_secs(2);
+
+/// A sweep under way, for the line logged when it ends.
+struct SweepLog {
+    asked: Instant,
+    cause: Request,
+    /// Rows it has yet to read.
+    pending: std::collections::BTreeSet<String>,
+    listed: bool,
+    reads: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Class {
     Sweep,
@@ -217,6 +234,9 @@ struct Engine<R: KeyedReader> {
     turn: Turn<R::Sweep>,
     busy_since: Option<Instant>,
     announced: bool,
+    name: &'static str,
+    last_refresh: Option<Instant>,
+    sweep: Option<SweepLog>,
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -233,7 +253,27 @@ fn panic_message_ref(payload: &Box<dyn std::any::Any + Send>) -> &str {
 
 impl<R: KeyedReader> Engine<R> {
     fn absorb(&mut self, demand: Demand, now: Instant) {
-        if let Some(request) = demand.whole {
+        let burst = demand.whole == Some(Request::Refresh)
+            && self
+                .last_refresh
+                .is_some_and(|at| now.duration_since(at) < REFRESH_BURST);
+        if let Some(request) = demand.whole.filter(|_| !burst) {
+            if request == Request::Refresh {
+                self.last_refresh = Some(now);
+            }
+            let pending = self.rows.keys().cloned().collect();
+            match &mut self.sweep {
+                Some(sweep) => sweep.pending = pending,
+                None => {
+                    self.sweep = Some(SweepLog {
+                        asked: now,
+                        cause: request,
+                        pending,
+                        listed: false,
+                        reads: 0,
+                    });
+                }
+            }
             let class = if request == Request::Direct {
                 Class::User
             } else {
@@ -454,6 +494,12 @@ impl<R: KeyedReader> Engine<R> {
                 }
                 match value {
                     Ok(value) => {
+                        if let Some(sweep) = &mut self.sweep
+                            && flight.started >= sweep.asked
+                            && sweep.pending.remove(&key)
+                        {
+                            sweep.reads += 1;
+                        }
                         let listed = if flight.entry == row.entry {
                             row.listed
                         } else {
@@ -537,6 +583,19 @@ impl<R: KeyedReader> Engine<R> {
                 flight.cancel.cancel();
             }
         }
+        if let Some(sweep) = &mut self.sweep
+            && started >= sweep.asked
+        {
+            // Rows it found are its to read; rows that left are not.
+            sweep.pending.retain(|key| self.rows.contains_key(key));
+            sweep.pending.extend(
+                self.rows
+                    .iter()
+                    .filter(|(_, row)| row.value.is_none())
+                    .map(|(key, _)| key.clone()),
+            );
+            sweep.listed = true;
+        }
         self.order = order;
         self.index_at = Some(started);
         self.failed = None;
@@ -552,6 +611,31 @@ impl<R: KeyedReader> Engine<R> {
             },
             _ => want,
         });
+    }
+
+    /// Say what a finished sweep cost. Sweeps are the expensive reads, and
+    /// one that runs when nothing asked for it should be visible without
+    /// debug logging.
+    fn log_sweep(&mut self, now: Instant) {
+        if self
+            .sweep
+            .as_ref()
+            .is_some_and(|sweep| sweep.listed && sweep.pending.is_empty())
+            && let Some(sweep) = self.sweep.take()
+        {
+            tracing::info!(
+                source = self.name,
+                rows = sweep.reads,
+                of = self.rows.len(),
+                duration_ms = now.duration_since(sweep.asked).as_millis() as u64,
+                cause = match sweep.cause {
+                    Request::Recheck => "unrouted change",
+                    Request::Refresh => "refresh",
+                    Request::Direct => "user action",
+                },
+                "sweep completed"
+            );
+        }
     }
 
     /// Requests still wanted or in flight.
@@ -662,6 +746,7 @@ pub fn start_keyed_source<R: KeyedReader>(
     reader: R,
 ) -> LeafHandle<Vec<R::Row>> {
     let refresh = spec.policy;
+    let name = spec.name;
     let (handle, mut publisher) = leaf_channel(scope, spec);
     let token = scope.token();
     scope.spawn(async move {
@@ -686,10 +771,14 @@ pub fn start_keyed_source<R: KeyedReader>(
             turn: Turn::None,
             busy_since: None,
             announced: false,
+            name,
+            last_refresh: None,
+            sweep: None,
         };
         let mut flights: Flights<R> = FuturesUnordered::new();
         loop {
             let now = Instant::now();
+            engine.log_sweep(now);
             engine.publish(&publisher);
             let due = engine.pump(&mut flights, now);
             let announce = engine.announce(&publisher, now);
@@ -914,7 +1003,7 @@ mod tests {
         assert_eq!(first.data().unwrap().len(), 5);
         assert_eq!(fake.reads().len(), 5);
 
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let accepted = Stamp::now();
         fake.with(|state| state.values.insert("c".into(), 7));
         source.request_keys(Request::Direct, ["c"]);
@@ -949,7 +1038,7 @@ mod tests {
         let fake = Fake::new(&keys.iter().map(String::as_str).collect::<Vec<_>>());
         let source = start(&scope, &fake);
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         let swept = Stamp::now();
         let before = fake.reads().len();
@@ -1002,24 +1091,40 @@ mod tests {
         source.refresh();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fake.reads().len(), 4);
-        let second = Stamp::now();
-        // Two callers ask for the first load a moment apart, as at start.
+        // Two callers ask for the first load a moment apart, as at start:
+        // one request, one read of each row.
         source.refresh();
-        source
-            .subscribe()
+        let mut updates = source.subscribe();
+        updates
+            .wait_for(|snapshot| *snapshot.state() == SourceState::Ready)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        source.refresh();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(fake.reads().len(), 8, "a refresh was read twice");
+
+        // A change nothing could route arrives while a later sweep is under
+        // way: only the reads that had already started are repeated.
+        source.refresh();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fake.reads().len(), 11);
+        let changed = Stamp::now();
+        source.request(Request::Recheck);
+        updates
             .wait_for(|snapshot| {
                 *snapshot.state() == SourceState::Ready
                     && snapshot.domains()[&Domain::Git]
                         .observed()
-                        .at_or_after(&second)
+                        .at_or_after(&changed)
                         == Some(true)
             })
             .await
             .unwrap();
         assert_eq!(
             fake.reads().len(),
-            12,
-            "the four reads in flight are repeated, the four not yet started are not"
+            19,
+            "the three reads in flight are repeated, the five not yet started are not"
         );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
@@ -1030,7 +1135,7 @@ mod tests {
         let fake = Fake::new(&["a", "b"]);
         let source = start(&scope, &fake);
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let accepted = Stamp::now();
         fake.with(|state| {
             state.listing = vec![("a".into(), 0), ("c".into(), 0)];
@@ -1080,7 +1185,7 @@ mod tests {
         let fake = Fake::new(&["a", "b"]);
         let source = start(&scope, &fake);
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let urgent = fake.with(|state| state.urgent.len());
         // A background read of "a" is in flight when a listing shows the key
         // at another path.
@@ -1123,7 +1228,7 @@ mod tests {
             fake.clone(),
         );
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         source.request_keys(Request::Recheck, ["a"]);
         tokio::time::sleep(Duration::from_millis(150)).await;
         // The listing now says something new about "a" (a new branch). Its
@@ -1160,7 +1265,7 @@ mod tests {
         let fake = Fake::new(&["a", "a#2", "b"]);
         let source = start(&scope, &fake);
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let reads = fake.reads().len();
         let accepted = Stamp::now();
         source.request_keys(Request::Direct, ["a"]);
@@ -1184,7 +1289,7 @@ mod tests {
         assert_eq!(keys, ["a", "b"]);
         // A newer read of one of them alone does not move the shared stamp:
         // the other is as old as it was.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let later = Stamp::now();
         let revision = source.snapshot().revision();
         source.request_keys(Request::Recheck, ["a#2"]);
@@ -1203,7 +1308,7 @@ mod tests {
         let fake = Fake::new(&["a", "b", "c", "d", "e", "f"]);
         let source = start(&scope, &fake);
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         // Three rows change faster than they can be read, which takes every
         // background lane.
         let busy = source.clone();
@@ -1250,13 +1355,14 @@ mod tests {
         loaded(&source).await;
         let live = source.snapshot().domains()[&Domain::Git].observed();
         fake.with(|state| state.listing_error = Some("offline".into()));
+        tokio::time::sleep(Duration::from_secs(3)).await;
         source.refresh();
         let mut updates = source.subscribe();
         updates
             .wait_for(|snapshot| matches!(snapshot.state(), SourceState::Failed(_)))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let failed = source.snapshot();
         assert!(matches!(failed.state(), SourceState::Failed(_)));
         assert_eq!(failed.data().unwrap().len(), 2);
@@ -1309,7 +1415,7 @@ mod tests {
         loaded(&source).await;
         assert_eq!(fake.with(|state| state.turns), 0);
         assert_eq!(fake.with(|state| state.urgent.len()), 6);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         let reads = fake.reads().len();
         let swept = Stamp::now();
@@ -1372,7 +1478,7 @@ mod tests {
             fake.clone(),
         );
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let (reads, listings) = (fake.reads().len(), fake.with(|state| state.listings));
         // An isolated event waits only for the debounce.
         source.request_keys(Request::Recheck, ["a"]);
@@ -1398,7 +1504,7 @@ mod tests {
         let fake = Fake::new(&["a", "b"]);
         let source = start(&scope, &fake);
         loaded(&source).await;
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let reads = fake.reads().len();
         source.request_keys(Request::Recheck, ["a"]);
         tokio::time::sleep(Duration::from_millis(40)).await;

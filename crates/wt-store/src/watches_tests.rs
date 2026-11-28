@@ -851,9 +851,17 @@ fn an_earlier_incarnations_removal_record_says_nothing_about_a_later_watch() {
 #[test]
 fn clearing_the_gate_is_one_write_and_a_changed_gate_takes_the_watch_with_it() {
     let (_temp, mut store) = store();
-    store
-        .set_slug_work_status("one", Some(&status(Some("after #7"))))
-        .unwrap();
+    let mut gated = status(Some("after #7"));
+    gated.extra.insert(
+        crate::GATE_ORIGIN.into(),
+        serde_json::json!({"state": "ready", "gate": "after #7"}),
+    );
+    store.set_slug_work_status("one", Some(&gated)).unwrap();
+    assert!(
+        store.read_wt_state().unwrap()["slugs"]["one"]["work"]
+            .get(crate::GATE_ORIGIN)
+            .is_some()
+    );
     let both = || {
         then(|then| {
             then.unblock = Some("after #7".into());
@@ -874,6 +882,13 @@ fn clearing_the_gate_is_one_write_and_a_changed_gate_takes_the_watch_with_it() {
         UnblockDelivery::Cleared
     );
     assert_eq!(gate(&mut store), None);
+    // Where the gate was asserted goes with it: left behind, it would be
+    // read as the origin of the next gate with the same text.
+    assert!(
+        store.read_wt_state().unwrap()["slugs"]["one"]["work"]
+            .get(crate::GATE_ORIGIN)
+            .is_none()
+    );
     let left = store.list_watches(None).unwrap().remove(0);
     assert_eq!(crate::cleared_gate(&left), Some("after #7"));
     assert_eq!(

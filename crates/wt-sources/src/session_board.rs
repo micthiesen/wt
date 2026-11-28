@@ -165,6 +165,13 @@ fn compose(
         } else {
             state_name(session.extras.derived_state)
         };
+        // The transcript was last read while the session ran. Its process is
+        // gone now, and only a running one can be working or waiting: say
+        // nothing of it until the read that follows its exit says how it
+        // ended, as the row's glyph already does.
+        if inventory_ok && !live && matches!(state, "working" | "asking" | "polling" | "waiting") {
+            state = "unknown";
+        }
         if live
             && !identity_unproven
             && let Some(inputs) = activity.data()
@@ -931,6 +938,99 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(3));
         let recurred = pass(board).data().unwrap().attention[0].at_ms;
         assert!(recurred > first);
+    }
+
+    /// The row's glyph clears when its session's process exits. The details
+    /// line reads the same prepared state: what the transcript said while
+    /// the session ran (waiting, working) is not said of one that is gone.
+    #[test]
+    fn a_session_whose_process_exited_is_not_shown_in_a_running_state() {
+        let board = SourceSnapshot::test_live(
+            Some(Board {
+                rows: vec![BoardRow {
+                    key: "one".into(),
+                    slug: "one".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            SourceState::Ready,
+            Domain::Git,
+        );
+        let discovered = |state| {
+            SourceSnapshot::test_live(
+                Some(vec![DiscoveredSession {
+                    key: SessionKey {
+                        slug: "one".into(),
+                        harness: wt_core::HarnessId::Claude,
+                        session_id: "id".into(),
+                    },
+                    session: HarnessSession {
+                        display_name: "primary".into(),
+                        session_id: "id".into(),
+                        tmux_session_name: "one".into(),
+                        last_active_ms: None,
+                        is_live: true,
+                        extras: HarnessExtras {
+                            derived_state: Some(state),
+                            ..Default::default()
+                        },
+                    },
+                }]),
+                SourceState::Ready,
+                Domain::Sessions,
+            )
+        };
+        let mut running = SessionInventory::default();
+        running.all.insert(
+            "one".into(),
+            crate::session_source::SessionDescriptor {
+                name: "one".into(),
+                id: "$1".into(),
+                created_at: 0,
+                attached_clients: 0,
+                window_count: 1,
+                harness_session_id: None,
+            },
+        );
+        let shown = |inventory: SessionInventory, state| {
+            let result = compose(
+                &mut FailureClock::default(),
+                board.clone(),
+                SourceSnapshot::test_live(Some(inventory), SourceState::Ready, Domain::Sessions),
+                discovered(state),
+                SourceSnapshot::default(),
+                &[],
+            );
+            let row = &result.data().unwrap().rows[0];
+            (
+                row.sessions[0].state.clone(),
+                row.sessions[0].live,
+                row.live_sessions.len(),
+            )
+        };
+        assert_eq!(
+            shown(running, DerivedState::Waiting),
+            ("waiting".into(), true, 1)
+        );
+        // The process is gone; the transcript has not been read again yet.
+        for stale in [
+            DerivedState::Waiting,
+            DerivedState::Working,
+            DerivedState::Asking,
+            DerivedState::Polling,
+        ] {
+            assert_eq!(
+                shown(SessionInventory::default(), stale),
+                ("unknown".into(), false, 0),
+                "{stale:?}"
+            );
+        }
+        // How it ended is said once that is read.
+        for ended in [DerivedState::Idle, DerivedState::Abandoned] {
+            let (state, live, _) = shown(SessionInventory::default(), ended);
+            assert_eq!((state.as_str(), live), (state_name(Some(ended)), false));
+        }
     }
 
     #[test]

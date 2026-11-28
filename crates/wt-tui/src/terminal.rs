@@ -895,7 +895,24 @@ fn log_latencies(samples: &mut Vec<f64>, coalesced: &mut usize) {
 
 /// Send the action a reply or a new snapshot queued behind it.
 fn send_follow_up(model: &mut Model, outbox: Outbox<'_>) {
-    model.release_creation_moves();
+    // A follow-up that waited for room was meant for the view of the reply
+    // that queued it. A key has acted since: sending it now would act under
+    // the person's hands, so it is dropped, and said.
+    if let Some((kept_at, kept)) = model.follow_up_kept.take()
+        && kept_at != model.ui_generation
+        && model.follow_up.as_ref() == Some(&kept)
+    {
+        model.follow_up = None;
+        model.toast = Some((
+            "a queued action was not sent: actions were busy".into(),
+            ToastTone::Notice,
+        ));
+    }
+    // A move chosen for a row still being created is released only into a
+    // free slot, so it waits where a key cannot orphan it.
+    if model.follow_up.is_none() && outbox.requests.capacity() > 0 {
+        model.release_creation_moves();
+    }
     let Some(action) = model.follow_up.take() else {
         return;
     };
@@ -906,6 +923,7 @@ fn send_follow_up(model: &mut Model, outbox: Outbox<'_>) {
     // queued itself. A full queue keeps it for the next reply or snapshot,
     // each of which is when room appears.
     let Ok(permit) = outbox.requests.try_reserve() else {
+        model.follow_up_kept = Some((model.ui_generation, action.clone()));
         model.follow_up = Some(action);
         return;
     };
@@ -1181,6 +1199,9 @@ mod request_channel_tests {
         );
         assert!(model.pending_request.is_none());
         assert!(model.toast.is_none());
+        // Still no room, and no key since: it keeps waiting.
+        send_follow_up(&mut model, outbox);
+        assert_eq!(model.follow_up, Some(queued.clone()));
         // The next reply or snapshot finds room and sends it.
         controller.requests.try_recv().unwrap();
         send_follow_up(&mut model, outbox);
@@ -1191,6 +1212,55 @@ mod request_channel_tests {
             sent = Some(request.action);
         }
         assert_eq!(sent, Some(queued));
+    }
+
+    /// A follow-up was queued for the view its reply found. Once a key has
+    /// acted, room appearing must not send it under the person's hands.
+    #[tokio::test]
+    async fn a_kept_follow_up_is_dropped_once_a_key_has_acted() {
+        let (actions, mut controller) = crate::action_channel();
+        let outbox = Outbox {
+            requests: &actions.requests,
+            background: &actions.background,
+            views: &actions.views,
+        };
+        while actions
+            .requests
+            .try_send(crate::UiRequest {
+                id: 0,
+                generation: 0,
+                action: UiAction::HardRefresh,
+                cancellation: None,
+            })
+            .is_ok()
+        {}
+        let mut model = Model {
+            follow_up: Some(UiAction::CyclePrimary),
+            ..Model::default()
+        };
+        send_follow_up(&mut model, outbox);
+        assert!(model.follow_up.is_some());
+        // A key that does something: here, opening help.
+        model.input(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('?')),
+            20,
+        );
+        while controller.requests.try_recv().is_ok() {}
+        send_follow_up(&mut model, outbox);
+        assert!(model.follow_up.is_none());
+        assert!(model.pending_request.is_none());
+        assert!(
+            controller.requests.try_recv().is_err(),
+            "the stale follow-up was sent"
+        );
+        assert_eq!(model.toast.as_ref().unwrap().1, ToastTone::Notice);
+        // The next follow-up is its own: it is not judged by the old mark.
+        model.follow_up = Some(UiAction::CyclePrimary);
+        send_follow_up(&mut model, outbox);
+        assert_eq!(
+            controller.requests.try_recv().map(|request| request.action),
+            Ok(UiAction::CyclePrimary)
+        );
     }
 
     #[tokio::test]

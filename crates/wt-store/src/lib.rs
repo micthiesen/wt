@@ -24,13 +24,14 @@ pub use migrations::{
     CURRENT_WT_STATE_VERSION, MigrationOutcome, migrate_wt_state, raw_wt_state_version,
 };
 pub use mutations::{
-    BaseUpdate, ClearFailedRemoval, LayoutChanged, RemovedSettle, SeenToggle, ShownSection,
-    ShownUnit, is_merged_removal, only_checks_left, verification_owed_at_removal,
+    BaseUpdate, ClearFailedRemoval, GATE_ORIGIN, LayoutChanged, RemovedSettle, SeenToggle,
+    ShownSection, ShownUnit, is_merged_removal, only_checks_left, verification_owed_at_removal,
     work_status_event,
 };
 pub use owed::{
-    CheckTargets, ChecksClosed, DisplacedCheck, OwedClosed, RemovedChecksClosed, WakeCompletion,
-    kept_checks_lost, removed_due_untold, removed_landing, removed_owed_items, stored_owed,
+    CheckTargets, ChecksClosed, DisplacedCheck, LANDING_COMMIT_OID, OwedClosed,
+    RemovedChecksClosed, WakeCompletion, kept_checks_lost, removed_due_untold, removed_landing,
+    removed_owed_items, stored_owed,
 };
 pub use stamps::{stored_pending_stamp, stored_stamp};
 pub use store::{Store, StoreError};

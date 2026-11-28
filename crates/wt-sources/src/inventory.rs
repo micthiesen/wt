@@ -240,6 +240,7 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
             .environments
             .get(wt_core::VerifyStage::Production)
             .is_some(),
+        github_off: std::env::var("WT_GITHUB").as_deref() == Ok("off"),
         actions: action_catalog(config),
     }
 }

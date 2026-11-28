@@ -61,30 +61,8 @@ pub async fn picker_slug(
     Ok(picker_agent(context, key, target).await?.slug)
 }
 
-/// Cached history nominates conversations; live tmux identity is checked again
-/// when a selection is attached. No transcript discovery runs on this path.
-pub async fn cached_session_options(
-    context: &AppContext,
-    key: Option<String>,
-    target: SessionTarget,
-    discoveries: &[crate::session_discovery::DiscoveredSession],
-) -> Result<(String, Vec<SessionMenuEntry>)> {
-    let agent = picker_agent(context, key.as_deref(), target).await?;
-    let app = AppHarness::new(context);
-    let live = app.session_inventory(context).await?;
-    let options = picker_entries(
-        &visible_harnesses(&context.config),
-        &agent,
-        key,
-        target,
-        discoveries,
-        &live,
-    );
-    Ok((agent.slug, options))
-}
-
 /// Prepared picker entries for one target, from the discovery snapshot and one
-/// tmux inventory. The board and the host's cached path both build from here,
+/// tmux inventory. Every host's board builds its pickers from here,
 /// so a row means the same thing wherever it is shown.
 pub fn picker_entries(
     visible: &[HarnessId],
@@ -1044,52 +1022,6 @@ mod tests {
         fixture.close().await.unwrap();
         assert!(crate::host_errors::error_reply(&unseen.err().unwrap()).stale);
         assert!(!crate::host_errors::error_reply(&seen.err().unwrap()).stale);
-    }
-
-    #[tokio::test]
-    async fn cached_picker_opens_with_unreadable_history_database() {
-        let mut fixture = crate::test_support::CommandFixture::new().await.unwrap();
-        std::sync::Arc::make_mut(&mut fixture.ctx.config)
-            .tmux
-            .socket = format!(
-            "wt-cached-picker-{}",
-            fixture._root.path().file_name().unwrap().to_string_lossy()
-        );
-        let database = fixture.ctx.home.join(".local/share/opencode/opencode.db");
-        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
-        std::fs::write(&database, "invalid SQLite database").unwrap();
-        let app = AppHarness::new(&fixture.ctx);
-        app.tmux
-            .create_session(
-                &wt_tmux::CreateSession {
-                    name: "one-opencode".into(),
-                    cwd: fixture.ctx.cwd.clone(),
-                    command: vec!["sleep".into(), "30".into()],
-                    width: None,
-                    height: None,
-                },
-                &fixture.ctx.cancellation,
-            )
-            .await
-            .unwrap();
-        let result = cached_session_options(
-            &fixture.ctx,
-            Some("one".into()),
-            SessionTarget::Harness,
-            &[],
-        )
-        .await;
-        app.tmux
-            .kill_session("one-opencode", &fixture.ctx.cancellation)
-            .await
-            .unwrap();
-        fixture.close().await.unwrap();
-        let (_, options) = result.unwrap();
-        assert!(
-            options
-                .iter()
-                .any(|option| option.is_live && option.selection.harness == HarnessId::Opencode)
-        );
     }
 
     #[tokio::test]

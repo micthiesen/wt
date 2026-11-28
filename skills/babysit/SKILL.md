@@ -147,7 +147,8 @@ are not failing, no open threads, not `conflicting`, and none of these holds:
 
 - `blockedOn` is set. `wt status --unblock` only if the gate is satisfied;
   otherwise say why you stopped. A status change keeps the gate: only
-  `--unblock`, its `--until` watch, `verified` or `dropped` clears it.
+  `--unblock`, its `--until` watch, `verified` or `dropped` clears it, and a
+  new `--blocked-on` replaces it.
 - Your stack parent (`.base` is another live worktree's branch) has not
   landed. If the order looks wrong, `wt manager send`.
 - You cannot honestly claim `low` or `medium` risk. Verify it, or hand the

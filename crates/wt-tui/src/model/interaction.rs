@@ -410,6 +410,12 @@ impl Model {
                         ));
                         return InputResult::Draw;
                     }
+                    // The run ended while its stop confirmation was open.
+                    if let ConfirmAction::KillAction { run_id, .. } = &confirm.action
+                        && !self.board.run_active(run_id)
+                    {
+                        return self.notify("that action has already finished");
+                    }
                     return InputResult::Action(match &confirm.action {
                         ConfirmAction::CopyDetails { details } => UiAction::Copy {
                             value: details.clone(),
@@ -485,9 +491,6 @@ impl Model {
                                 seen: seen.clone(),
                             }
                         }
-                        ConfirmAction::Cleanup { revisions } => UiAction::Cleanup {
-                            revisions: revisions.clone(),
-                        },
                         ConfirmAction::ManagedSignIn { provider, then } => {
                             UiAction::ManagedSignIn {
                                 provider: provider.clone(),
@@ -1042,12 +1045,6 @@ impl Model {
                 ..
             }) => Some(CleanupPreview::new(
                 targets.iter().map(|target| target.key.as_str()),
-            )),
-            Interaction::Confirm(ConfirmPrompt {
-                action: ConfirmAction::Cleanup { revisions },
-                ..
-            }) => Some(CleanupPreview::new(
-                revisions.iter().map(|revision| revision.key.as_str()),
             )),
             Interaction::Log { title, .. } if title == cleanup::LOG_TITLE => {
                 Some(CleanupPreview::new([]))

@@ -234,10 +234,16 @@ build identifier. Remote commands require worker role and an exact protocol
 version match. The controller provisions its exact native build automatically;
 the streamed host protocol also verifies that exact build before admitting
 commands. Independently installed or older worker launchers do not have to be
-manually updated first. Native wt uses worker protocol 3 and host-stream
-protocol 3; protocol 2 added each host's per-source provenance and observation
-stamps. Protocol 3 adds cleanup identities selected from the background board;
-the worker checks confirmed evidence and current hazards before removal. The
+manually updated first. Native wt uses worker protocol 3
+(`WORKER_PROTOCOL_VERSION`) and host-stream protocol 6 (`HOST_PROTOCOL`).
+Host-stream protocol 2 carries each host's per-source provenance and
+observation stamps. Protocol 3 carries cleanup identities selected from the
+background board; the worker checks confirmed evidence and current hazards
+before removal. Protocol 4 carries concurrent command replies and
+cancellation of read-only preparations. Protocol 5 carries the action catalog
+and the facts the palettes are built from, and `RunAction` carries what its
+palette showed. Protocol 6 carries every host's session pickers, terminals,
+reviewer pool and merge-queue removals. The
 hidden `_snapshot` command returns the versioned worktree snapshot contract;
 it is separate from the human-facing `wt ls --json` output. The worker reads
 development-server state in one batch without running health checks. A per-row

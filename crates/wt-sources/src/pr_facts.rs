@@ -112,6 +112,10 @@ fn compose(
                 && shown.number == Some(number)
             {
                 shown.queue_removal = Some(why);
+                // A person armed this merge and it fell out silently: like a
+                // failing check, it stays theirs to act on until it is
+                // armed again or the pull request ends.
+                row.needs_attention = true;
             }
         }
     }
@@ -333,5 +337,32 @@ mod tests {
         let saved = failed(Some(ReviewerPool::default()));
         let composed = stage(board(), &nothing, &SourceSnapshot::default(), &saved);
         assert!(composed.data().unwrap().attention.is_empty());
+    }
+
+    /// A merge a person armed that fell out of the queue is theirs to act
+    /// on, as a failing check is: the row asks for attention for as long as
+    /// the reason is shown, and for no longer.
+    #[test]
+    fn a_row_dropped_from_the_merge_queue_needs_attention_while_it_says_so() {
+        let attention = |github: SourceSnapshot<GithubData>, metadata| {
+            let composed = stage(board(), &github, &metadata, &SourceSnapshot::default());
+            let row = &composed.data().unwrap().rows[0];
+            (
+                row.needs_attention,
+                row.pr.as_ref().unwrap().queue_removal.is_some(),
+            )
+        };
+        let evicted = || live(github(pr(Some(2_000), false), true));
+        assert_eq!(attention(evicted(), armed(1_000)), (true, true));
+        // Armed again since, never armed by wt, or only a saved read: the
+        // row is as quiet as it was.
+        assert_eq!(attention(evicted(), armed(3_000)), (false, false));
+        assert_eq!(
+            attention(live(github(pr(Some(2_000), true), true)), armed(1_000)),
+            (false, false)
+        );
+        let restored =
+            SourceSnapshot::test_restored(github(pr(Some(2_000), false), true), Domain::Github, 1);
+        assert_eq!(attention(restored, armed(1_000)), (false, false));
     }
 }

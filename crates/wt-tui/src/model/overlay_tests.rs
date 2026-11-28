@@ -390,7 +390,7 @@ fn checks_the_board_does_not_show_failing_are_answered_without_a_host() {
     passing.checks = CheckState::Pass;
     for (pr, fact, said, refreshes) in [
         (Some(passing), PrFact::Unknown, "no failing checks", false),
-        (None, PrFact::Absent, "no PR for this branch", false),
+        (None, PrFact::Absent, "no PR for this branch", true),
         (
             None,
             PrFact::Unknown,
@@ -418,7 +418,9 @@ fn checks_the_board_does_not_show_failing_are_answered_without_a_host() {
         assert_eq!(model.toast, Some((said.into(), ToastTone::Notice)));
         assert!(matches!(model.interaction, Interaction::None));
         assert!(model.pending_request.is_none());
-        // Only a read that has not happened yet is asked for again.
+        // What the board shows is answered as it is. A pull request it
+        // does not show may have been opened since the last read, so that
+        // answer also asks for another.
         assert_eq!(std::mem::take(&mut model.refresh_requested), refreshes);
     }
 }
@@ -429,7 +431,7 @@ fn checks_the_board_does_not_show_failing_are_answered_without_a_host() {
 fn github_keys_never_wait_on_a_host_for_a_row_without_a_shown_pr() {
     for letter in ['e', 'E', 'v'] {
         for (fact, said, refreshes) in [
-            (PrFact::Absent, "no PR for this branch", false),
+            (PrFact::Absent, "no PR for this branch", true),
             (
                 PrFact::Unknown,
                 "GitHub data is still loading for this branch",
@@ -682,6 +684,209 @@ fn a_stale_stop_reopens_the_confirmation_from_the_newer_board() {
     );
 }
 
+/// Enter pressed twice in a row on a stop confirmation whose terminal was
+/// replaced: the first commit is refused as stale and the confirmation
+/// reopens naming the new terminal. The second Enter was typed for the old
+/// one and must not stop a terminal the person has not read about.
+#[tokio::test(start_paused = true)]
+async fn a_key_on_its_way_cannot_commit_a_confirmation_reopened_after_a_refusal() {
+    let mut model = Model::default();
+    model.apply(sessions(None));
+    let stop = KeyEvent::new(KeyCode::F(10), KeyModifiers::SHIFT);
+    model.input(stop, 20);
+    let InputResult::Action(commit) = model.input(key(KeyCode::Enter), 20) else {
+        panic!("the confirmation commits")
+    };
+    let generation = model.ui_generation;
+    model.begin_action(5, &commit);
+    let mut newer = sessions(None);
+    newer.test_data_mut().terminals.get_mut("one").unwrap()[0].id = "$9".into();
+    model.apply(newer.clone());
+    let refusal = "Changed since you looked: shell session changed since confirmation";
+    model.reply(UiReply {
+        operation_id: Some(5),
+        ui_generation: Some(generation),
+        ..UiReply::stale(refusal)
+    });
+    // It says what happened where the person is reading, and keeps saying
+    // it when the board redraws the confirmation.
+    let first_line = |model: &Model| match &model.interaction {
+        Interaction::Confirm(confirm) => confirm.lines[0].clone(),
+        _ => panic!("a stale stop reopens its confirmation"),
+    };
+    assert_eq!(first_line(&model), refusal);
+    model.apply(newer);
+    assert_eq!(first_line(&model), refusal);
+
+    tokio::time::advance(std::time::Duration::from_millis(20)).await;
+    for commit_key in [KeyCode::Enter, KeyCode::Char('y')] {
+        let result = model.input(key(commit_key), 20);
+        assert!(
+            !matches!(result, InputResult::Action(_)),
+            "{commit_key:?} typed for the old terminal stopped the new one: {result:?}"
+        );
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+    }
+    assert!(model.pending_request.is_none());
+    // Read and confirmed, it stops the terminal it names.
+    tokio::time::advance(super::reply::CONFIRM_SETTLE).await;
+    let InputResult::Action(UiAction::StopTerminal { session_id, .. }) =
+        model.input(key(KeyCode::Enter), 20)
+    else {
+        panic!("a confirmation that was read commits")
+    };
+    assert_eq!(session_id, "$9");
+}
+
+/// A refusal whose words do not already say so is introduced by them.
+#[tokio::test(start_paused = true)]
+async fn a_reopened_confirmation_always_says_it_changed() {
+    let mut model = Model::default();
+    let mut shown = live(Board {
+        rows: vec![BoardRow {
+            pr: Some(PrPresentation {
+                draft: true,
+                ..failing()
+            }),
+            ..row("one")
+        }],
+        ..Board::default()
+    });
+    shown.test_data_mut().rows[0].pr.as_mut().unwrap().checks = CheckState::Pass;
+    model.apply(shown);
+    ch(&mut model, 'E');
+    let InputResult::Action(commit) = model.input(key(KeyCode::Enter), 20) else {
+        panic!("the ship confirmation commits")
+    };
+    let generation = model.ui_generation;
+    model.begin_action(6, &commit);
+    model.reply(UiReply {
+        operation_id: Some(6),
+        ui_generation: Some(generation),
+        ..UiReply::stale("PR head moved")
+    });
+    let Interaction::Confirm(confirm) = &model.interaction else {
+        panic!("a stale ship reopens its confirmation")
+    };
+    assert_eq!(confirm.lines[0], "Changed since you looked: PR head moved");
+    assert!(!matches!(
+        model.input(key(KeyCode::Enter), 20),
+        InputResult::Action(_)
+    ));
+}
+
+/// The reply to an overlay that another request replaced was already on
+/// its way. It shares a generation with the request that replaced it, and
+/// must still open nothing.
+#[test]
+fn a_replaced_overlays_late_reply_opens_nothing() {
+    // Replaced by a request the model sent itself.
+    let mut model = model();
+    let generation = load_failed_checks(&mut model, 42);
+    model.begin_action(43, &UiAction::CyclePrimary);
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(log(&["late"], None)),
+        ..Default::default()
+    });
+    assert!(
+        matches!(model.interaction, Interaction::None),
+        "the log nobody waits for opened"
+    );
+    // The request that replaced it is still answered at this generation.
+    assert_eq!(
+        model.pending_request.as_ref().unwrap().generation,
+        generation
+    );
+    model.reply(UiReply {
+        operation_id: Some(43),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Confirm {
+            action: ConfirmAction::HardRefresh,
+            title: "Its own dialog".into(),
+            lines: Vec::new(),
+            cancel_key: None,
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+
+    // Replaced by a dialog another reply opened.
+    let mut model = self::model();
+    let generation = load_failed_checks(&mut model, 42);
+    model.reply(UiReply {
+        operation_id: Some(7),
+        ui_generation: Some(generation),
+        modal: Some(UiModal::Confirm {
+            action: ConfirmAction::HardRefresh,
+            title: "Something else".into(),
+            lines: Vec::new(),
+            cancel_key: None,
+        }),
+        ..Default::default()
+    });
+    model.reply(UiReply {
+        operation_id: Some(42),
+        ui_generation: Some(generation),
+        modal: Some(log(&["late"], None)),
+        ..Default::default()
+    });
+    assert!(
+        matches!(&model.interaction, Interaction::Confirm(confirm) if confirm.title == "Something else"),
+        "the late log replaced the dialog"
+    );
+    // Only that reply is marked: a later overlay fills as usual.
+    model.interaction = Interaction::None;
+    let generation = load_failed_checks(&mut model, 44);
+    model.reply(UiReply {
+        operation_id: Some(44),
+        ui_generation: Some(generation),
+        modal: Some(log(&["a"], None)),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::Log { .. }));
+}
+
+/// A removal review that arrived while the overlay was loading waited
+/// behind it, and is shown when the overlay closes.
+#[test]
+fn closing_the_overlay_shows_a_removal_review_that_waited_behind_it() {
+    let mut model = model();
+    load_failed_checks(&mut model, 42);
+    model.reply(UiReply {
+        operation_id: Some(9),
+        modal: Some(UiModal::Confirm {
+            action: ConfirmAction::Remove {
+                key: "two".into(),
+                force: true,
+                revision: Some(crate::RemovalRevision {
+                    key: "two".into(),
+                    path: "/worktrees/two".into(),
+                    branch: "feature/two".into(),
+                    head: "head".into(),
+                    digest: "digest".into(),
+                    hazards: vec!["Will discard 1 changed file".into()],
+                    published_base: None,
+                }),
+                seen: None,
+            },
+            title: "Review two".into(),
+            lines: vec!["two".into()],
+            cancel_key: Some('d'),
+        }),
+        ..Default::default()
+    });
+    assert!(matches!(model.interaction, Interaction::Loading(_)));
+    assert_eq!(model.input(key(KeyCode::Esc), 20), InputResult::Draw);
+    assert!(
+        matches!(&model.interaction, Interaction::Confirm(prompt) if prompt.title == "Review two"),
+        "the review stayed hidden until some other key"
+    );
+    // It appeared without being asked for, so it settles before it commits.
+    assert!(model.confirm_settles_at.is_some());
+}
+
 #[test]
 fn a_new_worktree_on_a_remote_row_opens_its_prompt_without_asking_the_host() {
     let mut model = Model::default();
@@ -854,4 +1059,278 @@ fn key_to_first_frame_of_each_menu() {
             samples[RUNS * 99 / 100]
         );
     }
+}
+
+/// A row the remove menu confirms without asking a host.
+fn removable(name: &str) -> BoardRow {
+    BoardRow {
+        path: format!("/worktrees/{name}"),
+        git: crate::GitPresentation {
+            head_sha: Some("head".into()),
+            tracked_changes: Some(0),
+            untracked_files: Some(0),
+            ..Default::default()
+        },
+        ..row(name)
+    }
+}
+
+fn ignored(model: &Model) -> bool {
+    model
+        .toast
+        .as_ref()
+        .is_some_and(|(text, _)| text.contains("key ignored"))
+}
+
+/// `v` on a row without a pull request answers with a notice, not the
+/// picker. The `d` typed for the picker must not open the remove menu, and
+/// the `y` after it must not confirm anything.
+#[tokio::test(start_paused = true)]
+async fn keys_typed_for_a_menu_that_did_not_open_never_reach_the_board() {
+    let board = || {
+        live(Board {
+            rows: vec![removable("one"), removable("two")],
+            display: DisplayPolicy {
+                reviewers: true,
+                ..Default::default()
+            },
+            ..Board::default()
+        })
+    };
+    // Each of these keys opens a menu or prompt when it can.
+    let openers = [
+        key(KeyCode::Char('v')),
+        key(KeyCode::Char('e')),
+        key(KeyCode::Char('E')),
+        key(KeyCode::Char('f')),
+        key(KeyCode::Char(';')),
+        KeyEvent::new(KeyCode::F(10), KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        key(KeyCode::Char('Q')),
+    ];
+    for opener in openers {
+        let mut model = Model::default();
+        model.apply(board());
+        assert_eq!(model.input(opener, 20), InputResult::Draw, "{opener:?}");
+        assert!(matches!(model.interaction, Interaction::None));
+        let said = model.toast.clone().unwrap().0;
+        tokio::time::advance(std::time::Duration::from_millis(30)).await;
+        for typed in ['d', 'y', 'y', 'j', 'q'] {
+            let result = ch(&mut model, typed);
+            assert_eq!(result, InputResult::Draw, "{opener:?} then {typed}");
+            assert!(
+                matches!(model.interaction, Interaction::None) && model.yank.is_none(),
+                "{opener:?} then {typed} acted on the board"
+            );
+        }
+        assert_eq!(model.selected_row().unwrap().key, "one");
+        // The notice stays readable beside the reason keys were ignored.
+        let (text, _) = model.toast.clone().unwrap();
+        assert!(
+            text.starts_with(&said) && text.contains("key ignored"),
+            "{text}"
+        );
+        // A key pressed once the person has seen that nothing opened is
+        // their own.
+        tokio::time::advance(super::reply::CONFIRM_SETTLE).await;
+        assert_eq!(ch(&mut model, 'd'), InputResult::Draw);
+        assert!(
+            matches!(model.interaction, Interaction::Confirm(_)),
+            "{opener:?}: a deliberate key was still ignored"
+        );
+    }
+}
+
+/// `d y y y`: the first `y` confirms the removal and the confirmation is
+/// gone. The rest were typed at it. On the board they would open the yank
+/// menu and copy the branch.
+#[tokio::test(start_paused = true)]
+async fn keys_typed_at_a_confirmation_that_just_closed_never_reach_the_board() {
+    for (close, commits) in [('y', true), ('n', false), ('q', false)] {
+        let mut model = Model::default();
+        model.apply(live(Board {
+            rows: vec![removable("one"), removable("two")],
+            ..Board::default()
+        }));
+        assert_eq!(ch(&mut model, 'd'), InputResult::Draw);
+        assert!(matches!(model.interaction, Interaction::Confirm(_)));
+        let closed = ch(&mut model, close);
+        assert_eq!(
+            matches!(closed, InputResult::Action(UiAction::Remove { .. })),
+            commits,
+            "{close}: {closed:?}"
+        );
+        for typed in ['y', 'y', 'n', 'q', 'j'] {
+            tokio::time::advance(std::time::Duration::from_millis(40)).await;
+            let result = ch(&mut model, typed);
+            assert_eq!(
+                result,
+                InputResult::Draw,
+                "{close} then {typed}: {result:?}"
+            );
+            assert!(
+                model.yank.is_none(),
+                "{close} then {typed} opened the yank menu"
+            );
+            assert!(matches!(model.interaction, Interaction::None));
+            assert!(ignored(&model));
+        }
+        assert_eq!(model.selected_row().unwrap().key, "one");
+        // Esc opens and commits nothing, so it is never held back.
+        assert_eq!(model.input(key(KeyCode::Esc), 20), InputResult::Draw);
+        assert!(model.keys_settle.is_none());
+        assert_eq!(ch(&mut model, 'j'), InputResult::Draw);
+        assert_eq!(model.selected_row().unwrap().key, "two");
+    }
+}
+
+/// Keys that open nothing by design are not held: moving on after a plain
+/// notice, or inside a menu that stayed open, is immediate.
+#[tokio::test(start_paused = true)]
+async fn only_a_missing_menu_or_a_closed_confirmation_holds_keys() {
+    let mut model = Model::default();
+    model.apply(live(Board {
+        rows: vec![removable("one"), removable("two")],
+        ..Board::default()
+    }));
+    // Space finds nothing needing attention; `p` has no pull request to open.
+    for plain in [' ', 'p'] {
+        ch(&mut model, plain);
+        assert!(model.keys_settle.is_none(), "{plain:?} held the next key");
+    }
+    assert_eq!(ch(&mut model, 'j'), InputResult::Draw);
+    assert_eq!(model.selected_row().unwrap().key, "two");
+    // A confirmation that is still open keeps its keys.
+    ch(&mut model, 'd');
+    assert_eq!(ch(&mut model, 'j'), InputResult::Draw);
+    assert!(matches!(model.interaction, Interaction::Confirm(_)));
+    assert!(model.keys_settle.is_none());
+    // A pointer acts where it points, whatever was typed before.
+    ch(&mut model, 'n');
+    assert!(model.keys_settle.is_some());
+    model.pointer_input(key(KeyCode::Char('k')), 20);
+    assert_eq!(model.selected_row().unwrap().key, "one");
+}
+
+/// With GitHub reads switched off no pull request will ever load. The keys
+/// say that, and ask for no refresh that cannot help.
+#[test]
+fn with_github_off_the_pr_keys_and_the_palette_say_so() {
+    let mut shown = live(Board {
+        rows: vec![row("one")],
+        display: DisplayPolicy {
+            reviewers: true,
+            github_off: true,
+            actions: crate::menus::palette::tests::catalog(),
+            ..Default::default()
+        },
+        ..Board::default()
+    });
+    shown.test_data_mut().rows[0].action_facts.tracker_id = true;
+    let off = crate::menus::github::GITHUB_OFF;
+    for letter in ['e', 'E', 'v', 'f'] {
+        let mut model = Model::default();
+        model.apply(shown.clone());
+        assert_eq!(ch(&mut model, letter), InputResult::Draw);
+        assert_eq!(
+            model.toast,
+            Some((off.into(), ToastTone::Notice)),
+            "{letter}"
+        );
+        assert!(!model.refresh_requested, "{letter} asked for a read");
+        assert!(model.pending_request.is_none());
+    }
+    // The palette gives one reason for the one fact.
+    let mut model = Model::default();
+    model.apply(shown);
+    ch(&mut model, '!');
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("the palette opens")
+    };
+    let detail = |id: &str| {
+        picker
+            .options
+            .iter()
+            .find(|option| option.value.as_deref() == Some(id))
+            .and_then(|option| option.detail.clone())
+            .unwrap()
+    };
+    let said = format!("({off})");
+    assert_eq!(detail("rerun-review"), said);
+    assert_eq!(detail("ask-review"), said);
+    assert_eq!(detail(crate::AUTO_MERGE_ACTION_ID), said);
+    // Choosing one neither waits for GitHub nor asks it anything.
+    let index = picker
+        .options
+        .iter()
+        .position(|option| option.value.as_deref() == Some("rerun-review"))
+        .unwrap();
+    for _ in 0..index {
+        ch(&mut model, 'j');
+    }
+    model.refresh_requested = false;
+    assert_eq!(model.input(key(KeyCode::Enter), 20), InputResult::Draw);
+    assert!(matches!(model.interaction, Interaction::Picker(_)));
+    assert!(
+        model.palette_wait.is_none(),
+        "it waits for a read that never comes"
+    );
+    assert!(!model.refresh_requested);
+    assert!(model.toast.as_ref().unwrap().0.ends_with(off));
+}
+
+/// The stop confirmation names one run. When that run ends while the
+/// confirmation is open it says so, and Enter closes it without asking a
+/// host to stop anything.
+#[test]
+fn a_stop_confirmation_says_when_its_run_has_finished() {
+    let running = |active: bool| {
+        let mut shown = live(Board {
+            rows: vec![row("one")],
+            display: DisplayPolicy {
+                actions: crate::menus::palette::tests::catalog(),
+                ..Default::default()
+            },
+            ..Board::default()
+        });
+        shown.test_data_mut().rows[0].action_facts.active_run =
+            active.then(|| crate::ActiveRunView {
+                action_key: "one".into(),
+                run_id: "run".into(),
+                action_name: "check".into(),
+            });
+        shown
+    };
+    let mut model = Model::default();
+    model.apply(running(true));
+    ch(&mut model, '!');
+    let text = |model: &Model| match &model.interaction {
+        Interaction::Confirm(confirm) => (confirm.title.clone(), confirm.lines.clone()),
+        _ => panic!("the stop confirmation is open"),
+    };
+    assert_eq!(text(&model).0, "Stop check?");
+    assert!(text(&model).1[0].contains("is active"));
+    // Still running on the next board: nothing changes.
+    model.apply(running(true));
+    assert_eq!(text(&model).0, "Stop check?");
+    model.apply(running(false));
+    let (title, lines) = text(&model);
+    assert_eq!(title, "check has finished");
+    assert!(!lines.concat().contains("is active"), "{lines:?}");
+    // The confirmation still names that run and no other.
+    assert!(matches!(
+        &model.interaction,
+        Interaction::Confirm(ConfirmPrompt {
+            action: ConfirmAction::KillAction { run_id, .. },
+            ..
+        }) if run_id == "run"
+    ));
+    model.confirm_settles_at = None;
+    let result = model.input(key(KeyCode::Enter), 20);
+    assert_eq!(
+        result,
+        InputResult::Draw,
+        "a finished run was asked to stop"
+    );
+    assert!(matches!(model.interaction, Interaction::None));
 }

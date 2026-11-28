@@ -79,6 +79,21 @@ pub struct Model {
     pub(crate) local_domains: wt_runtime::DomainMap,
     pub(crate) source_board: Arc<Board>,
     pub(crate) follow_up: Option<UiAction>,
+    /// A `follow_up` that found the request queue full, with the input
+    /// generation it was queued at. It is sent when room appears only if no
+    /// key has acted since: after one, nobody is waiting for it any more.
+    pub(crate) follow_up_kept: Option<(u64, UiAction)>,
+    /// Until when keys are ignored, and why. A key that normally opens a
+    /// menu or prompt answered with a notice instead, or a confirmation
+    /// just closed: the person may still be typing for the layer they
+    /// believed was on top, and those keys must not act on the board.
+    pub(crate) keys_settle: Option<(tokio::time::Instant, &'static str)>,
+    /// The key being dispatched asked for a menu and got a notice.
+    pub(crate) menu_refused: bool,
+    /// The request of a loading overlay that something else replaced. It
+    /// was cancelled, but its reply may already be on its way and must not
+    /// open the content nobody is waiting for.
+    pub(crate) abandoned_overlay: Option<u64>,
     /// Sections chosen for rows still being created, by creation request.
     pub(crate) creation_moves: std::collections::BTreeMap<u64, pending::CreationMove>,
     /// The request whose board-built menu is open.
@@ -194,6 +209,10 @@ impl Default for Model {
             next_op: 0,
             local_domains: Default::default(),
             follow_up: None,
+            follow_up_kept: None,
+            abandoned_overlay: None,
+            keys_settle: None,
+            menu_refused: false,
             creation_moves: Default::default(),
             local_menu: None,
             local_menu_default: None,

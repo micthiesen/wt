@@ -30,9 +30,7 @@ mod session_commands;
 pub use session_commands::{
     SessionEnd, forget_claude_session, prepare_session, stop_managed_session,
 };
-pub use session_commands::{
-    cached_session_options, picker_entries, picker_slug, visible_harnesses,
-};
+pub use session_commands::{picker_entries, picker_slug, visible_harnesses};
 use session_commands::{session_name, slot_name};
 
 /// How a delivered message reads in the target worktree's history.

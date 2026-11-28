@@ -56,34 +56,43 @@ pub fn assert_checks(
     }
 }
 
-/// The key under which a status record keeps the state its gate was
-/// asserted in. Additive: a build that does not know it carries it along
-/// with the record's other unknown fields, or drops it with the record.
-const GATE_STATE: &str = "blockedOnState";
+use wt_store::GATE_ORIGIN;
 
-/// The state `record`'s gate was asserted in. A gate written before that
-/// was recorded has only the record's own state to go by, and that state is
-/// taken: such a gate found on `todo` reads as a start gate, which every
-/// gate on `todo` was until gates began to be carried, and one found on any
-/// other state as a merge gate.
+/// The state `record`'s gate was asserted in. The record says so only while
+/// what it recorded is about the gate now set: a session on a build that
+/// does not know the field can set another gate in place and leave the old
+/// origin beside it. A gate with no origin of its own has only the record's
+/// state to go by, and that state is taken: such a gate found on `todo`
+/// reads as a start gate, which every gate on `todo` was until gates began
+/// to be carried, and one found on any other state as a merge gate.
 fn gate_state(record: &WorkStatusRecord) -> wt_core::WorkState {
     record
         .extra
-        .get(GATE_STATE)
-        .and_then(|state| serde_json::from_value(state.clone()).ok())
+        .get(GATE_ORIGIN)
+        .filter(|origin| {
+            origin["gate"].as_str().is_some()
+                && origin["gate"].as_str() == record.blocked_on.as_deref()
+        })
+        .and_then(|origin| serde_json::from_value(origin["state"].clone()).ok())
         .unwrap_or(record.state)
+}
+
+/// Put `gate`, asserted in `state`, on `record`, or clear its gate.
+fn put_gate(record: &mut WorkStatusRecord, gate: Option<(String, wt_core::WorkState)>) {
+    record.extra.remove(GATE_ORIGIN);
+    record.blocked_on = gate.map(|(gate, state)| {
+        record.extra.insert(
+            GATE_ORIGIN.to_owned(),
+            serde_json::json!({"state": state, "gate": gate}),
+        );
+        gate
+    });
 }
 
 /// Set or clear `record`'s gate as asserted now, in the record's own state.
 pub fn set_gate(record: &mut WorkStatusRecord, gate: Option<String>) {
-    let state = gate
-        .as_ref()
-        .and_then(|_| serde_json::to_value(record.state).ok());
-    match state {
-        Some(state) => record.extra.insert(GATE_STATE.to_owned(), state),
-        None => record.extra.remove(GATE_STATE),
-    };
-    record.blocked_on = gate;
+    let state = record.state;
+    put_gate(record, gate.map(|gate| (gate, state)));
 }
 
 /// Give `next`, a status about to replace `previous`, its gate. A gate on
@@ -111,13 +120,7 @@ pub fn assert_gate(
     let carried = previous
         .filter(|previous| !start_gate_ends(previous, next))
         .and_then(|previous| Some((previous.blocked_on.clone()?, gate_state(previous))));
-    set_gate(next, None);
-    if let Some((gate, state)) = carried {
-        next.blocked_on = Some(gate);
-        if let Ok(state) = serde_json::to_value(state) {
-            next.extra.insert(GATE_STATE.to_owned(), state);
-        }
-    }
+    put_gate(next, carried);
 }
 
 /// Whether `next` starts work that `previous` held back with a gate
@@ -307,7 +310,7 @@ mod tests {
             start_gate_notice(Some(&still), &working).as_deref(),
             Some("start gate cleared (was: secrets land)")
         );
-        assert!(!working.extra.contains_key(GATE_STATE));
+        assert!(!working.extra.contains_key(GATE_ORIGIN));
 
         // A merge gate set on ready, carried through todo, is not one.
         let ready = asserted(WorkState::Ready, None, Some("the release"));
@@ -364,6 +367,44 @@ mod tests {
         set_gate(&mut amended, Some("another".into()));
         assert_eq!(gate_state(&amended), WorkState::Ready);
         set_gate(&mut amended, None);
-        assert!(amended.blocked_on.is_none() && !amended.extra.contains_key(GATE_STATE));
+        assert!(amended.blocked_on.is_none() && !amended.extra.contains_key(GATE_ORIGIN));
+    }
+
+    /// Sessions keep the build that started them and share the state: one
+    /// that does not know the origin edits `blockedOn` and carries the rest
+    /// of the record along.
+    #[test]
+    fn an_origin_left_by_a_build_that_does_not_know_it_is_not_this_gates() {
+        // A merge gate parked on todo, then re-gated there in place by an
+        // older build: the origin still says "ready", of the gate before.
+        let ready = asserted(WorkState::Ready, None, Some("the release"));
+        let mut parked = asserted(WorkState::Todo, Some(&ready), None);
+        assert_eq!(gate_state(&parked), WorkState::Ready);
+        parked.blocked_on = Some("secrets land".into());
+        assert_eq!(gate_state(&parked), WorkState::Todo);
+        let working = asserted(WorkState::Working, Some(&parked), None);
+        assert_eq!(working.blocked_on, None);
+        assert_eq!(
+            start_gate_notice(Some(&parked), &working).as_deref(),
+            Some("start gate cleared (was: secrets land)")
+        );
+        // Cleared by such a build and set again later, even with the old
+        // text: the leftover is dropped by the write that sets the new one.
+        let mut cleared = asserted(WorkState::Todo, Some(&ready), None);
+        cleared.blocked_on = None;
+        assert_eq!(
+            asserted(WorkState::Todo, Some(&cleared), None)
+                .extra
+                .get(GATE_ORIGIN),
+            None
+        );
+        let again = asserted(WorkState::Todo, Some(&cleared), Some("the release"));
+        assert_eq!(gate_state(&again), WorkState::Todo);
+        // A value in an earlier shape (the bare state) names no gate.
+        let mut bare = WorkStatusRecord::new(WorkState::Todo, "t");
+        bare.blocked_on = Some("secrets land".into());
+        bare.extra
+            .insert(GATE_ORIGIN.to_owned(), serde_json::json!("ready"));
+        assert_eq!(gate_state(&bare), WorkState::Todo);
     }
 }

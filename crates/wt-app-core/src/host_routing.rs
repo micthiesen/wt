@@ -53,7 +53,6 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::PrepareRemove { .. }
         | UiAction::Remove { .. }
         | UiAction::DismissFailedRemoval { .. }
-        | UiAction::Cleanup { .. }
         | UiAction::CleanupTargets { .. }
         | UiAction::PrepareStatus { .. }
         | UiAction::SetStatus { .. }
@@ -155,11 +154,6 @@ fn visit_keys(
         UiAction::CleanupTargets { targets } => {
             for target in targets {
                 visit(&mut target.key)?;
-            }
-        }
-        UiAction::Cleanup { revisions } => {
-            for revision in revisions {
-                visit(&mut revision.key)?;
             }
         }
         UiAction::Session { key, .. }

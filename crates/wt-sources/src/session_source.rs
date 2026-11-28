@@ -527,6 +527,12 @@ fn spawn_discoveries(
             for entry in &mut data {
                 let is_live = is_session_live(&inv, entry.key.harness, &entry.session);
                 liveness_changed |= entry.session.is_live != is_live;
+                // What was read of a running session (working, waiting) is
+                // not true of one that has ended: read how it ended, without
+                // waiting for someone to open its picker.
+                if entry.session.is_live && !is_live {
+                    pending.insert((entry.key.slug.clone(), entry.key.harness));
+                }
                 entry.session.is_live = is_live;
             }
             let by_slug = targets

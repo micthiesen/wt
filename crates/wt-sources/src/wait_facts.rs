@@ -252,17 +252,20 @@ pub struct Changed {
     pub github: bool,
     /// What origin's base branches were last fetched as.
     pub git: bool,
+    /// The worktrees themselves: one was added or removed.
+    pub inventory: bool,
 }
 
 impl Changed {
     pub fn any(self) -> bool {
-        self.state || self.github || self.git
+        self.state || self.github || self.git || self.inventory
     }
 
     pub fn absorb(&mut self, other: Self) {
         self.state |= other.state;
         self.github |= other.github;
         self.git |= other.git;
+        self.inventory |= other.inventory;
     }
 }
 
@@ -271,6 +274,7 @@ enum Signal {
     State,
     Github,
     Git,
+    Inventory,
 }
 
 /// A file as last seen: `None` while it does not exist.
@@ -312,10 +316,16 @@ impl Signals {
             .map(|name| git.join("refs/remotes/origin").join(name))
             .chain([git.join("packed-refs")])
             .map(|path| (path, Signal::Git));
+        // Adding or removing a worktree adds or removes an entry in each of
+        // these directories, which changes the directory's own times.
+        let listing = [git.join("worktrees"), paths.worktree_root.clone()]
+            .into_iter()
+            .map(|path| (path, Signal::Inventory));
         Self {
             files: files
                 .into_iter()
                 .chain(refs)
+                .chain(listing)
                 .map(|(path, signal)| {
                     let seen = seen(&path);
                     (path, signal, seen)
@@ -336,6 +346,7 @@ impl Signals {
                 Signal::State => changed.state = true,
                 Signal::Github => changed.github = true,
                 Signal::Git => changed.git = true,
+                Signal::Inventory => changed.inventory = true,
             }
         }
         changed
@@ -402,6 +413,8 @@ pub struct RowsRead {
     pub branches: BTreeMap<String, String>,
     /// Why pull-request answers are missing, when they are.
     pub problem: Option<String>,
+    /// What the removal records say of the worktrees that are gone.
+    pub removed: crate::watch_facts::Removed,
     /// Why GitHub took a named worktree's pull request out of the merge
     /// queue since its merge was armed, by slug: see [`queue_removal`].
     pub removals: BTreeMap<String, String>,
@@ -450,9 +463,22 @@ struct Asked {
 /// The fields of a worktree's record a pass reads.
 const ROW_FIELDS: [&str; 5] = ["createdAt", "work", "mergeArm", "baseSha", "baseBranch"];
 
+/// The fields of a removal record a pass reads.
+const REMOVED_FIELDS: [&str; 7] = [
+    "removedAt",
+    "landedOnAtRemoval",
+    "landedOn",
+    "prState",
+    "gitState",
+    "prMergeCommitOid",
+    wt_store::LANDING_COMMIT_OID,
+];
+
 /// The part of the state a pass over `watches` depends on: for each
-/// worktree they name, the fields it reads. Most writes to a fleet's state
-/// are about other worktrees or other fields and leave this as it was.
+/// worktree they name, the fields it reads of its record and of its removal
+/// records, and the removals under way (a removal leaves the worktree's own
+/// record as it was). Most writes to a fleet's state are about other
+/// worktrees or other fields and leave this as it was.
 fn concern(state: &serde_json::Value, watches: &[Watch]) -> serde_json::Value {
     let mut slugs = BTreeSet::new();
     for watch in watches {
@@ -463,18 +489,35 @@ fn concern(state: &serde_json::Value, watches: &[Watch]) -> serde_json::Value {
             }
         }
     }
-    slugs
-        .into_iter()
+    let rows = slugs
+        .iter()
         .map(|slug| {
-            let stored = &state["slugs"][slug];
+            let stored = &state["slugs"][*slug];
             let fields = ROW_FIELDS
                 .iter()
                 .map(|field| stored[*field].clone())
                 .collect::<Vec<_>>();
-            (slug.to_owned(), serde_json::Value::Array(fields))
+            ((*slug).to_owned(), serde_json::Value::Array(fields))
         })
-        .collect::<serde_json::Map<_, _>>()
-        .into()
+        .collect::<serde_json::Map<_, _>>();
+    let removed = state["removed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["slug"]
+                .as_str()
+                .is_some_and(|slug| slugs.contains(slug))
+        })
+        .map(|entry| {
+            let fields = REMOVED_FIELDS
+                .iter()
+                .map(|field| entry[*field].clone())
+                .collect::<Vec<_>>();
+            serde_json::json!([entry["slug"], fields])
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!([rows, removed, state["removals"]])
 }
 
 fn asked(watches: &[Watch]) -> BTreeMap<String, Asked> {
@@ -518,6 +561,18 @@ impl RowReader {
     ) -> bool {
         let asked = asked(watches);
         if changed.git && asked.values().any(|asked| asked.landing) {
+            return true;
+        }
+        // A worktree came or went: what "gone" and every row condition read.
+        let names_worktree = watches.iter().any(|watch| {
+            watch.when.iter().any(|cond| {
+                matches!(
+                    cond.cond,
+                    Condition::Own(_) | Condition::Worktree { .. } | Condition::Gone { .. }
+                )
+            })
+        });
+        if changed.inventory && names_worktree {
             return true;
         }
         // The daemon rewrites its snapshot for every pull request of the
@@ -664,6 +719,10 @@ impl RowReader {
         };
         let probed = |stage| ctx.config.environments.get(stage).is_some();
         let mut read = RowsRead {
+            removed: crate::watch_facts::removed_rows(
+                &state,
+                ctx.config.branch.separate_production(),
+            ),
             problem: self.problem.clone().filter(|_| !branches.is_empty()),
             github_due_ms: self.github_due_ms,
             ..RowsRead::default()
@@ -1539,5 +1598,69 @@ mod tests {
         let mut merged = again;
         merged.state = "MERGED".into();
         assert_eq!(queue_removal(&merged, Some(&arm(7)), out), None);
+    }
+
+    #[tokio::test]
+    async fn a_removal_of_a_named_worktree_prompts_a_pass() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let watches = [watch("one", &["wt:two:gone"])];
+        let mut signals = Signals::new(ctx);
+        let mut reader = RowReader::default();
+        reader.read(ctx, &watches).await.unwrap();
+        let state = Changed {
+            state: true,
+            ..Changed::default()
+        };
+        // The removal record is written beside the worktree's own record,
+        // which stays as it was.
+        let removed = |slug: &'static str| {
+            ctx.database.call(move |store| {
+                let entry: wt_store::RemovedWorktree = serde_json::from_value(serde_json::json!({
+                    "slug": slug, "branch": format!("feature/{slug}"),
+                    "removedAt": "2026-11-27T12:00:00Z", "landedOnAtRemoval": "base",
+                }))?;
+                store.record_removed_worktrees(&[entry], 1_795_000_000_000)?;
+                Ok(())
+            })
+        };
+        removed("three").await.unwrap();
+        assert!(!reader.concerns(ctx, &watches, state).await);
+        removed("two").await.unwrap();
+        assert!(reader.concerns(ctx, &watches, state).await);
+        let read = reader.read(ctx, &watches).await.unwrap();
+        assert_eq!(read.removed.get("two").unwrap().merged, Some(true));
+        assert!(!reader.concerns(ctx, &watches, state).await);
+
+        // The worktree list changing is seen, and concerns a watch that
+        // names a worktree and no other.
+        signals.poll();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&ctx.config.paths.main_clone)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let two = ctx.config.paths.worktree_root.join("two");
+        git(&["worktree", "remove", "--force", two.to_str().unwrap()]);
+        let seen = signals.poll();
+        assert!(seen.inventory, "{seen:?}");
+        let listing = Changed {
+            inventory: true,
+            ..Changed::default()
+        };
+        assert!(reader.concerns(ctx, &watches, listing).await);
+        assert!(
+            !reader
+                .concerns(ctx, &[watch("one", &["pr:7"])], listing)
+                .await
+        );
+        let read = reader.read(ctx, &watches).await.unwrap();
+        assert!(!read.rows.contains_key("two"));
+        fixture.close().await.unwrap();
     }
 }

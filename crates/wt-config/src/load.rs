@@ -780,6 +780,7 @@ impl Config {
             &mut errors,
             &mut warnings,
         );
+        warnings.extend(action_key_warnings(&actions, dev_server.is_some()));
         let skills_raw: SkillsSection = section(&raw, "skills", &mut errors);
         let manager_raw: ManagerSection = section(&raw, "manager", &mut errors);
         let update_raw: StartupCheckSection = section(&raw, "update", &mut errors);
@@ -1418,6 +1419,95 @@ fn parse_history(raw: &toml::Value, errors: &mut Vec<String>) -> HistoryConfig {
         return HistoryConfig::default();
     }
     history
+}
+
+/// The letters a palette keeps for its own rows, with what each does.
+/// Movement, quit and the custom prompt are every palette's.
+const PALETTE_KEYS: &[(char, &str)] = &[
+    ('c', "the custom prompt"),
+    ('j', "moving down"),
+    ('k', "moving up"),
+    ('q', "closing the palette"),
+];
+/// The row palette's own rows.
+const ROW_KEYS: &[(char, &str)] = &[
+    ('m', "merge when ready"),
+    ('l', "the dev server log"),
+    ('u', "the built-in status update"),
+    ('g', "the built-in continue"),
+];
+/// The row palette's dev-server rows, listed when `[dev_server]` is set.
+const DEV_SERVER_KEYS: &[(char, &str)] = &[
+    ('d', "starting the dev server"),
+    ('s', "stopping the dev server"),
+];
+/// The manager palette's built-in rows.
+const MANAGER_KEYS: &[(char, &str)] = &[
+    ('d', "the fleet digest"),
+    ('t', "triage"),
+    ('o', "the merge order"),
+    ('n', "nudging workers"),
+    ('a', "the status audit"),
+    ('s', "starting the next todo"),
+    ('r', "asking about the row"),
+    ('m', "compacting the manager"),
+];
+
+/// What a palette that lists `action` keeps `key` for, when it does. Every
+/// action but a slot's is listed on the row palette (`!`); a prompt for the
+/// manager is listed on the manager palette (`M`) too.
+pub fn reserved_action_key(
+    action: &ActionDef,
+    key: char,
+    dev_server: bool,
+) -> Option<(&'static str, &'static str)> {
+    if action.target == ActionTarget::Slot {
+        return None;
+    }
+    let find = |keys: &'static [(char, &'static str)]| {
+        keys.iter()
+            .find(|(reserved, _)| *reserved == key)
+            .map(|(_, what)| *what)
+    };
+    let row = find(PALETTE_KEYS)
+        .or_else(|| find(ROW_KEYS))
+        .or_else(|| dev_server.then(|| find(DEV_SERVER_KEYS)).flatten())
+        .map(|what| ("!", what));
+    let manager = (action.kind == ActionKind::Claude && action.target == ActionTarget::Manager)
+        .then(|| find(MANAGER_KEYS))
+        .flatten()
+        .map(|what| ("M", what));
+    row.or(manager)
+}
+
+/// A configured `key` the palettes cannot give its action: wt keeps the
+/// letter for a row of its own, or an earlier action already has it. The
+/// palette then lists the action under another letter, which the person
+/// who wrote the key must be told rather than find out.
+fn action_key_warnings(actions: &[ActionDef], dev_server: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut taken = BTreeMap::<char, &str>::new();
+    for (index, action) in actions.iter().enumerate() {
+        let Some(key) = action.key.as_deref().and_then(|key| key.chars().next()) else {
+            continue;
+        };
+        if action.target == ActionTarget::Slot {
+            continue;
+        }
+        let id = &action.id;
+        if let Some((palette, what)) = reserved_action_key(action, key, dev_server) {
+            warnings.push(format!(
+                "actions[{index}] (\"{id}\"): key = \"{key}\" is not used. The `{palette}` palette keeps {key} for {what}, so the action is listed under another letter. Choose a free key."
+            ));
+        } else if let Some(earlier) = taken.get(&key) {
+            warnings.push(format!(
+                "actions[{index}] (\"{id}\"): key = \"{key}\" is not used. \"{earlier}\" already has it, so the action is listed under another letter. Choose a free key."
+            ));
+        } else {
+            taken.insert(key, id);
+        }
+    }
+    warnings
 }
 
 fn parse_automations(

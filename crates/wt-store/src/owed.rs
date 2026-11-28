@@ -804,6 +804,11 @@ pub(crate) fn begin_checks(record: &mut WorkStatusRecord, previous: Option<&Work
     }
 }
 
+/// Key of a removal record's landing commit when no pull request merge
+/// names one: the head the base branch contained when the row was removed.
+/// Records written before it existed have none, and read as before.
+pub const LANDING_COMMIT_OID: &str = "landingCommitOid";
+
 /// A removed row's landing as its record holds it: where its work was when
 /// it was removed, raised to production once that was proven since.
 pub fn removed_landing(entry: &RemovedWorktree, separate_production: bool) -> Landing {

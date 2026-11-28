@@ -182,16 +182,23 @@ pub async fn run(ctx: &AppContext, args: &RemoveArgs) -> Result<i32> {
             Ok(0)
         }
         Err(error) => {
+            let error = error.to_string();
             eprintln!("Failed: {error}");
-            if !args.force {
-                eprintln!(
-                    "  retry with `wt rm {} --force` only if discarding work is intended",
-                    record.target.slug()
-                );
+            if let Some(hint) = force_hint(&error, record.target.slug(), args.force) {
+                eprintln!("  {hint}");
             }
             Ok(1)
         }
     }
+}
+
+/// The advice to force, for a refusal that has not given its own. One that
+/// already names `--force` (a failed teardown hook) says what forcing would
+/// leave behind; forcing past a hook discards no work, so this line would
+/// be wrong there as well as said twice.
+fn force_hint(error: &str, slug: &str, forced: bool) -> Option<String> {
+    (!forced && !error.contains("--force"))
+        .then(|| format!("retry with `wt rm {slug} --force` only if discarding work is intended"))
 }
 
 pub fn is_our_stage_deployed(path: &Path, stage: &str, prefix: &str) -> bool {
@@ -201,7 +208,29 @@ pub fn is_our_stage_deployed(path: &Path, stage: &str, prefix: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_our_stage_deployed;
+    use super::{force_hint, is_our_stage_deployed};
+
+    #[test]
+    fn the_force_hint_is_given_once_and_only_where_it_fits() {
+        assert_eq!(
+            force_hint(
+                "refusing lifecycle operation: uncommitted changes",
+                "one",
+                false
+            )
+            .unwrap(),
+            "retry with `wt rm one --force` only if discarding work is intended"
+        );
+        // The hook refusal carries its own, differently worded advice.
+        let hook = "refusing lifecycle operation: the dev server's stop_command failed, so \
+                    nothing was removed: volume is gone; fix the hook, or run `wt rm one --force` \
+                    to remove the worktree anyway and leave behind whatever the hook would have \
+                    cleaned up";
+        assert_eq!(force_hint(hook, "one", false), None);
+        assert_eq!(hook.matches("--force").count(), 1);
+        // Already forced: there is nothing further to suggest.
+        assert_eq!(force_hint("git failed", "one", true), None);
+    }
     use wt_sst::safe_pinned_stage;
 
     #[test]

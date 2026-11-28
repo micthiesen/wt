@@ -1377,6 +1377,8 @@ fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
         (KeyCode::Char(';'), KeyModifiers::NONE),
     ] {
         model.toast = None;
+        // Each key is its own press, not typed behind the one before.
+        model.keys_settle = None;
         assert_eq!(
             press_with(&mut model, code, modifiers),
             InputResult::Draw,
@@ -1403,6 +1405,7 @@ fn session_entry_on_a_row_being_removed_is_refused_without_an_action() {
         ..Default::default()
     });
     model.toast = None;
+    model.keys_settle = None;
     assert_eq!(ch(&mut model, 'x'), InputResult::Draw);
     assert_eq!(toast(&model), Some("removal is already in progress"));
     // Unrelated rows still enter immediately.

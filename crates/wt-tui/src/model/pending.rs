@@ -361,7 +361,12 @@ impl Model {
                 loading.request = Some(id);
                 loading.action = action.clone();
             }
-            Interaction::Loading(_) => self.interaction = Interaction::None,
+            // No generation bump here: this request was already sent at
+            // the current one, and its own reply must still count.
+            Interaction::Loading(loading) => {
+                self.abandoned_overlay = loading.request;
+                self.interaction = Interaction::None;
+            }
             _ => {}
         }
         self.pending_request = Some(super::PendingRequest {

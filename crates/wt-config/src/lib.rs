@@ -12,7 +12,7 @@ mod schema;
 
 pub use error::ConfigError;
 pub use load::{
-    CHECK_RULE_ID, LoadOptions, RESERVED_MANAGED_ENV, WATCH_RULE_ID,
+    CHECK_RULE_ID, LoadOptions, RESERVED_MANAGED_ENV, WATCH_RULE_ID, reserved_action_key,
     verification_due_settle_seconds,
 };
 pub use resources::{LinuxResources, ResourceLimits, ResourcesConfig, memory_bytes};

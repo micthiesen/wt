@@ -208,6 +208,16 @@ impl Blocker {
             Self::NoTrackerId => "no tracker id (set one with `#`)",
         }
     }
+
+    /// The reason as a palette of this host says it. With GitHub reads
+    /// switched off no read will ever confirm a branch, and saying one is
+    /// awaited would be untrue.
+    pub fn reason_on(self, display: &crate::DisplayPolicy) -> &'static str {
+        match self {
+            Self::PrUnconfirmed if display.github_off => super::github::GITHUB_OFF,
+            blocker => blocker.reason(),
+        }
+    }
 }
 
 /// The first reason `entry` cannot run on `surface`, given the facts of the
@@ -394,7 +404,9 @@ pub(super) fn menu(board: &Board, surface: &ActionSurface) -> Menu {
     let unavailable = |reason: &str| format!("({reason})");
     let mut groups: Vec<(&str, Vec<PickerOption>)> = Vec::new();
     for entry in entries.iter().filter(|entry| entry.id != CUSTOM_ACTION_ID) {
-        let reason = blocked.or_else(|| blocker(entry, surface, facts).map(Blocker::reason));
+        let reason = blocked.or_else(|| {
+            blocker(entry, surface, facts).map(|blocker| blocker.reason_on(scope.display))
+        });
         let group = entry.group.as_deref().unwrap_or_default();
         let label = if group.is_empty() {
             entry.name.clone()
@@ -452,6 +464,8 @@ pub(super) fn menu(board: &Board, surface: &ActionSurface) -> Menu {
             Some('m'),
             if has_pr {
                 "gh · merge queue aware".into()
+            } else if scope.display.github_off {
+                unavailable(super::github::GITHUB_OFF)
             } else {
                 unavailable("no PR")
             },
@@ -594,7 +608,7 @@ fn action_detail(entry: &ActionEntry, primary: &str) -> String {
 /// Letters a surface keeps for its fixed rows, so configured actions never
 /// take them: custom prompt and movement everywhere, then merge and dev logs
 /// on rows and open-in-editor on slots.
-fn reserved_keys(surface: &ActionSurface) -> &'static [char] {
+pub fn reserved_keys(surface: &ActionSurface) -> &'static [char] {
     match surface {
         ActionSurface::Row { .. } => &['c', 'j', 'k', 'q', 'm', 'l'],
         ActionSurface::Manager { .. } => &['c', 'j', 'k', 'q'],

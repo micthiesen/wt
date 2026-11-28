@@ -248,8 +248,15 @@ impl Family for LayoutChange {
                         .unwrap_or(0)
                 };
                 rows.splice(at..at, moving.rows.iter().copied());
+                stored_positions(board, index);
             }
-            Self::Cross { rows, to, top, .. } => {
+            Self::Cross {
+                unit,
+                rows,
+                to,
+                top,
+                ..
+            } => {
                 let Some(destination) = section_at(board, to) else {
                     return;
                 };
@@ -268,6 +275,7 @@ impl Family for LayoutChange {
                 if entering.is_empty() {
                     return;
                 }
+                let source = row_section(board, entering[0]);
                 for section in &mut board.sections {
                     section.rows.retain(|row| !entering.contains(row));
                 }
@@ -331,6 +339,18 @@ impl Family for LayoutChange {
                     _ => entry_point(board, &board.sections[destination], rank, *top),
                 };
                 board.sections[destination].rows.splice(at..at, block);
+                // The unit is given a stored order where it enters, and the
+                // section it left is written as a reorder writes one. So is
+                // the one it enters at the top under manual sort.
+                if let Some(row) = board.rows.iter_mut().find(|row| row.key == *unit) {
+                    row.creation_placement = None;
+                }
+                if let Some(source) = source {
+                    stored_positions(board, source);
+                }
+                if *top && !board.display.status_sort {
+                    stored_positions(board, destination);
+                }
             }
             Self::SectionPass {
                 section,
@@ -479,6 +499,27 @@ impl SectionUnit {
                         .as_ref()
                         .is_some_and(|work| work.record.is_some())
                 }))
+    }
+}
+
+/// Show what the store does to the units at their creation position when a
+/// press writes a section, so that the next press is resolved from the
+/// board the read after it will bring. Manual sort gives every unit an
+/// order, and none is at its creation position after. Status sort leaves
+/// them there and restates which unit each follows.
+fn stored_positions(board: &mut Board, section: usize) {
+    let units = section_units(board, &board.sections[section]);
+    let mut before: Option<&str> = None;
+    for unit in &units {
+        let follows = unit.at_creation_position(board);
+        if let Some(row) = board.rows.iter_mut().find(|row| row.key == unit.key) {
+            if !board.display.status_sort {
+                row.creation_placement = None;
+            } else if let Some(placement) = row.creation_placement.as_mut().filter(|_| follows) {
+                placement.after = before.map(str::to_owned);
+            }
+        }
+        before = Some(&unit.key);
     }
 }
 

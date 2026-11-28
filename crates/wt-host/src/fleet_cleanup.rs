@@ -4,52 +4,20 @@
 use std::collections::BTreeMap;
 
 use tokio::task::JoinSet;
-use wt_tui::{CleanupTarget, RemovalRevision, ReplyOutcome, UiAction, UiReply};
+use wt_tui::{CleanupTarget, ReplyOutcome, UiAction, UiReply};
 
 use crate::{remote_board::Fleet, remote_host::RemoteHostError};
 
-/// Route only the revisions captured by the combined confirmation. Unknown
-/// or reconfigured hosts are reported and skipped; no host is replanned.
-pub async fn cleanup(fleet: &Fleet, revisions: Vec<RemovalRevision>) -> UiReply {
-    cleanup_items(fleet, revisions).await
-}
-
+/// Route the rows the combined confirmation captured to the hosts that own
+/// them. Unknown or reconfigured hosts are reported and skipped; each host
+/// checks its own rows again before it removes anything.
 pub async fn cleanup_targets(fleet: &Fleet, targets: Vec<CleanupTarget>) -> UiReply {
-    cleanup_items(fleet, targets).await
-}
-
-trait CleanupItem: Send + 'static {
-    fn key_mut(&mut self) -> &mut String;
-    fn action(items: Vec<Self>) -> UiAction
-    where
-        Self: Sized;
-}
-
-impl CleanupItem for RemovalRevision {
-    fn key_mut(&mut self) -> &mut String {
-        &mut self.key
-    }
-    fn action(revisions: Vec<Self>) -> UiAction {
-        UiAction::Cleanup { revisions }
-    }
-}
-
-impl CleanupItem for CleanupTarget {
-    fn key_mut(&mut self) -> &mut String {
-        &mut self.key
-    }
-    fn action(targets: Vec<Self>) -> UiAction {
-        UiAction::CleanupTargets { targets }
-    }
-}
-
-async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiReply {
     let hosts = fleet
         .remotes
         .iter()
         .map(|remote| remote.endpoint.key())
         .collect::<Vec<_>>();
-    let mut partition = partition_items(revisions, &hosts);
+    let mut partition = partition_items(targets, &hosts);
     let mut lines = std::mem::take(&mut partition.lines);
     let mut summary = CleanupSummary {
         failed: partition.failed,
@@ -66,7 +34,9 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
             (
                 "This machine".to_owned(),
                 revisions.len(),
-                service.execute(T::action(revisions)).await,
+                service
+                    .execute(UiAction::CleanupTargets { targets: revisions })
+                    .await,
             )
         });
     }
@@ -96,7 +66,7 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
                 label,
                 count,
                 endpoint
-                    .execute(T::action(revisions))
+                    .execute(UiAction::CleanupTargets { targets: revisions })
                     .await
                     .map_err(anyhow::Error::from),
             )
@@ -140,7 +110,7 @@ async fn cleanup_items<T: CleanupItem>(fleet: &Fleet, revisions: Vec<T>) -> UiRe
                     label,
                     count,
                     endpoint
-                        .execute(T::action(revisions))
+                        .execute(UiAction::CleanupTargets { targets: revisions })
                         .await
                         .map_err(anyhow::Error::from),
                 )
@@ -199,17 +169,14 @@ impl CleanupSummary {
     }
 }
 
-struct CleanupPartition<T> {
-    local: Vec<T>,
-    remote: BTreeMap<String, Vec<T>>,
+struct CleanupPartition {
+    local: Vec<CleanupTarget>,
+    remote: BTreeMap<String, Vec<CleanupTarget>>,
     lines: Vec<String>,
     failed: bool,
 }
 
-fn partition_items<T: CleanupItem>(
-    revisions: Vec<T>,
-    configured_hosts: &[String],
-) -> CleanupPartition<T> {
+fn partition_items(revisions: Vec<CleanupTarget>, configured_hosts: &[String]) -> CleanupPartition {
     let mut partition = CleanupPartition {
         local: vec![],
         remote: BTreeMap::new(),
@@ -217,7 +184,7 @@ fn partition_items<T: CleanupItem>(
         failed: false,
     };
     for mut revision in revisions {
-        match wt_core::parse_worktree_ledger_key(revision.key_mut()) {
+        match wt_core::parse_worktree_ledger_key(&revision.key) {
             Some(wt_core::WorktreeRef::Local { .. }) => partition.local.push(revision),
             Some(wt_core::WorktreeRef::Remote { host, slug }) => {
                 if !configured_hosts
@@ -230,14 +197,14 @@ fn partition_items<T: CleanupItem>(
                     ));
                     continue;
                 }
-                *revision.key_mut() = slug;
+                revision.key = slug;
                 partition.remote.entry(host).or_default().push(revision);
             }
             None => {
                 partition.failed = true;
                 partition.lines.push(format!(
                     "Invalid cleanup identity {:?}: candidate skipped",
-                    revision.key_mut()
+                    revision.key
                 ));
             }
         }
@@ -320,20 +287,17 @@ mod tests {
         assert!(!partition.remote.contains_key("unknown"));
     }
 
-    fn revision(key: &str, path: &str) -> RemovalRevision {
-        RemovalRevision {
+    fn revision(key: &str, path: &str) -> CleanupTarget {
+        CleanupTarget {
             key: key.into(),
             path: path.into(),
             branch: format!("feature/{key}"),
             head: "0123456789abcdef".into(),
-            digest: "digest".into(),
-            hazards: Vec::new(),
-            published_base: None,
         }
     }
 
     #[test]
-    fn confirmed_revisions_partition_exactly_once_by_config_qualified_host() {
+    fn confirmed_rows_partition_exactly_once_by_config_qualified_host() {
         let first_host = "builder:/etc/first.toml";
         let second_host = "builder:/etc/second.toml";
         let confirmed = vec![

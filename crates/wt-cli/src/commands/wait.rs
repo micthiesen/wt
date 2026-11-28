@@ -57,6 +57,8 @@ enum Ended {
     Held,
     TimedOut,
     Interrupted,
+    /// What is asked can no longer hold, so there is nothing to wait for.
+    Cannot,
 }
 
 /// How a wait ended, with each condition's last truth.
@@ -72,7 +74,37 @@ struct Outcome {
     /// What GitHub said of a condition that holds, where it said more than
     /// the condition does: why a merge was dropped.
     why: Vec<Option<String>>,
+    /// Why a condition can no longer hold, where it cannot.
+    never: Vec<Option<String>>,
     waited: Duration,
+}
+
+/// Whether waiting on is pointless: a condition that must hold cannot, or
+/// with `--any` none of them can.
+fn cannot_hold(never: &[Option<String>], any: bool) -> bool {
+    let mut cannot = never.iter().map(Option::is_some);
+    !never.is_empty()
+        && if any {
+            cannot.all(|cannot| cannot)
+        } else {
+            cannot.any(|cannot| cannot)
+        }
+}
+
+/// A duration from now, to the millisecond. `wt wake` stores a whole second
+/// so the time reads back as it prints; a wait stores nothing, and rounding
+/// up would hold it for up to a second past what was asked.
+fn exact_duration(arg: &str, cond: &mut WatchCondition, clock: LocalClock) {
+    let text = arg.trim();
+    let text = text.strip_prefix('+').unwrap_or(text);
+    if matches!(cond.cond, Condition::At { .. })
+        && text.starts_with(|first: char| first.is_ascii_digit())
+        && let Some(delay) = Delay::parse(text)
+    {
+        cond.cond = Condition::At {
+            at_ms: clock.now_ms.saturating_add(delay.as_ms()),
+        };
+    }
 }
 
 fn holds(truths: &[Truth], any: bool) -> bool {
@@ -92,6 +124,7 @@ impl Outcome {
         match self.ended {
             Ended::Held => 0,
             Ended::Interrupted => EXIT_INTERRUPTED,
+            Ended::Cannot => 1,
             Ended::TimedOut if self.untold() => 1,
             Ended::TimedOut => EXIT_TIMED_OUT,
         }
@@ -108,6 +141,7 @@ impl Outcome {
         match self.ended {
             Ended::Held => "held",
             Ended::Interrupted => "interrupted",
+            Ended::Cannot => "cannot_hold",
             Ended::TimedOut if self.untold() => "unknown",
             Ended::TimedOut => "timed_out",
         }
@@ -124,6 +158,9 @@ impl Outcome {
                     .filter(|_| cond.first_held_at_ms.is_some_and(|since| since <= now_ms))
                     .map(|delay| format!("holding, {delay} not yet over")),
             ),
+            Truth::Unknown(_) if self.never.get(index).is_some_and(Option::is_some) => {
+                ("unknown", self.never[index].clone())
+            }
             Truth::Unknown(reason) => {
                 let about_row = matches!(cond.cond, Condition::Own(_) | Condition::Worktree { .. });
                 let reason = self
@@ -144,6 +181,9 @@ impl Outcome {
             Ended::Held if held.len() == 1 => format!("held after {waited}: {}", held[0]),
             Ended::Held => format!("all {} conditions hold after {waited}", held.len()),
             Ended::Interrupted => format!("interrupted after {waited}"),
+            Ended::Cannot => {
+                format!("cannot hold, stopped after {waited}: see each condition's reason")
+            }
             Ended::TimedOut if self.untold() => {
                 format!("could not tell after {waited}: see each condition's reason")
             }
@@ -326,16 +366,24 @@ async fn wait_until(
             rows_known,
             &rows.prs,
             &externals,
+            &rows.removed,
         );
         let evaluation = evaluate(&watch, &known, now);
         if let Some(stamps) = &evaluation.stamps {
             stamps.apply(&mut watch);
         }
+        let never = watch
+            .when
+            .iter()
+            .map(|cond| wt_core::watch::never_holds(cond, &known))
+            .collect::<Vec<_>>();
         let waited = started.elapsed();
         let ended = if holds(&evaluation.truths, any) {
             Some(Ended::Held)
         } else if ctx.cancellation.is_cancelled() {
             Some(Ended::Interrupted)
+        } else if cannot_hold(&never, any) {
+            Some(Ended::Cannot)
         } else if waited >= timeout {
             Some(Ended::TimedOut)
         } else {
@@ -363,6 +411,7 @@ async fn wait_until(
                 when: watch.when,
                 problem,
                 why,
+                never,
                 waited,
             });
         }
@@ -422,10 +471,14 @@ async fn wait(ctx: &AppContext, args: &WaitArgs) -> Result<(i32, Option<Outcome>
         Ok(inventory) => inventory,
         Err(message) => return refuse(1, message),
     };
-    let read = match super::watch::read_conditions(ctx, &inventory, &args.conditions, clock).await {
-        Ok(read) => read,
-        Err(message) => return refuse(2, message),
-    };
+    let mut read =
+        match super::watch::read_conditions(ctx, &inventory, &args.conditions, clock).await {
+            Ok(read) => read,
+            Err(message) => return refuse(2, message),
+        };
+    for (arg, cond) in args.conditions.iter().zip(&mut read.when) {
+        exact_duration(arg, cond, clock);
+    }
     if let Some(message) = args
         .conditions
         .iter()
@@ -516,6 +569,7 @@ mod tests {
                 .collect(),
             problem: None,
             why: Vec::new(),
+            never: Vec::new(),
             waited: Duration::from_secs(750),
         }
     }
@@ -630,6 +684,36 @@ mod tests {
     }
 
     #[test]
+    fn a_duration_is_waited_to_the_millisecond_and_a_clock_time_as_read() {
+        let now = LocalClock {
+            now_ms: 1_795_000_000_250,
+            utc_offset_minutes: 0,
+        };
+        for (arg, exact) in [("3s", 3_000), ("+90m", 5_400_000)] {
+            let mut cond = parse(arg, now).unwrap();
+            // As stored for a wake: the next whole second.
+            assert_eq!(cond.known_at_ms(), Some(now.now_ms + exact + 750), "{arg}");
+            exact_duration(arg, &mut cond, now);
+            assert_eq!(cond.known_at_ms(), Some(now.now_ms + exact), "{arg}");
+        }
+        for arg in ["17:00", "2030-01-15T09:00", "merged", "merged+5m"] {
+            let mut cond = parse(arg, now).unwrap();
+            let before = cond.clone();
+            exact_duration(arg, &mut cond, now);
+            assert_eq!(cond, before, "{arg}");
+        }
+    }
+
+    #[test]
+    fn a_wait_stops_when_what_must_hold_cannot() {
+        let cannot = Some("gone".to_owned());
+        assert!(cannot_hold(&[None, cannot.clone()], false));
+        assert!(!cannot_hold(&[None, cannot.clone()], true));
+        assert!(cannot_hold(&[cannot.clone(), cannot], true));
+        assert!(!cannot_hold(&[None], false) && !cannot_hold(&[], true));
+    }
+
+    #[test]
     fn a_timeout_is_a_duration_of_at_most_a_day() {
         assert_eq!(timeout_ms("30m"), Ok(1_800_000));
         assert_eq!(timeout_ms("24h"), Ok(TIMEOUT_MAX_MS));
@@ -702,6 +786,52 @@ mod tests {
         let (code, how, _) = ended(wait(ctx, &args(&["1s"], false, "30m")).await.unwrap());
         assert_eq!((code, how), (0, Ended::Held));
         assert!(started.elapsed() >= Duration::from_millis(900));
+
+        // A worktree merged and removed before the wait began holds from
+        // its removal record; one removed unmerged ends the wait at once,
+        // since nothing is left to wait for.
+        ctx.database
+            .call(|store| {
+                let removed = |slug: &str, landed: &str| {
+                    serde_json::from_value::<wt_store::RemovedWorktree>(json!({
+                        "slug": slug, "branch": format!("feature/{slug}"),
+                        "removedAt": "2026-11-27T12:00:00Z", "landedOnAtRemoval": landed,
+                    }))
+                };
+                store.record_removed_worktrees(
+                    &[
+                        removed("landed", "base")?,
+                        removed("abandoned", "unlanded")?,
+                    ],
+                    1_795_000_000_000,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (code, how, truths) = ended(
+            wait(ctx, &args(&["wt:landed:merged"], false, "30m"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!((code, how, truths), (0, Ended::Held, vec![Truth::Holds]));
+        let (code, outcome) = wait(ctx, &args(&["wt:abandoned:merged"], false, "30m"))
+            .await
+            .unwrap();
+        let outcome = outcome.unwrap();
+        assert_eq!((code, outcome.ended), (1, Ended::Cannot));
+        assert!(
+            outcome
+                .text(&args(&["wt:abandoned:merged"], false, "30m"), clock())
+                .contains("abandoned was removed without merging"),
+        );
+        // With --any another condition may still hold: the wait goes on.
+        let (code, how, _) = ended(
+            wait(ctx, &args(&["wt:abandoned:merged", "1s"], true, "30m"))
+                .await
+                .unwrap(),
+        );
+        assert_eq!((code, how), (0, Ended::Held));
 
         // Becoming ready ends a wait that was already running.
         let waiting = tokio::spawn({

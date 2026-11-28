@@ -218,7 +218,7 @@ fn compose(
                     *entry = serde_json::json!({});
                 }
                 if let Some(layout) = layout {
-                    for field in ["section", "order", "creationAfter"] {
+                    for field in ["section", "order", "creationAfter", "creationSlot"] {
                         if let Some(value) = layout.get(field) {
                             entry[field] = value.clone();
                         }

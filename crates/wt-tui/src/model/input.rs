@@ -76,9 +76,35 @@ impl Model {
         InputResult::Draw
     }
 
-    /// Keys synthesized from the pointer act where the pointer is.
+    /// Keys synthesized from the pointer act where the pointer is: they are
+    /// not typed for a layer the person expected, so no settle holds them.
     pub(crate) fn pointer_input(&mut self, key: KeyEvent, height: usize) -> InputResult {
+        self.keys_settle = None;
         self.input(key, height)
+    }
+
+    /// A key that opens a menu or prompt has nothing to open. What is typed
+    /// next was meant for that menu, so it waits out the settle window.
+    pub(super) fn refuse_menu(&mut self, text: impl Into<String>) -> InputResult {
+        self.menu_refused = true;
+        self.notify(text)
+    }
+
+    /// Say that a key was ignored and why, beside what the footer already
+    /// says: the notice that started the window is the reason.
+    fn key_ignored(&mut self, why: &str) -> InputResult {
+        let ignored = format!("key ignored: {why}");
+        self.toast = Some(match self.toast.take() {
+            Some((text, tone)) if text.contains("key ignored") => (text, tone),
+            Some((text, ToastTone::Failed)) if !text.trim().is_empty() => {
+                (format!("{text}; {ignored}"), ToastTone::Failed)
+            }
+            Some((text, _)) if !text.trim().is_empty() => {
+                (format!("{text}; {ignored}"), ToastTone::Notice)
+            }
+            _ => (ignored, ToastTone::Notice),
+        });
+        InputResult::Draw
     }
 
     /// Keys while an overlay's content loads belong to the overlay, which
@@ -118,12 +144,23 @@ impl Model {
         self.interaction = Interaction::None;
         self.ui_generation = self.ui_generation.wrapping_add(1);
         self.toast = None;
+        // A removal review that waited behind the overlay has its turn.
+        self.show_next_removal_review();
     }
 
     pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
         if matches!(self.interaction, Interaction::Loading(_)) {
             return self.loading_input(key);
         }
+        // Esc opens and commits nothing anywhere, so it is never held.
+        if let Some((until, why)) = self.keys_settle {
+            if tokio::time::Instant::now() < until && key.code != KeyCode::Esc {
+                return self.key_ignored(why);
+            }
+            self.keys_settle = None;
+        }
+        let confirm_before = matches!(self.interaction, Interaction::Confirm(_));
+        self.menu_refused = false;
         let generation = self.ui_generation;
         let toast_before = self.toast.clone();
         self.ui_generation = self.ui_generation.wrapping_add(1);
@@ -147,6 +184,24 @@ impl Model {
             InputResult::Action(action) => self.open_board_menu(action),
             result => result,
         };
+        // The person believes a layer is on top that is not: the menu a key
+        // asked for did not open, or a confirmation took the key and closed.
+        // What they type next was meant for it. A second `y` would yank, a
+        // second `q` would quit.
+        let refused = std::mem::take(&mut self.menu_refused);
+        // Esc dismisses on purpose and can do nothing twice.
+        let closed =
+            confirm_before && key.code != KeyCode::Esc && !matches!(result, InputResult::Unchanged);
+        if matches!(self.interaction, Interaction::None) && (refused || closed) {
+            self.keys_settle = Some((
+                tokio::time::Instant::now() + super::reply::CONFIRM_SETTLE,
+                if refused {
+                    "no menu opened"
+                } else {
+                    "the prompt just closed"
+                },
+            ));
+        }
         if matches!(result, InputResult::Unchanged) {
             self.ui_generation = generation;
         } else {
@@ -478,7 +533,8 @@ impl Model {
             }
             KeyCode::Char('Q') if !control => {
                 if !self.board.automations_shown() {
-                    return self.notify("no [[automations]] configured and nothing is waiting");
+                    return self
+                        .refuse_menu("no [[automations]] configured and nothing is waiting");
                 }
                 self.interaction = Interaction::Automations { scroll: 0 };
                 InputResult::Draw
@@ -669,7 +725,7 @@ impl Model {
             }
             KeyCode::Char('n') if control => {
                 if self.board.hosts.len() <= 1 {
-                    return self.notify("[remote] is not configured");
+                    return self.refuse_menu("[remote] is not configured");
                 }
                 InputResult::Action(UiAction::PrepareCreate {
                     placement: self.creation_placement(),
@@ -876,13 +932,16 @@ impl Model {
     }
 
     pub(super) fn row_action(&mut self, build: impl FnOnce(String) -> UiAction) -> InputResult {
-        if self.selected_row().is_some_and(|row| row.pending_creation) {
-            return self.notify("worktree is still being created");
-        }
-        match self.actionable_row() {
-            Some(row) => InputResult::Action(build(row.key.clone())),
-            None => self.notify("select a worktree first"),
-        }
+        let refusal = if self.selected_row().is_some_and(|row| row.pending_creation) {
+            "worktree is still being created"
+        } else if let Some(row) = self.actionable_row() {
+            return InputResult::Action(build(row.key.clone()));
+        } else {
+            "select a worktree first"
+        };
+        // Whether the key would have opened a menu is what its request says.
+        self.menu_refused = build(String::new()).is_preparation();
+        self.notify(refusal)
     }
 
     pub(super) fn session_action(&mut self, target: SessionTarget) -> InputResult {
@@ -899,7 +958,8 @@ impl Model {
         build: impl FnOnce(String) -> UiAction,
     ) -> InputResult {
         if self.actionable_row().is_some_and(Self::removal_active) {
-            return self.notify(REMOVAL_IN_PROGRESS);
+            // A picker, or a session the person would be typing into.
+            return self.refuse_menu(REMOVAL_IN_PROGRESS);
         }
         self.row_action(build)
     }

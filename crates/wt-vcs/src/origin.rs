@@ -35,8 +35,11 @@ const FETCH_STAMP: &str = "fetch-origin.stamp";
 /// Held for the main clone's dependency install, beside the fetch lock.
 const MAIN_INSTALL_LOCK: &str = "main-dependency-sync";
 /// Beside that lock: the main clone commit its last successful install ran
-/// at. Read and written only while holding the lock.
+/// at, or the commit before a pull whose install is still owed. Written only
+/// under the stamp lock.
 const MAIN_INSTALL_STAMP: &str = "main-dependency-sync.stamp";
+/// Serializes writers of that stamp.
+const MAIN_INSTALL_STAMP_LOCK: &str = "main-dependency-sync-stamp";
 
 /// An install the main clone owes.
 struct InstallDue {
@@ -653,12 +656,15 @@ impl GitRepository {
         };
         // Looked at first without the lock, so a pull with nothing to
         // install takes neither a slot nor the lock.
-        if self
-            .install_due(&plan, &sync, cancellation)
-            .await?
-            .is_none()
-        {
+        let Some(due) = self.install_due(&plan, &sync, cancellation).await? else {
             return Ok(());
+        };
+        // With no usable stamp the packages are those of the commit before
+        // this pull. Say so before queueing: if this pass is cancelled while
+        // it waits, or its install fails, a later pull has no other way to
+        // know what it owes.
+        if !due.stamped {
+            self.record_owed_install(&plan, &sync, cancellation).await?;
         }
         // Every install on the machine shares one bound, so this one waits
         // its turn among the installs of new worktrees. It runs as bulk and
@@ -684,13 +690,6 @@ impl GitRepository {
         let Some(due) = self.install_due(&plan, &sync, cancellation).await? else {
             return Ok(());
         };
-        let stamp = sync.repository_lock_dir.join(MAIN_INSTALL_STAMP);
-        // With no usable stamp the packages are those of the commit before
-        // this pull. Say so before installing: if this install is cancelled
-        // or fails, a later pull has no other way to know what it owes.
-        if !due.stamped {
-            let _ = tokio::fs::write(&stamp, sync.before).await;
-        }
         let head = due.head;
         let result = self
             .origin_runner()
@@ -704,13 +703,56 @@ impl GitRepository {
         match result {
             // An unwritten stamp only costs a repeated install.
             Ok(()) => {
-                let _ = tokio::fs::write(&stamp, &head).await;
+                if let Ok(_writing) = self.lock_install_stamp(&sync, cancellation).await {
+                    let stamp = sync.repository_lock_dir.join(MAIN_INSTALL_STAMP);
+                    let _ = tokio::fs::write(&stamp, &head).await;
+                }
             }
             Err(ProcessError::Cancelled { .. }) => return Err(RepositoryError::Cancelled),
             Err(error) => warnings.push(format!(
                 "main clone dependency sync failed ({}): {error}",
                 plan.label
             )),
+        }
+        Ok(())
+    }
+
+    /// Held only around a write of the install stamp, never across a wait
+    /// for a slot or an install, so a pass that is about to queue can
+    /// record what it owes without waiting for a running install.
+    async fn lock_install_stamp(
+        &self,
+        sync: &DependencySync<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<FileLock, RepositoryError> {
+        FileLock::acquire(
+            sync.repository_lock_dir,
+            MAIN_INSTALL_STAMP_LOCK,
+            "write main clone install stamp",
+            cancellation,
+        )
+        .await
+        .map_err(|source| lock_error(sync.repository_lock_dir, source))
+    }
+
+    /// Stamp the commit before this pull as the one the packages belong to,
+    /// unless a usable stamp has appeared since the caller looked: an
+    /// install that finished meanwhile must not be marked undone.
+    async fn record_owed_install(
+        &self,
+        plan: &wt_platform::install::InstallCommand,
+        sync: &DependencySync<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        let _writing = self.lock_install_stamp(sync, cancellation).await?;
+        if self
+            .install_due(plan, sync, cancellation)
+            .await?
+            .is_some_and(|due| !due.stamped)
+        {
+            // An unwritten stamp leaves things as they were before stamps.
+            let stamp = sync.repository_lock_dir.join(MAIN_INSTALL_STAMP);
+            let _ = tokio::fs::write(&stamp, sync.before).await;
         }
         Ok(())
     }
@@ -1421,6 +1463,69 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(main.join(".git/installed-locks")).unwrap(),
             "one\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_install_cancelled_while_queued_for_a_slot_is_still_owed_by_the_next_pull() {
+        use wt_platform::lock::{DEPENDENCY_INSTALL_POOL, DEPENDENCY_INSTALL_SLOTS, MachineSlots};
+        let (root, runner, seed, main, worktrees) = fixture().await;
+        let repo = repository(&main, &worktrees);
+        repo.fetch_origin(Default::default(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let before = git(&runner, &main, &["rev-parse", "HEAD"]).await;
+        commit_file(&runner, &seed, "pnpm-lock.yaml", "lock\n", "dependencies").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        let locks = root.path().join("configured-locks");
+        let others = MachineSlots::open(&locks, DEPENDENCY_INSTALL_POOL, DEPENDENCY_INSTALL_SLOTS)
+            .await
+            .unwrap();
+        let held: Vec<_> = (0..DEPENDENCY_INSTALL_SLOTS.get())
+            .map(|_| others.try_acquire().unwrap().unwrap())
+            .collect();
+        let options = FetchOriginOptions {
+            sync_install: Some(InstallPolicy {
+                command: Some("cat pnpm-lock.yaml >> .git/installed-locks".into()),
+                shell: "sh".into(),
+            }),
+            install_lock_dir: Some(locks.clone()),
+            ..Default::default()
+        };
+        let cancel = CancellationToken::new();
+        let queued = tokio::spawn({
+            let (repo, cancel, options) = (repo.clone(), cancel.clone(), options.clone());
+            async move { repo.fetch_origin(options, &cancel).await }
+        });
+        // What the clone owes is on record while the install only queues.
+        let stamp = repo
+            .repository_lock_dir()
+            .await
+            .join(super::MAIN_INSTALL_STAMP);
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while std::fs::read_to_string(&stamp).ok().as_deref() != Some(before.trim()) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the pre-pull commit is stamped before the wait for a slot");
+        assert!(!queued.is_finished());
+        cancel.cancel();
+        assert!(matches!(
+            queued.await.unwrap(),
+            Err(RepositoryError::Cancelled)
+        ));
+        assert!(!main.join(".git/installed-locks").exists());
+        drop(held);
+        // This pull changes no lockfile.
+        commit_file(&runner, &seed, "code.rs", "code\n", "code only").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        repo.fetch_origin(options, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(main.join(".git/installed-locks")).unwrap(),
+            "lock\n"
         );
     }
 

@@ -299,3 +299,63 @@ fn shell(
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// The config loader warns about a configured key a palette keeps for
+    /// itself. Its list is written out there, apart from the palettes and
+    /// the built-in actions that are the truth of it; this holds them
+    /// together.
+    #[tokio::test]
+    async fn the_keys_the_config_loader_warns_about_are_the_ones_the_palettes_keep() {
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        let mut config = (*fixture.ctx.config).clone();
+        config.actions.clear();
+        config.dev_server = Some(Default::default());
+        let kept = |config: &Config, surface: &ActionSurface| -> BTreeSet<char> {
+            definitions(config, surface)
+                .iter()
+                .filter(|def| def.id != CUSTOM_ID)
+                .filter_map(|def| def.key.as_deref()?.chars().next())
+                .chain(wt_tui::reserved_action_keys(surface).iter().copied())
+                .collect()
+        };
+        let warned = |kind, target, dev_server| -> BTreeSet<char> {
+            let action = ActionDef {
+                kind,
+                target,
+                ..ActionDef::default()
+            };
+            ('a'..='z')
+                .chain('0'..='9')
+                .filter(|key| wt_config::reserved_action_key(&action, *key, dev_server).is_some())
+                .collect()
+        };
+        let row = kept(&config, &ActionSurface::Row { key: String::new() });
+        let manager = kept(&config, &ActionSurface::Manager { key: None });
+        assert_eq!(
+            warned(ActionKind::Shell, ActionTarget::Headless, true),
+            row,
+            "an action listed on the row palette"
+        );
+        // A prompt for the manager is listed on both palettes.
+        assert_eq!(
+            warned(ActionKind::Claude, ActionTarget::Manager, true),
+            row.union(&manager).copied().collect(),
+            "an action listed on the manager palette too"
+        );
+        // Without a dev server its two rows, and their letters, are absent.
+        config.dev_server = None;
+        assert_eq!(
+            warned(ActionKind::Shell, ActionTarget::Headless, false),
+            kept(&config, &ActionSurface::Row { key: String::new() })
+        );
+        // No palette lists a slot's configured action.
+        assert!(warned(ActionKind::Claude, ActionTarget::Slot, true).is_empty());
+        fixture.close().await.unwrap();
+    }
+}

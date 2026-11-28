@@ -136,8 +136,15 @@ GitHub snapshots also carry the exact branch set queried by that read.
 `CoveredPr` distinguishes an unqueried branch, a confirmed absent PR, and a
 present PR. Action requirements preserve that distinction in
 `ActionPrObservation`; restored board data cannot prove absence or authorize a
-write. PR-dependent actions wait briefly for the existing shared leaf to
-confirm their branch instead of launching a second GitHub lookup.
+write. An action palette entry that needs a pull request waits on the board,
+in the open palette, for the shared leaf to confirm its branch: up to 12
+seconds, cancellable, with no second GitHub lookup. The host waits up to the same
+12 seconds before a commit that depends on a pull request (`RunAction` for
+such an action, a reviewer edit, mark ready, merge arming, ship, a
+failed-check fetch) when its confirmed read is older than 10 minutes or does
+not cover the branch. A row's pull request fact reads unknown once the GitHub read
+behind it is older than 10 minutes (`PR_EVIDENCE_AGE`), the bound the host
+holds its GitHub writes to.
 
 `attention_source` observes the existing prepared GitHub, metadata, issue,
 dev-server, and manager-session snapshots and narrates confirmed transitions.
@@ -220,10 +227,14 @@ events.
 
 Menus are presentation of the board, not host requests. `UiAction::menu`
 (`wt-tui/src/menus`) declares for every action, without a wildcard arm,
-whether its menu is built from the presented board, needs host-only data
-(with the reason), or is not a menu. Board builders are pure functions of
-`Board` and answer any board, including an empty one; a builder may defer to
-the host when its board lacks the data (an unprefetched palette). The host service refuses any action whose menu is board-built. An
+whether its menu is built from the presented board (`Menu::Local`), is
+content its host fetches live into an overlay that opens at the keypress
+(`Menu::Overlay`: failed-check logs and dev-server logs), is a read a host
+makes as a step of another request (`Menu::Host`, with the reason; no key
+opens one), or is not a menu. Board builders are pure functions of `Board`
+and answer any board, including an empty one. A board that cannot answer yet
+returns `LocalMenu::NotYet`: the notice says so and the sources are asked to
+read again. The host service refuses any action whose menu is board-built. An
 open board menu rebuilds on each presented snapshot and keeps its selection
 by option value, so option values identify choices, never list positions.
 
@@ -262,18 +273,29 @@ action's own validation.
 An open picker whose cursor the user has not moved follows the builder's
 newest default when it rebuilds; a moved cursor follows its option value and chord, since two options can share a value.
 
-The action palette is prefetched. While the selection rests (200 ms), the model
-sends a background `WarmPalette` for the selected row's and manager surfaces;
-the host computes the palette exactly as `PrepareActions` would and publishes
-it through the `palettes` source (`Persistence::Never`: it reflects running
-actions). Only confirmed-GitHub pickers are published; an active run or
-unconfirmed data withdraws the entry, so `!` asks the host. An open prefetched
-palette warms again while open. Commits re-run availability on the host; an
-action that became unavailable or started meanwhile is refused as stale.
+Every action palette (`!`, `M`, `<` `>` `\`) is built from the board, for
+local and remote rows. The catalog is `DisplayPolicy.actions`; a remote row
+reads its own host's policy from `Board.host_display`. The action source
+publishes `BoardRow.action_facts` (pull request fact, deployed stage, tracker
+id, active run) and `Board.actions` (recent argument values, active runs by
+slot, unavailable slots), and remote hosts' state arrives as
+`Board.host_actions`. `wt_tui::blocker` is the one availability rule: the
+palette lists entries by it and the host applies it again. An active run
+opens the Stop confirmation with the run id the board shows. The TUI opens
+argument and extras prompts itself and sends one `RunAction` carrying `seen`:
+the row's path and branch, and the pull request number for an action that
+requires one. The host makes one dispatch preparation and refuses as stale a
+different checkout, a different pull request, a pull-request action whose
+witness names no pull request, an entry unavailable now, or a run that
+started meanwhile; the palette reopens from the newer board. Recent argument
+values ride the board frame only for actions with an argument prompt.
 
-Host-built menus hold keys typed during preparation and replay them into the
-menu when it opens, stopping if it closes. Pointer-synthesized keys are not
-typeahead.
+A loading overlay (`Interaction::Loading`) takes every key while its request
+runs. Esc, `q`, Ctrl+C or the overlay's own key close it and cancel the
+request, and so does a dialog or request that replaces it. Nothing typed is
+held or replayed. An open confirmation rebuilds only while the rebuilt action
+equals the one it opened for: when its subject changes on the board it stays
+as shown and the host refuses the commit.
 The header's refresh wave counts prepared refreshing lanes and has a 10 Hz timer
 only while moving. Animation copies the last rendered screen and repaints its
 header, without rebuilding pane models or requesting source work. Resize falls
@@ -320,20 +342,24 @@ observations within the original timeout budget. A later response must prove
 presence or absence; persistent uncertainty remains an error. Mutating commands
 are never replayed by this mechanism.
 
-Session pickers, the harness chooser and terminal stop are board menus. The
-session source prepares `Board.session_menus` and `Board.terminals` for each
-local worktree and slot from the background session-history snapshot and the
-one tmux inventory the board already holds. Menus open from that board without
-a host request and rebuild as discovery completes. Opening `;` also sends a
+Session pickers, the harness chooser and terminal stop are board menus for
+every host. The session source prepares `Board.session_menus` and
+`Board.terminals` for each local worktree and slot from the background
+session-history snapshot and the one tmux inventory the board already holds.
+`remote_board` lists each connected host's `session_menus` and `terminals`
+under its rows' ledger keys, and a remote row's harness list and primary come
+from `Board.host_display`. A terminal whose process exited and whose pane
+tmux keeps is listed with `retained`, so its stop confirmation is built from
+the board as well. Menus open from that board without a host request and
+rebuild as discovery completes. A remote row whose host is disconnected or
+has not sent its lists gets a notice (`session list unknown: <error>`,
+`session list not loaded yet`) instead of a menu. Opening `;` also sends a
 background `DiscoverSessions` read that queues a history refresh, so saved
 conversations join the open picker. Cached history only nominates choices:
 attachment and stop check the live tmux identity again, and a mismatch replies
-stale so the menu reopens. Remote rows and targets without prepared entries
-are answered by their host from the same snapshot. A `New` choice carries the
+stale so the menu reopens. A `New` choice carries the
 live slot ids the picker showed; the host refuses it as stale when a slot it
-did not show is live for that harness. Terminal stop is local only for a
-running local terminal; retained dead panes and remote rows are read by their
-host. Target resolution uses
+did not show is live for that harness. Target resolution uses
 worktree inventory without Git status scans across the fleet.
 
 ## Query layer
@@ -359,9 +385,9 @@ at once and keeps one of those lanes for user-caused reads. A row's stamp is
 the earlier of its own read start and the start of the listing it was read
 against. The domain stamp is the oldest row stamp, and a key the listing did
 not show answers with the listing's stamp. Keyed stamps are filed under board
-row keys (the GitHub leaf also files them under the branch name and one
-reserved merge-queue key), and rows sharing a stamp key are confirmed
-together. `request_keys(Direct | Refresh, keys)` is user-caused and
+row keys (the GitHub leaf also files a branch's own read under
+`//branch/<name>`, `github_source::branch_key`, which no slug or branch can
+equal), and rows sharing a stamp key are confirmed together. `request_keys(Direct | Refresh, keys)` is user-caused and
 `request_keys(Recheck, keys)` is event-caused. A request for the whole domain
 is a sweep, except a whole `Direct`, which reads every row at user priority.
 `start_demanded_source` hands a fetch the `Demand` it serves (whole, listing,
@@ -373,8 +399,8 @@ not board data says why with `#[expect(clippy::disallowed_methods)]`.
 
 **Persistence.** Each leaf declares `Persistence::Disk(DiskCache)` or
 `Persistence::Never(reason)`. Disk leaves (Git inventory, GitHub PR data,
-review requests, issue statuses, dev status, session discoveries, Git
-presentation facts, remote host snapshots) restore their last live value at
+review requests, the reviewer pool, issue statuses, dev status, session
+discoveries, Git presentation facts, remote host snapshots) restore their last live value at
 start, off the input path, as `Provenance::Restored` in the `Refreshing` state,
 unless a live publish arrived first. They save live, ready data at most every
 10 seconds and once at shutdown within a one-second budget that never fails
@@ -391,7 +417,11 @@ that changed. Remote host display snapshots use `<cache root>/remote-query/` ins
 their scope binds the repository, main clone, selected repository config,
 endpoint, host protocol, and explicit display-cache schema. Compatible binary
 updates and unrelated local settings do not discard remembered remote rows.
-They restore as cached, never as confirmed live evidence. Empty startup frames
+They restore as cached, never as confirmed live evidence. The saved copy
+leaves out recent action argument values (`HostSnapshot::scrub_for_cache`
+through `DiskCache::scrubbed`), which stay on the host that recorded them;
+until the live stream arrives, an argument prompt for a remote row is a plain
+text prompt. Empty startup frames
 update connection state without replacing remembered rows. A mismatched,
 corrupt, oversized or week-old file is deleted and ignored. The directory is owner-only, identical data is not rewritten, and
 temporary files a crashed writer left behind are removed. Sources that read SQLite, logs or live process state are `Never`:
@@ -406,6 +436,24 @@ computation (automation lifecycle facts, the board's Git facts) asks
 that ref, and `wt_core::Landing` combines the answer with the Git landing.
 The leaf's snapshot only wakes those readers when a ref moves. A stage with
 a probe and no ref yet is not deployed.
+
+**Palette, reviewer and queue facts.** The `action-facts` leaf (`Never`: the
+checkout and history files are the source) reads what the palettes need
+beyond run records: recent argument values from the action history file,
+which special slots are unavailable, and, only when some action requires
+`deployed`, each confirmed local checkout's deployed stage. The deployed
+probe runs on worktree and run changes, on a board refresh and every 60
+seconds, so a deploy made outside wt can read as not deployed for up to a
+minute. The `reviewer-pool` leaf (`Disk`, GitHub domain) holds the people
+the reviewer picker offers. It reads GitHub when the pool is missing or a day
+old, on hard refresh, and on a board refresh while there is no pool at all; a
+restart inside the day reads nothing, and a pool that never loaded reports on
+the attention feed. The derived `pr-facts` stage, after `work_presentation`,
+attaches `Board.reviewers` and `PrPresentation.queue_removal`. The pool
+lends the board no provenance: it only offers names, and its commit is
+checked by the host. Queue removal is `wait_facts::queue_removal`, the
+predicate `wt wait` and `wt fleet` call, and is set only from a live GitHub
+read.
 
 **Confirmed inputs.** `LeafHandle::confirmed()` returns `Confirmed<T>` only for
 live data (for GitHub this includes an events-daemon snapshot, which is a fresh
@@ -440,8 +488,11 @@ when the outcome is ambiguous. It is shown over confirmed data until a fetch of 
 waits for a fetch of the whole domain)
 that started at or after the accept stamp shows the change, the write fails, or
 a bounded deadline passes (60 s in flight; 30 s accepted for GitHub, reviews and
-issues; 12 s for local domains; 30 s unconfirmed; creation and removal, which can
-legitimately take minutes, 10 minutes). A fleet-wide cleanup is one entry: the
+issues; 12 s for local domains; 30 s unconfirmed; creation, which can
+legitimately take minutes, 10 minutes, and removal 30 minutes). An accepted
+change stays past its deadline while no read that started after the write has
+finished: up to 120 s for GitHub and 60 s for local domains. A read that
+could have shown it and did not still expires it at the deadline. A fleet-wide cleanup is one entry: the
 controller folds the owning hosts' answers into accepted (its own stamp, taken
 after the last answer), unconfirmed only when a host's reply was ambiguous, or
 failed. A change waits only on domains that a
@@ -489,8 +540,24 @@ An expiry while confirmed data still disagrees shows one notice.
   field applies while the row has no explicit order and, under status sorting,
   no work status. The projection preserves stack units and handles missing or
   cyclic anchors without dropping rows.
-  J/K selection follows the pending reorder through unchanged snapshots and
-  its confirming layout. Filing through the section picker, archiving, or
+  J/K is resolved at the keypress: `plan_reorder` turns the press into a
+  `ReorderStep` against the board on screen (`Pass` a neighbouring unit,
+  `Cross` into the next section drawn, or `Section` for a header), and a
+  press that moves nothing is a local notice with no host request. The step
+  is projected at once as a `Pass`, `Cross` or `SectionPass` layout change. A
+  `Pass` is keyed by its unordered pair of units and a `Cross` by its unit,
+  so a later press on the same pair or unit replaces the earlier claim. The
+  controller validates the step (every key is a row it lists, the pair is
+  adjacent, `Cross.rows` are one stack, no derived section is involved) and
+  passes the store each listed unit's band (its status under status sort)
+  and whether it is drawn at its creation position. The store compares that
+  drawn layout with the stored one inside the same transaction and answers
+  `LayoutChanged`, a stale reply, on a difference; nothing is written. A unit
+  is the rows of a stack drawn together in one section, derived from
+  `BoardRow.stack_parent` and `stack_index`, which layout publishes;
+  `DisplayPolicy.status_sort` mirrors `[ui] sort`. J/K selection follows the
+  pending reorder through unchanged snapshots and its confirming layout, and
+  a refused crossing leaves the cursor on the row that did not move. Filing through the section picker, archiving, or
   removing a row keeps the cursor on a surviving neighbor in its old section.
 - The GitHub action worker keeps a private ledger of its own accepted and
   uncertain writes for its no-op guards (disarm is sent whenever the ledger
@@ -572,8 +639,10 @@ reports runs down, and a read the user caused may start one interval early; see
 [github-events.md](github-events.md#graphql-budget)); the optional events
 daemon supplies push updates stamped with its own fetch start, with a
 configured poll backstop for missed events or daemon downtime. After an accepted
-GitHub write the lane reads the written branch and the merge queue directly
-and stamps only those newer, and while any of the worker's writes is
+GitHub write the lane reads the written branch directly, its pull request and
+its own merge-queue entry, and stamps only that branch newer; other
+branches' queue entries, and whether the queue was read whole, stay as the
+last read of every branch left them. While any of the worker's writes is
 unconfirmed it keeps requesting that read (still rate limited) until one
 shows the write or its deadline passes, so a lagging read model does not make
 the change expire. A Sessions refresh also reruns the session-activity pass,
@@ -595,8 +664,8 @@ when their host scope ends.
 Capacity is counted per host. Long jobs (whole-host operations, action
 dispatch, and a removal until its worker is running) have four slots per
 host. Pull-request and fork-base writes have two per host, session stops two,
-and read-only preparation, prefetch, creation, metadata writes and host
-control one each. Three budgets are shared by all hosts. Attention
+and read-only preparation, the session picker's background discovery,
+creation, metadata writes and host control one each. Three budgets are shared by all hosts. Attention
 acknowledgement has a reserved view-control slot. Layout writes (fold, move,
 reorder, rename or delete a section, archive) serialize with each other in
 their own slot. Opening a link or an editor and copying exclude nothing and
@@ -650,13 +719,17 @@ while a later one is pending, and the failure stays beside that request's
 progress and result until the next user action. Background reads never
 interrupt.
 The terminal sends user requests and its own background reads on separate
-channels with separate queue bounds. Every user request logs one info-level
+channels with separate queue bounds. The user queue holds 64 requests beyond
+those the controller has taken. A key whose request finds it full is refused
+with `actions are busy; try again when one finishes` and projects nothing. A
+follow-up the model queued itself is not refused for a full queue: it is held
+until there is room. Every user request logs one info-level
 `controller request` record (`operation`, `lane`, `host`, `queued_ms`,
 `run_ms`, and `outcome`: `ok`, `failed`, `stale`, `uncertain`, `cancelled` or
 `replaced`). A background read logs it at debug unless it failed, is
-uncertain, or took over one second. Every host menu logs `host menu prepared`
-with `prepare_ms`, the number of `keys` typed and `typeahead` (`none`,
-`replayed` or `dropped`).
+uncertain, or took over one second. Every loading overlay that is answered
+logs `host overlay answered` with `operation_id`, `load_ms` and `filled`
+(whether the reply filled it or closed it with a message).
 Quitting closes command admission and cancels source reads, including automation
 evidence preparation. Already-claimed automation dispatches and accepted local
 writes retain their command token until their outcomes have been persisted;
@@ -783,7 +856,14 @@ writes nothing once the schema and the repository row exist, and the state
 payload is migrated at open. `Database::call` runs on the one writable
 connection. `Database::read` runs on a separate read-only connection that
 refuses writes, never migrates, and sees every write whose `call` returned
-before the read started.
+before the read started. It uses that connection only once the state payload
+migration has succeeded in this process; until then it runs on the write
+queue, which retries the migration first. The metadata leaf, row history and
+the removed-rows ledger read through it. The metadata leaf reads state and
+archived keys in one read transaction, and begins that read one stamp tick
+(a millisecond) after its fetch stamp, so a write accepted in the same
+millisecond as the stamp cannot fall after a read that counts as following
+it.
 
 The per-source query cache, event observations, action log tails, and source
 snapshots are rebuildable. Hard refresh may clear derived caches; it must not
@@ -860,13 +940,16 @@ Admission is first in, first out within a class. The highest class goes
 first, except that a waiter older than 5 seconds goes ahead. A command's
 timeout counts from admission. Waiting for admission has its own bound: 60
 seconds, or 15 minutes for bulk, unless the command sets one. Heavy commands
-(`git worktree add` and remove, Rift create, remove and gc, the destroy hook,
-the main clone's dependency install) also take a slot shared by every wt
-process that uses the same `paths.lock_dir`. They take it before their local
-permit and wait for it at most 10 minutes, or the admission bound if that is
-shorter. A read of every checkout's Git status takes a fleet-scan turn the
-same way and waits at most 10 seconds. After either wait the work proceeds
-without a slot, and interactive handles take neither. Dependency installs
+(`git worktree add` and remove, Rift create, remove and gc, the destroy hook)
+also take a slot shared by every wt process that uses the same
+`paths.lock_dir`. A heavy command holds neither its local permit nor a
+machine slot while it waits for the other: it waits for the permit and then
+only tries the slot; when none is free it gives the permit back, waits for a
+slot with nothing held, and keeps it only if a permit is free at once. Past
+10 minutes, or the admission bound if that is shorter, it runs on its permit
+alone. A read of every checkout's Git status waits at most 10 seconds for a
+fleet-scan turn and then reads without one. Interactive handles take
+neither. Dependency installs
 (3 at a time) and deletions of removed checkouts (2) have their own pools in
 the lock directory, outside the heavy slots. A wait of a second or more, or a
 run of five seconds or more, logs `slow subprocess` under `wt::process`
@@ -874,6 +957,22 @@ run of five seconds or more, logs `slow subprocess` under `wt::process`
 second or more logs `waited for a fleet-scan turn`. A few helpers built
 outside the application context (`wt init`, `_managed`, the controller bridge,
 updates, the workload helper) run on a flat pool of 8 instead.
+
+An origin fetch holds the repository's fetch lock for the fetch, its stamp,
+and the ref and checkout maintenance that follows (restoring generated paths,
+syncing the local trunk and `keep_fresh` branches, freshening idle Rift
+clones). The lock is released before the main clone's dependency install,
+which runs when the pull moved the main clone's HEAD and a lockfile differs
+between the commit its packages were last installed at and HEAD. That commit
+is recorded in `main-dependency-sync.stamp` in the repository lock directory
+(`<git common dir>/wt-locks`): HEAD after a successful install, and the
+pre-pull commit before a first install, so an install that was cancelled or
+failed is still owed to the next pull that moves HEAD. The install runs as
+bulk, not heavy. It takes one `dependency-install` slot in `paths.lock_dir`
+first, then the `main-dependency-sync` lock, checks again under the lock, and
+installs; a pull with nothing to install takes neither. A Rift create holds
+`main-dependency-sync` while it copies the main clone
+([backends.md](backends.md)).
 
 Long blocking jobs that must not occupy the runtime's blocking threads run on
 `wt_platform::blocking::run_long`, a process-wide pool of two threads. The

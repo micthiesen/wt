@@ -212,7 +212,7 @@ cannot be read, the classes that depend on it are skipped, never guessed, and
 | What | Removed when |
 |---|---|
 | Installed versions (`<install root>/versions/<key>`) | not the current or last-good build, not part of a pending boot, not named by any running process (its executable or its environment) or by the environment of any session on wt's tmux server (a session stays pinned through its `PATH` to the build that started it, even while nothing runs in it), and not one of the three most recently installed of the rest. If `ps`, the session list or any session's environment cannot be read, no version is removed that pass. Done under the install state's lock; a busy lock removes nothing. `wt rollback` reaches only versions still installed |
-| Action runs (`<log dir>/actions/<run id>`) | finished, started over 30 days ago, not among the newest 500 runs, and its worker's lock is free |
+| Action runs (`<log dir>/actions/<run id>`) | finished, started over 30 days ago, not among the newest 500 runs, and no worker can be alive: the action worker lock of the run's worktree (`action-worker-<hash>`) is free, and so is an older build's per-run lock (`action-run-<run id>`). A run whose `meta.json` names no worktree is kept |
 | Dev-server files (`<cache root>/dev/<slug>.state`, `.state.attempts`, `.crash.log`) | the slug has no worktree and the file is 7 days old |
 | Inspector sockets and session logs (`<cache root>/insp/<session>.sock`, `sessions/<session>.err`) | no tmux session has that name, no worktree's slug starts it, and the file is 7 days old |
 | Slug records in the repository state | only by `wt doctor --prune`, or daily with `state_records = true`; see below |
@@ -228,7 +228,10 @@ pass.
 
 Lock files are never removed. A lock is its file's inode, a locker keeps the
 file after release and does not look at it again once open, so unlinking one
-could let two processes hold "the same" lock. They are empty files.
+could let two processes hold "the same" lock. They are empty files. Action
+runs share fixed lock names (one worker lock per worktree, 64 state locks),
+so runs add no files; the per-run `action-run-*` and `action-state-<run id>`
+files older builds created stay.
 
 A worktree's record in the repository state outlives the worktree on purpose:
 restoring its branch reads the recorded fork base, and a pause is remembered

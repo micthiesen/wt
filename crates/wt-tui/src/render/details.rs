@@ -1103,7 +1103,13 @@ fn status_header(row: &BoardRow) -> Option<(Vec<Spans>, ratatui::style::Color)> 
         Some(phase) => phase_header(phase, row.owed_block, &row.owes),
         None => {
             let (work, effective) = (work?, effective?);
-            if work.blocked {
+            // A gate outlives a change of state: a row gated while it is
+            // still being worked on reads as `wt status` and `wt fleet` say
+            // it, blocked, with the state beside it.
+            let gated = record
+                .and_then(|record| record.blocked_on.as_deref())
+                .is_some_and(|gate| !gate.is_empty());
+            if work.blocked || (gated && !derived) {
                 let state = record.map_or(effective, |record| record.state);
                 (
                     glyphs::OWED_GATE,
@@ -3451,6 +3457,49 @@ mod tests {
             .filter_map(|line| line.strip_prefix("  ").map(str::to_owned))
             .collect();
         assert_eq!(order, ["after the deploy", "sooner", "later", "other"]);
+    }
+
+    /// A gate now survives a change of state. `wt status` and `wt fleet`
+    /// read such a row as `blocked/working`; the banner must not read as if
+    /// nothing held it.
+    #[test]
+    fn a_gated_row_that_is_still_being_worked_on_reads_blocked() {
+        for state in [WorkState::Working, WorkState::Review] {
+            let mut gated = row();
+            let work = gated.work.as_mut().unwrap();
+            work.effective_state = Some(state);
+            // The core's gate rule covers ready and todo only.
+            work.blocked = false;
+            let record = work.record.as_mut().unwrap();
+            record.state = state;
+            record.blocked_on = Some("mobile release".into());
+            let header = block(&gated, 200)[0].clone();
+            assert!(
+                header.starts_with(&format!("⊘ blocked · {}", state.as_str())),
+                "{header}"
+            );
+            // The same row without a gate reads as its state alone.
+            gated
+                .work
+                .as_mut()
+                .unwrap()
+                .record
+                .as_mut()
+                .unwrap()
+                .blocked_on = None;
+            let header = block(&gated, 200)[0].clone();
+            assert!(!header.contains("blocked"), "{header}");
+            assert!(header.contains(state.as_str()), "{header}");
+        }
+        // An agent asking a question is said first, gate or not.
+        let mut asking = row();
+        let work = asking.work.as_mut().unwrap();
+        work.effective_state = Some(WorkState::NeedsHuman);
+        work.derived = true;
+        work.blocked = false;
+        work.record.as_mut().unwrap().state = WorkState::Working;
+        work.record.as_mut().unwrap().blocked_on = Some("mobile release".into());
+        assert!(block(&asking, 200)[0].contains("needs-human · live"));
     }
 
     #[test]

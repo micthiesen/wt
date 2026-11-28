@@ -112,6 +112,20 @@ pub struct Board {
 }
 
 impl Board {
+    /// Whether any host's action source lists the run as active.
+    pub fn run_active(&self, run_id: &str) -> bool {
+        let listed =
+            |actions: &crate::ActionState| actions.runs.values().any(|run| run.run_id == run_id);
+        listed(&self.actions)
+            || self.host_actions.values().any(listed)
+            || self.rows.iter().any(|row| {
+                row.action_facts
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|run| run.run_id == run_id)
+            })
+    }
+
     /// Whether the automation engine has anything to show or to pause:
     /// configured rules, fires it holds or ran, or a row that waits for
     /// something. Watches run under an implicit rule, so a repository with no
@@ -1149,6 +1163,9 @@ pub struct DisplayPolicy {
     pub staging_probe: bool,
     /// The same for `[environments.production]`.
     pub production_probe: bool,
+    /// GitHub reads are switched off on this host (`WT_GITHUB=off`): no
+    /// pull request will ever load, so nothing should say one is loading.
+    pub github_off: bool,
     /// The action definitions the palettes list.
     pub actions: crate::ActionCatalog,
 }

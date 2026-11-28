@@ -129,8 +129,9 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   a fetch of the rows it names that *started* at or after the host's accept
   stamp shows it (a change that names no row waits for a fetch of the whole
   domain), the write fails, or its bounded deadline expires. For GitHub that
-  fetch may read the written branch alone: only that branch, its rows and the
-  merge queue are then stamped newer than the last read of every branch. A
+  fetch may read the written branch alone: only that branch (key
+  `//branch/<name>`, with its own merge-queue entry) and the rows showing it
+  are then claimed newer than the last read of every branch. A
   resolved request, an older fetch, a restored value or another process's
   stamp never settles it. Every
   new `UiAction` declares its effect in `UiAction::effect`; toggles resolve
@@ -139,10 +140,13 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   wildcard-free declaration of each menu's source; do not keep a second list.
   When a menu is slow, publish its data through a source and build it from the
   board; never add a host round trip, a host-side cache, or a special case in
-  generic dispatch to open it. `Menu::Host` names data the board cannot carry
-  (a live network fetch, fleet-wide planning, exact removal hazards).
-  Builders are pure and total over any `Board`; configuration they need goes
-  into `DisplayPolicy`. Picker option values identify choices, never list
+  generic dispatch to open it. Content only a host can fetch live (a CI log, a
+  terminal's output) is `Menu::Overlay`: its overlay opens at the keypress
+  with a loading body and the reply fills it. `Menu::Host` is a read a host
+  makes as a step of another request; no key opens one. Builders are pure and
+  total over any `Board`: a board that cannot answer yet says so
+  (`LocalMenu::NotYet`, which also asks the sources to read again) instead of
+  asking a host. Configuration they need goes into `DisplayPolicy`. Picker option values identify choices, never list
   positions, because open menus rebuild on each snapshot.
 - Cached data decides what a menu offers, never what a write assumes. Every
   menu commit carries a witness of what was shown (`Seen<T>`, `PrPin`,
@@ -151,12 +155,17 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   lock where one exists, and refuses a mismatch with `controller::stale`;
   nothing is written and nothing is retried with the newer state. Do not
   loosen a witness to silence stale replies, drop it from a commit, or treat a
-  witnessless commit as a menu commit.
-- Keys belong to the layer the user believes is on top. Keys typed while a
-  host menu loads replay into that menu and stop when it closes; they never
-  reach the board underneath. Never block keyboard input to wait for a host;
-  typed keys are dropped only with a notice, when their menu fails or loads
-  past the typeahead limit.
+  witnessless commit as a menu commit. `J`/`K` carries a `ReorderStep`
+  resolved against the board on screen; the controller moves exactly the units
+  that step names, and the store compares the layout it lists with the
+  stored one inside the write. The controller's board never picks the
+  neighbour or the unit.
+- Keys belong to the layer the user believes is on top, and that layer is
+  always on screen: every key that opens something opens it in the same input
+  call, from the board or as a loading overlay. A loading overlay takes every
+  key until it fills or is closed; closing it (Esc, `q`, Ctrl+C, its own key)
+  or replacing it cancels its request. Nothing typed is held for later or
+  replayed, and no key waits on a host with nothing on screen.
 - Hold state is self-expiring and resource-scoped. Recheck the exact hold ID
   immediately before honoring it; an unknown or stale copy creates no freeze.
 

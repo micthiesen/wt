@@ -23,7 +23,7 @@ mod section;
 mod status;
 
 mod confirms;
-mod github;
+pub(crate) mod github;
 pub(crate) mod sessions;
 
 pub use confirms::new_worktree_prompt;
@@ -68,8 +68,9 @@ pub enum LocalMenu {
     },
     /// Nothing to choose from; show this notice instead.
     Notice(String),
-    /// The board cannot answer yet: say so and ask the sources to read
-    /// again, instead of holding the key until a host has waited for them.
+    /// The board has no answer yet, or one that may be behind what the
+    /// person knows: say it and ask the sources to read again, instead of
+    /// holding the key until a host has waited for them.
     NotYet(String),
 }
 
@@ -199,7 +200,6 @@ impl UiAction {
             | A::OpenEditor { .. }
             | A::Remove { .. }
             | A::DismissFailedRemoval { .. }
-            | A::Cleanup { .. }
             | A::CleanupTargets { .. }
             | A::ToggleArchive { .. }
             | A::SetStatus { .. }

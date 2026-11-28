@@ -724,16 +724,17 @@ fn an_open_stop_confirmation_keeps_the_run_it_was_opened_for() {
     let Interaction::Confirm(confirm) = &model.interaction else {
         panic!("the confirmation closed")
     };
-    assert_eq!(confirm.title, "Stop Lint?");
+    // It still names Lint, and says Lint is over; it never becomes a
+    // confirmation to stop Deploy.
+    assert_eq!(confirm.title, "Lint has finished");
+    assert!(matches!(
+        &confirm.action,
+        ConfirmAction::KillAction { run_id, .. } if run_id == "run-9"
+    ));
     model.confirm_settles_at = None;
-    // The host answers that Lint is no longer running; Deploy is untouched.
-    assert_eq!(
-        model.input(key(KeyCode::Enter), 20),
-        InputResult::Action(UiAction::KillAction {
-            action_key: "one".into(),
-            run_id: "run-9".into(),
-        })
-    );
+    // Enter closes it. Deploy is untouched and no host is asked anything.
+    assert_eq!(model.input(key(KeyCode::Enter), 20), InputResult::Draw);
+    assert!(matches!(model.interaction, Interaction::None));
     // The same holds when the slot goes idle: the list does not appear
     // under an Enter meant for the confirmation.
     let mut model = super::Model::default();
@@ -744,6 +745,6 @@ fn an_open_stop_confirmation_keeps_the_run_it_was_opened_for() {
     model.apply(live(board));
     assert!(matches!(
         &model.interaction,
-        Interaction::Confirm(confirm) if confirm.title == "Stop Lint?"
+        Interaction::Confirm(confirm) if confirm.title == "Lint has finished"
     ));
 }

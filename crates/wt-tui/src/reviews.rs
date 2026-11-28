@@ -126,6 +126,7 @@ mod tests {
             wt_core::Domain::Git,
         ));
         assert_eq!(model.selected, Some(0));
+        model.keys_settle = None;
         assert_eq!(
             model.input(KeyEvent::from(KeyCode::Char('t')), 20),
             InputResult::Unchanged

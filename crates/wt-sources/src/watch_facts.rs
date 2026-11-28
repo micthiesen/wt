@@ -322,15 +322,75 @@ fn merged_for_good(pr: &PrFacts) -> bool {
     pr.life == Some(PrLife::Merged) && pr.merge_oid.is_some()
 }
 
+/// What the removal records say of each removed worktree, newest record per
+/// slug: whether its work landed, where, and by which commit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Removed(BTreeMap<String, (RowFacts, Option<String>)>);
+
+impl Removed {
+    /// What `slug`'s removal record says, when one is kept.
+    pub fn get(&self, slug: &str) -> Option<&RowFacts> {
+        self.0.get(slug).map(|(row, _)| row)
+    }
+
+    /// The commit that landed `slug`'s work, where its record names one.
+    pub fn landing_commit(&self, slug: &str) -> Option<&str> {
+        self.0.get(slug)?.1.as_deref()
+    }
+}
+
+/// Read the removal records of `state`. A record that says the work was
+/// not on the base branch (or that was dropped before landing) reads as not
+/// merged, never as unknown: nothing more will be learned of it.
+pub fn removed_rows(state: &serde_json::Value, separate_production: bool) -> Removed {
+    let mut newest: BTreeMap<String, wt_store::RemovedWorktree> = BTreeMap::new();
+    for entry in state["removed"].as_array().into_iter().flatten() {
+        let Ok(entry) = serde_json::from_value::<wt_store::RemovedWorktree>(entry.clone()) else {
+            continue;
+        };
+        let at = |entry: &wt_store::RemovedWorktree| wt_core::parse_iso_millis(&entry.removed_at);
+        if newest
+            .get(&entry.slug)
+            .is_none_or(|kept| at(kept) <= at(&entry))
+        {
+            newest.insert(entry.slug.clone(), entry);
+        }
+    }
+    Removed(
+        newest
+            .into_iter()
+            .map(|(slug, entry)| {
+                let landing = wt_store::removed_landing(&entry, separate_production);
+                let row = RowFacts {
+                    merged: Some(landing.base),
+                    production: (landing.base && landing.production).then_some(true),
+                    ..RowFacts::default()
+                };
+                // The pull request's merge commit, or for a landing Git
+                // alone proved, the head the base contains.
+                let commit = ["prMergeCommitOid", wt_store::LANDING_COMMIT_OID]
+                    .into_iter()
+                    .filter_map(|key| entry.extra.get(key)?.as_str())
+                    .find(|oid| landing.base && !oid.is_empty())
+                    .map(str::to_owned);
+                (slug, (row, commit))
+            })
+            .collect(),
+    )
+}
+
 /// Everything known this pass. `rows` are the live worktrees; when they come
 /// from a confirmed inventory, a worktree a watch names that is not among
-/// them is known gone.
+/// them is known gone, and `removed` says what its removal record kept of
+/// it. A live worktree always answers for its slug: a record of an earlier
+/// one with the same name is not asked.
 pub fn facts(
     watches: &[Watch],
     rows: &BTreeMap<String, RowFacts>,
     inventory_confirmed: bool,
     fleet_prs: &BTreeMap<u64, PrFacts>,
     externals: &Externals,
+    removed: &Removed,
 ) -> WatchFacts {
     let mut facts = WatchFacts {
         rows: rows.clone(),
@@ -338,7 +398,16 @@ pub fn facts(
     };
     if inventory_confirmed {
         for slug in named_worktrees(watches) {
-            facts.rows.entry(slug).or_default();
+            if facts.rows.contains_key(&slug) {
+                continue;
+            }
+            if let Some(commit) = removed.landing_commit(&slug) {
+                facts
+                    .removed_landings
+                    .insert(slug.clone(), commit.to_owned());
+            }
+            let row = removed.get(&slug).cloned().unwrap_or_default();
+            facts.rows.insert(slug, row);
         }
     }
     externals.fill(&mut facts);
@@ -412,7 +481,16 @@ fn judge(watch: &Watch, facts: &WatchFacts, now_ms: i64) -> Option<WatchStamps> 
         .stamps
         .and_then(|stamps| stamps.last_error)
         .flatten();
-    let error = check_error.or_else(|| closed_unmerged(watch, facts));
+    // Neither is a worktree removed before it merged, which the watch can
+    // only go on waiting for.
+    let error = check_error
+        .or_else(|| closed_unmerged(watch, facts))
+        .or_else(|| {
+            watch
+                .when
+                .iter()
+                .find_map(|cond| wt_core::watch::never_holds(cond, facts))
+        });
     let mut stamps = evaluation
         .stamps
         .unwrap_or_else(|| WatchStamps::new(&watch.id));
@@ -731,6 +809,7 @@ mod tests {
             true,
             &BTreeMap::new(),
             &Externals::default(),
+            &Removed::default(),
         );
         apply(&mut own, &known, NOON);
         assert!(!own.is_met());
@@ -794,9 +873,23 @@ mod tests {
         let watches = [watch("aaaaaa", "one", &["two:gone"])];
         let rows = BTreeMap::from([("one".to_owned(), row("first"))]);
         let externals = Externals::default();
-        let unconfirmed = facts(&watches, &rows, false, &BTreeMap::new(), &externals);
+        let unconfirmed = facts(
+            &watches,
+            &rows,
+            false,
+            &BTreeMap::new(),
+            &externals,
+            &Removed::default(),
+        );
         assert!(!unconfirmed.rows.contains_key("two"));
-        let confirmed = facts(&watches, &rows, true, &BTreeMap::new(), &externals);
+        let confirmed = facts(
+            &watches,
+            &rows,
+            true,
+            &BTreeMap::new(),
+            &externals,
+            &Removed::default(),
+        );
         assert!(!confirmed.rows["two"].exists);
         let mut pending = watches[0].clone();
         assert!(!apply(&mut pending, &unconfirmed, NOON));
@@ -862,5 +955,120 @@ mod tests {
         let mut known = WatchFacts::default();
         externals.fill(&mut known);
         assert!(known.commits.is_empty() && known.releases.is_empty());
+    }
+
+    /// The gate `--until wt:two:merged` where "two" merged and was removed
+    /// before anything judged the watch.
+    #[test]
+    fn a_watch_on_a_worktree_removed_after_merging_is_met_from_its_record() {
+        let record = |slug: &str, at: &str, landed: &str, commit: Option<&str>| {
+            serde_json::json!({
+                "slug": slug, "branch": format!("feature/{slug}"), "removedAt": at,
+                "landedOnAtRemoval": landed, "prMergeCommitOid": commit,
+            })
+        };
+        let state = serde_json::json!({"removed": [
+            // An earlier worktree of the same name never merged.
+            record("two", "2026-11-20T00:00:00Z", "unlanded", None),
+            record("two", "2026-11-27T00:00:00Z", "base", Some("c0ffee1")),
+            record("three", "2026-11-27T00:00:00Z", "unlanded", None),
+            // Landed by Git alone: no pull request, the head is in the base.
+            serde_json::json!({
+                "slug": "five", "branch": "feature/five", "removedAt": "2026-11-27T00:00:00Z",
+                "landedOnAtRemoval": "base", "gitState": "merged", "landingCommitOid": "5eed5",
+            }),
+            // An unlanded record's commit is never followed.
+            serde_json::json!({
+                "slug": "six", "branch": "feature/six", "removedAt": "2026-11-27T00:00:00Z",
+                "landedOnAtRemoval": "unlanded", "landingCommitOid": "5eed6",
+            }),
+        ]});
+        let removed = removed_rows(&state, true);
+        assert_eq!(removed.get("two").unwrap().merged, Some(true));
+        assert_eq!(removed.landing_commit("two"), Some("c0ffee1"));
+        assert_eq!(removed.get("three").unwrap().merged, Some(false));
+        assert_eq!(removed.landing_commit("three"), None);
+        assert_eq!(removed.get("five").unwrap().merged, Some(true));
+        assert_eq!(removed.landing_commit("five"), Some("5eed5"));
+        assert_eq!(removed.landing_commit("six"), None);
+        assert!(removed.get("four").is_none());
+
+        let externals = Externals::default();
+        let live = BTreeMap::from([("one".to_owned(), row("first"))]);
+        let known = |watches: &[Watch], rows: &BTreeMap<String, RowFacts>, confirmed| {
+            facts(
+                watches,
+                rows,
+                confirmed,
+                &BTreeMap::new(),
+                &externals,
+                &removed,
+            )
+        };
+        let mut gate = watch("aaaaaa", "one", &["wt:two:merged"]);
+        // Only a confirmed inventory says the worktree is gone.
+        assert!(!{
+            let facts = known(std::slice::from_ref(&gate), &live, false);
+            apply(&mut gate, &facts, NOON)
+        });
+        assert!({
+            let facts = known(std::slice::from_ref(&gate), &live, true);
+            apply(&mut gate, &facts, NOON)
+        });
+        assert!(gate.is_met());
+        // A stage follows the commit the record names.
+        let mut staged = watch("bbbbbb", "one", &["wt:two:staging"]);
+        {
+            let facts = known(std::slice::from_ref(&staged), &live, true);
+            apply(&mut staged, &facts, NOON)
+        };
+        assert_eq!(
+            staged.when[0].cond,
+            Condition::Commit {
+                oid: "c0ffee1".into(),
+                stage: VerifyStage::Staging
+            }
+        );
+
+        let mut git_only = watch("dddddd", "one", &["wt:five:staging"]);
+        {
+            let facts = known(std::slice::from_ref(&git_only), &live, true);
+            apply(&mut git_only, &facts, NOON)
+        };
+        assert_eq!(
+            git_only.when[0].cond,
+            Condition::Commit {
+                oid: "5eed5".into(),
+                stage: VerifyStage::Staging
+            }
+        );
+
+        // Removed without merging: not met, and the watch says why.
+        let unlanded = watch("cccccc", "one", &["wt:three:merged"]);
+        let stamps = stamps(
+            std::slice::from_ref(&unlanded),
+            &known(std::slice::from_ref(&unlanded), &live, true),
+            &BTreeMap::new(),
+            NOON,
+        );
+        assert_eq!(stamps[0].met_at_ms, None);
+        assert!(
+            stamps[0]
+                .last_error
+                .clone()
+                .flatten()
+                .is_some_and(|error| error.contains("three was removed without merging"))
+        );
+
+        // A later live worktree named "two" answers for the slug.
+        let mut reborn = live.clone();
+        let mut again = row("second");
+        again.merged = Some(false);
+        reborn.insert("two".into(), again);
+        let mut waiting = watch("dddddd", "one", &["wt:two:merged"]);
+        assert!(!{
+            let facts = known(std::slice::from_ref(&waiting), &reborn, true);
+            apply(&mut waiting, &facts, NOON)
+        });
     }
 }

@@ -300,29 +300,109 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             }
             members_by_unit.entry(root).or_default().push(index);
         }
-        let mut positions = Vec::new();
-        for &root in &units {
-            let entry = &state["slugs"][&board.rows[root].key];
-            let Some(after) = entry.get("creationAfter") else {
-                continue;
+        // The units still at their creation position.
+        let anchored: Vec<usize> = units
+            .iter()
+            .copied()
+            .filter(|root| {
+                let entry = &state["slugs"][&board.rows[*root].key];
+                let started = members_by_unit[root].iter().any(|&member| {
+                    parse_work_status(&state["slugs"][&board.rows[member].key]["work"]).is_some()
+                });
+                entry.get("creationAfter").is_some()
+                    && !(entry["order"].is_number() || (sort == UiSort::Status && started))
+            })
+            .collect();
+        // Where a row that is not drawn here would be: behind the last unit
+        // drawn by its own order that does not sort after it. `status` is
+        // `None` for a row whose status is no longer known.
+        let behind = |status: Option<u8>, order: f64, identity: &str| {
+            let mut placed = units
+                .iter()
+                .copied()
+                .filter(|root| !anchored.contains(root));
+            let by_order = |root: usize| {
+                let key = unit(root);
+                key.1.total_cmp(&order).then_with(|| key.2.cmp(identity))
             };
-            let started = members_by_unit[&root].iter().any(|&member| {
-                parse_work_status(&state["slugs"][&board.rows[member].key]["work"]).is_some()
-            });
-            if entry["order"].is_number() || (sort == UiSort::Status && started) {
-                continue;
+            match status {
+                Some(status) => {
+                    placed.rfind(|&root| unit(root).0.cmp(&status).then(by_order(root)).is_le())
+                }
+                None => placed
+                    .filter(|&root| by_order(root).is_le())
+                    .max_by(|&a, &b| {
+                        let (a, b) = (unit(a), unit(b));
+                        a.1.total_cmp(&b.1).then_with(|| a.2.cmp(b.2))
+                    }),
             }
-            let anchor = after.as_str().and_then(|key| {
-                indices
-                    .iter()
-                    .copied()
-                    .find(|&index| board.rows[index].key == key)
-                    .map(anchor_of)
-            });
-            if anchor != Some(root) {
-                positions.push((root, anchor));
+        };
+        let stored_here = |index: usize| {
+            let filed = state["slugs"][&board.rows[index].key]["section"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or(INBOX);
+            filed == key.as_str()
+        };
+        // The unit an anchored unit is drawn behind; `None` is the top. The
+        // row it was created after may no longer be drawn here. Archived,
+        // landed or being removed, it is still filed here, and the unit
+        // stays where that row would be drawn. Filed elsewhere or forgotten,
+        // the store kept where it was (`creationSlot`).
+        let follows = |root: usize| {
+            let mut entry = &state["slugs"][&board.rows[root].key];
+            // Bounded, so rows that name each other end at the top.
+            for _ in 0..=board.rows.len() {
+                let named = entry["creationAfter"].as_str();
+                if let Some(drawn) = named.and_then(|after| {
+                    indices
+                        .iter()
+                        .copied()
+                        .find(|&index| board.rows[index].key == after)
+                }) {
+                    return Some(anchor_of(drawn));
+                }
+                let Some(elsewhere) = named
+                    .and_then(|after| board.rows.iter().position(|row| row.key == after))
+                    .filter(|&index| stored_here(index))
+                else {
+                    let slot = &entry["creationSlot"];
+                    return slot.is_object().then_some(()).and_then(|()| {
+                        behind(
+                            None,
+                            slot["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
+                            slot["key"].as_str().unwrap_or_default(),
+                        )
+                    });
+                };
+                let slug = board.rows[elsewhere].key.as_str();
+                let stored = &state["slugs"][slug];
+                let by_status =
+                    sort == UiSort::Status && parse_work_status(&stored["work"]).is_some();
+                if stored.get("creationAfter").is_some()
+                    && !stored["order"].is_number()
+                    && !by_status
+                {
+                    entry = stored;
+                    continue;
+                }
+                return behind(
+                    Some(if sort == UiSort::Status {
+                        rank(slug)
+                    } else {
+                        0
+                    }),
+                    stored["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
+                    slug,
+                );
             }
-        }
+            None
+        };
+        let positions: Vec<(usize, Option<usize>)> = anchored
+            .iter()
+            .map(|&root| (root, follows(root)))
+            .filter(|&(root, anchor)| anchor != Some(root))
+            .collect();
         apply_creation_positions(&mut units, &positions);
         let mut placed = Vec::with_capacity(indices.len());
         for root in units {

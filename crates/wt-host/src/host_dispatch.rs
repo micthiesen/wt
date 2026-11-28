@@ -19,16 +19,8 @@ pub async fn execute(
     // Cleanup is a fleet-wide confirmation, built from the board: route what
     // it captured back to the hosts that own it. Explicitly host-scoped
     // requests use the normal path.
-    if !matches!(command, UiAction::OnHost { .. }) {
-        match command {
-            UiAction::CleanupTargets { targets } => {
-                return Ok(crate::fleet_cleanup::cleanup_targets(fleet, targets).await);
-            }
-            UiAction::Cleanup { revisions } => {
-                return Ok(crate::fleet_cleanup::cleanup(fleet, revisions).await);
-            }
-            _ => {}
-        }
+    if let UiAction::CleanupTargets { targets } = command {
+        return Ok(crate::fleet_cleanup::cleanup_targets(fleet, targets).await);
     }
     let (host, action, _) = wt_app_core::host_routing::resolve(command)?;
     if let UiAction::SetPerf {

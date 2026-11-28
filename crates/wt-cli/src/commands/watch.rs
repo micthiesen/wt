@@ -243,15 +243,75 @@ impl ReadConditions {
     }
 }
 
+/// The removal records, read only when a condition names a worktree that
+/// is not there.
+async fn removed_for(
+    ctx: &AppContext,
+    conditions: &[Condition],
+    live: &[String],
+) -> wt_sources::watch_facts::Removed {
+    let absent = conditions
+        .iter()
+        .any(|cond| matches!(cond, Condition::Worktree { slug, .. } if !live.contains(slug)));
+    if !absent {
+        return Default::default();
+    }
+    let separate = ctx.config.branch.separate_production();
+    ctx.database
+        .call(|store| Ok(store.read_wt_state()?))
+        .await
+        .map(|state| wt_sources::watch_facts::removed_rows(&state, separate))
+        .unwrap_or_default()
+}
+
 /// What to say about a condition on a worktree that is not there. `live`
-/// is every live worktree's slug.
-fn absent_worktree(cond: &Condition, live: &[String]) -> Option<String> {
+/// is every live worktree's slug; `removed` says what the removal record of
+/// one that is gone kept, which is what the condition is then judged by.
+fn absent_worktree(
+    cond: &Condition,
+    live: &[String],
+    removed: &wt_sources::watch_facts::Removed,
+) -> Option<String> {
     let known = |slug: &String| live.contains(slug);
     match cond {
-        Condition::Worktree { slug, state } if !known(slug) => Some(format!(
-            "no worktree named {slug} right now; this waits until one exists and reaches {}",
-            state.as_str()
-        )),
+        Condition::Worktree { slug, state } if !known(slug) => {
+            let follows_landing = matches!(
+                state,
+                RowState::Merged | RowState::Staging | RowState::Production
+            );
+            Some(match removed.get(slug).and_then(|row| row.merged) {
+                None => format!(
+                    "no worktree named {slug} right now; this waits until one exists and reaches {}",
+                    state.as_str()
+                ),
+                Some(true) if *state == RowState::Merged => {
+                    format!("{slug} was removed after its work merged, so this holds already")
+                }
+                Some(true) if follows_landing && removed.get(slug)?.get(*state) == Some(true) => {
+                    format!(
+                        "{slug} was removed after its work reached {}, so this holds already",
+                        state.as_str()
+                    )
+                }
+                Some(true) if follows_landing => match removed.landing_commit(slug) {
+                    Some(_) => format!(
+                        "{slug} was removed after its work merged; this follows the commit that landed it to {}",
+                        state.as_str()
+                    ),
+                    None => format!(
+                        "{slug} was removed after its work merged and the commit that landed it was not recorded, so whether it reached {} cannot be told",
+                        state.as_str()
+                    ),
+                },
+                Some(false) if follows_landing => format!(
+                    "{slug} was removed without merging, so this cannot hold unless a worktree named {slug} is created again and merges"
+                ),
+                Some(_) => format!(
+                    "{slug} was removed and can no longer become {}",
+                    state.as_str()
+                ),
+            })
+        }
         Condition::Gone { slug } if !known(slug) => Some(format!(
             "no worktree named {slug} right now, so this holds already"
         )),
@@ -292,9 +352,17 @@ pub(crate) async fn read_conditions(
         warnings: Vec::new(),
     };
     let live = live_slugs(inventory);
-    for arg in args {
-        let mut cond = parse(arg, clock).map_err(|error| error.to_string())?;
-        if let Some(warning) = absent_worktree(&cond.cond, &live)
+    let parsed = args
+        .iter()
+        .map(|arg| parse(arg, clock).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let named = parsed
+        .iter()
+        .map(|cond| cond.cond.clone())
+        .collect::<Vec<_>>();
+    let removed = removed_for(ctx, &named, &live).await;
+    for mut cond in parsed {
+        if let Some(warning) = absent_worktree(&cond.cond, &live, &removed)
             && !read.warnings.contains(&warning)
         {
             read.warnings.push(warning);
@@ -905,6 +973,12 @@ async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
             return Ok(1);
         }
     };
+    let named = conditions
+        .iter()
+        .filter_map(|arg| parse(arg, clock).ok())
+        .map(|cond| cond.cond)
+        .collect::<Vec<_>>();
+    let removed = removed_for(ctx, &named, &live).await;
     let mut failed = false;
     for arg in conditions {
         let cond = match parse(arg, clock) {
@@ -919,7 +993,7 @@ async fn check(ctx: &AppContext, conditions: &[String]) -> Result<i32> {
         if let Condition::At { .. } = cond.cond {
             println!("  at {} local time", cond.to_arg(clock.utc_offset_minutes));
         }
-        if let Some(warning) = absent_worktree(&cond.cond, &live) {
+        if let Some(warning) = absent_worktree(&cond.cond, &live, &removed) {
             println!("  warning: {warning}");
         }
         match config_fact(config, &cond.cond) {
@@ -1345,6 +1419,50 @@ mod tests {
             [
                 "no worktree named ghost right now; this waits until one exists and reaches merged",
                 "no worktree named ghost right now, so this holds already",
+            ]
+        );
+        // A worktree that was removed is judged by its removal record, and
+        // the warning says how.
+        ctx.database
+            .call(|store| {
+                let removed = |slug: &str, landed: &str, commit: Option<&str>| {
+                    serde_json::from_value::<wt_store::RemovedWorktree>(json!({
+                        "slug": slug, "branch": format!("feature/{slug}"),
+                        "removedAt": "2026-11-27T12:00:00Z", "landedOnAtRemoval": landed,
+                        "prMergeCommitOid": commit,
+                    }))
+                };
+                store.record_removed_worktrees(
+                    &[
+                        removed("landed", "base", Some("c0ffee1"))?,
+                        removed("abandoned", "unlanded", None)?,
+                    ],
+                    1_795_000_000_000,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let read = read_conditions(
+            ctx,
+            &listed,
+            &[
+                "wt:landed:merged".into(),
+                "wt:landed:staging".into(),
+                "wt:landed:ready".into(),
+                "wt:abandoned:merged".into(),
+            ],
+            clock(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read.warnings,
+            [
+                "landed was removed after its work merged, so this holds already",
+                "landed was removed after its work merged; this follows the commit that landed it to staging",
+                "landed was removed and can no longer become ready",
+                "abandoned was removed without merging, so this cannot hold unless a worktree named abandoned is created again and merges",
             ]
         );
         // The argument of a check is one argv entry of someone's command.

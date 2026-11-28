@@ -566,6 +566,24 @@ impl DevServerService {
         Ok(())
     }
 
+    /// [`Self::stop_under_lifecycle_lock`] for a worktree whose checkout no
+    /// longer exists: the server's session is ended and nothing else. The
+    /// `stop_command` runs inside the checkout, so it cannot run. Returns
+    /// whether one is configured and was therefore skipped.
+    pub async fn end_session_under_lifecycle_lock(
+        &self,
+        worktree: &DevWorktree,
+        _lifecycle_lock: &FileLock,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, DevServerError> {
+        self.config
+            .tmux
+            .kill_session(&session_name(&worktree.slug), cancellation)
+            .await?;
+        let _ = self.write_marker(&worktree.slug, "stopped").await;
+        Ok(self.config.settings.stop_command.is_some())
+    }
+
     async fn stop_locked(
         &self,
         worktree: &DevWorktree,

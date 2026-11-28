@@ -148,7 +148,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         // Stack operations and checkouts made for a review or a restore can
         // span multiple checkouts.
         A::Restack { .. } | A::ReviewCheckout { .. } | A::RestoreRemoved { .. } => Lane::Host(host),
-        A::Cleanup { .. } | A::CleanupTargets { .. } => {
+        A::CleanupTargets { .. } => {
             unreachable!("cleanup lanes are resolved before host routing")
         }
     })
@@ -168,10 +168,6 @@ pub fn cleanup_lane(action: &wt_tui::UiAction, explicit: Option<&str>) -> Result
         wt_tui::UiAction::CleanupTargets { targets } => {
             targets.iter().map(|target| target.key.as_str()).collect()
         }
-        wt_tui::UiAction::Cleanup { revisions } => revisions
-            .iter()
-            .map(|revision| revision.key.as_str())
-            .collect(),
         _ => unreachable!("caller checked is_cleanup_action"),
     };
     let mut targets = BTreeSet::new();
@@ -189,7 +185,7 @@ pub fn cleanup_lane(action: &wt_tui::UiAction, explicit: Option<&str>) -> Result
 
 fn is_cleanup_action(action: &wt_tui::UiAction) -> bool {
     match action {
-        wt_tui::UiAction::Cleanup { .. } | wt_tui::UiAction::CleanupTargets { .. } => true,
+        wt_tui::UiAction::CleanupTargets { .. } => true,
         wt_tui::UiAction::OnHost { action, .. } => is_cleanup_action(action),
         _ => false,
     }

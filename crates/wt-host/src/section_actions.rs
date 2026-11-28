@@ -260,7 +260,6 @@ fn layout_changed(board: &wt_tui::Board, changed: wt_store::LayoutChanged) -> an
             format!("{} and {} have changed places", name(&first), name(&second))
         }
         wt_store::LayoutChanged::Section(section) => format!("section {section} is gone"),
-        wt_store::LayoutChanged::Ordered(key) => format!("{} has been reordered", name(&key)),
     })
 }
 
@@ -1177,7 +1176,6 @@ mod tests {
         section: &str,
         down: bool,
     ) -> Result<UiReply> {
-        use wt_runtime::Mutation;
         let step = wt_tui::plan_reorder(seen, key, section, down)
             .map_err(wt_app_core::host_errors::notice)?;
         let action = wt_tui::UiAction::Reorder {
@@ -1186,16 +1184,51 @@ mod tests {
             down,
             step: step.clone(),
         };
-        let wt_tui::Effect::Mutation(shown) = action.effect(seen) else {
-            panic!("a reorder changes the board");
-        };
-        shown.apply(seen);
+        show(seen, &action);
         reorder(
             ctx,
             key.map(str::to_owned),
             section.to_owned(),
             down,
             step,
+            Some(host),
+        )
+        .await
+    }
+
+    fn show(seen: &mut wt_tui::Board, action: &wt_tui::UiAction) {
+        use wt_runtime::Mutation;
+        let wt_tui::Effect::Mutation(shown) = action.effect(seen) else {
+            panic!("a reorder changes the board");
+        };
+        shown.apply(seen);
+    }
+
+    /// Show and send a press already resolved from `seen`.
+    async fn send_shown(
+        ctx: &AppContext,
+        seen: &mut wt_tui::Board,
+        host: &wt_tui::Board,
+        key: &str,
+        section: &str,
+        down: bool,
+        step: &wt_tui::ReorderStep,
+    ) -> Result<UiReply> {
+        show(
+            seen,
+            &wt_tui::UiAction::Reorder {
+                key: Some(key.to_owned()),
+                section: section.to_owned(),
+                down,
+                step: step.clone(),
+            },
+        );
+        reorder(
+            ctx,
+            Some(key.to_owned()),
+            section.to_owned(),
+            down,
+            step.clone(),
             Some(host),
         )
         .await
@@ -1609,14 +1642,17 @@ mod tests {
     /// board lists it. A reorder writes placement, which needs no checkout.
     #[derive(Clone, Debug)]
     struct Fabricated {
+        /// A remote host's row when it is a remote ledger key.
         key: String,
-        section: &'static str,
+        /// `None` is the Inbox.
+        section: Option<&'static str>,
         order: Option<f64>,
         /// Created from the board: behind this row, or first when `None`.
         created_after: Option<Option<String>>,
+        /// The branch of the row it is stacked on.
         stacked_on: Option<String>,
         status: Option<wt_core::WorkState>,
-        /// Filed in the section and drawn elsewhere.
+        /// Filed in the section and not listed by the board.
         hidden: bool,
     }
 
@@ -1624,7 +1660,7 @@ mod tests {
         fn new(key: &str, section: &'static str) -> Self {
             Self {
                 key: key.to_owned(),
-                section,
+                section: Some(section),
                 order: None,
                 created_after: None,
                 stacked_on: None,
@@ -1632,9 +1668,14 @@ mod tests {
                 hidden: false,
             }
         }
+
+        fn branch(&self) -> &str {
+            self.key.rsplit('/').next().unwrap_or(&self.key)
+        }
     }
 
-    const FABRICATED_SECTIONS: [&str; 3] = ["S", "T", "U"];
+    /// The sections the fabricated board draws, by key, in the order drawn.
+    const FABRICATED_SECTIONS: [&str; 4] = [wt_sources::board_layout::INBOX, "S", "T", "U"];
 
     /// Store `rows` as the whole layout and return the rows a board lists.
     async fn fabricate(
@@ -1642,6 +1683,7 @@ mod tests {
         rows: &[Fabricated],
     ) -> Vec<wt_tui::BoardRow> {
         let mut slugs = serde_json::Map::new();
+        let mut remote = serde_json::Map::new();
         let mut listed = Vec::new();
         for row in rows {
             let record = row
@@ -1662,13 +1704,22 @@ mod tests {
                 entry["work"] = serde_json::to_value(record).unwrap();
                 assert!(wt_core::parse_work_status(&entry["work"]).is_some());
             }
-            slugs.insert(row.key.clone(), entry);
+            let host = match wt_core::parse_worktree_ledger_key(&row.key) {
+                Some(wt_core::WorktreeRef::Remote { host, .. }) => Some(host),
+                _ => None,
+            };
+            if host.is_some() {
+                remote.insert(row.key.clone(), entry);
+            } else {
+                slugs.insert(row.key.clone(), entry);
+            }
             if !row.hidden {
                 listed.push(wt_tui::BoardRow {
                     key: row.key.clone(),
-                    slug: row.key.clone(),
+                    host,
+                    slug: row.branch().to_owned(),
                     title: row.key.clone(),
-                    branch: row.key.clone(),
+                    branch: row.branch().to_owned(),
                     base_branch: row.stacked_on.clone(),
                     work_rank: wt_core::work_record_rank(record.as_ref()),
                     work: record.map(|record| wt_tui::WorkPresentation {
@@ -1679,7 +1730,11 @@ mod tests {
                 });
             }
         }
-        let state = serde_json::json!({ "sectionsOrder": FABRICATED_SECTIONS, "slugs": slugs });
+        let state = serde_json::json!({
+            "sectionsOrder": ["S", "T", "U"],
+            "slugs": slugs,
+            "remoteLayouts": remote,
+        });
         fixture
             .ctx
             .database
@@ -1689,20 +1744,44 @@ mod tests {
         listed
     }
 
+    /// What is stored, as the board source hands it to the layout: a remote
+    /// row's placement is the controller's.
+    async fn stored_layout(
+        fixture: &wt_app_core::test_support::CommandFixture,
+    ) -> serde_json::Value {
+        let mut state = stored(fixture).await;
+        let remote = state["remoteLayouts"].clone();
+        for (key, layout) in remote.as_object().into_iter().flatten() {
+            state["slugs"][key] = layout.clone();
+        }
+        state
+    }
+
     /// The board the layout draws from what is stored now.
     async fn laid_out(
         fixture: &wt_app_core::test_support::CommandFixture,
         rows: &[wt_tui::BoardRow],
         sort: wt_config::UiSort,
     ) -> wt_tui::Board {
+        laid_out_with(fixture, rows, sort, |_| {}).await
+    }
+
+    /// The same, for a board the caller says more about first.
+    async fn laid_out_with(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        rows: &[wt_tui::BoardRow],
+        sort: wt_config::UiSort,
+        tell: impl FnOnce(&mut wt_tui::Board),
+    ) -> wt_tui::Board {
         let mut board = wt_tui::Board {
             rows: rows.to_vec(),
             ..Default::default()
         };
         board.display.status_sort = sort == wt_config::UiSort::Status;
+        tell(&mut board);
         wt_sources::board_layout::prepare(
             &mut board,
-            &stored(fixture).await,
+            &stored_layout(fixture).await,
             &fixture.ctx.config.branch.base,
             sort,
         );
@@ -1775,6 +1854,183 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// A held J crosses a section edge and goes on in the next section
+    /// before this host has read its own write. The row was created from
+    /// the board and has no status, so the host's board still shows it at
+    /// its creation position; the crossing gave it a stored order.
+    #[tokio::test]
+    async fn a_row_at_its_creation_position_crosses_an_edge_and_goes_on() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let sort = wt_config::UiSort::Status;
+        let ctx = sorting(&fixture, sort);
+        let rows = [
+            Fabricated {
+                order: Some(1.0),
+                ..Fabricated::new("x", "S")
+            },
+            Fabricated {
+                created_after: Some(Some("x".into())),
+                ..Fabricated::new("new", "S")
+            },
+            Fabricated {
+                order: Some(1.0),
+                ..Fabricated::new("t1", "T")
+            },
+            Fabricated {
+                order: Some(2.0),
+                ..Fabricated::new("t2", "T")
+            },
+        ];
+        let listed = fabricate(&fixture, &rows).await;
+        let behind = laid_out(&fixture, &listed, sort).await;
+        assert_eq!(drawn(&behind, "S"), ["x", "new"]);
+        let mut seen = behind.clone();
+        let mut section = "S";
+        for expected in [
+            ["new", "t1", "t2"],
+            ["t1", "new", "t2"],
+            ["t1", "t2", "new"],
+        ] {
+            press_and_show(&ctx, &mut seen, &behind, Some("new"), section, true)
+                .await
+                .unwrap();
+            section = "T";
+            assert_eq!(drawn(&seen, "T"), expected);
+            assert_eq!(
+                drawn(&laid_out(&fixture, &listed, sort).await, "T"),
+                expected
+            );
+        }
+        fixture.close().await.unwrap();
+    }
+
+    /// A row created from the board and never ordered is drawn behind the
+    /// row it was created after. When that row is no longer drawn in the
+    /// section, by whatever path, the new row stays where it is drawn
+    /// instead of jumping to the top of the section.
+    #[tokio::test]
+    async fn a_row_at_its_creation_position_keeps_its_place_when_the_row_before_it_leaves() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ordered = |key: &str, order: f64| Fabricated {
+            order: Some(order),
+            ..Fabricated::new(key, "S")
+        };
+        let rows = [
+            ordered("p", 0.0),
+            ordered("x", 1.0),
+            Fabricated {
+                created_after: Some(Some("x".into())),
+                ..Fabricated::new("new", "S")
+            },
+            // Created after the new row in turn.
+            Fabricated {
+                created_after: Some(Some("new".into())),
+                ..Fabricated::new("newer", "S")
+            },
+            ordered("y", 2.0),
+        ];
+        let stays = ["p", "new", "newer", "y"];
+        let without = |listed: &[wt_tui::BoardRow], gone: &str| -> Vec<wt_tui::BoardRow> {
+            listed
+                .iter()
+                .filter(|row| row.key != gone)
+                .cloned()
+                .collect()
+        };
+        for sort in [wt_config::UiSort::Manual, wt_config::UiSort::Status] {
+            let start = || async {
+                let listed = fabricate(&fixture, &rows).await;
+                let board = laid_out(&fixture, &listed, sort).await;
+                assert_eq!(drawn(&board, "S"), ["p", "x", "new", "newer", "y"]);
+                listed
+            };
+            let database = &fixture.ctx.database;
+
+            // Filed elsewhere: `wt section mv` and the section menu.
+            let listed = start().await;
+            database
+                .call(|store| Ok(store.move_worktrees_to_section(&["x".to_owned()], Some("T"))?))
+                .await
+                .unwrap();
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(drawn(&board, "S"), stays, "moved under {sort:?}");
+            assert_eq!(drawn(&board, "T"), ["x"]);
+            // The same through the write that places one row.
+            let listed = start().await;
+            database
+                .call(|store| Ok(store.place_slug("x", None, false)?))
+                .await
+                .unwrap();
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(drawn(&board, "S"), stays, "placed under {sort:?}");
+
+            // Archived, and landed into the Landed block: still filed in the
+            // section, drawn elsewhere, and nothing is written.
+            let listed = start().await;
+            let board = laid_out_with(&fixture, &listed, sort, |board| {
+                board.rows[1].archived = true;
+            })
+            .await;
+            assert_eq!(drawn(&board, "S"), stays, "archived under {sort:?}");
+            let board = laid_out_with(&fixture, &listed, sort, |board| {
+                board.display.owed_sections = true;
+                board.rows[1].git.landed_on = Some(wt_tui::LandingKind::Base);
+                board.rows[1].owed_block = Some(wt_core::OwedBlock::Done);
+            })
+            .await;
+            assert_eq!(drawn(&board, "S"), stays, "landed under {sort:?}");
+            assert_eq!(drawn(&board, wt_tui::LANDED_SECTION), ["x"]);
+
+            // Removed: its record is cleared, or reaped with its checkout.
+            let listed = start().await;
+            database
+                .call(|store| Ok(store.clear_slug_state("x")?))
+                .await
+                .unwrap();
+            let board = laid_out(&fixture, &without(&listed, "x"), sort).await;
+            assert_eq!(drawn(&board, "S"), stays, "cleared under {sort:?}");
+            let listed = start().await;
+            database
+                .call(|store| {
+                    let live = ["p", "new", "newer", "y"].map(str::to_owned).into();
+                    Ok(store.reap_wt_state(&live)?)
+                })
+                .await
+                .unwrap();
+            let board = laid_out(&fixture, &without(&listed, "x"), sort).await;
+            assert_eq!(drawn(&board, "S"), stays, "reaped under {sort:?}");
+
+            // The row in between leaves: the one behind it follows what
+            // that one followed.
+            let listed = start().await;
+            database
+                .call(|store| Ok(store.move_worktrees_to_section(&["new".to_owned()], Some("T"))?))
+                .await
+                .unwrap();
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(drawn(&board, "S"), ["p", "x", "newer", "y"], "{sort:?}");
+
+            // The section is deleted: its rows go to the Inbox in the order
+            // they had, the new rows still behind the row before them.
+            let listed = start().await;
+            database
+                .call(|store| Ok(store.remove_section("S")?))
+                .await
+                .unwrap();
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(
+                drawn(&board, wt_sources::board_layout::INBOX),
+                ["p", "x", "new", "newer", "y"],
+                "deleted under {sort:?}"
+            );
+        }
+        fixture.close().await.unwrap();
+    }
+
     /// The same sections on every run.
     struct Dice(u64);
 
@@ -1790,22 +2046,37 @@ mod tests {
         fn chance(&mut self, percent: u64) -> bool {
             self.roll(100) < percent
         }
+
+        fn status(&mut self) -> Option<wt_core::WorkState> {
+            [
+                None,
+                Some(wt_core::WorkState::Ready),
+                Some(wt_core::WorkState::Review),
+                Some(wt_core::WorkState::Todo),
+            ][self.roll(4) as usize]
+        }
     }
 
     fn random_sections(dice: &mut Dice) -> Vec<Fabricated> {
         let count = 3 + dice.roll(7);
         let mut rows: Vec<Fabricated> = Vec::new();
         for index in 0..count {
-            let section = FABRICATED_SECTIONS[usize::from(dice.chance(35))];
-            let mut row = Fabricated::new(&format!("r{index}"), section);
+            let section = [None, Some("S"), Some("S"), Some("T")][dice.roll(4) as usize];
+            let key = if dice.chance(15) {
+                format!("@remote/box/r{index}")
+            } else {
+                format!("r{index}")
+            };
+            let mut row = Fabricated {
+                section,
+                ..Fabricated::new(&key, "S")
+            };
             match dice.roll(10) {
                 0..=4 => row.order = Some(dice.roll(6) as f64),
                 5..=6 => {}
                 _ => {
-                    let peers: Vec<&Fabricated> = rows
-                        .iter()
-                        .filter(|peer| peer.section == section && !peer.hidden)
-                        .collect();
+                    let peers: Vec<&Fabricated> =
+                        rows.iter().filter(|peer| peer.section == section).collect();
                     row.created_after = Some(if peers.is_empty() || dice.chance(25) {
                         None
                     } else {
@@ -1813,54 +2084,148 @@ mod tests {
                     });
                 }
             }
-            row.status = [
-                None,
-                Some(wt_core::WorkState::Ready),
-                Some(wt_core::WorkState::Review),
-                Some(wt_core::WorkState::Todo),
-            ][dice.roll(4) as usize];
+            row.status = dice.status();
             if !rows.is_empty() && dice.chance(25) {
-                row.stacked_on = Some(rows[dice.roll(rows.len() as u64) as usize].key.clone());
+                let parent = &rows[dice.roll(rows.len() as u64) as usize];
+                row.stacked_on = Some(parent.branch().to_owned());
             }
-            if dice.chance(10) {
-                row.hidden = true;
-                row.created_after = None;
-                row.order = Some(dice.roll(6) as f64);
-            }
+            row.hidden = dice.chance(10);
             rows.push(row);
         }
         rows
     }
 
+    /// Each row's section and stored order, local and remote.
+    fn placements(
+        state: &serde_json::Value,
+    ) -> std::collections::BTreeMap<String, (Option<String>, Option<f64>)> {
+        ["slugs", "remoteLayouts"]
+            .into_iter()
+            .filter_map(|collection| state[collection].as_object())
+            .flatten()
+            .map(|(key, layout)| {
+                let section = layout["section"].as_str().map(str::to_owned);
+                (key.clone(), (section, layout["order"].as_f64()))
+            })
+            .collect()
+    }
+
+    /// What no press may do, whatever the board it was resolved from and
+    /// whatever this host's board says: file a row it does not name in
+    /// another section, or change the stored order between two rows that
+    /// are not of the status it moved within. A refused press writes
+    /// nothing.
+    fn assert_conserved(
+        before: &serde_json::Value,
+        after: &serde_json::Value,
+        step: &wt_tui::ReorderStep,
+        host: &wt_tui::Board,
+        accepted: bool,
+        said: &str,
+    ) {
+        if !accepted {
+            assert_eq!(before, after, "a refused press wrote\n{said}");
+            return;
+        }
+        let (unit, moved, listed): (&str, &[String], Vec<&String>) = match step {
+            wt_tui::ReorderStep::Pass { unit, units, .. } => (unit, &[], units.iter().collect()),
+            wt_tui::ReorderStep::Cross {
+                unit,
+                rows,
+                units,
+                to_units,
+                ..
+            } => (unit, rows, units.iter().chain(to_units).collect()),
+            wt_tui::ReorderStep::Section { .. } => {
+                assert_eq!(before["slugs"], after["slugs"], "{said}");
+                return;
+            }
+        };
+        let band = |key: &str| {
+            host.display
+                .status_sort
+                .then(|| wt_tui::unit_rank(host, key))
+        };
+        let pressed = |key: &String| {
+            key == unit || moved.contains(key) || (listed.contains(&key) && band(key) == band(unit))
+        };
+        let (before, after) = (placements(before), placements(after));
+        for (key, (section, _)) in before.iter().filter(|(key, _)| !moved.contains(*key)) {
+            assert_eq!(
+                Some(section),
+                after.get(key).map(|now| &now.0),
+                "{key}\n{said}"
+            );
+        }
+        let others: Vec<(&String, &Option<String>, f64)> = before
+            .iter()
+            .filter(|(key, _)| !pressed(key))
+            .filter_map(|(key, (section, order))| Some((key, section, (*order)?)))
+            .collect();
+        for (a, section_a, order_a) in &others {
+            for (b, section_b, order_b) in &others {
+                if section_a == section_b && order_a < order_b {
+                    let now = |key: &String| after.get(key).and_then(|now| now.1);
+                    assert!(
+                        now(a).zip(now(b)).is_some_and(|(a, b)| a < b),
+                        "{a} was stored before {b}, now {:?} and {:?}\n{said}",
+                        now(a),
+                        now(b)
+                    );
+                }
+            }
+        }
+    }
+
     /// For sections of every kind the layout draws (ordered rows, rows never
-    /// ordered, rows at their creation position, rows filed there and drawn
-    /// elsewhere, stacks whole and split, with and without statuses, under
-    /// both sorts): a press the host accepts is stored so that the board
-    /// draws exactly what the terminal showed at the keypress, and a press
-    /// resolved from the board as drawn is never refused as stale.
+    /// ordered, rows at their creation position, rows filed there and not
+    /// drawn, stacks whole and split, local and remote rows, the Inbox and
+    /// named sections, with and without statuses, under both sorts).
+    ///
+    /// Half the runs hold a key: a burst of presses, each resolved from the
+    /// board the one before left on screen, against a host whose board is
+    /// the one from before the first. Every press it accepts is stored so
+    /// that the board draws exactly what the terminal showed.
+    ///
+    /// The other half change statuses between the person's look and the
+    /// press, so this host's board is newer than the one the press was
+    /// resolved from. The press may then go through or be refused.
+    ///
+    /// Either way no press files or reorders rows it has no business with.
     #[tokio::test]
     async fn every_accepted_press_redraws_the_board_as_it_was_shown() {
         let fixture = wt_app_core::test_support::CommandFixture::new()
             .await
             .unwrap();
-        let (mut passes, mut crossings) = (0, 0);
-        for seed in 0..1500u64 {
+        let (mut passes, mut crossings, mut refused, mut drifted) = (0, 0, 0, 0);
+        let layout = |board: &wt_tui::Board| {
+            FABRICATED_SECTIONS.map(|section| (section, drawn(board, section)))
+        };
+        for seed in 0..2000u64 {
             let mut dice = Dice(seed);
             let sort = if seed % 2 == 0 {
                 wt_config::UiSort::Status
             } else {
                 wt_config::UiSort::Manual
             };
+            let drift = seed % 4 >= 2;
             let ctx = sorting(&fixture, sort);
-            let rows = random_sections(&mut dice);
-            let listed = fabricate(&fixture, &rows).await;
-            for press in 0..4 {
-                let board = laid_out(&fixture, &listed, sort).await;
-                let layout = |board: &wt_tui::Board| {
-                    FABRICATED_SECTIONS.map(|section| (section, drawn(board, section)))
-                };
-                let before = layout(&board);
-                let candidates: Vec<(&str, &String)> = before
+            let mut rows = random_sections(&mut dice);
+            let mut listed = fabricate(&fixture, &rows).await;
+            let shown = laid_out(&fixture, &listed, sort).await;
+            let mut host = shown.clone();
+            if drift {
+                for _ in 0..=dice.roll(2) {
+                    let changed = dice.roll(rows.len() as u64) as usize;
+                    rows[changed].status = dice.status();
+                }
+                listed = fabricate(&fixture, &rows).await;
+                host = laid_out(&fixture, &listed, sort).await;
+            }
+            let mut seen = shown;
+            for press in 0..if drift { 1 } else { 4 } {
+                let drawn_now = layout(&seen);
+                let candidates: Vec<(&str, &String)> = drawn_now
                     .iter()
                     .flat_map(|(section, keys)| keys.iter().map(|key| (*section, key)))
                     .collect();
@@ -1869,12 +2234,18 @@ mod tests {
                 }
                 let (section, key) = candidates[dice.roll(candidates.len() as u64) as usize];
                 let down = dice.chance(50);
+                // Nothing to do (an edge, a status that pins the row).
+                let Ok(step) = wt_tui::plan_reorder(&seen, Some(key), section, down) else {
+                    continue;
+                };
+                let before = stored(&fixture).await;
                 let said = format!(
-                    "seed {seed} press {press}: {key} {} in {section} under {sort:?}\nstored {}\ndrawn {before:?}",
+                    "seed {seed} press {press}: {key} {} in {section:?} under {sort:?}{}\nstep {step:?}\nstored {} {}\ndrawn {drawn_now:?}",
                     if down { "down" } else { "up" },
-                    stored(&fixture).await["slugs"],
+                    if drift { ", statuses changed" } else { "" },
+                    before["slugs"],
+                    before["remoteLayouts"],
                 );
-                let mut seen = board.clone();
                 // Not compared: a split stack member that crosses into the
                 // section of the row it is stacked on joins that unit, and
                 // under status sort its status can move the whole unit to
@@ -1882,38 +2253,49 @@ mod tests {
                 // order the board does not carry.
                 let joins_its_stack = sort == wt_config::UiSort::Status
                     && matches!(
-                        wt_tui::plan_reorder(&board, Some(key), section, down),
-                        Ok(wt_tui::ReorderStep::Cross { unit, to, .. })
-                            if board
+                        &step,
+                        wt_tui::ReorderStep::Cross { unit, to, .. }
+                            if seen
                                 .rows
                                 .iter()
-                                .find(|row| row.key == unit)
+                                .find(|row| row.key == *unit)
                                 .and_then(|row| row.stack_parent.as_ref())
-                                .is_some_and(|parent| drawn(&board, &to).contains(parent))
+                                .is_some_and(|parent| drawn(&seen, to).contains(parent))
                     );
-                match press_and_show(&ctx, &mut seen, &board, Some(key), section, down).await {
-                    Ok(_) if joins_its_stack => {}
+                let result = send_shown(&ctx, &mut seen, &host, key, section, down, &step).await;
+                let after = stored(&fixture).await;
+                assert_conserved(&before, &after, &step, &host, result.is_ok(), &said);
+                match result {
+                    // The board on screen is no longer what will be drawn.
+                    Ok(_) if joins_its_stack => break,
+                    Ok(_) if drift && sort == wt_config::UiSort::Status => drifted += 1,
                     Ok(_) => {
-                        let after = laid_out(&fixture, &listed, sort).await;
-                        assert_eq!(layout(&after), layout(&seen), "{said}");
-                        if drawn(&seen, section).contains(key) {
+                        let redrawn = laid_out(&fixture, &listed, sort).await;
+                        assert_eq!(layout(&redrawn), layout(&seen), "{said}");
+                        if matches!(step, wt_tui::ReorderStep::Pass { .. }) {
                             passes += 1;
                         } else {
                             crossings += 1;
                         }
                     }
-                    // Nothing to do (an edge, a status that pins the row).
-                    Err(error) => assert!(
-                        error.is::<wt_app_core::host_errors::Notice>(),
-                        "{error:#}\n{said}"
-                    ),
+                    Err(error) => {
+                        assert!(
+                            is_stale(&error) || error.is::<wt_app_core::host_errors::Notice>(),
+                            "{error:#}\n{said}"
+                        );
+                        // Resolved from this host's own board, a press is
+                        // never refused: nothing else wrote.
+                        assert!(drift || press > 0, "{error:#}\n{said}");
+                        refused += 1;
+                        break;
+                    }
                 }
             }
         }
-        // Enough of both went through for the comparison to mean something.
+        // Enough of each went through for the comparisons to mean something.
         assert!(
-            passes > 600 && crossings > 200,
-            "{passes} passes, {crossings} crossings"
+            passes > 800 && crossings > 250 && drifted > 100 && refused < passes / 10,
+            "{passes} passes, {crossings} crossings, {drifted} after a status change, {refused} refused"
         );
         fixture.close().await.unwrap();
     }

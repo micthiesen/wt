@@ -76,9 +76,12 @@ pub async fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<i32> {
     // The PR read overlaps the local ones. `--json` has nowhere to say that
     // its data is a held snapshot, and its `PR / CI` status sets the exit
     // code, so it always reads GitHub itself, as `wt ls --json` reads Git.
+    let github_off = github_off();
     let (github, local) = tokio::join!(
         async {
-            if args.json {
+            if github_off {
+                (Ok(wt_github::GithubData::default()), None)
+            } else if args.json {
                 (live_pull_requests(ctx, &branches).await, None)
             } else {
                 super::fleet::pull_requests(ctx, &branches).await
@@ -135,19 +138,7 @@ pub async fn run(ctx: &AppContext, args: &DoctorArgs) -> Result<i32> {
                         format!("#{} {state}; {checks_msg}", pr.number),
                     ));
                 }
-                None if pr_error.is_some() => checks.push(check(
-                    "PR / CI",
-                    CheckStatus::Warn,
-                    format!(
-                        "GitHub unavailable: {}",
-                        pr_error.as_deref().unwrap_or_default()
-                    ),
-                )),
-                None => checks.push(check(
-                    "PR / CI",
-                    CheckStatus::Info,
-                    "no pull request found".into(),
-                )),
+                None => checks.push(no_pr_check(pr_error.as_deref(), github_off)),
             }
         }
         reports.push(Report {
@@ -227,14 +218,25 @@ async fn local_reads(
         }
         let install = install_paths(ctx);
         Some(tokio::join!(
-            super::events::token_budget(ctx),
+            async {
+                if github_off() {
+                    None
+                } else {
+                    Some(super::events::token_budget(ctx).await)
+                }
+            },
             leftover_lines(ctx, install.as_ref()),
         ))
     };
     let (extras, rows) = tokio::join!(extras, row_reads(ctx, rows, banners));
     if let Some((budget, leftovers)) = extras {
-        for (label, text) in super::events::budget_lines(&budget, super::events::now_ms()) {
-            println!("github {label:<10} {text}");
+        match budget {
+            Some(budget) => {
+                for (label, text) in super::events::budget_lines(&budget, super::events::now_ms()) {
+                    println!("github {label:<10} {text}");
+                }
+            }
+            None => println!("github {:<10} switched off (WT_GITHUB=off)", "budget now"),
         }
         for line in leftovers {
             println!("{line}");
@@ -463,6 +465,28 @@ fn merged_at(pr: Option<&wt_github::PullRequest>, head: Option<&str>) -> bool {
     pr.is_some_and(|pr| {
         pr.state == "MERGED" && head.is_some() && pr.head_ref_oid.as_deref() == head
     })
+}
+
+/// Whether GitHub is switched off for this process: nothing then runs `gh`.
+fn github_off() -> bool {
+    std::env::var("WT_GITHUB").as_deref() == Ok("off")
+}
+
+/// The `PR / CI` check of a row with no pull request to show, and why.
+fn no_pr_check(error: Option<&str>, off: bool) -> Check {
+    match error {
+        _ if off => check(
+            "PR / CI",
+            CheckStatus::Info,
+            "not read: GitHub is switched off (WT_GITHUB=off)".into(),
+        ),
+        Some(error) => check(
+            "PR / CI",
+            CheckStatus::Warn,
+            format!("GitHub unavailable: {error}"),
+        ),
+        None => check("PR / CI", CheckStatus::Info, "no pull request found".into()),
+    }
 }
 
 async fn live_pull_requests(
@@ -884,6 +908,26 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use wt_app_core::test_support::CommandFixture;
+
+    #[test]
+    fn a_row_says_why_it_shows_no_pull_request() {
+        // Switched off, nothing was asked: that is neither a failure nor
+        // "none found", whatever an error would have said.
+        for error in [None, Some("gh: not logged in")] {
+            let check = no_pr_check(error, true);
+            assert!(matches!(check.status, CheckStatus::Info));
+            assert_eq!(
+                check.message,
+                "not read: GitHub is switched off (WT_GITHUB=off)"
+            );
+        }
+        let failed = no_pr_check(Some("timeout"), false);
+        assert!(matches!(failed.status, CheckStatus::Warn));
+        assert_eq!(failed.message, "GitHub unavailable: timeout");
+        let none = no_pr_check(None, false);
+        assert!(matches!(none.status, CheckStatus::Info));
+        assert_eq!(none.message, "no pull request found");
+    }
 
     #[tokio::test]
     async fn leftovers_and_legacy_files_are_each_reported_once() {

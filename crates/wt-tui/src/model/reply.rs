@@ -175,9 +175,18 @@ impl Model {
                 reply.modal_host.take(),
             ));
         }
-        let presentation_current = reply
-            .ui_generation
-            .is_none_or(|generation| generation == self.ui_generation);
+        // The reply to an overlay that was replaced answers a view that is
+        // gone, whatever generation it carries: the request that replaced
+        // it was sent at the same one.
+        let abandoned =
+            reply.operation_id.is_some() && reply.operation_id == self.abandoned_overlay;
+        if abandoned {
+            self.abandoned_overlay = None;
+        }
+        let presentation_current = !abandoned
+            && reply
+                .ui_generation
+                .is_none_or(|generation| generation == self.ui_generation);
         if reply.handoff.is_some() && !presentation_current {
             // Dropping the unacknowledged ticket releases its controller wait
             // without suspending this newer interaction or attaching a client.
@@ -204,13 +213,15 @@ impl Model {
         if reply.modal.is_some() && presentation_current {
             // A dialog that takes a loading overlay's place ends its load:
             // nothing is left on screen for that request to fill.
-            if let Interaction::Loading(loading) = &self.interaction
-                && self
+            if let Interaction::Loading(loading) = &self.interaction {
+                if self
                     .pending_request
                     .as_ref()
                     .is_some_and(|request| Some(request.id) == loading.request)
-            {
-                self.pending_request = None;
+                {
+                    self.pending_request = None;
+                }
+                self.abandoned_overlay = loading.request;
             }
             // A dialog answering the request in flight must not discard a
             // removal review already on screen; the review waits its turn.

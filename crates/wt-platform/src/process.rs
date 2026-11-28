@@ -154,13 +154,21 @@ pub enum ProcessError {
     PipeDrain { program: String },
     #[error("{program}: streaming observer panicked")]
     ObserverPanicked { program: String },
-    #[error("{program}: exited with {code:?}: {stderr}")]
+    #[error("{program} exited {}: {stderr}", exit_words(*.code))]
     Exit {
         program: String,
         code: Option<i32>,
         stderr: String,
         stdout: String,
     },
+}
+
+/// An exit as a person reads it. No code means a signal ended the process.
+fn exit_words(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("with status {code}"),
+        None => "on a signal".into(),
+    }
 }
 
 /// A handle on one subprocess budget. Clones and `with_class` handles share
@@ -774,6 +782,24 @@ mod tests {
 
     fn subcommand(args: &[&str]) -> Option<String> {
         git_subcommand(&args.iter().map(OsString::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn an_exit_reads_as_a_status_not_as_a_debug_value() {
+        let exit = |code| ProcessError::Exit {
+            program: "git".into(),
+            code,
+            stderr: "fatal: invalid reference: nope".into(),
+            stdout: String::new(),
+        };
+        assert_eq!(
+            exit(Some(128)).to_string(),
+            "git exited with status 128: fatal: invalid reference: nope"
+        );
+        assert_eq!(
+            exit(None).to_string(),
+            "git exited on a signal: fatal: invalid reference: nope"
+        );
     }
 
     #[test]

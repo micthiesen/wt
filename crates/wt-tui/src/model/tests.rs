@@ -336,6 +336,7 @@ fn folding_keeps_the_group_selected_and_hidden_rows_cannot_receive_actions() {
         Some("select a worktree first")
     );
     assert_eq!(model.yank_choices()[0].2, "Batch");
+    model.keys_settle = None;
     // Unfolding expands in place: the first row takes the header's stop.
     model.apply(grouped(&["one", "two"], false));
     assert_eq!(model.selected_row().unwrap().key, "one");
@@ -1113,32 +1114,6 @@ fn remove_confirm_captures_target_and_cancel_key_never_mutates() {
 }
 
 #[test]
-fn cleanup_confirmation_keeps_the_prepared_candidate_set() {
-    let mut model = Model::default();
-    model.apply(snapshot(&["a", "b"]));
-    model.input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), 20);
-    model.reply(UiReply {
-        modal: Some(UiModal::Confirm {
-            action: ConfirmAction::Cleanup {
-                revisions: vec![removal_revision("a")],
-            },
-            title: "clean merged".into(),
-            lines: vec!["a".into(), "kept b: dirty".into()],
-            cancel_key: Some('c'),
-        }),
-        ..UiReply::default()
-    });
-    // The prompt has been on screen past its settle window.
-    model.confirm_settles_at = None;
-    assert_eq!(
-        model.input(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), 20),
-        InputResult::Action(UiAction::Cleanup {
-            revisions: vec![removal_revision("a")]
-        })
-    );
-}
-
-#[test]
 fn cleanup_key_opens_cached_menu_and_requests_background_refresh() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
@@ -1845,6 +1820,7 @@ fn q_opens_the_automations_overlay_which_pauses_in_place_and_closes() {
     let mut board = (*model.board).clone();
     board.display.automations = true;
     model.board = board.into();
+    model.keys_settle = None;
     model.input(KeyEvent::from(KeyCode::Char('Q')), 20);
     assert!(matches!(model.interaction, Interaction::Automations { .. }));
     assert_eq!(
@@ -1921,6 +1897,7 @@ fn delayed_removal_reviews_survive_navigation_and_keep_each_host_and_witness() {
         );
         assert_eq!(model.interaction_host.as_deref(), Some("remote"));
         model.confirm_settles_at = None;
+        model.keys_settle = None;
         let InputResult::Action(UiAction::OnHost { host, action }) =
             model.input(KeyEvent::from(KeyCode::Char('y')), 20)
         else {
@@ -2349,7 +2326,9 @@ async fn a_menu_the_user_opened_confirms_without_a_settle_wait() {
     model.apply(snapshot(&["one"]));
     model.reply(removal_review("one"));
     model.input(KeyEvent::from(KeyCode::Char('n')), 20);
-    // A confirm opened by the user's own key right after is theirs to answer.
+    // What is typed straight after belonged to the review that closed. A
+    // confirm the user then opens with their own key is theirs to answer.
+    tokio::time::advance(super::reply::CONFIRM_SETTLE).await;
     model.input(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL), 20);
     assert!(matches!(model.interaction, Interaction::Confirm(_)));
     assert_eq!(
