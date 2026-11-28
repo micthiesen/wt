@@ -136,18 +136,63 @@ struct Failing {
     reported: Duration,
 }
 
+/// How long the tracker is left alone after a pass in which nothing could
+/// be read: it is down or unreachable, which says nothing about any issue.
+const OUTAGE_RETRY: Duration = Duration::from_secs(60);
+/// Single issues tried after a refused batch to tell one bad id from a
+/// tracker that answers nothing.
+const OUTAGE_PROBES: usize = 3;
+
 /// The issues the tracker could not read, and when each is tried again. A
 /// failing issue is read on its own, off the batch it would fail, and at
 /// most once per backoff step. It is reported once per step and once more
-/// when it reads again, not once per pass.
+/// when it reads again, not once per pass. A pass in which nothing at all
+/// could be read is the tracker's failure, not any issue's.
 #[derive(Default)]
-struct Unavailable(std::sync::Mutex<BTreeMap<String, Failing>>);
+struct Unavailable {
+    issues: std::sync::Mutex<BTreeMap<String, Failing>>,
+    /// Until when the tracker is left alone, and what it last failed with.
+    outage: std::sync::Mutex<Option<(tokio::time::Instant, String)>>,
+    /// Rotates which issues are probed, so ids that fail on their own
+    /// cannot pass for an outage on every pass.
+    probes: std::sync::atomic::AtomicUsize,
+}
 
 impl Unavailable {
     fn seen(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Failing>> {
-        self.0
+        self.issues
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn outage(&self) -> std::sync::MutexGuard<'_, Option<(tokio::time::Instant, String)>> {
+        self.outage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The error of an outage still being waited out.
+    fn held(&self, now: tokio::time::Instant) -> Option<String> {
+        self.outage()
+            .as_ref()
+            .filter(|(until, _)| now < *until)
+            .map(|(_, error)| error.clone())
+    }
+
+    /// Nothing could be read this pass. Reported when it begins, not on
+    /// every pass it lasts.
+    fn down(&self, error: &str, now: tokio::time::Instant) {
+        let mut outage = self.outage();
+        if outage.is_none() {
+            tracing::warn!(%error, "issue tracker unavailable");
+        }
+        *outage = Some((now + OUTAGE_RETRY, error.to_owned()));
+    }
+
+    fn up(&self) {
+        if self.outage().take().is_some() {
+            tracing::info!("issue tracker available again");
+        }
     }
 
     /// Record a failed read. Returns whether it is news: the issue's first
@@ -179,11 +224,14 @@ impl Unavailable {
         self.seen().retain(|id, _| ids.contains(id));
     }
 
-    /// A person asked for a refresh: try every failing issue on the next
-    /// pass, and start its wait over. What was already reported is not
-    /// reported again.
+    /// A person asked for a refresh: try the tracker and every failing
+    /// issue on the next pass, and start each wait over. What was already
+    /// reported is not reported again.
     fn retry_now(&self) {
         let now = tokio::time::Instant::now();
+        if let Some((until, _)) = self.outage().as_mut() {
+            *until = now;
+        }
         for failing in self.seen().values_mut() {
             failing.retry_at = now;
             failing.delay = RETRY_BASE / 2;
@@ -223,7 +271,13 @@ impl Unavailable {
 /// display-only, so a refused batch is halved until the ids it cannot read
 /// stand alone, and only their rows stay blank. Those ids are then left out
 /// of the batch and tried on their own with a growing wait (see
-/// [`Unavailable`]). A run that does not complete ends the pass.
+/// [`Unavailable`]).
+///
+/// An id is charged with a failure only in a pass where something else was
+/// read: a tracker that is down refuses every id the same way. After a
+/// refused batch a few single issues are tried first; if none reads, the
+/// pass fails as a whole and the tracker is left alone for a short while.
+/// A run that does not complete ends the pass the same way.
 async fn read_with_fallback(
     context: &AppContext,
     command: &[String],
@@ -233,43 +287,152 @@ async fn read_with_fallback(
     unavailable: &Unavailable,
 ) -> Result<BTreeMap<String, String>> {
     unavailable.keep(ids);
-    let (healthy, due, waiting) = unavailable.plan(ids, tokio::time::Instant::now());
-    let mut groups = due.into_iter().map(|id| vec![id]).collect::<Vec<_>>();
-    if !healthy.is_empty() {
-        groups.push(healthy);
+    let started = tokio::time::Instant::now();
+    if let Some(error) = unavailable.held(started) {
+        return Err(anyhow::Error::msg(error));
     }
-    let mut statuses = BTreeMap::new();
-    let mut refused = None;
+    let (mut healthy, due, waiting) = unavailable.plan(ids, started);
+    let mut pass = Pass {
+        context,
+        command,
+        timeout,
+        cancel,
+        unavailable,
+        statuses: BTreeMap::new(),
+        alone: Vec::new(),
+        refused: None,
+        working: false,
+    };
+    let mut groups = Vec::new();
+    if !healthy.is_empty() && !pass.read(&healthy).await? {
+        if healthy.len() == 1 {
+            pass.alone(&healthy[0]);
+        } else {
+            // Refused with nothing read yet: one bad id, or no tracker.
+            // A few single issues tell which.
+            let first = unavailable
+                .probes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let at = first % healthy.len();
+            healthy.rotate_left(at);
+            for _ in 0..OUTAGE_PROBES.min(healthy.len()) {
+                let probe = [healthy.remove(0)];
+                if pass.read(&probe).await? {
+                    break;
+                }
+                pass.alone(&probe[0]);
+            }
+            if !pass.working {
+                return Err(pass.down());
+            }
+            groups.push(healthy);
+        }
+    }
     while let Some(mut group) = groups.pop() {
-        match read_statuses(context, command, &group, timeout, cancel).await {
+        if group.is_empty() || pass.read(&group).await? {
+            continue;
+        }
+        if group.len() == 1 {
+            pass.alone(&group[0]);
+        } else {
+            let half = group.split_off(group.len() / 2);
+            groups.extend([half, group]);
+        }
+    }
+    for id in due {
+        // With nothing read yet these say no more than the probes did.
+        if !pass.working && pass.alone.len() >= OUTAGE_PROBES {
+            break;
+        }
+        if !pass.read(std::slice::from_ref(&id)).await? {
+            pass.alone(&id);
+        }
+    }
+    if !pass.working {
+        // Nothing read: no id is to blame, and none waits longer for it.
+        return match waiting {
+            _ if pass.refused.is_some() => Err(pass.down()),
+            Some(error) => Err(anyhow::Error::msg(error)),
+            None => Ok(pass.statuses),
+        };
+    }
+    unavailable.up();
+    let now = tokio::time::Instant::now();
+    for (id, error) in &pass.alone {
+        if unavailable.failed(id, error, now) {
+            tracing::warn!(issue = %id, %error, "issue status unavailable");
+        }
+    }
+    Ok(pass.statuses)
+}
+
+/// One pass over the tracker: what it read, and what it refused.
+struct Pass<'a> {
+    context: &'a AppContext,
+    command: &'a [String],
+    timeout: Duration,
+    cancel: &'a tokio_util::sync::CancellationToken,
+    unavailable: &'a Unavailable,
+    statuses: BTreeMap<String, String>,
+    /// Ids refused on their own, with the error; charged to the id only
+    /// once the tracker is known to work.
+    alone: Vec<(String, String)>,
+    /// The first refusal, and the latest one's text.
+    refused: Option<(anyhow::Error, String)>,
+    /// Some run of this pass succeeded.
+    working: bool,
+}
+
+impl Pass<'_> {
+    /// Run the command for `group`. `Ok(false)` is a refusal; a run that
+    /// was cancelled or did not complete ends the pass.
+    async fn read(&mut self, group: &[String]) -> Result<bool> {
+        match read_statuses(self.context, self.command, group, self.timeout, self.cancel).await {
             Ok(read) => {
+                self.working = true;
                 // A run that succeeded read every id it named, whether or
                 // not the tracker has a status for each.
-                unavailable.note_read(&group);
-                statuses.extend(read);
+                self.unavailable.note_read(group);
+                self.statuses.extend(read);
+                Ok(true)
             }
-            Err(error) if cancel.is_cancelled() => return Err(refused.unwrap_or(error)),
-            Err(error) if incomplete(&error) => return Err(error),
-            Err(error) if group.len() == 1 => {
-                let text = format!("{error:#}");
-                if unavailable.failed(&group[0], &text, tokio::time::Instant::now()) {
-                    tracing::warn!(issue = %group[0], error = %text, "issue status unavailable");
-                }
-                refused.get_or_insert(error);
+            Err(error) if self.cancel.is_cancelled() => Err(error),
+            Err(error) if incomplete(&error) => {
+                self.unavailable
+                    .down(&format!("{error:#}"), tokio::time::Instant::now());
+                Err(error)
             }
             Err(error) => {
-                refused.get_or_insert(error);
-                let rest = group.split_off(group.len() / 2);
-                groups.extend([rest, group]);
+                let text = format!("{error:#}");
+                match &mut self.refused {
+                    Some((_, latest)) => *latest = text,
+                    None => self.refused = Some((error, text)),
+                }
+                Ok(false)
             }
         }
     }
-    if statuses.is_empty()
-        && let Some(error) = refused.or_else(|| waiting.map(anyhow::Error::msg))
-    {
-        return Err(error);
+
+    /// The last refusal was of `id` alone.
+    fn alone(&mut self, id: &str) {
+        let error = self
+            .refused
+            .as_ref()
+            .map(|(_, latest)| latest.clone())
+            .unwrap_or_default();
+        self.alone.push((id.to_owned(), error));
     }
-    Ok(statuses)
+
+    /// Nothing was read: leave the tracker alone for a while and fail the
+    /// pass with its first refusal.
+    fn down(self) -> anyhow::Error {
+        let (error, _) = self
+            .refused
+            .unwrap_or_else(|| (anyhow::anyhow!("issue tracker unavailable"), String::new()));
+        self.unavailable
+            .down(&format!("{error:#}"), tokio::time::Instant::now());
+        error
+    }
 }
 
 /// The status command did not run to completion (it could not start, hung
@@ -556,6 +719,67 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("COZ-2"), "{error:#}");
         assert!(runs().is_empty());
+        fixture.close().await.unwrap();
+    }
+
+    /// A tracker that is down refuses every id the same way. That is not
+    /// eight bad issues: no id is charged, the pass costs a few runs and not
+    /// one per issue, and every status is back on the first pass after.
+    #[tokio::test]
+    async fn a_tracker_outage_is_not_charged_to_any_issue() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let script = fixture.ctx.config.paths.main_clone.join("statuses.sh");
+        let log = fixture.ctx.config.paths.main_clone.join("runs");
+        let offline = fixture.ctx.config.paths.main_clone.join("offline");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {log:?}\n[ -e {offline:?} ] && {{ echo 'could not resolve host' >&2; exit 1; }}\nprintf '{{\"issues\":['\nsep=''\nfor id in \"$@\"; do printf '%s{{\"id\":\"%s\",\"status\":\"Done\"}}' \"$sep\" \"$id\"; sep=','; done\nprintf ']}}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let command = vec![script.to_string_lossy().into_owned(), "{ids}".into()];
+        let ids = (1..=8).map(|n| format!("COZ-{n}")).collect::<Vec<_>>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let unavailable = Unavailable::default();
+        let runs = || {
+            let all = std::fs::read_to_string(&log).unwrap_or_default();
+            std::fs::write(&log, "").unwrap();
+            all.lines().count()
+        };
+        let read = || {
+            read_with_fallback(
+                &fixture.ctx,
+                &command,
+                &ids,
+                READ_TIMEOUT,
+                &cancel,
+                &unavailable,
+            )
+        };
+
+        std::fs::write(&offline, "").unwrap();
+        let error = read().await.unwrap_err();
+        assert!(format!("{error:#}").contains("could not resolve host"));
+        // The batch and the probes; halving to every id would be fifteen.
+        assert_eq!(runs(), 1 + OUTAGE_PROBES);
+        assert!(unavailable.seen().is_empty(), "no issue is to blame");
+        // While it is left alone a pass runs nothing and fails the same way.
+        assert!(read().await.is_err());
+        assert_eq!(runs(), 0);
+        let (until, _) = unavailable.outage().clone().unwrap();
+        assert!(until <= tokio::time::Instant::now() + OUTAGE_RETRY);
+
+        // Back online: the next pass that tries reads everything at once.
+        std::fs::remove_file(&offline).unwrap();
+        unavailable.retry_now();
+        assert_eq!(read().await.unwrap().len(), 8);
+        assert_eq!(runs(), 1);
+        assert!(unavailable.outage().is_none());
         fixture.close().await.unwrap();
     }
 

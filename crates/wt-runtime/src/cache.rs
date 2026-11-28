@@ -146,6 +146,23 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> DiskCache<T> {
     }
 }
 
+impl<T: Clone + Serialize + DeserializeOwned + Send + Sync + 'static> DiskCache<T> {
+    /// A slot that saves a copy of the data with `scrub` applied: what the
+    /// running process may hold but a file on disk must not.
+    pub fn scrubbed(store: &CacheStore, scrub: fn(&mut T)) -> Self {
+        Self {
+            slot: Arc::new(ScrubbedSlot {
+                inner: SerdeSlot::<T> {
+                    store: store.clone(),
+                    written: std::sync::Mutex::new(None),
+                    _type: PhantomData,
+                },
+                scrub,
+            }),
+        }
+    }
+}
+
 impl<T> DiskCache<T> {
     pub(crate) fn slot(&self) -> Arc<dyn CacheSlot<T>> {
         self.slot.clone()
@@ -246,6 +263,29 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T> for S
             .map_err(|error| error.error)?;
         *written = Some(digest);
         Ok(())
+    }
+}
+
+struct ScrubbedSlot<T> {
+    inner: SerdeSlot<T>,
+    scrub: fn(&mut T),
+}
+
+impl<T: Clone + Serialize + DeserializeOwned + Send + Sync + 'static> CacheSlot<T>
+    for ScrubbedSlot<T>
+{
+    fn peek(&self, name: &str) -> Result<(T, u64), Rejected> {
+        self.inner.peek(name)
+    }
+
+    fn read(&self, name: &str) -> Result<(T, u64), Rejected> {
+        self.inner.read(name)
+    }
+
+    fn write(&self, name: &str, data: &T) -> std::io::Result<()> {
+        let mut saved = data.clone();
+        (self.scrub)(&mut saved);
+        self.inner.write(name, &saved)
     }
 }
 
@@ -354,6 +394,21 @@ mod tests {
             let mode = std::fs::metadata(&directory).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn a_scrubbed_slot_saves_the_copy_and_leaves_the_data_whole() {
+        let root = tempfile::tempdir().unwrap();
+        let cache: DiskCache<Vec<String>> = DiskCache::scrubbed(
+            &CacheStore::new(root.path().to_path_buf(), "scope"),
+            |rows| rows.retain(|row| row != "private"),
+        );
+        let data = vec!["shown".to_owned(), "private".to_owned()];
+        cache.write("host", &data).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(cache.read("host").unwrap().0, ["shown"]);
+        let saved = std::fs::read_to_string(root.path().join("host.json")).unwrap();
+        assert!(!saved.contains("private"), "{saved}");
     }
 
     #[test]

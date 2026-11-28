@@ -260,6 +260,7 @@ fn layout_changed(board: &wt_tui::Board, changed: wt_store::LayoutChanged) -> an
             format!("{} and {} have changed places", name(&first), name(&second))
         }
         wt_store::LayoutChanged::Section(section) => format!("section {section} is gone"),
+        wt_store::LayoutChanged::Ordered(key) => format!("{} has been reordered", name(&key)),
     })
 }
 
@@ -282,8 +283,6 @@ pub async fn reorder(
 ) -> Result<UiReply> {
     let board = board.context("worktree metadata is still loading")?;
     let from = filed_section(board, &section)?;
-    // Status sort draws a section by status first, so only the units of one
-    // status are drawn in their stored order.
     let status_sort = ctx.config.ui.sort == wt_config::UiSort::Status;
     match step {
         wt_tui::ReorderStep::Section { past, sections } => {
@@ -311,13 +310,12 @@ pub async fn reorder(
             if status_sort && wt_tui::unit_rank(board, &unit) != wt_tui::unit_rank(board, &past) {
                 return Err(wt_app_core::host_errors::notice(wt_tui::STATUS_SORT_PINS));
             }
-            let ordered = drawn_by_order(board, status_sort, &units, &unit);
+            let drawn = shown_units(board, status_sort, &units);
             ctx.database
                 .call(move |store| {
                     let shown = wt_store::ShownSection {
                         name: from.as_deref(),
-                        drawn: &units,
-                        ordered: &ordered,
+                        drawn: &drawn,
                     };
                     Ok(store.swap_shown_units(shown, &unit, &past)?)
                 })
@@ -340,14 +338,8 @@ pub async fn reorder(
             check_listed(board, &units)?;
             check_listed(board, &to_units)?;
             check_unit_rows(board, &unit, &rows)?;
-            let ordered = drawn_by_order(board, status_sort, &units, &unit);
-            // Where the unit lands among another section's statuses is not
-            // something the person was shown under status sort.
-            let to_ordered = if status_sort {
-                Vec::new()
-            } else {
-                to_units.clone()
-            };
+            let drawn = shown_units(board, status_sort, &units);
+            let to_drawn = shown_units(board, status_sort, &to_units);
             let message = format!("moved to {}", destination.as_deref().unwrap_or("Inbox"));
             // Recorded before the write, so a read racing its commit already
             // knows the move as this process's own.
@@ -359,13 +351,11 @@ pub async fn reorder(
                 .call(move |store| {
                     let leaving = wt_store::ShownSection {
                         name: from.as_deref(),
-                        drawn: &units,
-                        ordered: &ordered,
+                        drawn: &drawn,
                     };
                     let entering = wt_store::ShownSection {
                         name: destination.as_deref(),
-                        drawn: &to_units,
-                        ordered: &to_ordered,
+                        drawn: &to_drawn,
                     };
                     Ok(store.move_shown_unit(&rows, &unit, leaving, entering, down)?)
                 })
@@ -390,20 +380,27 @@ pub async fn reorder(
     }
 }
 
-/// The units of `drawn` the board draws by stored order: all of them under
-/// manual sort; under status sort, which draws by status first, those of
-/// the moved unit's status.
-fn drawn_by_order(
+/// The units a press lists, with what decides where the board draws each
+/// besides its stored order. Status sort draws by status first, and leaves
+/// a unit that has neither a status nor an order behind the unit it was
+/// created after. Manual sort draws by stored order alone, and a press
+/// there gives every unit of the section one.
+fn shown_units(
     board: &wt_tui::Board,
     status_sort: bool,
-    drawn: &[String],
-    unit: &str,
-) -> Vec<String> {
-    let rank = wt_tui::unit_rank(board, unit);
-    drawn
+    units: &[String],
+) -> Vec<wt_store::ShownUnit> {
+    units
         .iter()
-        .filter(|other| !status_sort || wt_tui::unit_rank(board, other) == rank)
-        .cloned()
+        .map(|key| wt_store::ShownUnit {
+            key: key.clone(),
+            band: if status_sort {
+                wt_tui::unit_rank(board, key).unwrap_or(u8::MAX)
+            } else {
+                0
+            },
+            anchored: status_sort && wt_tui::unit_at_creation_position(board, key),
+        })
         .collect()
 }
 
@@ -1350,10 +1347,17 @@ mod tests {
             .call(|store| {
                 let theirs: Vec<String> =
                     ["one", "four", "three", "two"].map(str::to_owned).to_vec();
+                let theirs: Vec<wt_store::ShownUnit> = theirs
+                    .into_iter()
+                    .map(|key| wt_store::ShownUnit {
+                        key,
+                        band: 0,
+                        anchored: false,
+                    })
+                    .collect();
                 let shown = wt_store::ShownSection {
                     name: None,
                     drawn: &theirs,
-                    ordered: &theirs,
                 };
                 Ok(store.swap_shown_units(shown, "three", "two")?)
             })
@@ -1598,6 +1602,319 @@ mod tests {
             .unwrap();
         assert_eq!(stored(&fixture).await["slugs"]["two"]["section"], "Third");
         assert!(fixture.ctx.section_writes.consume("two", Some("Third")));
+        fixture.close().await.unwrap();
+    }
+
+    /// A row of a fabricated board: what is stored for it, and whether the
+    /// board lists it. A reorder writes placement, which needs no checkout.
+    #[derive(Clone, Debug)]
+    struct Fabricated {
+        key: String,
+        section: &'static str,
+        order: Option<f64>,
+        /// Created from the board: behind this row, or first when `None`.
+        created_after: Option<Option<String>>,
+        stacked_on: Option<String>,
+        status: Option<wt_core::WorkState>,
+        /// Filed in the section and drawn elsewhere.
+        hidden: bool,
+    }
+
+    impl Fabricated {
+        fn new(key: &str, section: &'static str) -> Self {
+            Self {
+                key: key.to_owned(),
+                section,
+                order: None,
+                created_after: None,
+                stacked_on: None,
+                status: None,
+                hidden: false,
+            }
+        }
+    }
+
+    const FABRICATED_SECTIONS: [&str; 3] = ["S", "T", "U"];
+
+    /// Store `rows` as the whole layout and return the rows a board lists.
+    async fn fabricate(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        rows: &[Fabricated],
+    ) -> Vec<wt_tui::BoardRow> {
+        let mut slugs = serde_json::Map::new();
+        let mut listed = Vec::new();
+        for row in rows {
+            let record = row
+                .status
+                .map(|state| wt_core::WorkStatusRecord::new(state, "2026-10-11T00:00:00Z"));
+            let mut entry = serde_json::json!({ "section": row.section });
+            if let Some(order) = row.order {
+                entry["order"] = serde_json::json!(order);
+            }
+            if let Some(after) = &row.created_after {
+                entry["order"] = serde_json::Value::Null;
+                entry["creationAfter"] = serde_json::json!(after);
+            }
+            if let Some(base) = &row.stacked_on {
+                entry["baseBranch"] = serde_json::json!(base);
+            }
+            if let Some(record) = &record {
+                entry["work"] = serde_json::to_value(record).unwrap();
+                assert!(wt_core::parse_work_status(&entry["work"]).is_some());
+            }
+            slugs.insert(row.key.clone(), entry);
+            if !row.hidden {
+                listed.push(wt_tui::BoardRow {
+                    key: row.key.clone(),
+                    slug: row.key.clone(),
+                    title: row.key.clone(),
+                    branch: row.key.clone(),
+                    base_branch: row.stacked_on.clone(),
+                    work_rank: wt_core::work_record_rank(record.as_ref()),
+                    work: record.map(|record| wt_tui::WorkPresentation {
+                        record: Some(record),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            }
+        }
+        let state = serde_json::json!({ "sectionsOrder": FABRICATED_SECTIONS, "slugs": slugs });
+        fixture
+            .ctx
+            .database
+            .call(move |store| Ok(store.write_repository_state_json(&state.to_string())?))
+            .await
+            .unwrap();
+        listed
+    }
+
+    /// The board the layout draws from what is stored now.
+    async fn laid_out(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        rows: &[wt_tui::BoardRow],
+        sort: wt_config::UiSort,
+    ) -> wt_tui::Board {
+        let mut board = wt_tui::Board {
+            rows: rows.to_vec(),
+            ..Default::default()
+        };
+        board.display.status_sort = sort == wt_config::UiSort::Status;
+        wt_sources::board_layout::prepare(
+            &mut board,
+            &stored(fixture).await,
+            &fixture.ctx.config.branch.base,
+            sort,
+        );
+        board
+    }
+
+    fn sorting(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        sort: wt_config::UiSort,
+    ) -> AppContext {
+        let mut ctx = fixture.ctx.clone();
+        std::sync::Arc::make_mut(&mut ctx.config).ui.sort = sort;
+        ctx
+    }
+
+    /// Status sort draws a row that has a status by that status, also one
+    /// created from the board that was never ordered. Taken for a row still
+    /// behind the row it was created after, it was stored on the near side
+    /// of its neighbour: accepted, shown, and drawn back.
+    #[tokio::test]
+    async fn under_status_sort_a_started_row_created_from_the_board_passes_its_neighbour() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let sort = wt_config::UiSort::Status;
+        let ctx = sorting(&fixture, sort);
+        let rows = [
+            Fabricated {
+                order: Some(5.0),
+                status: Some(wt_core::WorkState::Ready),
+                ..Fabricated::new("p", "S")
+            },
+            Fabricated {
+                order: Some(1.0),
+                status: Some(wt_core::WorkState::Review),
+                ..Fabricated::new("q", "S")
+            },
+            Fabricated {
+                created_after: Some(Some("p".into())),
+                status: Some(wt_core::WorkState::Review),
+                ..Fabricated::new("a", "S")
+            },
+            Fabricated {
+                order: Some(2.0),
+                status: Some(wt_core::WorkState::Review),
+                ..Fabricated::new("z", "S")
+            },
+        ];
+        for (key, down, expected) in [
+            ("a", true, ["p", "q", "a", "z"]),
+            ("q", false, ["p", "q", "a", "z"]),
+            // Neither of the pair is that row, and it still must not move.
+            ("q", true, ["p", "a", "z", "q"]),
+            ("z", false, ["p", "a", "z", "q"]),
+        ] {
+            let listed = fabricate(&fixture, &rows).await;
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(drawn(&board, "S"), ["p", "a", "q", "z"]);
+            let mut seen = board.clone();
+            press_and_show(&ctx, &mut seen, &board, Some(key), "S", down)
+                .await
+                .unwrap();
+            assert_eq!(drawn(&seen, "S"), expected, "{key} down={down}");
+            assert_eq!(
+                drawn(&laid_out(&fixture, &listed, sort).await, "S"),
+                expected,
+                "{key} down={down}"
+            );
+        }
+        fixture.close().await.unwrap();
+    }
+
+    /// The same sections on every run.
+    struct Dice(u64);
+
+    impl Dice {
+        fn roll(&mut self, sides: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % sides
+        }
+
+        fn chance(&mut self, percent: u64) -> bool {
+            self.roll(100) < percent
+        }
+    }
+
+    fn random_sections(dice: &mut Dice) -> Vec<Fabricated> {
+        let count = 3 + dice.roll(7);
+        let mut rows: Vec<Fabricated> = Vec::new();
+        for index in 0..count {
+            let section = FABRICATED_SECTIONS[usize::from(dice.chance(35))];
+            let mut row = Fabricated::new(&format!("r{index}"), section);
+            match dice.roll(10) {
+                0..=4 => row.order = Some(dice.roll(6) as f64),
+                5..=6 => {}
+                _ => {
+                    let peers: Vec<&Fabricated> = rows
+                        .iter()
+                        .filter(|peer| peer.section == section && !peer.hidden)
+                        .collect();
+                    row.created_after = Some(if peers.is_empty() || dice.chance(25) {
+                        None
+                    } else {
+                        Some(peers[dice.roll(peers.len() as u64) as usize].key.clone())
+                    });
+                }
+            }
+            row.status = [
+                None,
+                Some(wt_core::WorkState::Ready),
+                Some(wt_core::WorkState::Review),
+                Some(wt_core::WorkState::Todo),
+            ][dice.roll(4) as usize];
+            if !rows.is_empty() && dice.chance(25) {
+                row.stacked_on = Some(rows[dice.roll(rows.len() as u64) as usize].key.clone());
+            }
+            if dice.chance(10) {
+                row.hidden = true;
+                row.created_after = None;
+                row.order = Some(dice.roll(6) as f64);
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// For sections of every kind the layout draws (ordered rows, rows never
+    /// ordered, rows at their creation position, rows filed there and drawn
+    /// elsewhere, stacks whole and split, with and without statuses, under
+    /// both sorts): a press the host accepts is stored so that the board
+    /// draws exactly what the terminal showed at the keypress, and a press
+    /// resolved from the board as drawn is never refused as stale.
+    #[tokio::test]
+    async fn every_accepted_press_redraws_the_board_as_it_was_shown() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let (mut passes, mut crossings) = (0, 0);
+        for seed in 0..1500u64 {
+            let mut dice = Dice(seed);
+            let sort = if seed % 2 == 0 {
+                wt_config::UiSort::Status
+            } else {
+                wt_config::UiSort::Manual
+            };
+            let ctx = sorting(&fixture, sort);
+            let rows = random_sections(&mut dice);
+            let listed = fabricate(&fixture, &rows).await;
+            for press in 0..4 {
+                let board = laid_out(&fixture, &listed, sort).await;
+                let layout = |board: &wt_tui::Board| {
+                    FABRICATED_SECTIONS.map(|section| (section, drawn(board, section)))
+                };
+                let before = layout(&board);
+                let candidates: Vec<(&str, &String)> = before
+                    .iter()
+                    .flat_map(|(section, keys)| keys.iter().map(|key| (*section, key)))
+                    .collect();
+                if candidates.is_empty() {
+                    break;
+                }
+                let (section, key) = candidates[dice.roll(candidates.len() as u64) as usize];
+                let down = dice.chance(50);
+                let said = format!(
+                    "seed {seed} press {press}: {key} {} in {section} under {sort:?}\nstored {}\ndrawn {before:?}",
+                    if down { "down" } else { "up" },
+                    stored(&fixture).await["slugs"],
+                );
+                let mut seen = board.clone();
+                // Not compared: a split stack member that crosses into the
+                // section of the row it is stacked on joins that unit, and
+                // under status sort its status can move the whole unit to
+                // another status. Where among those is decided by a stored
+                // order the board does not carry.
+                let joins_its_stack = sort == wt_config::UiSort::Status
+                    && matches!(
+                        wt_tui::plan_reorder(&board, Some(key), section, down),
+                        Ok(wt_tui::ReorderStep::Cross { unit, to, .. })
+                            if board
+                                .rows
+                                .iter()
+                                .find(|row| row.key == unit)
+                                .and_then(|row| row.stack_parent.as_ref())
+                                .is_some_and(|parent| drawn(&board, &to).contains(parent))
+                    );
+                match press_and_show(&ctx, &mut seen, &board, Some(key), section, down).await {
+                    Ok(_) if joins_its_stack => {}
+                    Ok(_) => {
+                        let after = laid_out(&fixture, &listed, sort).await;
+                        assert_eq!(layout(&after), layout(&seen), "{said}");
+                        if drawn(&seen, section).contains(key) {
+                            passes += 1;
+                        } else {
+                            crossings += 1;
+                        }
+                    }
+                    // Nothing to do (an edge, a status that pins the row).
+                    Err(error) => assert!(
+                        error.is::<wt_app_core::host_errors::Notice>(),
+                        "{error:#}\n{said}"
+                    ),
+                }
+            }
+        }
+        // Enough of both went through for the comparison to mean something.
+        assert!(
+            passes > 600 && crossings > 200,
+            "{passes} passes, {crossings} crossings"
+        );
         fixture.close().await.unwrap();
     }
 

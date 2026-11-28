@@ -27,6 +27,9 @@ pub(crate) struct PaletteWait {
     surface: ActionSurface,
     id: String,
     until: Instant,
+    /// The input generation of the choice. Any later key that does
+    /// something ends the wait, so nothing fires under the person's hands.
+    generation: u64,
 }
 
 /// What choosing an entry did. `keep_open` leaves the palette up.
@@ -102,6 +105,7 @@ impl Model {
                     surface: surface.clone(),
                     id: id.to_owned(),
                     until: Instant::now() + GITHUB_WAIT,
+                    generation: self.ui_generation,
                 });
                 self.refresh_requested = true;
                 let branch = scope.row.map_or("its branch", |row| row.branch.as_str());
@@ -120,6 +124,14 @@ impl Model {
             Some(blocker) => self.unavailable(format!("{}: {}", entry.name, blocker.reason())),
             None => {
                 let seen = scope.seen(entry);
+                if entry.needs_pr() && scope.row.is_some() && seen.0.pr.is_none() {
+                    // Its host would refuse a run for a pull request the
+                    // board has not shown.
+                    return self.unavailable(format!(
+                        "{}: the board does not show its pull request yet",
+                        entry.name
+                    ));
+                }
                 Pick::close(self.proceed(surface, entry, None, seen, scope.state))
             }
         }
@@ -194,6 +206,14 @@ impl Model {
         self.palette_wait = None;
     }
 
+    /// The cursor moved in the open palette. The person is choosing again,
+    /// so the earlier choice stops waiting and stops saying that it waits.
+    pub(super) fn palette_moved(&mut self) {
+        if self.palette_wait.take().is_some() {
+            self.rebuild_local_menu();
+        }
+    }
+
     pub(super) fn palette_wait_deadline(&self) -> Option<Instant> {
         self.palette_wait.as_ref().map(|wait| wait.until)
     }
@@ -230,7 +250,8 @@ impl Model {
             Interaction::Picker(picker)
                 if matches!(&picker.action, PickerAction::Actions { surface } if *surface == wait.surface)
         );
-        if !open {
+        // The rebuild that precedes this already dropped the waiting mark.
+        if !open || wait.generation != self.ui_generation {
             self.palette_wait = None;
             return;
         }
@@ -261,16 +282,44 @@ impl Model {
             None if self.follow_up.is_some() => self.mark_palette_wait(),
             None => {
                 self.palette_wait = None;
+                let seen = scope.seen(entry);
+                if entry.needs_pr() && scope.row.is_some() && seen.0.pr.is_none() {
+                    self.toast = Some((
+                        format!(
+                            "{}: the board does not show its pull request yet",
+                            entry.name
+                        ),
+                        ToastTone::Notice,
+                    ));
+                    return;
+                }
+                if entry.arg_prompt.is_some() || !(entry.shell || entry.direct) {
+                    // Its next step is a prompt. Nothing was typed since the
+                    // choice, but a prompt that opened by itself would take
+                    // the next key as its text or its commit: the palette
+                    // stays, on that entry, and Enter is the person's own.
+                    if let Interaction::Picker(picker) = &mut self.interaction
+                        && let Some(index) = picker
+                            .options
+                            .iter()
+                            .position(|option| option.value.as_deref() == Some(id.as_str()))
+                    {
+                        picker.selected = index;
+                    }
+                    self.toast = Some((
+                        format!("{}: GitHub confirmed; Enter continues", entry.name),
+                        ToastTone::Info,
+                    ));
+                    return;
+                }
                 self.interaction = Interaction::None;
                 let menu = self.local_menu.take();
-                let seen = scope.seen(entry);
-                match self.proceed(&surface, entry, None, seen, scope.state) {
-                    InputResult::Action(action) => {
-                        // A stale answer reopens the palette it came from.
-                        self.committed_menu = menu;
-                        self.follow_up = Some(action);
-                    }
-                    _ => self.local_menu = menu,
+                if let InputResult::Action(action) =
+                    self.proceed(&surface, entry, None, seen, scope.state)
+                {
+                    // A stale answer reopens the palette it came from.
+                    self.committed_menu = menu;
+                    self.follow_up = Some(action);
                 }
             }
         }

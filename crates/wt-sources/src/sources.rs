@@ -61,7 +61,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     );
     let github_actions =
         crate::github_actions::GithubActions::start(scope, context, github_refresh.clone());
-    let github_pickers = Arc::new(crate::github_pickers::GithubPickers::start(context));
+    let github_pickers = Arc::new(crate::github_pickers::GithubPickers::start(scope, context));
     let activity = crate::activity_source::start(
         scope,
         context.config.paths.cache_root.clone(),
@@ -139,6 +139,13 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
     let board = crate::attention_source::overlay(scope, context, board, attention_sources);
     let board =
         crate::work_presentation::overlay(scope, context.config.clone(), board, github.view());
+    let board = crate::pr_facts::overlay(
+        scope,
+        board,
+        github.view(),
+        local_sources.metadata.view(),
+        github_pickers.reviewers(),
+    );
     let board = crate::watch_board::overlay(
         scope,
         board,
@@ -397,6 +404,7 @@ mod tests {
         "dev-status",
         "session-discoveries",
         "git-presentation",
+        "reviewer-pool",
     ];
 
     /// Sources that read durable SQLite; it is authoritative and never cached.

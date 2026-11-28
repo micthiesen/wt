@@ -6,8 +6,8 @@ use tempfile::tempdir;
 
 use crate::{
     CURRENT_WT_STATE_VERSION, LayoutChanged, MergeEdge, RemovedWorktree, RepositoryIdentity,
-    SeenToggle, ShownSection, Store, StoreError, TitleSource, TitleWrite, WorkStatusRecord,
-    WtState, migrate_wt_state,
+    SeenToggle, ShownSection, ShownUnit, Store, StoreError, TitleSource, TitleWrite,
+    WorkStatusRecord, WtState, migrate_wt_state,
 };
 
 fn identity(id: &str, path: &str) -> RepositoryIdentity {
@@ -996,10 +996,10 @@ fn mixed_host_ordering_stays_in_controller_layout_and_preserves_unknown_fields()
     .unwrap();
     let remote = "@remote/server/one";
     store.write_repository_state_json(r#"{"slugs":{"local":{"order":1,"manualTitle":"Keep"}},"remoteLayouts":{"@remote/server/one":{"order":2,"future":42}}}"#).unwrap();
-    let shown = ["local".to_owned(), remote.to_owned()];
+    let shown = units(&["local", remote]);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(None, &shown, &shown), "local", remote)
+            .swap_shown_units(as_shown(None, &shown), "local", remote)
             .unwrap(),
         Ok(())
     );
@@ -1044,16 +1044,25 @@ fn keys(names: &[&str]) -> Vec<String> {
     names.iter().map(|name| (*name).to_owned()).collect()
 }
 
-fn as_shown<'a>(
-    name: Option<&'a str>,
-    drawn: &'a [String],
-    ordered: &'a [String],
-) -> ShownSection<'a> {
-    ShownSection {
-        name,
-        drawn,
-        ordered,
-    }
+/// Units as manual sort shows them: one band, each drawn by its stored order.
+fn units(names: &[&str]) -> Vec<ShownUnit> {
+    banded(&names.iter().map(|name| (*name, 0)).collect::<Vec<_>>())
+}
+
+/// Units with the status the board draws them under.
+fn banded(units: &[(&str, u8)]) -> Vec<ShownUnit> {
+    units
+        .iter()
+        .map(|(key, band)| ShownUnit {
+            key: (*key).to_owned(),
+            band: *band,
+            anchored: false,
+        })
+        .collect()
+}
+
+fn as_shown<'a>(name: Option<&'a str>, drawn: &'a [ShownUnit]) -> ShownSection<'a> {
+    ShownSection { name, drawn }
 }
 
 #[test]
@@ -1072,10 +1081,10 @@ fn a_swap_moves_exactly_the_pair_shown_and_refuses_a_layout_that_changed() {
         )
         .unwrap();
     let all = ["a", "b", "c", "d"];
-    let shown = keys(&all);
+    let shown = units(&all);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "b")
+            .swap_shown_units(as_shown(Some("S"), &shown), "a", "b")
             .unwrap(),
         Ok(())
     );
@@ -1090,30 +1099,30 @@ fn a_swap_moves_exactly_the_pair_shown_and_refuses_a_layout_that_changed() {
     // host that has not re-read its own write) must not swap the pair back.
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "b")
+            .swap_shown_units(as_shown(Some("S"), &shown), "a", "b")
             .unwrap(),
         Err(LayoutChanged::Order("a".into(), "b".into()))
     );
     assert_eq!(by_stored_order(&mut store, &all), ["b", "a", "c", "d"]);
     // The next press carries what the first one left, and goes one further.
-    let shown = keys(&["b", "a", "c", "d"]);
+    let shown = units(&["b", "a", "c", "d"]);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "c")
+            .swap_shown_units(as_shown(Some("S"), &shown), "a", "c")
             .unwrap(),
         Ok(())
     );
     assert_eq!(by_stored_order(&mut store, &all), ["b", "c", "a", "d"]);
 
     // Another writer reorders the section: the witness no longer holds.
-    let theirs = keys(&["b", "c", "a", "d"]);
+    let theirs = units(&["b", "c", "a", "d"]);
     store
-        .swap_shown_units(as_shown(Some("S"), &theirs, &theirs), "d", "a")
+        .swap_shown_units(as_shown(Some("S"), &theirs), "d", "a")
         .unwrap()
         .unwrap();
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &theirs, &theirs), "a", "d")
+            .swap_shown_units(as_shown(Some("S"), &theirs), "a", "d")
             .unwrap(),
         Err(LayoutChanged::Order("a".into(), "d".into()))
     );
@@ -1121,10 +1130,10 @@ fn a_swap_moves_exactly_the_pair_shown_and_refuses_a_layout_that_changed() {
     store
         .move_worktrees_to_section(&["c".to_owned()], Some("T"))
         .unwrap();
-    let shown = keys(&["b", "c", "d", "a"]);
+    let shown = units(&["b", "c", "d", "a"]);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "d", "a")
+            .swap_shown_units(as_shown(Some("S"), &shown), "d", "a")
             .unwrap(),
         Err(LayoutChanged::Filed("c".into()))
     );
@@ -1156,10 +1165,10 @@ fn the_first_reorder_stores_the_order_drawn_including_creation_anchors() {
         )
         .unwrap();
     let all = ["top", "x", "y", "new", "z"];
-    let shown = keys(&all);
+    let shown = units(&all);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "x", "y")
+            .swap_shown_units(as_shown(Some("S"), &shown), "x", "y")
             .unwrap(),
         Ok(())
     );
@@ -1183,9 +1192,9 @@ fn the_first_reorder_stores_the_order_drawn_including_creation_anchors() {
                 "x":{"section":"S","order":7},"since":{"section":"S","order":8}}}"#,
         )
         .unwrap();
-    let shown = keys(&["a", "b", "x"]);
+    let shown = units(&["a", "b", "x"]);
     store
-        .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "b")
+        .swap_shown_units(as_shown(Some("S"), &shown), "a", "b")
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -1203,11 +1212,10 @@ fn the_first_reorder_stores_the_order_drawn_including_creation_anchors() {
                 "q":{"section":"S","order":3},"late":{"section":"S","order":0}}}"#,
         )
         .unwrap();
-    let drawn = keys(&["p", "q", "other", "late"]);
-    let status = keys(&["p", "q"]);
+    let drawn = banded(&[("p", 0), ("q", 0), ("late", 1), ("other", 1)]);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &drawn, &status), "p", "q")
+            .swap_shown_units(as_shown(Some("S"), &drawn), "p", "q")
             .unwrap(),
         Ok(())
     );
@@ -1217,9 +1225,10 @@ fn the_first_reorder_stores_the_order_drawn_including_creation_anchors() {
     );
     // Manual sort draws by stored order alone, so there the whole list is
     // the witness and this one was never the stored order.
+    let drawn = units(&["p", "q", "late", "other"]);
     assert_eq!(
         store
-            .swap_shown_units(as_shown(Some("S"), &drawn, &drawn), "p", "q")
+            .swap_shown_units(as_shown(Some("S"), &drawn), "p", "q")
             .unwrap(),
         Err(LayoutChanged::Order("p".into(), "q".into()))
     );
@@ -1243,11 +1252,11 @@ fn a_unit_crosses_to_the_edge_of_the_section_shown_or_is_refused() {
                 "remoteLayouts":{"@remote/server/one":{"section":"S","order":2,"future":42}}}"#,
         )
         .unwrap();
-    fn section<'a>(name: &'a str, drawn: &'a [String]) -> ShownSection<'a> {
-        as_shown(Some(name), drawn, drawn)
+    fn section<'a>(name: &'a str, drawn: &'a [ShownUnit]) -> ShownSection<'a> {
+        as_shown(Some(name), drawn)
     }
     let unit = keys(&["root", "child"]);
-    let (here, there) = (&keys(&["root", remote]), &keys(&["c", "d"]));
+    let (here, there) = (&units(&["root", remote]), &units(&["c", "d"]));
     // "c" was never ordered and is drawn first, so the top is before it.
     assert_eq!(
         store
@@ -1263,7 +1272,7 @@ fn a_unit_crosses_to_the_edge_of_the_section_shown_or_is_refused() {
     assert_eq!(state["slugs"]["child"]["section"], "T");
 
     // Back up: the bottom of S, behind the remote row filed there.
-    let (back, rest) = (&keys(&["root", "c", "d"]), &keys(&[remote]));
+    let (back, rest) = (&units(&["root", "c", "d"]), &units(&[remote]));
     assert_eq!(
         store
             .move_shown_unit(&unit, "root", section("T", back), section("S", rest), false)
@@ -1281,8 +1290,8 @@ fn a_unit_crosses_to_the_edge_of_the_section_shown_or_is_refused() {
     // Refused: the row left the section it was shown in, the destination
     // is gone, or either section is not laid out as shown.
     let before = store.read_wt_state().unwrap();
-    let none: &[String] = &[];
-    let leaving = &keys(&[remote, "root"]);
+    let none: &[ShownUnit] = &[];
+    let leaving = &units(&[remote, "root"]);
     assert_eq!(
         store
             .move_shown_unit(
@@ -1353,20 +1362,142 @@ fn a_unit_crosses_to_the_edge_of_the_section_shown_or_is_refused() {
             .is_ok()
     );
     let last = keys(&["d"]);
-    let inbox = ShownSection {
-        name: None,
-        drawn: none,
-        ordered: none,
-    };
+    let (leaving, inbox) = (&units(&["d", "c"]), as_shown(None, none));
     assert!(
         store
-            .move_shown_unit(&last, "d", section("T", none), inbox, false)
+            .move_shown_unit(&last, "d", section("T", leaving), inbox, false)
             .unwrap()
             .is_ok()
     );
     let state = store.read_wt_state().unwrap();
     assert_eq!(state["slugs"]["root"]["section"], "Empty");
     assert!(state["slugs"]["d"]["section"].is_null());
+}
+
+#[test]
+fn under_status_sort_a_press_stores_the_section_as_drawn_with_one_unit_moved() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    // "a" was created from the board and has a status: status sort draws it
+    // by that, first of its status because it was never ordered, and not
+    // behind "p", which a row still at its creation position would follow.
+    let state = r#"{"slugs":{
+        "p":{"section":"S","order":5},
+        "q":{"section":"S","order":1},
+        "a":{"section":"S","order":null,"creationAfter":"p"},
+        "z":{"section":"S","order":2}}}"#;
+    let drawn = banded(&[("p", 0), ("a", 1), ("q", 1), ("z", 1)]);
+    // The orders stored must draw each status in the order shown, with only
+    // the pressed unit moved.
+    let status_one =
+        |store: &mut Store| -> Vec<String> { by_stored_order(store, &["a", "q", "z"]) };
+    for (unit, past, expected) in [
+        ("a", "q", ["q", "a", "z"]),
+        ("q", "a", ["q", "a", "z"]),
+        ("q", "z", ["a", "z", "q"]),
+        ("z", "q", ["a", "z", "q"]),
+    ] {
+        store.write_repository_state_json(state).unwrap();
+        assert_eq!(
+            store
+                .swap_shown_units(as_shown(Some("S"), &drawn), unit, past)
+                .unwrap(),
+            Ok(()),
+            "{unit} past {past}"
+        );
+        assert_eq!(status_one(&mut store), expected, "{unit} past {past}");
+    }
+    // The manual order across statuses, which status sort does not draw,
+    // is kept: "p" stays behind every unit it was stored behind.
+    assert_eq!(
+        by_stored_order(&mut store, &["a", "z", "q", "p"]),
+        ["a", "z", "q", "p"]
+    );
+}
+
+#[test]
+fn a_unit_at_its_creation_position_keeps_no_order_and_follows_what_is_drawn_before_it() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let state = r#"{"sectionsOrder":["S","T"],"slugs":{
+        "x":{"section":"S","order":1},
+        "new":{"section":"S","order":null,"creationAfter":"x"},
+        "y":{"section":"S","order":2},
+        "t":{"section":"T","order":1}}}"#;
+    store.write_repository_state_json(state).unwrap();
+    let anchored = |key: &str| ShownUnit {
+        key: key.to_owned(),
+        band: 5,
+        anchored: true,
+    };
+    let placed = |key: &str| ShownUnit {
+        key: key.to_owned(),
+        band: 2,
+        anchored: false,
+    };
+    let anchor = |store: &mut Store, key: &str| {
+        let state = store.read_wt_state().unwrap();
+        assert!(state["slugs"][key]["order"].is_null(), "{key} has an order");
+        state["slugs"][key]["creationAfter"].clone()
+    };
+    // The new row passes "y": no order is written, it follows "y" now.
+    let drawn = [placed("x"), anchored("new"), placed("y")];
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &drawn), "new", "y")
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(anchor(&mut store, "new"), "y");
+    assert_eq!(by_stored_order(&mut store, &["x", "y"]), ["x", "y"]);
+    // "y" passes it back: the row follows what is drawn before it, "x".
+    let drawn = [placed("x"), placed("y"), anchored("new")];
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &drawn), "y", "new")
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(anchor(&mut store, "new"), "x");
+    // The unit it follows leaves the section: it follows the one before,
+    // and here that is none.
+    let drawn = [placed("x"), anchored("new"), placed("y")];
+    let there = [placed("t")];
+    assert!(
+        store
+            .move_shown_unit(
+                &keys(&["x"]),
+                "x",
+                as_shown(Some("S"), &drawn),
+                as_shown(Some("T"), &there),
+                false
+            )
+            .unwrap()
+            .is_ok()
+    );
+    assert!(anchor(&mut store, "new").is_null());
+    assert_eq!(by_stored_order(&mut store, &["t", "x"]), ["t", "x"]);
+    // Shown at its creation position, ordered since: not the layout shown.
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{"x":{"section":"S","order":1},"new":{"section":"S","order":3,"creationAfter":"x"}}}"#,
+        )
+        .unwrap();
+    let drawn = [placed("x"), anchored("new")];
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &drawn), "x", "new")
+            .unwrap(),
+        Err(LayoutChanged::Ordered("new".into()))
+    );
 }
 
 #[test]
@@ -2216,4 +2347,40 @@ fn an_armed_merge_is_one_record_per_slug_cleared_by_cancel_end_or_removal() {
     store.set_slug_merge_arm("one", &arm(40)).unwrap();
     store.reap_wt_state(&BTreeSet::new()).unwrap();
     assert!(store.read_wt_state().unwrap()["slugs"]["one"].is_null());
+}
+
+/// The metadata reader takes the state and the archived keys together. A
+/// write that lands between its two statements must show in both or in
+/// neither, on the read-only connection and on a writable one.
+#[test]
+fn state_and_archived_keys_are_read_as_one_snapshot() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut writer = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let keys = |key: &str| BTreeSet::from([key.to_owned()]);
+    let mut seen = 1;
+    writer.set_attention_seen(seen).unwrap();
+    writer.replace_archived_keys(&keys("at-1")).unwrap();
+    for read_only in [true, false] {
+        let mut reader = if read_only {
+            Store::open_read_only(&path, identity("repo", "/repo")).unwrap()
+        } else {
+            Store::open(&path, identity("repo", "/repo")).unwrap()
+        };
+        let before = seen;
+        seen += 1;
+        let (state, archived) = reader
+            .read_state_and_archived(|| {
+                writer.set_attention_seen(seen).unwrap();
+                writer
+                    .replace_archived_keys(&keys(&format!("at-{seen}")))
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(state["attentionSeenTs"], before);
+        assert_eq!(archived, keys(&format!("at-{before}")), "a mixed pair");
+        let (state, archived) = reader.read_wt_state_and_archived_keys().unwrap();
+        assert_eq!(state["attentionSeenTs"], seen);
+        assert_eq!(archived, keys(&format!("at-{seen}")));
+    }
 }

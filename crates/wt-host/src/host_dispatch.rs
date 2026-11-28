@@ -16,12 +16,11 @@ pub async fn execute(
 ) -> Result<UiReply> {
     let selected_context = context.for_action(&command)?;
     let context = &selected_context;
-    // Cleanup is a fleet-wide confirmation: prepare the candidate set from
-    // every configured host, then route the captured revisions back to their
-    // owners. Explicitly host-scoped legacy requests still use the normal path.
+    // Cleanup is a fleet-wide confirmation, built from the board: route what
+    // it captured back to the hosts that own it. Explicitly host-scoped
+    // requests use the normal path.
     if !matches!(command, UiAction::OnHost { .. }) {
         match command {
-            UiAction::PrepareCleanup => return Ok(crate::fleet_cleanup::prepare(fleet).await),
             UiAction::CleanupTargets { targets } => {
                 return Ok(crate::fleet_cleanup::cleanup_targets(fleet, targets).await);
             }
@@ -118,15 +117,6 @@ pub async fn execute(
                 .with_context(|| format!("host {host:?} is no longer configured"))
         })
         .transpose()?;
-    if matches!(action, UiAction::PrepareSessions { .. }) {
-        let location = remote
-            .map(|remote| remote.endpoint.label.as_str())
-            .unwrap_or("this machine");
-        replies
-            .send(UiReply::message(format!("Loading sessions on {location}…")))
-            .await
-            .context("show session discovery progress")?;
-    }
     if let UiAction::ManagedSignIn { provider, then } = action {
         let remote = remote.context("sign-in belongs to a managed remote host")?;
         let lent = Lent {

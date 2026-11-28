@@ -114,7 +114,6 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::PrepareSection { .. }
         | A::PrepareDeleteSection { .. }
         | A::PrepareRemove { .. }
-        | A::PrepareCleanup
         | A::PrepareStatus { .. }
         | A::PrepareBase { .. }
         | A::PrepareNotify { .. }

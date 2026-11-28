@@ -537,7 +537,6 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::Cleanup { .. } | A::CleanupTargets { .. } => "clean worktrees",
         A::PrepareCreate { .. } => "prepare worktree creation",
         A::PrepareRemove { .. } => "prepare worktree removal",
-        A::PrepareCleanup => "prepare worktree cleanup",
         A::PrepareGithub { .. } => "prepare GitHub action",
         A::PrepareReviewers { .. } => "prepare reviewer picker",
         A::PrepareReviewCheckout { .. } => "prepare review checkout",
@@ -700,8 +699,7 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::RenameSection { .. }
         | A::DeleteSection { .. }
         | A::CyclePrimary
-        | A::Copy { .. }
-        | A::PrepareCleanup => return None,
+        | A::Copy { .. } => return None,
     };
     let key = &key;
     match wt_core::parse_worktree_ledger_key(key)? {
@@ -2350,11 +2348,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_preparation_does_not_claim_the_mutation_lane() {
-        assert_eq!(
-            lane_for(&UiAction::PrepareCleanup).unwrap(),
-            Lane::Preparation(None)
-        );
+    fn cleanup_owns_only_the_checkouts_it_removes() {
         assert_eq!(
             lane_for(&UiAction::Cleanup { revisions: vec![] }).unwrap(),
             Lane::FleetCleanup(BTreeSet::new())

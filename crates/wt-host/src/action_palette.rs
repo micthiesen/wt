@@ -110,17 +110,28 @@ async fn check(
                 context.slug
             )));
         }
-        if let Some(number) = seen.pr
-            && context
+        let needs_pr = definition.requires.iter().any(|requirement| {
+            matches!(
+                requirement,
+                wt_config::RequireTag::Pr | wt_config::RequireTag::PrReady
+            )
+        });
+        // The run names a pull request: only the one the person was shown.
+        if needs_pr && context.worktree_ref.is_some() {
+            let Some(number) = seen.pr else {
+                return Err(refused(&definition, "the palette showed no pull request"));
+            };
+            if context
                 .row
                 .pr_number
                 .as_deref()
                 .is_some_and(|current| current != number.to_string())
-        {
-            return Err(refused(
-                &definition,
-                "its pull request changed since the palette opened",
-            ));
+            {
+                return Err(refused(
+                    &definition,
+                    "its pull request changed since the palette opened",
+                ));
+            }
         }
     }
     let entry = wt_sources::inventory::action_entry(&definition);
@@ -538,6 +549,11 @@ mod tests {
             (
                 shown(path, "feature/one", Some(6)),
                 "Fix CI: its pull request changed since the palette opened",
+            ),
+            // A view that named no pull request cannot start a run that names one.
+            (
+                shown(path, "feature/one", None),
+                "Fix CI: the palette showed no pull request",
             ),
         ] {
             let error = check(&fixture.ctx, &request, None, Some(&github))

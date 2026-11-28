@@ -292,6 +292,14 @@ fn compose(
                 if let Some(run) = &mut row.action_facts.active_run {
                     run.action_name = wt_core::sanitize_terminal_text(&run.action_name);
                 }
+                if let Some(pr) = &mut row.pr {
+                    if let Some(why) = &mut pr.queue_removal {
+                        *why = wt_core::sanitize_terminal_text(why);
+                    }
+                    for reviewer in &mut pr.suggested_reviewers {
+                        reviewer.login = wt_core::sanitize_terminal_text(&reviewer.login);
+                    }
+                }
                 board.rows.push(row);
             }
             if let Some(remote) = &data.board {
@@ -303,6 +311,17 @@ fn compose(
                 board
                     .host_actions
                     .insert(host.clone(), sanitize_actions(remote.actions.clone()));
+                if let Some(pool) = &remote.reviewers {
+                    board
+                        .host_reviewers
+                        .insert(host.clone(), sanitize_reviewers(pool.clone()));
+                }
+                // Which sessions and terminals run is only known of a host
+                // that is connected now. Their absence here is what makes
+                // its rows' menus say so instead of listing none.
+                if current {
+                    list_sessions(&mut board, &host, remote);
+                }
                 for mut review in remote.review_requests.clone() {
                     review.host = Some(host.clone());
                     for value in [&mut review.title, &mut review.author] {
@@ -489,6 +508,57 @@ fn sanitize_display(mut display: wt_tui::DisplayPolicy) -> wt_tui::DisplayPolicy
     }
     display.primary_harness = wt_core::sanitize_terminal_text(&display.primary_harness);
     display
+}
+
+/// A host's session pickers and terminals, listed under the keys its rows
+/// have on this board, so their menus are built here as a local row's are.
+/// Each choice names its row by that key and is routed back by it. Identity
+/// fields return to the host unchanged; only what is drawn is cleaned.
+fn list_sessions(board: &mut Board, host: &str, remote: &Board) {
+    for (key, entries) in &remote.session_menus {
+        // Only a worktree's picker is keyed by its row. The slot pickers
+        // (manager, main clone) are this machine's own.
+        if !remote.rows.iter().any(|row| row.key == *key) {
+            continue;
+        }
+        let listed = wt_core::remote_worktree_ledger_key(host, key);
+        let entries = entries
+            .iter()
+            .filter(|entry| entry.selection.key.as_deref() == Some(key.as_str()))
+            .cloned()
+            .map(|mut entry| {
+                entry.selection.key = Some(listed.clone());
+                entry.display_name = wt_core::sanitize_terminal_text(&entry.display_name);
+                if let Some(state) = &mut entry.state {
+                    *state = wt_core::sanitize_terminal_text(state);
+                }
+                entry
+            })
+            .collect();
+        board.session_menus.insert(listed, entries);
+    }
+    for (key, terminals) in &remote.terminals {
+        if !remote.rows.iter().any(|row| row.key == *key) {
+            continue;
+        }
+        let mut terminals = terminals.clone();
+        for terminal in &mut terminals {
+            terminal.name = wt_core::sanitize_terminal_text(&terminal.name);
+        }
+        board
+            .terminals
+            .insert(wt_core::remote_worktree_ledger_key(host, key), terminals);
+    }
+}
+
+/// Another host's reviewer pool is drawn here. A login that cleaning
+/// changes is not one GitHub knows, and that host refuses it on commit.
+fn sanitize_reviewers(mut pool: wt_tui::ReviewerPool) -> wt_tui::ReviewerPool {
+    pool.viewer = wt_core::sanitize_terminal_text(&pool.viewer);
+    for contributor in &mut pool.contributors {
+        contributor.login = wt_core::sanitize_terminal_text(&contributor.login);
+    }
+    pool
 }
 
 /// What another host says about its palettes is drawn here; the argument
@@ -761,6 +831,175 @@ mod tests {
         assert_eq!(remote_row.owed_phase, Some(wt_core::OwedPhase::Due));
         fixture.close().await.unwrap();
     }
+    /// A remote row's session picker, terminal stop and reviewer picker are
+    /// built on this board, from what its own host listed.
+    #[tokio::test]
+    async fn a_connected_hosts_sessions_terminals_and_reviewers_are_listed_under_its_rows() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let endpoint = wt_config::RemoteConfig {
+            host: "builder".into(),
+            label: "Builder".into(),
+            ..Default::default()
+        };
+        let host_key = endpoint.key();
+        let selection = |key: Option<&str>, target| wt_tui::SessionSelection {
+            key: key.map(str::to_owned),
+            target,
+            harness: wt_core::HarnessId::Codex,
+            session_id: Some("exact".into()),
+            live_slot: Some(wt_tui::LiveSessionIdentity {
+                id: "$1".into(),
+                created_at: 5,
+            }),
+            managed_name: None,
+            mode: wt_tui::SessionMode::Resume,
+            live: true,
+            seen_live: None,
+        };
+        let entry = |key: Option<&str>, target| wt_tui::SessionMenuEntry {
+            selection: selection(key, target),
+            display_name: "pri\u{1b}[31mmary".into(),
+            state: Some("work\u{1b}[31ming".into()),
+            is_live: true,
+            last_active_ms: None,
+        };
+        let harness = wt_tui::SessionTarget::Harness;
+        let manager = wt_tui::SessionTarget::Manager;
+        let remote = Board {
+            rows: vec![wt_tui::BoardRow {
+                key: "one".into(),
+                slug: "one".into(),
+                branch: "feature/one".into(),
+                ..Default::default()
+            }],
+            session_menus: [
+                ("one".to_owned(), vec![entry(Some("one"), harness)]),
+                // That host's manager slot is not a row of this board.
+                (
+                    wt_tui::session_menu_key(None, manager),
+                    vec![entry(None, manager)],
+                ),
+            ]
+            .into(),
+            terminals: [(
+                "one".to_owned(),
+                vec![wt_tui::TerminalSlotView {
+                    target: wt_tui::SessionTarget::Shell,
+                    name: "one-\u{1b}[31mshell".into(),
+                    id: "$7".into(),
+                    created_at: 42,
+                    retained: true,
+                }],
+            )]
+            .into(),
+            reviewers: Some(wt_tui::ReviewerPool {
+                viewer: "me".into(),
+                contributors: vec![wt_tui::ContributorView {
+                    login: "a\u{1b}[31mna".into(),
+                    contributions: 3,
+                }],
+                fetched_at_ms: 9,
+            }),
+            ..Default::default()
+        };
+        let snapshot = |board: &Board| HostSnapshot {
+            board: Some(board.clone()),
+            state: HostState::Ready,
+            domains: Default::default(),
+            layout: Default::default(),
+        };
+        // This machine's own slot picker shares that host's slot key.
+        let local = Board {
+            session_menus: [(wt_tui::session_menu_key(None, manager), Vec::new())].into(),
+            ..Default::default()
+        };
+        let metadata = || ready((serde_json::json!({"slugs": {}}), Default::default()));
+        let composed = compose(
+            &mut FailureClock::default(),
+            &fixture.ctx.config,
+            ready(local.clone()),
+            metadata(),
+            &[(&endpoint, host(snapshot(&remote)), None)],
+        );
+        let board = composed.data().cloned().unwrap();
+        let listed = wt_core::remote_worktree_ledger_key(&host_key, "one");
+        assert_eq!(board.rows[0].key, listed);
+        let entries = &board.session_menus[&listed];
+        assert_eq!(entries.len(), 1);
+        // The choice names the row as this board does, so its commit is
+        // routed to that host; what the host must match is untouched.
+        assert_eq!(entries[0].selection.key.as_deref(), Some(listed.as_str()));
+        assert_eq!(entries[0].selection.live_slot.as_ref().unwrap().id, "$1");
+        assert_eq!(entries[0].selection.session_id.as_deref(), Some("exact"));
+        assert_eq!(entries[0].display_name, "primary");
+        assert_eq!(entries[0].state.as_deref(), Some("working"));
+        assert!(
+            board.session_menus[&wt_tui::session_menu_key(None, manager)].is_empty(),
+            "another host's slot picker replaced this machine's"
+        );
+        assert_eq!(board.session_menus.len(), 2);
+        let terminal = &board.terminals[&listed][0];
+        assert_eq!(
+            (
+                terminal.name.as_str(),
+                terminal.id.as_str(),
+                terminal.created_at
+            ),
+            ("one-shell", "$7", 42)
+        );
+        assert!(terminal.retained);
+        assert_eq!(board.host_reviewers[&host_key].contributors[0].login, "ana");
+        // The menus the model opens for that row are answered here.
+        for action in [
+            wt_tui::UiAction::PrepareSessions {
+                key: Some(listed.clone()),
+                target: harness,
+            },
+            wt_tui::UiAction::PrepareStopTerminal {
+                key: listed.clone(),
+                target: wt_tui::SessionTarget::Shell,
+            },
+        ] {
+            assert!(
+                matches!(
+                    action.menu(&board),
+                    wt_tui::Menu::Local(wt_tui::LocalMenu::Modal { .. })
+                ),
+                "{action:?}"
+            );
+        }
+
+        // A host that is not connected now says nothing about what runs
+        // there: its rows stay, their session menus are not offered.
+        for stale in [
+            host(snapshot(&remote)).with_state(SourceState::Failed("SSH disconnected".into())),
+            SourceSnapshot::test_restored(snapshot(&remote), Domain::Host, 1_000),
+        ] {
+            let composed = compose(
+                &mut FailureClock::default(),
+                &fixture.ctx.config,
+                ready(local.clone()),
+                metadata(),
+                &[(&endpoint, stale, None)],
+            );
+            let board = composed.data().cloned().unwrap();
+            assert_eq!(board.rows[0].key, listed);
+            assert!(!board.session_menus.contains_key(&listed));
+            assert!(!board.terminals.contains_key(&listed));
+            assert!(matches!(
+                wt_tui::UiAction::PrepareStopTerminal {
+                    key: listed.clone(),
+                    target: wt_tui::SessionTarget::Shell,
+                }
+                .menu(&board),
+                wt_tui::Menu::Local(wt_tui::LocalMenu::Notice(_) | wt_tui::LocalMenu::NotYet(_))
+            ));
+        }
+        fixture.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn same_slugs_on_three_hosts_stay_separate_when_one_host_disconnects() {
         let fixture = wt_app_core::test_support::CommandFixture::new()

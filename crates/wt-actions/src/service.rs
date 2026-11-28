@@ -1010,6 +1010,9 @@ impl ActionService {
             else {
                 continue;
             };
+            let Some(_legacy_worker_lock) = self.legacy_worker_gone(&run.meta.run_id).await? else {
+                continue;
+            };
             let _state_lock = self.state_lock(&run.meta.run_id).await?;
             run.meta = read_json(&run.run_dir.join("meta.json")).await?;
             if run.meta.status != ActionRunStatus::Running {
@@ -1056,15 +1059,57 @@ impl ActionService {
         Ok(reconciled)
     }
 
-    async fn state_lock(&self, run_id: &str) -> Result<FileLock, ActionServiceError> {
+    /// The lock held while one run's outcome files are rewritten, and with
+    /// it the lock an older build takes for the same run when that build
+    /// has left one: its worker and its reconcile write under that name
+    /// alone. Always taken in this order, and by nothing else.
+    async fn state_lock(
+        &self,
+        run_id: &str,
+    ) -> Result<(FileLock, Option<FileLock>), ActionServiceError> {
         validate_run_id(run_id)?;
-        Ok(FileLock::acquire(
+        let shared = FileLock::acquire(
             &self.config.lock_dir,
             &state_lock_key(run_id),
             "write action outcome",
             &CancellationToken::new(),
         )
-        .await?)
+        .await?;
+        let key = format!("action-state-{run_id}");
+        // Never created here: a name per run is what filled the directory.
+        let legacy = if lock_file_exists(&self.config.lock_dir, &key).await {
+            Some(
+                FileLock::acquire(
+                    &self.config.lock_dir,
+                    &key,
+                    "write action outcome",
+                    &CancellationToken::new(),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        Ok((shared, legacy))
+    }
+
+    /// A worker from a build that named its lock for the run holds that
+    /// name, not the worktree's: sessions keep the build that started them.
+    /// `Some(None)` when no such lock file exists (nothing to hold, and no
+    /// file is created for a run that never had one); `None` while held.
+    async fn legacy_worker_gone(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<Option<FileLock>>, ActionServiceError> {
+        let key = format!("action-run-{run_id}");
+        if !lock_file_exists(&self.config.lock_dir, &key).await {
+            return Ok(Some(None));
+        }
+        Ok(
+            FileLock::try_acquire(&self.config.lock_dir, &key, "reconcile action worker")
+                .await?
+                .map(Some),
+        )
     }
 
     async fn restore_completion(&self, run: &mut ActionRun) -> Result<bool, ActionServiceError> {
@@ -1379,6 +1424,12 @@ pub fn worker_lock_key(log_dir: &Path, slug: &str) -> String {
 /// and never while another of them is taken.
 fn state_lock_key(run_id: &str) -> String {
     format!("action-state-{:02x}", stable_hash(run_id) % 64)
+}
+
+async fn lock_file_exists(lock_dir: &Path, key: &str) -> bool {
+    fs::try_exists(lock_dir.join(format!("{key}.lock")))
+        .await
+        .unwrap_or(true)
 }
 
 fn valid_env_name(name: &str) -> bool {
@@ -1722,6 +1773,70 @@ mod tests {
         assert_eq!(all[0].meta.started_at, 31);
         assert!(all[0].command.is_empty());
         assert_eq!(service(temp.path()).list_runs(3).await.unwrap().len(), 3);
+    }
+
+    /// Sessions keep the build that started them, so a worker may hold the
+    /// locks an older build named for its run. Recovery leaves such a run
+    /// alone, and a kill waits for the worker's own outcome write.
+    #[tokio::test]
+    async fn recovery_and_kill_respect_an_older_builds_per_run_locks() {
+        let temp = tempfile::tempdir().unwrap();
+        let job = prepared_job(temp.path(), request(temp.path(), &["true"])).await;
+        let run_dir = job.parent().unwrap();
+        let meta: ActionMeta = read_json(&run_dir.join("meta.json")).await.unwrap();
+        let locks = temp.path().join("locks");
+        let hold = |key: String| {
+            let locks = locks.clone();
+            async move {
+                FileLock::acquire(&locks, &key, "older build", &CancellationToken::new())
+                    .await
+                    .unwrap()
+            }
+        };
+        let worker = hold(format!("action-run-{}", meta.run_id)).await;
+        fs::write(run_dir.join("done.json"), br#"{"exitCode":0}"#)
+            .await
+            .unwrap();
+        let reconciled = || async {
+            service(temp.path())
+                .reconcile_runs(&CancellationToken::new())
+                .await
+                .unwrap()
+        };
+        assert_eq!(reconciled().await, 0, "its worker is alive");
+        drop(worker);
+
+        let writing = hold(format!("action-state-{}", meta.run_id)).await;
+        let kill = tokio::spawn({
+            let (service, meta) = (service(temp.path()), meta.clone());
+            async move {
+                let key = if meta.action_key.is_empty() {
+                    meta.slug.clone()
+                } else {
+                    meta.action_key.clone()
+                };
+                service
+                    .kill_run(&key, &meta.run_id, &CancellationToken::new())
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!kill.is_finished(), "the kill wrote beside the worker");
+        drop(writing);
+        let _ = tokio::time::timeout(Duration::from_secs(20), kill)
+            .await
+            .expect("the kill never ran")
+            .unwrap();
+        assert_eq!(
+            reconciled().await,
+            usize::from(
+                read_json::<ActionMeta>(&run_dir.join("meta.json"))
+                    .await
+                    .unwrap()
+                    .status
+                    == ActionRunStatus::Running
+            )
+        );
     }
 
     #[tokio::test]

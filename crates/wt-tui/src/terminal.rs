@@ -476,7 +476,7 @@ async fn run_inner<'a>(
                                             if let Some(request) = &mut model.pending_request {
                                                 request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
                                             }
-                                            model.toast = Some((if model.pending_request.as_ref().is_some_and(|request| request.preparation) { "loading menu… Esc cancels" } else { "working…" }.into(), ToastTone::Info));
+                                            if let Some(text) = model.sent_feedback() { model.toast = Some((text.into(), ToastTone::Info)); }
                                         },
                                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => { model.request_not_sent(); model.toast = Some(("actions are busy; try again when one finishes".into(), ToastTone::Failed)) },
                                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => { model.request_not_sent(); model.toast = Some(("action worker stopped; restart wt".into(), ToastTone::Failed)) },
@@ -564,6 +564,8 @@ async fn run_inner<'a>(
                     }
                 } else {
                     controller_open = false;
+                    // Nothing will fill an overlay that is still loading.
+                    model.close_loading();
                     model.pending_request = None;
                     model.toast = Some(("action worker stopped; restart wt".into(), ToastTone::Failed));
                     dirty = true;
@@ -900,38 +902,30 @@ fn send_follow_up(model: &mut Model, outbox: Outbox<'_>) {
     if publish_view(outbox, &action) {
         return;
     }
+    // Nobody is at hand to press a key again for a request the model
+    // queued itself. A full queue keeps it for the next reply or snapshot,
+    // each of which is when room appears.
+    let Ok(permit) = outbox.requests.try_reserve() else {
+        model.follow_up = Some(action);
+        return;
+    };
     let id = model.next_op_id();
     let action = model.resolve(action);
     let feedback = action.clone();
     let cancellation = action.is_cancellable().then(CancellationToken::new);
-    let request = crate::UiRequest {
+    permit.send(crate::UiRequest {
         id,
         generation: model.ui_generation,
         action,
         cancellation: cancellation.clone(),
-    };
-    if outbox.requests.try_send(request).is_err() {
-        model.request_not_sent();
-        model.toast = Some((
-            "action queue is busy; retry the action".into(),
-            ToastTone::Failed,
-        ));
-        return;
-    }
+    });
     model.begin_action(id, &feedback);
     if let Some(request) = &mut model.pending_request {
         request._cancel_on_drop = cancellation.map(CancellationToken::drop_guard);
     }
-    let preparing = model
-        .pending_request
-        .as_ref()
-        .is_some_and(|request| request.preparation);
-    let text = if preparing {
-        "loading menu… Esc cancels"
-    } else {
-        "working…"
-    };
-    model.toast = Some((text.into(), ToastTone::Info));
+    if let Some(text) = model.sent_feedback() {
+        model.toast = Some((text.into(), ToastTone::Info));
+    }
 }
 
 /// Send read-only warm-up requests a board menu asked for. They carry no
@@ -1151,6 +1145,52 @@ mod request_channel_tests {
         assert!(!publish_view(outbox, &UiAction::HardRefresh));
         assert!(controller.requests.try_recv().is_err());
         assert!(controller.background.try_recv().is_err());
+    }
+
+    /// A request the model queued behind a reply has nobody to press its
+    /// key again. One that finds the queue full waits for room.
+    #[tokio::test]
+    async fn a_follow_up_that_finds_the_queue_full_is_kept_until_there_is_room() {
+        let (actions, mut controller) = crate::action_channel();
+        let outbox = Outbox {
+            requests: &actions.requests,
+            background: &actions.background,
+            views: &actions.views,
+        };
+        while actions
+            .requests
+            .try_send(crate::UiRequest {
+                id: 0,
+                generation: 0,
+                action: UiAction::HardRefresh,
+                cancellation: None,
+            })
+            .is_ok()
+        {}
+        let mut model = Model::default();
+        let queued = UiAction::FoldSection {
+            key: "Batch".into(),
+            folded: true,
+        };
+        model.follow_up = Some(queued.clone());
+        send_follow_up(&mut model, outbox);
+        assert_eq!(
+            model.follow_up,
+            Some(queued.clone()),
+            "the request was dropped"
+        );
+        assert!(model.pending_request.is_none());
+        assert!(model.toast.is_none());
+        // The next reply or snapshot finds room and sends it.
+        controller.requests.try_recv().unwrap();
+        send_follow_up(&mut model, outbox);
+        assert!(model.follow_up.is_none());
+        assert!(model.pending_request.is_some());
+        let mut sent = None;
+        while let Ok(request) = controller.requests.try_recv() {
+            sent = Some(request.action);
+        }
+        assert_eq!(sent, Some(queued));
     }
 
     #[tokio::test]

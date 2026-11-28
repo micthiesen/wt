@@ -161,7 +161,9 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
             let context = context.clone();
             async move {
                 fn read(store: &mut wt_store::Store) -> anyhow::Result<Metadata> {
-                    Ok((store.read_wt_state()?, store.read_archived_keys()?))
+                    // One snapshot: beside the write queue, a write of this
+                    // process can land between two separate statements.
+                    Ok(store.read_wt_state_and_archived_keys()?)
                 }
                 // On the read connection, so a refresh does not queue behind
                 // a write waiting for another process's lock. It sees every

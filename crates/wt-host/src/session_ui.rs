@@ -1,38 +1,13 @@
 //! Host-owned session actions: terminal stop, live session stop and kill.
-//! Pickers are built from the board (`wt_tui::menus::sessions`); the host
-//! answers a picker only for targets the board has no prepared entries for.
+//! Their pickers and confirmations are built from the board
+//! (`wt_tui::menus::sessions`) for local and remote rows alike; the host
+//! compares what a commit says it was shown with tmux as it is now.
 use anyhow::Result;
 use wt_app_core::context::AppContext;
 use wt_tui::{UiAction, UiReply};
 
 pub async fn execute(context: &AppContext, action: UiAction) -> Result<UiReply> {
     match action {
-        // The board answers running local terminals; the host reads tmux for
-        // retained dead panes, remote rows and boards without inventory yet.
-        UiAction::PrepareStopTerminal { key, target } => {
-            let (tmux, name, label) = terminal_target(context, &key, target).await?;
-            let Some(session) = tmux
-                .list_sessions(&context.cancellation)
-                .await?
-                .into_iter()
-                .find(|session| session.name == name)
-            else {
-                return Ok(UiReply {
-                    message: format!("No {label} session is running"),
-                    ..Default::default()
-                });
-            };
-            Ok(UiReply {
-                modal: Some(wt_tui::stop_terminal_confirm(
-                    &key,
-                    target,
-                    &name,
-                    &session.id,
-                    session.created_at,
-                )),
-                ..Default::default()
-            })
-        }
         UiAction::StopTerminal {
             key,
             target,

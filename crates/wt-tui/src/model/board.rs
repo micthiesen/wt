@@ -86,10 +86,18 @@ pub struct Board {
     /// Entries only nominate choices; attachment revalidates live identity.
     #[serde(default)]
     pub session_menus: std::collections::BTreeMap<String, Vec<SessionMenuEntry>>,
-    /// Live shell and diff terminals keyed by row key, with the tmux identity
-    /// a stop request must match.
+    /// Shell and diff terminals keyed by row key, with the tmux identity a
+    /// stop request must match. A row its host's inventory covers has an
+    /// entry even with no terminal, so a missing one means not read yet.
     #[serde(default)]
     pub terminals: std::collections::BTreeMap<String, Vec<TerminalSlotView>>,
+    /// Who can review a pull request here: this host's last read of the
+    /// repository's contributors. `None` until one has been read.
+    #[serde(default)]
+    pub reviewers: Option<ReviewerPool>,
+    /// Each remote host's reviewer pool, keyed by `BoardRow::host`.
+    #[serde(default)]
+    pub host_reviewers: std::collections::BTreeMap<String, ReviewerPool>,
     /// What this host's action source publishes for its palettes: recent
     /// argument values, active runs and unavailable slots.
     #[serde(default)]
@@ -127,13 +135,44 @@ pub struct SessionMenuEntry {
     pub last_active_ms: Option<i64>,
 }
 
-/// A live shell or diff terminal and its exact tmux identity.
+/// A shell or diff terminal and its exact tmux identity.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalSlotView {
     pub target: crate::SessionTarget,
     pub name: String,
     pub id: String,
     pub created_at: i64,
+    /// Its process has exited and tmux keeps the pane for inspection.
+    #[serde(default)]
+    pub retained: bool,
+}
+
+/// The people a reviewer picker offers besides those a pull request names:
+/// the repository's recent contributors, read about once a day.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ReviewerPool {
+    /// The signed-in GitHub login, which is never offered as a reviewer.
+    pub viewer: String,
+    pub contributors: Vec<ContributorView>,
+    /// When GitHub was read (epoch ms).
+    pub fetched_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ContributorView {
+    pub login: String,
+    pub contributions: u64,
+}
+
+/// Someone GitHub suggests as a reviewer of one pull request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SuggestedReviewerView {
+    pub login: String,
+    pub author: bool,
+    pub commenter: bool,
 }
 
 /// One prepared perf sample. CPU values are `ps` percentages (100 per core);
@@ -924,11 +963,16 @@ pub struct PrPresentation {
     pub failed_checks: Vec<String>,
     pub review: ReviewState,
     pub reviewers: Vec<String>,
+    /// The reviewers GitHub suggests for this pull request.
+    pub suggested_reviewers: Vec<SuggestedReviewerView>,
     pub review_bot: Option<ReviewBotView>,
     pub unresolved_threads: u32,
     /// GitHub has more threads than were read, so the count is a lower bound.
     pub unresolved_threads_more: bool,
     pub merge_queue: Option<MergeQueueView>,
+    /// Why GitHub took the pull request out of the merge queue after wt
+    /// armed its merge, while nothing holds the merge now.
+    pub queue_removal: Option<String>,
     pub auto_merge_armed: bool,
     pub comments: Vec<PrCommentView>,
     pub error: Option<String>,
@@ -1252,6 +1296,11 @@ pub struct BoardRow {
     /// in it.
     #[serde(default)]
     pub stack_parent: Option<String>,
+    /// The row's place in its stack as the board draws it: a parent before
+    /// what is stacked on it. Rows of one stack drawn together are in this
+    /// order.
+    #[serde(default)]
+    pub stack_index: usize,
     #[serde(default)]
     pub title_source: TitleSource,
     #[serde(default)]

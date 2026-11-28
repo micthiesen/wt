@@ -47,6 +47,20 @@ pub struct ReviewerPrompt {
     pub selected: usize,
 }
 
+/// The overlay of content its host is still fetching. It is on screen from
+/// the keypress, so the keys are its own while it loads.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LoadingPrompt {
+    pub title: String,
+    /// The extra key that closes the filled overlay closes this one too.
+    pub close_key: Option<char>,
+    /// The request that fetches the content, as the key asked for it.
+    pub(crate) action: UiAction,
+    /// That request's id once the terminal has sent it.
+    pub(crate) request: Option<u64>,
+    pub(crate) started: tokio::time::Instant,
+}
+
 /// The open history modal (`H`). `key` names the row; its lines are rebuilt
 /// from the board on every draw.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -78,6 +92,7 @@ pub enum Interaction {
     },
     Reviewers(ReviewerPrompt),
     Timeline(TimelinePrompt),
+    Loading(LoadingPrompt),
 }
 
 impl Model {
@@ -91,6 +106,12 @@ impl Model {
         let code = key.code;
         match &mut interaction {
             Interaction::None => InputResult::Unchanged,
+            // Its keys are handled before any other dispatch; see
+            // `Model::loading_input`.
+            Interaction::Loading(_) => {
+                self.interaction = interaction;
+                InputResult::Unchanged
+            }
             Interaction::Reviewers(picker) => {
                 if matches!(code, KeyCode::Esc | KeyCode::Char('q'))
                     || (control && code == KeyCode::Char('c'))
@@ -526,6 +547,7 @@ impl Model {
                     && picker_move(code, &mut picker.selected, picker.options.len())
                 {
                     self.interaction = interaction;
+                    self.palette_moved();
                     return InputResult::Draw;
                 }
                 if code == KeyCode::Esc

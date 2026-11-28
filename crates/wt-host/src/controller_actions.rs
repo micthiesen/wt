@@ -167,13 +167,13 @@ pub async fn execute_with_shutdown(
         | UiAction::PrepareHardRefresh
         | UiAction::PrepareReviewCheckout { .. }
         | UiAction::PrepareRestoreRemoved { .. }
-        | UiAction::PrepareHarnesses { .. } => {
+        | UiAction::PrepareHarnesses { .. }
+        | UiAction::PrepareCreate { .. }
+        | UiAction::PrepareSessions { .. }
+        | UiAction::PrepareStopTerminal { .. }
+        | UiAction::PrepareReviewers { .. }
+        | UiAction::PrepareGithub { .. } => {
             bail!("this menu is built from the board and never asks the host")
-        }
-        // Answered by the host service, from the board's own entries when they
-        // exist and from its discovery snapshot otherwise.
-        UiAction::PrepareSessions { .. } => {
-            bail!("session pickers are answered by the host service")
         }
         // Queued by the host service before dispatch; it never produces a reply.
         UiAction::DiscoverSessions { .. } => {
@@ -182,7 +182,6 @@ pub async fn execute_with_shutdown(
         UiAction::HardRefresh
         | UiAction::ReviewCheckout { .. }
         | UiAction::DismissReviewRequest { .. }
-        | UiAction::PrepareReviewers { .. }
         | UiAction::SubmitReviewers { .. }
         | UiAction::SetPerf { .. }
         | UiAction::SetHistoryActive { .. }
@@ -219,8 +218,7 @@ pub async fn execute_with_shutdown(
             wt_app_core::editor::open(ctx, &path).await?;
             Ok(message(format!("Opened {}", path.display())))
         }
-        action @ (UiAction::PrepareStopTerminal { .. }
-        | UiAction::StopTerminal { .. }
+        action @ (UiAction::StopTerminal { .. }
         | UiAction::StopSession { .. }
         | UiAction::KillSession { .. }) => crate::session_ui::execute(ctx, action).await,
         UiAction::SelectSession { .. }
@@ -300,11 +298,6 @@ pub async fn execute_with_shutdown(
         }
         UiAction::OnHost { .. } => bail!("host routing must be resolved before local dispatch"),
         UiAction::ManagedSignIn { .. } => bail!("sign-in belongs to a managed remote host"),
-        // Ctrl+N builds its host picker and name prompt from the board. This
-        // arm answers only a host the user already chose, with the same prompt.
-        UiAction::PrepareCreate { initial, placement } => {
-            Ok(modal(wt_tui::new_worktree_prompt(&initial, placement)))
-        }
         UiAction::KillAction { action_key, run_id } => {
             let killed = wt_app_core::actions::service(ctx)?
                 .kill_run(&action_key, &run_id, &ctx.cancellation)
@@ -316,7 +309,6 @@ pub async fn execute_with_shutdown(
             }))
         }
         UiAction::PrepareActions { .. }
-        | UiAction::PrepareGithub { .. }
         | UiAction::GithubMarkReady { .. }
         | UiAction::GithubSetAutoMerge { .. }
         | UiAction::GithubShip { .. }
@@ -574,42 +566,6 @@ pub async fn execute_with_shutdown(
                     ..Default::default()
                 }),
             }
-        }
-        UiAction::PrepareCleanup => {
-            let rows = ctx.repository.inventory(&ctx.cancellation).await?;
-            let plans = lifecycle_ops::plan_cached(ctx, rows, github).await?;
-            let mut revisions = Vec::new();
-            let mut lines = Vec::new();
-            for plan in plans.rows {
-                if !plan.landed {
-                    continue;
-                }
-                if plan.hazards.is_empty() {
-                    revisions.push(ui_revision(&plan.revision));
-                    lines.push(format!("Remove {}", plan.row.target.slug()));
-                } else {
-                    lines.push(format!(
-                        "Keep {}: {}",
-                        plan.row.target.slug(),
-                        plan.hazards.join(", ")
-                    ));
-                }
-            }
-            if let Some(warning) = plans.warning {
-                lines.push(warning);
-            }
-            if revisions.is_empty() {
-                return Ok(message(format!(
-                    "Nothing is ready to clean. {}",
-                    lines.join("; ")
-                )));
-            }
-            Ok(modal(UiModal::Confirm {
-                action: ConfirmAction::Cleanup { revisions },
-                title: "Clean landed worktrees?".into(),
-                lines,
-                cancel_key: Some('c'),
-            }))
         }
         UiAction::CleanupTargets { targets } => Ok(message(
             lifecycle_ops::cleanup_targets_cached(ctx, &targets, github).await?,
@@ -1049,9 +1005,10 @@ async fn set_status(
     let utc_offset_minutes =
         wt_app_core::display_time::local_utc_offset_minutes(wt_app_core::feeds::epoch_ms())
             .unwrap_or(0);
-    let displaced = ctx
+    let (displaced, started) = ctx
         .database
         .call(move |store| {
+            let mut started = None;
             // The compare and the carry-over read the record under the
             // write's own transaction: `wt status` in another process can
             // otherwise land between them and be overwritten.
@@ -1110,19 +1067,26 @@ async fn set_status(
                         }
                     });
                     wt_ops::status_checks::assert_checks(&mut next, before.as_ref(), edit);
-                    // The menu neither shows nor edits the merge gate, so a
-                    // status picked here keeps it, as `wt status` does.
+                    // The menu neither shows nor edits a gate, so a status
+                    // picked here keeps a merge gate and, by starting the
+                    // work, clears one asserted on todo: as `wt status` does.
                     wt_ops::status_checks::assert_gate(&mut next, before.as_ref(), None);
+                    started = wt_ops::status_checks::start_gate_notice(before.as_ref(), &next);
                     let stored = serde_json::to_value(&next)
                         .and_then(serde_json::from_value::<wt_store::WorkStatusRecord>)
                         .context("encode status record")?;
                     Ok(Some(stored))
                 })??;
-            Ok(write.displaced)
+            Ok((write.displaced, started))
         })
         .await?;
+    // Said like a kept check: nothing the pick changed goes unseen.
+    let updated = match started {
+        Some(notice) => format!("Work status updated; {notice}"),
+        None => "Work status updated".to_owned(),
+    };
     if displaced.is_empty() {
-        return Ok(message("Work status updated"));
+        return Ok(message(updated));
     }
     let kept = displaced
         .iter()
@@ -1136,7 +1100,7 @@ async fn set_status(
         })
         .collect::<Vec<_>>()
         .join("; ");
-    Ok(message(format!("Work status updated; {kept}")))
+    Ok(message(format!("{updated}; {kept}")))
 }
 
 async fn set_base(
@@ -1295,6 +1259,66 @@ mod tests {
         assert_eq!(check["steps"], "open the page twice");
         assert_eq!(check["forPr"], 7);
         assert!(state["watches"].as_array().is_none_or(Vec::is_empty));
+    }
+
+    /// A pick in the menu starts work a gate on todo held back, and says
+    /// so; a merge gate parked on todo is kept through the same picks.
+    #[tokio::test]
+    async fn a_pick_clears_a_start_gate_with_a_notice_and_keeps_a_merge_gate() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let row = wt_ops::commands::resolve::resolve_named_worktree(ctx, "one")
+            .await
+            .unwrap();
+        let key = wt_core::worktree_target_key(&row.target);
+        let gated = |state: wt_core::WorkState, gate: &'static str| {
+            ctx.database.call(move |store| {
+                let mut record = wt_core::WorkStatusRecord::new(state, "2026-11-27T12:00:00Z");
+                wt_ops::status_checks::assert_gate(&mut record, None, Some(gate.into()));
+                let stored: wt_store::WorkStatusRecord =
+                    serde_json::from_value(serde_json::to_value(&record)?)?;
+                store.set_slug_work_status("one", Some(&stored))?;
+                Ok(())
+            })
+        };
+        let key = &key;
+        let pick = |state: &'static str| async move {
+            set_status(
+                ctx,
+                None,
+                key,
+                status(Some(state.into()), None, None, None, None),
+            )
+            .await
+            .unwrap()
+            .message
+        };
+        let gate = || async {
+            ctx.database
+                .call(|store| Ok(store.read_wt_state()?))
+                .await
+                .unwrap()["slugs"]["one"]["work"]["blockedOn"]
+                .as_str()
+                .map(str::to_owned)
+        };
+        gated(wt_core::WorkState::Todo, "secrets land")
+            .await
+            .unwrap();
+        assert_eq!(
+            pick("working").await,
+            "Work status updated; start gate cleared (was: secrets land)"
+        );
+        assert_eq!(gate().await, None);
+
+        gated(wt_core::WorkState::Ready, "the release")
+            .await
+            .unwrap();
+        for state in ["todo", "working", "ready"] {
+            assert_eq!(pick(state).await, "Work status updated", "{state}");
+            assert_eq!(gate().await.as_deref(), Some("the release"), "{state}");
+        }
     }
 
     #[tokio::test]

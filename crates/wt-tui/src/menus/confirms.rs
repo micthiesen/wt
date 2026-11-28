@@ -75,20 +75,14 @@ pub(super) fn review_checkout(
 }
 
 /// `Ctrl+N`: choose a host when remote hosts are configured, then name the
-/// worktree. The host list is the board's own, so the choice is local; the
-/// chosen host answers the name prompt through its controller.
+/// worktree. The host list is the board's own, so the choice is local, and
+/// the name prompt opens for the chosen host without asking it.
 pub(super) fn create(
     board: &Board,
     initial: &str,
     placement: Option<crate::CreatePlacement>,
 ) -> Menu {
-    if board.hosts.is_empty() {
-        // Without the host list the picker cannot be built; the host answers
-        // with the same name prompt.
-        return Menu::Host {
-            reason: "the host list is not prepared yet",
-        };
-    }
+    // A board that lists no other host creates on this one.
     if board.hosts.len() <= 1 {
         return Menu::Local(LocalMenu::modal(new_worktree_prompt(initial, placement)));
     }
@@ -119,7 +113,8 @@ pub(super) fn create(
     }))
 }
 
-/// The name prompt for a new worktree on the host that answers it.
+/// The name prompt for a new worktree. The model names the host it opens
+/// for in the prompt's label.
 pub fn new_worktree_prompt(initial: &str, placement: Option<crate::CreatePlacement>) -> UiModal {
     UiModal::Text {
         action: TextAction::Create { placement },
@@ -240,12 +235,12 @@ mod tests {
 
     #[test]
     fn create_asks_for_a_host_only_when_remotes_exist() {
-        // Empty board: the host answers.
+        // Local only, or a board that lists no host yet: the name prompt
+        // opens directly.
         assert!(matches!(
             create(&Board::default(), "", None),
-            Menu::Host { .. }
+            Menu::Local(LocalMenu::Modal { .. })
         ));
-        // Local only: the name prompt opens directly.
         let local = Board {
             hosts: vec![HostChoice {
                 id: None,
@@ -267,8 +262,8 @@ mod tests {
                 allow_empty: false,
             }
         );
-        // With remotes: the picker offers the same choices the host listed,
-        // and carries the name so the chosen host opens the same prompt.
+        // With remotes: the picker offers the board's hosts and carries the
+        // name, so the prompt for the chosen host opens with it.
         let remote = Board {
             hosts: vec![
                 HostChoice {
@@ -322,5 +317,38 @@ mod tests {
                 }),
             }
         );
+    }
+
+    #[test]
+    fn a_chosen_hosts_prompt_opens_without_asking_it() {
+        let placement = Some(crate::CreatePlacement {
+            section: Some("Review".into()),
+            after: None,
+        });
+        for host in [None, Some("ssh:box".to_owned())] {
+            let action = UiAction::OnHost {
+                host: host.clone(),
+                action: Box::new(UiAction::PrepareCreate {
+                    initial: "--base feature/one".into(),
+                    placement: placement.clone(),
+                }),
+            };
+            // Any board answers, including one that lists no hosts.
+            let Menu::Local(LocalMenu::Modal {
+                modal,
+                host: captured,
+                ..
+            }) = action.menu(&Board::default())
+            else {
+                panic!("expected the name prompt");
+            };
+            assert!(action.is_board_menu());
+            // Its commit is routed to the host it was opened for.
+            assert_eq!(captured, host);
+            assert_eq!(
+                *modal,
+                new_worktree_prompt("--base feature/one", placement.clone())
+            );
+        }
     }
 }

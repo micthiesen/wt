@@ -861,10 +861,11 @@ impl AutomationEngine {
             .into_iter()
             .map(|intent| (fire_identity(&intent.fire), intent))
             .collect();
-        // A watch fire comes from its watch on every pass. One that no
-        // longer does (cancelled, or held by a paused worktree) starts over
-        // when it returns, so its stored deferral would only be restored at
-        // each start and never cleared.
+        // A fire whose intent this pass no longer holds starts over if it
+        // returns: a watch that was cancelled or is held by a paused
+        // worktree, a prompt whose session could not be reached and whose
+        // worktree is now gone or whose condition cleared. Its stored
+        // deferral would only be restored at each start and never cleared.
         // A failed run's retry is dropped with its intent the same way
         // (its condition cleared, or a guard skipped it).
         let retries = self
@@ -874,7 +875,6 @@ impl AutomationEngine {
             .map(|(id, _)| id.clone());
         let stale = existing
             .iter()
-            .filter(|intent| intent.fire.watch.is_some())
             .map(|intent| fire_identity(&intent.fire))
             .chain(retries)
             .collect::<BTreeSet<_>>()
@@ -3590,6 +3590,77 @@ mod tests {
         let wake = tick.claims[0].fire().watch.clone().unwrap();
         assert_eq!(wake.action, WatchAction::Wake);
         assert_eq!(wake.cleared_gate.as_deref(), Some("the release"));
+    }
+
+    /// A rule's prompt whose session cannot be started costs one attempt per
+    /// backoff step, not one per pass, is never recorded as handled, and
+    /// ends when its worktree does.
+    #[tokio::test]
+    async fn an_undeliverable_session_prompt_is_tried_once_per_backoff_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [rule("tell-session", 0.0)];
+        let rows = [row()];
+        let mut context = AutomationEvalContext::default();
+        context.actions.insert(
+            "tell-session".into(),
+            wt_automations::ActionTraits {
+                audience: wt_automations::ActionAudience::Session,
+                ..Default::default()
+            },
+        );
+        let identity = evaluate(&rules, &rows, &context)
+            .iter()
+            .map(fire_identity)
+            .next()
+            .unwrap();
+        let requirements = BTreeMap::from([(identity, RequirementState::Ready)]);
+        let (quiescence, activity) = (BTreeMap::new(), RuntimeActivity::default());
+        let start = now_ms();
+        let pass = |rows, now| {
+            input(
+                &rules,
+                rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                now,
+            )
+        };
+        let unreachable = || AutomationOutcome::Deferred {
+            reason: "cannot reach its session: its token helper failed".into(),
+            frozen: BTreeMap::new(),
+        };
+
+        // The source passes once a second. Five minutes of passes dispatch
+        // once per backoff step.
+        let mut attempts = 0;
+        let mut now = start;
+        while now < start + 5 * 60 * 1000 {
+            let tick = engine.tick(pass(&rows, now)).await.unwrap();
+            for claim in &tick.claims {
+                attempts += 1;
+                engine.finish(claim, unreachable(), now).await.unwrap();
+            }
+            now += 1_000;
+        }
+        let steps = (5 * 60 * 1000 / DEFER_RETRY_MS) as usize;
+        assert!((2..=steps + 1).contains(&attempts), "{attempts} attempts");
+        assert!(
+            engine.queued()[0]
+                .waiting_for
+                .contains("its token helper failed")
+        );
+        assert_eq!(engine.queued().len(), 1);
+        assert_eq!(ledger.deferred().await.unwrap().len(), 1);
+
+        // Its worktree removed, nobody is left to hear it.
+        let gone = engine.tick(pass(&[], now + DEFER_RETRY_MS)).await.unwrap();
+        assert!(gone.claims.is_empty());
+        assert_eq!(engine.pending_count(), 0);
+        assert!(ledger.deferred().await.unwrap().is_empty());
     }
 
     /// A session that cannot be reached is tried again on the deferral

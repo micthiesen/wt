@@ -392,6 +392,7 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             row.stack_lane = lane;
             row.split_parent_section = split;
             row.stack_parent = parent;
+            row.stack_index = node_of(index).map_or(0, |entry| entry.node.index);
             row.stack_prefix = spine
                 .get(&row.key)
                 .map(|cell| {

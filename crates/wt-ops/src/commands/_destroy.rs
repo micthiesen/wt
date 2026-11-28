@@ -1586,4 +1586,103 @@ mod tests {
         assert!(retry, "the worktree can be removed again");
         fixture.close().await.unwrap();
     }
+
+    /// A first attempt records what its caller saw: an archived row is
+    /// drawn under Archived and a landed one as landed. Only a retry takes
+    /// the earlier record's word over the caller's.
+    #[tokio::test]
+    async fn a_first_removal_attempt_records_where_the_row_was_and_a_retry_keeps_it() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let record = |key: &'static str| {
+            let database = ctx.database.clone();
+            async move {
+                database
+                    .call(|store| Ok(store.read_wt_state()?))
+                    .await
+                    .unwrap()["removals"][key]
+                    .clone()
+            }
+        };
+        ctx.database
+            .call(|store| {
+                // "one" was archived and had not landed; "two" the reverse.
+                store.set_archived("one", true)?;
+                assert!(store.begin_removal_of(
+                    "one",
+                    "1-a",
+                    "/one",
+                    "feature/one",
+                    false,
+                    true
+                )?);
+                assert!(store.begin_removal_of(
+                    "two",
+                    "2-b",
+                    "/two",
+                    "feature/two",
+                    true,
+                    false
+                )?);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (one, two) = (record("one").await, record("two").await);
+        assert_eq!(one["wasArchived"], true, "{one}");
+        assert!(one["landed"].is_null(), "{one}");
+        assert_eq!(two["landed"], true, "{two}");
+        assert!(two["wasArchived"].is_null(), "{two}");
+
+        // Both fail. The retries are told the opposite, as a start reading
+        // only today's archive set and a weaker plan would tell them.
+        ctx.database
+            .call(|store| {
+                store.finish_removal("one", "1-a", Some("hook failed"))?;
+                store.finish_removal("two", "2-b", Some("hook failed"))?;
+                store.set_archived("two", true)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            was_archived_before_removal(ctx, "one".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !was_archived_before_removal(ctx, "two".into())
+                .await
+                .unwrap()
+        );
+        ctx.database
+            .call(|store| {
+                assert!(store.begin_removal_of(
+                    "one",
+                    "3-c",
+                    "/one",
+                    "feature/one",
+                    false,
+                    false
+                )?);
+                assert!(store.begin_removal_of(
+                    "two",
+                    "4-d",
+                    "/two",
+                    "feature/two",
+                    false,
+                    true
+                )?);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (one, two) = (record("one").await, record("two").await);
+        assert_eq!(one["jobId"], "3-c");
+        assert_eq!(one["wasArchived"], true, "{one}");
+        assert_eq!(two["jobId"], "4-d");
+        assert_eq!(two["landed"], true, "{two}");
+        assert!(two["wasArchived"].is_null(), "{two}");
+        fixture.close().await.unwrap();
+    }
 }

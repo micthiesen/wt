@@ -246,8 +246,8 @@ fn compose(
         }
     }
     // Prepared picker entries. Built only from a Ready inventory, so an unknown
-    // tmux state never reads as "nothing is running". Absent entries send the
-    // menu to its host, which answers from its own cached discovery.
+    // tmux state never reads as "nothing is running": a row without an entry
+    // is one whose sessions have not been read, and its menus say so.
     board.session_menus.clear();
     board.terminals.clear();
     if inventory_ok && let Some(inventory) = inventory.data() {
@@ -351,8 +351,9 @@ fn compose(
         .with_input(&activity)
 }
 
-/// Live shell and diff terminals of one worktree, with the exact tmux identity
-/// a stop request must match.
+/// Shell and diff terminals of one worktree, with the exact tmux identity a
+/// stop request must match: the running ones, and one whose process exited
+/// and whose pane tmux keeps.
 fn terminal_slots(inventory: &SessionInventory, slug: &str) -> Vec<TerminalSlotView> {
     [
         (SessionTarget::Shell, "shell"),
@@ -361,12 +362,16 @@ fn terminal_slots(inventory: &SessionInventory, slug: &str) -> Vec<TerminalSlotV
     .into_iter()
     .filter_map(|(target, label)| {
         let name = format!("{slug}-{label}");
-        let descriptor = inventory.all.get(&name)?;
+        let (descriptor, retained) = match inventory.all.get(&name) {
+            Some(descriptor) => (descriptor, false),
+            None => (inventory.retained.get(&name)?, true),
+        };
         Some(TerminalSlotView {
             target,
             name,
             id: descriptor.id.clone(),
             created_at: descriptor.created_at,
+            retained,
         })
     })
     .collect()
@@ -825,7 +830,42 @@ mod tests {
         assert_eq!(board.terminals["one"][0].name, "one-shell");
         assert_eq!(board.terminals["one"][0].id, "$3");
         assert_eq!(board.terminals["one"][0].created_at, 7);
+        assert!(!board.terminals["one"][0].retained);
         assert!(!board.terminals.contains_key("remote:one"));
+
+        // A terminal whose process exited is listed with the identity a
+        // stop must match, and a read row with none still has its entry:
+        // that is what tells "none running" from "not read yet".
+        let mut exited = inventory.data().unwrap().as_ref().clone();
+        let shell = exited.all.remove("one-shell").unwrap();
+        exited.retained.insert("one-shell".into(), shell);
+        let result = compose(
+            &mut FailureClock::default(),
+            source.clone(),
+            SourceSnapshot::test_live(Some(exited), SourceState::Ready, Domain::Sessions),
+            discoveries.clone(),
+            SourceSnapshot::default(),
+            &[],
+        );
+        let board = result.data().unwrap();
+        let [terminal] = board.terminals["one"].as_slice() else {
+            panic!("{:?}", board.terminals)
+        };
+        assert!(terminal.retained);
+        assert_eq!((terminal.id.as_str(), terminal.created_at), ("$3", 7));
+        let result = compose(
+            &mut FailureClock::default(),
+            source.clone(),
+            SourceSnapshot::test_live(
+                Some(SessionInventory::default()),
+                SourceState::Ready,
+                Domain::Sessions,
+            ),
+            discoveries.clone(),
+            SourceSnapshot::default(),
+            &[],
+        );
+        assert_eq!(result.data().unwrap().terminals["one"], Vec::new());
 
         // Without a Ready inventory nothing is claimed as prepared or stopped.
         let failed = compose(

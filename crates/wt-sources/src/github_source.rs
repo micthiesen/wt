@@ -488,9 +488,16 @@ impl LaneClock {
                 None => shown.prs.remove(branch),
             };
             match read.merge_queue.get(branch) {
-                Some(entry) => shown.merge_queue.insert(branch.clone(), entry.clone()),
-                None => shown.merge_queue.remove(branch),
-            };
+                Some(entry) => {
+                    shown.merge_queue.insert(branch.clone(), entry.clone());
+                }
+                // Missing from a page that was not the whole queue proves
+                // nothing: the last read of every branch still stands.
+                None if read.merge_queue_complete => {
+                    shown.merge_queue.remove(branch);
+                }
+                None => {}
+            }
             self.read_alone.insert(
                 branch.clone(),
                 (started, rows.get(branch).cloned().unwrap_or_default()),
@@ -1561,6 +1568,46 @@ mod tests {
         };
         assert!(fetched.data.merge_queue.contains_key("a"));
         assert!(!fetched.data.merge_queue.contains_key("b"));
+    }
+
+    /// A branch missing from the queue page its own read saw has left the
+    /// queue only when that page was the whole queue.
+    #[tokio::test(start_paused = true)]
+    async fn a_branch_leaves_the_queue_only_on_a_read_of_the_whole_queue() {
+        use crate::github_actions::tests::pr;
+        let branches = vec!["a".to_owned()];
+        let mut full = GithubData {
+            covered_branches: branches.iter().cloned().collect(),
+            prs: [("a".to_owned(), pr("a"))].into(),
+            ..GithubData::default()
+        };
+        full.merge_queue.insert(
+            "a".into(),
+            wt_github::MergeQueueEntry {
+                head_ref_name: "a".into(),
+                position: 60,
+                state: wt_github::MergeQueueState::Queued,
+                enqueued_at: "2026-10-03T12:00:00Z".into(),
+                estimated_time_to_merge: None,
+            },
+        );
+        let start = Instant::now();
+        let read = |complete: bool| GithubData {
+            prs: [("a".to_owned(), pr("a"))].into(),
+            merge_queue_complete: complete,
+            ..GithubData::default()
+        };
+        let mut clock = LaneClock::default();
+        clock.live_read(start, branches.clone(), &full);
+        let at = start + Duration::from_secs(5);
+        let fetched = clock
+            .branches_read(&branches, &BTreeMap::new(), read(false), at)
+            .unwrap();
+        assert!(fetched.data.merge_queue.contains_key("a"));
+        let fetched = clock
+            .branches_read(&branches, &BTreeMap::new(), read(true), at)
+            .unwrap();
+        assert!(!fetched.data.merge_queue.contains_key("a"));
     }
 
     /// A read of every branch waiting behind the floor is not dropped by a

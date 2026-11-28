@@ -345,34 +345,28 @@ impl Model {
         while let UiAction::OnHost { action, .. } = inner {
             inner = action;
         }
-        let preparation = inner.is_preparation();
         self.earlier_failure = None;
         self.begun.push_back(id);
         if self.begun.len() > super::reply::BEGUN_LIMIT {
             self.begun.pop_front();
         }
         self.last_menu = self.committed_menu.take().map(|menu| (id, menu));
-        let carried = std::mem::take(&mut self.carry_typeahead);
+        // An overlay not yet waiting on a request opened for this one: the
+        // key that opens it produces the request, and one that is not sent
+        // closes it again. An overlay waiting on another request lost it to
+        // this one: replacing the request in flight cancels it, so nothing
+        // would ever fill it.
+        match &mut self.interaction {
+            Interaction::Loading(loading) if loading.request.is_none() => {
+                loading.request = Some(id);
+                loading.action = action.clone();
+            }
+            Interaction::Loading(_) => self.interaction = Interaction::None,
+            _ => {}
+        }
         self.pending_request = Some(super::PendingRequest {
             id,
             generation: self.ui_generation,
-            preparation,
-            // Enter, Space and Tab commit or move inside menus; repeating one
-            // must not cancel the menu it opened. Nor may the first letter of
-            // text typed ahead into a prompt.
-            opener: self.last_key.take().filter(|key| {
-                preparation
-                    && !matches!(inner, UiAction::PrepareCreate { .. })
-                    && !matches!(
-                        key.code,
-                        crossterm::event::KeyCode::Enter
-                            | crossterm::event::KeyCode::Char(' ')
-                            | crossterm::event::KeyCode::Tab
-                    )
-            }),
-            typeahead: if preparation { carried } else { Vec::new() },
-            typeahead_overflow: false,
-            started: tokio::time::Instant::now(),
             action: inner.clone(),
             _cancel_on_drop: None,
         });
@@ -412,7 +406,27 @@ impl Model {
                         && row.host == mutation.target.host
                 })
             });
+        // A refused J or K loses its entry before the board is presented
+        // again, and the row is then no longer where it was shown. Keep the
+        // cursor on it; left on a neighbour there, a held key would move
+        // that row next.
+        let moved = reply
+            .operation_id
+            .and_then(|id| self.pending.mutation(id))
+            .filter(|mutation| {
+                matches!(
+                    mutation.kind,
+                    crate::MutationKind::Layout(
+                        crate::LayoutChange::Pass { .. } | crate::LayoutChange::Cross { .. }
+                    )
+                )
+            })
+            .and_then(|mutation| mutation.target.key.clone())
+            .filter(|key| self.selected_row().is_some_and(|row| row.key == *key));
         if self.finish_pending(reply) {
+            if moved.is_some() {
+                self.pending_selection = moved;
+            }
             self.reproject(tokio::time::Instant::now());
         }
         selected_create

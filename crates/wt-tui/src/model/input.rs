@@ -10,11 +10,6 @@ use crate::{
     LineEditor, PickerAction, SessionTarget, TextAction, UiAction, UrlKind, editor::EditResult,
 };
 
-/// Keys held for a loading menu. Further keys are dropped.
-pub(crate) const TYPEAHEAD_LIMIT: usize = 16;
-/// A menu slower than this drops its typeahead instead of replaying keys
-/// into a menu the user never saw.
-pub(crate) const TYPEAHEAD_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Session entry on a checkout whose removal was accepted.
 pub(crate) const REMOVAL_IN_PROGRESS: &str = "removal is already in progress";
 
@@ -81,58 +76,54 @@ impl Model {
         InputResult::Draw
     }
 
-    /// Keys synthesized from the pointer act where the pointer is. They are
-    /// not typeahead, so a loading menu is abandoned rather than fed.
+    /// Keys synthesized from the pointer act where the pointer is.
     pub(crate) fn pointer_input(&mut self, key: KeyEvent, height: usize) -> InputResult {
-        if self
-            .pending_request
-            .as_ref()
-            .is_some_and(|request| request.preparation)
-        {
-            self.presentation_changed();
-        }
-        self.cancelled_menu = None;
         self.input(key, height)
     }
 
-    pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
-        if let Some(cancelled) = &mut self.cancelled_menu {
-            if cancelled.started.elapsed() <= TYPEAHEAD_TTL {
-                if !std::mem::replace(&mut cancelled.noticed, true) {
-                    self.append_typeahead_notice("keys typed while the menu loaded were dropped");
-                }
-                return InputResult::Draw;
-            }
-            self.cancelled_menu = None;
+    /// Keys while an overlay's content loads belong to the overlay, which
+    /// is on screen: the keys that close a log close it and cancel its
+    /// request, and any other key is taken, so nothing reaches the board
+    /// underneath and nothing is replayed later.
+    fn loading_input(&mut self, key: KeyEvent) -> InputResult {
+        let Interaction::Loading(loading) = &self.interaction else {
+            return InputResult::Unchanged;
+        };
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let close = matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+            || (control && matches!(key.code, KeyCode::Char('c' | 'C')))
+            || loading
+                .close_key
+                .is_some_and(|close| !control && key.code == KeyCode::Char(close));
+        if !close {
+            return InputResult::Unchanged;
         }
-        if let Some(request) = &mut self.pending_request
-            && request.generation == self.ui_generation
-            && request.preparation
+        self.close_loading();
+        InputResult::Draw
+    }
+
+    /// Close the loading overlay and cancel the request behind it. A reply
+    /// already on its way finds an older view and opens nothing.
+    pub(crate) fn close_loading(&mut self) {
+        let Interaction::Loading(loading) = &self.interaction else {
+            return;
+        };
+        if self
+            .pending_request
+            .as_ref()
+            .is_some_and(|request| Some(request.id) == loading.request)
         {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                || request.opener == Some(key)
-                || (key.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(key.code, KeyCode::Char('c' | 'C')))
-            {
-                self.cancelled_menu = Some(super::CancelledMenu {
-                    id: request.id,
-                    started: request.started,
-                    noticed: false,
-                });
-                self.pending_request = None;
-                self.ui_generation = self.ui_generation.wrapping_add(1);
-                return self.notify("menu cancelled");
-            }
-            // Keys typed before the menu opens belong to that menu, never to
-            // the board underneath it. They replay in order when it opens.
-            if request.typeahead.len() < TYPEAHEAD_LIMIT {
-                request.typeahead.push((key, height));
-            } else {
-                request.typeahead_overflow = true;
-            }
-            return InputResult::Draw;
+            self.pending_request = None;
         }
-        self.last_key = Some(key);
+        self.interaction = Interaction::None;
+        self.ui_generation = self.ui_generation.wrapping_add(1);
+        self.toast = None;
+    }
+
+    pub(crate) fn input(&mut self, key: KeyEvent, height: usize) -> InputResult {
+        if matches!(self.interaction, Interaction::Loading(_)) {
+            return self.loading_input(key);
+        }
         let generation = self.ui_generation;
         let toast_before = self.toast.clone();
         self.ui_generation = self.ui_generation.wrapping_add(1);
@@ -156,32 +147,14 @@ impl Model {
             InputResult::Action(action) => self.open_board_menu(action),
             result => result,
         };
-        if let InputResult::Action(action) = &result
-            && let Some(request) = &self.pending_request
-            && request.preparation
-        {
-            let mut inner = action;
-            while let UiAction::OnHost { action, .. } = inner {
-                inner = action;
-            }
-            if *inner == request.action {
-                self.pending_request = None;
-                return self.notify("menu cancelled");
-            }
-        }
         if matches!(result, InputResult::Unchanged) {
             self.ui_generation = generation;
         } else {
             let cancelled = self.pending_request.take();
-            let cancelled_feedback = cancelled.as_ref().and_then(|request| {
-                if request.preparation {
-                    Some("menu cancelled")
-                } else if request.action.is_terminal_handoff() {
-                    Some("session connection cancelled")
-                } else {
-                    None
-                }
-            });
+            let cancelled_feedback = cancelled
+                .as_ref()
+                .filter(|request| request.action.is_terminal_handoff())
+                .map(|_| "session connection cancelled");
             if let Some(message) = cancelled_feedback
                 && matches!(result, InputResult::Draw | InputResult::Refresh)
                 && self.toast == toast_before
@@ -193,10 +166,6 @@ impl Model {
             {
                 self.toast = None;
             }
-        }
-        // Only a request the terminal is about to send has an opener.
-        if !matches!(result, InputResult::Action(_)) {
-            self.last_key = None;
         }
         if !matches!(self.interaction, Interaction::Confirm(_)) {
             self.confirm_settles_at = None;
@@ -222,9 +191,17 @@ impl Model {
     /// The terminal could not queue the request this key produced. Drop what
     /// was staged for it so a later, unrelated request cannot inherit it.
     pub(crate) fn request_not_sent(&mut self) {
-        self.last_key = None;
         self.committed_menu = None;
-        self.carry_typeahead.clear();
+        // Its overlay opened for a request that never left.
+        if matches!(&self.interaction, Interaction::Loading(loading) if loading.request.is_none()) {
+            self.interaction = Interaction::None;
+        }
+    }
+
+    /// What the footer says once a request has been sent: nothing when its
+    /// own overlay already shows that it is loading.
+    pub(crate) fn sent_feedback(&self) -> Option<&'static str> {
+        (!matches!(self.interaction, Interaction::Loading(_))).then_some("working…")
     }
 
     fn input_inner(&mut self, key: KeyEvent, height: usize) -> InputResult {
@@ -989,13 +966,7 @@ impl Model {
     /// presentation requests. Accepted domain mutations remain in Pending.
     pub(crate) fn presentation_changed(&mut self) {
         self.ui_generation = self.ui_generation.wrapping_add(1);
-        if self
-            .pending_request
-            .take()
-            .is_some_and(|request| request.preparation)
-        {
-            self.notify("menu cancelled");
-        }
+        self.pending_request = None;
     }
 
     pub(crate) fn paste(&mut self, text: &str) -> bool {

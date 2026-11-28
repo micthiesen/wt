@@ -25,7 +25,8 @@ pub use migrations::{
 };
 pub use mutations::{
     BaseUpdate, ClearFailedRemoval, LayoutChanged, RemovedSettle, SeenToggle, ShownSection,
-    is_merged_removal, only_checks_left, verification_owed_at_removal, work_status_event,
+    ShownUnit, is_merged_removal, only_checks_left, verification_owed_at_removal,
+    work_status_event,
 };
 pub use owed::{
     CheckTargets, ChecksClosed, DisplacedCheck, OwedClosed, RemovedChecksClosed, WakeCompletion,

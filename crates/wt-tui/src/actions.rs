@@ -239,7 +239,6 @@ pub enum UiAction {
         key: String,
         seen: Seen<FailedRemovalSeen>,
     },
-    PrepareCleanup,
     Cleanup {
         revisions: Vec<RemovalRevision>,
     },
@@ -1010,8 +1009,13 @@ pub struct UiRequest {
     pub cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
+/// How many of the user's requests wait here for the controller, beyond the
+/// ones it has taken. A key whose request finds this full is refused aloud,
+/// so the bound sits above what held-down keys produce while a write stalls.
+const QUEUED_REQUESTS: usize = 64;
+
 pub fn action_channel() -> (UiActions, ActionController) {
-    let (requests, incoming) = mpsc::channel(16);
+    let (requests, incoming) = mpsc::channel(QUEUED_REQUESTS);
     let (background, incoming_background) = mpsc::channel(8);
     #[expect(
         clippy::disallowed_methods,

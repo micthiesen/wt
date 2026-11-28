@@ -1,29 +1,49 @@
 //! `;` session picker, `Shift+F12` harness picker, and `Shift+F10`/`F11`
 //! terminal stop, built from the prepared board.
 //!
-//! The host prepares [`Board::session_menus`] and [`Board::terminals`] from
-//! its discovery snapshot and one tmux inventory. Builders only arrange those
-//! entries. A missing entry means the board has no prepared data for that
-//! target, so the request goes to the owning host.
+//! Each host prepares [`Board::session_menus`] and [`Board::terminals`] from
+//! its discovery snapshot and one tmux inventory, and the fleet board lists
+//! a remote host's under its rows' keys. Builders only arrange those
+//! entries. A row without an entry is one whose host has not read its
+//! sessions yet, which the menu says instead of guessing that none run.
 
-use super::{LocalMenu, Menu};
+use super::{LocalMenu, host_unknown, row_display};
 use crate::{
     Board, ConfirmAction, PickerAction, PickerOption, SessionMenuEntry, SessionMode,
     SessionSelection, SessionTarget, UiAction, UiModal, session_menu_key,
 };
 
+const ROW_GONE: &str = "worktree is no longer on the board";
+
 /// `;`: the resumable conversations and live slots for a worktree or slot,
 /// then one `new` row per visible harness.
-pub(super) fn sessions_menu(board: &Board, key: Option<&str>, target: SessionTarget) -> Menu {
+pub(super) fn sessions_menu(board: &Board, key: Option<&str>, target: SessionTarget) -> LocalMenu {
+    // A worktree's picker belongs to its row; a slot's to this machine.
+    let row = match (target, key) {
+        (SessionTarget::Harness, Some(key)) => {
+            let Some(row) = board.rows.iter().find(|row| row.key == key) else {
+                return LocalMenu::Notice(ROW_GONE.into());
+            };
+            if row.is_main {
+                return LocalMenu::Notice("the main checkout has its own session: press .".into());
+            }
+            Some(row)
+        }
+        _ => None,
+    };
     let menu_key = session_menu_key(key, target);
     let Some(entries) = board.session_menus.get(&menu_key) else {
-        return Menu::Host {
-            reason: "has no prepared session data for this target",
+        return match row {
+            Some(row) => host_unknown(board, row, "session list"),
+            None => LocalMenu::NotYet("session list not loaded yet".into()),
         };
     };
 
-    let harnesses = visible_harnesses(board);
-    Menu::Local(LocalMenu::Modal {
+    let harnesses = match row {
+        Some(row) => row_display(board, row).harnesses.clone(),
+        None => board.display.harnesses.clone(),
+    };
+    LocalMenu::Modal {
         modal: Box::new(session_picker(
             key.map(str::to_owned),
             target,
@@ -37,7 +57,7 @@ pub(super) fn sessions_menu(board: &Board, key: Option<&str>, target: SessionTar
             target,
         })),
         host: None,
-    })
+    }
 }
 
 /// The picker over prepared entries. Entry order is the board's order; each
@@ -136,25 +156,21 @@ pub(crate) fn choice_for_value<'a>(
     choices.iter().find(|choice| session_value(choice) == value)
 }
 
-/// `Shift+F12`: the visible harnesses, cursor on the persisted primary. The
-/// primary is this machine's; a remote row's commit still runs on its host.
-pub(super) fn harness_menu(board: &Board, key: &str) -> Menu {
-    if board.rows.iter().all(|row| row.key != key) {
-        return Menu::Local(LocalMenu::Notice(
-            "worktree is no longer on the board".into(),
-        ));
+/// `Shift+F12`: the harnesses visible on the row's host, cursor on that
+/// host's persisted primary.
+pub(super) fn harness_menu(board: &Board, key: &str) -> LocalMenu {
+    let Some(row) = board.rows.iter().find(|row| row.key == key) else {
+        return LocalMenu::Notice(ROW_GONE.into());
+    };
+    let display = row_display(board, row);
+    if display.harnesses.is_empty() {
+        return LocalMenu::Notice("all agent harnesses are hidden in configuration".into());
     }
-    let visible = visible_harnesses(board);
-    if visible.is_empty() {
-        return Menu::Local(LocalMenu::Notice(
-            "all agent harnesses are hidden in configuration".into(),
-        ));
-    }
-    Menu::Local(LocalMenu::modal(harness_picker(
+    LocalMenu::modal(harness_picker(
         key.to_owned(),
-        &visible,
-        board.display.primary,
-    )))
+        &display.harnesses,
+        display.primary,
+    ))
 }
 
 /// The harness chooser over the visible harnesses, starting on `primary`.
@@ -184,55 +200,38 @@ pub fn harness_picker(
     }
 }
 
-/// `Shift+F10`/`Shift+F11`: confirm stopping the live shell or diff terminal
-/// of a worktree, naming the exact tmux identity the stop must match.
-pub(super) fn stop_terminal_menu(board: &Board, key: &str, target: SessionTarget) -> Menu {
+/// `Shift+F10`/`Shift+F11`: confirm stopping the shell or diff terminal of a
+/// worktree, naming the exact tmux identity the stop must match. A terminal
+/// whose process exited, kept by tmux for inspection, is listed too.
+pub(super) fn stop_terminal_menu(board: &Board, key: &str, target: SessionTarget) -> LocalMenu {
     if !matches!(target, SessionTarget::Shell | SessionTarget::Diff) {
-        return Menu::Local(LocalMenu::Notice(
-            "only shell and diff sessions use terminal stop".into(),
-        ));
+        return LocalMenu::Notice("only shell and diff sessions use terminal stop".into());
     }
-    let row = board.rows.iter().find(|row| row.key == key);
-    if row.is_some_and(|row| row.is_main) {
-        return Menu::Local(LocalMenu::Notice(
-            "terminal stop requires a worktree on this host".into(),
-        ));
-    }
-    // The board lists running local terminals only. A remote row, a terminal
-    // whose pane died but is retained for inspection, and a board tmux has
-    // not answered yet are all read by the owning host.
-    let Some(terminal) = row
-        .filter(|row| row.host.is_none())
-        .and_then(|_| board.terminals.get(key))
-        .and_then(|terminals| terminals.iter().find(|terminal| terminal.target == target))
-    else {
-        return Menu::Host {
-            reason: "reads retained and remote terminals from tmux",
-        };
+    let Some(row) = board.rows.iter().find(|row| row.key == key) else {
+        return LocalMenu::Notice(ROW_GONE.into());
     };
-    Menu::Local(LocalMenu::modal(stop_terminal_confirm(
-        key,
-        target,
-        &terminal.name,
-        &terminal.id,
-        terminal.created_at,
-    )))
+    if row.is_main {
+        return LocalMenu::Notice("terminal stop requires a worktree".into());
+    }
+    let Some(terminals) = board.terminals.get(key) else {
+        return host_unknown(board, row, "terminal list");
+    };
+    match terminals.iter().find(|terminal| terminal.target == target) {
+        Some(terminal) => LocalMenu::modal(stop_terminal_confirm(key, terminal)),
+        None => LocalMenu::Notice(format!("No {} session is running", terminal_label(target))),
+    }
 }
 
-/// The stop confirmation for one exact shell or diff terminal. The board
-/// builder and the owning host both answer with this.
-pub fn stop_terminal_confirm(
-    key: &str,
-    target: SessionTarget,
-    name: &str,
-    session_id: &str,
-    created_at: i64,
-) -> UiModal {
+/// The stop confirmation for one exact shell or diff terminal.
+fn stop_terminal_confirm(key: &str, terminal: &crate::TerminalSlotView) -> UiModal {
+    let target = terminal.target;
     UiModal::Confirm {
         title: format!("Stop {} session?", terminal_label(target)),
         lines: vec![
-            name.to_owned(),
-            if target == SessionTarget::Shell {
+            terminal.name.clone(),
+            if terminal.retained {
+                "Its process has exited; closing it discards the output kept for inspection."
+            } else if target == SessionTarget::Shell {
                 "Processes running in this shell will stop."
             } else {
                 "The diff viewer will restart fresh next time."
@@ -242,8 +241,8 @@ pub fn stop_terminal_confirm(
         action: ConfirmAction::StopTerminal {
             key: key.to_owned(),
             target,
-            session_id: session_id.to_owned(),
-            created_at,
+            session_id: terminal.id.clone(),
+            created_at: terminal.created_at,
         },
         cancel_key: None,
     }
@@ -256,10 +255,6 @@ pub fn terminal_label(target: SessionTarget) -> &'static str {
     } else {
         "shell"
     }
-}
-
-fn visible_harnesses(board: &Board) -> Vec<wt_core::HarnessId> {
-    board.display.harnesses.clone()
 }
 
 /// One resumable session row: the harness, the session name, and the derived
@@ -345,8 +340,23 @@ mod tests {
         }
     }
 
-    fn picker(menu: Menu) -> (UiModal, Option<Box<UiAction>>) {
-        let Menu::Local(LocalMenu::Modal { modal, warm, .. }) = menu else {
+    /// A row of the host `builder` as the fleet board lists it, with that
+    /// host's own policy.
+    fn remote(mut board: Board) -> Board {
+        board.rows[0].host = Some("builder".into());
+        board.host_display.insert(
+            "builder".into(),
+            DisplayPolicy {
+                harnesses: vec![HarnessId::Pi],
+                primary: Some(HarnessId::Pi),
+                ..Default::default()
+            },
+        );
+        board
+    }
+
+    fn picker(menu: LocalMenu) -> (UiModal, Option<Box<UiAction>>) {
+        let LocalMenu::Modal { modal, warm, .. } = menu else {
             panic!("expected a board picker, got {menu:?}")
         };
         (*modal, warm)
@@ -362,31 +372,84 @@ mod tests {
             .collect()
     }
 
+    fn shell(retained: bool) -> TerminalSlotView {
+        TerminalSlotView {
+            target: SessionTarget::Shell,
+            name: "one-shell".into(),
+            id: "$7".into(),
+            created_at: 42,
+            retained,
+        }
+    }
+
     #[test]
-    fn empty_board_answers_locally_and_only_sessions_may_ask_the_host() {
-        let empty = Board::default();
-        // The host serves a picker only when no prepared entries exist.
-        assert!(matches!(
-            UiAction::PrepareSessions {
-                key: Some("one".into()),
-                target: SessionTarget::Harness,
-            }
-            .menu(&empty),
-            Menu::Host { .. }
-        ));
+    fn every_board_is_answered_without_a_host() {
+        let sessions = UiAction::PrepareSessions {
+            key: Some("one".into()),
+            target: SessionTarget::Harness,
+        };
+        let slot = UiAction::PrepareSessions {
+            key: None,
+            target: SessionTarget::Manager,
+        };
         let harnesses = UiAction::PrepareHarnesses { key: "one".into() };
-        assert!(matches!(
-            harnesses.menu(&empty),
-            Menu::Local(LocalMenu::Notice(_))
-        ));
-        assert!(harnesses.is_board_menu());
-        // Retained dead panes and remote rows are only visible to the host.
         let stop = UiAction::PrepareStopTerminal {
             key: "one".into(),
             target: SessionTarget::Shell,
         };
-        assert!(matches!(stop.menu(&empty), Menu::Host { .. }));
-        assert!(!stop.is_board_menu());
+        let empty = Board::default();
+        // A row with nothing prepared: its host has not read tmux yet.
+        let unread = Board {
+            session_menus: Default::default(),
+            ..board(vec![])
+        };
+        for action in [&sessions, &slot, &harnesses, &stop] {
+            assert!(action.is_board_menu(), "{action:?}");
+            for board in [&empty, &unread, &remote(unread.clone())] {
+                assert!(
+                    matches!(action.menu(board), crate::Menu::Local(_)),
+                    "{action:?}"
+                );
+            }
+        }
+        assert_eq!(
+            sessions_menu(&empty, Some("one"), SessionTarget::Harness),
+            LocalMenu::Notice(ROW_GONE.into())
+        );
+        assert_eq!(
+            sessions_menu(&empty, None, SessionTarget::Manager),
+            LocalMenu::NotYet("session list not loaded yet".into())
+        );
+        assert_eq!(
+            sessions_menu(&unread, Some("one"), SessionTarget::Harness),
+            LocalMenu::NotYet("session list not loaded yet".into())
+        );
+        assert_eq!(
+            stop_terminal_menu(&unread, "one", SessionTarget::Shell),
+            LocalMenu::NotYet("terminal list not loaded yet".into())
+        );
+        // A host that cannot be reached is named, not waited for.
+        let mut lost = remote(unread.clone());
+        lost.host_errors
+            .insert("builder".into(), "SSH disconnected".into());
+        assert_eq!(
+            sessions_menu(&lost, Some("one"), SessionTarget::Harness),
+            LocalMenu::Notice("session list unknown: SSH disconnected".into())
+        );
+        assert_eq!(
+            stop_terminal_menu(&lost, "one", SessionTarget::Diff),
+            LocalMenu::Notice("terminal list unknown: SSH disconnected".into())
+        );
+        let mut main = unread;
+        main.rows[0].is_main = true;
+        assert!(matches!(
+            sessions_menu(&main, Some("one"), SessionTarget::Harness),
+            LocalMenu::Notice(_)
+        ));
+        assert!(matches!(
+            stop_terminal_menu(&main, "one", SessionTarget::Shell),
+            LocalMenu::Notice(_)
+        ));
     }
 
     #[test]
@@ -423,6 +486,51 @@ mod tests {
                 key: Some("one".into()),
                 target: SessionTarget::Harness,
             })
+        );
+    }
+
+    #[test]
+    fn a_remote_rows_menus_use_its_hosts_entries_and_harnesses() {
+        let live = entry(HarnessId::Pi, "abc", true, Some("$1"));
+        let board = remote(board(vec![live]));
+        let (modal, warm) = picker(sessions_menu(&board, Some("one"), SessionTarget::Harness));
+        // That host hides every harness but Pi; this machine's list is not
+        // offered for its rows.
+        assert_eq!(values(&modal), vec!["session:pi:abc", "new:pi"]);
+        let UiModal::Picker {
+            action: PickerAction::Sessions { choices },
+            ..
+        } = &modal
+        else {
+            panic!()
+        };
+        // A new session beside the live slot it was shown with.
+        assert_eq!(
+            choices[1].seen_live,
+            Some(crate::Seen(vec!["$1".to_owned()]))
+        );
+        // The background read is routed to the row's host by its key.
+        assert_eq!(
+            warm.as_deref(),
+            Some(&UiAction::DiscoverSessions {
+                key: Some("one".into()),
+                target: SessionTarget::Harness,
+            })
+        );
+        let (modal, _) = picker(harness_menu(&board, "one"));
+        let UiModal::Picker {
+            options, selected, ..
+        } = modal
+        else {
+            panic!()
+        };
+        assert_eq!(selected, 0);
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.value.clone().unwrap())
+                .collect::<Vec<_>>(),
+            ["pi"]
         );
     }
 
@@ -489,16 +597,13 @@ mod tests {
         );
         assert!(matches!(
             sessions_menu(&board, None, SessionTarget::Dotfiles),
-            Menu::Host { .. }
+            LocalMenu::NotYet(_)
         ));
     }
 
     #[test]
     fn harness_picker_starts_on_the_persisted_primary() {
-        let (modal, _) = match harness_menu(&board(vec![]), "one") {
-            Menu::Local(LocalMenu::Modal { modal, warm, .. }) => (*modal, warm),
-            other => panic!("{other:?}"),
-        };
+        let (modal, _) = picker(harness_menu(&board(vec![]), "one"));
         let UiModal::Picker {
             action,
             options,
@@ -519,10 +624,11 @@ mod tests {
         );
         assert_eq!(
             harness_menu(&Board::default(), "one"),
-            Menu::Local(LocalMenu::Notice(
-                "worktree is no longer on the board".into()
-            ))
+            LocalMenu::Notice(ROW_GONE.into())
         );
+        let mut hidden = board(vec![]);
+        hidden.display.harnesses.clear();
+        assert!(matches!(harness_menu(&hidden, "one"), LocalMenu::Notice(_)));
     }
 
     #[test]
@@ -548,58 +654,50 @@ mod tests {
     #[test]
     fn stop_terminal_confirms_the_exact_slot_or_reports_none() {
         let mut board = board(vec![]);
-        board.terminals.insert(
-            "one".into(),
-            vec![TerminalSlotView {
-                target: SessionTarget::Shell,
-                name: "one-shell".into(),
-                id: "$7".into(),
-                created_at: 42,
-            }],
-        );
-        let Menu::Local(LocalMenu::Modal { modal, .. }) =
-            stop_terminal_menu(&board, "one", SessionTarget::Shell)
-        else {
-            panic!()
+        board.terminals.insert("one".into(), vec![shell(false)]);
+        let confirm = |board: &Board| {
+            let LocalMenu::Modal { modal, .. } =
+                stop_terminal_menu(board, "one", SessionTarget::Shell)
+            else {
+                panic!()
+            };
+            let UiModal::Confirm {
+                title,
+                lines,
+                action,
+                ..
+            } = *modal
+            else {
+                panic!()
+            };
+            (title, lines, action)
         };
-        let UiModal::Confirm {
-            title,
-            lines,
-            action,
-            ..
-        } = *modal
-        else {
-            panic!()
-        };
+        let (title, lines, action) = confirm(&board);
         assert_eq!(title, "Stop shell session?");
         assert_eq!(lines[0], "one-shell");
+        assert_eq!(lines[1], "Processes running in this shell will stop.");
+        let stop = ConfirmAction::StopTerminal {
+            key: "one".into(),
+            target: SessionTarget::Shell,
+            session_id: "$7".into(),
+            created_at: 42,
+        };
+        assert_eq!(action, stop);
+        // A remote row confirms the identity its own host listed.
+        assert_eq!(confirm(&remote(board.clone())).2, stop);
+        // A pane kept after its process exited stops by the same identity.
+        board.terminals.insert("one".into(), vec![shell(true)]);
+        let (_, lines, action) = confirm(&board);
+        assert!(lines[1].starts_with("Its process has exited"), "{lines:?}");
+        assert_eq!(action, stop);
+        // The inventory was read and holds no such terminal.
         assert_eq!(
-            action,
-            ConfirmAction::StopTerminal {
-                key: "one".into(),
-                target: SessionTarget::Shell,
-                session_id: "$7".into(),
-                created_at: 42,
-            }
-        );
-        // No running terminal, an unknown row, or no inventory yet: the host
-        // reads tmux, which also sees panes retained after their process died.
-        for menu in [
             stop_terminal_menu(&board, "one", SessionTarget::Diff),
-            stop_terminal_menu(&Board::default(), "one", SessionTarget::Shell),
-        ] {
-            assert!(matches!(menu, Menu::Host { .. }), "{menu:?}");
-        }
-        let mut remote = board.clone();
-        remote.rows[0].host = Some("builder".into());
-        assert!(matches!(
-            stop_terminal_menu(&remote, "one", SessionTarget::Shell),
-            Menu::Host { .. }
-        ));
-        board.terminals.clear();
-        assert!(matches!(
-            stop_terminal_menu(&board, "one", SessionTarget::Shell),
-            Menu::Host { .. }
-        ));
+            LocalMenu::Notice("No diff session is running".into())
+        );
+        assert_eq!(
+            stop_terminal_menu(&board, "one", SessionTarget::Harness),
+            LocalMenu::Notice("only shell and diff sessions use terminal stop".into())
+        );
     }
 }

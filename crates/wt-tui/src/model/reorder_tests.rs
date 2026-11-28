@@ -331,6 +331,7 @@ fn a_stack_moves_as_one_unit_and_a_member_filed_elsewhere_moves_alone() {
     for row in &mut stored.rows {
         if row.key == "child" || row.key == "split" {
             row.stack_parent = Some("root".into());
+            row.stack_index = if row.key == "child" { 1 } else { 2 };
         }
     }
     let mut model = Model::default();
@@ -555,4 +556,143 @@ fn a_remote_rows_layout_is_confirmed_by_the_controller_from_the_first_press() {
     assert!(model.pending.is_empty());
     assert_eq!(drawn(&model, "Three"), [remote]);
     assert_nothing_went_wrong(&model);
+}
+
+#[test]
+fn a_refused_crossing_leaves_the_cursor_on_the_row_that_did_not_move() {
+    let stored = board(&[("One", &["a", "b"]), ("Two", &["c", "d"])]);
+    let mut model = Model::default();
+    model.apply(read(stored));
+    model.select(model.row_position("b").unwrap());
+    press(&mut model, 'J', 1);
+    assert_eq!(drawn(&model, "Two"), ["b", "c", "d"]);
+    assert_eq!(selected(&model), "b");
+    // Refused: the row is back in the section it never left, and so is the
+    // cursor. On "c", a held J would have moved that row next.
+    model.reply(UiReply {
+        operation_id: Some(1),
+        ..UiReply::stale("Changed since you looked: b is filed elsewhere now")
+    });
+    assert!(model.pending.is_empty());
+    assert_eq!(drawn(&model, "One"), ["a", "b"]);
+    assert_eq!(selected(&model), "b");
+    // The same for a notice, which answers a press that moved nothing.
+    press(&mut model, 'J', 2);
+    model.reply(UiReply {
+        operation_id: Some(2),
+        notice: true,
+        ..UiReply::no_change("status sort pins this row")
+    });
+    assert_eq!(selected(&model), "b");
+    // A cursor the person moved away meanwhile stays where they put it.
+    press(&mut model, 'J', 3);
+    model.select(model.row_position("d").unwrap());
+    model.reply(UiReply {
+        operation_id: Some(3),
+        ..UiReply::stale("Changed since you looked")
+    });
+    assert_eq!(selected(&model), "d");
+}
+
+#[test]
+fn a_row_still_being_created_does_not_move_its_section() {
+    let mut stored = board(&[("One", &["new"]), ("Two", &["b"])]);
+    stored.rows[1].pending_creation = true;
+    let mut model = Model::default();
+    model.apply(read(stored));
+    model.select(model.row_position("new").unwrap());
+    for key in ['J', 'K'] {
+        assert!(refused(&mut model, key).contains("still being created"));
+    }
+    assert!(model.pending.is_empty());
+    assert_eq!(sections(&model), ["One", "Two"]);
+    assert_eq!(selected(&model), "new");
+}
+
+#[test]
+fn a_stack_that_crosses_twice_from_different_rows_is_one_claim() {
+    let mut stored = board(&[("One", &["child", "root"]), ("Two", &[]), ("Three", &[])]);
+    stored.sections[0].rows.reverse();
+    for row in &mut stored.rows {
+        if row.key == "child" {
+            row.stack_parent = Some("root".into());
+        }
+    }
+    let mut model = Model::default();
+    model.apply(read(stored));
+    assert_eq!(drawn(&model, "One"), ["root", "child"]);
+    model.select(model.row_position("root").unwrap());
+    press(&mut model, 'J', 1);
+    assert_eq!(drawn(&model, "Two"), ["root", "child"]);
+    // From the other row of the stack, before the first crossing settles.
+    model.select(model.row_position("child").unwrap());
+    press(&mut model, 'J', 2);
+    assert_eq!(model.pending.len(), 1);
+    assert_eq!(drawn(&model, "Three"), ["root", "child"]);
+    accepted(&mut model, 1);
+    accepted(&mut model, 2);
+    let mut settled = board(&[("One", &[]), ("Two", &[]), ("Three", &["child", "root"])]);
+    settled.sections[2].rows.reverse();
+    model.apply(read(settled));
+    assert!(model.pending.is_empty());
+    assert_eq!(drawn(&model, "Three"), ["root", "child"]);
+    assert_nothing_went_wrong(&model);
+}
+
+#[test]
+fn under_status_sort_a_crossing_is_shown_where_its_status_is_drawn() {
+    let ranked = |sections: &[(&str, &[&str])]| {
+        let mut board = board(sections);
+        board.display.status_sort = true;
+        for row in &mut board.rows {
+            // The second letter of a key is its status here.
+            row.work_rank = row.key.as_bytes()[1] - b'0';
+            row.work = Some(crate::WorkPresentation {
+                record: Some(wt_core::WorkStatusRecord::new(
+                    wt_core::WorkState::Review,
+                    "2026-10-11T00:00:00Z",
+                )),
+                ..Default::default()
+            });
+        }
+        // Created from the board and not started: drawn behind "y2".
+        if let Some(row) = board.rows.iter_mut().find(|row| row.key == "w9") {
+            row.work = None;
+            row.creation_placement = Some(crate::CreatePlacement {
+                section: Some("Two".into()),
+                after: Some("y2".into()),
+            });
+        }
+        board
+    };
+    let stored = ranked(&[
+        ("One", &["a2"]),
+        ("Two", &["x1", "y2", "w9", "z3"]),
+        ("Three", &["b2"]),
+    ]);
+    // Entering at the top: first of its own status, not first of the section.
+    let mut model = Model::default();
+    model.apply(read(stored.clone()));
+    model.select(model.row_position("a2").unwrap());
+    press(&mut model, 'J', 1);
+    assert_eq!(drawn(&model, "Two"), ["x1", "a2", "y2", "w9", "z3"]);
+    // The next press is resolved from where the row will be drawn.
+    let next = press(&mut model, 'J', 2);
+    assert_eq!(units_seen(&next), ["x1", "a2", "y2", "w9", "z3"]);
+    assert_eq!(drawn(&model, "Two"), ["x1", "y2", "a2", "w9", "z3"]);
+    // Entering at the bottom: last of its status, behind the row that
+    // still follows the last of them from its creation.
+    let mut model = Model::default();
+    model.apply(read(stored.clone()));
+    model.select(model.row_position("b2").unwrap());
+    press(&mut model, 'K', 1);
+    assert_eq!(drawn(&model, "Two"), ["x1", "y2", "w9", "b2", "z3"]);
+    // Manual sort draws by stored order alone: the edge is the edge.
+    let mut manual = stored;
+    manual.display.status_sort = false;
+    let mut model = Model::default();
+    model.apply(read(manual));
+    model.select(model.row_position("a2").unwrap());
+    press(&mut model, 'J', 1);
+    assert_eq!(drawn(&model, "Two"), ["a2", "x1", "y2", "w9", "z3"]);
 }

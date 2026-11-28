@@ -22,8 +22,9 @@ fn board(keys: &[&str]) -> SourceSnapshot<Board> {
 }
 
 fn request_remove(model: &mut Model, id: u64) -> u64 {
-    // Host-picked rows can be absent from this board and still need a host
-    // preparation. Ordinary delete keys now open their menu locally.
+    // A removal asked of a host for a row this board does not list is the
+    // one preparation a host still plans. Delete keys open their menu
+    // locally.
     let action = UiAction::OnHost {
         host: Some("builder".into()),
         action: Box::new(UiAction::PrepareRemove {
@@ -31,7 +32,7 @@ fn request_remove(model: &mut Model, id: u64) -> u64 {
         }),
     };
     model.begin_action(id, &action);
-    model.toast = Some(("loading menu… Esc cancels".into(), ToastTone::Info));
+    model.toast = Some(("working…".into(), ToastTone::Info));
     model.ui_generation
 }
 
@@ -178,18 +179,20 @@ fn failed_preparation_finishes_loading_and_reports_the_error() {
 }
 
 #[test]
-fn abandoning_a_menu_cancels_its_read() {
+fn moving_on_cancels_a_host_read_in_flight() {
     let mut model = Model::default();
     model.apply(board(&["one", "two"]));
     request_remove(&mut model, 7);
     let cancellation = tokio_util::sync::CancellationToken::new();
     model.pending_request.as_mut().unwrap()._cancel_on_drop =
         Some(cancellation.clone().drop_guard());
-    // Navigation typed while the menu loads belongs to the menu.
-    model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+    // A key that changes nothing leaves the read alone.
+    model.input(KeyEvent::from(KeyCode::Null), 20);
     assert!(!cancellation.is_cancelled());
-    assert_eq!(model.selected_row().unwrap().key, "one");
-    model.input(KeyEvent::from(KeyCode::Esc), 20);
+    // Nothing is held back while a host reads: the board keeps the keys,
+    // and acting on it abandons the read.
+    model.input(KeyEvent::from(KeyCode::Char('j')), 20);
+    assert_eq!(model.selected_row().unwrap().key, "two");
     assert!(cancellation.is_cancelled());
     assert!(model.pending_request.is_none());
 }

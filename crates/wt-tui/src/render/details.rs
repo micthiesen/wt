@@ -652,6 +652,17 @@ fn pr_segments(pr: Option<&PrPresentation>, policy: &DisplayPolicy) -> Option<Ve
             ],
         ));
     }
+    // GitHub dropped the merge wt armed and nothing holds it now. The same
+    // words `wt wait` and `wt fleet` give, from the same rule.
+    if let Some(why) = &pr.queue_removal {
+        segments.push(Segment::new(
+            2,
+            vec![
+                glyph_text(glyphs::MERGE_QUEUE, why, theme::WARN),
+                glyph_text(glyphs::MERGE_QUEUE, "removed", theme::WARN),
+            ],
+        ));
+    }
     if pr.is_open() {
         if let Some(checks) = badges::check_badge(pr.checks) {
             let text = if pr.checks == CheckState::Pending {
@@ -2690,6 +2701,43 @@ mod tests {
             ..Default::default()
         });
         assert!(!text(&own_row, &policy, 80).contains(book));
+    }
+
+    #[test]
+    fn a_pull_request_dropped_from_the_merge_queue_says_why_on_its_line() {
+        let why = "removed from the merge queue: merge_conflict";
+        let row = BoardRow {
+            pr: Some(PrPresentation {
+                number: Some(1234),
+                state: Some("OPEN".into()),
+                checks: CheckState::Pass,
+                queue_removal: Some(why.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let line = |row: &BoardRow, width| pr_value(row, &DisplayPolicy::default(), width).concat();
+        let text = |row: &BoardRow, width| {
+            line(row, width)
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        };
+        let wide = line(&row, 100);
+        let said = wide
+            .iter()
+            .find(|span| span.content.contains(why))
+            .expect("the reason is on the PR line");
+        assert_eq!(said.style.fg, Some(theme::WARN));
+        // A narrow pane keeps the fact and drops the reason.
+        let narrow = text(&row, 30);
+        assert!(
+            narrow.contains("removed") && !narrow.contains("merge_conflict"),
+            "{narrow}"
+        );
+        let mut queued = row.clone();
+        queued.pr.as_mut().unwrap().queue_removal = None;
+        assert!(!text(&queued, 100).contains("removed"));
     }
 
     #[test]

@@ -251,6 +251,40 @@ impl Store {
         Ok(keys)
     }
 
+    /// The repository state and the archived keys as of one moment: both
+    /// are read in one deferred transaction, so a write that lands between
+    /// the two statements (from another connection of this process, or
+    /// another process) shows in both or in neither.
+    pub fn read_wt_state_and_archived_keys(
+        &mut self,
+    ) -> Result<(WtState, BTreeSet<String>), StoreError> {
+        self.read_state_and_archived(|| {})
+    }
+
+    /// `between` runs after the state is read and before the keys are.
+    pub(crate) fn read_state_and_archived(
+        &mut self,
+        between: impl FnOnce(),
+    ) -> Result<(WtState, BTreeSet<String>), StoreError> {
+        // A writable store migrates an older payload in a transaction of
+        // its own, which cannot nest in the read below.
+        if !self.read_only {
+            self.read_repository_state_json_migrated()?;
+        }
+        let Some(db) = &self.db else {
+            return Ok((crate::mutations::empty_state(), BTreeSet::new()));
+        };
+        let snapshot = db.unchecked_transaction()?;
+        let state = match self.read_repository_state_json()? {
+            Some(raw) => crate::mutations::normalize_state(serde_json::from_str(&raw)?),
+            None => crate::mutations::empty_state(),
+        };
+        between();
+        let archived = self.read_archived_keys()?;
+        snapshot.commit()?;
+        Ok((state, archived))
+    }
+
     pub fn replace_archived_keys(&mut self, keys: &BTreeSet<String>) -> Result<(), StoreError> {
         let id = self.identity.id.clone();
         let db = self.writable_db()?;

@@ -35,27 +35,24 @@ pub use menus::palette::{
     ActionSeen, ActionState, ActiveRunView, ArgValue, Blocker, CUSTOM_ACTION_ID,
     DEV_LOGS_ACTION_ID, OPEN_EDITOR_ACTION_ID, PrFact, blocker, slot_name,
 };
-pub use menus::sessions::{
-    harness_label, harness_letter, harness_picker, session_picker, session_value,
-    stop_terminal_confirm, terminal_label,
-};
-pub use menus::{LocalMenu, Menu, new_worktree_prompt, session_menu_key};
+pub use menus::sessions::{harness_label, session_value, terminal_label};
+pub use menus::{LoadingOverlay, LocalMenu, Menu, session_menu_key};
 pub use model::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
-    AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
-    GitPresentation, GuideView, HostChoice, Interaction, LANDED_SECTION, LANDED_TITLE, LandingKind,
-    LiveSlotView, LocalStamp, LogView, MergeQueueView, Model, OWED_BLOCK_PREFIX,
-    OWED_SECTIONS_OPTION, OtherPrView, OwedBlock, OwedView, PerfGroupView, PerfProcessView,
-    PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup, RemovalView,
-    RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
-    SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem,
-    WatchActionKind, WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount,
-    WorkStateCount, owed_block_refusal,
+    AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, ContributorView,
+    DiffStat, DisplayPolicy, GitPresentation, GuideView, HostChoice, Interaction, LANDED_SECTION,
+    LANDED_TITLE, LandingKind, LiveSlotView, LocalStamp, LogView, MergeQueueView, Model,
+    OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION, OtherPrView, OwedBlock, OwedView, PerfGroupView,
+    PerfProcessView, PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup,
+    RemovalView, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow,
+    ReviewState, ReviewerPool, SectionRollup, SessionMenuEntry, SessionView, SuggestedReviewerView,
+    TerminalSlotView, TitleSource, UsageItem, WatchActionKind, WatchConditionView, WatchTruth,
+    WatchView, WorkPresentation, WorkRiskCount, WorkStateCount, owed_block_refusal,
 };
 pub use mutations::{
     AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,
     ReorderStep, RowChange, SETTLING_DOMAINS, STATUS_SORT_PINS, UiMutation, plan_reorder,
-    reorder_refusal, unit_rank,
+    reorder_refusal, unit_at_creation_position, unit_rank,
 };
 pub use terminal::{run, run_with_palette_probe};
 #[doc(hidden)]

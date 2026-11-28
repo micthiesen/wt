@@ -127,7 +127,6 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::Copy { .. }
         | UiAction::OpenEditor { .. }
         | UiAction::PrepareRemove { .. }
-        | UiAction::PrepareCleanup
         | UiAction::PrepareStatus { .. }
         | UiAction::PrepareBase { .. }
         | UiAction::PrepareNotify { .. }

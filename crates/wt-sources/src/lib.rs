@@ -24,6 +24,7 @@ pub mod issue_source;
 pub mod local_source;
 pub mod mcp_events;
 pub mod perf_source;
+pub mod pr_facts;
 pub mod review_requests;
 pub mod session_activity;
 pub mod session_board;

@@ -53,7 +53,6 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::PrepareRemove { .. }
         | UiAction::Remove { .. }
         | UiAction::DismissFailedRemoval { .. }
-        | UiAction::PrepareCleanup
         | UiAction::Cleanup { .. }
         | UiAction::CleanupTargets { .. }
         | UiAction::PrepareStatus { .. }
@@ -227,7 +226,6 @@ fn visit_keys(
         | UiAction::ResolveCreation { .. }
         | UiAction::CreateResolved { .. }
         | UiAction::Create { .. }
-        | UiAction::PrepareCleanup
         | UiAction::ManagedSignIn { .. }
         | UiAction::CancelAutomations => {}
     }

@@ -7,9 +7,13 @@
 //! before writing. A mismatch answers with a stale reply; the model reopens
 //! the same menu from the newer board instead of applying the old view.
 //!
+//! Content only a host can fetch (a CI log, a live terminal) is not a menu
+//! of choices: its overlay opens at the keypress with a loading body, owns
+//! the keys, and is filled by the host's reply.
+//!
 //! [`UiAction::menu`] is the single declaration of where each menu comes
 //! from. It has no wildcard arm: a new preparation must choose a board
-//! builder or name the host-only data it needs.
+//! builder or name the host-only content it fetches.
 
 mod base;
 pub(crate) mod notify;
@@ -34,9 +38,20 @@ pub enum Menu {
     NotMenu,
     /// Built from the board without asking the host.
     Local(LocalMenu),
-    /// Needs data only the owning host can read. The model requests it and
-    /// holds typed keys until it opens.
+    /// Content only the owning host can fetch. Its overlay opens at the
+    /// keypress and takes the keys; the request's reply fills it.
+    Overlay(LoadingOverlay),
+    /// A read the owning host makes as a step of another request. No key
+    /// opens one, so nothing waits on it with an empty screen.
     Host { reason: &'static str },
+}
+
+/// The overlay shown while its content is fetched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadingOverlay {
+    pub title: String,
+    /// An extra key that closes it, the one the filled overlay will have.
+    pub close_key: Option<char>,
 }
 
 /// A menu built from the board.
@@ -53,6 +68,9 @@ pub enum LocalMenu {
     },
     /// Nothing to choose from; show this notice instead.
     Notice(String),
+    /// The board cannot answer yet: say so and ask the sources to read
+    /// again, instead of holding the key until a host has waited for them.
+    NotYet(String),
 }
 
 impl LocalMenu {
@@ -79,13 +97,22 @@ impl UiAction {
     pub fn menu(&self, board: &Board) -> Menu {
         use UiAction as A;
         match self {
-            A::OnHost { action, .. } => match action.menu(board) {
-                // A host-picked menu stays host-built; its rows are not on
-                // this board.
-                Menu::Local(_) => Menu::Host {
-                    reason: "the menu was requested for a picked host",
+            // The host is already chosen, so the name prompt opens for it.
+            A::OnHost { host, action } => match &**action {
+                A::PrepareCreate { initial, placement } => Menu::Local(LocalMenu::Modal {
+                    modal: Box::new(new_worktree_prompt(initial, placement.clone())),
+                    warm: None,
+                    host: host.clone(),
+                }),
+                // A row is named by its key, which carries its host; a
+                // request that names another host's rows by their own keys
+                // cannot be answered from this board.
+                action => match action.menu(board) {
+                    Menu::Local(_) => Menu::Host {
+                        reason: "names rows by another host's keys",
+                    },
+                    menu => menu,
                 },
-                menu => menu,
             },
             A::PrepareCreate { initial, placement } => {
                 confirms::create(board, initial, placement.clone())
@@ -95,10 +122,8 @@ impl UiAction {
             },
             A::PrepareHardRefresh => Menu::Local(confirms::hard_refresh()),
             A::PrepareRestoreRemoved { key } => Menu::Local(confirms::restore_removed(board, key)),
-            A::PrepareGithub { key, ship } => github::menu(board, key, *ship),
-            A::PrepareReviewers { .. } => Menu::Host {
-                reason: "lists repository contributors from GitHub",
-            },
+            A::PrepareGithub { key, ship } => Menu::Local(github::menu(board, key, *ship)),
+            A::PrepareReviewers { key } => Menu::Local(github::reviewers(board, key)),
             A::PrepareReviewCheckout {
                 url,
                 updated_at,
@@ -111,30 +136,32 @@ impl UiAction {
                 branch,
                 host.as_deref(),
             )),
-            A::GithubFailedChecks { .. } => Menu::Host {
-                reason: "fetches the failed CI log from GitHub",
-            },
+            // The CI log is fetched from GitHub when the board shows a
+            // failing check.
+            A::GithubFailedChecks { key } => github::failed_checks(board, key),
             A::PrepareActions { surface } => palette::menu(board, surface),
-            A::PrepareDevLogs { .. } => Menu::Host {
-                reason: "captures the dev server's live terminal output",
-            },
+            // The dev server's terminal output is read live from its host.
+            A::PrepareDevLogs { key } => Menu::Overlay(LoadingOverlay {
+                title: match board.rows.iter().find(|row| row.key == *key) {
+                    Some(row) => format!("{} dev logs", row.slug),
+                    None => "dev logs".into(),
+                },
+                close_key: Some('l'),
+            }),
             A::PrepareSection { key } => Menu::Local(section::menu(board, key)),
             A::PrepareDeleteSection { section } => {
                 Menu::Local(section::delete_confirm(board, section))
             }
             A::PrepareRemove { key } => remove::menu(board, key),
-            A::PrepareCleanup => Menu::Host {
-                reason: "plans landing evidence on every host; `c` builds from the board",
-            },
             A::PrepareStatus { key } => Menu::Local(status::menu(board, key)),
             A::PrepareBase { key } => base::menu(board, key),
             A::PrepareNotify { key } => Menu::Local(notify::menu(board, key)),
             A::PrepareSessions { key, target } => {
-                sessions::sessions_menu(board, key.as_deref(), *target)
+                Menu::Local(sessions::sessions_menu(board, key.as_deref(), *target))
             }
-            A::PrepareHarnesses { key } => sessions::harness_menu(board, key),
+            A::PrepareHarnesses { key } => Menu::Local(sessions::harness_menu(board, key)),
             A::PrepareStopTerminal { key, target } => {
-                sessions::stop_terminal_menu(board, key, *target)
+                Menu::Local(sessions::stop_terminal_menu(board, key, *target))
             }
             A::CreateResolved { .. }
             | A::ManagedSignIn { .. }
@@ -191,8 +218,30 @@ impl UiAction {
     }
 
     /// Whether the board answers this request, so a host must never be asked.
+    /// Asked of the empty board: a request a host ever answers says so there.
     pub fn is_board_menu(&self) -> bool {
         matches!(self.menu(&Board::default()), Menu::Local(_))
+    }
+}
+
+/// The display policy of the host a row lives on: a remote row's menus read
+/// its own host's configuration, not this machine's.
+pub(crate) fn row_display<'a>(board: &'a Board, row: &crate::BoardRow) -> &'a crate::DisplayPolicy {
+    row.host
+        .as_ref()
+        .and_then(|host| board.host_display.get(host))
+        .unwrap_or(&board.display)
+}
+
+/// What to say when a remote row's host has not sent what a menu needs.
+pub(crate) fn host_unknown(board: &Board, row: &crate::BoardRow, what: &str) -> LocalMenu {
+    match row
+        .host
+        .as_ref()
+        .and_then(|host| board.host_errors.get(host))
+    {
+        Some(error) => LocalMenu::Notice(format!("{what} unknown: {error}")),
+        None => LocalMenu::NotYet(format!("{what} not loaded yet")),
     }
 }
 
@@ -205,7 +254,10 @@ mod tests {
         // Spot-check the declaration agrees with `is_preparation`.
         for action in [
             UiAction::PrepareHardRefresh,
-            UiAction::PrepareCleanup,
+            UiAction::ResolveCreation {
+                input: "one".into(),
+            },
+            UiAction::GithubFailedChecks { key: "one".into() },
             UiAction::PrepareSessions {
                 key: Some("one".into()),
                 target: SessionTarget::Harness,

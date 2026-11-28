@@ -151,7 +151,7 @@ fn prepare_work(row: &mut BoardRow, separate_production: bool, now_ms: i64) {
     row.work = Some(work);
 }
 
-fn pick_pr<'a>(row: &BoardRow, data: &'a GithubData) -> Option<&'a PullRequest> {
+pub(crate) fn pick_pr<'a>(row: &BoardRow, data: &'a GithubData) -> Option<&'a PullRequest> {
     if wt_core::is_remote_worktree_ledger_key(&row.key) {
         return data.prs.get(&row.branch);
     }
@@ -190,6 +190,15 @@ fn pr_presentation(pr: &PullRequest) -> wt_tui::PrPresentation {
             .iter()
             .map(|login| sanitize_terminal_text(login))
             .collect(),
+        suggested_reviewers: pr
+            .suggested_reviewers
+            .iter()
+            .map(|reviewer| wt_tui::SuggestedReviewerView {
+                login: sanitize_terminal_text(&reviewer.login),
+                author: reviewer.is_author,
+                commenter: reviewer.is_commenter,
+            })
+            .collect(),
         review_bot: pr.review_bot.as_ref().map(|bot| wt_tui::ReviewBotView {
             state: sanitize_terminal_text(&bot.state).to_ascii_lowercase(),
             unresolved: bot.unresolved,
@@ -198,6 +207,8 @@ fn pr_presentation(pr: &PullRequest) -> wt_tui::PrPresentation {
         unresolved_threads: pr.unresolved_threads_total,
         unresolved_threads_more: pr.unresolved_threads_more,
         merge_queue: None,
+        // Needs the stored arming: `pr_facts` fills it in.
+        queue_removal: None,
         auto_merge_armed: pr.auto_merge.is_some(),
         comments: Vec::new(),
         error: None,

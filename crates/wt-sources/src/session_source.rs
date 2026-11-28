@@ -74,6 +74,12 @@ pub struct SessionInventory {
     /// Normalized terminal activity only; not transcript identity or idle proof.
     #[serde(default)]
     pub pane_activity: BTreeMap<String, String>,
+    /// Sessions whose every pane has exited, which tmux keeps so their
+    /// output can be read. Nothing runs in them: they are live for no
+    /// routing or idleness decision, and are listed so a person can close
+    /// one.
+    #[serde(default)]
+    pub retained: BTreeMap<String, SessionDescriptor>,
 }
 
 impl SessionInventory {
@@ -252,12 +258,28 @@ fn running_session_inventory(
         .filter(|pane| !pane.dead)
         .map(|pane| pane.session_name.as_str())
         .collect::<BTreeSet<_>>();
-    let mut inventory = classify_sessions(
-        sessions
-            .into_iter()
-            .filter(|session| live.contains(session.name.as_str()))
-            .collect(),
-    );
+    let (running, exited): (Vec<_>, Vec<_>) = sessions
+        .into_iter()
+        .partition(|session| live.contains(session.name.as_str()));
+    let mut inventory = classify_sessions(running);
+    inventory.retained = exited
+        .into_iter()
+        // A session listed with no pane at all ended between the two reads.
+        .filter(|session| panes.iter().any(|pane| pane.session_name == session.name))
+        .map(|session| {
+            (
+                session.name.clone(),
+                SessionDescriptor {
+                    name: session.name,
+                    id: session.id,
+                    created_at: session.created_at,
+                    attached_clients: session.attached_clients,
+                    window_count: session.window_count,
+                    harness_session_id: session.harness_session_id,
+                },
+            )
+        })
+        .collect();
     for name in inventory.all.keys() {
         let mut candidates = panes
             .iter()
@@ -1024,6 +1046,47 @@ mod tests {
         );
         assert!(retried.kinds.codex.contains("branch"));
         assert_eq!(retried.harness_session_ids["branch-codex"], "new");
+    }
+
+    /// A shell whose process exited is kept by tmux for reading. It runs
+    /// nothing, so it is live for no decision, but a person can close it
+    /// and has to be shown it for that.
+    #[test]
+    fn an_exited_terminal_is_listed_apart_from_the_running_ones() {
+        let pane = |session: &str, dead: bool| wt_tmux::PaneInfo {
+            title: String::new(),
+            id: format!("%{session}"),
+            session_name: session.into(),
+            window_id: "@1".into(),
+            window_index: 0,
+            index: 0,
+            active: true,
+            pid: Some(42),
+            current_path: "/tmp/branch".into(),
+            width: 80,
+            height: 24,
+            dead,
+        };
+        let inventory = running_session_inventory(
+            vec![
+                session("branch-shell", None),
+                session("branch-diff", None),
+                // Listed, then gone before its panes were read.
+                session("branch-codex", None),
+            ],
+            &[pane("branch-shell", true), pane("branch-diff", false)],
+        );
+        assert_eq!(
+            inventory.all.keys().collect::<Vec<_>>(),
+            ["branch-diff"],
+            "an exited pane counted as running"
+        );
+        assert!(inventory.kinds.shell.is_empty());
+        assert_eq!(
+            inventory.retained.keys().collect::<Vec<_>>(),
+            ["branch-shell"]
+        );
+        assert_eq!(inventory.retained["branch-shell"].name, "branch-shell");
     }
 
     #[test]

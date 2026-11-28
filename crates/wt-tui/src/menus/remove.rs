@@ -6,8 +6,10 @@ use crate::{Board, ConfirmAction, FailedRemovalSeen, RemovalSeen, Seen, UiModal,
 
 pub(super) fn menu(board: &Board, key: &str) -> Menu {
     let Some(row) = board.rows.iter().find(|row| row.key == key) else {
+        // No key reaches this: `d` names a row the board lists. The owning
+        // host still plans a removal asked of it for a row it alone knows.
         return Menu::Host {
-            reason: "the worktree is not on the board",
+            reason: "plans a checkout this board does not list",
         };
     };
     if row.is_main || row.pending_creation || row.key.starts_with('\0') {

@@ -211,16 +211,36 @@ pub async fn dispatch_automation(
             } else {
                 DeliverySlot::Session
             };
-            match deliver_prompt(
-                context, route_slug, cwd, branch, managed, &text, true, false,
+            prompt_outcome(
+                deliver_prompt(
+                    context, route_slug, cwd, branch, managed, &text, true, false,
+                )
+                .await,
+                slot,
             )
-            .await
-            {
-                PromptDelivery::Delivered => AutomationOutcome::Delivered { slot },
-                PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous { reason, slot },
-                PromptDelivery::Unreachable(_) => AutomationOutcome::NotStarted,
-            }
         }
+    }
+}
+
+/// How an automation's prompt ended, for the engine. A session that could
+/// not be reached defers: nothing was sent, and the engine tries again on
+/// its deferral backoff. Releasing the claim as not started instead would
+/// have the next pass, a second later, cold-start the session again.
+fn prompt_outcome(
+    delivery: PromptDelivery,
+    slot: wt_app_core::automation_engine::DeliverySlot,
+) -> wt_app_core::automation_engine::AutomationOutcome {
+    use wt_app_core::automation_engine::{AutomationOutcome, DeliverySlot};
+    match delivery {
+        PromptDelivery::Delivered => AutomationOutcome::Delivered { slot },
+        PromptDelivery::Ambiguous(reason) => AutomationOutcome::Ambiguous { reason, slot },
+        PromptDelivery::Unreachable(reason) => AutomationOutcome::Deferred {
+            reason: match slot {
+                DeliverySlot::Manager => format!("cannot reach the manager: {reason}"),
+                _ => format!("cannot reach its session: {reason}"),
+            },
+            frozen: Default::default(),
+        },
     }
 }
 
@@ -1179,6 +1199,47 @@ mod tests {
         assert!(!wt_app_core::action_builtins::is_fleet("manager-ask-row"));
         assert!(wt_app_core::action_builtins::is_direct("manager-compact"));
         assert!(!wt_app_core::action_builtins::is_direct("manager-digest"));
+    }
+
+    /// An automation prompt that could not be sent is deferred with its
+    /// reason, never released for the next pass to send again at once and
+    /// never recorded as possibly sent.
+    #[test]
+    fn an_automation_prompt_that_cannot_be_sent_is_deferred_not_released() {
+        use wt_app_core::automation_engine::{AutomationOutcome, DeliverySlot};
+        assert_eq!(
+            prompt_outcome(
+                PromptDelivery::Unreachable("one was left running".into()),
+                DeliverySlot::Session
+            ),
+            AutomationOutcome::Deferred {
+                reason: "cannot reach its session: one was left running".into(),
+                frozen: Default::default(),
+            }
+        );
+        assert!(matches!(
+            prompt_outcome(
+                PromptDelivery::Unreachable("busy".into()),
+                DeliverySlot::Manager
+            ),
+            AutomationOutcome::Deferred { reason, .. } if reason.starts_with("cannot reach the manager")
+        ));
+        assert!(matches!(
+            prompt_outcome(
+                PromptDelivery::Ambiguous("lost".into()),
+                DeliverySlot::Session
+            ),
+            AutomationOutcome::Ambiguous {
+                slot: DeliverySlot::Session,
+                ..
+            }
+        ));
+        assert_eq!(
+            prompt_outcome(PromptDelivery::Delivered, DeliverySlot::Session),
+            AutomationOutcome::Delivered {
+                slot: DeliverySlot::Session
+            }
+        );
     }
 
     #[test]

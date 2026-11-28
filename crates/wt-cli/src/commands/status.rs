@@ -1556,7 +1556,7 @@ fn amend_record(
         next.risk = Some(risk);
     }
     if let Some(blocked) = blocked {
-        next.blocked_on = blocked;
+        wt_ops::status_checks::set_gate(&mut next, blocked);
     }
     let amended = next.clone();
     wt_ops::status_checks::assert_checks(
@@ -2469,10 +2469,49 @@ mod tests {
         );
         let merge_gate = StatusArgs {
             blocked_on: Some("the release".into()),
-            ..ready
+            ..ready.clone()
         };
         assert_eq!(run(ctx, &stated(&["ready"], merge_gate)).await.unwrap(), 0);
         assert_eq!(gate().await, (Some("the release".to_owned()), 0));
+
+        // A merge gate parked on todo and picked up again was never a start
+        // gate: it and the watch that clears it outlive the restart.
+        let watched = StatusArgs {
+            blocked_on: Some("the release".into()),
+            until: vec!["3h".into()],
+            ..ready.clone()
+        };
+        assert_eq!(run(ctx, &stated(&["ready"], watched)).await.unwrap(), 0);
+        let held = (Some("the release".to_owned()), 1);
+        for next in [
+            stated(&["todo"], StatusArgs::default()),
+            stated(&["todo"], StatusArgs::default()),
+            stated(&["working"], StatusArgs::default()),
+            stated(&["ready"], ready.clone()),
+        ] {
+            assert_eq!(run(ctx, &next).await.unwrap(), 0, "{next:?}");
+            assert_eq!(gate().await, held, "{next:?}");
+        }
+        // Set again in place while on todo, it is a start gate from then on.
+        assert_eq!(
+            run(ctx, &stated(&["todo"], StatusArgs::default()))
+                .await
+                .unwrap(),
+            0
+        );
+        let amended = StatusArgs {
+            blocked_on: Some("a decision".into()),
+            ..Default::default()
+        };
+        assert_eq!(run(ctx, &amended).await.unwrap(), 0);
+        assert_eq!(gate().await, (Some("a decision".to_owned()), 0));
+        assert_eq!(
+            run(ctx, &stated(&["working"], StatusArgs::default()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(gate().await, (None, 0));
         fixture.close().await.unwrap();
     }
 

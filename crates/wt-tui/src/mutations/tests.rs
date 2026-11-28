@@ -236,6 +236,7 @@ async fn every_mutation_kind_meets_the_contract() {
         ),
         (
             row(LayoutChange::Cross {
+                unit: "a".into(),
                 rows: vec!["a".into()],
                 to: "Batch".into(),
                 top: true,
@@ -459,7 +460,10 @@ fn every_action_declares_an_effect_and_toggles_use_the_shown_state() {
     };
     assert_eq!(mutation.target.host.as_deref(), Some("box"));
     assert_eq!(mutation.domains(), [Domain::Github]);
-    assert_eq!(UiAction::PrepareCleanup.effect(&shown), Effect::ReadOnly);
+    assert_eq!(
+        UiAction::PrepareRemove { key: "a".into() }.effect(&shown),
+        Effect::ReadOnly
+    );
     assert_eq!(
         UiAction::MoveSection {
             key: "a".into(),

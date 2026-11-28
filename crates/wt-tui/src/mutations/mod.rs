@@ -20,7 +20,8 @@ use crate::{
 pub use effect::Effect;
 pub use github::GithubChange;
 pub use layout::{
-    LayoutChange, ReorderStep, STATUS_SORT_PINS, plan_reorder, reorder_refusal, unit_rank,
+    LayoutChange, ReorderStep, STATUS_SORT_PINS, plan_reorder, reorder_refusal,
+    unit_at_creation_position, unit_rank,
 };
 pub use lifecycle::LifecycleChange;
 pub use row::RowChange;
@@ -108,6 +109,11 @@ trait Family {
     fn pairwise(&self) -> bool {
         false
     }
+    /// The row that identifies the change when that is not the row it
+    /// marks: the cursor can be on any row of a stack that moves as one.
+    fn key_row(&self) -> Option<&str> {
+        None
+    }
     /// The rows the change writes besides its target; their reads confirm
     /// it too.
     fn rows(&self) -> Vec<String> {
@@ -175,6 +181,12 @@ impl Mutation<Board> for UiMutation {
         };
         if self.kind.family().is_some_and(Family::pairwise) {
             return format!("#{field}");
+        }
+        if let Some(row) = self.kind.family().and_then(Family::key_row) {
+            return format!(
+                "{}/{row}#{field}",
+                self.target.host.as_deref().unwrap_or("")
+            );
         }
         format!("{target}#{field}")
     }

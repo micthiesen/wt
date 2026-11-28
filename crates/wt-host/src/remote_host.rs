@@ -123,8 +123,10 @@ impl RemoteHost {
             SourceSpec {
                 name: source_name(&endpoint),
                 domain: Domain::Host,
-                persistence: Persistence::Disk(DiskCache::new(
+                // The saved copy leaves out what must stay off this disk.
+                persistence: Persistence::Disk(DiskCache::scrubbed(
                     &wt_app_core::query_cache::remote_store(&context.config, &endpoint),
+                    protocol::HostSnapshot::scrub_for_cache,
                 )),
                 // Fetches are driven by the worker's stream, not by a timer.
                 policy: RefreshPolicy::default(),

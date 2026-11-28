@@ -69,6 +69,18 @@ pub struct ActionEntry {
     pub fleet: bool,
 }
 
+impl ActionEntry {
+    /// Its run names the row's pull request.
+    pub fn needs_pr(&self) -> bool {
+        self.requires.iter().any(|requirement| {
+            matches!(
+                requirement,
+                ActionRequirement::Pr | ActionRequirement::PrReady
+            )
+        })
+    }
+}
+
 /// Where an action's prompt or command goes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,12 +322,7 @@ impl<'a> Scope<'a> {
 
     /// What a commit for this surface says it was shown.
     pub(crate) fn seen(&self, entry: &ActionEntry) -> Seen<ActionSeen> {
-        let needs_pr = entry.requires.iter().any(|requirement| {
-            matches!(
-                requirement,
-                ActionRequirement::Pr | ActionRequirement::PrReady
-            )
-        });
+        let needs_pr = entry.needs_pr();
         Seen(ActionSeen {
             row: self.row.map(|row| ActionRowSeen {
                 path: row.path.clone(),

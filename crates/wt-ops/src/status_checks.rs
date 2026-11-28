@@ -56,36 +56,91 @@ pub fn assert_checks(
     }
 }
 
+/// The key under which a status record keeps the state its gate was
+/// asserted in. Additive: a build that does not know it carries it along
+/// with the record's other unknown fields, or drops it with the record.
+const GATE_STATE: &str = "blockedOnState";
+
+/// The state `record`'s gate was asserted in. A gate written before that
+/// was recorded has only the record's own state to go by, and that state is
+/// taken: such a gate found on `todo` reads as a start gate, which every
+/// gate on `todo` was until gates began to be carried, and one found on any
+/// other state as a merge gate.
+fn gate_state(record: &WorkStatusRecord) -> wt_core::WorkState {
+    record
+        .extra
+        .get(GATE_STATE)
+        .and_then(|state| serde_json::from_value(state.clone()).ok())
+        .unwrap_or(record.state)
+}
+
+/// Set or clear `record`'s gate as asserted now, in the record's own state.
+pub fn set_gate(record: &mut WorkStatusRecord, gate: Option<String>) {
+    let state = gate
+        .as_ref()
+        .and_then(|_| serde_json::to_value(record.state).ok());
+    match state {
+        Some(state) => record.extra.insert(GATE_STATE.to_owned(), state),
+        None => record.extra.remove(GATE_STATE),
+    };
+    record.blocked_on = gate;
+}
+
 /// Give `next`, a status about to replace `previous`, its gate. A gate on
 /// work under way is a prerequisite of merging, not a claim of one
 /// assertion: a status change that does not mention it keeps it, and with it
 /// the watch that clears it. `asked` replaces it. Verified and dropped end
 /// the work the gate held back, so neither carries one.
 ///
-/// A gate on `todo` is a different thing: why the work has not started.
-/// Leaving `todo` is the decision that it no longer holds, so it is not
-/// carried into another state, where it would read as "do not merge".
+/// A gate asserted on `todo` is a different thing: why the work has not
+/// started. Leaving `todo` is the decision that it no longer holds, so it
+/// is not carried into another state, where it would read as "do not
+/// merge". A merge gate carried through `todo` is still a merge gate: what
+/// decides is the state the gate was asserted in, which is carried with it.
 pub fn assert_gate(
     next: &mut WorkStatusRecord,
     previous: Option<&WorkStatusRecord>,
     asked: Option<String>,
 ) {
+    if next.is_terminal() {
+        return set_gate(next, None);
+    }
+    if asked.is_some() {
+        return set_gate(next, asked);
+    }
     let carried = previous
         .filter(|previous| !start_gate_ends(previous, next))
-        .and_then(|previous| previous.blocked_on.clone());
-    next.blocked_on = if next.is_terminal() {
-        None
-    } else {
-        asked.or(carried)
-    };
+        .and_then(|previous| Some((previous.blocked_on.clone()?, gate_state(previous))));
+    set_gate(next, None);
+    if let Some((gate, state)) = carried {
+        next.blocked_on = Some(gate);
+        if let Ok(state) = serde_json::to_value(state) {
+            next.extra.insert(GATE_STATE.to_owned(), state);
+        }
+    }
 }
 
-/// Whether `next` starts work that `previous` held back with a gate on
-/// `todo`.
+/// Whether `next` starts work that `previous` held back with a gate
+/// asserted on `todo`.
 pub fn start_gate_ends(previous: &WorkStatusRecord, next: &WorkStatusRecord) -> bool {
-    previous.state == wt_core::WorkState::Todo
+    previous.blocked_on.is_some()
+        && gate_state(previous) == wt_core::WorkState::Todo
         && next.state != wt_core::WorkState::Todo
-        && previous.blocked_on.is_some()
+        && !next.is_terminal()
+}
+
+/// What to tell whoever asserted `next` over `previous` when that cleared a
+/// start gate without their saying so: the one notice for the command line
+/// and the board.
+pub fn start_gate_notice(
+    previous: Option<&WorkStatusRecord>,
+    next: &WorkStatusRecord,
+) -> Option<String> {
+    let previous = previous.filter(|previous| start_gate_ends(previous, next))?;
+    let gate = previous.blocked_on.as_deref()?;
+    next.blocked_on
+        .is_none()
+        .then(|| format!("start gate cleared (was: {gate})"))
 }
 
 /// `verified` asserted for a worktree that owes checks: close every check
@@ -227,5 +282,88 @@ mod tests {
             assert_checks(&mut terminal, Some(&edited), []);
             assert!(stages(&terminal).is_empty());
         }
+    }
+
+    fn asserted(
+        state: WorkState,
+        previous: Option<&WorkStatusRecord>,
+        gate: Option<&str>,
+    ) -> WorkStatusRecord {
+        let mut next = WorkStatusRecord::new(state, "t");
+        assert_gate(&mut next, previous, gate.map(str::to_owned));
+        // As stored and read back: the origin must survive the round trip.
+        wt_core::parse_work_status(&serde_json::to_value(&next).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn starting_clears_a_gate_asserted_on_todo_and_never_a_merge_gate() {
+        // A start gate: kept while not started, cleared by starting.
+        let todo = asserted(WorkState::Todo, None, Some("secrets land"));
+        let still = asserted(WorkState::Todo, Some(&todo), None);
+        assert_eq!(still.blocked_on.as_deref(), Some("secrets land"));
+        let working = asserted(WorkState::Working, Some(&still), None);
+        assert_eq!(working.blocked_on, None);
+        assert_eq!(
+            start_gate_notice(Some(&still), &working).as_deref(),
+            Some("start gate cleared (was: secrets land)")
+        );
+        assert!(!working.extra.contains_key(GATE_STATE));
+
+        // A merge gate set on ready, carried through todo, is not one.
+        let ready = asserted(WorkState::Ready, None, Some("the release"));
+        let parked = asserted(WorkState::Todo, Some(&ready), None);
+        assert_eq!(parked.blocked_on.as_deref(), Some("the release"));
+        let again = asserted(WorkState::Todo, Some(&parked), None);
+        let resumed = asserted(WorkState::Working, Some(&again), None);
+        assert_eq!(resumed.blocked_on.as_deref(), Some("the release"));
+        assert_eq!(start_gate_notice(Some(&again), &resumed), None);
+        let ready = asserted(WorkState::Ready, Some(&resumed), None);
+        assert_eq!(ready.blocked_on.as_deref(), Some("the release"));
+
+        // A new gate is asserted where it is set, whatever it replaces.
+        let regated = asserted(WorkState::Todo, Some(&ready), Some("a decision"));
+        assert_eq!(
+            asserted(WorkState::Working, Some(&regated), None).blocked_on,
+            None
+        );
+        let merge = asserted(WorkState::Ready, Some(&todo), Some("the release"));
+        assert_eq!(start_gate_notice(Some(&todo), &merge), None);
+        assert_eq!(
+            asserted(WorkState::Review, Some(&merge), None)
+                .blocked_on
+                .as_deref(),
+            Some("the release")
+        );
+
+        // An ending clears either kind, and that is not "starting".
+        let dropped = asserted(WorkState::Dropped, Some(&todo), None);
+        assert_eq!(dropped.blocked_on, None);
+        assert_eq!(start_gate_notice(Some(&todo), &dropped), None);
+    }
+
+    #[test]
+    fn a_gate_with_no_recorded_origin_is_read_by_the_state_it_is_found_on() {
+        let mut old_todo = WorkStatusRecord::new(WorkState::Todo, "t");
+        old_todo.blocked_on = Some("secrets land".into());
+        assert_eq!(
+            asserted(WorkState::Working, Some(&old_todo), None).blocked_on,
+            None
+        );
+        // Found on ready it is a merge gate, and stays one through todo.
+        let mut old_ready = WorkStatusRecord::new(WorkState::Ready, "t");
+        old_ready.blocked_on = Some("the release".into());
+        let parked = asserted(WorkState::Todo, Some(&old_ready), None);
+        assert_eq!(
+            asserted(WorkState::Working, Some(&parked), None)
+                .blocked_on
+                .as_deref(),
+            Some("the release")
+        );
+        // Amending a gate in place records where it was asserted.
+        let mut amended = old_ready.clone();
+        set_gate(&mut amended, Some("another".into()));
+        assert_eq!(gate_state(&amended), WorkState::Ready);
+        set_gate(&mut amended, None);
+        assert!(amended.blocked_on.is_none() && !amended.extra.contains_key(GATE_STATE));
     }
 }

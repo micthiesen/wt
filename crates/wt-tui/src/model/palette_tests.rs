@@ -554,6 +554,7 @@ fn the_fixed_rows_send_their_own_requests() {
         pick(&mut model, DEV_LOGS_ACTION_ID),
         InputResult::Action(UiAction::PrepareDevLogs { key: "one".into() })
     );
+    let mut model = start(ready());
     model.input(key(KeyCode::Char('>')), 20);
     assert_eq!(
         model.input(key(KeyCode::Char('z')), 20),
@@ -617,4 +618,132 @@ fn a_remote_rows_palette_opens_and_commits_like_a_local_one() {
             seen: seen(None),
         })
     );
+}
+
+#[test]
+fn a_key_after_the_choice_ends_the_github_wait_before_anything_fires() {
+    let mut unconfirmed = ready();
+    unconfirmed.rows[0].action_facts.pr = PrFact::Unknown;
+    let mut model = start(unconfirmed);
+    model.input(key(KeyCode::Char('!')), 20);
+    pick(&mut model, "rerun-review");
+    assert_eq!(
+        detail(&model, "rerun-review"),
+        "waiting for GitHub… Esc cancels"
+    );
+    // Moving on to another entry: the earlier choice no longer waits, and
+    // the palette stops saying that it does, at once.
+    model.input(key(KeyCode::Char('j')), 20);
+    assert_eq!(
+        detail(&model, "rerun-review"),
+        "(GitHub data is not confirmed)"
+    );
+    assert!(model.next_deadline().is_none());
+    model.apply(live(ready()));
+    assert!(model.follow_up.is_none(), "the action ran under the cursor");
+    assert_eq!(open_palette(&model), Some(&row()));
+}
+
+#[test]
+fn a_confirmed_wait_never_opens_a_prompt_under_the_next_key() {
+    let mut unconfirmed = ready();
+    unconfirmed.rows[0].action_facts.pr = PrFact::Unknown;
+    let mut model = start(unconfirmed);
+    model.input(key(KeyCode::Char('!')), 20);
+    // Chosen by its position while the cursor rests elsewhere.
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("no palette is open")
+    };
+    let resting = picker.selected;
+    let wanted = picker
+        .options
+        .iter()
+        .position(|option| option.value.as_deref() == Some("ask-review"))
+        .unwrap();
+    assert_ne!(resting, wanted);
+    pick(&mut model, "ask-review");
+    model.apply(live(ready()));
+    // The entry takes a value. Its prompt does not replace the palette by
+    // itself: a key already on its way would become its text or commit it.
+    assert!(model.follow_up.is_none());
+    assert_eq!(open_palette(&model), Some(&row()));
+    let Interaction::Picker(picker) = &model.interaction else {
+        panic!("no palette is open")
+    };
+    assert_eq!(
+        picker.selected, wanted,
+        "the cursor names what Enter continues"
+    );
+    assert_eq!(
+        model.toast,
+        Some((
+            "Ask for review: GitHub confirmed; Enter continues".into(),
+            ToastTone::Info
+        ))
+    );
+    assert_eq!(model.input(key(KeyCode::Enter), 20), InputResult::Draw);
+    assert!(matches!(
+        &model.interaction,
+        Interaction::Text(prompt) if matches!(&prompt.action, TextAction::ActionArg { id, .. } if id == "ask-review")
+    ));
+}
+
+#[test]
+fn an_action_for_a_pull_request_the_board_does_not_show_is_not_sent() {
+    // The facts say a pull request exists; the row has no number to show.
+    let mut board = ready();
+    board.rows[0].pr = None;
+    let mut model = start(board);
+    model.input(key(KeyCode::Char('!')), 20);
+    assert_eq!(pick(&mut model, "rerun-review"), InputResult::Draw);
+    assert_eq!(
+        model.toast,
+        Some((
+            "Re-run review: the board does not show its pull request yet".into(),
+            ToastTone::Notice
+        ))
+    );
+    assert!(model.refresh_requested);
+    assert_eq!(open_palette(&model), Some(&row()));
+}
+
+#[test]
+fn an_open_stop_confirmation_keeps_the_run_it_was_opened_for() {
+    let run = |id: &str, name: &str| ActiveRunView {
+        action_key: "one".into(),
+        run_id: id.into(),
+        action_name: name.into(),
+    };
+    let mut board = ready();
+    board.rows[0].action_facts.active_run = Some(run("run-9", "Lint"));
+    let mut model = start(board.clone());
+    model.input(key(KeyCode::Char('!')), 20);
+    // Lint ends and an automation starts Deploy in the same slot.
+    board.rows[0].action_facts.active_run = Some(run("run-10", "Deploy"));
+    model.apply(live(board.clone()));
+    let Interaction::Confirm(confirm) = &model.interaction else {
+        panic!("the confirmation closed")
+    };
+    assert_eq!(confirm.title, "Stop Lint?");
+    model.confirm_settles_at = None;
+    // The host answers that Lint is no longer running; Deploy is untouched.
+    assert_eq!(
+        model.input(key(KeyCode::Enter), 20),
+        InputResult::Action(UiAction::KillAction {
+            action_key: "one".into(),
+            run_id: "run-9".into(),
+        })
+    );
+    // The same holds when the slot goes idle: the list does not appear
+    // under an Enter meant for the confirmation.
+    let mut model = super::Model::default();
+    board.rows[0].action_facts.active_run = Some(run("run-9", "Lint"));
+    model.apply(live(board.clone()));
+    model.input(key(KeyCode::Char('!')), 20);
+    board.rows[0].action_facts.active_run = None;
+    model.apply(live(board));
+    assert!(matches!(
+        &model.interaction,
+        Interaction::Confirm(confirm) if confirm.title == "Stop Lint?"
+    ));
 }

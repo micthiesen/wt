@@ -17,8 +17,24 @@ fn identity(option: &PickerOption) -> OptionIdentity {
 impl Model {
     /// Answer a requested action from the board when it is a board menu.
     pub(super) fn open_board_menu(&mut self, action: UiAction) -> InputResult {
-        let Menu::Local(menu) = action.menu(&self.board) else {
-            return InputResult::Action(action);
+        let menu = match action.menu(&self.board) {
+            Menu::Local(menu) => menu,
+            // Content its host must fetch: the overlay is on screen from
+            // this key on, and the request the terminal now sends fills it.
+            Menu::Overlay(overlay) => {
+                self.committed_menu = None;
+                self.local_menu = None;
+                self.interaction_host = None;
+                self.interaction = Interaction::Loading(super::LoadingPrompt {
+                    title: overlay.title,
+                    close_key: overlay.close_key,
+                    action: action.clone(),
+                    request: None,
+                    started: tokio::time::Instant::now(),
+                });
+                return InputResult::Action(action);
+            }
+            Menu::NotMenu | Menu::Host { .. } => return InputResult::Action(action),
         };
         // The opening key is not a commit that the host could find stale.
         self.committed_menu = None;
@@ -38,6 +54,11 @@ impl Model {
             LocalMenu::Notice(text) => {
                 self.local_menu = None;
                 self.toast = Some((text, ToastTone::Notice));
+            }
+            LocalMenu::NotYet(text) => {
+                self.local_menu = None;
+                self.toast = Some((text, ToastTone::Notice));
+                self.refresh_requested = true;
             }
         }
     }
@@ -143,6 +164,10 @@ impl Model {
                     selected,
                 };
             }
+            // A confirmation never changes what it will do while it is open:
+            // only its wording follows the board. When its subject changed
+            // (another run in the slot, another pull request or checkout)
+            // the person keeps the one they are reading and the host refuses.
             (
                 Interaction::Confirm(confirm),
                 UiModal::Confirm {
@@ -151,7 +176,7 @@ impl Model {
                     lines,
                     cancel_key,
                 },
-            ) if discriminant(&confirm.action) == discriminant(&action) => {
+            ) if confirm.action == action => {
                 *confirm = ConfirmPrompt {
                     action,
                     title,

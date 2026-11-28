@@ -10,7 +10,10 @@ use wt_tui::{Board, UiAction, UiReply};
 /// 5: boards carry the action catalog and facts the palettes are built from;
 /// `RunAction` carries what its palette showed, and palette preparation is
 /// gone from the wire.
-pub const HOST_PROTOCOL: u32 = 5;
+/// 6: boards carry every host's session pickers, terminals, reviewer pool
+/// and merge-queue removals; a host no longer prepares those menus, and
+/// fleet-wide cleanup planning is gone from the wire.
+pub const HOST_PROTOCOL: u32 = 6;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -97,6 +100,19 @@ impl HostSnapshot {
         self == other
             && !(wt_runtime::settling()
                 && wt_runtime::stamps_advanced(&self.domains, &other.domains))
+    }
+
+    /// Drop what must not outlive the connection on this machine's disk.
+    /// Argument values people ran actions with can be private (ticket text,
+    /// paths); the controller holds them for its pickers and never saves
+    /// them.
+    pub fn scrub_for_cache(&mut self) {
+        if let Some(board) = &mut self.board {
+            board.actions.recent_args.clear();
+            for actions in board.host_actions.values_mut() {
+                actions.recent_args.clear();
+            }
+        }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -208,6 +224,44 @@ mod tests {
         assert!(read::<ClientFrame, _>(&mut reader).await.is_err());
         task.await.unwrap();
     }
+    #[test]
+    fn a_cached_snapshot_holds_no_argument_values() {
+        let mut board = Board::default();
+        let value = wt_tui::ArgValue {
+            value: "SECRET-1 customer text".into(),
+            shown: "SECRET-1 customer text".into(),
+            label: Some("Customer".into()),
+        };
+        board
+            .actions
+            .recent_args
+            .insert("file-ticket".into(), vec![value]);
+        board
+            .actions
+            .slots_blocked
+            .insert("wt".into(), "paths.wt_source not set".into());
+        let mut snapshot = HostSnapshot {
+            board: Some(board),
+            state: HostState::Ready,
+            domains: Default::default(),
+            layout: BTreeMap::new(),
+        };
+        // The frame carries them, so the picker opens with its history.
+        assert!(
+            String::from_utf8(encode(&snapshot).unwrap())
+                .unwrap()
+                .contains("SECRET-1")
+        );
+        snapshot.scrub_for_cache();
+        let saved = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !saved.contains("SECRET-1") && !saved.contains("Customer"),
+            "{saved}"
+        );
+        // Nothing else of the palette state is dropped.
+        assert!(saved.contains("paths.wt_source not set"));
+    }
+
     #[test]
     fn duplicate_or_remote_keys_reject_the_entire_snapshot() {
         let row = wt_tui::BoardRow {

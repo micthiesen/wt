@@ -40,9 +40,10 @@ pub enum LayoutChange {
         past: String,
         down: bool,
     },
-    /// J or K at a section's edge: `rows` are drawn in `to`, entering at
-    /// its top when `top`.
+    /// J or K at a section's edge: `rows`, the rows of `unit`, are drawn
+    /// in `to`, entering at its top when `top`.
     Cross {
+        unit: String,
         rows: Vec<String>,
         to: String,
         top: bool,
@@ -66,7 +67,8 @@ impl LayoutChange {
                 past: past.clone(),
                 down,
             },
-            ReorderStep::Cross { rows, to, .. } => Self::Cross {
+            ReorderStep::Cross { unit, rows, to, .. } => Self::Cross {
+                unit: unit.clone(),
                 rows: rows.clone(),
                 to: to.clone(),
                 top: down,
@@ -103,7 +105,7 @@ impl Family for LayoutChange {
                 let (a, b) = pair(unit, past);
                 format!("order:{section:?}:{a:?}:{b:?}")
             }
-            // Where the row is filed, the field a move from the section menu
+            // Where the unit is filed, the field a move from the section menu
             // writes: a later crossing replaces an earlier one.
             Self::Cross { .. } => "section".into(),
             Self::SectionPass { section, past, .. } => {
@@ -115,6 +117,13 @@ impl Family for LayoutChange {
 
     fn pairwise(&self) -> bool {
         matches!(self, Self::Pass { .. })
+    }
+
+    fn key_row(&self) -> Option<&str> {
+        match self {
+            Self::Cross { unit, .. } => Some(unit),
+            _ => None,
+        }
     }
 
     fn rows(&self) -> Vec<String> {
@@ -240,7 +249,7 @@ impl Family for LayoutChange {
                 };
                 rows.splice(at..at, moving.rows.iter().copied());
             }
-            Self::Cross { rows, to, top } => {
+            Self::Cross { rows, to, top, .. } => {
                 let Some(destination) = section_at(board, to) else {
                     return;
                 };
@@ -256,15 +265,72 @@ impl Family for LayoutChange {
                         })
                     })
                     .collect();
+                if entering.is_empty() {
+                    return;
+                }
                 for section in &mut board.sections {
                     section.rows.retain(|row| !entering.contains(row));
                 }
-                let drawn = &mut board.sections[destination].rows;
-                if *top {
-                    drawn.splice(0..0, entering);
-                } else {
-                    drawn.extend(entering);
+                let before = section_units(board, &board.sections[destination]);
+                board.sections[destination]
+                    .rows
+                    .extend(entering.iter().copied());
+                // Drawn there, the rows are one unit with the rows of their
+                // stack filed there already: a row stacked on them joins
+                // them, and stacked on one of those they join its unit.
+                let Some(joined) = section_units(board, &board.sections[destination])
+                    .into_iter()
+                    .find(|unit| unit.rows.contains(&entering[0]))
+                else {
+                    return;
+                };
+                let rank = joined.rank(board);
+                let mut block = joined.rows;
+                block.sort_by_key(|&row| board.rows[row].stack_index);
+                // A unit at its creation position that was created after a
+                // row of this unit is drawn behind all of it. Not when the
+                // rows enter at the top under manual sort: that gives every
+                // unit there an order, and it stays.
+                if board.display.status_sort || !*top {
+                    let mut following: Vec<usize> = Vec::new();
+                    for unit in before.iter().filter(|unit| !block.contains(&unit.rows[0])) {
+                        let created_after = board
+                            .rows
+                            .iter()
+                            .find(|row| row.key == unit.key)
+                            .and_then(|row| row.creation_placement.as_ref())
+                            .and_then(|placement| placement.after.as_deref());
+                        if unit.at_creation_position(board)
+                            && created_after.is_some_and(|after| {
+                                block
+                                    .iter()
+                                    .chain(&following)
+                                    .any(|&row| board.rows[row].key == after)
+                            })
+                        {
+                            following.extend(unit.rows.iter().copied());
+                        }
+                    }
+                    block.extend(following);
                 }
+                let own_row = |row: &usize| board.rows[*row].key == joined.key;
+                let leads = entering.iter().any(own_row);
+                let drawn = &board.sections[destination].rows;
+                // A unit they join stays where its own row is drawn.
+                let held = drawn.iter().position(own_row).map(|at| {
+                    drawn[..at]
+                        .iter()
+                        .filter(|row| !block.contains(row))
+                        .count()
+                });
+                board.sections[destination]
+                    .rows
+                    .retain(|row| !block.contains(row));
+                let at = match held {
+                    Some(held) if !leads => held,
+                    _ => entry_point(board, &board.sections[destination], rank, *top),
+                };
+                board.sections[destination].rows.splice(at..at, block);
             }
             Self::SectionPass {
                 section,
@@ -397,6 +463,62 @@ impl SectionUnit {
             .min()
             .unwrap_or(u8::MAX)
     }
+
+    /// Whether the unit is still drawn behind the unit it was created
+    /// after: it has no stored order and, under status sort, none of its
+    /// rows has a status, which that sort would draw it by instead.
+    fn at_creation_position(&self, board: &Board) -> bool {
+        board
+            .rows
+            .iter()
+            .any(|row| row.key == self.key && row.creation_placement.is_some())
+            && !(board.display.status_sort
+                && self.rows.iter().any(|&row| {
+                    board.rows[row]
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| work.record.is_some())
+                }))
+    }
+}
+
+/// Where a unit of status `rank` that enters `section` at its edge is
+/// drawn, as an index into the section's rows. Manual sort draws by stored
+/// order alone and the unit is given the first or the last. Status sort
+/// draws by status before that, so the unit is first or last among the
+/// units of its own status; a unit still at its creation position stays
+/// behind the unit it follows.
+fn entry_point(board: &Board, section: &BoardSection, rank: u8, top: bool) -> usize {
+    let end = section.rows.len();
+    if !board.display.status_sort {
+        return if top { 0 } else { end };
+    }
+    let units = section_units(board, section);
+    let placed = |unit: &SectionUnit| !unit.at_creation_position(board);
+    let starts = |unit: &SectionUnit| {
+        section
+            .rows
+            .iter()
+            .position(|row| unit.rows.contains(row))
+            .unwrap_or(end)
+    };
+    if top {
+        return units
+            .iter()
+            .find(|unit| placed(unit) && unit.rank(board) >= rank)
+            .map_or(end, starts);
+    }
+    match units
+        .iter()
+        .rposition(|unit| placed(unit) && unit.rank(board) <= rank)
+    {
+        // Behind the last such unit and whatever follows it from creation.
+        Some(last) => units[last + 1..]
+            .iter()
+            .find(|unit| placed(unit))
+            .map_or(end, starts),
+        None => units.iter().find(|unit| placed(unit)).map_or(end, starts),
+    }
 }
 
 /// The units of a section in the order drawn. A stacked row belongs to the
@@ -430,6 +552,24 @@ fn section_units(board: &Board, section: &BoardSection) -> Vec<SectionUnit> {
         }
     }
     units
+}
+
+/// Whether the board draws a unit behind the unit it was created after
+/// instead of by its stored order and, under status sort, its status.
+pub fn unit_at_creation_position(board: &Board, unit: &str) -> bool {
+    let Some(index) = board.rows.iter().position(|row| row.key == unit) else {
+        return false;
+    };
+    board
+        .sections
+        .iter()
+        .find(|section| section.rows.contains(&index))
+        .and_then(|section| {
+            section_units(board, section)
+                .into_iter()
+                .find(|drawn| drawn.key == unit)
+        })
+        .is_some_and(|drawn| drawn.at_creation_position(board))
 }
 
 /// The status a unit sorts by under status sort, where `board` draws it.

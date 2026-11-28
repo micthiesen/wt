@@ -226,14 +226,15 @@ impl Store {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            entry.insert("jobId".into(), json!(job_id));
-            entry.insert("path".into(), json!(path));
-            entry.insert("branch".into(), json!(branch));
             // A retry of a failed attempt keeps where the board drew the row
             // before the first one. That attempt archived the row itself, so
             // the archive set no longer says where it was, and a row drawn
-            // as landed stays there whatever this attempt can prove.
+            // as landed stays there whatever this attempt can prove. Read
+            // before this attempt writes its own job id into the entry.
             let retried = entry.contains_key("jobId");
+            entry.insert("jobId".into(), json!(job_id));
+            entry.insert("path".into(), json!(path));
+            entry.insert("branch".into(), json!(branch));
             let was_archived = if retried {
                 entry.get("wasArchived") == Some(&json!(true))
             } else {
@@ -764,10 +765,12 @@ impl Store {
         })
     }
 
-    /// Exchange two units of a section whose layout the caller was shown.
-    /// The layout is compared with the stored one inside the write's own
-    /// transaction, so a unit filed elsewhere, or two stored the other way
-    /// round, refuses and nothing is written.
+    /// Move a unit of a section to the far side of the unit drawn next to
+    /// it, for a caller that was shown the section. The layout shown is
+    /// compared with the stored one inside the write's own transaction, so a
+    /// unit filed elsewhere, or two stored the other way round, refuses and
+    /// nothing is written. What is written draws the section as shown with
+    /// only that unit moved.
     pub fn swap_shown_units(
         &mut self,
         shown: ShownSection<'_>,
@@ -775,43 +778,40 @@ impl Store {
         past: &str,
     ) -> Result<Result<(), LayoutChanged>, StoreError> {
         self.mutate_wt_state(|state| {
-            if let Err(changed) = check_shown(state, &shown) {
-                return Ok((Err(changed), false));
-            }
-            let sequence = manual_sequence(state, shown.drawn);
-            let at =
-                |sequence: &[String], key: &str| sequence.iter().position(|placed| placed == key);
-            let (Some(unit_at), Some(past_at)) = (at(&sequence, unit), at(&sequence, past)) else {
+            let at = |key: &str| shown.drawn.iter().position(|drawn| drawn.key == key);
+            let (Some(unit_at), Some(past_at)) = (at(unit), at(past)) else {
                 return Ok((Err(LayoutChanged::Filed(unit.to_owned())), false));
             };
+            if let Err(changed) = check_shown(state, &shown, shown.drawn[unit_at].band) {
+                return Ok((Err(changed), false));
+            }
             if unit_at == past_at {
                 return Ok((Ok(()), false));
             }
-            let orders: Vec<Option<f64>> = shown
-                .drawn
+            // The section as it is drawn once the unit has passed.
+            let mut after: Vec<&ShownUnit> = shown.drawn.iter().collect();
+            let moved = after.remove(unit_at);
+            let behind = usize::from(unit_at < past_at);
+            let past_now = after
                 .iter()
-                .map(|key| stored_order(state, key))
-                .collect();
-            if let (Some(unit_order), Some(past_order)) =
-                (stored_order(state, unit), stored_order(state, past))
-                && unit_at.abs_diff(past_at) == 1
-                && distinct(&orders)
-            {
-                // Neighbours with stored orders of their own trade them, and
-                // no other row is rewritten.
-                set_layout_order(state, unit, past_order);
-                set_layout_order(state, past, unit_order);
-            } else {
-                // Under status sort, units of another status can sit between
-                // the two in manual order. Only the unit that was moved
-                // changes its place among them: it takes the other's index.
-                let mut sequence = with_unlisted(state, shown.name, sequence);
-                if let (Some(unit_at), Some(past_at)) = (at(&sequence, unit), at(&sequence, past)) {
-                    let moved = sequence.remove(unit_at);
-                    sequence.insert(past_at, moved);
+                .position(|drawn| drawn.key == past)
+                .unwrap_or(past_at);
+            after.insert(past_now + behind, moved);
+            // A unit at its creation position has no order to exchange: the
+            // anchors restated below are what carries the move.
+            if !shown.drawn[unit_at].anchored && !shown.drawn[past_at].anchored {
+                let placed: Vec<&ShownUnit> = after
+                    .iter()
+                    .copied()
+                    .filter(|drawn| !drawn.anchored)
+                    .collect();
+                if !trade_orders(state, &placed, unit, past) {
+                    let sequence = manual_order(state, &placed, Some(unit));
+                    let sequence = with_unlisted(state, shown.name, sequence, Some(unit));
+                    write_sequence(state, shown.name, &sequence);
                 }
-                write_sequence(state, shown.name, &sequence);
             }
+            restate_anchors(state, &after);
             Ok((Ok(()), true))
         })
     }
@@ -821,7 +821,8 @@ impl Store {
     /// `unit` the one that carries its position. Refused, with nothing
     /// written, when either section is not laid out as shown, when a row is
     /// no longer filed in `from`, or when `to` is a named section that is
-    /// gone.
+    /// gone. The unit is drawn first or last among the units of `to` that
+    /// share its band.
     pub fn move_shown_unit(
         &mut self,
         rows: &[String],
@@ -842,32 +843,73 @@ impl Store {
             {
                 return Ok((Err(LayoutChanged::Section(name.to_owned())), false));
             }
-            if let Err(changed) = check_shown(state, &from).and_then(|()| check_shown(state, &to)) {
-                return Ok((Err(changed), false));
-            }
-            let orders: Vec<Option<f64>> = to
+            let Some(band) = from
                 .drawn
                 .iter()
-                .map(|key| stored_order(state, key))
-                .collect();
-            // Read before the rows arrive, so they are not taken for rows
-            // already filed there.
-            let mut sequence = with_unlisted(state, to.name, manual_sequence(state, to.drawn));
-            sequence.retain(|placed| placed != unit);
-            let moved = move_to_section(state, rows, to.name);
-            if distinct(&orders) {
-                let order = edge_order(state, to.name, at_top);
-                set_layout_order(state, unit, order);
-            } else {
-                // A unit never ordered is drawn before every ordered one, so
-                // an order past the stored ones would not be the edge.
-                if at_top {
-                    sequence.insert(0, unit.to_owned());
-                } else {
-                    sequence.push(unit.to_owned());
-                }
-                write_sequence(state, to.name, &sequence);
+                .find(|drawn| drawn.key == unit)
+                .map(|drawn| drawn.band)
+            else {
+                return Ok((Err(LayoutChanged::Filed(unit.to_owned())), false));
+            };
+            if let Err(changed) =
+                check_shown(state, &from, band).and_then(|()| check_shown(state, &to, band))
+            {
+                return Ok((Err(changed), false));
             }
+            // A unit never ordered is drawn before every ordered one of its
+            // band, so an order below the stored ones would not be the top:
+            // every unit there is numbered, with this one first. Whatever
+            // its band: a row stacked on the unit and filed there joins it,
+            // and may change the band it is drawn in. Read before the rows
+            // arrive, so they are not taken for rows filed there.
+            let numbered = (at_top
+                && to
+                    .drawn
+                    .iter()
+                    .any(|drawn| !drawn.anchored && stored_order(state, &drawn.key).is_none()))
+            .then(|| {
+                let placed: Vec<&ShownUnit> =
+                    to.drawn.iter().filter(|drawn| !drawn.anchored).collect();
+                let mut sequence =
+                    with_unlisted(state, to.name, manual_order(state, &placed, None), None);
+                sequence.retain(|placed| placed != unit);
+                sequence.insert(0, unit.to_owned());
+                sequence
+            });
+            let moved = move_to_section(state, rows, to.name);
+            match numbered {
+                Some(sequence) => write_sequence(state, to.name, &sequence),
+                None => {
+                    let order = edge_order(state, to.name, at_top);
+                    set_layout_order(state, unit, order);
+                }
+            }
+            // A unit left behind at its creation position named the unit
+            // drawn before it, which may be the one that left. Where the
+            // caller lists it as any other unit (manual sort), it takes an
+            // order with the rest of its section instead.
+            let staying: Vec<&ShownUnit> = from
+                .drawn
+                .iter()
+                .filter(|drawn| drawn.key != unit)
+                .collect();
+            if staying.iter().any(|drawn| {
+                !drawn.anchored
+                    && stored_order(state, &drawn.key).is_none()
+                    && state[layout_collection(&drawn.key)][&drawn.key]
+                        .get("creationAfter")
+                        .is_some()
+            }) {
+                let placed: Vec<&ShownUnit> = staying
+                    .iter()
+                    .copied()
+                    .filter(|drawn| !drawn.anchored)
+                    .collect();
+                let sequence =
+                    with_unlisted(state, from.name, manual_order(state, &placed, None), None);
+                write_sequence(state, from.name, &sequence);
+            }
+            restate_anchors(state, &staying);
             Ok((Ok(moved), true))
         })
     }
@@ -2569,6 +2611,9 @@ pub enum LayoutChanged {
     Order(String, String),
     /// This named section is no longer stored.
     Section(String),
+    /// This row was shown at its creation position and has since been
+    /// given a stored order.
+    Ordered(String),
 }
 
 fn layout_collection(key: &str) -> &'static str {
@@ -2610,44 +2655,171 @@ fn sections_order(state: &Value) -> Vec<String> {
         .collect()
 }
 
+/// One unit of a section as its caller was shown it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShownUnit {
+    /// The row that carries the unit's stored order.
+    pub key: String,
+    /// What the board sorts by before the stored order: the unit's status
+    /// under status sort, one value for every unit under manual sort.
+    pub band: u8,
+    /// Drawn behind the unit it was created after instead of by its band
+    /// and order. A reorder leaves it without an order and restates which
+    /// unit it follows.
+    pub anchored: bool,
+}
+
 /// A section as its caller was shown it.
 #[derive(Clone, Copy, Debug)]
 pub struct ShownSection<'a> {
     /// The stored name; `None` is the Inbox.
     pub name: Option<&'a str>,
     /// Its units in the order drawn.
-    pub drawn: &'a [String],
-    /// Those of them the board draws by stored order: all of them under
-    /// manual sort, the units of one status under status sort.
-    pub ordered: &'a [String],
+    pub drawn: &'a [ShownUnit],
 }
 
 /// Whether the stored layout of a section is the one shown: every unit
-/// drawn is filed in it, and the stored orders of `ordered` do not fall
-/// along the order they were drawn in. A unit never ordered is drawn by
-/// what the store does not hold (its stack, its creation anchor), so its
-/// place is not compared.
-fn check_shown(state: &Value, shown: &ShownSection<'_>) -> Result<(), LayoutChanged> {
+/// drawn is filed in it, none shown at its creation position has been given
+/// an order since, and the stored orders of the units of `band` do not
+/// fall along the order they were drawn in. Other bands are not compared: a
+/// press moves within one, and a status that changed since the look would
+/// refuse it for rows it does not touch. A unit never ordered is drawn by
+/// what the store does not hold (its stack), so its place is not compared.
+fn check_shown(state: &Value, shown: &ShownSection<'_>, band: u8) -> Result<(), LayoutChanged> {
     if let Some(moved) = shown
         .drawn
         .iter()
-        .find(|key| stored_section(state, key) != shown.name)
+        .find(|drawn| stored_section(state, &drawn.key) != shown.name)
     {
-        return Err(LayoutChanged::Filed(moved.clone()));
+        return Err(LayoutChanged::Filed(moved.key.clone()));
+    }
+    if let Some(placed) = shown
+        .drawn
+        .iter()
+        .find(|drawn| drawn.anchored && stored_order(state, &drawn.key).is_some())
+    {
+        return Err(LayoutChanged::Ordered(placed.key.clone()));
     }
     let mut last: Option<(f64, &String)> = None;
-    for key in shown.ordered {
-        let Some(order) = stored_order(state, key) else {
+    for drawn in shown
+        .drawn
+        .iter()
+        .filter(|drawn| drawn.band == band && !drawn.anchored)
+    {
+        let Some(order) = stored_order(state, &drawn.key) else {
             continue;
         };
         if let Some((earlier_order, earlier)) = last
             && order < earlier_order
         {
-            return Err(LayoutChanged::Order(earlier.clone(), key.clone()));
+            return Err(LayoutChanged::Order(earlier.clone(), drawn.key.clone()));
         }
-        last = Some((order, key));
+        last = Some((order, &drawn.key));
     }
     Ok(())
+}
+
+/// Exchange the stored orders of two units, when that alone moves one past
+/// the other: every unit has an order of its own and no other unit's lies
+/// between theirs. No other row is rewritten.
+fn trade_orders(state: &mut Value, placed: &[&ShownUnit], unit: &str, past: &str) -> bool {
+    let mut orders = Vec::with_capacity(placed.len());
+    for drawn in placed {
+        match stored_order(state, &drawn.key) {
+            Some(order) => orders.push((order, drawn.key.as_str())),
+            None => return false,
+        }
+    }
+    orders.sort_by(|a, b| a.0.total_cmp(&b.0));
+    if orders.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        return false;
+    }
+    let at = |key: &str| orders.iter().position(|(_, placed)| *placed == key);
+    match (at(unit), at(past)) {
+        (Some(unit_at), Some(past_at)) if unit_at.abs_diff(past_at) == 1 => {
+            let (unit_order, past_order) = (orders[unit_at].0, orders[past_at].0);
+            set_layout_order(state, unit, past_order);
+            set_layout_order(state, past, unit_order);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// One manual order for every unit of `placed`, which lists them as they
+/// are to be drawn. The board draws each band by stored order, so numbering
+/// the result draws exactly `placed`: within a band it keeps their order.
+/// Across bands, which the board never draws against each other, it keeps
+/// the stored orders: a unit never ordered, and `moved`, whose stored order
+/// is the place it left, go where the ordered unit next to them in their
+/// band goes.
+fn manual_order(state: &Value, placed: &[&ShownUnit], moved: Option<&str>) -> Vec<String> {
+    let mut bands: std::collections::BTreeMap<u8, Vec<(&str, Option<f64>)>> = Default::default();
+    for drawn in placed {
+        let order = stored_order(state, &drawn.key).filter(|_| moved != Some(drawn.key.as_str()));
+        bands
+            .entry(drawn.band)
+            .or_default()
+            .push((drawn.key.as_str(), order));
+    }
+    // Each unit with the order it is merged by: its own, else that of the
+    // next ordered unit of its band, else of the one before.
+    let mut queues: Vec<std::collections::VecDeque<(&str, f64)>> = bands
+        .into_values()
+        .map(|band| {
+            let mut next = None;
+            let mut merged: Vec<(&str, Option<f64>)> = band
+                .iter()
+                .rev()
+                .map(|&(key, order)| {
+                    next = order.or(next);
+                    (key, next)
+                })
+                .collect();
+            merged.reverse();
+            let mut before = None;
+            merged
+                .into_iter()
+                .map(|(key, order)| {
+                    before = order.or(before);
+                    (key, before.unwrap_or(f64::NEG_INFINITY))
+                })
+                .collect()
+        })
+        .collect();
+    let mut sequence = Vec::with_capacity(placed.len());
+    while let Some(first) = queues
+        .iter()
+        .enumerate()
+        .filter_map(|(band, queue)| Some((queue.front()?.1, band)))
+        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, band)| band)
+    {
+        if let Some((key, _)) = queues[first].pop_front() {
+            sequence.push(key.to_owned());
+        }
+    }
+    sequence
+}
+
+/// Store, for each unit drawn at its creation position, the unit it is
+/// drawn behind in `drawn`; the first of a section follows none.
+fn restate_anchors(state: &mut Value, drawn: &[&ShownUnit]) {
+    for (index, unit) in drawn.iter().enumerate() {
+        if !unit.anchored {
+            continue;
+        }
+        let after = index
+            .checked_sub(1)
+            .map_or(Value::Null, |before| json!(drawn[before].key));
+        let collection = layout_collection(&unit.key);
+        let mut entry = state[collection][&unit.key]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        entry.insert("creationAfter".to_owned(), after);
+        object_mut(state, collection).insert(unit.key.clone(), Value::Object(entry));
+    }
 }
 
 /// `sequence` with the other rows of the section that have a stored order
@@ -2655,7 +2827,12 @@ fn check_shown(state: &Value, shown: &ShownSection<'_>) -> Result<(), LayoutChan
 /// not shown, because the board draws them elsewhere (landed, archived) or
 /// they were filed since. Numbering the result keeps each of them on the
 /// side of every shown unit it was on.
-fn with_unlisted(state: &Value, section: Option<&str>, mut sequence: Vec<String>) -> Vec<String> {
+fn with_unlisted(
+    state: &Value,
+    section: Option<&str>,
+    mut sequence: Vec<String>,
+    moved: Option<&str>,
+) -> Vec<String> {
     let mut unlisted: Vec<(f64, String)> = ["slugs", "remoteLayouts"]
         .into_iter()
         .filter_map(|collection| Some((collection, state[collection].as_object()?)))
@@ -2669,7 +2846,10 @@ fn with_unlisted(state: &Value, section: Option<&str>, mut sequence: Vec<String>
         .collect();
     unlisted.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     for (order, key) in unlisted {
-        let stored = |placed: &String| stored_order(state, placed);
+        // The stored order of the unit that moved is the place it left.
+        let stored = |placed: &String| {
+            stored_order(state, placed).filter(|_| moved != Some(placed.as_str()))
+        };
         let at = sequence
             .iter()
             .rposition(|placed| stored(placed).is_some_and(|before| before <= order))
@@ -2677,52 +2857,6 @@ fn with_unlisted(state: &Value, section: Option<&str>, mut sequence: Vec<String>
             .or_else(|| sequence.iter().position(|placed| stored(placed).is_some()))
             .unwrap_or(sequence.len());
         sequence.insert(at, key);
-    }
-    sequence
-}
-
-/// Whether every unit has a stored order of its own.
-fn distinct(orders: &[Option<f64>]) -> bool {
-    let mut known: Vec<f64> = orders.iter().flatten().copied().collect();
-    if known.len() != orders.len() {
-        return false;
-    }
-    known.sort_by(f64::total_cmp);
-    known.windows(2).all(|pair| pair[0] < pair[1])
-}
-
-/// The manual order of a section's units with every unit given a place:
-/// stored orders decide among the units that have one; a unit never ordered
-/// goes before them, as the board draws it; and one still at its creation
-/// anchor stays behind the unit drawn before it. Under manual sort this is
-/// the order drawn.
-fn manual_sequence(state: &Value, drawn: &[String]) -> Vec<String> {
-    let anchored = |key: &str| {
-        stored_order(state, key).is_none()
-            && state[layout_collection(key)][key]
-                .get("creationAfter")
-                .is_some()
-    };
-    let mut sequence = Vec::with_capacity(drawn.len());
-    let mut ordered = Vec::new();
-    for key in drawn {
-        match stored_order(state, key) {
-            Some(order) => ordered.push((order, key)),
-            None if !anchored(key) => sequence.push(key.clone()),
-            None => {}
-        }
-    }
-    ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
-    sequence.extend(ordered.into_iter().map(|(_, key)| key.clone()));
-    for (index, key) in drawn.iter().enumerate() {
-        if !anchored(key) {
-            continue;
-        }
-        let at = index
-            .checked_sub(1)
-            .and_then(|before| sequence.iter().position(|placed| *placed == drawn[before]))
-            .map_or(0, |at| at + 1);
-        sequence.insert(at, key.clone());
     }
     sequence
 }

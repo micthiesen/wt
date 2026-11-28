@@ -240,7 +240,13 @@ fn sessions_digits_count_session_rows_and_space_never_confirms() {
 
 #[test]
 fn new_claude_name_prompt_allows_auto_name_filters_and_backs_out() {
-    let mut model = model_with(&["one"]);
+    let mut model = Model::default();
+    let mut shown = ready(board(&["one"]));
+    shown
+        .test_data_mut()
+        .session_menus
+        .insert("one".into(), Vec::new());
+    model.apply(shown);
     open_sessions(&mut model);
     ch(&mut model, 'c');
     press(&mut model, KeyCode::Enter);
@@ -253,14 +259,17 @@ fn new_claude_name_prompt_allows_auto_name_filters_and_backs_out() {
     };
     assert_eq!(prompt.editor.text(), "a");
     press(&mut model, KeyCode::Backspace);
-    // Backspace on empty input returns to the sessions picker.
-    assert_eq!(
-        press(&mut model, KeyCode::Backspace),
-        InputResult::Action(UiAction::PrepareSessions {
-            key: Some("one".into()),
-            target: SessionTarget::Harness,
+    // Backspace on empty input returns to the sessions picker, which the
+    // board rebuilds at once.
+    assert_eq!(press(&mut model, KeyCode::Backspace), InputResult::Draw);
+    assert!(matches!(
+        &model.interaction,
+        Interaction::Picker(PickerPrompt {
+            action: PickerAction::Sessions { .. },
+            ..
         })
-    );
+    ));
+    assert!(model.pending_request.is_none());
 
     let mut model = model_with(&["one"]);
     open_sessions(&mut model);

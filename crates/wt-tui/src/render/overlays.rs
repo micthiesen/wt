@@ -69,6 +69,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &mut Model, area: Rect) {
         Interaction::Confirm(confirm) => confirmation(frame, area, confirm),
         Interaction::Automations { scroll } => automations(frame, area, &model.board, scroll),
         Interaction::Timeline(view) => super::timeline::modal(frame, area, &model.board, view),
+        Interaction::Loading(loading) => self::loading(frame, area, &loading.title),
         Interaction::Picker(picker) => {
             let summary = session_summary(&model.board, picker);
             self::picker(frame, area, picker, &primary, summary.as_deref())
@@ -1159,6 +1160,23 @@ fn max_entry_offset(rows: &[Vec<Line<'static>>], visible: usize) -> usize {
 }
 
 // ── Logs and performance ────────────────────────────────────────────────
+
+/// A log overlay whose content is still being fetched: the frame the log
+/// will fill, so the key shows at once and Esc has something to close.
+fn loading(frame: &mut Frame<'_>, area: Rect, title: &str) {
+    let modal = Modal::new(title, vec![hint("esc / q", "cancel")]);
+    let outer = if area.width < NARROW_WIDTH {
+        modal.place(area, area.width as usize, 1, true)
+    } else {
+        let height = modal.place(area, 0, 1, true).height;
+        centered(area, area.width - 4, height)
+    };
+    let body = modal.draw(frame, area, outer);
+    if body.width == 0 || body.height == 0 {
+        return;
+    }
+    frame.render_widget(Paragraph::new(Line::styled("loading…", theme::dim())), body);
+}
 
 fn log(frame: &mut Frame<'_>, area: Rect, title: &str, lines: &[String], scroll: &mut usize) {
     if title == cleanup::LOG_TITLE {
@@ -2937,6 +2955,27 @@ mod tests {
         assert_eq!(max_entry_offset(&rows, 3), 1);
         assert_eq!(max_entry_offset(&rows, 1), 2);
         assert_eq!(max_entry_offset(&[], 3), 0);
+    }
+
+    #[test]
+    fn a_loading_overlay_shows_its_title_and_how_to_leave() {
+        let mut model = Model {
+            interaction: Interaction::Loading(crate::model::LoadingPrompt {
+                title: "Failed checks: feature/one".into(),
+                close_key: Some('f'),
+                action: crate::UiAction::GithubFailedChecks { key: "one".into() },
+                request: Some(1),
+                started: tokio::time::Instant::now(),
+            }),
+            ..Model::default()
+        };
+        for (width, height) in [(120, 40), (60, 12)] {
+            let buffer = draw(&mut model, width, height);
+            let text = rows(&buffer).join("\n");
+            assert!(text.contains("Failed checks: feature/one"), "{text}");
+            assert!(text.contains("loading…"), "{text}");
+            assert!(text.contains("esc / q cancel"), "{text}");
+        }
     }
 
     #[test]

@@ -13,6 +13,8 @@ mod selection;
 #[cfg(test)]
 mod interaction_tests;
 #[cfg(test)]
+mod overlay_tests;
+#[cfg(test)]
 mod palette_tests;
 #[cfg(test)]
 mod reorder_tests;
@@ -30,20 +32,20 @@ use crate::UiAction;
 pub(crate) use board::{ARCHIVED_SECTION, INBOX_SECTION, REMOVING_SECTION};
 pub use board::{
     ActivityLine, AttentionLine, AutomationQueueView, AutomationRecordView, AutomationRunView,
-    AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, DiffStat, DisplayPolicy,
-    GitPresentation, GuideView, HostChoice, LANDED_SECTION, LANDED_TITLE, LandingKind,
-    LiveSlotView, LocalStamp, LogView, MergeQueueView, OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION,
-    OtherPrView, OwedBlock, OwedView, PerfGroupView, PerfProcessView, PerfTone, PerfView,
-    PrCommentView, PrPresentation, PreparedDetailGroup, RemovalView, RemovedHistoryRow,
-    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
-    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WatchActionKind,
-    WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount, WorkStateCount,
-    owed_block_refusal,
+    AutomationsView, Board, BoardRow, BoardSection, BusyView, CheckState, ContributorView,
+    DiffStat, DisplayPolicy, GitPresentation, GuideView, HostChoice, LANDED_SECTION, LANDED_TITLE,
+    LandingKind, LiveSlotView, LocalStamp, LogView, MergeQueueView, OWED_BLOCK_PREFIX,
+    OWED_SECTIONS_OPTION, OtherPrView, OwedBlock, OwedView, PerfGroupView, PerfProcessView,
+    PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup, RemovalView,
+    RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
+    ReviewerPool, SectionRollup, SessionMenuEntry, SessionView, SuggestedReviewerView,
+    TerminalSlotView, TitleSource, UsageItem, WatchActionKind, WatchConditionView, WatchTruth,
+    WatchView, WorkPresentation, WorkRiskCount, WorkStateCount, owed_block_refusal,
 };
 pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{
-    ConfirmPrompt, Interaction, PickerPrompt, ReviewerPrompt, TextPrompt, TimelinePrompt,
-    TitlePrompt,
+    ConfirmPrompt, Interaction, LoadingPrompt, PickerPrompt, ReviewerPrompt, TextPrompt,
+    TimelinePrompt, TitlePrompt,
 };
 pub(crate) use interaction::{digit_rows, overlay_scroll};
 pub(crate) use selection::{ListAnchor, VisualItem};
@@ -62,27 +64,9 @@ pub enum ToastTone {
 pub(crate) struct PendingRequest {
     pub id: u64,
     pub generation: u64,
-    pub preparation: bool,
-    /// The key that requested this menu; pressing it again cancels it.
-    /// `None` when the menu is a text prompt, where that letter is text.
-    pub opener: Option<crossterm::event::KeyEvent>,
-    /// Keys typed while the menu loads, replayed into it when it opens. They
-    /// never reach the board underneath.
-    pub typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
-    /// Keys past [`input::TYPEAHEAD_LIMIT`] were dropped; the menu says so
-    /// when it opens.
-    pub typeahead_overflow: bool,
-    pub started: tokio::time::Instant,
     pub action: UiAction,
+    /// Dropping the request cancels a read or a session entry on its host.
     pub _cancel_on_drop: Option<tokio_util::sync::DropGuard>,
-}
-/// A loading menu the user cancelled. The rest of what they typed for it is
-/// still arriving and must not reach the board, so keys are dropped until
-/// its reply arrives or it is older than typeahead is kept for.
-pub(crate) struct CancelledMenu {
-    pub id: u64,
-    pub started: tokio::time::Instant,
-    pub noticed: bool,
 }
 /// Everything the terminal shows and the keys act on: the presented board
 /// (source board with pending changes applied), cursor, panes and prompts.
@@ -97,8 +81,6 @@ pub struct Model {
     pub(crate) follow_up: Option<UiAction>,
     /// Sections chosen for rows still being created, by creation request.
     pub(crate) creation_moves: std::collections::BTreeMap<u64, pending::CreationMove>,
-    /// Typeahead left after a replayed key requested another menu.
-    pub(crate) carry_typeahead: Vec<(crossterm::event::KeyEvent, usize)>,
     /// The request whose board-built menu is open.
     pub(crate) local_menu: Option<UiAction>,
     /// The open board menu's default choice, while the user has not moved.
@@ -117,8 +99,6 @@ pub struct Model {
     pub(crate) palette_wait: Option<palette::PaletteWait>,
     /// The sources should refresh because a commit found changed state.
     pub(crate) refresh_requested: bool,
-    /// The key being dispatched, recorded as the opener of a requested menu.
-    pub(crate) last_key: Option<crossterm::event::KeyEvent>,
     pub board: Arc<Board>,
     pub source_state: SourceState,
     pub selected: Option<usize>,
@@ -134,7 +114,6 @@ pub struct Model {
     /// The failure of an earlier request, said while another was in flight
     /// and kept beside that request's feedback until the user acts again.
     pub(crate) earlier_failure: Option<String>,
-    pub(crate) cancelled_menu: Option<CancelledMenu>,
     pub(crate) pr_chord: Option<(std::time::Instant, String, bool)>,
     pub help: bool,
     pub(crate) help_scroll: usize,
@@ -216,7 +195,6 @@ impl Default for Model {
             local_domains: Default::default(),
             follow_up: None,
             creation_moves: Default::default(),
-            carry_typeahead: Vec::new(),
             local_menu: None,
             local_menu_default: None,
             picker_choice_lost: false,
@@ -225,7 +203,6 @@ impl Default for Model {
             background: Vec::new(),
             palette_wait: None,
             refresh_requested: false,
-            last_key: None,
             source_state: SourceState::Empty,
             selected: None,
             offset: 0,
@@ -235,7 +212,6 @@ impl Default for Model {
             pending_request: None,
             begun: Default::default(),
             earlier_failure: None,
-            cancelled_menu: None,
             pr_chord: None,
             help: false,
             help_scroll: 0,

@@ -216,7 +216,8 @@ impl HostService {
     }
 
     /// Refresh tmux and saved-conversation history for one slug. The picker
-    /// rebuilds from the discoveries source as each harness completes.
+    /// open on the board rebuilds from the discoveries source as each
+    /// harness completes.
     fn queue_session_discovery(&self, context: &AppContext, slug: &str) {
         self.sources.sessions.inventory.refresh();
         for harness in wt_app_core::harness::visible_harnesses(&context.config) {
@@ -238,40 +239,15 @@ impl HostService {
             anyhow::bail!("this menu is built from the board and never asks the host");
         }
         let context = self.context.for_action(&command)?;
-        match &command {
-            // Background read behind an open picker: no reply, and a target
-            // without a slug has nothing to refresh.
-            UiAction::DiscoverSessions { key, target } => {
-                if let Ok(slug) =
-                    wt_app_core::harness::picker_slug(&context, key.as_deref(), *target).await
-                {
-                    self.queue_session_discovery(&context, &slug);
-                }
-                return Ok(UiReply::default());
-            }
-            // Remote rows, and local targets the board has no entries for, are
-            // answered here from the same discovery snapshot the board uses.
-            UiAction::PrepareSessions { key, target } => {
-                let history = self.sources.sessions.discoveries.snapshot();
-                let (slug, entries) = wt_app_core::harness::cached_session_options(
-                    &context,
-                    key.clone(),
-                    *target,
-                    history.data().map_or(&[], |entries| entries.as_slice()),
-                )
-                .await?;
+        // Background read behind an open picker, which the board built: no
+        // reply, and a target without a slug has nothing to refresh.
+        if let UiAction::DiscoverSessions { key, target } = &command {
+            if let Ok(slug) =
+                wt_app_core::harness::picker_slug(&context, key.as_deref(), *target).await
+            {
                 self.queue_session_discovery(&context, &slug);
-                return Ok(UiReply {
-                    modal: Some(wt_tui::session_picker(
-                        key.clone(),
-                        *target,
-                        &entries,
-                        &wt_app_core::harness::visible_harnesses(&context.config),
-                    )),
-                    ..Default::default()
-                });
             }
-            _ => {}
+            return Ok(UiReply::default());
         }
         if matches!(command, UiAction::HardRefresh) {
             self.sources
@@ -307,40 +283,25 @@ impl HostService {
         // that has been failing, say): its PR and head checks need a recent
         // read. Landing evidence for cleanup stays valid at any age.
         let github_for_writes = github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE));
-        if matches!(
-            command,
-            UiAction::PrepareReviewers { .. } | UiAction::SubmitReviewers { .. }
-        ) {
+        if let UiAction::SubmitReviewers {
+            key,
+            pr_number,
+            original,
+            selected,
+        } = &command
+        {
             let board = board.ok_or_else(|| anyhow::anyhow!("worktree board is still loading"))?;
-            return match command {
-                UiAction::PrepareReviewers { key } => {
-                    Box::pin(
-                        self.sources
-                            .github_pickers
-                            .prepare_reviewers(&key, board, github),
-                    )
-                    .await
-                }
-                UiAction::SubmitReviewers {
+            return Box::pin(self.sources.github_pickers.submit_reviewers(
+                wt_sources::github_pickers::ReviewerSubmission {
                     key,
-                    pr_number,
+                    pr_number: *pr_number,
                     original,
                     selected,
-                } => {
-                    Box::pin(self.sources.github_pickers.submit_reviewers(
-                        wt_sources::github_pickers::ReviewerSubmission {
-                            key: &key,
-                            pr_number,
-                            original: &original,
-                            selected: &selected,
-                            board,
-                            github: github_for_writes,
-                        },
-                    ))
-                    .await
-                }
-                _ => unreachable!(),
-            };
+                    board,
+                    github: github_for_writes,
+                },
+            ))
+            .await;
         }
         let github_action = match &command {
             UiAction::GithubMarkReady { key, pin } => Some(GithubAction::MarkReady {
@@ -422,29 +383,6 @@ impl HostService {
             UiAction::Restack { key } => {
                 Box::pin(wt_ops::restack_action::start(&context, &key, github, board)).await?
             }
-            // The board builds the prompt for a row whose PR it shows. Here
-            // the board had no PR, so confirmed GitHub data decides between
-            // loading, no PR, and a PR that appeared since the board was made.
-            UiAction::PrepareGithub { key, .. } => {
-                let row = board
-                    .and_then(|board| board.rows.iter().find(|row| row.key == key))
-                    .ok_or_else(|| {
-                        wt_app_core::host_errors::notice("worktree is no longer on the board")
-                    })?;
-                let github =
-                    github.ok_or_else(|| anyhow::anyhow!("GitHub data is still loading"))?;
-                return Err(match github.covered_pr(&row.branch) {
-                    wt_github::CoveredPr::Present(_) => {
-                        wt_app_core::host_errors::stale("GitHub data changed; press e again")
-                    }
-                    wt_github::CoveredPr::Absent => {
-                        wt_app_core::host_errors::notice("no PR for this row")
-                    }
-                    wt_github::CoveredPr::Uncovered => {
-                        anyhow::anyhow!("GitHub data is not confirmed for this branch")
-                    }
-                });
-            }
             UiAction::CancelAutomations => {
                 let cancelled = self.sources.automations.cancel_pending().await?;
                 UiReply {
@@ -498,9 +436,7 @@ impl HostService {
         self.action_requires_pr(command)
             || matches!(
                 command,
-                UiAction::PrepareGithub { .. }
-                    | UiAction::PrepareReviewers { .. }
-                    | UiAction::SubmitReviewers { .. }
+                UiAction::SubmitReviewers { .. }
                     | UiAction::GithubMarkReady { .. }
                     | UiAction::GithubSetAutoMerge { .. }
                     | UiAction::GithubShip { .. }
@@ -520,9 +456,7 @@ impl HostService {
                     _ => return None,
                 }
             }
-            UiAction::PrepareGithub { key, .. }
-            | UiAction::PrepareReviewers { key }
-            | UiAction::SubmitReviewers { key, .. }
+            UiAction::SubmitReviewers { key, .. }
             | UiAction::GithubMarkReady { key, .. }
             | UiAction::GithubSetAutoMerge { key, .. }
             | UiAction::GithubShip { key, .. }
@@ -611,6 +545,26 @@ mod tests {
         for action in [
             UiAction::PrepareStatus { key: "one".into() },
             UiAction::PrepareHarnesses { key: "one".into() },
+            UiAction::PrepareSessions {
+                key: Some("one".into()),
+                target: wt_tui::SessionTarget::Harness,
+            },
+            UiAction::PrepareStopTerminal {
+                key: "one".into(),
+                target: wt_tui::SessionTarget::Shell,
+            },
+            UiAction::PrepareReviewers { key: "one".into() },
+            UiAction::PrepareGithub {
+                key: "one".into(),
+                ship: true,
+            },
+            UiAction::OnHost {
+                host: None,
+                action: Box::new(UiAction::PrepareCreate {
+                    initial: String::new(),
+                    placement: None,
+                }),
+            },
         ] {
             assert!(action.is_board_menu());
             let error = host.execute(action).await.unwrap_err();
@@ -619,6 +573,136 @@ mod tests {
                 "{error:#}"
             );
         }
+        // Content a host fetches is asked of it, whatever the board lists.
+        for action in [
+            UiAction::GithubFailedChecks { key: "one".into() },
+            UiAction::PrepareDevLogs { key: "one".into() },
+        ] {
+            assert!(!action.is_board_menu(), "{action:?}");
+        }
+        scope
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    /// The whole path of a board-built confirmation, on the real source
+    /// graph and a tmux server of the fixture's own: the board lists the
+    /// terminal, the menu built from it names that exact terminal, and the
+    /// host stops that one or nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_stops_by_the_identity_the_board_showed_or_not_at_all() {
+        let mut fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .tmux
+            .socket = format!(
+            "wt-stop-terminal-{}",
+            fixture._root.path().file_name().unwrap().to_string_lossy()
+        );
+        let cancel = &fixture.ctx.cancellation;
+        let tmux = wt_tmux::TmuxClient::new(
+            fixture.ctx.processes.clone(),
+            wt_tmux::TmuxServer::named(fixture.ctx.config.tmux.socket.clone())
+                .with_cwd(fixture.ctx.home.clone()),
+        );
+        let shell = wt_tmux::CreateSession {
+            name: "one-shell".into(),
+            cwd: fixture.ctx.cwd.clone(),
+            command: vec!["sleep".into(), "300".into()],
+            width: None,
+            height: None,
+        };
+        // A server left with no session exits and numbers its sessions from
+        // the start again; a real one outlives any one terminal.
+        let other = wt_tmux::CreateSession {
+            name: "two-shell".into(),
+            ..shell.clone()
+        };
+        tmux.create_session(&other, cancel).await.unwrap();
+        tmux.create_session(&shell, cancel).await.unwrap();
+        let scope = TaskScope::new();
+        let host = HostService::start(
+            &scope,
+            fixture.ctx.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        // The confirmation the model opens for Shift+F10, from this board.
+        let confirmed = |board: &Board| {
+            let menu = UiAction::PrepareStopTerminal {
+                key: "one".into(),
+                target: wt_tui::SessionTarget::Shell,
+            }
+            .menu(board);
+            let wt_tui::Menu::Local(wt_tui::LocalMenu::Modal { modal, .. }) = menu else {
+                return None;
+            };
+            let wt_tui::UiModal::Confirm {
+                action:
+                    wt_tui::ConfirmAction::StopTerminal {
+                        key,
+                        target,
+                        session_id,
+                        created_at,
+                    },
+                ..
+            } = *modal
+            else {
+                panic!("a stop confirmation")
+            };
+            Some(UiAction::StopTerminal {
+                key,
+                target,
+                session_id,
+                created_at,
+            })
+        };
+        let mut updates = host.sources.board.subscribe();
+        let mut listed = async |other_than: Option<&UiAction>| {
+            let snapshot = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                updates.wait_for(|snapshot| {
+                    snapshot
+                        .data()
+                        .and_then(|board| confirmed(board))
+                        .is_some_and(|stop| Some(&stop) != other_than)
+                }),
+            )
+            .await
+            .expect("the board lists the terminal")
+            .unwrap();
+            confirmed(snapshot.data().unwrap()).unwrap()
+        };
+        let shown = listed(None).await;
+        let running = async || {
+            tmux.list_sessions(cancel)
+                .await
+                .unwrap()
+                .into_iter()
+                .any(|session| session.name == "one-shell")
+        };
+
+        // The shell is replaced after the confirmation was drawn.
+        tmux.kill_session("one-shell", cancel).await.unwrap();
+        tmux.create_session(&shell, cancel).await.unwrap();
+        let refused = host.execute(shown.clone()).await.unwrap_err();
+        assert!(
+            wt_app_core::host_errors::error_reply(&refused).stale,
+            "{refused:#}"
+        );
+        assert!(running().await, "a terminal nobody confirmed was stopped");
+
+        // The board catches up, and the confirmation rebuilt from it stops
+        // the terminal that is there now.
+        host.sources.sessions.inventory.refresh();
+        let current = listed(Some(&shown)).await;
+        let reply = host.execute(current).await.unwrap();
+        assert!(!reply.failed, "{}", reply.message);
+        assert!(!running().await);
+
+        let _ = tmux.kill_server(cancel).await;
         scope
             .shutdown(std::time::Duration::from_secs(5))
             .await
