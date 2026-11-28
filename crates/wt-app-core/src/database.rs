@@ -39,6 +39,11 @@ struct Reader {
     started: tokio::sync::OnceCell<mpsc::Sender<Message<ReadJob>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     closed: AtomicBool,
+    /// Whether the state payload is known to be in this build's shape. The
+    /// read-only connection returns an older payload as it is, so until a
+    /// migration has succeeded every read runs on the writable connection,
+    /// which migrates as it reads.
+    migrated: AtomicBool,
 }
 
 impl Database {
@@ -57,7 +62,9 @@ impl Database {
             started: tokio::sync::OnceCell::new(),
             worker: Mutex::new(None),
             closed: AtomicBool::new(false),
+            migrated: AtomicBool::new(false),
         });
+        let opened = Arc::clone(&reader);
         let (send, mut receive) = mpsc::channel::<Message<Job>>(64);
         let (ready, started) = oneshot::channel();
         let worker = std::thread::Builder::new()
@@ -65,14 +72,10 @@ impl Database {
             .spawn(move || {
                 let mut store = match Store::open(path, identity) {
                     Ok(mut store) => {
-                        // The read-only connection returns an older build's
-                        // payload as it is. Migrate it here, before any read
-                        // can start, so none sees a shape this build does
-                        // not expect. A payload that cannot be migrated
-                        // fails the reads that parse it, as it always did.
-                        if let Err(error) = store.read_repository_state_json_migrated() {
-                            tracing::debug!(%error, "state payload migration at open failed");
-                        }
+                        // Migrate before any read can start. A failure here
+                        // (another process holding the write lock past the
+                        // busy timeout, say) is retried by the first reads.
+                        opened.migrate(&mut store);
                         let _ = ready.send(Ok(()));
                         store
                     }
@@ -134,13 +137,24 @@ impl Database {
     /// that must follow a write the caller has not awaited belongs in
     /// `call`. A read that decides a write belongs in that write's own `call`,
     /// where no other write can come between the two. The store refuses
-    /// every write here with `StoreError::ReadOnly`. Statements of one read
+    /// every write here with `StoreError::ReadOnly`. Until the state payload
+    /// has been migrated to this build's shape, which normally happens at
+    /// open, a read runs through the write queue instead. Statements of one read
     /// are not one snapshot: another connection may commit between them, as
     /// another process always could.
     pub async fn read<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut Store) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        if !self.reader.migrated.load(Ordering::SeqCst) {
+            let reader = Arc::clone(&self.reader);
+            return self
+                .call(move |store| {
+                    reader.migrate(store);
+                    operation(store)
+                })
+                .await;
+        }
         let send = self
             .reader
             .started
@@ -187,6 +201,20 @@ async fn join_worker(worker: &Mutex<Option<JoinHandle<()>>>, name: &'static str)
 }
 
 impl Reader {
+    /// Bring the state payload to this build's shape on the writable
+    /// connection, once.
+    fn migrate(&self, store: &mut Store) {
+        if self.migrated.load(Ordering::SeqCst) {
+            return;
+        }
+        match store.read_repository_state_json_migrated() {
+            Ok(_) => self.migrated.store(true, Ordering::SeqCst),
+            Err(error) => {
+                tracing::warn!(%error, "state payload migration failed; state reads stay on the write queue");
+            }
+        }
+    }
+
     async fn start(&self) -> Result<mpsc::Sender<Message<ReadJob>>> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(anyhow!("state reader unavailable"));
@@ -320,6 +348,54 @@ mod tests {
             .read(|store| Ok(store.write_repository_state_json("{}")?))
             .await;
         assert!(refused.is_err());
+        database.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reads_stay_on_the_write_queue_until_a_migration_has_succeeded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite");
+        let identity = RepositoryIdentity::new("fixture", directory.path().to_string_lossy());
+        // The migration at open fails on this payload.
+        Store::open(&path, identity.clone())
+            .unwrap()
+            .write_repository_state_json("{ not json")
+            .unwrap();
+        let database = Database::open_path(path, identity).await.unwrap();
+        let raw = database
+            .read(|store| Ok(store.read_repository_state_json()?))
+            .await
+            .unwrap();
+        assert_eq!(raw.as_deref(), Some("{ not json"));
+        assert!(
+            database.reader.started.get().is_none(),
+            "the read-only connection is not used while the payload may be older"
+        );
+        // An older build's payload replaces it; the next read migrates it.
+        let older = wt_store::CURRENT_WT_STATE_VERSION - 1;
+        database
+            .call(move |store| {
+                Ok(store.write_repository_state_json(&format!(r#"{{"version":{older}}}"#))?)
+            })
+            .await
+            .unwrap();
+        async fn version(database: &Database) -> Option<u64> {
+            let state = database.read(|store| Ok(store.read_wt_state()?)).await;
+            state.unwrap()["version"].as_u64()
+        }
+        assert_eq!(
+            version(&database).await,
+            Some(wt_store::CURRENT_WT_STATE_VERSION)
+        );
+        assert!(database.reader.started.get().is_none());
+        assert_eq!(
+            version(&database).await,
+            Some(wt_store::CURRENT_WT_STATE_VERSION)
+        );
+        assert!(
+            database.reader.started.get().is_some(),
+            "once migrated, reads leave the write queue"
+        );
         database.shutdown().await.unwrap();
     }
 

@@ -189,200 +189,251 @@ pub async fn adopt_explicit_sections(ctx: &AppContext) -> Result<bool> {
         .await
 }
 
-/// Move the displayed unit. Stack membership is always inferred from branches;
-/// only controller-owned order/section fields are persisted.
+/// The stored name of a section rows are filed in (`None` is the Inbox),
+/// or the refusal for a group wt derives: nothing in one has an order or a
+/// placement a press could change.
+fn filed_section(board: &wt_tui::Board, key: &str) -> Result<Option<String>> {
+    let title = board
+        .sections
+        .iter()
+        .find(|section| section.key == key)
+        .map_or(wt_tui::LANDED_TITLE, |section| section.title.as_str());
+    match wt_tui::reorder_refusal(key, title) {
+        // A notice, as for the other keys the Landed block answers.
+        Some(refusal) if key.starts_with(wt_tui::OWED_BLOCK_PREFIX) => {
+            Err(wt_app_core::host_errors::notice(refusal))
+        }
+        Some(refusal) => bail!(refusal),
+        None => Ok((key != wt_sources::board_layout::INBOX).then(|| key.to_owned())),
+    }
+}
+
+/// A press moves one place: `past` is the entry right behind `moving`
+/// going down, right before it going up, in a list that names each once.
+fn check_neighbors(shown: &[String], moving: &str, past: &str, down: bool) -> Result<()> {
+    let at = |key: &str| shown.iter().position(|entry| entry == key);
+    let unique = shown
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == shown.len();
+    let adjacent = match (at(moving), at(past)) {
+        (Some(moving), Some(past)) if down => past == moving + 1,
+        (Some(moving), Some(past)) => moving == past + 1,
+        _ => false,
+    };
+    if !unique || !adjacent {
+        bail!("the move does not match the list it was resolved against");
+    }
+    Ok(())
+}
+
+/// Every unit a press names must be a row this host lists; one that is gone
+/// was shown by an older board.
+fn check_listed(board: &wt_tui::Board, keys: &[String]) -> Result<()> {
+    match keys
+        .iter()
+        .find(|key| !board.rows.iter().any(|row| row.key == **key))
+    {
+        Some(gone) => Err(wt_app_core::host_errors::stale(format!(
+            "{gone} is no longer listed"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn layout_changed(board: &wt_tui::Board, changed: wt_store::LayoutChanged) -> anyhow::Error {
+    let name = |key: &str| {
+        if key == wt_sources::board_layout::INBOX {
+            return "Inbox".to_owned();
+        }
+        board
+            .rows
+            .iter()
+            .find(|row| row.key == key)
+            .map_or(key, |row| row.slug.as_str())
+            .to_owned()
+    };
+    wt_app_core::host_errors::stale(match changed {
+        wt_store::LayoutChanged::Filed(key) => format!("{} is filed elsewhere now", name(&key)),
+        wt_store::LayoutChanged::Order(first, second) => {
+            format!("{} and {} have changed places", name(&first), name(&second))
+        }
+        wt_store::LayoutChanged::Section(section) => format!("section {section} is gone"),
+    })
+}
+
+/// Store one J or K press. `step` is the move as the person saw it: the
+/// units it names are the ones written, and the layout it lists is compared
+/// with the stored one inside the write. This host's board is not consulted
+/// for either, because it may not show a press this host has already
+/// stored; a second press resolved from it would undo the first. The board
+/// supplies only what no press changes: which rows exist, how they are
+/// stacked, and their status.
+/// Stack membership is always inferred from branches; only controller-owned
+/// order and section fields are persisted.
 pub async fn reorder(
     ctx: &AppContext,
     key: Option<String>,
     section: String,
     down: bool,
+    step: wt_tui::ReorderStep,
     board: Option<&wt_tui::Board>,
 ) -> Result<UiReply> {
     let board = board.context("worktree metadata is still loading")?;
-    if section == wt_sources::board_layout::ARCHIVED {
-        bail!("Archived rows do not reorder; use a to restore");
-    }
-    let group_index = board
-        .sections
-        .iter()
-        .position(|group| group.key == section)
-        .context("section disappeared")?;
-    if board.sections[group_index].owed_block() {
-        // wt orders these blocks and the rows in them.
-        return Err(wt_app_core::host_errors::notice(
-            wt_tui::owed_block_refusal(&board.sections[group_index].title),
-        ));
-    }
-    if key.is_none() {
-        let order = board
-            .sections
-            .iter()
-            .filter(|group| {
-                group.key != wt_sources::board_layout::ARCHIVED
-                    && !group.owed_block()
-                    && group.drawn()
+    let from = filed_section(board, &section)?;
+    // Status sort draws a section by status first, so only the units of one
+    // status are drawn in their stored order.
+    let status_sort = ctx.config.ui.sort == wt_config::UiSort::Status;
+    match step {
+        wt_tui::ReorderStep::Section { past, sections } => {
+            if key.is_some() {
+                bail!("a section move names no row");
+            }
+            filed_section(board, &past)?;
+            check_neighbors(&sections, &section, &past, down)?;
+            let moved = ctx
+                .database
+                .call(move |store| Ok(store.move_group_past(&section, &past, !down, &sections)?))
+                .await?
+                .map_err(|changed| layout_changed(board, changed))?;
+            if !moved {
+                return Err(wt_app_core::host_errors::notice("section did not move"));
+            }
+            Ok(UiReply {
+                message: format!("moved section {}", if down { "down" } else { "up" }),
+                ..Default::default()
             })
-            .map(|group| group.key.clone())
-            .collect::<Vec<_>>();
-        let current = order
-            .iter()
-            .position(|group| group == &section)
-            .context("section is empty")?;
-        let neighbor = if down {
-            current.checked_add(1)
-        } else {
-            current.checked_sub(1)
         }
-        .and_then(|index| order.get(index))
-        .cloned()
-        .ok_or_else(|| {
-            wt_app_core::host_errors::notice(if down {
-                "section already at bottom"
+        wt_tui::ReorderStep::Pass { unit, past, units } => {
+            check_neighbors(&units, &unit, &past, down)?;
+            check_listed(board, &units)?;
+            if status_sort && wt_tui::unit_rank(board, &unit) != wt_tui::unit_rank(board, &past) {
+                return Err(wt_app_core::host_errors::notice(wt_tui::STATUS_SORT_PINS));
+            }
+            let ordered = drawn_by_order(board, status_sort, &units, &unit);
+            ctx.database
+                .call(move |store| {
+                    let shown = wt_store::ShownSection {
+                        name: from.as_deref(),
+                        drawn: &units,
+                        ordered: &ordered,
+                    };
+                    Ok(store.swap_shown_units(shown, &unit, &past)?)
+                })
+                .await?
+                .map_err(|changed| layout_changed(board, changed))?;
+            // A swap within the section shows itself; no toast, as in TS.
+            Ok(UiReply::default())
+        }
+        wt_tui::ReorderStep::Cross {
+            unit,
+            rows,
+            units,
+            to,
+            to_units,
+        } => {
+            let destination = filed_section(board, &to)?;
+            if destination == from || !rows.contains(&unit) || !units.contains(&unit) {
+                bail!("the move does not match the list it was resolved against");
+            }
+            check_listed(board, &units)?;
+            check_listed(board, &to_units)?;
+            check_unit_rows(board, &unit, &rows)?;
+            let ordered = drawn_by_order(board, status_sort, &units, &unit);
+            // Where the unit lands among another section's statuses is not
+            // something the person was shown under status sort.
+            let to_ordered = if status_sort {
+                Vec::new()
             } else {
-                "section already at top"
-            })
-        })?;
-        ctx.database
-            .call(move |store| Ok(store.move_group_past(&section, &neighbor, !down, &order)?))
-            .await?;
-        return Ok(UiReply {
-            message: format!("moved section {}", if down { "down" } else { "up" }),
-            ..Default::default()
-        });
-    }
-    let key = key.expect("checked row key");
-    let stacks = shown_stacks(board, &ctx.config.branch.base, |row| !row.archived);
-    let section_rows = board.sections[group_index]
-        .rows
-        .iter()
-        .filter_map(|index| board.rows.get(*index))
-        .collect::<Vec<_>>();
-    // A stack moves as one block under its root, but only within the
-    // root's section: a split member shown here under another section's
-    // root moves on its own, so a swap never drags the root across.
-    let unit_key = |row: &wt_tui::BoardRow| {
-        stacks
-            .by_branch
-            .get(&wt_sources::board_layout::branch_key(row, &row.branch))
-            .and_then(|entry| stacks.layouts[entry.layout_index].nodes.first())
-            .map(|root| root.slug.clone())
-            .filter(|root| section_rows.iter().any(|row| &row.key == root))
-            .unwrap_or_else(|| row.key.clone())
-    };
-    let row = board
-        .rows
-        .iter()
-        .find(|row| row.key == key)
-        .context("selected worktree disappeared")?;
-    let mover = unit_key(row);
-    let mut units = Vec::new();
-    for row in &section_rows {
-        let key = unit_key(row);
-        if !units.contains(&key) {
-            units.push(key);
-        }
-    }
-    let index = units
-        .iter()
-        .position(|unit| unit == &mover)
-        .context("selected row left this section")?;
-    let neighbor = if down {
-        index.checked_add(1)
-    } else {
-        index.checked_sub(1)
-    }
-    .and_then(|index| units.get(index))
-    .cloned();
-    let state = ctx
-        .database
-        .call(|store| Ok(store.read_wt_state()?))
-        .await?;
-    if let Some(neighbor) = neighbor {
-        let rank = |unit: &str| {
-            section_rows
-                .iter()
-                .filter(|row| unit_key(row) == unit)
-                .map(|row| row.work_rank)
-                .min()
-                .unwrap_or(99)
-        };
-        if ctx.config.ui.sort == wt_config::UiSort::Status && rank(&mover) != rank(&neighbor) {
-            return Err(wt_app_core::host_errors::notice(
-                "status sort pins this row; reorder within the same status or use manual sort",
-            ));
-        }
-        let manual_order = |key: &str| {
-            let collection = if wt_core::is_remote_worktree_ledger_key(key) {
-                "remoteLayouts"
-            } else {
-                "slugs"
+                to_units.clone()
             };
-            state[collection][key]["order"]
-                .as_f64()
-                .filter(|value| value.is_finite())
-                .unwrap_or(f64::NEG_INFINITY)
-        };
-        units.sort_by(|a, b| {
-            manual_order(a)
-                .total_cmp(&manual_order(b))
-                .then_with(|| a.cmp(b))
-        });
-        let section = (!section.starts_with('\0')).then_some(section);
-        ctx.database
-            .call(move |store| {
-                Ok(store.swap_orders(&mover, &neighbor, section.as_deref(), &units)?)
+            let message = format!("moved to {}", destination.as_deref().unwrap_or("Inbox"));
+            // Recorded before the write, so a read racing its commit already
+            // knows the move as this process's own.
+            ctx.section_writes
+                .record(rows.iter().cloned(), destination.as_deref());
+            let (recorded, target) = (rows.clone(), destination.clone());
+            let moved = ctx
+                .database
+                .call(move |store| {
+                    let leaving = wt_store::ShownSection {
+                        name: from.as_deref(),
+                        drawn: &units,
+                        ordered: &ordered,
+                    };
+                    let entering = wt_store::ShownSection {
+                        name: destination.as_deref(),
+                        drawn: &to_units,
+                        ordered: &to_ordered,
+                    };
+                    Ok(store.move_shown_unit(&rows, &unit, leaving, entering, down)?)
+                })
+                .await?;
+            let moved = match moved {
+                Ok(moved) => moved,
+                Err(changed) => {
+                    // Nothing was written: a later move of these rows to
+                    // that section by someone else is news again.
+                    for row in &recorded {
+                        ctx.section_writes.consume(row, target.as_deref());
+                    }
+                    return Err(layout_changed(board, changed));
+                }
+            };
+            tracing::info!(slugs = ?moved, section = %to, "moved a unit across a section edge");
+            Ok(UiReply {
+                message,
+                ..Default::default()
             })
-            .await?;
-    } else {
-        let destination = if down {
-            board
-                .sections
-                .iter()
-                .skip(group_index + 1)
-                .collect::<Vec<_>>()
-        } else {
-            board.sections[..group_index]
-                .iter()
-                .rev()
-                .collect::<Vec<_>>()
         }
-        .into_iter()
-        // A row only crosses into a section on screen: a named section even
-        // while empty, a derived group (the Inbox) only with rows.
-        .find(|group| {
-            group.key != wt_sources::board_layout::ARCHIVED && !group.owed_block() && group.drawn()
-        })
-        .ok_or_else(|| {
-            wt_app_core::host_errors::notice(if down {
-                "already at bottom"
-            } else {
-                "already at top"
-            })
-        })?;
-        let section =
-            (destination.key != wt_sources::board_layout::INBOX).then(|| destination.key.clone());
-        let message = format!("moved to {}", section.as_deref().unwrap_or("Inbox"));
-        let moving = section_rows
-            .iter()
-            .filter(|row| unit_key(row) == mover)
-            .map(|row| row.key.clone())
-            .collect::<Vec<_>>();
-        ctx.section_writes
-            .record(moving.iter().cloned(), section.as_deref());
-        ctx.database
-            .call(move |store| {
-                store.move_worktrees_to_section(&moving, section.as_deref())?;
-                store.place_slug(&mover, section.as_deref(), down)?;
-                Ok(())
-            })
-            .await?;
-        return Ok(UiReply {
-            message,
-            ..Default::default()
-        });
     }
-    // A swap within the section shows itself; no toast, as in TS.
-    Ok(UiReply::default())
+}
+
+/// The units of `drawn` the board draws by stored order: all of them under
+/// manual sort; under status sort, which draws by status first, those of
+/// the moved unit's status.
+fn drawn_by_order(
+    board: &wt_tui::Board,
+    status_sort: bool,
+    drawn: &[String],
+    unit: &str,
+) -> Vec<String> {
+    let rank = wt_tui::unit_rank(board, unit);
+    drawn
+        .iter()
+        .filter(|other| !status_sort || wt_tui::unit_rank(board, other) == rank)
+        .cloned()
+        .collect()
+}
+
+/// The rows a press moves together must be one stack as this host knows it:
+/// each is the unit's own row or stacked, however deep, on it.
+fn check_unit_rows(board: &wt_tui::Board, unit: &str, rows: &[String]) -> Result<()> {
+    let parent = |key: &str| {
+        board
+            .rows
+            .iter()
+            .find(|row| row.key == key)
+            .and_then(|row| row.stack_parent.as_deref())
+    };
+    for row in rows {
+        let mut at = row.as_str();
+        // Bounded by the rows listed, so a malformed cycle of parents ends.
+        let mut steps = 0;
+        while at != unit {
+            match parent(at) {
+                Some(above) if steps < board.rows.len() => at = above,
+                _ => {
+                    return Err(wt_app_core::host_errors::stale(format!(
+                        "{row} is no longer stacked on {unit}"
+                    )));
+                }
+            }
+            steps += 1;
+        }
+    }
+    Ok(())
 }
 
 /// Delete a named section; its rows (live, archived and remote) return to
@@ -657,15 +708,25 @@ mod tests {
             .unwrap();
         let mut ctx = fixture.ctx.clone();
         std::sync::Arc::make_mut(&mut ctx.config).ui.sort = wt_config::UiSort::Manual;
-        reorder(&ctx, Some(last.clone()), "Next".into(), true, Some(&board))
+        press(&ctx, &board, &board, Some(last.as_str()), "Next", true)
             .await
             .unwrap_err();
+        // An empty named section is on screen and takes the row.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.place_slug("ghost", Some("Later"), false)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         board.sections.push(wt_tui::BoardSection {
             key: "Later".into(),
             title: "Later".into(),
             ..Default::default()
         });
-        reorder(&ctx, Some(last.clone()), "Next".into(), true, Some(&board))
+        press(&ctx, &board, &board, Some(last.as_str()), "Next", true)
             .await
             .unwrap();
         let (one, two) = sections(&fixture).await;
@@ -741,20 +802,51 @@ mod tests {
         );
         for down in [true, false] {
             refused(
+                press(&fixture.ctx, &board, &board, Some("one"), &done, down)
+                    .await
+                    .unwrap_err(),
+            );
+            refused(
+                press(&fixture.ctx, &board, &board, None, &done, down)
+                    .await
+                    .unwrap_err(),
+            );
+            // The host refuses on its own account, whatever the request says.
+            refused(
                 reorder(
                     &fixture.ctx,
                     Some("one".into()),
                     done.clone(),
                     down,
+                    wt_tui::ReorderStep::Cross {
+                        unit: "one".into(),
+                        rows: vec!["one".into()],
+                        units: vec!["one".into()],
+                        to: "Batch".into(),
+                        to_units: vec!["two".into()],
+                    },
                     Some(&board),
                 )
                 .await
                 .unwrap_err(),
             );
             refused(
-                reorder(&fixture.ctx, None, done.clone(), down, Some(&board))
-                    .await
-                    .unwrap_err(),
+                reorder(
+                    &fixture.ctx,
+                    Some("two".into()),
+                    "Batch".into(),
+                    down,
+                    wt_tui::ReorderStep::Cross {
+                        unit: "two".into(),
+                        rows: vec!["two".into()],
+                        units: vec!["two".into()],
+                        to: done.clone(),
+                        to_units: vec!["one".into()],
+                    },
+                    Some(&board),
+                )
+                .await
+                .unwrap_err(),
             );
         }
         // Into it: a row at the bottom of the last stored section has
@@ -766,17 +858,11 @@ mod tests {
             .map(|section| section.key.as_str())
             .collect();
         assert_eq!(order, ["Batch", done.as_str()]);
-        let bottom = reorder(
-            &fixture.ctx,
-            Some("two".into()),
-            "Batch".into(),
-            true,
-            Some(&board),
-        )
-        .await
-        .unwrap_err();
+        let bottom = press(&fixture.ctx, &board, &board, Some("two"), "Batch", true)
+            .await
+            .unwrap_err();
         assert_eq!(bottom.to_string(), "already at bottom");
-        let bottom = reorder(&fixture.ctx, None, "Batch".into(), true, Some(&board))
+        let bottom = press(&fixture.ctx, &board, &board, None, "Batch", true)
             .await
             .unwrap_err();
         assert_eq!(bottom.to_string(), "section already at bottom");
@@ -973,15 +1059,10 @@ mod tests {
             .unwrap();
         let mut board =
             wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
-        reorder(
-            &fixture.ctx,
-            Some("one".into()),
-            wt_sources::board_layout::INBOX.into(),
-            true,
-            Some(&board),
-        )
-        .await
-        .unwrap();
+        let inbox = wt_sources::board_layout::INBOX;
+        press(&fixture.ctx, &board, &board, Some("one"), inbox, true)
+            .await
+            .unwrap();
         let state = fixture
             .ctx
             .database
@@ -1002,19 +1083,30 @@ mod tests {
         assert_eq!(board.rows[inbox.rows[0]].key, "two");
         let first = inbox.rows[0];
         board.rows[first].work_rank = 0;
+        board.display.status_sort = true;
         let mut ctx = fixture.ctx.clone();
         std::sync::Arc::make_mut(&mut ctx.config).ui.sort = wt_config::UiSort::Status;
-        assert!(
-            reorder(
-                &ctx,
-                Some("two".into()),
-                wt_sources::board_layout::INBOX.into(),
-                true,
-                Some(&board)
-            )
+        let inbox = wt_sources::board_layout::INBOX;
+        let pinned = press(&ctx, &board, &board, Some("two"), inbox, true)
             .await
-            .is_err()
-        );
+            .unwrap_err();
+        assert_eq!(pinned.to_string(), wt_tui::STATUS_SORT_PINS);
+        // The host applies the rule itself to a request that ignores it.
+        let pinned = reorder(
+            &ctx,
+            Some("two".into()),
+            inbox.into(),
+            true,
+            wt_tui::ReorderStep::Pass {
+                unit: "two".into(),
+                past: "one".into(),
+                units: vec!["two".into(), "one".into()],
+            },
+            Some(&board),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(pinned.to_string(), wt_tui::STATUS_SORT_PINS);
         // An empty derived group is not drawn, so moving down past the last
         // row skips it; an empty named section is on screen and takes the row.
         board.sections.push(wt_tui::BoardSection {
@@ -1023,30 +1115,27 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            reorder(
-                &fixture.ctx,
-                Some("one".into()),
-                wt_sources::board_layout::INBOX.into(),
-                true,
-                Some(&board),
-            )
-            .await
-            .is_err()
+            press(&fixture.ctx, &board, &board, Some("one"), inbox, true)
+                .await
+                .is_err()
         );
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.place_slug("ghost", Some("Next"), false)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
         board.sections.push(wt_tui::BoardSection {
             key: "Next".into(),
             title: "Next".into(),
             ..Default::default()
         });
-        reorder(
-            &fixture.ctx,
-            Some("one".into()),
-            wt_sources::board_layout::INBOX.into(),
-            true,
-            Some(&board),
-        )
-        .await
-        .unwrap();
+        press(&fixture.ctx, &board, &board, Some("one"), inbox, true)
+            .await
+            .unwrap();
         let state = fixture
             .ctx
             .database
@@ -1054,6 +1143,527 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(state["slugs"]["one"]["section"], "Next");
+        fixture.close().await.unwrap();
+    }
+
+    /// Send the press a person looking at `seen` would make to a host whose
+    /// own board is `host`. A press that moves nothing is a notice, as the
+    /// terminal says it.
+    async fn press(
+        ctx: &AppContext,
+        seen: &wt_tui::Board,
+        host: &wt_tui::Board,
+        key: Option<&str>,
+        section: &str,
+        down: bool,
+    ) -> Result<UiReply> {
+        let step = wt_tui::plan_reorder(seen, key, section, down)
+            .map_err(wt_app_core::host_errors::notice)?;
+        reorder(
+            ctx,
+            key.map(str::to_owned),
+            section.to_owned(),
+            down,
+            step,
+            Some(host),
+        )
+        .await
+    }
+
+    /// The same press, also shown on `seen` the way the terminal shows it
+    /// before the host has answered.
+    async fn press_and_show(
+        ctx: &AppContext,
+        seen: &mut wt_tui::Board,
+        host: &wt_tui::Board,
+        key: Option<&str>,
+        section: &str,
+        down: bool,
+    ) -> Result<UiReply> {
+        use wt_runtime::Mutation;
+        let step = wt_tui::plan_reorder(seen, key, section, down)
+            .map_err(wt_app_core::host_errors::notice)?;
+        let action = wt_tui::UiAction::Reorder {
+            key: key.map(str::to_owned),
+            section: section.to_owned(),
+            down,
+            step: step.clone(),
+        };
+        let wt_tui::Effect::Mutation(shown) = action.effect(seen) else {
+            panic!("a reorder changes the board");
+        };
+        shown.apply(seen);
+        reorder(
+            ctx,
+            key.map(str::to_owned),
+            section.to_owned(),
+            down,
+            step,
+            Some(host),
+        )
+        .await
+    }
+
+    async fn stored(fixture: &wt_app_core::test_support::CommandFixture) -> serde_json::Value {
+        fixture
+            .ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap()
+    }
+
+    /// `board` laid out again, under manual sort, from what is stored now.
+    async fn relaid(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        board: &wt_tui::Board,
+    ) -> wt_tui::Board {
+        let mut board = board.clone();
+        // The board source files a remote row from the controller's layout.
+        let mut state = stored(fixture).await;
+        let remote = state["remoteLayouts"].clone();
+        for (key, layout) in remote.as_object().into_iter().flatten() {
+            state["slugs"][key] = layout.clone();
+        }
+        wt_sources::board_layout::prepare(
+            &mut board,
+            &state,
+            &fixture.ctx.config.branch.base,
+            wt_config::UiSort::Manual,
+        );
+        board.display.status_sort = false;
+        board
+    }
+
+    fn drawn(board: &wt_tui::Board, section: &str) -> Vec<String> {
+        board
+            .sections
+            .iter()
+            .find(|drawn| drawn.key == section)
+            .map(|drawn| {
+                drawn
+                    .rows
+                    .iter()
+                    .map(|&row| board.rows[row].key.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The fixture's board with rows that exist only on it. A reorder
+    /// writes placement, which needs no checkout.
+    async fn board_with(
+        fixture: &wt_app_core::test_support::CommandFixture,
+        extra: &[&str],
+    ) -> wt_tui::Board {
+        let facts = fixture
+            .ctx
+            .repository
+            .inventory_status(&fixture.ctx.cancellation)
+            .await
+            .unwrap();
+        let state = stored(fixture).await;
+        let mut board =
+            wt_sources::inventory::board(&fixture.ctx.config, &facts, &state, &Default::default());
+        for key in extra {
+            let mut row = board
+                .rows
+                .iter()
+                .find(|row| row.key == "one")
+                .unwrap()
+                .clone();
+            row.key = (*key).into();
+            row.slug = (*key).into();
+            row.branch = format!("feature/{key}");
+            if let Some(reference) = wt_core::parse_worktree_ledger_key(key)
+                && let wt_core::WorktreeRef::Remote { host, .. } = reference
+            {
+                row.host = Some(host);
+            }
+            board.rows.push(row);
+        }
+        relaid(fixture, &board).await
+    }
+
+    fn manual(fixture: &wt_app_core::test_support::CommandFixture) -> AppContext {
+        let mut ctx = fixture.ctx.clone();
+        std::sync::Arc::make_mut(&mut ctx.config).ui.sort = wt_config::UiSort::Manual;
+        ctx
+    }
+
+    fn is_stale(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.is::<wt_app_core::host_errors::Stale>())
+    }
+
+    /// The regression this guards: the host chose the neighbour from its own
+    /// board, which still showed the order from before its last write, and
+    /// swapped the same pair back.
+    #[tokio::test]
+    async fn a_burst_of_presses_lands_each_one_on_a_host_whose_board_is_behind() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = manual(&fixture);
+        let inbox = wt_sources::board_layout::INBOX;
+        // The host's board is never read again here; the person's follows
+        // each press.
+        let behind = board_with(&fixture, &["four", "three"]).await;
+        assert_eq!(drawn(&behind, inbox), ["four", "one", "three", "two"]);
+        let mut seen = behind.clone();
+        for _ in 0..3 {
+            press_and_show(&ctx, &mut seen, &behind, Some("four"), inbox, true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(drawn(&seen, inbox), ["one", "three", "two", "four"]);
+        assert_eq!(
+            drawn(&relaid(&fixture, &behind).await, inbox),
+            drawn(&seen, inbox)
+        );
+        for _ in 0..2 {
+            press_and_show(&ctx, &mut seen, &behind, Some("four"), inbox, false)
+                .await
+                .unwrap();
+        }
+        assert_eq!(drawn(&seen, inbox), ["one", "four", "three", "two"]);
+        assert_eq!(
+            drawn(&relaid(&fixture, &behind).await, inbox),
+            drawn(&seen, inbox)
+        );
+
+        // A press resolved from the board that shows none of it is refused
+        // inside the write, and stores nothing.
+        let before = stored(&fixture).await;
+        let error = press(&ctx, &behind, &behind, Some("four"), inbox, true)
+            .await
+            .unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        assert_eq!(stored(&fixture).await, before);
+
+        // Another process reorders the section between the person's look
+        // and their press.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                let theirs: Vec<String> =
+                    ["one", "four", "three", "two"].map(str::to_owned).to_vec();
+                let shown = wt_store::ShownSection {
+                    name: None,
+                    drawn: &theirs,
+                    ordered: &theirs,
+                };
+                Ok(store.swap_shown_units(shown, "three", "two")?)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let error = press(&ctx, &seen, &behind, Some("one"), inbox, true)
+            .await
+            .unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        assert_eq!(error.to_string(), "three and two have changed places");
+        // The list then shows the true order, and a press from it goes through.
+        let truth = relaid(&fixture, &behind).await;
+        assert_eq!(drawn(&truth, inbox), ["one", "four", "two", "three"]);
+        press(&ctx, &truth, &behind, Some("one"), inbox, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            drawn(&relaid(&fixture, &behind).await, inbox),
+            ["four", "one", "two", "three"]
+        );
+        // A row the host no longer lists was shown by an older board.
+        let mut gone = behind.clone();
+        gone.rows.retain(|row| row.key != "three");
+        let error = press(&ctx, &truth, &gone, Some("one"), inbox, true)
+            .await
+            .unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stack_reorders_as_one_unit_and_remote_rows_keep_their_own_layout() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = manual(&fixture);
+        let inbox = wt_sources::board_layout::INBOX;
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.set_slug_base("two", Some(("feature/one", None)))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let remote = "@remote/box/far";
+        let behind = board_with(&fixture, &["three", remote]).await;
+        // A unit sorts by its root, wherever its members would sort alone.
+        assert_eq!(drawn(&behind, inbox), [remote, "one", "two", "three"]);
+        let two = behind.rows.iter().find(|row| row.key == "two").unwrap();
+        assert_eq!(two.stack_parent.as_deref(), Some("one"));
+        let mut seen = behind.clone();
+        // From the member: the whole stack passes its neighbour.
+        press_and_show(&ctx, &mut seen, &behind, Some("two"), inbox, true)
+            .await
+            .unwrap();
+        assert_eq!(drawn(&seen, inbox), [remote, "three", "one", "two"]);
+        assert_eq!(
+            drawn(&relaid(&fixture, &behind).await, inbox),
+            drawn(&seen, inbox)
+        );
+        // The remote row's order is the controller's, in its own collection.
+        press_and_show(&ctx, &mut seen, &behind, Some(remote), inbox, true)
+            .await
+            .unwrap();
+        assert_eq!(drawn(&seen, inbox), ["three", remote, "one", "two"]);
+        assert_eq!(
+            drawn(&relaid(&fixture, &behind).await, inbox),
+            drawn(&seen, inbox)
+        );
+        let state = stored(&fixture).await;
+        assert!(state["remoteLayouts"][remote]["order"].is_number());
+        assert!(state["slugs"].get(remote).is_none());
+
+        // A member filed in another section is a unit there, and crossing
+        // back takes only it.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.move_worktrees_to_section(&["two".to_owned()], Some("Later"))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let split = relaid(&fixture, &behind).await;
+        assert_eq!(drawn(&split, "Later"), ["two"]);
+        assert_eq!(drawn(&split, inbox), ["three", remote, "one"]);
+        let mut seen = split.clone();
+        // The Inbox is drawn above Later here, so up leaves Later for its
+        // bottom.
+        press_and_show(&ctx, &mut seen, &split, Some("two"), "Later", false)
+            .await
+            .unwrap();
+        let state = stored(&fixture).await;
+        assert!(state["slugs"]["two"]["section"].is_null());
+        assert!(state["slugs"]["one"]["section"].is_null());
+        assert_eq!(drawn(&seen, inbox), ["three", remote, "one", "two"]);
+        assert_eq!(
+            drawn(&relaid(&fixture, &split).await, inbox),
+            drawn(&seen, inbox)
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_sort_compares_and_moves_only_within_one_status() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut ctx = fixture.ctx.clone();
+        std::sync::Arc::make_mut(&mut ctx.config).ui.sort = wt_config::UiSort::Status;
+        let inbox = wt_sources::board_layout::INBOX;
+        // Stored manual order: one, three, two.
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                for key in ["one", "three", "two"] {
+                    store.place_slug(key, None, false)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Status sort draws "three" first: its status ranks before theirs.
+        let mut board = board_with(&fixture, &["three"]).await;
+        assert_eq!(drawn(&board, inbox), ["one", "three", "two"]);
+        let index = |board: &wt_tui::Board, key: &str| {
+            board.rows.iter().position(|row| row.key == key).unwrap()
+        };
+        let (one, two, three) = (
+            index(&board, "one"),
+            index(&board, "two"),
+            index(&board, "three"),
+        );
+        board.rows[three].work_rank = 0;
+        board.display.status_sort = true;
+        let section = board
+            .sections
+            .iter_mut()
+            .find(|section| section.key == inbox)
+            .unwrap();
+        section.rows = vec![three, one, two];
+        // "one" passes "two"; "three" keeps its place in the manual order
+        // although the list drawn does not show it there.
+        let mut seen = board.clone();
+        press_and_show(&ctx, &mut seen, &board, Some("one"), inbox, true)
+            .await
+            .unwrap();
+        assert_eq!(drawn(&seen, inbox), ["three", "two", "one"]);
+        assert_eq!(
+            drawn(&relaid(&fixture, &board).await, inbox),
+            ["three", "two", "one"]
+        );
+        // Under manual sort the list drawn is the witness, and this one was
+        // never the stored order.
+        let error = press(&manual(&fixture), &board, &board, Some("one"), inbox, true)
+            .await
+            .unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        // A neighbour of another status is not passed.
+        let pinned = press(&ctx, &seen, &board, Some("two"), inbox, false)
+            .await
+            .unwrap_err();
+        assert_eq!(pinned.to_string(), wt_tui::STATUS_SORT_PINS);
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_section_moves_past_the_one_shown_on_a_host_whose_board_is_behind() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = manual(&fixture);
+        fixture
+            .ctx
+            .database
+            .call(|store| {
+                store.place_slug("one", Some("First"), false)?;
+                store.place_slug("two", Some("Second"), false)?;
+                store.place_slug("ghost", Some("Third"), false)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let behind = board_with(&fixture, &[]).await;
+        let named = |board: &wt_tui::Board| -> Vec<String> {
+            board
+                .sections
+                .iter()
+                .filter(|section| !section.key.starts_with('\0'))
+                .map(|section| section.key.clone())
+                .collect()
+        };
+        assert_eq!(named(&behind), ["First", "Second", "Third"]);
+        let mut seen = behind.clone();
+        for _ in 0..2 {
+            press_and_show(&ctx, &mut seen, &behind, None, "First", true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(named(&seen), ["Second", "Third", "First"]);
+        assert_eq!(named(&relaid(&fixture, &behind).await), named(&seen));
+        let error = press(&ctx, &behind, &behind, None, "First", true)
+            .await
+            .unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        assert_eq!(named(&relaid(&fixture, &behind).await), named(&seen));
+        // A crossing refused inside the write leaves no claim that the move
+        // was this process's own.
+        let crossing = |rows: &[&str], to_units: &[&str]| wt_tui::ReorderStep::Cross {
+            unit: "two".into(),
+            rows: rows.iter().map(|row| (*row).to_owned()).collect(),
+            units: vec!["two".into()],
+            to: "Third".into(),
+            to_units: to_units.iter().map(|unit| (*unit).to_owned()).collect(),
+        };
+        let cross = |step| {
+            reorder(
+                &ctx,
+                Some("two".into()),
+                "Second".into(),
+                true,
+                step,
+                Some(&behind),
+            )
+        };
+        let error = cross(crossing(&["two"], &["one"])).await.unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        assert_eq!(error.to_string(), "one is filed elsewhere now");
+        assert!(!fixture.ctx.section_writes.consume("two", Some("Third")));
+        // Rows that are not one stack do not move as one unit.
+        let error = cross(crossing(&["two", "one"], &[])).await.unwrap_err();
+        assert!(is_stale(&error), "{error:#}");
+        assert_eq!(stored(&fixture).await["slugs"]["one"]["section"], "First");
+        // A row at the edge enters the section the person saw next.
+        press_and_show(&ctx, &mut seen, &behind, Some("two"), "Second", true)
+            .await
+            .unwrap();
+        assert_eq!(stored(&fixture).await["slugs"]["two"]["section"], "Third");
+        assert!(fixture.ctx.section_writes.consume("two", Some("Third")));
+        fixture.close().await.unwrap();
+    }
+
+    /// Measurement, not a check. Run with
+    /// `cargo test -p wt-host timing_of_a_press -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "timing measurement of one J or K press"]
+    async fn timing_of_a_press_shown_and_stored() {
+        use std::time::{Duration, Instant};
+        use wt_runtime::Mutation;
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = manual(&fixture);
+        let inbox = wt_sources::board_layout::INBOX;
+        let extra: Vec<String> = (0..40).map(|row| format!("r{row:02}")).collect();
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let behind = board_with(&fixture, &extra).await;
+        let mut seen = behind.clone();
+        let (mut shown, mut written, mut reread) = (Vec::new(), Vec::new(), Vec::new());
+        for press in 0..60 {
+            let down = (press / 20) % 2 == 0;
+            // What the keypress waits for now: resolving and showing it.
+            let started = Instant::now();
+            let step = wt_tui::plan_reorder(&seen, Some("one"), inbox, down).unwrap();
+            let action = wt_tui::UiAction::Reorder {
+                key: Some("one".into()),
+                section: inbox.into(),
+                down,
+                step: step.clone(),
+            };
+            let wt_tui::Effect::Mutation(change) = action.effect(&seen) else {
+                panic!("a reorder changes the board");
+            };
+            change.apply(&mut seen);
+            shown.push(started.elapsed());
+            let started = Instant::now();
+            reorder(
+                &ctx,
+                Some("one".into()),
+                inbox.into(),
+                down,
+                step,
+                Some(&behind),
+            )
+            .await
+            .unwrap();
+            written.push(started.elapsed());
+            // What it waited for before, at the least: the write, then the
+            // stored state read again and the board laid out from it.
+            let again = relaid(&fixture, &behind).await;
+            reread.push(started.elapsed());
+            assert_eq!(drawn(&again, inbox), drawn(&seen, inbox));
+        }
+        let report = |name: &str, samples: &mut Vec<Duration>| {
+            samples.sort();
+            println!(
+                "{name}: p50 {:?}, p90 {:?}, max {:?}",
+                samples[samples.len() / 2],
+                samples[samples.len() * 9 / 10],
+                samples[samples.len() - 1]
+            );
+        };
+        report("shown at the keypress", &mut shown);
+        report("stored by the host", &mut written);
+        report("stored, read again and laid out", &mut reread);
         fixture.close().await.unwrap();
     }
 

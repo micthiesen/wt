@@ -305,6 +305,7 @@ fn backspace_on_an_empty_extras_prompt_keeps_it_open() {
                 surface: ActionSurface::Row { key: "one".into() },
                 id: "custom".into(),
                 arg: None,
+                seen: None,
             },
             prompt: "Prompt: ".into(),
             initial: String::new(),
@@ -339,45 +340,34 @@ fn confirm_cancels_on_n() {
 
 #[test]
 fn palettes_confirm_on_their_own_opener_and_ignore_digits() {
-    for (surface, opener) in [
-        (ActionSurface::Manager { key: None }, 'M'),
-        (
-            ActionSurface::Slot {
-                target: SessionTarget::WtSource,
-            },
-            '<',
-        ),
-        (ActionSurface::Row { key: "one".into() }, '!'),
+    // The first entry of each palette: a manager and a slot prompt open
+    // their instructions, a row's shell action commits.
+    for (opener, first) in [
+        ('M', "manager-digest"),
+        ('<', "slot-continue"),
+        ('!', "teardown"),
     ] {
-        let mut model = model_with(&["one"]);
-        model.reply(UiReply {
-            modal: Some(UiModal::Picker {
-                action: PickerAction::Actions {
-                    surface: surface.clone(),
-                },
-                title: "Commands".into(),
-                options: vec![PickerOption {
-                    value: Some("digest".into()),
-                    label: "Digest".into(),
-                    chord: Some('d'),
-                    note: None,
-                    verify_after_merge: None,
-                    verify_in: None,
-                    detail: None,
-                }],
-                selected: 0,
-            }),
-            ..Default::default()
-        });
+        let mut shown = crate::menus::palette::tests::board();
+        shown.rows[0].action_facts.deployed = true;
+        let mut model = Model::default();
+        model.apply(SourceSnapshot::test_live(
+            Some(shown),
+            SourceState::Ready,
+            wt_core::Domain::Git,
+        ));
+        assert_eq!(ch(&mut model, opener), InputResult::Draw);
         assert_eq!(ch(&mut model, '1'), InputResult::Unchanged);
-        assert_eq!(
-            ch(&mut model, opener),
-            InputResult::Action(UiAction::PrepareAction {
-                surface,
-                id: "digest".into(),
-                arg: None,
-            })
-        );
+        let committed = ch(&mut model, opener);
+        match &model.interaction {
+            Interaction::Text(prompt) => assert!(
+                matches!(&prompt.action, TextAction::ActionExtras { id, .. } if id == first),
+                "{opener}"
+            ),
+            _ => assert!(
+                matches!(&committed, InputResult::Action(UiAction::RunAction { id, .. }) if id == first),
+                "{opener}: {committed:?}"
+            ),
+        }
     }
 }
 
@@ -1014,11 +1004,7 @@ fn status_note_starts_empty() {
 #[test]
 fn live_log_closes_on_its_key_and_refresh_keeps_scroll() {
     let mut model = model_with(&["a"]);
-    let refresh = UiAction::PrepareAction {
-        surface: ActionSurface::Row { key: "a".into() },
-        id: "dev-logs".into(),
-        arg: None,
-    };
+    let refresh = UiAction::PrepareDevLogs { key: "a".into() };
     let log = |lines: usize| UiReply {
         modal: Some(UiModal::Log {
             title: "a dev logs".into(),

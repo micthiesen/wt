@@ -172,7 +172,10 @@ Sections are asserted by people and agents. With `[ui] owed_sections = true`
 (off by default) the board instead draws every landed, unarchived local row
 in **one** derived block, **Landed** ([tui.md](tui.md)), in landing order.
 The board has no block per stage: each row in Landed carries a label saying
-what it waits for next.
+what it waits for next. A row being removed stays in the block, labelled
+`removing` in place of what it waited for, and the header stops counting it
+([tui.md](tui.md)); the removal record stores `landed` and `wasArchived` so
+the row keeps its place after its checkout is gone.
 
 The headings below exist only in `wt owed --all`, which groups every
 worktree's items under them. One function, `wt_core::OwedBlock`, gives both

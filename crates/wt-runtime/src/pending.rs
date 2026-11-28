@@ -98,6 +98,12 @@ pub struct PendingLimits {
     /// floor plus a slow, retried read.
     pub accepted_github_cap: Duration,
     pub accepted_local: Duration,
+    /// How far the accepted deadline of a local change stretches while no
+    /// read that started after the write has finished. A local read takes
+    /// well under a second, but it can sit behind a loaded machine or an
+    /// SSH hop; a change is reported as not shown only once a read that
+    /// could have shown it has come back without it.
+    pub accepted_local_cap: Duration,
     pub unconfirmed: Duration,
 }
 
@@ -109,6 +115,7 @@ impl Default for PendingLimits {
             // 10s GitHub rate floor + the client's 100s retry budget + slack.
             accepted_github_cap: Duration::from_secs(120),
             accepted_local: Duration::from_secs(12),
+            accepted_local_cap: Duration::from_secs(60),
             unconfirmed: Duration::from_secs(30),
         }
     }
@@ -124,8 +131,10 @@ impl PendingLimits {
         };
         let cap = if domains.contains(&Domain::Github) {
             self.accepted_github_cap.max(deadline)
-        } else {
+        } else if domains.iter().any(|domain| domain.slow_reads()) {
             deadline
+        } else {
+            self.accepted_local_cap.max(deadline)
         };
         (deadline, cap)
     }
@@ -680,6 +689,51 @@ mod tests {
         let expired = pending.settle(&stale, |_, _| Some(before), Instant::now());
         assert_eq!(expired.len(), 1);
         assert!(pending.is_empty());
+    }
+
+    /// A local read is quick, but one held up past the accepted deadline (a
+    /// loaded machine, a slow hop to another host) says nothing about the
+    /// change. Only a read that could have shown it, or the cap, ends it.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_change_outlives_its_deadline_until_a_read_could_have_shown_it() {
+        let mut pending = Pending::default();
+        let rows: std::collections::BTreeMap<_, _> = [("a", true)].into_iter().collect();
+        let gone = std::collections::BTreeMap::new();
+        let before = Stamp::now();
+        tokio::time::advance(Duration::from_millis(10)).await;
+        pending.begin(1, Drop(&["a"]), Instant::now());
+        pending.accept(1, Stamp::now(), Instant::now());
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert!(
+            pending
+                .settle(&rows, |_, _| Some(before), Instant::now())
+                .is_empty(),
+            "no read that started after the write has finished yet"
+        );
+        assert_eq!(pending.len(), 1);
+        let mut shown = pending.clone();
+        assert!(
+            shown
+                .settle(&gone, |_, _| Some(Stamp::now()), Instant::now())
+                .is_empty()
+        );
+        assert!(shown.is_empty(), "the late read settled it");
+        // A read after the write that disagrees still ends it at once.
+        let mut disagreed = pending.clone();
+        assert_eq!(
+            disagreed
+                .settle(&rows, |_, _| Some(Stamp::now()), Instant::now())
+                .len(),
+            1
+        );
+        tokio::time::advance(Duration::from_secs(41)).await;
+        assert_eq!(
+            pending
+                .settle(&rows, |_, _| Some(before), Instant::now())
+                .len(),
+            1,
+            "the cap still bounds it"
+        );
     }
 
     #[tokio::test(start_paused = true)]

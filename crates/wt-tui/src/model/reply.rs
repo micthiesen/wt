@@ -154,17 +154,10 @@ impl Model {
                 )
             })
             .filter(|(keys, _, _)| !keys.is_empty());
-        // A confirm is the user's own when the menu they asked for is one. A
-        // palette request asks for a list or a prompt, never for a confirm.
+        // A confirm is the user's own when the menu they asked for is one.
         let requested_menu = by_key
             || completed_request.as_ref().is_some_and(|request| {
-                request.generation == self.ui_generation
-                    && request.preparation
-                    && !matches!(
-                        request.action,
-                        crate::UiAction::PrepareActions { .. }
-                            | crate::UiAction::PrepareAction { .. }
-                    )
+                request.generation == self.ui_generation && request.preparation
             });
         let selected_create = self.reply_pending(&reply);
         let (stale, stale_id, stale_message) =
@@ -361,16 +354,22 @@ impl Model {
                 title,
                 lines,
                 cancel_key,
-            }) => self.reply_confirm(
-                ConfirmPrompt {
-                    action,
-                    title,
-                    lines,
-                    selected: 0,
-                    cancel_key,
-                },
-                requested_menu,
-            ),
+            }) => {
+                // A palette key asks for a list. The stop confirmation that
+                // opens in its place while an action runs was not asked for.
+                let requested =
+                    requested_menu && !matches!(action, crate::ConfirmAction::KillAction { .. });
+                self.reply_confirm(
+                    ConfirmPrompt {
+                        action,
+                        title,
+                        lines,
+                        selected: 0,
+                        cancel_key,
+                    },
+                    requested,
+                )
+            }
             Some(UiModal::Picker {
                 action,
                 title,
@@ -529,8 +528,8 @@ mod tests {
     use super::super::{InputResult, Interaction, Model, ToastTone, input::TYPEAHEAD_LIMIT};
     use crate::{ActionSurface, Board, BoardRow, PickerAction, PickerOption, UiModal, UiReply};
 
-    /// Open the row's action menu with `keys` typed while it loaded and a
-    /// reply carrying `message`.
+    /// Open a host-built menu for the row with `keys` typed while it loaded
+    /// and a reply carrying `message`.
     fn overflowing_menu(first: KeyCode, message: &str) -> Model {
         let mut model = Model::default();
         model.apply(SourceSnapshot::test_live(
@@ -545,9 +544,9 @@ mod tests {
             SourceState::Ready,
             wt_core::Domain::Git,
         ));
-        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20)
         else {
-            panic!("`!` opens the action menu")
+            panic!("`v` asks the host for its menu")
         };
         let generation = model.ui_generation;
         model.begin_action(42, &action);

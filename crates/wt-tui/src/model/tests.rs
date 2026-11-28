@@ -242,18 +242,19 @@ fn grouped(keys: &[&str], folded: bool) -> SourceSnapshot<Board> {
 }
 
 #[test]
-fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
+fn a_delayed_host_menu_keeps_fast_chords_and_ignores_unrelated_replies() {
     for host in [None, Some("maxbook".to_owned())] {
         let mut model = Model::default();
         model.apply(snapshot(&["one", "two"]));
-        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char(';')), 20)
         else {
             panic!()
         };
         let generation = model.ui_generation;
         model.begin_action(42, &action);
+        // `d` stops the highlighted session once the picker is there.
         assert_eq!(
-            model.input(KeyEvent::from(KeyCode::Char('m')), 20),
+            model.input(KeyEvent::from(KeyCode::Char('d')), 20),
             InputResult::Draw
         );
         assert_eq!(model.ui_generation, generation);
@@ -265,21 +266,31 @@ fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
         });
         assert!(model.pending_request.is_some());
         model.apply(snapshot(&["two", "one"]));
-        let surface = crate::ActionSurface::Row { key: "one".into() };
+        let selection = crate::SessionSelection {
+            key: Some("one".into()),
+            target: crate::SessionTarget::Harness,
+            harness: wt_core::HarnessId::Claude,
+            session_id: Some("s1".into()),
+            live_slot: None,
+            managed_name: None,
+            mode: crate::SessionMode::Resume,
+            live: true,
+            seen_live: None,
+        };
         model.reply(UiReply {
             operation_id: Some(42),
             ui_generation: Some(generation),
             modal_host: host.clone(),
             modal: Some(UiModal::Picker {
-                action: PickerAction::Actions {
-                    surface: surface.clone(),
+                action: PickerAction::Sessions {
+                    choices: vec![selection.clone()],
                 },
-                title: "Actions".into(),
+                title: "sessions".into(),
                 selected: 0,
                 options: vec![PickerOption {
-                    value: Some(crate::AUTO_MERGE_ACTION_ID.into()),
-                    label: "Merge".into(),
-                    chord: Some('m'),
+                    value: Some(crate::session_value(&selection)),
+                    label: "Claude · live".into(),
+                    chord: None,
                     note: None,
                     verify_after_merge: None,
                     verify_in: None,
@@ -289,11 +300,7 @@ fn delayed_palette_keeps_fast_chords_and_ignores_unrelated_replies() {
             ..Default::default()
         });
         assert!(model.pending_request.is_none());
-        let expected = UiAction::PrepareAction {
-            surface,
-            id: crate::AUTO_MERGE_ACTION_ID.into(),
-            arg: None,
-        };
+        let expected = UiAction::StopSession { selection };
         assert_eq!(
             model.follow_up,
             Some(match host {
@@ -312,7 +319,7 @@ fn keys_typed_while_a_menu_loads_replay_into_it_and_escape_cancels() {
     for key in [KeyCode::Null, KeyCode::Esc, KeyCode::Down] {
         let mut model = Model::default();
         model.apply(snapshot(&["one", "two"]));
-        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20)
         else {
             panic!()
         };
@@ -415,7 +422,7 @@ fn fast_session_close_never_reaches_board_remove() {
 async fn slow_menus_drop_typeahead_instead_of_replaying_it() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     let generation = model.ui_generation;
@@ -452,7 +459,7 @@ async fn slow_menus_drop_typeahead_instead_of_replaying_it() {
 fn replay_stops_when_the_menu_closes_so_keys_never_fall_through() {
     let mut model = Model::default();
     model.apply(snapshot(&["one", "two"]));
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     let generation = model.ui_generation;
@@ -487,7 +494,7 @@ fn pending_palette_cancellation_keys_discard_early_chord_immediately() {
     ] {
         let mut model = Model::default();
         model.apply(snapshot(&["one"]));
-        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
+        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20)
         else {
             panic!()
         };
@@ -522,7 +529,7 @@ fn pending_palette_cancellation_keys_discard_early_chord_immediately() {
 fn palette_failure_clears_buffer_and_never_runs_board_chord() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     model.begin_action(42, &action);
@@ -541,76 +548,63 @@ fn palette_failure_clears_buffer_and_never_runs_board_chord() {
 
 #[test]
 fn action_palette_chords_and_arguments_keep_the_original_target() {
+    let listed = |keys: &[&str]| {
+        let mut shown = snapshot(keys);
+        shown.test_data_mut().display.actions = crate::menus::palette::tests::catalog();
+        shown
+    };
     let mut model = Model::default();
-    model.apply(snapshot(&["one", "two"]));
+    model.apply(listed(&["one", "two"]));
     let surface = crate::ActionSurface::Row { key: "one".into() };
+    // The palette is the board's: it opens with the key.
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::Char('!')), 20),
-        InputResult::Action(UiAction::PrepareActions {
-            surface: surface.clone()
-        })
+        InputResult::Draw
     );
-    model.reply(UiReply {
-        modal: Some(UiModal::Picker {
-            action: PickerAction::Actions {
-                surface: surface.clone(),
-            },
-            title: "Actions".into(),
-            selected: 0,
-            options: vec![PickerOption {
-                value: Some("continue".into()),
-                label: "Continue".into(),
-                chord: Some('g'),
-                note: None,
-                verify_after_merge: None,
-                verify_in: None,
-                detail: None,
-            }],
-        }),
-        ..Default::default()
-    });
-    model.apply(snapshot(&["two", "one"]));
+    model.apply(listed(&["two", "one"]));
     assert_eq!(
         model.input(KeyEvent::from(KeyCode::Char('g')), 20),
-        InputResult::Action(UiAction::PrepareAction {
-            surface: surface.clone(),
-            id: "continue".into(),
-            arg: None
-        })
+        InputResult::Draw
     );
-    model.reply(UiReply {
-        modal: Some(UiModal::Text {
-            action: TextAction::ActionExtras {
-                surface: surface.clone(),
-                id: "continue".into(),
-                arg: Some("saved".into()),
-            },
-            prompt: "Extra instructions".into(),
-            initial: "go".into(),
-            allow_empty: true,
-        }),
-        ..Default::default()
-    });
+    let Interaction::Text(prompt) = &model.interaction else {
+        panic!("the chord opens the entry's instructions")
+    };
+    assert!(matches!(
+        &prompt.action,
+        TextAction::ActionExtras { surface: target, id, arg: None, .. }
+            if *target == surface && id == "agent-continue"
+    ));
+    model.input(KeyEvent::from(KeyCode::Char('g')), 20);
+    model.input(KeyEvent::from(KeyCode::Char('o')), 20);
     model.input(KeyEvent::from(KeyCode::Char('q')), 20);
-    assert_eq!(
+    assert!(matches!(
         model.input(KeyEvent::from(KeyCode::Enter), 20),
-        InputResult::Action(UiAction::RunAction {
-            surface,
-            id: "continue".into(),
-            arg: Some("saved".into()),
-            extras: "goq".into()
-        })
-    );
+        InputResult::Action(UiAction::RunAction { surface: target, id, arg: None, extras, .. })
+            if target == surface && id == "agent-continue" && extras == "goq"
+    ));
 }
 
 #[test]
 fn special_palettes_open_without_a_selected_worktree() {
     let mut model = Model::default();
+    let mut shown = snapshot(&[]);
+    shown.test_data_mut().display.actions = crate::menus::palette::tests::catalog();
+    model.apply(shown);
+    let mut opened = |key: char| {
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char(key)), 20),
+            InputResult::Draw
+        );
+        let Interaction::Picker(picker) = std::mem::take(&mut model.interaction) else {
+            panic!("{key} opened no palette")
+        };
+        picker.action
+    };
     assert_eq!(
-        model.input(KeyEvent::from(KeyCode::Char('M')), 20),
-        InputResult::Action(UiAction::PrepareActions {
+        opened('M'),
+        PickerAction::Actions {
             surface: crate::ActionSurface::Manager { key: None }
-        })
+        }
     );
     for (key, target) in [
         ('<', SessionTarget::WtSource),
@@ -618,10 +612,10 @@ fn special_palettes_open_without_a_selected_worktree() {
         ('\\', SessionTarget::Dotfiles),
     ] {
         assert_eq!(
-            model.input(KeyEvent::from(KeyCode::Char(key)), 20),
-            InputResult::Action(UiAction::PrepareActions {
+            opened(key),
+            PickerAction::Actions {
                 surface: crate::ActionSurface::Slot { target }
-            })
+            }
         );
     }
 }
@@ -2048,11 +2042,11 @@ fn an_unsent_request_leaves_nothing_for_the_next_one() {
     model.apply(snapshot(&["one"]));
     model.carry_typeahead = vec![(KeyEvent::from(KeyCode::Char('m')), 20)];
     model.committed_menu = Some(UiAction::PrepareStatus { key: "one".into() });
-    let InputResult::Action(_) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(_) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     model.request_not_sent();
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     model.begin_action(9, &action);
@@ -2171,7 +2165,7 @@ fn a_rebuild_keeps_the_section_picker_on_the_last_target() {
 fn keys_past_the_typeahead_limit_are_reported_when_the_menu_opens() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     let generation = model.ui_generation;
@@ -2787,7 +2781,7 @@ fn a_modal_from_a_request_in_flight_does_not_discard_an_open_removal_review() {
 fn keys_after_a_cancelled_loading_menu_never_reach_the_board() {
     let mut model = Model::default();
     model.apply(snapshot(&["one", "two"]));
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     let generation = model.ui_generation;
@@ -2837,7 +2831,7 @@ fn keys_after_a_cancelled_loading_menu_never_reach_the_board() {
 async fn a_cancelled_menu_that_never_answers_stops_holding_keys() {
     let mut model = Model::default();
     model.apply(snapshot(&["one", "two"]));
-    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20) else {
+    let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('v')), 20) else {
         panic!()
     };
     model.begin_action(42, &action);
@@ -2851,13 +2845,14 @@ async fn a_cancelled_menu_that_never_answers_stops_holding_keys() {
 fn the_opener_letter_is_text_for_a_loading_text_prompt() {
     let mut model = Model::default();
     model.apply(snapshot(&["one"]));
-    let surface = crate::ActionSurface::Row { key: "one".into() };
-    let action = UiAction::PrepareAction {
-        surface: surface.clone(),
-        id: "custom".into(),
-        arg: None,
+    // The name prompt for a host picked in the host menu is that host's.
+    let action = UiAction::OnHost {
+        host: Some("studio".into()),
+        action: Box::new(UiAction::PrepareCreate {
+            initial: String::new(),
+            placement: None,
+        }),
     };
-    // Palette chord `c` requested the custom prompt.
     model.last_key = Some(KeyEvent::from(KeyCode::Char('c')));
     model.begin_action(42, &action);
     let generation = model.ui_generation;
@@ -2873,12 +2868,8 @@ fn the_opener_letter_is_text_for_a_loading_text_prompt() {
         operation_id: Some(42),
         ui_generation: Some(generation),
         modal: Some(UiModal::Text {
-            action: TextAction::ActionExtras {
-                surface,
-                id: "custom".into(),
-                arg: None,
-            },
-            prompt: "Prompt".into(),
+            action: TextAction::Create { placement: None },
+            prompt: "New worktree".into(),
             initial: String::new(),
             allow_empty: false,
         }),
@@ -2891,39 +2882,32 @@ fn the_opener_letter_is_text_for_a_loading_text_prompt() {
 }
 
 #[test]
-fn typeahead_is_dropped_when_a_palette_request_returns_a_confirm() {
+fn keys_typed_for_a_palette_never_commit_the_stop_confirmation_in_its_place() {
     for typed in [KeyCode::Enter, KeyCode::Char('y')] {
         let mut model = Model::default();
-        model.apply(snapshot(&["one"]));
-        let InputResult::Action(action) = model.input(KeyEvent::from(KeyCode::Char('!')), 20)
-        else {
-            panic!()
-        };
-        let generation = model.ui_generation;
-        model.begin_action(42, &action);
-        model.input(KeyEvent::from(typed), 20);
-        model.reply(UiReply {
-            operation_id: Some(42),
-            ui_generation: Some(generation),
-            modal: Some(UiModal::Confirm {
-                action: ConfirmAction::KillAction {
-                    action_key: "one:check".into(),
-                    run_id: "run".into(),
-                },
-                title: "Stop check?".into(),
-                lines: vec![],
-                cancel_key: Some('!'),
-            }),
-            ..Default::default()
+        let mut shown = snapshot(&["one"]);
+        let board = shown.test_data_mut();
+        board.display.actions = crate::menus::palette::tests::catalog();
+        board.rows[0].action_facts.active_run = Some(crate::ActiveRunView {
+            action_key: "one".into(),
+            run_id: "run".into(),
+            action_name: "check".into(),
         });
+        model.apply(shown);
+        // A run is active, so the key that asks for the list opens the stop
+        // confirmation. What was typed next was meant for the list.
+        assert_eq!(
+            model.input(KeyEvent::from(KeyCode::Char('!')), 20),
+            InputResult::Draw
+        );
+        let result = model.input(KeyEvent::from(typed), 20);
         assert!(
-            model.follow_up.is_none(),
-            "{typed:?} typed for the palette stopped the action: {:?}",
-            model.follow_up
+            !matches!(result, InputResult::Action(_)),
+            "{typed:?} typed for the palette stopped the action: {result:?}"
         );
         assert!(matches!(model.interaction, Interaction::Confirm(_)));
         let (text, tone) = model.toast.clone().unwrap();
         assert_eq!(tone, ToastTone::Notice);
-        assert!(text.contains("dropped"), "{text}");
+        assert!(text.contains("just appeared"), "{text}");
     }
 }

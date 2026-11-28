@@ -67,9 +67,8 @@ so moving a merged head (`l`, `J`/`K`) moves only that row.
 
 With `[ui] owed_sections = true` (off by default) every landed, unarchived
 local row is drawn in one derived block, **Landed**, instead of its section.
-The block sits after the manual sections and the Inbox and before the rows
-being removed and the archive, is hidden while empty, and folds like a
-section. Its header counts its rows by where they stand, leaving out a count
+The block sits after the manual sections and the Inbox and before the
+archive, is hidden while empty, and folds like a section. Its header counts its rows by where they stand, leaving out a count
 of zero, open or folded; only `N due` is coloured, as its rows' own `due`
 labels are (red once anything is overdue). Folded, the name is on the left
 and the counts are at the right edge (`[×29] Landed      3 due · 24 waiting ·
@@ -109,6 +108,14 @@ heading `wt owed --all` lists the row under
 and the glyph cluster outrank the title: a long title is cut with an
 ellipsis to make room for them, and the label goes only in a pane too narrow
 for it and eight cells of title.
+
+With the option on there is no **Removing** section. A row being removed
+stays where it was drawn: in the Landed block, in its own section, or in
+Archived if it was archived before the removal. Its title is struck through
+while the removal runs. In the Landed block its label says `checking removal`
+until the worker has recorded the removal, then `removing`, or `removal
+failed` in the error colour, in place of what the row waited for, and the
+header stops counting the row.
 
 #### The Landed block's pane
 
@@ -182,11 +189,15 @@ inventory replaces that row without a duplicate. Navigation away is preserved
 when preparation or creation finishes. Worktree actions, including F12, become
 available when the real checkout is ready; F12 is never queued automatically.
 Dependency installation continues as a background action; the row keeps the
-hourglass, and its details git line reads `installing dependencies`, until that
-action ends, whatever its outcome. A removal request
+hourglass until that action ends, whatever its outcome. Its details git line
+reads `waiting to install` while the install is queued for one of the three
+install slots, then `installing dependencies`. A removal request
 keeps the row in place with a dim gray, struck-through name while safety
 checks run. When the worker accepts removal, the row moves to **Removing**, directly
-above **Archived**, and file cleanup continues in the background. Active
+above **Archived**, and file cleanup continues in the background. With
+`[ui] owed_sections` there is no Removing section and the row stays where it
+is drawn ([the Landed block](#the-landed-blocks-pane) describes its label);
+what follows about Removing rows applies to such a row in place. Active
 removals reject duplicate requests, and session entry on that row (F10, F11,
 F12, Shift+F12, `;` and their pickers) says **removal is already in progress**
 instead of queuing behind the teardown. Failed rows stay in Removing with an
@@ -240,7 +251,10 @@ outcomes and expired updates also enter the attention feed. Board-wide changes,
 such as switching the primary harness, show progress in the bottom status line.
 Uncertain board-wide outcomes stay in Attention, without replacing the top bar.
 A failed request
-rolls back at once with an error toast. A change that a fresh read still does
+rolls back at once with an error toast. A failure or notice from an earlier
+request of yours is shown even while a later one is pending; the failure then
+stays beside that request's progress and result until your next action. The
+board's own background reads never interrupt. A change that a fresh read still does
 not show after its deadline (30 seconds for GitHub, reviews and issue statuses;
 12 seconds for local state; 10 minutes for creating or removing a worktree) is
 dropped with a notice; nothing is resent automatically. A key that turns out to
@@ -602,7 +616,7 @@ WT still checks the published base. Missing evidence does not mean merged.
 | `i` / `I` | Open the preferred issue / primary tracker issue |
 | `s` | Open the deployed stage or dev URL when available |
 | `z` | Open the row's change guide. Only with `[guides] enabled`; see [configuration.md](configuration.md#guides--change-guides) |
-| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
+| `u` | Set or clear the work-status claim, note, or verification obligation (letters `t w r n h y v d` pick a state, `a` / `p` ready with a check owed in staging / production, `x` clears, `m` edits the note). A status picked here keeps the row's merge gate and its `--until` watch, as `wt status` does; only verified and dropped clear them. Picking verified on a row that owes checks closes the due ones as `wt status verified` does; while one remains the reply says so (`✓ <slug> closed the check in staging: <first line>; still owes the check in production: the status stays ready until it is closed`) and the state is kept |
 | `W` | Notify me when the row is ready (`r`), checks are green (`c`), it is merged (`m`), on staging (`s`) or in production (`p`); picking one that is set cancels it. See [Waiting rows](#waiting-rows) |
 | `y` | Copy a worktree field: `b` branch, `s` stage name, `S` stage URL, `d` dev URL, `p` path, `n` slug, `i`/`I` issues, `r` PR. Unavailable entries stay listed. On a folded section, `n` copies the section name, `s` the slugs, `b` the branches, `l` a list |
 | `l` / `L` | Move to a section (`l l` confirms, `l n` creates a new section; `Esc` returns to the picker) / rename the section. The picker lists every section in board order with its size |
@@ -625,6 +639,10 @@ records its source, and a lower source never replaces a higher one:
 | `agent` | `wt new <words>`, `wt next --title`, or `wt title` from an agent. It may replace any title but a person's, as often as the outcome changes |
 | `issue` | `wt new <ID>` with no title words: the tracker's title (`[issue_tracker] status_command`) |
 | `fallback` | The same, when the tracker gave no title: the bare ID |
+
+A creation from the TUI with a bare issue id does not wait for the tracker:
+the row shows the id (`fallback`) and takes the tracker's title (`issue`) when
+it arrives within a minute, unless the row was retitled meanwhile.
 
 A worktree nobody titled (created from a branch or a one-word slug) shows its
 PR title, then its first commit, then its slug. The details pane tags only a

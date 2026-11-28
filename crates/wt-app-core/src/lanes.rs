@@ -34,9 +34,9 @@ pub enum Lane {
     /// Read-only prompts and pickers must not sit behind a long accepted
     /// mutation on the same host. The final mutation still revalidates.
     Preparation(Option<String>),
-    /// Background reads that prepare a board menu ahead of its key (palette
-    /// prefetch). One runs at a time beside foreground preparations, never
-    /// taking their slot or ordinary host capacity.
+    /// Background reads that keep an open board menu current (the session
+    /// picker's discovery). One runs at a time beside foreground
+    /// preparations, never taking their slot or ordinary host capacity.
     Prefetch(Option<String>),
     /// One accepted cleanup confirmation, which may span several hosts. It
     /// owns exactly the checkouts it removes, as `(host, slug)` pairs, so
@@ -84,7 +84,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::DismissReviewRequest { .. }
         | A::KillAction { .. }
         | A::HardRefresh => Lane::HostControl(host),
-        A::WarmPalette { .. } | A::DiscoverSessions { .. } => Lane::Prefetch(host),
+        A::DiscoverSessions { .. } => Lane::Prefetch(host),
         A::Session { key, .. } => Lane::Terminal(host, key),
         A::SelectSession { selection } => Lane::Terminal(host, selection.key),
         A::EnterHarness { key, .. } => Lane::Terminal(host, Some(key)),
@@ -110,7 +110,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::PrepareRestoreRemoved { .. }
         | A::PrepareGithub { .. }
         | A::PrepareActions { .. }
-        | A::PrepareAction { .. }
+        | A::PrepareDevLogs { .. }
         | A::PrepareSection { .. }
         | A::PrepareDeleteSection { .. }
         | A::PrepareRemove { .. }
@@ -715,6 +715,7 @@ mod tests {
             id: "any".into(),
             arg: None,
             extras: String::new(),
+            seen: None,
         };
         let row = lane_for(&run(ActionSurface::Row { key: "row".into() })).unwrap();
         assert_eq!(row, Lane::Action(None, Some("row".into())));

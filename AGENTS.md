@@ -90,8 +90,12 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
 - Batched GitHub reads fail closed as a whole. A missing chunk is not proof that
   a branch has no PR. Retry transient transport failures at the chunk boundary;
   never turn rate-limit or ambiguous mutation results into automatic retries.
-  Keep fetches batched and coalesced, with the minimum interval measured from
-  the prior fetch start so slow requests count toward the floor.
+  Keep fetches batched and coalesced. The lane averages at most one network
+  read per minimum interval. A background read also waits that interval from
+  the prior fetch start, so slow requests count toward the floor. A read the
+  user caused (after an accepted write, or a hard refresh) may start one
+  interval early, which the reads after it give back. A rate limit whose reply
+  names a reset holds user-caused reads too.
 - Merge-queue submission and classic auto-merge are separate operations.
   Select from the PR's base branch when arming, inspect the PR's actual state
   when cancelling, and retain the expected head SHA across retries. A lost or
@@ -116,10 +120,19 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   or live process state are `Never`. Restored cache data is display-only:
   safety decisions take `Confirmed<T>` from a leaf handle, and a fetch keyed by
   another source's data skips while that input is unconfirmed.
+- The events snapshot and the query cache are read across builds by schema
+  (`wt_events::SNAPSHOT_SCHEMA`, `QUERY_CACHE_SCHEMA` in `query_cache.rs`):
+  bump the constant when a persisted field changes meaning. A reader that
+  decides, not only displays, still requires a snapshot from this build's
+  daemon.
 - Optimistic display uses only `wt_runtime::Pending`. A change stays shown until
-  a fetch that *started* at or after the host's accept stamp shows it, the
-  write fails, or its bounded deadline expires. A resolved request, an older
-  fetch, a restored value or another process's stamp never settles it. Every
+  a fetch of the rows it names that *started* at or after the host's accept
+  stamp shows it (a change that names no row waits for a fetch of the whole
+  domain), the write fails, or its bounded deadline expires. For GitHub that
+  fetch may read the written branch alone: only that branch, its rows and the
+  merge queue are then stamped newer than the last read of every branch. A
+  resolved request, an older fetch, a restored value or another process's
+  stamp never settles it. Every
   new `UiAction` declares its effect in `UiAction::effect`; toggles resolve
   against the board the user saw, and GitHub writes carry a `PrPin`.
 - Menus are presentation of the board. `UiAction::menu` is the single,

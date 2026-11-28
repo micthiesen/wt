@@ -436,7 +436,7 @@ mod tests {
             runner,
         )))
         .with_spawn_path(format!("{}:/usr/bin:/bin", bin.display()));
-        let error = service
+        let outcome = service
             .send(
                 &HarnessTarget {
                     id: HarnessId::Claude,
@@ -449,10 +449,16 @@ mod tests {
                 },
                 &CancellationToken::new(),
             )
-            .await
-            .unwrap_err()
-            .to_string();
+            .await;
         let _ = tmux.kill_server(&CancellationToken::new()).await;
+        // Refused before anything could be submitted, and reported so.
+        let Ok(HarnessMessageOutcome::Claude(ClaudeMessageOutcome::Failed {
+            reason: error,
+            maybe_submitted: false,
+        })) = outcome
+        else {
+            panic!("{outcome:?}");
+        };
         assert!(error.contains("did not fall back"), "{error}");
         assert!(!started.exists());
     }

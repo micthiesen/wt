@@ -435,6 +435,11 @@ async fn run_inner<'a>(
                             let toast_before = model.toast.clone();
                             let result = model.input(key, terminal.size()?.height.saturating_sub(4) as usize);
                             send_background(&mut model, outbox);
+                            // A palette entry the board cannot offer yet asks
+                            // the sources to read again.
+                            if std::mem::take(&mut model.refresh_requested) {
+                                source.refresh();
+                            }
                             if model.toast.is_some() && model.toast != toast_before {
                                 // Input-side feedback ("nothing needs you") expires
                                 // like any other toast.
@@ -488,7 +493,7 @@ async fn run_inner<'a>(
                             let area = terminal.size()?.into();
                             dirty |= crate::mouse::select(&mut model, mouse, area);
                             dirty |= crate::mouse::scroll(&mut model, mouse, area);
-                            // The wheel can move a picker or history selection; plan its prefetch.
+                            // A click can open a menu that queued a background read.
                             send_background(&mut model, outbox);
                             // A released drag copies what the next frame
                             // draws under it, so nothing later may change it.
@@ -931,25 +936,16 @@ fn send_follow_up(model: &mut Model, outbox: Outbox<'_>) {
 
 /// Send read-only warm-up requests a board menu asked for. They carry no
 /// foreground feedback and never block input. They travel apart from the
-/// user's requests, so neither can fill the other's queue; a skipped
-/// prefetch is retried later.
+/// user's requests, so neither can fill the other's queue. One that finds
+/// the queue full is dropped; the menu asks again the next time it opens.
 fn send_background(model: &mut Model, outbox: Outbox<'_>) {
-    let now = tokio::time::Instant::now();
-    model.plan_palette_warm(now);
-    model.fire_palette_warm(now);
     for action in std::mem::take(&mut model.background) {
-        let sent = outbox
-            .background
-            .try_send(crate::UiRequest {
-                id: 0,
-                cancellation: None,
-                generation: model.ui_generation,
-                action: action.clone(),
-            })
-            .is_ok();
-        if !sent {
-            model.background_not_sent(&action, now);
-        }
+        let _ = outbox.background.try_send(crate::UiRequest {
+            id: 0,
+            cancellation: None,
+            generation: model.ui_generation,
+            action,
+        });
     }
 }
 

@@ -42,8 +42,7 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::ToggleRemovedAutomations { .. }
         | UiAction::KillAction { .. }
         | UiAction::PrepareActions { .. }
-        | UiAction::WarmPalette { .. }
-        | UiAction::PrepareAction { .. }
+        | UiAction::PrepareDevLogs { .. }
         | UiAction::RunAction { .. }
         | UiAction::CyclePrimary
         | UiAction::SetTitle { .. }
@@ -193,10 +192,9 @@ fn visit_keys(
         | UiAction::GithubSetAutoMerge { key, .. }
         | UiAction::GithubShip { key, .. }
         | UiAction::GithubFailedChecks { key } => visit(key)?,
-        UiAction::PrepareActions { surface }
-        | UiAction::WarmPalette { surface }
-        | UiAction::PrepareAction { surface, .. }
-        | UiAction::RunAction { surface, .. } => match surface {
+        UiAction::PrepareDevLogs { key } => visit(key)?,
+        UiAction::PrepareActions { surface } | UiAction::RunAction { surface, .. } => match surface
+        {
             ActionSurface::Row { key } => visit(key)?,
             ActionSurface::Manager { key } => {
                 if let Some(key) = key {

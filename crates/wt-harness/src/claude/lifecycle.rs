@@ -334,20 +334,40 @@ impl ClaudeSessionManager {
         let handoff = self.select_account(target, &name, cancel).await?;
         let created = match self.create(target, &name, handoff.as_ref(), cancel).await {
             Ok(()) => true,
-            // A lost tmux reply may still have created the pane. The stamp
-            // is set in the same tmux command, and no session had this name
-            // under the start lock, so a session stamped as this slot is ours.
             Err(error) => {
-                if !self.tmux.session_exists(&name, cancel).await? {
-                    return Err(error);
-                }
-                self.slot_is_own(target, cancel).await? == Some(true)
+                self.after_failed_create(target, &name, error, cancel)
+                    .await?
             }
         };
-        if let Some(handoff) = handoff {
+        // Only a pane this call created reads the handoff; otherwise it is
+        // removed here with the handle.
+        if created && let Some(handoff) = handoff {
             handoff.leave_for_pane();
         }
         Ok(created)
+    }
+
+    /// A failed create whose reply was lost may still have made the pane.
+    /// The stamp is set in the same tmux command and no session had this name
+    /// under the start lock, so a session stamped as this slot is this call's
+    /// (`true`). One recorded as another slot's took the name meanwhile and
+    /// is refused like any foreign slot; an unrecorded one is adopted as the
+    /// existing-session path adopts it (`false`).
+    async fn after_failed_create(
+        &self,
+        target: &ClaudeSessionTarget,
+        name: &str,
+        error: ClaudeSessionManagerError,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ClaudeSessionManagerError> {
+        if !self.tmux.session_exists(name, cancel).await? {
+            return Err(error);
+        }
+        match self.slot_is_own(target, cancel).await? {
+            Some(true) => Ok(true),
+            Some(false) => Err(foreign_slot("attach", name)),
+            None => Ok(false),
+        }
     }
 
     pub async fn start(
@@ -1942,6 +1962,61 @@ exec /bin/sleep 30
         assert!(before.is_some());
         assert_eq!(after, before, "the session was killed under its client");
         assert_eq!(handoffs, 0, "the unused token handoff was left behind");
+    }
+
+    /// A create whose reply was lost leaves a session to judge by its stamp:
+    /// this slot's is this call's, another slot's is refused, and only this
+    /// call's pane is left a token handoff to read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lost_create_reply_never_attaches_to_another_slots_session() {
+        let tmp = tempdir().unwrap();
+        let (manager, tmux, paths) = fixture_manager(tmp.path());
+        let cwd = fs::canonicalize(tmp.path()).unwrap();
+        let cancel = CancellationToken::new();
+        let target = |slug: &str| ClaudeSessionTarget {
+            slug: slug.into(),
+            cwd: cwd.clone(),
+            managed_name: None,
+        };
+        let lost = || operation("start", "tmux reply lost");
+        let own = claude_session_id(&cwd, None);
+        fixture_session(&tmux, "mine", &cwd, &[(CLAUDE_SLOT_OPTION, &own)]).await;
+        fixture_session(&tmux, "x-codex", &cwd, &[(HARNESS_SLOT_OPTION, "thread")]).await;
+        fixture_session(&tmux, "legacy", &cwd, &[]).await;
+        let mine = manager
+            .after_failed_create(&target("mine"), "mine", lost(), &cancel)
+            .await;
+        let foreign = manager
+            .after_failed_create(&target("x-codex"), "x-codex", lost(), &cancel)
+            .await;
+        let legacy = manager
+            .after_failed_create(&target("legacy"), "legacy", lost(), &cancel)
+            .await;
+        let absent = manager
+            .after_failed_create(&target("absent"), "absent", lost(), &cancel)
+            .await;
+        let _ = tmux.kill_server(&cancel).await;
+        assert!(mine.unwrap());
+        let foreign = foreign.expect_err("attached to another slot").to_string();
+        assert!(foreign.contains("left running"), "{foreign}");
+        assert!(!legacy.unwrap());
+        assert!(
+            absent
+                .expect_err("absent")
+                .to_string()
+                .contains("reply lost")
+        );
+        // A handoff nobody was told to keep goes with its handle.
+        let auth = paths.cache_dir.join("auth");
+        let token = super::super::auth::parse_token(b"tok".to_vec()).unwrap();
+        let kept = TokenHandoff::write(&auth, "mine", &token).unwrap();
+        let dropped = TokenHandoff::write(&auth, "x-codex", &token).unwrap();
+        let (kept_path, dropped_path) = (kept.path().to_owned(), dropped.path().to_owned());
+        kept.leave_for_pane();
+        drop(dropped);
+        assert!(kept_path.exists());
+        assert!(!dropped_path.exists());
     }
 
     /// Right after a slot is stopped its Claude can still be registered. An

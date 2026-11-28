@@ -91,6 +91,20 @@ fn message_delivered(outcome: &Result<HarnessMessageOutcome>) -> Option<bool> {
     }
 }
 
+/// Marks a send that failed before any harness adapter was asked to deliver.
+/// A caller that must never resend a possibly submitted prompt can retry one
+/// that carries this.
+#[derive(Clone, Copy, Debug)]
+pub struct NotSent;
+
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("nothing was sent")
+    }
+}
+
+impl std::error::Error for NotSent {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentTarget {
     pub slug: String,
@@ -946,12 +960,13 @@ impl AppHarness {
         context: &AppContext,
     ) -> Result<HarnessMessageOutcome> {
         let id = route.choice.selected.ok_or_else(|| {
-            anyhow::anyhow!(
-                "could not inspect wt's tmux session registry; no harness was selected or started"
+            anyhow::Error::new(NotSent).context(
+                "could not inspect wt's tmux session registry; no harness was selected or started",
             )
         })?;
         self.prepare_start(id, &route.target.slug, &route.target.cwd, context)
-            .await?;
+            .await
+            .map_err(|error| error.context(NotSent))?;
         self.service
             .send(
                 &HarnessTarget {
@@ -2431,6 +2446,35 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// A send refused before any adapter is asked says so in its type, so a
+    /// wake is retried instead of being recorded as possibly delivered.
+    #[tokio::test]
+    async fn a_send_refused_before_delivery_is_marked_not_sent() {
+        let fixture = crate::test_support::CommandFixture::new().await.unwrap();
+        let mut app = AppHarness::new(&fixture.ctx);
+        app.codex_config = fixture.ctx.home.join("selected-codex/config.toml");
+        let route = |slug: &str, selected| AgentRoute {
+            target: special_target(slug, fixture.ctx.cwd.clone(), None),
+            choice: HarnessChoice {
+                selected,
+                source: SelectionSource::Primary,
+                live: None,
+            },
+        };
+        for refused in [
+            route("one", None),
+            // Not this worktree's checkout: Codex preparation refuses it.
+            route("unregistered", Some(HarnessId::Codex)),
+        ] {
+            let error = app
+                .send_unrecorded(&refused, "hello", &fixture.ctx)
+                .await
+                .unwrap_err();
+            assert!(error.is::<NotSent>(), "{error:#}");
+        }
+        fixture.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn codex_preparation_rejects_unowned_and_mismatched_roots() {
         let fixture = crate::test_support::CommandFixture::new().await.unwrap();
@@ -2745,12 +2789,15 @@ mod tests {
                     live: Some(Vec::new()),
                 },
             };
-            let send = app
-                .send(&route, "hello", None, ctx)
-                .await
-                .err()
-                .context("message wake started without a token")?;
-            for error in [format!("{entry:#}"), format!("{send:#}")] {
+            // Refused before anything could be submitted, and reported so.
+            let send = match app.send(&route, "hello", None, ctx).await? {
+                HarnessMessageOutcome::Claude(wt_harness::ClaudeMessageOutcome::Failed {
+                    reason,
+                    maybe_submitted: false,
+                }) => reason,
+                other => bail!("message wake started without a token: {other:?}"),
+            };
+            for error in [format!("{entry:#}"), send] {
                 assert!(error.contains("exited with status 9"), "{error}");
                 assert!(error.contains("did not fall back"), "{error}");
                 assert!(!error.contains("sk-secret"), "{error}");

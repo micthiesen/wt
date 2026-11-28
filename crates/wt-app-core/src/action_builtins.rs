@@ -3,11 +3,11 @@
 use wt_config::{ActionDef, ActionKind, ActionTarget, Config, EffectTag, RequireTag};
 use wt_tui::ActionSurface;
 
-pub const CUSTOM_ID: &str = "__custom__";
+pub const CUSTOM_ID: &str = wt_tui::CUSTOM_ACTION_ID;
 /// Slot palette `z`: open the slot's checkout in the editor.
-pub const OPEN_EDITOR_ID: &str = "__open_editor__";
+pub const OPEN_EDITOR_ID: &str = wt_tui::OPEN_EDITOR_ACTION_ID;
 /// Row palette `l`: show the dev server's output.
-pub const DEV_LOGS_ID: &str = "__dev_logs__";
+pub const DEV_LOGS_ID: &str = wt_tui::DEV_LOGS_ACTION_ID;
 
 pub fn definitions(config: &Config, surface: &ActionSurface) -> Vec<ActionDef> {
     let mut out = match surface {

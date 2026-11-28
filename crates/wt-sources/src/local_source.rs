@@ -163,7 +163,13 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
                 fn read(store: &mut wt_store::Store) -> anyhow::Result<Metadata> {
                     Ok((store.read_wt_state()?, store.read_archived_keys()?))
                 }
-                let metadata = context.database.call(read).await?;
+                // On the read connection, so a refresh does not queue behind
+                // a write waiting for another process's lock. It sees every
+                // write whose call returned before the read began, and the
+                // read begins a tick after this fetch's stamp: a fetch stamped
+                // at or after an accepted write therefore shows it.
+                next_tick().await;
+                let metadata = context.database.read(read).await?;
                 // Reconciliation acts only on recorded removals. Without one
                 // it writes nothing, so what was just read is what a second
                 // read would return.
@@ -174,7 +180,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
                     return Ok(metadata);
                 }
                 wt_ops::commands::_destroy::reconcile_removals(&context, &metadata.0).await?;
-                context.database.call(read).await
+                context.database.read(read).await
             }
         }
     });
@@ -192,6 +198,18 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> LocalSources {
         metadata,
         git,
         edits,
+    }
+}
+
+/// Wait for the stamp clock's next millisecond. A write is stamped as
+/// accepted after it returned, and a fetch counts as following it when its
+/// stamp is the same millisecond or later. A read that began in the
+/// millisecond of its fetch's stamp could run before a write stamped in
+/// that same millisecond and still count as following it.
+async fn next_tick() {
+    let tick = wt_runtime::Stamp::now();
+    while tick.at_or_after(&wt_runtime::Stamp::now()) == Some(true) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -1012,6 +1030,91 @@ mod tests {
                 );
             }
         }
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    /// The metadata leaf reads beside the write queue. The read that confirms
+    /// a write still shows it: the host stamps an accepted write after its
+    /// call returned, so every fetch that starts at or after that stamp must
+    /// show the write, with no fetch in between showing less. And a refresh
+    /// no longer waits for a write that is stuck.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_metadata_read_shows_every_returned_write_and_passes_a_stuck_one() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let scope = TaskScope::new();
+        let local = start(&scope, &fixture.ctx);
+        local.metadata.refresh();
+        let mut updates = local.metadata.subscribe();
+        updates
+            .wait_for(|snapshot| *snapshot.state() == SourceState::Ready)
+            .await
+            .unwrap();
+        let fresh = |snapshot: &SourceSnapshot<Metadata>, since: &Stamp| {
+            snapshot.domains()[&Domain::Metadata]
+                .observed()
+                .at_or_after(since)
+                == Some(true)
+        };
+        for write in 1..=40u64 {
+            fixture
+                .ctx
+                .database
+                .call(move |store| Ok(store.set_attention_seen(write)?))
+                .await
+                .unwrap();
+            let accepted = Stamp::now();
+            local.metadata.refresh();
+            let confirming = updates
+                .wait_for(|snapshot| fresh(snapshot, &accepted))
+                .await
+                .unwrap()
+                .clone();
+            assert_eq!(
+                confirming.data().unwrap().0["attentionSeenTs"],
+                write,
+                "a read that started after the write returned did not show it"
+            );
+        }
+
+        // A writer held up, as by another process's lock.
+        let (entered, held) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        let stuck = tokio::spawn({
+            let (database, entered, held) =
+                (fixture.ctx.database.clone(), entered.clone(), held.clone());
+            async move {
+                database
+                    .call(move |_| {
+                        entered.notify_one();
+                        while held.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        entered.notified().await;
+        let asked = Stamp::now();
+        local.metadata.refresh();
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            updates.wait_for(|snapshot| fresh(snapshot, &asked)),
+        )
+        .await
+        .map(|read| read.unwrap().data().unwrap().0["attentionSeenTs"].clone());
+        held.store(false, std::sync::atomic::Ordering::SeqCst);
+        stuck.await.unwrap().unwrap();
+        assert_eq!(
+            read.expect("the read waited behind a stuck write"),
+            40,
+            "a read beside the write queue shows what was written before it"
+        );
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();
     }

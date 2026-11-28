@@ -115,8 +115,8 @@ impl UiAction {
                 reason: "fetches the failed CI log from GitHub",
             },
             A::PrepareActions { surface } => palette::menu(board, surface),
-            A::PrepareAction { .. } => Menu::Host {
-                reason: "reads action definitions, running actions and checkout state",
+            A::PrepareDevLogs { .. } => Menu::Host {
+                reason: "captures the dev server's live terminal output",
             },
             A::PrepareSection { key } => Menu::Local(section::menu(board, key)),
             A::PrepareDeleteSection { section } => {
@@ -186,8 +186,7 @@ impl UiAction {
             | A::EnterHarness { .. }
             | A::StopTerminal { .. }
             | A::StopSession { .. }
-            | A::DiscoverSessions { .. }
-            | A::WarmPalette { .. } => Menu::NotMenu,
+            | A::DiscoverSessions { .. } => Menu::NotMenu,
         }
     }
 

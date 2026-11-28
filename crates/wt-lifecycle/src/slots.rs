@@ -30,7 +30,10 @@ pub struct SlotPool {
 /// with four at once and 350 s with nine, while checkouts beside them took
 /// four times as long. Three finish a batch about as soon and leave the
 /// machine usable.
-pub const DEPENDENCY_INSTALLS: SlotPool = SlotPool::new("dependency-install", 3);
+pub const DEPENDENCY_INSTALLS: SlotPool = SlotPool::new(
+    wt_platform::lock::DEPENDENCY_INSTALL_POOL,
+    wt_platform::lock::DEPENDENCY_INSTALL_SLOTS.get(),
+);
 
 /// Deletions of checkouts a removal already moved aside. Nothing waits on
 /// them, and five at once kept the disk busy for over an hour.

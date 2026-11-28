@@ -67,10 +67,10 @@ In a wt-managed worktree you own the task's status, testing, and dev server.
 nothing is finished; the note never holds owed work:
 
 - A prerequisite before merging is `--blocked-on "<gate>"`, only when merging
-  now would make things worse until it happens (a manual deploy or follow-up
-  that leaves the status quo unchanged is a step). `--until <condition>`
-  clears it once wt observes the prerequisite, `--then "<prompt>"` acts then;
-  only a person's decision stays a bare gate (`wt status --unblock`).
+  now would make things worse (a manual deploy or follow-up that leaves the
+  status quo unchanged is a step). A status change keeps the gate. It clears by
+  `--until <condition>` once wt observes the prerequisite (`--then "<prompt>"`
+  acts then), by `wt status --unblock`, or with `verified` or `dropped`.
 - A check only a deployed environment can run is `--verify-in-staging` and/or
   `--verify-in-production` (both may be owed), set as soon as you know it. It
   never blocks merging; the row returns as `needs-testing` once the change is

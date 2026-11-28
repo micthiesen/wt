@@ -56,21 +56,36 @@ pub fn assert_checks(
     }
 }
 
-/// Give `next`, a status about to replace `previous`, its merge gate. A gate
-/// is a prerequisite of merging, not a claim of one assertion: a status
-/// change that does not mention it keeps it, and with it the watch that
-/// clears it. `asked` replaces it. Verified and dropped end the work the
-/// gate held back, so neither carries one. Clearing a gate is its own write.
+/// Give `next`, a status about to replace `previous`, its gate. A gate on
+/// work under way is a prerequisite of merging, not a claim of one
+/// assertion: a status change that does not mention it keeps it, and with it
+/// the watch that clears it. `asked` replaces it. Verified and dropped end
+/// the work the gate held back, so neither carries one.
+///
+/// A gate on `todo` is a different thing: why the work has not started.
+/// Leaving `todo` is the decision that it no longer holds, so it is not
+/// carried into another state, where it would read as "do not merge".
 pub fn assert_gate(
     next: &mut WorkStatusRecord,
     previous: Option<&WorkStatusRecord>,
     asked: Option<String>,
 ) {
+    let carried = previous
+        .filter(|previous| !start_gate_ends(previous, next))
+        .and_then(|previous| previous.blocked_on.clone());
     next.blocked_on = if next.is_terminal() {
         None
     } else {
-        asked.or_else(|| previous.and_then(|previous| previous.blocked_on.clone()))
+        asked.or(carried)
     };
+}
+
+/// Whether `next` starts work that `previous` held back with a gate on
+/// `todo`.
+pub fn start_gate_ends(previous: &WorkStatusRecord, next: &WorkStatusRecord) -> bool {
+    previous.state == wt_core::WorkState::Todo
+        && next.state != wt_core::WorkState::Todo
+        && previous.blocked_on.is_some()
 }
 
 /// `verified` asserted for a worktree that owes checks: close every check

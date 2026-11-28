@@ -200,7 +200,7 @@ impl ClaudeAuthError {
 
 /// One trailing newline (LF or CRLF) is the normal end of a line. Anything
 /// else that is not visible ASCII is a malformed token.
-fn parse_token(mut stdout: Vec<u8>) -> Result<ClaudeToken, &'static str> {
+pub(super) fn parse_token(mut stdout: Vec<u8>) -> Result<ClaudeToken, &'static str> {
     if stdout.last() == Some(&b'\n') {
         stdout.pop();
         if stdout.last() == Some(&b'\r') {

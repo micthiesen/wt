@@ -317,6 +317,10 @@ async fn deliver_prompt(
                 PromptDelivery::Unreachable(reason)
             }
         },
+        // Failed before any adapter was asked to deliver: provably unsent.
+        Err(error) if error.is::<wt_app_core::harness::NotSent>() => {
+            PromptDelivery::Unreachable(format!("{error:#}"))
+        }
         Err(_) => {
             PromptDelivery::Ambiguous("harness send failed after entering the delivery path".into())
         }
@@ -499,61 +503,32 @@ pub async fn prepare_dispatch(
         .and_then(serde_json::Value::as_str)
         .unwrap_or(&context.config.branch.base)
         .to_owned();
-    let issue_override = state_entry
-        .and_then(|entry| entry.get("issueId"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    let issue_id =
-        wt_app_core::issue_identity::resolve(&slug, issue_override.as_deref()).unwrap_or_default();
-    let (pr, pr_observation) = match row_snapshot.as_ref().zip(github) {
-        None => (None, ActionPrObservation::Unknown),
-        Some((snapshot, github)) => match github.covered_pr(&snapshot.target.branch) {
-            wt_github::CoveredPr::Uncovered => (None, ActionPrObservation::Unknown),
-            wt_github::CoveredPr::Absent => (None, ActionPrObservation::ConfirmedAbsent),
-            wt_github::CoveredPr::Present(pr) => (
-                Some(pr),
-                ActionPrObservation::Present(ActionPr {
-                    state: pr.state.clone(),
-                    is_draft: pr.is_draft,
-                }),
-            ),
-        },
-    };
+    let (pr, pr_observation) = pr_observation(
+        github,
+        row_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.target.branch.as_str()),
+    );
     let pr_number = pr.map(|pr| pr.number.to_string());
     let board_row = board.and_then(|board| board.rows.iter().find(|row| row.slug == slug));
     let deployed = if let Some(snapshot) = &row_snapshot {
         let path = PathBuf::from(&snapshot.target.path);
         let prefix = context.config.stage.prefix.clone();
-        tokio::task::spawn_blocking(move || {
-            matches!(
-                wt_sst::observe_local_deployment(&path, &prefix),
-                wt_sst::DeploymentObservation::Deployed { .. }
-            )
-        })
-        .await
-        .context("inspect local deployment facts")?
+        tokio::task::spawn_blocking(move || stage_deployed(&path, &prefix))
+            .await
+            .context("inspect local deployment facts")?
     } else {
         false
     };
-    let mut row = ActionRow {
-        slug: slug.clone(),
-        issue_id: issue_override.or_else(|| (!issue_id.is_empty()).then_some(issue_id.clone())),
-        issue_prefix: context
-            .config
-            .issue_tracker
-            .as_ref()
-            .and_then(|issue| issue.prefix.clone()),
-        pr: pr_observation,
+    let row = action_row(
+        &context.config,
+        &slug,
+        state_entry,
+        board_row.and_then(|row| row.issue_id.clone()),
+        pr_observation,
         pr_number,
         deployed,
-    };
-    // The rendered board's issue id is a presentation value; persisted explicit
-    // empty string remains an explicit clear and takes precedence.
-    if state_entry.and_then(|entry| entry.get("issueId")).is_none() {
-        row.issue_id = board_row
-            .and_then(|row| row.issue_id.clone())
-            .or(row.issue_id);
-    }
+    );
     let issue_id = row.issue_id.as_deref().unwrap_or_default().to_owned();
     // A slot whose harness is pinned renders its prompt for that harness.
     let primary = match slot
@@ -592,13 +567,81 @@ pub async fn prepare_dispatch(
     })
 }
 
+/// Whether a stage of the configured namespace is deployed from a checkout,
+/// as its files say. Reads the checkout: call it off the async threads.
+pub fn stage_deployed(path: &std::path::Path, prefix: &str) -> bool {
+    matches!(
+        wt_sst::observe_local_deployment(path, prefix),
+        wt_sst::DeploymentObservation::Deployed { .. }
+    )
+}
+
+/// What a confirmed GitHub read says about a branch's pull request. Without
+/// a read, or for a branch the read did not cover, the answer is unknown.
+pub fn pr_observation<'a>(
+    github: Option<&'a Confirmed<GithubData>>,
+    branch: Option<&str>,
+) -> (Option<&'a wt_github::PullRequest>, ActionPrObservation) {
+    match branch.zip(github) {
+        None => (None, ActionPrObservation::Unknown),
+        Some((branch, github)) => match github.covered_pr(branch) {
+            wt_github::CoveredPr::Uncovered => (None, ActionPrObservation::Unknown),
+            wt_github::CoveredPr::Absent => (None, ActionPrObservation::ConfirmedAbsent),
+            wt_github::CoveredPr::Present(pr) => (
+                Some(pr),
+                ActionPrObservation::Present(ActionPr {
+                    state: pr.state.clone(),
+                    is_draft: pr.is_draft,
+                }),
+            ),
+        },
+    }
+}
+
+/// The facts an action's requirements are checked against. Dispatch builds
+/// them here, and the action source publishes the same ones on the board, so
+/// a palette lists what a commit will find.
+pub fn action_row(
+    config: &wt_config::Config,
+    slug: &str,
+    state_entry: Option<&serde_json::Value>,
+    board_issue_id: Option<String>,
+    pr: ActionPrObservation,
+    pr_number: Option<String>,
+    deployed: bool,
+) -> ActionRow {
+    let issue_override = state_entry
+        .and_then(|entry| entry.get("issueId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let issue_id =
+        wt_app_core::issue_identity::resolve(slug, issue_override.as_deref()).unwrap_or_default();
+    let mut row = ActionRow {
+        slug: slug.to_owned(),
+        issue_id: issue_override.or_else(|| (!issue_id.is_empty()).then_some(issue_id)),
+        issue_prefix: config
+            .issue_tracker
+            .as_ref()
+            .and_then(|issue| issue.prefix.clone()),
+        pr,
+        pr_number,
+        deployed,
+    };
+    // The rendered board's issue id is a presentation value; persisted explicit
+    // empty string remains an explicit clear and takes precedence.
+    if state_entry.and_then(|entry| entry.get("issueId")).is_none() {
+        row.issue_id = board_issue_id.or(row.issue_id);
+    }
+    row
+}
+
 /// How long a send that something waits on lets a Claude session keep
 /// waiting on a person before it reports that nothing was sent. A prompt from
 /// the board holds a controller lane, and the manager wake is awaited by the
-/// automation source's loop; a person can take hours. Only that wait is
-/// bounded by this: a cold start and the delivery itself keep their own,
-/// shorter-than-a-minute bounds. Automation fires and the CLI run detached
-/// and keep the adapter's day.
+/// automation source's loop; a person can take hours. The limit starts once
+/// the session is up, so it is all the person's: a cold start before it and
+/// the delivery after it keep their own, shorter-than-a-minute bounds.
+/// Automation fires and the CLI run detached and keep the adapter's day.
 const ATTENDED_HUMAN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long such a send queues behind another message that is being
 /// delivered to the same session: long enough for that one's cold start,

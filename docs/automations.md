@@ -176,7 +176,10 @@ or 30 when both stages have deploy probes). Configuration cannot use the id.
   <target> --slug <slug> -m`. Each item is told once (again after it is put
   off and comes due). This is sent directly, outside the queue: it does not
   wait for the manager to be idle, and while no manager session can be
-  reached it is tried again every five minutes.
+  reached it is tried again every five minutes. It gives up once the manager
+  has waited on a person for 5 seconds, or after 90 seconds behind another
+  message being delivered. A manager that defers one such prompt is not asked
+  about the other rows until the next look.
 - **Like a wake.** It waits for the session to be idle and resumes a stopped
   one, is held (not consumed) while the worktree or everything is paused, and
   skips archived rows.

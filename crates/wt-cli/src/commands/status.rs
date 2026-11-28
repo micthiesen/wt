@@ -929,6 +929,9 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 }
             };
             report_dropped_checks(&slug, previous.as_ref(), &unverify);
+            let started = previous
+                .as_ref()
+                .is_some_and(|previous| wt_ops::status_checks::start_gate_ends(previous, &next));
             let (previous_note, previous_gate) = previous
                 .map(|previous| (previous.note, previous.blocked_on))
                 .unwrap_or_default();
@@ -945,6 +948,7 @@ pub async fn run(ctx: &AppContext, args: &StatusArgs) -> Result<i32> {
                 previous_gate.as_deref(),
                 next.blocked_on.as_deref(),
                 gate_asked,
+                started,
             ) {
                 println!("{line}");
             }
@@ -1686,11 +1690,18 @@ fn merge_note(
 }
 
 /// What an assertion did with the gate the previous status held, where the
-/// command did not say: a status change keeps it, and an ending (verified
-/// or dropped) clears it. Both are said, so neither happens unseen.
-fn gate_line(previous: Option<&str>, current: Option<&str>, asked: bool) -> Option<String> {
+/// command did not say: a status change keeps it, an ending (verified or
+/// dropped) clears it, and so does starting work a gate on `todo` held
+/// back (`started`). Each is said, so none happens unseen.
+fn gate_line(
+    previous: Option<&str>,
+    current: Option<&str>,
+    asked: bool,
+    started: bool,
+) -> Option<String> {
     let gate = previous?;
     match current {
+        None if started => Some(format!("  start gate cleared (was: {gate})")),
         None => Some(format!("  gate cleared (was: {gate})")),
         Some(kept) if kept == gate && !asked => Some(format!(
             "  still blocked on: {gate} (a status change keeps the gate; wt status --unblock clears it)"
@@ -2052,8 +2063,8 @@ mod tests {
         };
         assert_eq!(run(&fixture.ctx, &gated).await.unwrap(), 0);
         // `--unblock` was valid against the gated `todo` its caller saw, but
-        // the worktree's agent has asked for a human and the gate has been
-        // cleared since.
+        // the worktree's agent has asked for a human since, which cleared
+        // the start gate.
         let claim = StatusArgs {
             positionals: vec!["needs-human".into()],
             note: Some("approve the migration".into()),
@@ -2061,11 +2072,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run(&fixture.ctx, &claim).await.unwrap(), 0);
-        let unblock = StatusArgs {
-            unblock: true,
-            ..Default::default()
-        };
-        assert_eq!(run(&fixture.ctx, &unblock).await.unwrap(), 0);
         let refused = update_status(&fixture.ctx.database, "one", |previous| {
             amend_record("one", previous, None, None, Some(None), Vec::new(), false)
         })
@@ -2262,19 +2268,24 @@ mod tests {
     #[test]
     fn a_gate_kept_or_cleared_without_being_asked_is_said() {
         assert_eq!(
-            gate_line(Some("mobile release"), None, false).as_deref(),
+            gate_line(Some("mobile release"), None, false, false).as_deref(),
             Some("  gate cleared (was: mobile release)")
         );
+        assert_eq!(
+            gate_line(Some("secrets land"), None, false, true).as_deref(),
+            Some("  start gate cleared (was: secrets land)")
+        );
         assert!(
-            gate_line(Some("mobile release"), Some("mobile release"), false)
+            gate_line(Some("mobile release"), Some("mobile release"), false, false)
                 .unwrap()
                 .starts_with("  still blocked on: mobile release")
         );
         // The command named the gate itself: nothing to add.
-        assert_eq!(gate_line(Some("old"), Some("new"), true), None);
-        assert_eq!(gate_line(Some("same"), Some("same"), true), None);
-        assert_eq!(gate_line(None, Some("new"), true), None);
-        assert_eq!(gate_line(None, None, false), None);
+        assert_eq!(gate_line(Some("old"), Some("new"), true, false), None);
+        assert_eq!(gate_line(Some("old"), Some("new"), true, true), None);
+        assert_eq!(gate_line(Some("same"), Some("same"), true, false), None);
+        assert_eq!(gate_line(None, Some("new"), true, false), None);
+        assert_eq!(gate_line(None, None, false, false), None);
     }
 
     #[tokio::test]
@@ -2382,6 +2393,86 @@ mod tests {
         };
         assert_eq!(run(ctx, &stated(&["dropped"], dropped)).await.unwrap(), 0);
         assert_eq!(gate().await, (None, Vec::new()));
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn starting_the_work_clears_a_gate_set_on_todo_and_its_watch() {
+        use wt_app_core::test_support::CommandFixture;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let stated = |positionals: &[&str], extra: StatusArgs| StatusArgs {
+            positionals: positionals.iter().map(|word| (*word).to_owned()).collect(),
+            ..extra
+        };
+        let gate = || async {
+            let state = read_state(&ctx.database).await.unwrap();
+            (
+                state["slugs"]["one"]["work"]["blockedOn"]
+                    .as_str()
+                    .map(str::to_owned),
+                wt_store::stored_watches(&state)
+                    .iter()
+                    .filter(|watch| watch.slug == "one" && watch.then.unblock.is_some())
+                    .count(),
+            )
+        };
+        let not_started = || StatusArgs {
+            blocked_on: Some("secrets land".into()),
+            until: vec!["3h".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            run(ctx, &stated(&["todo"], not_started())).await.unwrap(),
+            0
+        );
+        // Still not started: the gate stands, watch and all.
+        assert_eq!(
+            run(ctx, &stated(&["todo"], StatusArgs::default()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(gate().await, (Some("secrets land".to_owned()), 1));
+        // Starting is the decision that it no longer holds. Carried on, it
+        // would make every later ready read "do not merge until secrets land".
+        assert_eq!(
+            run(ctx, &stated(&["working"], StatusArgs::default()))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(gate().await, (None, 0));
+        let ready = StatusArgs {
+            risk: Some("low".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            run(ctx, &stated(&["ready"], ready.clone())).await.unwrap(),
+            0
+        );
+        assert_eq!(gate().await, (None, 0));
+        // Straight from todo to ready is starting too, unless the command
+        // itself sets a merge gate.
+        assert_eq!(
+            run(ctx, &stated(&["todo"], not_started())).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            run(ctx, &stated(&["ready"], ready.clone())).await.unwrap(),
+            0
+        );
+        assert_eq!(gate().await, (None, 0));
+        assert_eq!(
+            run(ctx, &stated(&["todo"], not_started())).await.unwrap(),
+            0
+        );
+        let merge_gate = StatusArgs {
+            blocked_on: Some("the release".into()),
+            ..ready
+        };
+        assert_eq!(run(ctx, &stated(&["ready"], merge_gate)).await.unwrap(), 0);
+        assert_eq!(gate().await, (Some("the release".to_owned()), 0));
         fixture.close().await.unwrap();
     }
 

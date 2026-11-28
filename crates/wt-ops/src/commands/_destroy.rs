@@ -110,6 +110,23 @@ pub async fn start_removals(
     results
 }
 
+/// Whether the row was archived before any removal of it began. A failed
+/// attempt archived the row itself and recorded where it had been, so for a
+/// retry that record answers, not the archive set.
+async fn was_archived_before_removal(ctx: &AppContext, key: String) -> Result<bool> {
+    ctx.database
+        .call(move |store| {
+            let state = store.read_wt_state()?;
+            let failed = &state["removals"][&key];
+            Ok(if failed.is_object() {
+                failed["wasArchived"] == true
+            } else {
+                store.read_archived_keys()?.contains(&key)
+            })
+        })
+        .await
+}
+
 async fn start_remove_inner(
     ctx: &AppContext,
     record: &WorktreeRecord,
@@ -141,10 +158,7 @@ async fn start_remove_inner(
     let job_path = jobs.join(format!("{job_id}.json"));
     let archive_key = worktree_target_key(&record.target);
     let lookup = archive_key.clone();
-    let was_archived = ctx
-        .database
-        .call(move |store| Ok(store.read_archived_keys()?.contains(&lookup)))
-        .await?;
+    let was_archived = was_archived_before_removal(ctx, lookup).await?;
     let record_json = json!({
         "version": VERSION,
         "id": job_id,
@@ -234,7 +248,8 @@ async fn start_remove_inner(
         }
         match seen {
             Handover::Starting if started.elapsed() >= STARTUP_TIMEOUT => {
-                // Unacknowledged, it has begun nothing.
+                // It has not written its process id, which is the first
+                // thing a worker does: no removal record, nothing archived.
                 let _ = child.kill();
                 let _ = child.wait();
                 bail!(
@@ -263,7 +278,8 @@ async fn start_remove_inner(
 enum Handover {
     /// The worker has not written to the record yet.
     Starting,
-    /// The worker runs, and has not yet locked the worktree.
+    /// The worker has claimed the job, and has not yet locked the worktree.
+    /// It may already have recorded the removal and archived the row.
     Acknowledged,
     /// The worker holds the worktree's lifecycle lock.
     Locked,
@@ -286,6 +302,11 @@ fn handover(job: &Value, worker: u32) -> Handover {
             } else {
                 Handover::Acknowledged
             }
+        }
+        // Its id is written before the removal is recorded and the row
+        // archived, and `running` only after: from here it is not killed.
+        Some("starting") if job["workerPid"].as_u64() == Some(u64::from(worker)) => {
+            Handover::Acknowledged
         }
         _ => Handover::Starting,
     }
@@ -799,7 +820,9 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
         let Ok(mut job) = read_job(&entry.path()).await else {
             continue;
         };
-        if job["state"] != "running" {
+        // A worker writes its id before it records the removal, so a job
+        // still `starting` under a dead worker may hold the row as well.
+        if !matches!(job["state"].as_str(), Some("starting" | "running")) {
             continue;
         }
         let Some(pid) = job["workerPid"]
@@ -825,7 +848,7 @@ async fn reap_abandoned(ctx: &AppContext, directory: &Path) -> Result<()> {
         let Ok(current) = read_job(&entry.path()).await else {
             continue;
         };
-        if current["state"] != "running" || current["workerPid"] != job["workerPid"] {
+        if current["state"] != job["state"] || current["workerPid"] != job["workerPid"] {
             continue;
         }
         job["state"] = json!("failed");
@@ -1243,7 +1266,16 @@ mod tests {
                 LOCK_HELD_AT: if held { json!("2026-11-27T00:00:00Z") } else { Value::Null },
             })
         };
-        assert_eq!(handover(&job("starting", 7, false), 7), Handover::Starting);
+        assert_eq!(
+            handover(&json!({"state": "starting", "workerPid": null}), 7),
+            Handover::Starting
+        );
+        // A worker that has claimed the job may have recorded the removal
+        // already, whatever state it has got to writing.
+        assert_eq!(
+            handover(&job("starting", 7, false), 7),
+            Handover::Acknowledged
+        );
         // Running is written before the worker takes the lock: not yet.
         assert_eq!(
             handover(&job("running", 7, false), 7),
@@ -1411,6 +1443,147 @@ mod tests {
             "{}",
             state["removals"]
         );
+        fixture.close().await.unwrap();
+    }
+
+    /// Each attempt archives the row before it takes the lock. A retry must
+    /// still know the row was not archived before the first one, or the
+    /// board would draw a row being removed under Archived.
+    #[tokio::test]
+    async fn a_retried_removal_remembers_where_the_row_was_before_the_first_attempt() {
+        let mut fixture = CommandFixture::new().await.unwrap();
+        std::sync::Arc::make_mut(&mut fixture.ctx.config).dev_server =
+            Some(wt_config::DevServerConfig {
+                command: "true".into(),
+                stop_command: Some("exit 1".into()),
+                ..Default::default()
+            });
+        let ctx = &fixture.ctx;
+        let row = crate::lifecycle_ops::resolve_key(ctx, "one").await.unwrap();
+        let revision = crate::lifecycle_ops::service(ctx)
+            .unwrap()
+            .removal_revision(&row.target, false, &ctx.cancellation)
+            .await
+            .unwrap();
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        assert!(
+            !was_archived_before_removal(ctx, "one".into())
+                .await
+                .unwrap()
+        );
+        for (id, landed) in [("5-e", true), ("6-f", false)] {
+            let was_archived = was_archived_before_removal(ctx, "one".into())
+                .await
+                .unwrap();
+            assert!(
+                !was_archived,
+                "attempt {id} read the archive its predecessor set"
+            );
+            atomic_write(
+                &jobs.join(format!("{id}.json")),
+                &json!({
+                    "version": VERSION, "id": id, "state": "starting",
+                    "wasArchived": was_archived, "operation": "remove",
+                    "options": {"force": false, "deleteBranch": true, "landed": landed},
+                    "target": {
+                        "key": "one", "path": row.target.path, "branch": row.target.branch,
+                        "head": row.head_sha, "revision": revision,
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            run_worker(ctx, &DestroyWorkerArgs { job_id: id.into() })
+                .await
+                .unwrap_err();
+            let (state, archived) = ctx
+                .database
+                .call(|store| Ok((store.read_wt_state()?, store.read_archived_keys()?)))
+                .await
+                .unwrap();
+            // The failed attempt left the row archived, as every attempt does.
+            assert!(archived.contains("one"));
+            let record = &state["removals"]["one"];
+            assert_eq!(record["jobId"], id);
+            assert!(record["wasArchived"].is_null(), "{record}");
+            // Drawn as landed by the first attempt, it stays drawn there.
+            assert_eq!(record["landed"], true, "{record}");
+        }
+        // Even a job that claims the row was archived, as one written from
+        // the archive set alone would, does not move a retried row.
+        ctx.database
+            .call(|store| {
+                assert!(store.begin_removal_of(
+                    "one",
+                    "7-g",
+                    "/one",
+                    "feature/one",
+                    false,
+                    true
+                )?);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        assert!(state["removals"]["one"]["wasArchived"].is_null());
+        fixture.close().await.unwrap();
+    }
+
+    /// A worker killed after it claimed its job but before it wrote
+    /// `running` may have recorded the removal. The next start must clear
+    /// that, or the worktree answers "already being removed" for good.
+    #[tokio::test]
+    async fn reaping_fails_a_claimed_job_that_never_reached_running() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let pid = exited.id();
+        exited.wait().unwrap();
+        let claimed = jobs.join("8-h.json");
+        let unclaimed = jobs.join("9-i.json");
+        atomic_write(
+            &claimed,
+            &json!({
+                "id": "8-h", "state": "starting", "workerPid": pid,
+                "workerStartIdentity": "ps:an earlier start",
+                "wasArchived": false, "target": {"key": "one"},
+            }),
+        )
+        .await
+        .unwrap();
+        atomic_write(
+            &unclaimed,
+            &json!({"id": "9-i", "state": "starting", "workerPid": null, "target": {"key": "two"}}),
+        )
+        .await
+        .unwrap();
+        ctx.database
+            .call(|store| {
+                assert!(store.begin_removal("one", "8-h", "/one", "feature/one")?);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        prepare_removals(ctx).await.unwrap();
+
+        assert_eq!(read_job(&claimed).await.unwrap()["state"], "failed");
+        // A job no worker has claimed yet belongs to a start in progress.
+        assert_eq!(read_job(&unclaimed).await.unwrap()["state"], "starting");
+        let retry = ctx
+            .database
+            .call(|store| Ok(store.begin_removal("one", "10-j", "/one", "feature/one")?))
+            .await
+            .unwrap();
+        assert!(retry, "the worktree can be removed again");
         fixture.close().await.unwrap();
     }
 }

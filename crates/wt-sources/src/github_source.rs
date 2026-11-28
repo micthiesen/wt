@@ -3,7 +3,7 @@
 //! floor with its deferred reads.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -37,14 +37,25 @@ const DAEMON_MINIMUM: Duration = Duration::from_millis(100);
 pub struct GithubRefresh {
     github: LeafHandle<GithubData>,
     reads: Arc<Mutex<ReadTimes>>,
-    /// When a read of one branch was last asked for to confirm a write.
-    branch_asked: Arc<Mutex<Option<Stamp>>>,
+    /// The accept stamps of the latest writes whose own branch read was
+    /// asked for.
+    confirming: Arc<Mutex<VecDeque<Stamp>>>,
 }
 
-/// The key the merge queue's own read is stamped under in the GitHub
-/// domain's per-key stamps. No branch can be named this: Git refuses a ref
-/// with consecutive slashes.
-pub const MERGE_QUEUE_KEY: &str = "//merge-queue";
+/// How many accept stamps [`GithubRefresh`] remembers: each is looked up
+/// once, right after its write's reply.
+const CONFIRMING_KEPT: usize = 32;
+
+/// The key a branch's own read is stamped under in the GitHub domain's
+/// per-key stamps, and asked for by. Board rows are stamped under their
+/// slugs in the same map, and a slug can equal another row's branch name;
+/// no slug or branch starts like this, since Git refuses a ref with
+/// consecutive slashes.
+pub fn branch_key(branch: &str) -> String {
+    format!("{BRANCH_KEY}{branch}")
+}
+
+const BRANCH_KEY: &str = "//branch/";
 
 /// The latest direct GitHub read, for explaining a write that expired.
 #[derive(Clone, Copy, Debug, Default)]
@@ -78,28 +89,43 @@ impl GithubRefresh {
         self.github.request(Request::Direct);
     }
 
-    /// After an accepted write to `branch`'s pull request: a direct read of
-    /// that branch and the merge queue alone confirms it, merged into the
-    /// last read of every branch and stamped for that branch only.
+    /// A direct read of `branch` alone, its pull request and its merge-queue
+    /// entry, merged into the last read of every branch and stamped for
+    /// that branch only: the read that confirms a write to it.
     pub fn refresh_live_branch(&self, branch: &str) {
-        *self
-            .branch_asked
+        self.github
+            .request_keys(Request::Direct, [branch_key(branch)]);
+    }
+
+    /// [`refresh_live_branch`](Self::refresh_live_branch) for the write
+    /// accepted at `accepted`, remembered so the reply's own request for a
+    /// confirming read ([`refresh_live_since`](Self::refresh_live_since))
+    /// adds nothing to it.
+    pub fn confirm_branch(&self, branch: &str, accepted: Stamp) {
+        let mut confirming = self
+            .confirming
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Stamp::now());
-        self.github.request_keys(Request::Direct, [branch]);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if confirming.len() == CONFIRMING_KEPT {
+            confirming.pop_front();
+        }
+        confirming.push_back(accepted);
+        drop(confirming);
+        self.refresh_live_branch(branch);
     }
 
     /// [`refresh_live`](Self::refresh_live) for a caller that knows only
     /// that some write was accepted at `accepted`. Nothing more is asked
-    /// when the write's own branch read was asked for since: that read is
-    /// the one that confirms it, and a read of every branch would only
-    /// spend the budget beside it.
+    /// when that very write's branch read was asked for: it is the read
+    /// that confirms the write, and a read of every branch would only spend
+    /// the budget beside it.
     pub fn refresh_live_since(&self, accepted: Stamp) {
-        let asked = *self
-            .branch_asked
+        let known = self
+            .confirming
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if asked.and_then(|asked| asked.at_or_after(&accepted)) != Some(true) {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&accepted);
+        if !known {
             self.refresh_live();
         }
     }
@@ -118,7 +144,7 @@ impl GithubRefresh {
         Self {
             github,
             reads: Arc::default(),
-            branch_asked: Arc::default(),
+            confirming: Arc::default(),
         }
     }
 }
@@ -162,8 +188,9 @@ pub fn start(
     let refresh = GithubRefresh {
         github: github.clone(),
         reads: lane.reads.clone(),
-        branch_asked: Arc::default(),
+        confirming: Arc::default(),
     };
+    let _ = lane.source.set(github.view());
     spawn_deferred_reads(scope, &lane, github.view());
     spawn_github_driver(
         scope,
@@ -187,6 +214,9 @@ struct GithubLane {
     clock: Mutex<LaneClock>,
     reads: Arc<Mutex<ReadTimes>>,
     wake: Notify,
+    /// The leaf this lane fetches for, to ask again for what a fetch could
+    /// not serve. Unset in fixtures that call `fetch` themselves.
+    source: std::sync::OnceLock<SourceHandle<GithubData>>,
 }
 
 #[derive(Default)]
@@ -208,8 +238,10 @@ struct LaneClock {
     /// The published data and its observation stamp, so an older daemon
     /// snapshot can contribute only branches the shown data lacks.
     shown: Option<(GithubData, Stamp)>,
-    /// A network read the floor postponed is due then.
+    /// A network read of every branch the floor postponed is due then.
     deferred: Option<Instant>,
+    /// A read of the owed branches the floor postponed is due then.
+    branches_deferred: Option<Instant>,
     /// A `Request::Direct` has been made and no network read has started
     /// since: daemon snapshots are not served until one does.
     direct_owed: bool,
@@ -229,19 +261,16 @@ struct LaneClock {
     /// has started for since.
     branches_owed: BTreeSet<String>,
     /// Branches read alone since the shown read of every branch, each with
-    /// the start of its read and the board rows that show it. Only these
-    /// are newer than the shown stamp.
+    /// the start of its read and the board rows that show it. Only these,
+    /// pull request and merge-queue entry, are newer than the shown stamp.
     read_alone: BTreeMap<String, (Instant, Vec<String>)>,
-    /// Start of the merge queue's read, when a branch's read brought a
-    /// newer one than the shown read of every branch.
-    queue_read: Option<Instant>,
 }
 
 /// What the lane does about the branches a write asked to have read.
 enum BranchRead {
     /// Nothing is owed, or a read of every branch serves it.
     No,
-    /// Behind the rate floor; recorded in `deferred`.
+    /// Behind the rate floor; recorded in `branches_deferred`.
     Defer,
     Read(Vec<String>),
 }
@@ -328,8 +357,14 @@ impl LaneClock {
                 // from the older snapshot, so a newer read never regresses.
                 // The combined stamp is the older one for every branch.
                 let merged = merge_older(shown, read, branches);
-                self.read_alone.clear();
-                self.queue_read = None;
+                // The lane's own later reads of branches still shown stay
+                // known, so an older daemon read of one cannot replace it.
+                // Their rows are not named until the branch is read again.
+                self.read_alone
+                    .retain(|branch, _| branches.contains(branch));
+                for (_, rows) in self.read_alone.values_mut() {
+                    rows.clear();
+                }
                 merged
             } else {
                 // Nothing shown to keep: wait for a direct read.
@@ -375,18 +410,28 @@ impl LaneClock {
             return Plan::Defer;
         }
         self.started(now);
+        self.deferred = None;
         self.served_daemon = None;
         self.direct_owed = false;
         Plan::Network
     }
 
     /// A network read starts at `now`. Whatever it reads, it started after
-    /// every branch read asked for so far.
+    /// every branch read asked for so far. A read of every branch still
+    /// waiting behind the floor keeps waiting when this one is not it.
     fn started(&mut self, now: Instant) {
         self.sustained = Some(self.sustained.map_or(now, |at| at.max(now)) + GITHUB_MINIMUM);
         self.live_started = Some(now);
-        self.deferred = None;
+        self.branches_deferred = None;
         self.branches_owed.clear();
+    }
+
+    /// The earlier of the two postponed reads' due times.
+    fn next_deferred(&self) -> Option<Instant> {
+        match (self.deferred, self.branches_deferred) {
+            (Some(all), Some(branches)) => Some(all.min(branches)),
+            (all, branches) => all.or(branches),
+        }
     }
 
     /// Whether to read only the branches a write asked for. That needs shown
@@ -412,7 +457,7 @@ impl LaneClock {
             .and_then(|at| at.checked_sub(GITHUB_MINIMUM))
             .max(self.limited_until);
         if let Some(due) = due.filter(|due| *due > now) {
-            self.deferred = Some(due);
+            self.branches_deferred = Some(due);
             return BranchRead::Defer;
         }
         let named = self.branches_owed.iter().cloned().collect();
@@ -421,8 +466,12 @@ impl LaneClock {
     }
 
     /// A read of `named` alone, begun at `started`, succeeded: its answer
-    /// for each branch (a missing pull request included) and its merge queue
-    /// replace the shown ones. `rows` names the board rows showing each
+    /// for each branch, a missing pull request or merge-queue entry
+    /// included, replaces the shown one. Every other branch's queue entry
+    /// stays as old as its pull request, and whether the queue was read
+    /// whole stays what the read of every branch said: a newer queue beside
+    /// older pull requests would show one that merged meanwhile as open and
+    /// dropped from the queue. `rows` names the board rows showing each
     /// branch, which carry the branch's stamp too. `None` when the shown
     /// data it was to merge into is gone.
     fn branches_read(
@@ -438,13 +487,15 @@ impl LaneClock {
                 Some(pr) => shown.prs.insert(branch.clone(), pr.clone()),
                 None => shown.prs.remove(branch),
             };
+            match read.merge_queue.get(branch) {
+                Some(entry) => shown.merge_queue.insert(branch.clone(), entry.clone()),
+                None => shown.merge_queue.remove(branch),
+            };
             self.read_alone.insert(
                 branch.clone(),
                 (started, rows.get(branch).cloned().unwrap_or_default()),
             );
         }
-        shown.merge_queue = read.merge_queue;
-        shown.merge_queue_complete = read.merge_queue_complete;
         // Readers pace reads of every branch by what one of those cost.
         shown.rate_limit = match (read.rate_limit, shown.rate_limit) {
             (Some(read), Some(shown)) => Some(wt_github::RateLimit {
@@ -453,7 +504,6 @@ impl LaneClock {
             }),
             (read, shown) => read.or(shown),
         };
-        self.queue_read = Some(started);
         self.limited_until = None;
         let (data, observed) = (shown.clone(), *observed);
         Some(self.stamped(data, observed))
@@ -461,28 +511,31 @@ impl LaneClock {
 
     /// `data` whose read of every branch began at `observed`, with the
     /// later start of each branch read alone since. The stamps are keyed by
-    /// branch, which this host's write ledger settles on, and by the rows
-    /// showing the branch, which the board's pending changes settle on.
+    /// [`branch_key`], which this host's write ledger settles on, and by
+    /// the rows showing the branch, which the board's pending changes
+    /// settle on. A row showing two such branches is as old as the older.
     fn stamped(&self, data: GithubData, observed: Stamp) -> Fetched<GithubData> {
-        if self.read_alone.is_empty() && self.queue_read.is_none() {
+        if self.read_alone.is_empty() {
             return Fetched::new(data, observed);
         }
-        let mut stamps = BTreeMap::new();
+        let mut stamps: BTreeMap<String, Stamp> = BTreeMap::new();
         for (branch, (at, rows)) in &self.read_alone {
-            for key in std::iter::once(branch).chain(rows) {
-                stamps.insert(key.clone(), Stamp::at(*at));
+            let at = Stamp::at(*at);
+            stamps.insert(branch_key(branch), at);
+            for row in rows {
+                stamps
+                    .entry(row.clone())
+                    .and_modify(|seen| *seen = seen.earliest(at))
+                    .or_insert(at);
             }
-        }
-        if let Some(at) = self.queue_read {
-            stamps.insert(MERGE_QUEUE_KEY.to_owned(), Stamp::at(at));
         }
         Fetched::keyed(data, KeyedStamps::new(observed, stamps))
     }
 
-    /// The daemon's newer read of every branch, except that a branch (or
-    /// the merge queue) this lane read alone after the daemon read it keeps
-    /// the lane's answer and stamp: the read that confirmed a write is never
-    /// replaced by one that began before it.
+    /// The daemon's newer read of every branch, except that a branch this
+    /// lane read alone after the daemon read it keeps the lane's answer
+    /// (pull request and merge-queue entry) and stamp: the read that
+    /// confirmed a write is never replaced by one that began before it.
     fn keep_read_alone(&mut self, read: DaemonRead, branches: &[String]) -> GithubData {
         let DaemonRead {
             mut data,
@@ -494,21 +547,19 @@ impl LaneClock {
         self.read_alone.retain(|branch, (at, _)| {
             branches.contains(branch) && later(*at, scoped.get(branch).copied().or(started))
         });
-        self.queue_read = self.queue_read.filter(|at| later(*at, started));
         if let Some((shown, _)) = &self.shown {
             for branch in self.read_alone.keys() {
                 match shown.prs.get(branch) {
                     Some(pr) => data.prs.insert(branch.clone(), pr.clone()),
                     None => data.prs.remove(branch),
                 };
-            }
-            if self.queue_read.is_some() {
-                data.merge_queue = shown.merge_queue.clone();
-                data.merge_queue_complete = shown.merge_queue_complete;
+                match shown.merge_queue.get(branch) {
+                    Some(entry) => data.merge_queue.insert(branch.clone(), entry.clone()),
+                    None => data.merge_queue.remove(branch),
+                };
             }
         } else {
             self.read_alone.clear();
-            self.queue_read = None;
         }
         data
     }
@@ -556,7 +607,6 @@ impl LaneClock {
         self.pace_by(data.rate_limit);
         self.limited_until = None;
         self.read_alone.clear();
-        self.queue_read = None;
         self.live_observed = Some(started);
         self.published = Some(branches);
         self.shown = Some((data.clone(), Stamp::at(started)));
@@ -645,6 +695,7 @@ impl GithubLane {
             clock: Mutex::default(),
             reads: Arc::default(),
             wake: Notify::new(),
+            source: std::sync::OnceLock::new(),
         }
     }
 
@@ -668,7 +719,7 @@ impl GithubLane {
     ) -> Result<Option<Fetched<GithubData>>, GithubError> {
         // Nothing recorded means the request that woke this fetch was
         // already taken, at full strength, by the fetch before it.
-        let request = demand.strongest().unwrap_or(Request::Recheck);
+        let request = demand.whole.unwrap_or(Request::Recheck);
         // Recorded before any early return: a direct read, of every branch
         // or of the named ones, stays owed until a network read starts,
         // however many fetches skip or defer first.
@@ -680,7 +731,7 @@ impl GithubLane {
                     .keys
                     .into_iter()
                     .filter(|(_, request)| *request == Request::Direct)
-                    .map(|(branch, _)| branch),
+                    .filter_map(|(key, _)| key.strip_prefix(BRANCH_KEY).map(str::to_owned)),
             );
         }
         // The key set comes from Git. Restored or missing inventory cannot
@@ -703,8 +754,8 @@ impl GithubLane {
             clock.served_daemon = None;
             clock.shown = None;
             clock.branches_owed.clear();
+            clock.branches_deferred = None;
             clock.read_alone.clear();
-            clock.queue_read = None;
             return Ok(Some(Fetched::new(GithubData::default(), Stamp::now())));
         }
         let now = Instant::now();
@@ -713,11 +764,21 @@ impl GithubLane {
             BranchRead::No => {}
             BranchRead::Defer => {
                 self.wake.notify_one();
-                return Ok(None);
+                // A request for every branch made with it is served below
+                // as if no branch were owed.
+                if demand.whole.is_none() {
+                    return Ok(None);
+                }
             }
             BranchRead::Read(named) => {
                 let rows = rows_showing(&inventory, &state.0, &named);
-                return self.read_branches(named, rows, now, cancel).await;
+                let read = self.read_branches(named, rows, now, cancel).await;
+                // This fetch read the named branches only: what was asked
+                // of every branch with them is asked again.
+                if let (Some(request), Some(source)) = (demand.whole, self.source.get()) {
+                    source.request(request);
+                }
+                return read;
             }
         }
         let bypass = self.clock().direct_owed;
@@ -876,19 +937,32 @@ fn spawn_deferred_reads(
             }
             // A read that ran meanwhile clears the deferral; never fire twice.
             loop {
-                let deferred = lane.clock().deferred;
+                let deferred = lane.clock().next_deferred();
                 let Some(due) = deferred else { break };
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
+                    // Another read was postponed, perhaps to sooner.
+                    _ = lane.wake.notified() => continue,
                     _ = tokio::time::sleep_until(due) => {}
                 }
+                let now = Instant::now();
                 let mut clock = lane.clock();
-                if clock.deferred.is_some_and(|due| due <= Instant::now()) {
+                let branches = clock.branches_deferred.is_some_and(|due| due <= now);
+                let all = clock.deferred.is_some_and(|due| due <= now);
+                if branches {
+                    clock.branches_deferred = None;
+                }
+                if all {
                     clock.deferred = None;
-                    drop(clock);
+                }
+                let owed: Vec<String> = clock.branches_owed.iter().map(|b| branch_key(b)).collect();
+                drop(clock);
+                if branches && !owed.is_empty() {
+                    github.request_keys(Request::Direct, owed);
+                }
+                if all {
                     github.refresh();
-                    break;
                 }
             }
         }
@@ -1290,11 +1364,10 @@ mod tests {
         assert_eq!(clock.deferred, Some(start + 3 * GITHUB_MINIMUM));
     }
 
-    /// The read that confirms a write reads the written branch and the merge
-    /// queue alone. Merged into the shown read of every branch, it claims
-    /// to be newer for that branch, its rows and the queue only, and a
-    /// daemon snapshot whose read began before it does not take the answer
-    /// back.
+    /// The read that confirms a write reads the written branch alone. Merged
+    /// into the shown read of every branch, it claims to be newer for that
+    /// branch and its rows only, and a daemon snapshot whose read began
+    /// before it does not take the answer back.
     #[tokio::test(start_paused = true)]
     async fn a_written_branch_is_read_alone_and_stamped_alone() {
         use crate::github_actions::tests::{ledger_with_accepted_enable, pr, with_auto_merge};
@@ -1346,15 +1419,19 @@ mod tests {
         let fetched = clock.branches_read(&named, &rows, read, accepted).unwrap();
         assert!(fetched.data.prs["feature"].auto_merge.is_some());
         assert!(fetched.data.prs["other"].auto_merge.is_none());
-        assert!(fetched.data.merge_queue_complete);
+        // Whether the whole queue was read is the full read's to say.
+        assert!(!fetched.data.merge_queue_complete);
         assert_eq!(fetched.data.covered_branches.len(), 2);
         // The domain is as old as the read of every branch.
         assert_eq!(fetched.observed, Stamp::at(start));
         let stamps = fetched.stamps().unwrap();
-        for key in ["feature", "one", MERGE_QUEUE_KEY] {
-            assert_eq!(stamps.get(key), Stamp::at(accepted), "{key}");
+        for key in [branch_key("feature"), "one".to_owned()] {
+            assert_eq!(stamps.get(&key), Stamp::at(accepted), "{key}");
         }
-        assert_eq!(stamps.get("other"), Stamp::at(start));
+        // A row named like the branch is another key.
+        for key in [branch_key("other"), "feature".to_owned()] {
+            assert_eq!(stamps.get(&key), Stamp::at(start), "{key}");
+        }
 
         // The ledger settles the write on its branch's read, and a write to
         // the other branch at the same moment stays open.
@@ -1388,11 +1465,10 @@ mod tests {
         assert!(fetched.data.prs["feature"].auto_merge.is_some());
         assert!(fetched.data.prs["feature"].is_draft);
         assert!(!fetched.data.prs["other"].is_draft);
-        assert!(fetched.data.merge_queue_complete);
         let stamps = fetched.stamps().unwrap();
-        assert_eq!(stamps.get("feature"), Stamp::at(accepted));
+        assert_eq!(stamps.get(&branch_key("feature")), Stamp::at(accepted));
         assert_eq!(
-            stamps.get("other"),
+            stamps.get(&branch_key("other")),
             Stamp::at(start + Duration::from_secs(1))
         );
         // One that began after the branch read is the newer answer for all.
@@ -1403,6 +1479,267 @@ mod tests {
         };
         assert!(!fetched.data.prs["feature"].is_draft);
         assert!(fetched.stamps().is_none());
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    /// A queued pull request merges, and before the next read of every
+    /// branch a write to another branch is confirmed by a read of that
+    /// branch alone. The merged one still shows as open, as the last full
+    /// read left it; it must also still show as queued, or it would read as
+    /// dropped from the queue and fire "evicted" for a merge that landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_branch_read_does_not_bring_a_newer_queue_beside_older_pull_requests() {
+        use crate::github_actions::tests::pr;
+        let branches = vec!["a".to_owned(), "b".to_owned()];
+        let entry = |branch: &str| wt_github::MergeQueueEntry {
+            head_ref_name: branch.into(),
+            position: 1,
+            state: wt_github::MergeQueueState::Queued,
+            enqueued_at: "2026-10-03T12:00:00Z".into(),
+            estimated_time_to_merge: None,
+        };
+        let mut full = GithubData {
+            covered_branches: branches.iter().cloned().collect(),
+            merge_queue_complete: true,
+            ..GithubData::default()
+        };
+        for branch in &branches {
+            let mut pr = pr(branch);
+            pr.is_draft = false;
+            full.prs.insert(branch.clone(), pr);
+        }
+        full.merge_queue.insert("b".into(), entry("b"));
+        let start = Instant::now();
+        let mut clock = LaneClock::default();
+        clock.live_read(start, branches.clone(), &full);
+
+        // B has merged; the read of A alone sees a queue without it, read
+        // whole.
+        let read = GithubData {
+            prs: [("a".to_owned(), pr("a"))].into(),
+            merge_queue: [("a".to_owned(), entry("a"))].into(),
+            merge_queue_complete: true,
+            ..GithubData::default()
+        };
+        let at = start + Duration::from_secs(5);
+        let fetched = clock
+            .branches_read(&["a".to_owned()], &BTreeMap::new(), read, at)
+            .unwrap();
+        let data = &fetched.data;
+        // A's own entry is the newer one.
+        assert!(data.merge_queue.contains_key("a"));
+        let b = &data.prs["b"];
+        let now_ms = 10 * 60_000;
+        let arm = wt_core::MergeArm {
+            pr: b.number,
+            head: None,
+            armed_at_ms: 0,
+            mechanism: wt_core::MergeMechanism::Queue,
+            seen_armed_at_ms: Some(1_000),
+        };
+        // As `automation_facts::watch_row` asks it.
+        let dropped = wt_automations::merge_dropped(
+            &arm,
+            b.number,
+            b.auto_merge.is_some(),
+            data.merge_queue
+                .get("b")
+                .map(|_| true)
+                .or(data.merge_queue_complete.then_some(false)),
+            now_ms,
+        );
+        assert_ne!(dropped, Some(true));
+        assert_eq!(dropped, Some(false));
+
+        // A daemon read that began before A's keeps A's entry with A's
+        // pull request, and takes its own word for everything else.
+        let mut snapshot = daemon(Some(start + Duration::from_secs(1)), 1_000);
+        snapshot.data = full.clone();
+        snapshot.data.merge_queue.clear();
+        let Plan::Publish(fetched) = clock.plan(input(&branches, Some(snapshot), at)) else {
+            panic!("the daemon's newer read is published");
+        };
+        assert!(fetched.data.merge_queue.contains_key("a"));
+        assert!(!fetched.data.merge_queue.contains_key("b"));
+    }
+
+    /// A read of every branch waiting behind the floor is not dropped by a
+    /// branch read that starts meanwhile, and each has its own due time.
+    #[tokio::test(start_paused = true)]
+    async fn a_branch_read_leaves_a_postponed_read_of_every_branch_waiting() {
+        let branches = branches();
+        let start = Instant::now();
+        let mut clock = LaneClock::default();
+        let data = GithubData {
+            covered_branches: branches.iter().cloned().collect(),
+            ..GithubData::default()
+        };
+        assert!(matches!(
+            clock.plan(input(&branches, None, start)),
+            Plan::Network
+        ));
+        clock.live_read(start, branches.clone(), &data);
+        let second = Duration::from_secs(1);
+        // The backstop asks for every branch a second later: postponed.
+        assert!(matches!(
+            clock.plan(input(&branches, None, start + second)),
+            Plan::Defer
+        ));
+        let all_due = clock.deferred.unwrap();
+        // A write's branch read starts ahead of the floor.
+        clock.branches_owed.insert("feature".into());
+        assert!(matches!(
+            clock.branch_read(&branches, start + 2 * second),
+            BranchRead::Read(_)
+        ));
+        assert_eq!(clock.deferred, Some(all_due));
+        // The confirmer's next poll is postponed on its own, to sooner than
+        // the read of every branch now is.
+        clock.branches_owed.insert("feature".into());
+        assert!(matches!(
+            clock.branch_read(&branches, start + 3 * second),
+            BranchRead::Defer
+        ));
+        assert_eq!(clock.deferred, Some(all_due));
+        assert_eq!(clock.next_deferred(), Some(all_due));
+        assert_eq!(clock.branches_deferred, Some(start + GITHUB_MINIMUM));
+        // The read of every branch, when it goes, serves the branch too.
+        assert!(matches!(
+            clock.plan(input(&branches, None, start + 2 * GITHUB_MINIMUM)),
+            Plan::Network
+        ));
+        assert_eq!((clock.deferred, clock.branches_deferred), (None, None));
+        assert!(clock.branches_owed.is_empty());
+    }
+
+    /// After the branch set changes under shown data newer than the daemon's,
+    /// the lane still knows which branches it read alone: the daemon's older
+    /// read of one cannot replace the read that confirmed a write.
+    #[tokio::test(start_paused = true)]
+    async fn a_branch_set_change_keeps_the_lanes_own_branch_reads() {
+        use crate::github_actions::tests::{pr, with_auto_merge};
+        let _ = Stamp::now();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let branches = vec!["feature".to_owned()];
+        let start = Instant::now();
+        let mut clock = LaneClock::default();
+        let mut full = GithubData {
+            covered_branches: branches.iter().cloned().collect(),
+            ..GithubData::default()
+        };
+        full.prs.insert("feature".into(), pr("feature"));
+        clock.live_read(start, branches.clone(), &full);
+        // The lane reads `feature` alone and sees its merge armed.
+        let armed_at = start + Duration::from_secs(10);
+        let armed = with_auto_merge(GithubData {
+            prs: [("feature".to_owned(), pr("feature"))].into(),
+            ..GithubData::default()
+        });
+        let rows = [("feature".to_owned(), vec!["one".to_owned()])].into();
+        clock
+            .branches_read(&branches, &rows, armed, armed_at)
+            .unwrap();
+
+        // A worktree is added. The daemon's sweep predates the live read,
+        // and its own read of `feature` predates the lane's.
+        let more = vec!["feature".to_owned(), "new".to_owned()];
+        let stale = |written_ms| {
+            let mut read = daemon(Some(start - Duration::from_secs(5)), written_ms);
+            read.data.prs.insert("feature".into(), pr("feature"));
+            read.data.covered_branches = more.iter().cloned().collect();
+            read.scoped = [("feature".to_owned(), start + Duration::from_secs(5))].into();
+            read
+        };
+        let Plan::Publish(fetched) = clock.plan(input(&more, Some(stale(1_000)), armed_at)) else {
+            panic!("the new branch is published from the older snapshot");
+        };
+        assert!(fetched.data.prs["feature"].auto_merge.is_some());
+        let stamps = fetched.stamps().unwrap();
+        assert_eq!(stamps.get(&branch_key("feature")), Stamp::at(armed_at));
+        // The rows are not named again until the branch is read again.
+        assert_eq!(stamps.get("one"), fetched.observed);
+        // The daemon's next file: its read of `feature` is after the live
+        // read and before the lane's, and must not un-arm the merge.
+        match clock.plan(input(&more, Some(stale(2_000)), armed_at)) {
+            Plan::Skip => {}
+            Plan::Publish(fetched) => {
+                assert!(fetched.data.prs["feature"].auto_merge.is_some());
+            }
+            _ => panic!("a snapshot is served or skipped"),
+        }
+        assert!(
+            clock.shown.as_ref().unwrap().0.prs["feature"]
+                .auto_merge
+                .is_some()
+        );
+    }
+
+    /// The sleeper for postponed reads wakes for a newly postponed one that
+    /// is due sooner than the one it is sleeping to, and asks for the owed
+    /// branches rather than every branch.
+    #[tokio::test]
+    async fn a_sooner_postponed_read_is_not_kept_waiting_behind_a_later_one() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let scope = TaskScope::new();
+        let (git, _git) = leaf_channel(&scope, spec("git", Domain::Git));
+        let (metadata, _metadata) = leaf_channel(&scope, spec("metadata", Domain::Metadata));
+        let (github, mut publisher) =
+            leaf_channel::<GithubData>(&scope, spec("github", Domain::Github));
+        let lane = Arc::new(GithubLane::new(fixture.ctx.clone(), git, metadata, true));
+        spawn_deferred_reads(&scope, &lane, github.view());
+        tokio::time::pause();
+        let now = Instant::now();
+        lane.clock().deferred = Some(now + Duration::from_secs(300));
+        lane.wake.notify_one();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        {
+            let mut clock = lane.clock();
+            clock.branches_owed.insert("feature".into());
+            clock.branches_deferred = Some(now + Duration::from_secs(3));
+        }
+        lane.wake.notify_one();
+        tokio::time::timeout(Duration::from_secs(30), publisher.requested())
+            .await
+            .expect("the sooner read is asked for when it is due")
+            .unwrap();
+        assert!(now.elapsed() < Duration::from_secs(30));
+        let demand = publisher.take_demand();
+        assert_eq!(demand.whole, None);
+        assert_eq!(
+            demand.keys,
+            [(branch_key("feature"), Request::Direct)].into()
+        );
+        assert_eq!(lane.clock().deferred, Some(now + Duration::from_secs(300)));
+        tokio::time::resume();
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    /// The reply's own request for a confirming read adds nothing to the
+    /// branch read asked for that very write, and nothing less for any other.
+    #[tokio::test]
+    async fn only_the_write_whose_branch_read_was_asked_for_skips_the_read_of_every_branch() {
+        let scope = TaskScope::new();
+        let (github, mut publisher) =
+            leaf_channel::<GithubData>(&scope, spec("github", Domain::Github));
+        let refresh = GithubRefresh {
+            github,
+            reads: Arc::default(),
+            confirming: Arc::default(),
+        };
+        let first = Stamp::now();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let later = Stamp::now();
+        refresh.confirm_branch("feature", later);
+        refresh.refresh_live_since(later);
+        let demand = publisher.take_demand();
+        assert_eq!(demand.whole, None);
+        assert!(demand.keys.contains_key(&branch_key("feature")));
+        // A write accepted earlier, on a branch nobody asked to have read.
+        refresh.refresh_live_since(first);
+        assert_eq!(publisher.take_demand().whole, Some(Request::Direct));
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
@@ -1433,14 +1770,14 @@ mod tests {
             clock.branch_read(&branches, start + 2 * second),
             BranchRead::Defer
         ));
-        assert_eq!(clock.deferred, Some(start + GITHUB_MINIMUM));
+        assert_eq!(clock.branches_deferred, Some(start + GITHUB_MINIMUM));
         assert_eq!(clock.branches_owed.len(), 1);
         clock.rate_limited(Some(epoch_ms() + 60_000), start + 2 * second);
         assert!(matches!(
             clock.branch_read(&branches, start + GITHUB_MINIMUM),
             BranchRead::Defer
         ));
-        assert_eq!(clock.deferred, clock.limited_until);
+        assert_eq!(clock.branches_deferred, clock.limited_until);
         // A branch outside the shown read cannot be merged into it.
         clock.branches_owed.insert("unknown".into());
         assert!(matches!(

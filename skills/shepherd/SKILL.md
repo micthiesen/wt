@@ -117,9 +117,10 @@ verdict says.
 
 Read arming from `wt fleet --json`: `.merge_queue` (null when not queued)
 and `.pr.auto_merge`. A PR you armed that is open with neither was evicted or
-disarmed. Find the cause before acting: the failed queue run (`gh pr checks`
-and its log), a conflict with something that landed ahead of it, or a new
-requirement. A code cause goes to the owner as a nudge naming the failure;
+disarmed. Find the cause before acting: `.queue_removal` (`reason`, `at`;
+null unless GitHub removed the open PR from the queue after the arming), the
+failed queue run (`gh pr checks` and its log), a conflict with something that
+landed ahead of it, or a new requirement. A code cause goes to the owner as a nudge naming the failure;
 when the owner reports it fixed and the row meets the merge row above again,
 `wt merge <slug>` again. A flaky queue run with no code cause may be re-armed
 once without a push; a second failure is a real one. Never re-arm unchanged

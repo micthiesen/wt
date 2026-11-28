@@ -18,7 +18,7 @@ use tokio::process::{Child, Command};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::admission::Admission;
+use crate::admission::{Admission, Permit};
 pub use crate::admission::{ProcessBudget, ProcessClass};
 use crate::lock::{LockError, MachineSlot, MachineSlots};
 
@@ -49,9 +49,10 @@ pub struct CommandSpec {
     pub timeout: Duration,
     /// The longest wait for admission. `None` uses the class default, a
     /// minute (fifteen for bulk work), so a command queued behind others
-    /// fails only when the queue itself is stuck. A `heavy()` command first
-    /// waits for a machine-wide slot, for at most this long or ten minutes,
-    /// and then proceeds with or without one; that wait is not counted here.
+    /// fails only when the queue itself is stuck. A `heavy()` command also
+    /// wants a machine-wide slot, for at most this long or ten minutes,
+    /// after which it runs without one; each wait for the local permit in
+    /// between has this bound of its own.
     pub admission_timeout: Option<Duration>,
     pub output_limit: usize,
     /// Explicit ownership transfer for desktop launchers/clipboard providers.
@@ -321,6 +322,70 @@ impl ProcessRunner {
         Box::pin(self.run_inner(spec, cancellation, Some(Arc::new(observer)), false)).await
     }
 
+    /// Wait for the local permit and, for a heavy command, a machine slot.
+    /// Neither is held while waiting for the other: a slot kept idle behind
+    /// this process's busy permits is one no other process can use, and a
+    /// permit kept behind a full machine blocks this process's fetches. The
+    /// slot is only ever tried, or awaited with no permit in hand. Past the
+    /// slot bound the command runs on its permit alone.
+    async fn admit(
+        &self,
+        cancellation: &CancellationToken,
+        admission_timeout: Duration,
+        label: &CommandLabel,
+    ) -> Result<(Permit, Option<MachineSlot>), Stopped> {
+        let slots = self.admission.heavy().filter(|_| self.heavy);
+        let slot_bound = HEAVY_SLOT_WAIT.min(admission_timeout);
+        let slot_deadline = Instant::now() + slot_bound;
+        loop {
+            let permit = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(Stopped::Cancelled),
+                _ = tokio::time::sleep(admission_timeout) => return Err(Stopped::TimedOut),
+                permit = self.admission.acquire(self.class) => permit,
+            };
+            let Some(slots) = slots else {
+                return Ok((permit, None));
+            };
+            let unavailable = |error: LockError| {
+                // The slots shed load; they guard no data. Unusable slot
+                // files must not stop wt from running commands.
+                tracing::warn!(target: "wt::process", %error, "machine slots unavailable; running without one");
+            };
+            match slots.try_acquire() {
+                Ok(Some(slot)) => return Ok((permit, Some(slot))),
+                Ok(None) => {}
+                Err(error) => {
+                    unavailable(error);
+                    return Ok((permit, None));
+                }
+            }
+            let remaining = slot_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tracing::info!(
+                    target: "wt::process",
+                    program = %label.program,
+                    wait_ms = slot_bound.as_millis() as u64,
+                    "no machine slot came free; running the heavy command without one"
+                );
+                return Ok((permit, None));
+            }
+            drop(permit);
+            match slots.acquire_within(remaining, cancellation).await {
+                Ok(Some(slot)) => {
+                    if let Some(permit) = self.admission.try_acquire(self.class) {
+                        return Ok((permit, Some(slot)));
+                    }
+                    // The permit went to someone else meanwhile. Give the
+                    // slot back and queue for a permit with nothing held.
+                }
+                Ok(None) => {}
+                Err(LockError::Cancelled) => return Err(Stopped::Cancelled),
+                Err(error) => unavailable(error),
+            }
+        }
+    }
+
     async fn run_inner(
         &self,
         spec: CommandSpec,
@@ -339,46 +404,16 @@ impl ProcessRunner {
         } else {
             self.class.admission_timeout()
         });
-        // The machine slot comes first: waiting for it while holding a local
-        // permit would keep this process's few bulk permits from its fetches.
-        let slot = match self.admission.heavy().filter(|_| self.heavy) {
-            Some(slots) => {
-                let bound = HEAVY_SLOT_WAIT.min(admission_timeout);
-                match slots.acquire_within(bound, cancellation).await {
-                    Ok(Some(slot)) => Some(slot),
-                    Ok(None) => {
-                        tracing::info!(
-                            target: "wt::process",
-                            program = %label.program,
-                            wait_ms = bound.as_millis() as u64,
-                            "no machine slot came free; running the heavy command without one"
-                        );
-                        None
-                    }
-                    Err(LockError::Cancelled) => {
-                        label.report(started.elapsed(), None, "cancelled");
-                        return Err(cancelled());
-                    }
-                    Err(error) => {
-                        // The slots shed load; they guard no data. Unusable
-                        // slot files must not stop wt from running commands.
-                        tracing::warn!(target: "wt::process", %error, "machine slots unavailable; running without one");
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let queued = Instant::now();
-        let admitted = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => Err(cancelled()),
-            _ = tokio::time::sleep_until(queued + admission_timeout) => Err(ProcessError::Timeout {
-                program: program.clone(),
-                timeout: admission_timeout,
-            }),
-            permit = self.admission.acquire(self.class) => Ok((permit, slot)),
-        };
+        let admitted = self
+            .admit(cancellation, admission_timeout, &label)
+            .await
+            .map_err(|stopped| match stopped {
+                Stopped::Cancelled => cancelled(),
+                Stopped::TimedOut => ProcessError::Timeout {
+                    program: program.clone(),
+                    timeout: admission_timeout,
+                },
+            });
         let _admitted = match admitted {
             // Cancellation can arrive together with the permit. Do not launch
             // work whose caller already withdrew it.
@@ -548,6 +583,12 @@ impl ProcessRunner {
         );
         result
     }
+}
+
+/// Why admission ended without admitting.
+enum Stopped {
+    Cancelled,
+    TimedOut,
 }
 
 fn outcome(error: &ProcessError) -> &'static str {

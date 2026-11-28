@@ -279,7 +279,7 @@ async fn read_records(
 ) -> Result<Vec<RemovedWorktree>> {
     let records = context
         .database
-        .call(|store| Ok(store.read_removed_worktrees()?))
+        .read(|store| Ok(store.read_removed_worktrees()?))
         .await?;
     let cutoff = now_ms().saturating_sub(MAX_AGE.as_millis().min(i64::MAX as u128) as i64);
     Ok(filter_records(records, live_slugs, cutoff))

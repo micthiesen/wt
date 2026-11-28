@@ -387,9 +387,11 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             let split = parent_of(index)
                 .filter(|&parent| section_keys[parent] != section_keys[index])
                 .map(|parent| section_title(&section_keys[parent]));
+            let parent = parent_of(index).map(|parent| board.rows[parent].key.clone());
             let row = &mut board.rows[index];
             row.stack_lane = lane;
             row.split_parent_section = split;
+            row.stack_parent = parent;
             row.stack_prefix = spine
                 .get(&row.key)
                 .map(|cell| {

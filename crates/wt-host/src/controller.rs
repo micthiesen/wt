@@ -530,7 +530,6 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
     Cow::Borrowed(match action {
         A::OnHost { action, .. } => return action_name(action),
         A::RunAction { id, .. } => return Cow::Owned(format!("run action {id}")),
-        A::PrepareAction { id, .. } => return Cow::Owned(format!("prepare action {id}")),
         A::ManagedSignIn { provider, .. } => return Cow::Owned(format!("sign in to {provider}")),
         A::Create { .. } | A::CreateResolved { .. } => "create worktree",
         A::Remove { .. } => "remove worktree",
@@ -545,7 +544,7 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::PrepareRestoreRemoved { .. } => "prepare worktree restore",
         A::PrepareHardRefresh => "prepare cache refresh",
         A::PrepareActions { .. } => "prepare action palette",
-        A::WarmPalette { .. } => "prefetch action palette",
+        A::PrepareDevLogs { .. } => "load dev server logs",
         A::PrepareSection { .. } => "prepare section picker",
         A::PrepareDeleteSection { .. } => "prepare section delete",
         A::PrepareStatus { .. } => "prepare status picker",
@@ -625,16 +624,16 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
     };
     let key = match action {
         A::OnHost { action, .. } => return action_target(action),
-        A::RunAction { surface, .. }
-        | A::PrepareAction { surface, .. }
-        | A::PrepareActions { surface }
-        | A::WarmPalette { surface } => match surface_key(surface) {
-            Ok(key) => key?,
-            Err(label) => return Some(label),
-        },
+        A::RunAction { surface, .. } | A::PrepareActions { surface } => {
+            match surface_key(surface) {
+                Ok(key) => key?,
+                Err(label) => return Some(label),
+            }
+        }
         A::Remove { key, .. }
         | A::DismissFailedRemoval { key, .. }
         | A::PrepareRemove { key }
+        | A::PrepareDevLogs { key }
         | A::SetTitle { key, .. }
         | A::SetStatus { key, .. }
         | A::PrepareStatus { key }
@@ -1919,6 +1918,7 @@ mod tests {
                 id: "address-pr-review".into(),
                 arg: None,
                 extras: String::new(),
+                seen: None,
             };
             action_reply_with_context(
                 Ok(UiReply::failure("Codex delivery failed")),
@@ -2251,9 +2251,10 @@ mod tests {
     }
 
     #[test]
-    fn palette_prefetch_never_holds_a_menu_the_user_is_waiting_for() {
-        let warm = lane_for(&wt_tui::UiAction::WarmPalette {
-            surface: wt_tui::ActionSurface::Row { key: "one".into() },
+    fn a_background_read_never_holds_a_menu_the_user_is_waiting_for() {
+        let warm = lane_for(&wt_tui::UiAction::DiscoverSessions {
+            key: Some("one".into()),
+            target: wt_tui::SessionTarget::Harness,
         })
         .unwrap();
         assert_eq!(warm, Lane::Prefetch(None));

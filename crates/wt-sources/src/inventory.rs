@@ -230,6 +230,7 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
             .then(|| config.github.default_reviewer.clone())
             .flatten(),
         owed_sections: config.ui.owed_sections,
+        status_sort: config.ui.sort == wt_config::UiSort::Status,
         guides: config.guides.enabled,
         staging_probe: config
             .environments
@@ -239,6 +240,62 @@ pub fn display_policy(config: &Config) -> wt_tui::DisplayPolicy {
             .environments
             .get(wt_core::VerifyStage::Production)
             .is_some(),
+        actions: action_catalog(config),
+    }
+}
+
+/// The action definitions the palettes list, without their prompt and
+/// command bodies.
+fn action_catalog(config: &Config) -> wt_tui::ActionCatalog {
+    let entries = |surface: wt_tui::ActionSurface| {
+        wt_app_core::action_builtins::definitions(config, &surface)
+            .iter()
+            .map(action_entry)
+            .collect()
+    };
+    wt_tui::ActionCatalog {
+        row: entries(wt_tui::ActionSurface::Row { key: String::new() }),
+        manager: entries(wt_tui::ActionSurface::Manager { key: None }),
+        // Every slot lists the same actions.
+        slot: entries(wt_tui::ActionSurface::Slot {
+            target: wt_tui::SessionTarget::Main,
+        }),
+        groups_last: config.ui.action_groups_last.clone(),
+        dev_server: config.dev_server.is_some(),
+    }
+}
+
+/// One definition as a palette lists it. The host checks a commit against
+/// the entry it derives here from its own definition.
+pub fn action_entry(definition: &wt_config::ActionDef) -> wt_tui::ActionEntry {
+    wt_tui::ActionEntry {
+        id: definition.id.clone(),
+        name: definition.name.clone(),
+        group: definition.group.clone(),
+        key: definition.key.clone(),
+        shell: definition.kind == wt_config::ActionKind::Shell,
+        target: match definition.target {
+            wt_config::ActionTarget::Headless => wt_tui::ActionDelivery::Headless,
+            wt_config::ActionTarget::Session => wt_tui::ActionDelivery::Session,
+            wt_config::ActionTarget::Manager => wt_tui::ActionDelivery::Manager,
+            wt_config::ActionTarget::Slot => wt_tui::ActionDelivery::Slot,
+        },
+        requires: definition
+            .requires
+            .iter()
+            .map(|requirement| match requirement {
+                wt_config::RequireTag::Pr => wt_tui::ActionRequirement::Pr,
+                wt_config::RequireTag::PrReady => wt_tui::ActionRequirement::PrReady,
+                wt_config::RequireTag::Deployed => wt_tui::ActionRequirement::Deployed,
+                wt_config::RequireTag::IssueTracker => wt_tui::ActionRequirement::IssueTracker,
+            })
+            .collect(),
+        arg_prompt: definition
+            .arg_prompt
+            .as_ref()
+            .map(|prompt| prompt.label.clone()),
+        direct: wt_app_core::action_builtins::is_direct(&definition.id),
+        fleet: wt_app_core::action_builtins::is_fleet(&definition.id),
     }
 }
 

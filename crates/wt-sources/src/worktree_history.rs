@@ -88,9 +88,11 @@ pub fn start(
                 let slugs = history_slugs(&inventory, &metadata.0);
                 let observed = Stamp::now();
                 let known = published.lock().ok().and_then(|known| known.clone());
+                // An append that lands between the two statements only
+                // makes the next round read again.
                 let read = context
                     .database
-                    .call(move |store| {
+                    .read(move |store| {
                         let revision = store.worktree_events_revision()?;
                         if known.is_some_and(|(seen, read)| seen == revision && read == slugs) {
                             return Ok(None);

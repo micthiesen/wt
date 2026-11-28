@@ -32,8 +32,6 @@ pub struct BoardSources {
     pub perf: crate::perf_source::PerfCommands,
     pub hard_refresh: crate::hard_refresh::HardRefreshCommands,
     pub review_requests: crate::review_requests::ReviewRequests,
-    /// Palettes the host prepared for the selection, published on the board.
-    pub palettes: crate::palette_source::PaletteCommands,
 }
 
 pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
@@ -84,6 +82,7 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         scope,
         context,
         issues.board,
+        local_sources.metadata.view(),
         crate::action_source::RefreshTargets {
             git: local_sources.git.clone(),
             github: github.clone(),
@@ -146,8 +145,6 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         local_sources.metadata.view(),
         context.config.branch.separate_production(),
     );
-    let palettes = crate::palette_source::start(scope);
-    let board = crate::palette_source::overlay(scope, board, palettes.snapshot.view());
     let automations = crate::automation_source::start(
         scope,
         context,
@@ -200,7 +197,6 @@ pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
         perf: perf.commands,
         hard_refresh,
         review_requests,
-        palettes: palettes.commands,
     }
 }
 

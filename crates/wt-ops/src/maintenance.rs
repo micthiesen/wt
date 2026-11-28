@@ -361,6 +361,23 @@ fn lock_free(path: &Path) -> bool {
     }
 }
 
+/// Whether no worker of the run in `path` can be alive. A worker holds the
+/// lock of its run's worktree; one from a build that named the lock for the
+/// run holds that instead. A run whose worktree cannot be read proves
+/// nothing.
+fn worker_gone(actions: &Path, lock_dir: &Path, id: &str, path: &Path) -> bool {
+    let slug = fs::read(path.join("meta.json"))
+        .ok()
+        .and_then(|meta| serde_json::from_slice::<Value>(&meta).ok())
+        .and_then(|meta| Some(meta.get("slug")?.as_str()?.to_owned()));
+    let (Some(slug), Some(log_dir)) = (slug, actions.parent()) else {
+        return false;
+    };
+    let by_worktree = wt_actions::worker_lock_key(log_dir, &slug);
+    lock_free(&lock_dir.join(format!("{by_worktree}.lock")))
+        && lock_free(&lock_dir.join(format!("action-run-{id}.lock")))
+}
+
 /// Finished runs past the newest `keep` that started over [`RUN_MAX_AGE`]
 /// ago and whose worker no longer holds its lock: a held lock is a run that
 /// is not over, whatever its files say.
@@ -377,7 +394,7 @@ fn old_runs(actions: &Path, lock_dir: &Path, keep: usize, now: SystemTime) -> Ve
                 .is_ok_and(|old| old > RUN_MAX_AGE)
                 && path.is_dir()
                 && path.join("done.json").is_file()
-                && lock_free(&lock_dir.join(format!("action-run-{id}.lock")))
+                && worker_gone(actions, lock_dir, id, path)
         })
         .map(|(_, _, path)| path)
         .collect()
@@ -862,6 +879,15 @@ mod tests {
         file
     }
 
+    /// Unlock, then close. Closing alone frees a lock only once every copy
+    /// of the descriptor is closed, and a child another test's thread is
+    /// starting holds a copy from its fork until its exec.
+    fn release(file: fs::File) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by `file` and open for this call.
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
     fn tmux(ctx: &AppContext, args: &[&str]) -> bool {
         std::process::Command::new("tmux")
             .args(["-L", ctx.config.tmux.socket.as_str()])
@@ -907,15 +933,26 @@ mod tests {
         let finished_recent = run_id(DAY, 3);
         let finished_older = run_id(month * 2, 4);
         let finished_held = run_id(month, 5);
+        let finished_busy = run_id(month, 6);
+        let finished_nameless = run_id(month, 7);
         for (id, done) in [
             (&finished_old, true),
             (&running_old, false),
             (&finished_recent, true),
             (&finished_older, true),
             (&finished_held, true),
+            (&finished_busy, true),
+            (&finished_nameless, true),
         ] {
             fs::create_dir_all(actions.join(id)).unwrap();
-            fs::write(actions.join(id).join("meta.json"), "{}").unwrap();
+            let meta = if id == &finished_nameless {
+                "{}".to_owned()
+            } else if id == &finished_busy {
+                r#"{"slug":"busy"}"#.to_owned()
+            } else {
+                format!(r#"{{"slug":"row-{id}"}}"#)
+            };
+            fs::write(actions.join(id).join("meta.json"), meta).unwrap();
             if done {
                 fs::write(actions.join(id).join("done.json"), "{}").unwrap();
             }
@@ -926,6 +963,14 @@ mod tests {
         fs::write(&lock, "").unwrap();
         fs::write(locks.join(format!("action-run-{finished_old}.lock")), "").unwrap();
         let held = hold(&lock);
+        // A worker is alive on this run's worktree, under the lock named
+        // for the worktree; and a run that names no worktree proves nothing.
+        let busy = locks.join(format!(
+            "{}.lock",
+            wt_actions::worker_lock_key(dir.path(), "busy")
+        ));
+        fs::write(&busy, "").unwrap();
+        let working = hold(&busy);
         let now = SystemTime::now();
         assert_eq!(
             names(&old_runs(&actions, &locks, 0, now)),
@@ -933,12 +978,14 @@ mod tests {
         );
         // The newest runs stay whatever their age.
         assert_eq!(
-            names(&old_runs(&actions, &locks, 4, now)),
+            names(&old_runs(&actions, &locks, 6, now)),
             std::slice::from_ref(&finished_older)
         );
-        assert!(old_runs(&actions, &locks, 5, now).is_empty());
-        drop(held);
+        assert!(old_runs(&actions, &locks, 7, now).is_empty());
+        release(held);
         assert_eq!(old_runs(&actions, &locks, 0, now).len(), 3);
+        release(working);
+        assert_eq!(old_runs(&actions, &locks, 0, now).len(), 4);
         assert!(
             lock.exists(),
             "asking whether a lock is free removes nothing"

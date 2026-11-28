@@ -7,7 +7,10 @@ use wt_runtime::SourceState;
 use wt_tui::{Board, UiAction, UiReply};
 
 /// 4: concurrent command replies and cancellation of read-only preparations.
-pub const HOST_PROTOCOL: u32 = 4;
+/// 5: boards carry the action catalog and facts the palettes are built from;
+/// `RunAction` carries what its palette showed, and palette preparation is
+/// gone from the wire.
+pub const HOST_PROTOCOL: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -77,6 +80,10 @@ pub enum ClientFrame {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Frames cross bounded channels and most are snapshots; inline frames avoid an allocation for each one."
+)]
 pub enum ServerFrame {
     Hello { protocol: u32, build: String },
     Snapshot(HostSnapshot),

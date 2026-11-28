@@ -49,6 +49,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
     let prefix = tracker.as_ref().and_then(|tracker| tracker.prefix.clone());
     let enabled = command.is_some();
     let unavailable = Arc::new(Unavailable::default());
+    let retry = unavailable.clone();
     let statuses = start_skippable_source(scope, statuses_spec(context), {
         let context = context.clone();
         let board = board.clone();
@@ -89,7 +90,7 @@ pub fn start(scope: &TaskScope, context: &AppContext, board: SourceHandle<Board>
             }
         }
     });
-    let output = project(scope, board, statuses.view(), prefix, enabled);
+    let output = project(scope, board, statuses.view(), prefix, enabled, retry);
     IssueSources {
         board: output,
         statuses,
@@ -118,27 +119,54 @@ fn confirmed_ids(board: &SourceSnapshot<Board>, prefix: Option<&str>) -> Option<
 /// Bound on one run of the status command.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What each unreadable issue last failed with. The reader runs on every
-/// board change, so an issue that stays unreadable is reported once per
-/// distinct error and once more when it reads again, not once per pass.
+/// How long an issue that could not be read is left alone the first time,
+/// doubling with each failure in a row up to [`RETRY_CAP`]. An id the tracker
+/// refuses (a deleted or inaccessible task) fails the same way on every pass,
+/// and each try is a subprocess.
+const RETRY_BASE: Duration = Duration::from_secs(5 * 60);
+const RETRY_CAP: Duration = Duration::from_secs(60 * 60);
+
+/// One issue the tracker could not read.
+struct Failing {
+    error: String,
+    /// The wait before the next try.
+    delay: Duration,
+    retry_at: tokio::time::Instant,
+    /// The longest wait this failure has been reported at.
+    reported: Duration,
+}
+
+/// The issues the tracker could not read, and when each is tried again. A
+/// failing issue is read on its own, off the batch it would fail, and at
+/// most once per backoff step. It is reported once per step and once more
+/// when it reads again, not once per pass.
 #[derive(Default)]
-struct Unavailable(std::sync::Mutex<BTreeMap<String, String>>);
+struct Unavailable(std::sync::Mutex<BTreeMap<String, Failing>>);
 
 impl Unavailable {
-    fn seen(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, String>> {
+    fn seen(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Failing>> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Whether this failure is news: the issue's first, or a different one.
-    fn failed(&self, id: &str, error: &str) -> bool {
+    /// Record a failed read. Returns whether it is news: the issue's first
+    /// failure, a different error, or a longer wait than any reported.
+    fn failed(&self, id: &str, error: &str, now: tokio::time::Instant) -> bool {
         let mut seen = self.seen();
-        if seen.get(id).is_some_and(|last| last == error) {
-            return false;
-        }
-        seen.insert(id.to_owned(), error.to_owned());
-        true
+        // Each failure doubles the wait; the first doubles to the base.
+        let failing = seen.entry(id.to_owned()).or_insert(Failing {
+            error: String::new(),
+            delay: RETRY_BASE / 2,
+            retry_at: now,
+            reported: Duration::ZERO,
+        });
+        failing.delay = failing.delay.saturating_mul(2).min(RETRY_CAP);
+        failing.retry_at = now + failing.delay;
+        let news = failing.error != error || failing.delay > failing.reported;
+        failing.error = error.to_owned();
+        failing.reported = failing.reported.max(failing.delay);
+        news
     }
 
     /// Whether the issue had been failing until this read.
@@ -151,6 +179,36 @@ impl Unavailable {
         self.seen().retain(|id, _| ids.contains(id));
     }
 
+    /// A person asked for a refresh: try every failing issue on the next
+    /// pass, and start its wait over. What was already reported is not
+    /// reported again.
+    fn retry_now(&self) {
+        let now = tokio::time::Instant::now();
+        for failing in self.seen().values_mut() {
+            failing.retry_at = now;
+            failing.delay = RETRY_BASE / 2;
+        }
+    }
+
+    /// Split `ids` into those to read together, the failing ones due a
+    /// try, and the error of one still waiting (if any is).
+    fn plan(
+        &self,
+        ids: &[String],
+        now: tokio::time::Instant,
+    ) -> (Vec<String>, Vec<String>, Option<String>) {
+        let seen = self.seen();
+        let (mut healthy, mut due, mut waiting) = (Vec::new(), Vec::new(), None);
+        for id in ids {
+            match seen.get(id) {
+                None => healthy.push(id.clone()),
+                Some(failing) if failing.retry_at <= now => due.push(id.clone()),
+                Some(failing) => waiting = waiting.or_else(|| Some(failing.error.clone())),
+            }
+        }
+        (healthy, due, waiting)
+    }
+
     fn note_read<'a>(&self, ids: impl IntoIterator<Item = &'a String>) {
         for id in ids {
             if self.read(id) {
@@ -160,10 +218,12 @@ impl Unavailable {
     }
 }
 
-/// Read every status in one batch. A tracker may refuse a whole batch over
-/// one id it cannot resolve; statuses are display-only, so the rest are then
-/// read one at a time and only that row stays blank. A run that does not
-/// complete ends the pass.
+/// Read every status in as few runs as the tracker allows. A tracker may
+/// refuse a whole batch over one id it cannot resolve; statuses are
+/// display-only, so a refused batch is halved until the ids it cannot read
+/// stand alone, and only their rows stay blank. Those ids are then left out
+/// of the batch and tried on their own with a growing wait (see
+/// [`Unavailable`]). A run that does not complete ends the pass.
 async fn read_with_fallback(
     context: &AppContext,
     command: &[String],
@@ -173,33 +233,41 @@ async fn read_with_fallback(
     unavailable: &Unavailable,
 ) -> Result<BTreeMap<String, String>> {
     unavailable.keep(ids);
-    let batch = match read_statuses(context, command, ids, timeout, cancel).await {
-        Ok(statuses) => {
-            unavailable.note_read(statuses.keys());
-            return Ok(statuses);
-        }
-        Err(error) if ids.len() > 1 && !cancel.is_cancelled() && !incomplete(&error) => error,
-        Err(error) => return Err(error),
-    };
+    let (healthy, due, waiting) = unavailable.plan(ids, tokio::time::Instant::now());
+    let mut groups = due.into_iter().map(|id| vec![id]).collect::<Vec<_>>();
+    if !healthy.is_empty() {
+        groups.push(healthy);
+    }
     let mut statuses = BTreeMap::new();
-    for id in ids {
-        match read_statuses(context, command, std::slice::from_ref(id), timeout, cancel).await {
-            Ok(one) => {
-                unavailable.note_read(one.keys());
-                statuses.extend(one);
+    let mut refused = None;
+    while let Some(mut group) = groups.pop() {
+        match read_statuses(context, command, &group, timeout, cancel).await {
+            Ok(read) => {
+                // A run that succeeded read every id it named, whether or
+                // not the tracker has a status for each.
+                unavailable.note_read(&group);
+                statuses.extend(read);
             }
-            Err(_) if cancel.is_cancelled() => return Err(batch),
+            Err(error) if cancel.is_cancelled() => return Err(refused.unwrap_or(error)),
             Err(error) if incomplete(&error) => return Err(error),
-            Err(error) => {
-                let error = format!("{error:#}");
-                if unavailable.failed(id, &error) {
-                    tracing::warn!(issue = %id, %error, "issue status unavailable");
+            Err(error) if group.len() == 1 => {
+                let text = format!("{error:#}");
+                if unavailable.failed(&group[0], &text, tokio::time::Instant::now()) {
+                    tracing::warn!(issue = %group[0], error = %text, "issue status unavailable");
                 }
+                refused.get_or_insert(error);
+            }
+            Err(error) => {
+                refused.get_or_insert(error);
+                let rest = group.split_off(group.len() / 2);
+                groups.extend([rest, group]);
             }
         }
     }
-    if statuses.is_empty() {
-        return Err(batch);
+    if statuses.is_empty()
+        && let Some(error) = refused.or_else(|| waiting.map(anyhow::Error::msg))
+    {
+        return Err(error);
     }
     Ok(statuses)
 }
@@ -233,6 +301,7 @@ fn project(
     statuses: SourceHandle<StatusBatch>,
     prefix: Option<String>,
     enabled: bool,
+    unavailable: Arc<Unavailable>,
 ) -> SourceHandle<Board> {
     let (output, mut publisher) = derived_channel(scope, "issue-board");
     let cancel = scope.token();
@@ -258,6 +327,8 @@ fn project(
                 request = publisher.requested() => {
                     if request.is_none() { break; }
                     board.refresh();
+                    // An asked-for refresh reads what a quiet pass leaves alone.
+                    unavailable.retry_now();
                     if confirmed.is_some() { statuses.refresh(); }
                     continue;
                 }
@@ -408,6 +479,130 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// An id the tracker refuses fails the same way on every pass. It is
+    /// found once, then kept off the batch and left alone until its wait is
+    /// over or a person refreshes, so a pass is one run again instead of
+    /// one per issue.
+    #[tokio::test]
+    async fn a_refused_id_costs_one_search_and_then_no_runs_until_it_is_due() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let script = fixture.ctx.config.paths.main_clone.join("statuses.sh");
+        let log = fixture.ctx.config.paths.main_clone.join("runs");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {log:?}\nfor id in \"$@\"; do [ \"$id\" = COZ-2 ] && {{ echo 'not accessible: COZ-2' >&2; exit 1; }}; done\nprintf '{{\"issues\":['\nsep=''\nfor id in \"$@\"; do printf '%s{{\"id\":\"%s\",\"status\":\"Done\"}}' \"$sep\" \"$id\"; sep=','; done\nprintf ']}}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let command = vec![script.to_string_lossy().into_owned(), "{ids}".into()];
+        let ids = (1..=8).map(|n| format!("COZ-{n}")).collect::<Vec<_>>();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let unavailable = Unavailable::default();
+        let runs = || {
+            let all = std::fs::read_to_string(&log).unwrap_or_default();
+            std::fs::write(&log, "").unwrap();
+            all.lines().map(str::to_owned).collect::<Vec<_>>()
+        };
+        let read = || {
+            read_with_fallback(
+                &fixture.ctx,
+                &command,
+                &ids,
+                READ_TIMEOUT,
+                &cancel,
+                &unavailable,
+            )
+        };
+
+        let first = read().await.unwrap();
+        assert_eq!(first.len(), 7);
+        assert!(!first.contains_key("COZ-2"));
+        // Halving finds one bad id among eight in seven runs; one run per
+        // id after the failed batch would be nine.
+        assert_eq!(runs().len(), 7);
+
+        // Every later pass: one batch without the refused id.
+        for _ in 0..3 {
+            assert_eq!(read().await.unwrap().len(), 7);
+            assert_eq!(runs(), ["COZ-1 COZ-3 COZ-4 COZ-5 COZ-6 COZ-7 COZ-8"]);
+        }
+
+        // A refresh a person asked for tries it again, on its own.
+        unavailable.retry_now();
+        assert_eq!(read().await.unwrap().len(), 7);
+        let mut asked = runs();
+        asked.sort();
+        assert_eq!(
+            asked,
+            ["COZ-1 COZ-3 COZ-4 COZ-5 COZ-6 COZ-7 COZ-8", "COZ-2"]
+        );
+
+        // With nothing else to read, its error stands without a run.
+        let only_bad = ["COZ-2".to_owned()];
+        let error = read_with_fallback(
+            &fixture.ctx,
+            &command,
+            &only_bad,
+            READ_TIMEOUT,
+            &cancel,
+            &unavailable,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("COZ-2"), "{error:#}");
+        assert!(runs().is_empty());
+        fixture.close().await.unwrap();
+    }
+
+    #[test]
+    fn a_failing_issue_waits_twice_as_long_each_time_and_is_reported_once_per_step() {
+        let unavailable = Unavailable::default();
+        let ids = ["A-1".to_owned(), "A-2".to_owned()];
+        let mut now = tokio::time::Instant::now();
+        let (mut reports, mut waits) = (0, Vec::new());
+        for _ in 0..8 {
+            reports += usize::from(unavailable.failed("A-2", "not accessible", now));
+            let wait = unavailable.seen()["A-2"].delay;
+            waits.push(wait.as_secs() / 60);
+            // Until the wait is over it is neither batched nor tried.
+            let (healthy, due, waiting) =
+                unavailable.plan(&ids, now + wait - Duration::from_secs(1));
+            assert_eq!(healthy, ["A-1"]);
+            assert!(due.is_empty());
+            assert_eq!(waiting.as_deref(), Some("not accessible"));
+            now += wait;
+            assert_eq!(unavailable.plan(&ids, now).1, ["A-2"]);
+        }
+        assert_eq!(waits, [5, 10, 20, 40, 60, 60, 60, 60]);
+        assert_eq!(
+            reports, 5,
+            "one warning per step, none once the wait stops growing"
+        );
+        assert!(
+            unavailable.failed("A-2", "gone", now),
+            "a different error is news"
+        );
+
+        // An asked-for refresh makes it due at once and starts the wait
+        // over, without reporting the same failure again.
+        unavailable.retry_now();
+        let now = tokio::time::Instant::now();
+        assert_eq!(unavailable.plan(&ids, now).1, ["A-2"]);
+        assert!(!unavailable.failed("A-2", "gone", now));
+        assert_eq!(unavailable.seen()["A-2"].delay, RETRY_BASE);
+
+        // A read clears it; a later failure is a new one.
+        assert!(unavailable.read("A-2"));
+        assert_eq!(unavailable.plan(&ids, now).0, ids);
+        assert!(unavailable.failed("A-2", "gone", now));
+        assert_eq!(unavailable.seen()["A-2"].delay, RETRY_BASE);
+    }
+
     use super::*;
     use wt_runtime::SourceState;
     use wt_tui::BoardRow;
@@ -472,7 +667,14 @@ mod tests {
         let scope = TaskScope::new();
         let (boards, mut boards_writer) = derived_channel(&scope, "test-board");
         let (statuses, mut status_writer) = leaf::<StatusBatch>(&scope);
-        let output = project(&scope, boards, statuses.view(), Some("ENG".into()), true);
+        let output = project(
+            &scope,
+            boards,
+            statuses.view(),
+            Some("ENG".into()),
+            true,
+            Arc::default(),
+        );
         boards_writer.publish(live_board(board("ENG-1")));
         assert_eq!(status_writer.requested().await, Some(()));
         status_writer.publish_live(
@@ -513,7 +715,14 @@ mod tests {
         let scope = TaskScope::new();
         let (boards, boards_writer) = derived_channel(&scope, "test-board");
         let (statuses, mut status_writer) = leaf::<StatusBatch>(&scope);
-        let output = project(&scope, boards, statuses.view(), Some("ENG".into()), true);
+        let output = project(
+            &scope,
+            boards,
+            statuses.view(),
+            Some("ENG".into()),
+            true,
+            Arc::default(),
+        );
         let restored = SourceSnapshot::test_restored(board("ENG-1"), Domain::Git, 1).with_input(
             &SourceSnapshot::<()>::test_live(None, SourceState::Ready, Domain::Metadata),
         );
@@ -546,7 +755,14 @@ mod tests {
             let scope = TaskScope::new();
             let (boards, boards_writer) = derived_channel(&scope, "test-board");
             let (statuses, mut status_writer) = derived_channel(&scope, "test-statuses");
-            let output = project(&scope, boards, statuses, Some("ENG".into()), enabled);
+            let output = project(
+                &scope,
+                boards,
+                statuses,
+                Some("ENG".into()),
+                enabled,
+                Arc::default(),
+            );
             status_writer.publish(SourceSnapshot::test_restored(
                 StatusBatch::default(),
                 Domain::Issues,
@@ -643,16 +859,22 @@ mod tests {
     #[test]
     fn an_unreadable_issue_is_news_once_per_error_and_once_when_it_reads_again() {
         let unavailable = Unavailable::default();
-        assert!(unavailable.failed("COZ-1", "not found"));
-        assert!(!unavailable.failed("COZ-1", "not found"));
-        assert!(unavailable.failed("COZ-2", "not found"));
-        assert!(unavailable.failed("COZ-1", "tracker is down"));
-        assert!(!unavailable.failed("COZ-1", "tracker is down"));
+        let now = tokio::time::Instant::now();
+        // Reported at each longer wait, then no more once it stops growing.
+        let reports = |id: &str, error: &str| {
+            (0..12)
+                .filter(|_| unavailable.failed(id, error, now))
+                .count()
+        };
+        assert_eq!(reports("COZ-1", "not found"), 5);
+        assert_eq!(reports("COZ-1", "not found"), 0);
+        assert_eq!(reports("COZ-2", "not found"), 5);
+        assert_eq!(reports("COZ-1", "tracker is down"), 1);
         assert!(unavailable.read("COZ-1"));
         assert!(!unavailable.read("COZ-1"));
-        assert!(unavailable.failed("COZ-1", "tracker is down"));
+        assert_eq!(reports("COZ-1", "tracker is down"), 5);
         // An issue that left the board starts over if it returns.
         unavailable.keep(&["COZ-1".to_owned()]);
-        assert!(unavailable.failed("COZ-2", "not found"));
+        assert_eq!(reports("COZ-2", "not found"), 5);
     }
 }

@@ -7,6 +7,7 @@ pub use config::{
 };
 pub use service::{
     ActionDone, ActionRequest, ActionService, ActionServiceConfig, ActionServiceError, ActionStart,
+    worker_lock_key,
 };
 pub use types::{
     ActionArgHistory, ActionMeta, ActionOutputLine, ActionRun, ActionRunKind, ActionRunStatus,

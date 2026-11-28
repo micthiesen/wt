@@ -1358,7 +1358,9 @@ impl AutomationLedger {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let bytes = serde_json::to_vec_pretty(value).map_err(|error| LedgerError::Invalid {
+        // Compact: the whole file is rewritten and synced on every recorded
+        // transition, and indentation was a sixth of it.
+        let bytes = serde_json::to_vec(value).map_err(|error| LedgerError::Invalid {
             path: self.path.clone(),
             message: error.to_string(),
         })?;
@@ -1385,7 +1387,7 @@ impl AutomationLedger {
         }
         .await;
         if written.is_err() {
-            // A failed write must not strand a pretty-printed ledger copy.
+            // A failed write must not strand a full ledger copy.
             let _ = fs::remove_file(&temp).await;
         }
         written
@@ -1539,6 +1541,10 @@ fn new_claim_id() -> Result<String, LedgerError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// What only a claim still in flight is asked for: who owns it, what kind
+/// of dispatch it is, and whether it holds a breaker reservation.
+const IN_FLIGHT_FIELDS: [&str; 3] = ["owner", "kind", "breakerReserved"];
+
 fn prune(root: &mut Value, now_ms: i64) {
     let cutoff = now_ms.saturating_sub(RETENTION_MS);
     if let Some(fired) = root.get_mut("fired").and_then(Value::as_object_mut) {
@@ -1549,6 +1555,21 @@ fn prune(root: &mut Value, now_ms: i64) {
                 Some("delivered" | "failed" | "skipped" | "cancelled")
             ) || number(entry.get("at")).is_none_or(|at| at >= cutoff)
         });
+        // An ended entry is kept for the retention window only so its key
+        // stays handled. Nothing reads its in-flight fields again, and they
+        // were a quarter of a ledger that holds a month of fires. An entry
+        // in a state this build does not know is left whole.
+        for entry in fired.values_mut() {
+            let ended = matches!(
+                entry.get("state").and_then(Value::as_str),
+                Some("delivered" | "failed" | "skipped" | "cancelled" | "ambiguous")
+            );
+            if ended && let Some(entry) = entry.as_object_mut() {
+                for field in IN_FLIGHT_FIELDS {
+                    entry.remove(field);
+                }
+            }
+        }
     }
     if let Some(breaker) = root.get_mut("breaker").and_then(Value::as_object_mut) {
         breaker.retain(|_, entry| number(entry.get("updatedAt")).unwrap_or(now_ms) >= cutoff);
@@ -1664,6 +1685,116 @@ mod tests {
         assert_eq!(value["futureTop"]["keep"], "yes");
         assert_eq!(value["fired"]["old"]["futureField"]["kept"], true);
         assert_eq!(value["fired"]["key"]["state"], "delivered");
+    }
+
+    /// A month of ended fires is most of the ledger. An ended entry keeps
+    /// what is read again and drops what only a claim in flight is asked
+    /// for; a claim in flight, and an entry in a state this build does not
+    /// know, stay whole.
+    #[tokio::test]
+    async fn an_ended_claim_drops_only_what_a_claim_in_flight_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automations.json");
+        let now = now_ms();
+        let whole = |state: &str| {
+            json!({
+                "state": state, "at": now, "ruleId": "x", "slug": "s", "claimId": "c",
+                "owner": "gone", "kind": "headlessAction", "breakerReserved": true,
+                "futureField": 1,
+            })
+        };
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({"version":1,"fired":{
+                "older": whole("delivered"),
+                "newer": whole("held-by-a-newer-build"),
+            }}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ledger = AutomationLedger::new(&path);
+        let cancel = CancellationToken::new();
+        let policy = DispatchPolicy {
+            breaker_limit: Some(BREAKER_LIMIT),
+            ..DispatchPolicy::default()
+        };
+        let mut claims = Vec::new();
+        for (key, slug) in [("live", "one"), ("done", "two")] {
+            let keys = [key.to_owned()];
+            let DispatchClaimResult::Claimed(claim) = ledger
+                .claim_dispatch_checked(request(&keys, "rule", slug, policy, now), &cancel)
+                .await
+                .unwrap()
+            else {
+                panic!("{key} was not claimed");
+            };
+            claims.push(claim);
+        }
+        let done = &claims[1];
+        ledger
+            .mark_delivered_awaited(
+                done,
+                now + 1,
+                "rule|two",
+                json!({"claim": done, "deliveredAtMs": now + 1}),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let stored: Value = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+        let fields = |key: &str| {
+            let mut fields = stored["fired"][key]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            fields.sort_unstable();
+            fields
+        };
+        let in_flight = [
+            "at",
+            "breakerReserved",
+            "claimId",
+            "kind",
+            "owner",
+            "ruleId",
+            "slug",
+            "state",
+        ];
+        assert_eq!(fields("live"), in_flight);
+        assert_eq!(fields("done"), ["at", "claimId", "ruleId", "slug", "state"]);
+        assert_eq!(
+            fields("older"),
+            ["at", "claimId", "futureField", "ruleId", "slug", "state"]
+        );
+        assert_eq!(fields("newer").len(), in_flight.len() + 1);
+        // The ended claim is still the one its awaited run answers to.
+        assert!(ledger.awaited().await.unwrap().contains_key("rule|two"));
+        assert!(
+            ledger
+                .mark_failed(done, now + 2, "exit 1", 1, &cancel)
+                .await
+                .unwrap()
+        );
+        // The live claim still holds its breaker reservation and its pair.
+        let keys = ["again".to_owned()];
+        assert!(matches!(
+            ledger
+                .claim_dispatch_checked(request(&keys, "rule", "one", policy, now + 3), &cancel)
+                .await
+                .unwrap(),
+            DispatchClaimResult::Claimed(_)
+        ));
+        let keys = ["third".to_owned()];
+        assert!(matches!(
+            ledger
+                .claim_dispatch_checked(request(&keys, "rule", "one", policy, now + 4), &cancel)
+                .await
+                .unwrap(),
+            DispatchClaimResult::BreakerReserved { reserved: 2, .. }
+        ));
     }
 
     #[tokio::test]

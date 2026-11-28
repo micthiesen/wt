@@ -79,7 +79,8 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   pass `--timeout 9m` and run it again on exit 124. `--any` returns when the
   first condition holds and says which; exit 0 held, 124 timed out
   (`--timeout`, default 30m, at most 24h), 1 could not tell. It judges the conditions in its own process, so it works with
-  the TUI closed, and stores nothing. For what outlives the session (a
+  the TUI closed, and stores nothing. It wakes on changes to wt's state, the
+  events snapshot and origin's refs, with timers only as a backstop. For what outlives the session (a
   deploy, a release, a time hours or days away, another worktree's merge),
   `wt wake` it and end the turn; `wt notify` it when the person asked to be
   told, `--until` it when it is a merge gate. Conditions are one
@@ -87,7 +88,8 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   `"tomorrow 09:00"`); this worktree (`merged`, `staging`, `production`,
   `ready`, `green`, `verified`, `closed`); its open PR (`settled`: checks
   passed or failed, `reviewed`: the review bot finished the current head,
-  `evicted`: the armed merge was dropped); a pull request (`pr:3806`,
+  `evicted`: the armed merge was dropped, with GitHub's reason when it gave
+  one); a pull request (`pr:3806`,
   `pr:3806:production`); another worktree (`wt:<slug>:merged`,
   `wt:<slug>:gone`); the next release (`release:production`); a configured
   probe (`check:<id>=<arg>`). All but a time take a delay that must hold
@@ -130,9 +132,11 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   grouping decision you were part of, never to tidy the board.
 - **Cleanup.** The human sweeps merged worktrees. Never suggest `wt clean` or
   `wt rm` or list cleanup candidates; run them only when asked or to undo a
-  worktree you created by mistake. `wt rm` refuses dirty or unpushed work.
-  Report what would be lost and pass `--force` only after the user says to
-  discard it; a request to remove the worktree is not that.
+  worktree you created by mistake. `wt rm` refuses dirty or unpushed work,
+  and a worktree whose dev `stop_command` fails. Report what would be lost
+  (with a failing stop hook: whatever it cleans up) and pass `--force` only
+  after the user says to discard it; a request to remove the worktree is not
+  that.
 
 ## Index
 

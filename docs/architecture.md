@@ -78,6 +78,13 @@ Creation emits sparse `wt::creation` stage records with the checkout path,
 phase, elapsed milliseconds, outcome, and exit code. These distinguish Rift's
 whole create command (including any Rift-owned postcreate hooks), copied-index
 refresh, branch checkout, stacked-base fetch, and dependency installation.
+The origin fetch is `fetch-origin`, or `fetch-origin-including-maintenance`
+when ref maintenance runs before the checkout (Rift, or a local trunk or
+`keep_fresh` base). `origin-branch-probe` is the `ls-remote` after a reused
+fetch, `origin-maintenance` is maintenance run inline, and
+`dependency-install-queue` is the wait for an install slot. Maintenance
+handed to the detached `wt _maintain-origin` worker is not a phase: the
+worker logs `ref maintenance after creation finished` under `wt::origin`.
 An interrupted future records an interrupted phase. Command arguments and
 captured output are excluded. A slow Rift command is not by itself proof of a
 slow kernel clone; use process sampling during that phase to separate its
@@ -87,8 +94,9 @@ Safety decisions never read display data. TUI cleanup, removal, GitHub
 writes, action requirements, restack and automations take
 `wt_runtime::Confirmed<T>` values, which only a leaf source can produce from
 data this process fetched live (see the query layer below). Cached merged-PR
-evidence applies only to its exact HEAD; local hazards and removal revisions
-remain authoritative. Git-only landing evidence retains the published-base
+evidence applies only to its exact HEAD, or to a HEAD that Git proves holds
+only copies of that merged head (`wt_vcs::published_head_holds_everything`);
+local hazards and removal revisions remain authoritative. Git-only landing evidence retains the published-base
 check.
 
 The `c` cleanup menu opens directly from the prepared board, including archived
@@ -100,9 +108,11 @@ delaying the menu. The open confirmation keeps the displayed candidate set;
 reopening it uses the latest results.
 Confirmation captures only the displayed keys, paths, branches, and HEADs.
 Each host then checks the selected rows with its confirmed GitHub evidence and
-captures removal revisions for the worker's locked recheck. It does not start
-a second PR fetch. Cached merged-PR evidence applies only to its exact HEAD;
-local hazards and removal revisions remain authoritative. Git-only landing
+captures removal revisions for the worker's locked recheck. It plans four
+rows at a time and starts each removal as soon as that row's plan passes; a
+row that fails to plan is kept and the rest go on. It does not start
+a second PR fetch. Cached merged-PR evidence applies only to its exact HEAD or to
+copies of it; local hazards and removal revisions remain authoritative. Git-only landing
 evidence retains the published-base check. The prepared board nominates rows;
 it cannot authorize removal by itself.
 
@@ -227,7 +237,10 @@ menu opens without a removal action. No host scan runs before the menu opens.
 Accepted removals have repository-scoped SQLite records keyed by checkout and
 job ID. The metadata source reconciles interrupted result publication from the
 durable worker journal. Inventory projects active and failed records into the
-Removing section, including records whose checkout is absent. Only the current
+Removing section, including records whose checkout is absent. With
+`[ui] owed_sections` there is no Removing section: the row stays where it was
+drawn, and the record's `landed` and `wasArchived` fields say where that is
+once the checkout and its Git facts are gone. Only the current
 job can publish its result. A failed attempt remains until a reviewed retry
 succeeds, or, once its checkout is absent from inventory and disk, until a
 dismissal witnessing its job, path and branch deletes only that record; no
@@ -270,7 +283,13 @@ session/action tails. Mouse-wheel events scroll the pane beneath the pointer;
 the terminal restores normal mouse handling when the UI suspends or exits.
 Worktree session keys use private tmux client exit codes for direct shell,
 diff and agent navigation. The controller keeps the board suspended while the
-owning host prepares the next session through the normal session path. SSH
+owning host prepares the next session. The handoff resolves its worktree
+once and retains the attached agent's tmux identity. A session key then reads
+tmux only: the shell and diff keys check that their session exists and create
+it when absent, and the agent key returns to the retained selection, whose
+witness a replaced slot fails. A key refuses a checkout that no longer exists.
+Entering a Claude session creates the slot and attaches without waiting for
+the harness to register. SSH
 workers perform this loop locally. The agent attachment is retained so a return
 from the shell keeps the selected named conversation. A same-session key ends
 the attachment and returns to the board.
@@ -334,6 +353,20 @@ restored input reads as restored for that domain. `SourceSnapshot` fields are
 private, so projections cannot relabel restored data as live. Leaf readers must
 also validate their inputs before publishing their own observations; private
 snapshot fields alone cannot establish that an external read used current keys.
+A *keyed* leaf (`start_keyed_source`) lists its keys and reads each row with
+its own call, a bounded number at a time: the Git leaf reads four checkouts
+at once and keeps one of those lanes for user-caused reads. A row's stamp is
+the earlier of its own read start and the start of the listing it was read
+against. The domain stamp is the oldest row stamp, and a key the listing did
+not show answers with the listing's stamp. Keyed stamps are filed under board
+row keys (the GitHub leaf also files them under the branch name and one
+reserved merge-queue key), and rows sharing a stamp key are confirmed
+together. `request_keys(Direct | Refresh, keys)` is user-caused and
+`request_keys(Recheck, keys)` is event-caused. A request for the whole domain
+is a sweep, except a whole `Direct`, which reads every row at user priority.
+`start_demanded_source` hands a fetch the `Demand` it serves (whole, listing,
+keys), `Fetched::keyed` publishes per-key stamps, and
+`Confirmed::observed_for` reads one key's stamp.
 `clippy.toml` bans raw
 `tokio::sync::watch::channel` outside `wt-runtime`; a control channel that is
 not board data says why with `#[expect(clippy::disallowed_methods)]`.
@@ -347,8 +380,9 @@ unless a live publish arrived first. They save live, ready data at most every
 10 seconds and once at shutdown within a one-second budget that never fails
 shutdown. A fetch shows its lane as refreshing only if it runs longer than 100
 ms, so a skipped or quick refresh causes no redraw. Files live under `<cache root>/query/<name>.json` in an envelope
-whose scope is a list of named fingerprints: the build (plus the executable's
-size and mtime for `dev-` builds), the canonical main clone, and each
+whose scope is a list of named fingerprints: the cache schema
+(`QUERY_CACHE_SCHEMA`; for `dev-` builds also the build and the executable's
+size and mtime), the canonical main clone, and each
 configuration section a source's data can depend on. Sections that only decide
 presentation or what wt does with the board (`[ui]`, `[[actions]]`,
 `[[automations]]`, `[update]` and the like) are left out, so editing them
@@ -401,7 +435,9 @@ confirmed-input path.
 **Optimistic changes.** `wt_runtime::Pending<T, M: Mutation<T>>` is the only
 optimistic engine. It never writes, so it cannot retry. An entry is *in flight*
 until the host answers, then *accepted* with the host's stamp, or *unconfirmed*
-when the outcome is ambiguous. It is shown over confirmed data until a fetch
+when the outcome is ambiguous. It is shown over confirmed data until a fetch of its confirming rows
+(`Mutation::confirming`, by default its target; a change that names no row
+waits for a fetch of the whole domain)
 that started at or after the accept stamp shows the change, the write fails, or
 a bounded deadline passes (60 s in flight; 30 s accepted for GitHub, reviews and
 issues; 12 s for local domains; 30 s unconfirmed; creation and removal, which can
@@ -421,7 +457,8 @@ An expiry while confirmed data still disagrees shows one notice.
   (`UiAction::effect(&Board)`), resolved against the board the user sees, so
   toggles carry an explicit direction and GitHub writes carry the PR number and
   head SHA they target (`PrPin`). The executing host refreshes the domains the
-  effect names and replies with a `ReplyOutcome` (`Accepted(stamp)`,
+  effect names, for Git exactly the rows the change names (`Effect::rows()`
+  plus the created row from the reply), and replies with a `ReplyOutcome` (`Accepted(stamp)`,
   `NoChange`, `Deferred`, or `Uncertain`). Controller-owned metadata writes
   (including folding, layout and attention acknowledgement) use the same local
   completion classifier as host services: stamp successful writes and enable
@@ -442,7 +479,8 @@ An expiry while confirmed data still disagrees shows one notice.
   manually changed selection. F12 is a normal action once the real row is
   ready, never queued against an unfinished checkout. Dependency installation
   uses a durable background action, so
-  it does not delay agent entry. When a selected row disappears, cursor fallback
+  it does not delay agent entry. The action takes one of three install slots
+  per lock directory and waits for one otherwise. When a selected row disappears, cursor fallback
   uses the current visual row identity and section, not a stale position.
   Creation captures that section and an anchor key. After checkout creation,
   the controller records the new layout and sends its own acceptance stamp to
@@ -489,12 +527,36 @@ still rejects facts for a changed checkout, HEAD, base or PR identity; retained
 display data cannot authorize a mutation.
 
 Local Git inventory, metadata, edit timestamps, sessions, action logs, and
-GitHub observations have separate source lanes. Filesystem watchers invalidate
-only the facts affected by the event. A one-second metadata backstop detects
-lost Git notifications over the same declared watch paths: immediate checkout
-children and recursive Git refs/worktree metadata, excluding generated trees
-and symlink traversal. Each scan is capped at 8,192 entries and 200 ms, runs off
-the input path, and refreshes only the domains whose file metadata changed.
+GitHub observations have separate source lanes. Filesystem changes invalidate
+only the facts they affect. The Git leaf is keyed by checkout, so a change is
+routed to the rows it can touch (a path under a checkout, that checkout's
+`worktrees/<name>` metadata, a branch or upstream ref) and only those rows are
+read again. A path under the worktree root in no listed checkout, or a ref no
+row uses, asks for the listing alone. `packed-refs`, `config`, `info/` and
+paths that cannot be placed ask for a sweep of every row. Ref routing ignores
+case on macOS and Windows.
+
+The watch set is the worktree root, the main clone, the state database's
+directory, each checkout's immediate children, and each Git common directory
+with recursive `refs` and `worktrees`, excluding generated trees and symlink
+traversal. On macOS a metadata scan every 500 ms is the only detector for
+this set. Elsewhere native notifications drive and a scan every second
+catches lost ones. A scan runs off the input path and has no entry or time
+cap; one that runs long stretches its interval to four times its duration,
+and one slower than its interval logs a warning, at most once a minute. Where
+changes are found by polling, the state database, its WAL and the events
+snapshot are also stat-checked every 75 ms. Metadata reads caused by other
+processes' writes are paced to one per 250 ms after the first. A listing
+waits up to two seconds for its checkouts to be watched and baselined before
+their first read, so start-up normally makes one pass. A full sweep runs
+every 60 seconds, on `r`, on hard refresh and at start.
+
+Git reads are ordered: user-caused first, then event-caused, then sweeps. A
+sweep read that has waited 5 seconds is served with the event reads. Sweeps
+wait for a fleet-scan turn ([External effects](#external-effects-and-failures)),
+and one process holds at most one turn, shared by its fleet reads. A
+completed origin fetch asks for the checkout listing only. A finished
+Git-affecting action re-reads its own checkout.
 Native notifications for regular files already observed by that probe are
 deduplicated against current size, modification time, inode, device and change
 time. Directory and unknown-path events remain conservative invalidations.
@@ -503,14 +565,16 @@ accepted removal record and checkouts that no longer exist; it is re-read when
 either input changes. A watcher's missing-path error triggers at most one Git
 refresh and watch-list re-read per five seconds; other watcher errors keep
 their full refresh.
-Incomplete scans retain the 60-second full reconciliation backstop. GitHub reads remain batched and rate
-limited (10 s minimum interval measured from fetch start, stretched for
-background reads as the GraphQL budget each read reports runs down; see
+GitHub reads remain batched and rate
+limited (on average one network read per 10 s; a background read also waits
+10 s from the prior fetch start, stretched as the GraphQL budget each read
+reports runs down, and a read the user caused may start one interval early; see
 [github-events.md](github-events.md#graphql-budget)); the optional events
 daemon supplies push updates stamped with its own fetch start, with a
-configured poll backstop for missed events or daemon downtime. An accepted
-GitHub write bypasses the events cache, and while any of the worker's writes is
-unconfirmed it keeps requesting direct reads (still rate limited) until one
+configured poll backstop for missed events or daemon downtime. After an accepted
+GitHub write the lane reads the written branch and the merge queue directly
+and stamps only those newer, and while any of the worker's writes is
+unconfirmed it keeps requesting that read (still rate limited) until one
 shows the write or its deadline passes, so a lagging read model does not make
 the change expire. A Sessions refresh also reruns the session-activity pass,
 which re-reads the persisted primary harness.
@@ -528,12 +592,21 @@ tracks running commands through shutdown. `HostService` performs the host-local
 operation and returns a typed reply. Accepted mutations belong to the command
 drain, not the lifetime of a particular SSH view; read sources are cancelled
 when their host scope ends.
-Attention, history, and performance controls have a separate serialized slot
-reserved beyond the four ordinary action slots, so long host operations cannot
-delay them. Attention acknowledgement returns its own accept stamp before
-refreshing metadata. Read-only preparations, worktree creation and terminal
-entry also have reserved capacity. Title, issue and status writes share a bounded
-metadata slot independent of ordinary host capacity. They conflict with removal
+Capacity is counted per host. Long jobs (whole-host operations, action
+dispatch, and a removal until its worker is running) have four slots per
+host. Pull-request and fork-base writes have two per host, session stops two,
+and read-only preparation, prefetch, creation, metadata writes and host
+control one each. Three budgets are shared by all hosts. Attention
+acknowledgement has a reserved view-control slot. Layout writes (fold, move,
+reorder, rename or delete a section, archive) serialize with each other in
+their own slot. Opening a link or an editor and copying exclude nothing and
+wait only for each other's bound of four. Long host operations therefore
+delay none of these. Terminal entry has no budget, only conflicts. History
+and performance view state is not a request: the terminal publishes it as a
+watch value and the controller applies the newest to every host. Attention
+acknowledgement returns its own accept stamp before refreshing metadata.
+Title, issue, status and notify writes share the one metadata slot of their
+host. They conflict with removal
 of their own target, including a fleet cleanup that removes it, but not unrelated
 removals or cleanups, creation or long host actions such as compaction and GitHub requests. Transactional field
 updates and captured revisions protect independent metadata writes. Palette title actions use the same classification as direct
@@ -541,9 +614,12 @@ title actions. Terminal handoffs serialize with each other;
 worktree entry also conflicts with removal of that exact host and checkout,
 whether single or part of a fleet cleanup. Special-session entry and unrelated checkouts remain
 available during background writes. Preparations do not wait behind mutations because the
-confirmed write revalidates its inputs. Removals serialize by host and target;
-unrelated creates and removals can proceed concurrently, while broader host
-operations retain their conflict boundaries. A fleet cleanup is one accepted
+confirmed write revalidates its inputs. A removal excludes whole-host
+operations and holds a long-job slot only until its durable worker holds the
+checkout's lifecycle lock, which is when `start_remove` returns. From then it
+excludes only work on its own checkout until it completes, and at most four
+removals per host are in flight. A remote host's worker applies that planning
+phase itself. Unrelated creates and removals proceed concurrently. A fleet cleanup is one accepted
 operation that owns exactly the `(host, checkout)` pairs it removes: it
 serializes with another cleanup and with whole-host operations on a host it
 touches, and with checkout-scoped work only on those checkouts, so entry and
@@ -561,10 +637,26 @@ Host preferences and cancellation controls share the reserved control capacity;
 they do not acquire checkout or creation locks. Checkout-specific commands
 exclude removal of that checkout, not creation elsewhere. A new action must
 choose its scope explicitly instead of inheriting whole-host exclusion.
+Dispatching a configured action owns the one checkout it is for, or none for
+a manager or slot prompt; two dispatches with the same scope on one host
+still serialize. Restack, review checkout and restore own the host. A queued
+long job is not overtaken by a later long job it conflicts with; short writes
+and reads may pass it.
 While commands run or wait, the controller sends nonterminal progress after
 three seconds, including elapsed time and the conflicting operation or capacity
 wait. These notices cannot settle an optimistic mutation or complete a menu
-request, and stale notices cannot overwrite feedback for newer input.
+request. A failure or notice from an earlier request the user made is shown
+while a later one is pending, and the failure stays beside that request's
+progress and result until the next user action. Background reads never
+interrupt.
+The terminal sends user requests and its own background reads on separate
+channels with separate queue bounds. Every user request logs one info-level
+`controller request` record (`operation`, `lane`, `host`, `queued_ms`,
+`run_ms`, and `outcome`: `ok`, `failed`, `stale`, `uncertain`, `cancelled` or
+`replaced`). A background read logs it at debug unless it failed, is
+uncertain, or took over one second. Every host menu logs `host menu prepared`
+with `prepare_ms`, the number of `keys` typed and `typeahead` (`none`,
+`replayed` or `dropped`).
 Quitting closes command admission and cancels source reads, including automation
 evidence preparation. Already-claimed automation dispatches and accepted local
 writes retain their command token until their outcomes have been persisted;
@@ -585,7 +677,9 @@ await teardown, including cancellation during setup, so OS thread joins cannot
 block the async executor or outlive successful source cleanup.
 `wt_app_core::watcher` selects the backend centrally: macOS uses `PollWatcher` with
 metadata-only comparisons at a one-second interval, while other platforms use
-notify's recommended native watcher. Do not enable macOS kqueue here: recursive
+notify's recommended native watcher. The Git and state watch set
+(`wt_sources::freshness`) does not use this poller on macOS: its own metadata
+scan is the detector there. Do not enable macOS kqueue here: recursive
 directory link events can rebuild descendant watches and close unrelated open
 SQLite WAL/SHM descriptors. Closing a SHM descriptor releases SQLite's
 process-wide POSIX locks and can corrupt a concurrent writer, so keep
@@ -684,7 +778,12 @@ state, and other user-authored records. It also holds each worktree's event
 log, which is a record and never an input to a safety decision. SQLite schema migrations and the
 versioned worktree-state payload migrations are distinct compatibility
 boundaries. `wt state migrate` imports legacy records; it does not run as an
-implicit cache clear.
+implicit cache clear. Opening the state database takes no write lock and
+writes nothing once the schema and the repository row exist, and the state
+payload is migrated at open. `Database::call` runs on the one writable
+connection. `Database::read` runs on a separate read-only connection that
+refuses writes, never migrates, and sees every write whose `call` returned
+before the read started.
 
 The per-source query cache, event observations, action log tails, and source
 snapshots are rebuildable. Hard refresh may clear derived caches; it must not
@@ -693,15 +792,21 @@ Action metadata and logs remain tracked on disk so a disconnected controller
 can re-read completion and output.
 
 Worktree removal and cleanup use the lifecycle service and per-worktree
-operation locks. A confirmed removal moves its row to Archived with a
-removal glyph at once. Revision capture streams complete Git output and
+operation locks. A confirmed removal keeps its row on the board, in the
+Removing section or, with `[ui] owed_sections`, where it was drawn. Revision capture streams complete Git output and
 untracked file contents into fingerprints with bounded memory, cancellation,
-and deadlines; evidence is never truncated to satisfy a capture limit.
+and deadlines; evidence is never truncated to satisfy a capture limit. Its
+four Git reads (HEAD, status, and the unstaged and staged diffs) run
+concurrently without optional index locks, the untracked list comes from the
+status output, and untracked hashing runs on the long-job pool.
 Untracked content that cannot be hashed (a nested repository, a socket or
 FIFO, a set past the path or time budget) is pinned by name and stat data and
 surfaced as a hazard the user confirms; it no longer makes removal impossible.
 The worker archives the row before its startup reply and retains that state
-on failure. TUI actions await the durable
+on failure. A removal start returns once the worker holds the worktree's
+lifecycle lock (`lockHeldAt` in the job record) or the job has ended; a
+worker that acknowledged but reports no lock within 75 seconds leaves the
+removal uncertain. TUI actions await the durable
 job's terminal outcome off the input path, so startup does not settle the pending
 removal. A later failure keeps it archived and reports an attention event.
 CLI background mode returns the startup acknowledgement. Removal errors and completion enter the
@@ -715,7 +820,8 @@ sibling right after the final witness check under the slug lock; that rename
 is the commit point. Git then drops only that worktree's registration, the
 branch and records are settled, the lock is released and success is reported.
 The files are deleted afterwards: by the `_destroy` worker once it has
-published its result, or by foreground `wt rm` after it prints the removal.
+published its result, or by foreground `wt rm` after it prints the removal. At most two deletions
+run at a time for one lock directory; a later one waits its turn.
 The witness stands in for Git's own dirty check, so every removal without a
 caller witness still runs `git worktree remove` in place, as does one whose
 checkout cannot be moved aside or holds submodules. A Git-locked worktree is
@@ -731,7 +837,12 @@ Stacks are inferred from each worktree's recorded fork base. Preserve its
 `baseSha`: it anchors squash-safe replay. A trunk fork base means the worktree
 has no stack parent. “Landed” requires commits beyond that recorded base plus
 the relevant Git/GitHub proof; reachability alone is vacuously true for an
-unstarted branch.
+unstarted branch. The proofs are tried in order: a pull request merged at
+HEAD, the published base containing HEAD, a checkout that holds only copies
+of the head its pull request merged from, then the base holding every patch
+while merging changes nothing. With the copy proof the pull request's merge
+commit stands for the work in the production and deploy proofs
+(`wt_core::merged_pr_oid`).
 
 ## External effects and failures
 
@@ -741,6 +852,32 @@ token. Avoid shell construction for user values. Long-running child processes
 and process groups are reaped by their owning scope. Expected domain errors use
 the owning crate's error type; the CLI and TUI render actionable messages at
 their boundaries.
+
+One `ProcessBudget` admits the application's subprocesses by class
+(`interactive`, `confirming`, `background`, `bulk`): 16 at once, 6 of them
+reserved for interactive work, with background capped at 6 and bulk at 2.
+Admission is first in, first out within a class. The highest class goes
+first, except that a waiter older than 5 seconds goes ahead. A command's
+timeout counts from admission. Waiting for admission has its own bound: 60
+seconds, or 15 minutes for bulk, unless the command sets one. Heavy commands
+(`git worktree add` and remove, Rift create, remove and gc, the destroy hook,
+the main clone's dependency install) also take a slot shared by every wt
+process that uses the same `paths.lock_dir`. They take it before their local
+permit and wait for it at most 10 minutes, or the admission bound if that is
+shorter. A read of every checkout's Git status takes a fleet-scan turn the
+same way and waits at most 10 seconds. After either wait the work proceeds
+without a slot, and interactive handles take neither. Dependency installs
+(3 at a time) and deletions of removed checkouts (2) have their own pools in
+the lock directory, outside the heavy slots. A wait of a second or more, or a
+run of five seconds or more, logs `slow subprocess` under `wt::process`
+(`program`, `class`, `wait_ms`, `run_ms`, `outcome`); a fleet-scan wait of a
+second or more logs `waited for a fleet-scan turn`. A few helpers built
+outside the application context (`wt init`, `_managed`, the controller bridge,
+updates, the workload helper) run on a flat pool of 8 instead.
+
+Long blocking jobs that must not occupy the runtime's blocking threads run on
+`wt_platform::blocking::run_long`, a process-wide pool of two threads. The
+untracked-file hashing of a removal revision uses it.
 
 GitHub reads are batched and all-or-nothing when a batch is incomplete. A
 missing PR result is not an empty-success result. Mutations that can be
@@ -759,7 +896,8 @@ duplicate. The live terminal remains the sole owner of harness questions and
 approvals.
 
 Physical checkout deletion uses `ProcessRunner::run_to_completion`: queue
-admission remains bounded and cancellable, while an admitted process runs to
+admission remains cancellable and bounded (by the command's
+`admission_timeout`, or else its timeout), while an admitted process runs to
 completion with bounded output capture. Its caller retains ownership and the
 lifecycle lock. A short read-command deadline cannot interrupt Git while it
 unlinks checkout files. Other process operations keep their normal policy.

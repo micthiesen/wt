@@ -90,11 +90,17 @@ pub struct Board {
     /// a stop request must match.
     #[serde(default)]
     pub terminals: std::collections::BTreeMap<String, Vec<TerminalSlotView>>,
-    /// Action palettes the owning host prepared while idle, keyed by
-    /// [`crate::ActionSurface::menu_key`]. Absent or stale entries fall back
-    /// to asking the host; a commit is always checked there again.
+    /// What this host's action source publishes for its palettes: recent
+    /// argument values, active runs and unavailable slots.
     #[serde(default)]
-    pub palettes: std::collections::BTreeMap<String, PreparedPalette>,
+    pub actions: crate::ActionState,
+    /// Each remote host's display policy, keyed by `BoardRow::host`. A menu
+    /// about a remote row reads that host's configuration, not this one's.
+    #[serde(default)]
+    pub host_display: std::collections::BTreeMap<String, DisplayPolicy>,
+    /// Each remote host's palette state, keyed like `host_display`.
+    #[serde(default)]
+    pub host_actions: std::collections::BTreeMap<String, crate::ActionState>,
 }
 
 impl Board {
@@ -109,12 +115,6 @@ impl Board {
             || !(view.running.is_empty() && view.queued.is_empty() && view.recent.is_empty())
             || self.rows.iter().any(|row| !row.watches.is_empty())
     }
-}
-
-/// One action palette prepared by the host for a surface.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PreparedPalette {
-    pub modal: crate::UiModal,
 }
 
 /// One session-picker entry prepared by the owning host.
@@ -1095,6 +1095,9 @@ pub struct DisplayPolicy {
     pub default_reviewer: Option<String>,
     /// `[ui] owed_sections`: landed rows are drawn in one Landed block.
     pub owed_sections: bool,
+    /// `[ui] sort = "status"`: a section draws its rows by status before
+    /// their stored order.
+    pub status_sort: bool,
     /// `[guides] enabled`: the details pane shows each row's change guide.
     pub guides: bool,
     /// Staging has a deploy probe (`[environments.staging]`): reaching it
@@ -1102,6 +1105,8 @@ pub struct DisplayPolicy {
     pub staging_probe: bool,
     /// The same for `[environments.production]`.
     pub production_probe: bool,
+    /// The action definitions the palettes list.
+    pub actions: crate::ActionCatalog,
 }
 
 /// A recorded change guide. `current` compares the HEAD it described with
@@ -1241,6 +1246,12 @@ pub struct BoardRow {
     /// the row's own, so a split stack can still be followed.
     #[serde(default)]
     pub split_parent_section: Option<String>,
+    /// The row this one is stacked on, as the board draws stacks: `None`
+    /// for a root, and for a row whose parent's own work has landed. A
+    /// section sorts and moves a row with its parent while both are drawn
+    /// in it.
+    #[serde(default)]
+    pub stack_parent: Option<String>,
     #[serde(default)]
     pub title_source: TitleSource,
     #[serde(default)]
@@ -1264,6 +1275,9 @@ pub struct BoardRow {
     /// A tracked headless action is running for this row.
     #[serde(default)]
     pub action_running: bool,
+    /// What the row's palette entries depend on, as its host resolves them.
+    #[serde(default)]
+    pub action_facts: crate::ActionFacts,
     /// A stage is deployed or a dev server is running for this row.
     #[serde(default)]
     pub environment_live: bool,

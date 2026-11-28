@@ -550,20 +550,26 @@ impl Model {
                 let Some(section) = self.selected_section() else {
                     return self.notify("select a worktree first");
                 };
-                if section.owed_block() {
-                    // wt orders these blocks and the rows in them.
-                    return self.notify(crate::owed_block_refusal(&section.title));
-                }
                 let section = section.key.clone();
                 let row = self.actionable_row().map(|row| row.key.clone());
-                // The cursor follows a moved row, including across a section
-                // boundary (TS docs/tui.md "J / K").
-                self.pending_selection = row.clone();
-                InputResult::Action(UiAction::Reorder {
-                    key: row,
-                    section,
-                    down: key.code == KeyCode::Char('J'),
-                })
+                let down = key.code == KeyCode::Char('J');
+                // Resolved against the board on screen, so the request
+                // carries the move the person saw and a press that moves
+                // nothing says so without asking the host.
+                match crate::plan_reorder(&self.board, row.as_deref(), &section, down) {
+                    Ok(step) => {
+                        // The cursor follows a moved row, including across a
+                        // section boundary (TS docs/tui.md "J / K").
+                        self.pending_selection = row.clone();
+                        InputResult::Action(UiAction::Reorder {
+                            key: row,
+                            section,
+                            down,
+                            step,
+                        })
+                    }
+                    Err(refusal) => self.notify(refusal),
+                }
             }
             KeyCode::Char('u') if control => self.jump_section(false),
             KeyCode::Tab if !control => {

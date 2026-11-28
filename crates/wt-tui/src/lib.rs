@@ -30,6 +30,11 @@ pub use actions::{
 };
 pub use badges::harness_glyph;
 pub use editor::LineEditor;
+pub use menus::palette::{
+    ActionCatalog, ActionDelivery, ActionEntry, ActionFacts, ActionRequirement, ActionRowSeen,
+    ActionSeen, ActionState, ActiveRunView, ArgValue, Blocker, CUSTOM_ACTION_ID,
+    DEV_LOGS_ACTION_ID, OPEN_EDITOR_ACTION_ID, PrFact, blocker, slot_name,
+};
 pub use menus::sessions::{
     harness_label, harness_letter, harness_picker, session_picker, session_value,
     stop_terminal_confirm, terminal_label,
@@ -41,15 +46,16 @@ pub use model::{
     GitPresentation, GuideView, HostChoice, Interaction, LANDED_SECTION, LANDED_TITLE, LandingKind,
     LiveSlotView, LocalStamp, LogView, MergeQueueView, Model, OWED_BLOCK_PREFIX,
     OWED_SECTIONS_OPTION, OtherPrView, OwedBlock, OwedView, PerfGroupView, PerfProcessView,
-    PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup, PreparedPalette,
-    RemovalView, RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow,
-    ReviewState, SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource,
-    UsageItem, WatchActionKind, WatchConditionView, WatchTruth, WatchView, WorkPresentation,
-    WorkRiskCount, WorkStateCount, owed_block_refusal,
+    PerfTone, PerfView, PrCommentView, PrPresentation, PreparedDetailGroup, RemovalView,
+    RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
+    SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem,
+    WatchActionKind, WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount,
+    WorkStateCount, owed_block_refusal,
 };
 pub use mutations::{
     AUTO_MERGE_ACTION_ID, Effect, GithubChange, LayoutChange, LifecycleChange, MutationKind,
-    RowChange, SETTLING_DOMAINS, UiMutation,
+    ReorderStep, RowChange, SETTLING_DOMAINS, STATUS_SORT_PINS, UiMutation, plan_reorder,
+    reorder_refusal, unit_rank,
 };
 pub use terminal::{run, run_with_palette_probe};
 #[doc(hidden)]

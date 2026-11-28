@@ -1,5 +1,6 @@
 //! Where rows sit on the board: archive, sections, folding, and the
 //! attention feed's seen mark. All of it is durable wt metadata.
+use serde::{Deserialize, Serialize};
 use wt_core::Domain;
 use wt_runtime::Target;
 
@@ -7,16 +8,81 @@ use super::{
     ARCHIVED_SECTION, ARCHIVED_TITLE, Family, INBOX_SECTION, INBOX_TITLE, find_section, place,
     row_section, target_index, target_row,
 };
-use crate::Board;
+use crate::model::REMOVING_SECTION;
+use crate::{Board, BoardSection};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LayoutChange {
-    Archive { archived: bool },
-    MoveSection { section: Option<String> },
-    FoldSection { section: String, folded: bool },
-    RenameSection { old: String, new: String },
-    AttentionSeen { at_ms: u64 },
-    Creation { placement: crate::CreatePlacement },
+    Archive {
+        archived: bool,
+    },
+    MoveSection {
+        section: Option<String>,
+    },
+    FoldSection {
+        section: String,
+        folded: bool,
+    },
+    RenameSection {
+        old: String,
+        new: String,
+    },
+    AttentionSeen {
+        at_ms: u64,
+    },
+    Creation {
+        placement: crate::CreatePlacement,
+    },
+    /// J or K inside a section: `unit` is drawn on the far side of `past`.
+    Pass {
+        section: String,
+        unit: String,
+        past: String,
+        down: bool,
+    },
+    /// J or K at a section's edge: `rows` are drawn in `to`, entering at
+    /// its top when `top`.
+    Cross {
+        rows: Vec<String>,
+        to: String,
+        top: bool,
+    },
+    /// J or K on a section header: `section` is drawn on the far side of
+    /// `past`.
+    SectionPass {
+        section: String,
+        past: String,
+        down: bool,
+    },
+}
+
+impl LayoutChange {
+    /// What a resolved J or K press shows before the host has stored it.
+    pub(super) fn reorder(section: &str, down: bool, step: &ReorderStep) -> Self {
+        match step {
+            ReorderStep::Pass { unit, past, .. } => Self::Pass {
+                section: section.to_owned(),
+                unit: unit.clone(),
+                past: past.clone(),
+                down,
+            },
+            ReorderStep::Cross { rows, to, .. } => Self::Cross {
+                rows: rows.clone(),
+                to: to.clone(),
+                top: down,
+            },
+            ReorderStep::Section { past, .. } => Self::SectionPass {
+                section: section.to_owned(),
+                past: past.clone(),
+                down,
+            },
+        }
+    }
+}
+
+/// The two names of a pair in one order, whichever of them moved.
+fn pair<'a>(a: &'a str, b: &'a str) -> (&'a str, &'a str) {
+    if a <= b { (a, b) } else { (b, a) }
 }
 
 impl Family for LayoutChange {
@@ -28,6 +94,34 @@ impl Family for LayoutChange {
             Self::FoldSection { section, .. } => format!("fold:{section}"),
             Self::RenameSection { old, .. } => format!("rename:{old}"),
             Self::AttentionSeen { .. } => "attention".into(),
+            Self::Pass {
+                section,
+                unit,
+                past,
+                ..
+            } => {
+                let (a, b) = pair(unit, past);
+                format!("order:{section:?}:{a:?}:{b:?}")
+            }
+            // Where the row is filed, the field a move from the section menu
+            // writes: a later crossing replaces an earlier one.
+            Self::Cross { .. } => "section".into(),
+            Self::SectionPass { section, past, .. } => {
+                let (a, b) = pair(section, past);
+                format!("sections:{a:?}:{b:?}")
+            }
+        }
+    }
+
+    fn pairwise(&self) -> bool {
+        matches!(self, Self::Pass { .. })
+    }
+
+    fn rows(&self) -> Vec<String> {
+        match self {
+            Self::Pass { unit, past, .. } => vec![unit.clone(), past.clone()],
+            Self::Cross { rows, .. } => rows.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -42,6 +136,12 @@ impl Family for LayoutChange {
             Self::FoldSection { .. } => "folding".into(),
             Self::RenameSection { .. } => "renaming section".into(),
             Self::AttentionSeen { .. } => "marking seen".into(),
+            Self::Pass { .. } => "reordering".into(),
+            Self::Cross { to, .. } => format!(
+                "moving to {}",
+                if to == INBOX_SECTION { INBOX_TITLE } else { to }
+            ),
+            Self::SectionPass { .. } => "reordering sections".into(),
         }
     }
 
@@ -110,6 +210,80 @@ impl Family for LayoutChange {
             Self::AttentionSeen { at_ms } => {
                 board.attention_seen_ms = board.attention_seen_ms.max(*at_ms);
             }
+            Self::Pass {
+                section,
+                unit,
+                past,
+                down,
+            } => {
+                let Some(index) = section_at(board, section) else {
+                    return;
+                };
+                let units = section_units(board, &board.sections[index]);
+                let rows_of = |key: &str| units.iter().find(|unit| unit.key == key);
+                let (Some(moving), Some(fixed)) = (rows_of(unit), rows_of(past)) else {
+                    return;
+                };
+                let rows = &mut board.sections[index].rows;
+                if passed(rows, &moving.rows, &fixed.rows, *down) {
+                    return;
+                }
+                rows.retain(|row| !moving.rows.contains(row));
+                let at = if *down {
+                    rows.iter()
+                        .rposition(|row| fixed.rows.contains(row))
+                        .map_or(rows.len(), |last| last + 1)
+                } else {
+                    rows.iter()
+                        .position(|row| fixed.rows.contains(row))
+                        .unwrap_or(0)
+                };
+                rows.splice(at..at, moving.rows.iter().copied());
+            }
+            Self::Cross { rows, to, top } => {
+                let Some(destination) = section_at(board, to) else {
+                    return;
+                };
+                // A row already drawn there keeps the place it has, which a
+                // later press may have given it. One that wt has since drawn
+                // in a derived block (archived, landed) stays there.
+                let entering: Vec<usize> = rows
+                    .iter()
+                    .filter_map(|key| board.rows.iter().position(|row| row.key == *key))
+                    .filter(|&index| {
+                        row_section(board, index).is_none_or(|drawn| {
+                            drawn != destination && filed_in(&board.sections[drawn])
+                        })
+                    })
+                    .collect();
+                for section in &mut board.sections {
+                    section.rows.retain(|row| !entering.contains(row));
+                }
+                let drawn = &mut board.sections[destination].rows;
+                if *top {
+                    drawn.splice(0..0, entering);
+                } else {
+                    drawn.extend(entering);
+                }
+            }
+            Self::SectionPass {
+                section,
+                past,
+                down,
+            } => {
+                let (Some(moving), Some(fixed)) =
+                    (section_at(board, section), section_at(board, past))
+                else {
+                    return;
+                };
+                if (moving > fixed) == *down {
+                    return;
+                }
+                let moved = board.sections.remove(moving);
+                // Removing `moving` shifted `past` by one when it was behind
+                // it, so the far side of `past` is its old index either way.
+                board.sections.insert(fixed, moved);
+            }
         }
     }
 
@@ -143,7 +317,250 @@ impl Family for LayoutChange {
                 .is_none_or(|s| s.folded == *folded),
             Self::RenameSection { new, .. } => find_section(board, new).is_some(),
             Self::AttentionSeen { at_ms } => board.attention_seen_ms >= *at_ms,
+            // A unit or a section that is no longer drawn here has nothing
+            // left to show.
+            Self::Pass {
+                section,
+                unit,
+                past,
+                down,
+            } => section_at(board, section).is_none_or(|index| {
+                let drawn = &board.sections[index];
+                let units = section_units(board, drawn);
+                let rows_of = |key: &str| units.iter().find(|unit| unit.key == key);
+                match (rows_of(unit), rows_of(past)) {
+                    (Some(moving), Some(fixed)) => {
+                        passed(&drawn.rows, &moving.rows, &fixed.rows, *down)
+                    }
+                    _ => true,
+                }
+            }),
+            Self::Cross { rows, to, .. } => section_at(board, to).is_none_or(|destination| {
+                rows.iter()
+                    .filter_map(|key| board.rows.iter().position(|row| row.key == *key))
+                    .all(|index| board.sections[destination].rows.contains(&index))
+            }),
+            Self::SectionPass {
+                section,
+                past,
+                down,
+            } => match (section_at(board, section), section_at(board, past)) {
+                (Some(moving), Some(fixed)) => (moving > fixed) == *down,
+                _ => true,
+            },
         }
+    }
+}
+
+/// What one J or K press does, resolved against the board the person saw.
+/// It is the request and its witness: the host moves exactly the units named
+/// here, and refuses when the stored layout is no longer the one listed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReorderStep {
+    /// Pass `past`, the next unit drawn in the section. `units` are the
+    /// section's units in the order drawn before the move.
+    Pass {
+        unit: String,
+        past: String,
+        units: Vec<String>,
+    },
+    /// Leave the section at its edge for `to`, the next section drawn.
+    /// `rows` are the unit's rows; `units` are the units drawn in the
+    /// section it leaves and `to_units` those drawn in `to`.
+    Cross {
+        unit: String,
+        rows: Vec<String>,
+        units: Vec<String>,
+        to: String,
+        to_units: Vec<String>,
+    },
+    /// Move the section itself past `past`. `sections` are the sections
+    /// that can move, in the order drawn.
+    Section { past: String, sections: Vec<String> },
+}
+
+/// What a section sorts and moves as one: a row, or the rows of a stack
+/// drawn together in it. `key` is the row that carries the unit's stored
+/// order; `rows` index the board's rows in the order drawn.
+struct SectionUnit {
+    key: String,
+    rows: Vec<usize>,
+}
+
+impl SectionUnit {
+    /// The status the unit sorts by under status sort: the first of its
+    /// rows'.
+    fn rank(&self, board: &Board) -> u8 {
+        self.rows
+            .iter()
+            .map(|&row| board.rows[row].work_rank)
+            .min()
+            .unwrap_or(u8::MAX)
+    }
+}
+
+/// The units of a section in the order drawn. A stacked row belongs to the
+/// unit of the shallowest row of its stack drawn in the same section, so a
+/// member filed elsewhere is a unit of its own, here and there. A row still
+/// being created is not one: its host has not filed it yet.
+fn section_units(board: &Board, section: &BoardSection) -> Vec<SectionUnit> {
+    let drawn: Vec<(usize, &crate::BoardRow)> = section
+        .rows
+        .iter()
+        .filter_map(|&index| Some((index, board.rows.get(index)?)))
+        .filter(|(_, row)| !row.pending_creation)
+        .collect();
+    let row_of = |key: &str| drawn.iter().map(|(_, row)| *row).find(|row| row.key == key);
+    let mut units: Vec<SectionUnit> = Vec::new();
+    for &(index, row) in &drawn {
+        let mut anchor = row;
+        // Bounded by the rows drawn, so a malformed cycle of parents ends.
+        for _ in 0..drawn.len() {
+            match anchor.stack_parent.as_deref().and_then(row_of) {
+                Some(parent) => anchor = parent,
+                None => break,
+            }
+        }
+        match units.iter_mut().find(|unit| unit.key == anchor.key) {
+            Some(unit) => unit.rows.push(index),
+            None => units.push(SectionUnit {
+                key: anchor.key.clone(),
+                rows: vec![index],
+            }),
+        }
+    }
+    units
+}
+
+/// The status a unit sorts by under status sort, where `board` draws it.
+/// `None` for a row the board does not list.
+pub fn unit_rank(board: &Board, unit: &str) -> Option<u8> {
+    let index = board.rows.iter().position(|row| row.key == unit)?;
+    let rank = board
+        .sections
+        .iter()
+        .find(|section| section.rows.contains(&index))
+        .and_then(|section| {
+            section_units(board, section)
+                .into_iter()
+                .find(|drawn| drawn.key == unit)
+        })
+        .map_or(board.rows[index].work_rank, |drawn| drawn.rank(board));
+    Some(rank)
+}
+
+/// Why nothing in a section, nor the section itself, moves by hand: wt
+/// derives it, so no order or placement is stored for it. `None` for a
+/// section rows are filed in. `title` names a derived block in its refusal.
+pub fn reorder_refusal(key: &str, title: &str) -> Option<String> {
+    if key == ARCHIVED_SECTION {
+        Some("Archived rows do not reorder; use a to restore".into())
+    } else if key == REMOVING_SECTION {
+        Some("Rows being removed do not reorder".into())
+    } else if key.starts_with(crate::OWED_BLOCK_PREFIX) {
+        // wt orders these blocks and the rows in them.
+        Some(crate::owed_block_refusal(title))
+    } else if key.starts_with('\0') && key != INBOX_SECTION {
+        Some("This group is named by wt and holds no filed rows".into())
+    } else {
+        None
+    }
+}
+
+/// Resolve a J or K press on `key` (the section header when `None`) against
+/// the board on screen. `Err` is the notice for a press that moves nothing.
+pub fn plan_reorder(
+    board: &Board,
+    key: Option<&str>,
+    section: &str,
+    down: bool,
+) -> Result<ReorderStep, String> {
+    let index = section_at(board, section).ok_or("section disappeared")?;
+    let here = &board.sections[index];
+    if let Some(refusal) = reorder_refusal(&here.key, &here.title) {
+        return Err(refusal);
+    }
+    // A row or a section only moves next to a section on screen that rows
+    // are filed in: a named one even while empty, the Inbox only with rows.
+    let on_screen = |section: &&BoardSection| filed_in(section) && section.drawn();
+    let next = if down {
+        board.sections[index + 1..].iter().find(on_screen)
+    } else {
+        board.sections[..index].iter().rev().find(on_screen)
+    };
+    let edge = if down { "bottom" } else { "top" };
+    let Some(key) = key else {
+        let past = next.ok_or_else(|| format!("section already at {edge}"))?;
+        return Ok(ReorderStep::Section {
+            past: past.key.clone(),
+            sections: board
+                .sections
+                .iter()
+                .filter(|section| on_screen(section) || section.key == here.key)
+                .map(|section| section.key.clone())
+                .collect(),
+        });
+    };
+    let units = section_units(board, here);
+    let keys = |units: &[SectionUnit]| -> Vec<String> {
+        units.iter().map(|unit| unit.key.clone()).collect()
+    };
+    let at = units
+        .iter()
+        .position(|unit| unit.rows.iter().any(|&row| board.rows[row].key == key))
+        .ok_or("selected row left this section")?;
+    let unit = &units[at];
+    let neighbor = if down {
+        units.get(at + 1)
+    } else {
+        at.checked_sub(1).and_then(|before| units.get(before))
+    };
+    if let Some(past) = neighbor {
+        // Status sort draws a section by status first, so the stored order
+        // only decides among units of one status.
+        if board.display.status_sort && unit.rank(board) != past.rank(board) {
+            return Err(STATUS_SORT_PINS.into());
+        }
+        return Ok(ReorderStep::Pass {
+            unit: unit.key.clone(),
+            past: past.key.clone(),
+            units: keys(&units),
+        });
+    }
+    let to = next.ok_or_else(|| format!("already at {edge}"))?;
+    Ok(ReorderStep::Cross {
+        unit: unit.key.clone(),
+        rows: unit
+            .rows
+            .iter()
+            .map(|&row| board.rows[row].key.clone())
+            .collect(),
+        units: keys(&units),
+        to: to.key.clone(),
+        to_units: keys(&section_units(board, to)),
+    })
+}
+
+/// Why status sort refuses to exchange two neighbours.
+pub const STATUS_SORT_PINS: &str =
+    "status sort pins this row; reorder within the same status or use manual sort";
+
+fn section_at(board: &Board, key: &str) -> Option<usize> {
+    board.sections.iter().position(|section| section.key == key)
+}
+
+/// Whether rows are filed in this section, as opposed to drawn in it by wt
+/// (the archive, removals, the Landed block).
+fn filed_in(section: &BoardSection) -> bool {
+    reorder_refusal(&section.key, &section.title).is_none()
+}
+
+/// Whether `moving` is drawn on the far side of `fixed`.
+fn passed(drawn: &[usize], moving: &[usize], fixed: &[usize], down: bool) -> bool {
+    let first = |rows: &[usize]| drawn.iter().position(|row| rows.contains(row));
+    match (first(moving), first(fixed)) {
+        (Some(moving), Some(fixed)) => (moving > fixed) == down,
+        _ => true,
     }
 }
 

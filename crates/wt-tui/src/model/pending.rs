@@ -70,10 +70,9 @@ impl Model {
             self.pending.mutations().find_map(|mutation| {
                 let reordering = matches!(
                     mutation.kind,
-                    crate::MutationKind::Unprojected {
-                        label: "reordering",
-                        ..
-                    }
+                    crate::MutationKind::Layout(
+                        crate::LayoutChange::Pass { .. } | crate::LayoutChange::Cross { .. }
+                    )
                 );
                 (reordering && mutation.target.key.as_deref() == Some(row.key.as_str()))
                     .then(|| row.key.clone())
@@ -111,6 +110,7 @@ impl Model {
         }
         self.present(board);
         self.rebuild_local_menu();
+        self.settle_palette_wait(now);
     }
 
     /// The creation behind a row that is still a placeholder. The request
@@ -232,7 +232,7 @@ impl Model {
 
     /// When a pending change next needs re-checking against its deadline.
     pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
-        [self.pending.next_deadline(), self.palette_warm_deadline()]
+        [self.pending.next_deadline(), self.palette_wait_deadline()]
             .into_iter()
             .flatten()
             .min()
@@ -317,24 +317,6 @@ impl Model {
                 host,
                 action: Box::new(self.resolve(*action)),
             },
-            UiAction::PrepareAction {
-                surface: crate::ActionSurface::Row { key },
-                id,
-                ..
-            } if id == crate::AUTO_MERGE_ACTION_ID => {
-                let armed = self
-                    .board
-                    .rows
-                    .iter()
-                    .find(|row| row.key == key)
-                    .and_then(|row| row.pr.as_ref())
-                    .is_some_and(|pr| pr.auto_merge_armed || pr.merge_queue.is_some());
-                UiAction::GithubSetAutoMerge {
-                    pin: pin(&key),
-                    key,
-                    enable: !armed,
-                }
-            }
             UiAction::GithubSetAutoMerge {
                 key,
                 enable,
@@ -380,10 +362,7 @@ impl Model {
             // text typed ahead into a prompt.
             opener: self.last_key.take().filter(|key| {
                 preparation
-                    && !matches!(
-                        inner,
-                        UiAction::PrepareAction { .. } | UiAction::PrepareCreate { .. }
-                    )
+                    && !matches!(inner, UiAction::PrepareCreate { .. })
                     && !matches!(
                         key.code,
                         crossterm::event::KeyCode::Enter

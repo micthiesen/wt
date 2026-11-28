@@ -97,6 +97,7 @@ pub async fn execute(
                 id: crate::action_palette::CUSTOM_ID.into(),
                 arg: None,
                 extras: perf_investigation_prompt(&report),
+                seen: None,
             })
             .await
             .context("send the perf snapshot to the wt session")?;

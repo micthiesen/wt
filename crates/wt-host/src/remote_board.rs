@@ -289,9 +289,20 @@ fn compose(
                     *value = wt_core::sanitize_terminal_text(value);
                 }
                 row.owes.iter_mut().for_each(sanitize_owed);
+                if let Some(run) = &mut row.action_facts.active_run {
+                    run.action_name = wt_core::sanitize_terminal_text(&run.action_name);
+                }
                 board.rows.push(row);
             }
             if let Some(remote) = &data.board {
+                // The host's rows are listed with its own action catalog and
+                // palette state, which its menus are built from here.
+                board
+                    .host_display
+                    .insert(host.clone(), sanitize_display(remote.display.clone()));
+                board
+                    .host_actions
+                    .insert(host.clone(), sanitize_actions(remote.actions.clone()));
                 for mut review in remote.review_requests.clone() {
                     review.host = Some(host.clone());
                     for value in [&mut review.title, &mut review.author] {
@@ -453,6 +464,51 @@ fn compose(
 }
 
 /// What a remote row owes is derived on its host; this board only draws it.
+/// Another host's action catalog is drawn here. An id that sanitizing
+/// changes no longer names an action on that host, whose commit check then
+/// refuses it.
+fn sanitize_display(mut display: wt_tui::DisplayPolicy) -> wt_tui::DisplayPolicy {
+    let actions = &mut display.actions;
+    for entry in actions
+        .row
+        .iter_mut()
+        .chain(&mut actions.manager)
+        .chain(&mut actions.slot)
+    {
+        for value in [&mut entry.id, &mut entry.name]
+            .into_iter()
+            .chain(&mut entry.group)
+            .chain(&mut entry.key)
+            .chain(&mut entry.arg_prompt)
+        {
+            *value = wt_core::sanitize_terminal_text(value);
+        }
+    }
+    for group in &mut actions.groups_last {
+        *group = wt_core::sanitize_terminal_text(group);
+    }
+    display.primary_harness = wt_core::sanitize_terminal_text(&display.primary_harness);
+    display
+}
+
+/// What another host says about its palettes is drawn here; the argument
+/// values themselves go back to that host unchanged.
+fn sanitize_actions(mut actions: wt_tui::ActionState) -> wt_tui::ActionState {
+    for value in actions.recent_args.values_mut().flatten() {
+        value.shown = wt_core::sanitize_terminal_text(&value.shown);
+        if let Some(label) = &mut value.label {
+            *label = wt_core::sanitize_terminal_text(label);
+        }
+    }
+    for run in actions.runs.values_mut() {
+        run.action_name = wt_core::sanitize_terminal_text(&run.action_name);
+    }
+    for reason in actions.slots_blocked.values_mut() {
+        *reason = wt_core::sanitize_terminal_text(reason);
+    }
+    actions
+}
+
 fn sanitize_owed(item: &mut wt_tui::OwedView) {
     // The text keeps its lines: the pane draws them as written.
     item.what = wt_core::sanitize_terminal_lines(&item.what);

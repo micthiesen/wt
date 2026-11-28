@@ -334,7 +334,7 @@ impl ActionService {
             width: None,
             height: None,
         };
-        let worker_lock_key = format!("action-run-{run_id}");
+        let worker_lock_key = worker_lock_key(&self.config.log_dir, &run.meta.slug);
         let worker_lock = FileLock::acquire(
             &self.config.lock_dir,
             &worker_lock_key,
@@ -484,7 +484,7 @@ impl ActionService {
             });
         }
         validate_run_id(&job.run.meta.run_id)?;
-        let worker_lock_key = format!("action-run-{}", job.run.meta.run_id);
+        let worker_lock_key = worker_lock_key(&self.config.log_dir, &job.run.meta.slug);
         let _worker_lock = FileLock::acquire(
             &self.config.lock_dir,
             &worker_lock_key,
@@ -1003,7 +1003,7 @@ impl ActionService {
             };
             let Some(_worker_lock) = FileLock::try_acquire(
                 &self.config.lock_dir,
-                &format!("action-run-{}", run.meta.run_id),
+                &worker_lock_key(&self.config.log_dir, &run.meta.slug),
                 "reconcile action worker",
             )
             .await?
@@ -1060,7 +1060,7 @@ impl ActionService {
         validate_run_id(run_id)?;
         Ok(FileLock::acquire(
             &self.config.lock_dir,
-            &format!("action-state-{run_id}"),
+            &state_lock_key(run_id),
             "write action outcome",
             &CancellationToken::new(),
         )
@@ -1361,6 +1361,24 @@ fn action_session_name(key: &str) -> String {
 
 fn scoped_identity(log_dir: &Path, slug: &str) -> String {
     format!("{}\0{slug}", log_dir.to_string_lossy())
+}
+
+/// The lock a run's worker holds for as long as it lives. It is named for
+/// the worktree, not the run: one action runs on a worktree at a time, lock
+/// files are never deleted, and a name per run left a file behind for every
+/// run ever made.
+pub fn worker_lock_key(log_dir: &Path, slug: &str) -> String {
+    format!(
+        "action-worker-{:016x}",
+        stable_hash(&scoped_identity(log_dir, slug))
+    )
+}
+
+/// The lock held while one run's outcome files are rewritten. Runs share a
+/// fixed set of names, for the same reason; the lock is held for one write
+/// and never while another of them is taken.
+fn state_lock_key(run_id: &str) -> String {
+    format!("action-state-{:02x}", stable_hash(run_id) % 64)
 }
 
 fn valid_env_name(name: &str) -> bool {
@@ -1714,7 +1732,7 @@ mod tests {
         let meta: ActionMeta = read_json(&run_dir.join("meta.json")).await.unwrap();
         let worker_lock = FileLock::acquire(
             &temp.path().join("locks"),
-            &format!("action-run-{}", meta.run_id),
+            &worker_lock_key(temp.path(), &meta.slug),
             "fixture live worker",
             &CancellationToken::new(),
         )
@@ -1727,6 +1745,13 @@ mod tests {
                 .unwrap(),
             0
         );
+        // Lock files are never deleted, so none may be named for a run.
+        let named_for_the_run = std::fs::read_dir(temp.path().join("locks"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(&meta.run_id))
+            .count();
+        assert_eq!(named_for_the_run, 0);
         drop(worker_lock);
         // Legacy workers can leave only this sentinel before the TUI exits.
         fs::write(run_dir.join("done.json"), br#"{"exitCode":0}"#)

@@ -316,19 +316,21 @@ pub async fn execute_with_shutdown(
             }))
         }
         UiAction::PrepareActions { .. }
-        | UiAction::WarmPalette { .. }
         | UiAction::PrepareGithub { .. }
         | UiAction::GithubMarkReady { .. }
         | UiAction::GithubSetAutoMerge { .. }
         | UiAction::GithubShip { .. }
         | UiAction::GithubFailedChecks { .. }
-        | UiAction::PrepareAction { .. }
+        | UiAction::PrepareDevLogs { .. }
         | UiAction::RunAction { .. } => {
             bail!("action palette requests must be routed through their controller")
         }
-        UiAction::Reorder { key, section, down } => {
-            crate::section_actions::reorder(ctx, key, section, down, board).await
-        }
+        UiAction::Reorder {
+            key,
+            section,
+            down,
+            step,
+        } => crate::section_actions::reorder(ctx, key, section, down, step, board).await,
         UiAction::MoveSection { key, section, seen } => {
             crate::section_actions::move_row(ctx, key, section, seen, board).await
         }

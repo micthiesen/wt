@@ -364,12 +364,21 @@ pub async fn latest_shared_read(ctx: &AppContext) -> Option<(GithubData, u64)> {
 }
 
 /// Why GitHub took `pr` out of the merge queue, in words, when it did so
-/// after `arm` was sent for it. GitHub keeps the latest removal on the pull
-/// request for good, so one from before the arming says nothing about it.
+/// after `arm` was sent for it and nothing holds the merge now. GitHub
+/// keeps the latest removal on the pull request for good, so one from
+/// before the arming says nothing about it, and neither does one a later
+/// arming (by wt or by a person on GitHub) has made history: the pull
+/// request must be open, not set to auto-merge, and known not to be queued.
+/// `queued` is `None` where the read cannot say: no entry in a read that
+/// held only part of the queue. The one rule for every surface that says it.
 pub fn queue_removal(
     pr: &wt_github::PullRequest,
     arm: Option<&wt_core::MergeArm>,
+    queued: Option<bool>,
 ) -> Option<String> {
+    if pr.state != "OPEN" || pr.auto_merge.is_some() || queued != Some(false) {
+        return None;
+    }
     let arm = arm.filter(|arm| arm.pr == pr.number)?;
     let removal = pr.queue_removal.as_ref()?;
     if i64::try_from(removal.at_ms).unwrap_or(i64::MAX) <= arm.armed_at_ms {
@@ -412,6 +421,11 @@ pub struct RowReader {
     /// The state [`RowReader::concerns`] read to compare, kept for the pass
     /// it then asks for.
     state_next: Option<serde_json::Value>,
+    /// Each live worktree's branch as the last pass listed them.
+    branches: BTreeMap<String, String>,
+    /// What the daemon's snapshot said, when the last pass began, of the
+    /// pull requests that pass read from it: see [`RowReader::github_concern`].
+    github_seen: Option<serde_json::Value>,
     /// Armings GitHub was seen holding during this process, as
     /// `(slug, armed_at_ms)`: the engine records that on the arm itself,
     /// and none may be running.
@@ -503,13 +517,16 @@ impl RowReader {
         changed: Changed,
     ) -> bool {
         let asked = asked(watches);
-        if (changed.github && asked.values().any(|asked| asked.pr))
-            || (changed.git && asked.values().any(|asked| asked.landing))
-        {
+        if changed.git && asked.values().any(|asked| asked.landing) {
             return true;
         }
-        // The daemon's snapshot also answers for pull requests named by number.
-        if changed.github && !wt_core::watch::needs(watches).prs.is_empty() {
+        // The daemon rewrites its snapshot for every pull request of the
+        // fleet; only what it says of the ones asked about is a reason.
+        if changed.github
+            && (asked.values().any(|asked| asked.pr)
+                || !wt_core::watch::needs(watches).prs.is_empty())
+            && self.github_seen != Some(self.github_concern(ctx, watches).await)
+        {
             return true;
         }
         if !changed.state {
@@ -523,6 +540,50 @@ impl RowReader {
         }
         self.state_next = Some(state);
         true
+    }
+
+    /// The part of the daemon's snapshot a pass over `watches` reads, as the
+    /// snapshot stands now: the pull requests of the branches its row
+    /// conditions ask about, and the state of the ones named by number. A
+    /// question about the merge queue goes to GitHub itself (see
+    /// [`RowReader::github`]), so the snapshot answers no row then.
+    async fn github_concern(&self, ctx: &AppContext, watches: &[Watch]) -> serde_json::Value {
+        use crate::github_events_source::Held;
+        let asked = asked(watches);
+        let rows = if asked.values().any(|asked| asked.queue) {
+            Vec::new()
+        } else {
+            self.branches
+                .iter()
+                .filter(|(slug, branch)| {
+                    !branch.is_empty() && asked.get(*slug).is_some_and(|asked| asked.pr)
+                })
+                .map(|(_, branch)| branch.clone())
+                .collect::<Vec<_>>()
+        };
+        let off = std::env::var("WT_GITHUB").as_deref() == Ok("off");
+        let rows = if rows.is_empty() || off {
+            None
+        } else {
+            crate::github_events_source::load_for_display(ctx, &rows)
+                .await
+                // Past fresh a pass takes only the merges from it.
+                .map(|shown| serde_json::json!([shown.held == Held::Fresh, shown.read.data.prs]))
+        };
+        let numbers = wt_core::watch::needs(watches).prs;
+        let numbered = if numbers.is_empty() {
+            None
+        } else {
+            let branches = self.branches.values().cloned().collect::<Vec<_>>();
+            self.fleet_prs(ctx, &branches).await.map(|data| {
+                data.prs
+                    .values()
+                    .filter(|pr| numbers.contains(&pr.number))
+                    .map(|pr| serde_json::json!([pr.number, pr.state, pr.merge_commit_oid]))
+                    .collect::<Vec<_>>()
+            })
+        };
+        serde_json::json!([rows, numbered])
     }
 
     /// One pass. `Err` when the worktrees or the state cannot be read
@@ -561,6 +622,18 @@ impl RowReader {
             .filter(|branch| !branch.is_empty())
             .collect::<Vec<_>>();
         let queue = asked.values().any(|asked| asked.queue);
+        // Before the snapshot is read for the pass: one written in between
+        // then reads as a change, which costs a pass and misses nothing.
+        self.branches = records
+            .iter()
+            .map(|record| {
+                (
+                    record.target.slug().to_owned(),
+                    record.target.branch.clone(),
+                )
+            })
+            .collect();
+        self.github_seen = Some(self.github_concern(ctx, watches).await);
         let read_started_ms = now_ms();
         self.github_due_ms = None;
         let github_read = self.github(ctx, &branches, queue).await;
@@ -679,7 +752,10 @@ impl RowReader {
                     arm.seen_armed_at_ms.get_or_insert(arm.armed_at_ms);
                 }
             }
-            if let Some(why) = pr.and_then(|pr| queue_removal(pr, merge_arm.as_ref())) {
+            let queued = queue
+                .map(|_| true)
+                .or(data.merge_queue_complete.then_some(false));
+            if let Some(why) = pr.and_then(|pr| queue_removal(pr, merge_arm.as_ref(), queued)) {
                 read.removals.insert(slug.to_owned(), why);
             }
             let work = wt_core::parse_work_status(&stored["work"]);
@@ -718,7 +794,7 @@ impl RowReader {
         // and GitHub is not asked about that number at all.
         if !wt_core::watch::needs(watches).prs.is_empty() {
             read.prs.extend(
-                self.fleet_prs(ctx, &records)
+                self.fleet_prs(ctx, &self.branches.values().cloned().collect::<Vec<_>>())
                     .await
                     .iter()
                     .flat_map(numbered),
@@ -733,19 +809,15 @@ impl RowReader {
     /// The daemon's snapshot for every live branch, when it holds them all
     /// and `WT_GITHUB` allows it. Older than the board would use, it keeps
     /// only its merges.
-    async fn fleet_prs(
-        &self,
-        ctx: &AppContext,
-        records: &[wt_vcs::WorktreeRecord],
-    ) -> Option<GithubData> {
+    async fn fleet_prs(&self, ctx: &AppContext, branches: &[String]) -> Option<GithubData> {
         use crate::github_events_source::Held;
         if std::env::var("WT_GITHUB").as_deref() == Ok("off") {
             return None;
         }
-        let branches = records
+        let branches = branches
             .iter()
-            .map(|record| record.target.branch.clone())
             .filter(|branch| !branch.is_empty())
+            .cloned()
             .collect::<Vec<_>>();
         if branches.is_empty() {
             return None;
@@ -1237,21 +1309,93 @@ mod tests {
         assert!(!reader.concerns(ctx, &watches, state).await);
         assert!(!signals.poll().any());
 
-        // GitHub's and Git's files concern only a watch that asks them.
-        let outside = Changed {
-            state: false,
-            github: true,
+        // A fetch concerns only a watch that asks about a landing.
+        let fetched = Changed {
             git: true,
+            ..Changed::default()
         };
-        assert!(!reader.concerns(ctx, &watches, outside).await);
-        for asks in ["merged", "green", "pr:7"] {
+        assert!(!reader.concerns(ctx, &watches, fetched).await);
+        assert!(
+            reader
+                .concerns(ctx, &[watch("one", &["merged"])], fetched)
+                .await
+        );
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_write_prompts_a_pass_only_when_it_changes_what_is_asked() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let mut ctx = fixture.ctx.clone();
+        let mut config = (*ctx.config).clone();
+        config.github.events = Some(Default::default());
+        ctx.config = std::sync::Arc::new(config);
+        let ctx = &ctx;
+        let events = ctx.config.paths.cache_root.join("events");
+        std::fs::create_dir_all(&events).unwrap();
+        let pr = |number: u64, branch: &str, checks: &str| {
+            serde_json::json!({
+                "number": number, "url": format!("https://example.invalid/pull/{number}"),
+                "headRefName": branch, "baseRefName": "main", "title": "T",
+                "isDraft": false, "state": "OPEN", "checks": checks, "failedChecks": [],
+                "review": "none", "reviewRequests": 0, "requestedReviewers": [],
+                "suggestedReviewers": [], "autoMerge": null, "comments": [],
+                "unresolvedThreads": 0, "unresolvedThreadsTotal": 0,
+                "mergedAt": null, "closedAt": null
+            })
+        };
+        let write = |one: &str, two: &str| {
+            let written = epoch_ms();
+            let snapshot = serde_json::json!({
+                "updatedAt": written, "fetchStartedAtMs": written - 1_000,
+                "branches": ["feature/one", "feature/two"],
+                "prs": {
+                    "feature/one": pr(7, "feature/one", one),
+                    "feature/two": pr(8, "feature/two", two),
+                },
+                "mergeQueue": {},
+                "writerSha": wt_app_core::build_info::build_id(),
+                "schema": wt_events::SNAPSHOT_SCHEMA,
+                "schemaWriterSha": wt_app_core::build_info::build_id(),
+                "repository": wt_ops::events::repository_identity(&ctx.config),
+            });
+            std::fs::write(events.join("github.json"), snapshot.to_string()).unwrap();
+        };
+        let github = Changed {
+            github: true,
+            ..Changed::default()
+        };
+        write("pending", "pending");
+        for conditions in [&["green"][..], &["pr:7"][..]] {
+            let watches = [watch("one", conditions)];
+            let mut reader = RowReader::default();
+            write("pending", "pending");
+            let read = reader.read(ctx, &watches).await.unwrap();
+            assert!(read.prs.contains_key(&7), "{conditions:?}");
+            // The daemon wrote again with nothing new, then with news of
+            // another worktree's pull request: no pass.
+            write("pending", "pending");
             assert!(
-                reader
-                    .concerns(ctx, &[watch("one", &[asks])], outside)
-                    .await,
-                "{asks}"
+                !reader.concerns(ctx, &watches, github).await,
+                "{conditions:?}"
+            );
+            write("pending", "pass");
+            assert!(
+                !reader.concerns(ctx, &watches, github).await,
+                "{conditions:?}"
             );
         }
+        // News of the pull request a condition asks about is a reason.
+        let watches = [watch("one", &["green"])];
+        let mut reader = RowReader::default();
+        reader.read(ctx, &watches).await.unwrap();
+        write("pass", "pass");
+        assert!(reader.concerns(ctx, &watches, github).await);
+        let read = reader.read(ctx, &watches).await.unwrap();
+        assert_eq!(read.rows["one"].green, Some(true));
+        assert!(!reader.concerns(ctx, &watches, github).await);
         fixture.close().await.unwrap();
     }
 
@@ -1355,22 +1499,45 @@ mod tests {
         };
         let removed =
             |reason: &str, at_ms: u64| pr(serde_json::json!({"reason": reason, "atMs": at_ms}));
+        let out = Some(false);
         assert_eq!(
-            queue_removal(&removed("merge_conflict", 2_000), Some(&arm(7))).as_deref(),
+            queue_removal(&removed("merge_conflict", 2_000), Some(&arm(7)), out).as_deref(),
             Some("removed from the merge queue: merge_conflict")
         );
         assert_eq!(
-            queue_removal(&removed("", 2_000), Some(&arm(7))).as_deref(),
+            queue_removal(&removed("", 2_000), Some(&arm(7)), out).as_deref(),
             Some("removed from the merge queue")
         );
         // An earlier round's removal, another pull request's arming, no
         // arming, no removal.
-        assert_eq!(queue_removal(&removed("ci", 1_000), Some(&arm(7))), None);
-        assert_eq!(queue_removal(&removed("ci", 2_000), Some(&arm(8))), None);
-        assert_eq!(queue_removal(&removed("ci", 2_000), None), None);
         assert_eq!(
-            queue_removal(&pr(serde_json::Value::Null), Some(&arm(7))),
+            queue_removal(&removed("ci", 1_000), Some(&arm(7)), out),
             None
         );
+        assert_eq!(
+            queue_removal(&removed("ci", 2_000), Some(&arm(8)), out),
+            None
+        );
+        assert_eq!(queue_removal(&removed("ci", 2_000), None, out), None);
+        assert_eq!(
+            queue_removal(&pr(serde_json::Value::Null), Some(&arm(7)), out),
+            None
+        );
+        // Queued again, perhaps queued (the read held part of the queue),
+        // re-armed on GitHub with no arm record of wt's, merged or closed:
+        // the old removal is history.
+        let again = removed("merge_conflict", 2_000);
+        assert_eq!(queue_removal(&again, Some(&arm(7)), Some(true)), None);
+        assert_eq!(queue_removal(&again, Some(&arm(7)), None), None);
+        let mut rearmed = again.clone();
+        rearmed.auto_merge = serde_json::from_value(
+            serde_json::json!({"enabledAt": "2026-11-27T00:00:00Z", "mergeMethod": "SQUASH"}),
+        )
+        .unwrap();
+        assert!(rearmed.auto_merge.is_some());
+        assert_eq!(queue_removal(&rearmed, Some(&arm(7)), out), None);
+        let mut merged = again;
+        merged.state = "MERGED".into();
+        assert_eq!(queue_removal(&merged, Some(&arm(7)), out), None);
     }
 }

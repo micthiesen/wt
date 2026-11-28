@@ -5,8 +5,9 @@ use serde_json::{Map, json};
 use tempfile::tempdir;
 
 use crate::{
-    CURRENT_WT_STATE_VERSION, MergeEdge, RemovedWorktree, RepositoryIdentity, SeenToggle, Store,
-    StoreError, TitleSource, TitleWrite, WorkStatusRecord, WtState, migrate_wt_state,
+    CURRENT_WT_STATE_VERSION, LayoutChanged, MergeEdge, RemovedWorktree, RepositoryIdentity,
+    SeenToggle, ShownSection, Store, StoreError, TitleSource, TitleWrite, WorkStatusRecord,
+    WtState, migrate_wt_state,
 };
 
 fn identity(id: &str, path: &str) -> RepositoryIdentity {
@@ -995,10 +996,12 @@ fn mixed_host_ordering_stays_in_controller_layout_and_preserves_unknown_fields()
     .unwrap();
     let remote = "@remote/server/one";
     store.write_repository_state_json(r#"{"slugs":{"local":{"order":1,"manualTitle":"Keep"}},"remoteLayouts":{"@remote/server/one":{"order":2,"future":42}}}"#).unwrap();
-    assert!(
+    let shown = ["local".to_owned(), remote.to_owned()];
+    assert_eq!(
         store
-            .swap_orders("local", remote, None, &["local".into(), remote.into()])
-            .unwrap()
+            .swap_shown_units(as_shown(None, &shown, &shown), "local", remote)
+            .unwrap(),
+        Ok(())
     );
     let state = store.read_wt_state().unwrap();
     assert!(state["slugs"].get(remote).is_none());
@@ -1012,6 +1015,407 @@ fn mixed_host_ordering_stays_in_controller_layout_and_preserves_unknown_fields()
     let state = store.read_wt_state().unwrap();
     assert_eq!(state["remoteLayouts"][remote]["section"], "Next");
     assert!(state["slugs"].get(remote).is_none());
+}
+
+/// The stored orders of `keys`, sorted as the board draws explicit orders.
+fn by_stored_order(store: &mut Store, keys: &[&str]) -> Vec<String> {
+    let state = store.read_wt_state().unwrap();
+    let mut placed: Vec<(f64, String)> = keys
+        .iter()
+        .map(|key| {
+            let collection = if key.starts_with("@remote/") {
+                "remoteLayouts"
+            } else {
+                "slugs"
+            };
+            (
+                state[collection][*key]["order"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("{key} has no stored order")),
+                (*key).to_owned(),
+            )
+        })
+        .collect();
+    placed.sort_by(|a, b| a.0.total_cmp(&b.0));
+    placed.into_iter().map(|(_, key)| key).collect()
+}
+
+fn keys(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_owned()).collect()
+}
+
+fn as_shown<'a>(
+    name: Option<&'a str>,
+    drawn: &'a [String],
+    ordered: &'a [String],
+) -> ShownSection<'a> {
+    ShownSection {
+        name,
+        drawn,
+        ordered,
+    }
+}
+
+#[test]
+fn a_swap_moves_exactly_the_pair_shown_and_refuses_a_layout_that_changed() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{
+                "a":{"section":"S","order":0},"b":{"section":"S","order":1},
+                "c":{"section":"S","order":2,"manualTitle":"Keep"},"d":{"section":"S","order":3}}}"#,
+        )
+        .unwrap();
+    let all = ["a", "b", "c", "d"];
+    let shown = keys(&all);
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "b")
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(by_stored_order(&mut store, &all), ["b", "a", "c", "d"]);
+    // Neighbours with orders of their own trade them; the rest is untouched.
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["slugs"]["c"]["order"], 2.0);
+    assert_eq!(state["slugs"]["d"]["order"], 3.0);
+    assert_eq!(state["slugs"]["c"]["manualTitle"], "Keep");
+
+    // The same press sent again from the layout it no longer describes (a
+    // host that has not re-read its own write) must not swap the pair back.
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "b")
+            .unwrap(),
+        Err(LayoutChanged::Order("a".into(), "b".into()))
+    );
+    assert_eq!(by_stored_order(&mut store, &all), ["b", "a", "c", "d"]);
+    // The next press carries what the first one left, and goes one further.
+    let shown = keys(&["b", "a", "c", "d"]);
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "c")
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(by_stored_order(&mut store, &all), ["b", "c", "a", "d"]);
+
+    // Another writer reorders the section: the witness no longer holds.
+    let theirs = keys(&["b", "c", "a", "d"]);
+    store
+        .swap_shown_units(as_shown(Some("S"), &theirs, &theirs), "d", "a")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &theirs, &theirs), "a", "d")
+            .unwrap(),
+        Err(LayoutChanged::Order("a".into(), "d".into()))
+    );
+    // Or files one of its rows elsewhere.
+    store
+        .move_worktrees_to_section(&["c".to_owned()], Some("T"))
+        .unwrap();
+    let shown = keys(&["b", "c", "d", "a"]);
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "d", "a")
+            .unwrap(),
+        Err(LayoutChanged::Filed("c".into()))
+    );
+    assert_eq!(
+        by_stored_order(&mut store, &["b", "d", "a"]),
+        ["b", "d", "a"]
+    );
+}
+
+#[test]
+fn the_first_reorder_stores_the_order_drawn_including_creation_anchors() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    // Manual sort draws: the never-ordered rows first, then the ordered
+    // ones, with a new row behind the row it was created after.
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{
+                "top":{"section":"S","order":null,"creationAfter":null},
+                "x":{"section":"S"},
+                "y":{"section":"S","order":5},
+                "new":{"section":"S","order":null,"creationAfter":"y"},
+                "z":{"section":"S","order":6},
+                "landed":{"section":"S","order":5.5}}}"#,
+        )
+        .unwrap();
+    let all = ["top", "x", "y", "new", "z"];
+    let shown = keys(&all);
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &shown, &shown), "x", "y")
+            .unwrap(),
+        Ok(())
+    );
+    // Every unit has an order now, so the anchor no longer places "new":
+    // it stays where it was drawn.
+    assert_eq!(
+        by_stored_order(&mut store, &all),
+        ["top", "y", "x", "new", "z"]
+    );
+    // A row filed here and drawn elsewhere stays between the two it was
+    // stored between, although the caller was not shown it.
+    assert_eq!(
+        by_stored_order(&mut store, &["y", "landed", "z"]),
+        ["y", "landed", "z"]
+    );
+    // So does one filed after the caller looked.
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{
+                "a":{"section":"S"},"b":{"section":"S"},
+                "x":{"section":"S","order":7},"since":{"section":"S","order":8}}}"#,
+        )
+        .unwrap();
+    let shown = keys(&["a", "b", "x"]);
+    store
+        .swap_shown_units(as_shown(Some("S"), &shown, &shown), "a", "b")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        by_stored_order(&mut store, &["b", "a", "x", "since"]),
+        ["b", "a", "x", "since"]
+    );
+
+    // Under status sort the two can have units of another status between
+    // them in manual order. The moved unit takes the other's place and the
+    // rest keep their order; only the units of one status are compared.
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{
+                "p":{"section":"S","order":1},"other":{"section":"S","order":2},
+                "q":{"section":"S","order":3},"late":{"section":"S","order":0}}}"#,
+        )
+        .unwrap();
+    let drawn = keys(&["p", "q", "other", "late"]);
+    let status = keys(&["p", "q"]);
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &drawn, &status), "p", "q")
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        by_stored_order(&mut store, &["late", "p", "other", "q"]),
+        ["late", "other", "q", "p"]
+    );
+    // Manual sort draws by stored order alone, so there the whole list is
+    // the witness and this one was never the stored order.
+    assert_eq!(
+        store
+            .swap_shown_units(as_shown(Some("S"), &drawn, &drawn), "p", "q")
+            .unwrap(),
+        Err(LayoutChanged::Order("p".into(), "q".into()))
+    );
+}
+
+#[test]
+fn a_unit_crosses_to_the_edge_of_the_section_shown_or_is_refused() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let remote = "@remote/server/one";
+    store
+        .write_repository_state_json(
+            r#"{"sectionsOrder":["S","T","Empty"],
+                "slugs":{
+                "root":{"section":"S","order":0},"child":{"section":"S","order":1},
+                "c":{"section":"T"},"d":{"section":"T","order":3}},
+                "remoteLayouts":{"@remote/server/one":{"section":"S","order":2,"future":42}}}"#,
+        )
+        .unwrap();
+    fn section<'a>(name: &'a str, drawn: &'a [String]) -> ShownSection<'a> {
+        as_shown(Some(name), drawn, drawn)
+    }
+    let unit = keys(&["root", "child"]);
+    let (here, there) = (&keys(&["root", remote]), &keys(&["c", "d"]));
+    // "c" was never ordered and is drawn first, so the top is before it.
+    assert_eq!(
+        store
+            .move_shown_unit(&unit, "root", section("S", here), section("T", there), true)
+            .unwrap(),
+        Ok(unit.clone())
+    );
+    assert_eq!(
+        by_stored_order(&mut store, &["root", "c", "d"]),
+        ["root", "c", "d"]
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["slugs"]["child"]["section"], "T");
+
+    // Back up: the bottom of S, behind the remote row filed there.
+    let (back, rest) = (&keys(&["root", "c", "d"]), &keys(&[remote]));
+    assert_eq!(
+        store
+            .move_shown_unit(&unit, "root", section("T", back), section("S", rest), false)
+            .unwrap(),
+        Ok(unit.clone())
+    );
+    let state = store.read_wt_state().unwrap();
+    assert!(
+        state["slugs"]["root"]["order"].as_f64().unwrap()
+            > state["remoteLayouts"][remote]["order"].as_f64().unwrap()
+    );
+    assert_eq!(state["remoteLayouts"][remote]["future"], 42);
+    assert!(state["slugs"].get(remote).is_none());
+
+    // Refused: the row left the section it was shown in, the destination
+    // is gone, or either section is not laid out as shown.
+    let before = store.read_wt_state().unwrap();
+    let none: &[String] = &[];
+    let leaving = &keys(&[remote, "root"]);
+    assert_eq!(
+        store
+            .move_shown_unit(
+                &unit,
+                "root",
+                section("T", none),
+                section("Empty", none),
+                true
+            )
+            .unwrap(),
+        Err(LayoutChanged::Filed("root".into()))
+    );
+    assert_eq!(
+        store
+            .move_shown_unit(
+                &unit,
+                "root",
+                section("S", leaving),
+                section("Gone", none),
+                true
+            )
+            .unwrap(),
+        Err(LayoutChanged::Section("Gone".into()))
+    );
+    assert_eq!(
+        store
+            .move_shown_unit(
+                &unit,
+                "root",
+                section("S", here),
+                section("Empty", none),
+                true
+            )
+            .unwrap(),
+        Err(LayoutChanged::Order("root".into(), remote.into()))
+    );
+    store
+        .swap_shown_units(section("T", there), "c", "d")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .move_shown_unit(
+                &unit,
+                "root",
+                section("S", leaving),
+                section("T", there),
+                true
+            )
+            .unwrap(),
+        Err(LayoutChanged::Order("c".into(), "d".into()))
+    );
+    assert_eq!(
+        store.read_wt_state().unwrap()["slugs"]["root"],
+        before["slugs"]["root"]
+    );
+    // An empty named section takes the unit, and the Inbox is `None`.
+    assert!(
+        store
+            .move_shown_unit(
+                &unit,
+                "root",
+                section("S", leaving),
+                section("Empty", none),
+                true
+            )
+            .unwrap()
+            .is_ok()
+    );
+    let last = keys(&["d"]);
+    let inbox = ShownSection {
+        name: None,
+        drawn: none,
+        ordered: none,
+    };
+    assert!(
+        store
+            .move_shown_unit(&last, "d", section("T", none), inbox, false)
+            .unwrap()
+            .is_ok()
+    );
+    let state = store.read_wt_state().unwrap();
+    assert_eq!(state["slugs"]["root"]["section"], "Empty");
+    assert!(state["slugs"]["d"]["section"].is_null());
+}
+
+#[test]
+fn a_section_moves_past_the_one_shown_or_is_refused() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store
+        .write_repository_state_json(r#"{"sectionsOrder":["One","Two","Three"]}"#)
+        .unwrap();
+    let order = |store: &mut Store| -> Vec<String> {
+        store.read_wt_state().unwrap()["sectionsOrder"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|name| name.as_str())
+            .filter(|name| !name.starts_with('\0'))
+            .map(str::to_owned)
+            .collect()
+    };
+    let shown = keys(&["One", "Two", "Three"]);
+    assert_eq!(
+        store.move_group_past("One", "Two", false, &shown).unwrap(),
+        Ok(true)
+    );
+    assert_eq!(order(&mut store), ["Two", "One", "Three"]);
+    // The same press from the order it no longer describes.
+    assert_eq!(
+        store.move_group_past("One", "Two", false, &shown).unwrap(),
+        Err(LayoutChanged::Order("One".into(), "Two".into()))
+    );
+    let shown = keys(&["Two", "One", "Three"]);
+    assert_eq!(
+        store
+            .move_group_past("One", "Three", false, &shown)
+            .unwrap(),
+        Ok(true)
+    );
+    assert_eq!(order(&mut store), ["Two", "Three", "One"]);
+    store.remove_section("Three").unwrap();
+    let shown = keys(&["Two", "Three", "One"]);
+    assert_eq!(
+        store.move_group_past("One", "Three", true, &shown).unwrap(),
+        Err(LayoutChanged::Section("Three".into()))
+    );
+    assert_eq!(order(&mut store), ["Two", "One"]);
 }
 
 #[test]

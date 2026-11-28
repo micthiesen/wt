@@ -907,6 +907,7 @@ impl LifecycleService {
                 command: self.config.install_command.clone(),
                 shell: self.config.shell.clone(),
             }),
+            install_lock_dir: Some(self.config.lock_dir.clone()),
         }
     }
 
@@ -1571,17 +1572,17 @@ impl LifecycleService {
                 // Forcing is a decision to remove whatever is in the way. A
                 // teardown hook that can no longer succeed for this checkout
                 // would otherwise keep it forever.
-                Err(error) if options.force => warnings.push(format!(
-                    "the dev server's stop_command failed and the worktree was removed anyway; \
+                // Only the hook itself: with the session still running or
+                // the port unread, the server may be alive in the checkout.
+                Err(error) if options.force && dev_stop_hook_failed(&error) => {
+                    warnings.push(format!(
+                        "the dev server's stop_command failed and the worktree was removed anyway; \
                      whatever that hook cleans up (containers, databases, ports) may be left \
                      behind: {}",
-                    dev_stop_failure(&error)
-                )),
-                Err(
-                    error @ LifecycleError::Dev(wt_dev::DevServerError::StopCommandFailed {
-                        ..
-                    }),
-                ) => {
+                        dev_stop_failure(&error)
+                    ))
+                }
+                Err(error) if dev_stop_hook_failed(&error) => {
                     return Err(LifecycleError::Refused(format!(
                         "the dev server's stop_command failed, so nothing was removed: {}; \
                          fix the hook, or remove the worktree anyway with `wt rm {slug} --force`",
@@ -2474,6 +2475,21 @@ impl LifecycleService {
                 {
                     return Err(error);
                 }
+                // The clone copies the main clone's installed packages, so
+                // the main clone's own install is held off for the copy: a
+                // tree a package manager is writing would be copied half
+                // done. Taken under the slug lock and released before
+                // anything else is locked; the install takes it holding
+                // neither the slug lock nor the fetch lock, so the order
+                // slug, then this, has no way back.
+                let packages = self
+                    .repository
+                    .lock_main_dependency_sync(cancellation)
+                    .await
+                    .map_err(|error| match error {
+                        wt_vcs::RepositoryError::Cancelled => LifecycleError::Cancelled,
+                        error => error.into(),
+                    })?;
                 let mut output = self.run_rift_create(main, path, slug, cancellation).await?;
                 if !output.status.success()
                     && is_stale_rift_registry_error(&output.stderr, &output.stdout)
@@ -2482,6 +2498,7 @@ impl LifecycleService {
                     self.run_rift_gc(main, cancellation).await?;
                     output = self.run_rift_create(main, path, slug, cancellation).await?;
                 }
+                drop(packages);
                 output
                     .checked("rift")
                     .map_err(|source| process_error("create Rift clone", main, source))?;
@@ -4647,12 +4664,28 @@ fn git_spec(cwd: &Path, args: Vec<OsString>) -> CommandSpec {
     spec
 }
 
+/// Whether stopping the dev server failed in the project's `stop_command`
+/// itself, after wt had ended the server's session: the hook exited with an
+/// error, or ran past its time limit. A hook that hangs keeps a worktree as
+/// surely as one that fails. Every other stop error (the session could not
+/// be ended, the port record could not be read) is wt not knowing whether
+/// the server still runs, which `--force` does not decide.
+fn dev_stop_hook_failed(error: &LifecycleError) -> bool {
+    matches!(
+        error,
+        LifecycleError::Dev(
+            wt_dev::DevServerError::StopCommandFailed { .. }
+                | wt_dev::DevServerError::Process(ProcessError::Timeout { .. })
+        )
+    )
+}
+
 /// What a failed dev-server stop said, cut to the hook's last lines: its
 /// output can be a whole teardown log, and the end is where it failed.
 fn dev_stop_failure(error: &LifecycleError) -> String {
     let LifecycleError::Dev(wt_dev::DevServerError::StopCommandFailed { output, .. }) = error
     else {
-        return error.to_string();
+        return format!("it did not finish ({error})");
     };
     let lines: Vec<&str> = output
         .lines()
@@ -10451,5 +10484,117 @@ mod tests {
             .unwrap();
         assert!(removed.removed && locked.load(std::sync::atomic::Ordering::SeqCst));
         drop(quarantined);
+    }
+
+    /// `--force` gets past the project's stop hook and nothing else: any
+    /// other failure to stop the server leaves it possibly running in the
+    /// checkout that would be deleted under it.
+    #[test]
+    fn only_the_stop_hooks_own_failure_is_forced_past() {
+        let dev = LifecycleError::Dev;
+        assert!(dev_stop_hook_failed(&dev(
+            wt_dev::DevServerError::StopCommandFailed {
+                slug: "one".into(),
+                output: "volume is gone".into(),
+            }
+        )));
+        assert!(dev_stop_hook_failed(&dev(wt_dev::DevServerError::Process(
+            ProcessError::Timeout {
+                program: "sh".into(),
+                timeout: Duration::from_secs(300),
+            }
+        ))));
+        for other in [
+            dev(wt_dev::DevServerError::Io {
+                path: "/dev-dir/one.port".into(),
+                source: io::Error::other("unreadable"),
+            }),
+            dev(wt_dev::DevServerError::Process(ProcessError::Io {
+                program: "sh".into(),
+                operation: "spawn",
+                source: io::Error::other("no shell"),
+            })),
+            dev(wt_dev::DevServerError::Cancelled),
+            LifecycleError::Refused("something else".into()),
+        ] {
+            assert!(!dev_stop_hook_failed(&other), "{other}");
+        }
+    }
+
+    /// A Rift clone takes the main clone's `node_modules` as it finds them,
+    /// so the main clone's dependency install must not be running then.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rift_clone_is_copied_with_the_main_clones_install_held_off() {
+        let (scratch, mut service, _runner, main, root) = setup().await;
+        let rift = scratch.path().join("fake-rift");
+        let (copying, finish) = (
+            scratch.path().join("copying"),
+            scratch.path().join("finish"),
+        );
+        // Stands in for the copy: says it began, then waits to be let go.
+        write_executable(
+            &rift,
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = create ] || exit 0\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\necho 'fixture copy refused' >&2\nexit 1\n",
+                copying.display(),
+                finish.display()
+            ),
+        )
+        .await;
+        fs::create_dir_all(main.join(".rift")).await.unwrap();
+        service.config.backend = BackendKind::Rift;
+        service.config.rift_binary = rift.into_os_string();
+        let cancellation = CancellationToken::new();
+        let creating = tokio::spawn({
+            let (service, cancellation) = (service.clone(), cancellation.clone());
+            async move {
+                service
+                    .create(
+                        "michael/ENG-90-rift",
+                        CreateOptions {
+                            base: Some("refs/heads/main".into()),
+                            fetch_origin: false,
+                            run_install: false,
+                        },
+                        &cancellation,
+                    )
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !copying.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the clone began copying");
+        // What the main clone's install would wait on.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                service.repository.lock_main_dependency_sync(&cancellation),
+            )
+            .await
+            .is_err(),
+            "the main clone's install could start while the clone copies its packages"
+        );
+        fs::write(&finish, "").await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(20), creating)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        // Released with the copy, whatever became of the creation.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.repository.lock_main_dependency_sync(&cancellation),
+        )
+        .await
+        .expect("the install lock is free once the copy has ended")
+        .unwrap();
+        assert!(!root.join("ENG-90-rift").exists());
     }
 }

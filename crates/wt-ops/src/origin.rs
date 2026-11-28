@@ -34,6 +34,7 @@ pub fn options(ctx: &AppContext) -> FetchOriginOptions {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "bash".into()),
         }),
+        install_lock_dir: Some(ctx.config.paths.lock_dir.clone()),
     }
 }
 

@@ -23,6 +23,15 @@ semantics before startup. `wt dev reset [slug]` stops the server, runs
 `reset_command`, and starts again. If `stop_command` fails, reset stops before
 running `reset_command`, because external state may still be active.
 
+Removing a worktree stops its dev server and runs `stop_command`, even when
+the server is recorded stopped, since the hook also releases what a crashed
+server left behind. If the hook fails, a removal without `--force` is refused
+with the hook's last lines and nothing is removed; `wt clean` and the TUI
+cleanup keep the row and show that reason. `wt rm <slug> --force` removes the
+worktree anyway and warns that whatever the hook cleans up (containers,
+databases, ports) may be left behind. A failing `[lifecycle] destroy_command`
+is a warning in both cases.
+
 `wt dev status [slug]` reports running, starting, crashed, port, URL, queue
 position, restart attempts, and whether the recorded start commit is no longer
 an ancestor of the worktree head. For a running server this explicit command

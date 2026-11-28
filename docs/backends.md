@@ -21,8 +21,13 @@ such as `.codex/config.toml`, without excluding `node_modules` or other paths
 when a glob explicitly matches them. Wildcards retain their existing ability to
 span directories; broad patterns still require a broad scan. Copies never
 overwrite files already present in the new checkout or follow directory symlinks.
-Creation logs time the whole transaction, origin maintenance, backend creation,
+Creation logs time the whole transaction, the origin fetch, backend creation,
 checkout, configured copies, and foreground dependency installation separately.
+The fetch and ref maintenance are one phase
+(`fetch-origin-including-maintenance`) when maintenance runs before the
+checkout, which is always the case under Rift. Otherwise the fetch is
+`fetch-origin`, and maintenance runs after the checkout in a detached
+`wt _maintain-origin` process that logs its own duration under `wt::origin`.
 
 ## Why rift
 
@@ -180,7 +185,8 @@ and it drives the rest of the design:
   finishes first; after the check it stops the checkout's `git fsmonitor--daemon`
   when one is listening. The verified directory is then renamed to a
   `.wt-removing-<slug>-…` sibling (inventory ignores these) and deleted with
-  `rm -rf` at utility QoS. Only a pure `Directory not empty` failure, meaning
+  `rm -rf` at utility QoS, at most two deletions at a time for one lock
+  directory. Only a pure `Directory not empty` failure, meaning
   something created entries mid-deletion, is retried, a bounded number of
   times. If the quarantine still cannot be deleted, the removal still
   succeeds and is recorded, and a warning in the job log and attention feed

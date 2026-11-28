@@ -155,7 +155,13 @@ impl Family for RowChange {
                     .is_some_and(|record| record.state == *state)
             }),
             Self::Title { title } => row.is_none_or(|row| &row.title == title),
-            Self::Base { base } => row.is_none_or(|row| &row.base_branch == base),
+            // The host records a cleared base as the trunk, and both mean
+            // no parent: compared as written, a cleared base never showed.
+            Self::Base { base } => row.is_none_or(|row| {
+                let trunk = board.display.trunk.as_str();
+                wt_core::recorded_fork_base(row.base_branch.as_deref(), trunk)
+                    == wt_core::recorded_fork_base(base.as_deref(), trunk)
+            }),
             Self::Issue { issue_id } => row.is_none_or(|row| &row.issue_id == issue_id),
             Self::Automations { paused } => match target.key {
                 Some(_) => row.is_none_or(|row| row.automations_paused == *paused),

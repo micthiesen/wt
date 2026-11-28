@@ -146,8 +146,8 @@ Merge when, on the current head: the bot is `clean` and not stale, checks
 are not failing, no open threads, not `conflicting`, and none of these holds:
 
 - `blockedOn` is set. `wt status --unblock` only if the gate is satisfied;
-  otherwise say why you stopped. Re-asserting `ready` without `--blocked-on`
-  clears the gate, so check it first.
+  otherwise say why you stopped. A status change keeps the gate: only
+  `--unblock`, its `--until` watch, `verified` or `dropped` clears it.
 - Your stack parent (`.base` is another live worktree's branch) has not
   landed. If the order looks wrong, `wt manager send`.
 - You cannot honestly claim `low` or `medium` risk. Verify it, or hand the
@@ -200,7 +200,10 @@ step 2. Woken after the merge, close it: `wt done <id> -m "merged"`.
 
 When `wt wait` says `evicted`, or the PR is open and not draft but has no
 `.merge_queue` entry and `.pr.auto_merge` is false, or its queue entry reads
-`UNMERGEABLE`, it was evicted. Find out why before acting: the failed queue
+`UNMERGEABLE`, it was evicted. Find out why before acting. `wt wait` prints
+GitHub's reason on the `evicted` line when GitHub gave one (`removed from the
+merge queue: <reason>`), and `wt fleet --json` carries it as
+`.queue_removal`. Then read the failed queue
 run (`gh pr checks`, then its log), a conflict, or a new requirement. Fix it
 through the normal loop (findings, push, review), then `wt merge` again.
 Never re-arm unchanged after a real failure; it fails the same way. A flaky

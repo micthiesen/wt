@@ -143,25 +143,24 @@ pub enum UiAction {
         action_key: String,
         run_id: String,
     },
+    /// Open a palette. Built from the board for every surface.
     PrepareActions {
         surface: ActionSurface,
     },
-    /// Background: have the owning host publish the palette for `surface`
-    /// onto the board, so the next open needs no round trip. Carries no
-    /// feedback and is never a preparation.
-    WarmPalette {
-        surface: ActionSurface,
-    },
-    PrepareAction {
-        surface: ActionSurface,
-        id: String,
-        arg: Option<String>,
+    /// The row palette's dev-server log: live terminal output only the
+    /// owning host can read.
+    PrepareDevLogs {
+        key: String,
     },
     RunAction {
         surface: ActionSurface,
         id: String,
         arg: Option<String>,
         extras: String,
+        /// What the palette showed for the surface's row. A commit without
+        /// one (an internal send) asserts nothing about the view.
+        #[serde(default)]
+        seen: Option<Seen<crate::ActionSeen>>,
     },
     FoldSection {
         key: String,
@@ -178,10 +177,14 @@ pub enum UiAction {
         #[serde(default)]
         seen: Option<Seen<Option<String>>>,
     },
+    /// J or K: move the row's unit, or the section when `key` is `None`,
+    /// one place. `step` is the move resolved against the board the person
+    /// saw; the host stores exactly that, or refuses it as stale.
     Reorder {
         key: Option<String>,
         section: String,
         down: bool,
+        step: crate::ReorderStep,
     },
     RenameSection {
         old: String,
@@ -386,18 +389,6 @@ pub enum ActionSurface {
     Row { key: String },
     Manager { key: Option<String> },
     Slot { target: SessionTarget },
-}
-
-impl ActionSurface {
-    /// The [`crate::Board::palettes`] key for this surface. The prefix names
-    /// the variant, so keys of different kinds never collide.
-    pub fn menu_key(&self) -> String {
-        match self {
-            Self::Row { key } => format!("row:{key}"),
-            Self::Manager { key } => format!("manager:{}", key.as_deref().unwrap_or_default()),
-            Self::Slot { target } => format!("slot:{target:?}"),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,6 +623,8 @@ pub enum PickerAction {
     ActionArg {
         surface: ActionSurface,
         id: String,
+        #[serde(default)]
+        seen: Option<Seen<crate::ActionSeen>>,
     },
     Status {
         key: String,
@@ -669,11 +662,15 @@ pub enum TextAction {
     ActionArg {
         surface: ActionSurface,
         id: String,
+        #[serde(default)]
+        seen: Option<Seen<crate::ActionSeen>>,
     },
     ActionExtras {
         surface: ActionSurface,
         id: String,
         arg: Option<String>,
+        #[serde(default)]
+        seen: Option<Seen<crate::ActionSeen>>,
     },
     Create {
         placement: Option<CreatePlacement>,

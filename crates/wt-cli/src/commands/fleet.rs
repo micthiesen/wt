@@ -181,6 +181,9 @@ pub(super) struct PrSnapshot {
     age_ms: u64,
     /// Branches shown from a newer read than the snapshot's, with its age.
     newer: BTreeMap<String, u64>,
+    /// Those of them whose read held the whole merge queue: for these, no
+    /// entry means not queued. The snapshot itself never says.
+    queue_read: BTreeSet<String>,
     /// Why data older than the board would use was shown.
     pub(super) held: Option<String>,
 }
@@ -199,6 +202,7 @@ pub(super) async fn pull_requests(
         let mut snapshot = PrSnapshot {
             age_ms: shown.age_ms,
             newer: BTreeMap::new(),
+            queue_read: BTreeSet::new(),
             held: shown.note(),
         };
         let mut data = shown.read.data;
@@ -214,6 +218,9 @@ pub(super) async fn pull_requests(
                 None => now.saturating_sub(shown.age_ms),
             };
             for branch in overlay_newer(&mut data, branches, daemon_ms, &read, started_ms, now) {
+                if read.merge_queue_complete {
+                    snapshot.queue_read.insert(branch.clone());
+                }
                 snapshot
                     .newer
                     .insert(branch, now.saturating_sub(started_ms));
@@ -294,9 +301,14 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
     .await;
     let landings = super::landing::read_with(ctx, &records, &state, fetched.as_ref().ok()).await;
     let separate_production = ctx.config.branch.separate_production();
-    let (prs, queue, pr_note) = match fetched {
-        Ok(data) => (Some(data.prs), Some(data.merge_queue), None),
-        Err(error) => (None, None, Some(error.to_string())),
+    let (prs, queue, queue_complete, pr_note) = match fetched {
+        Ok(data) => (
+            Some(data.prs),
+            Some(data.merge_queue),
+            data.merge_queue_complete,
+            None,
+        ),
+        Err(error) => (None, None, false, Some(error.to_string())),
     };
     let (live_sessions, session_note) = match sessions {
         Ok(sessions) => (
@@ -441,16 +453,16 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
         let arm = worktree_state.and_then(|record| {
             serde_json::from_value::<wt_core::MergeArm>(record["mergeArm"].clone()).ok()
         });
-        let queue_removal = pr
-            .filter(|pr| pr.state == "OPEN" && pr_queue.is_none())
-            .filter(|pr| wt_sources::wait_facts::queue_removal(pr, arm.as_ref()).is_some())
-            .and_then(|pr| pr.queue_removal.as_ref())
-            .map(|removal| {
-                json!({
-                    "reason":wt_core::sanitize_terminal_text(removal.reason.trim()),
-                    "at":i64::try_from(removal.at_ms).ok().and_then(format_timestamp_ms),
-                })
-            });
+        let branch = &row.worktree.target.branch;
+        let queue_read = queue_complete
+            || pr_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.queue_read.contains(branch));
+        let queued = pr_queue
+            .as_ref()
+            .map(|_| true)
+            .or(queue_read.then_some(false));
+        let queue_removal = pr.and_then(|pr| queue_removal_json(pr, arm.as_ref(), queued));
         let owed = super::owed::derive(
             &state,
             &slug,
@@ -676,6 +688,21 @@ fn overlay_newer(
     replaced
 }
 
+/// The row's `queue_removal`, under the rule `wt wait` reports an eviction's
+/// reason by.
+fn queue_removal_json(
+    pr: &wt_github::PullRequest,
+    arm: Option<&wt_core::MergeArm>,
+    queued: Option<bool>,
+) -> Option<Value> {
+    wt_sources::wait_facts::queue_removal(pr, arm, queued)?;
+    let removal = pr.queue_removal.as_ref()?;
+    Some(json!({
+        "reason":wt_core::sanitize_terminal_text(removal.reason.trim()),
+        "at":i64::try_from(removal.at_ms).ok().and_then(format_timestamp_ms),
+    }))
+}
+
 fn queue_json(entry: &MergeQueueEntry) -> Value {
     serde_json::to_value(entry).unwrap_or(Value::Null)
 }
@@ -731,6 +758,38 @@ fn process_is_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removal_is_shown_only_while_nothing_holds_the_merge() {
+        let pr = |auto_merge: Value| -> wt_github::PullRequest {
+            serde_json::from_value(json!({
+                "number": 7, "url": "https://example.invalid/pull/7",
+                "headRefName": "b", "baseRefName": "main", "mergeCommitOid": null,
+                "title": "T", "isDraft": false, "state": "OPEN",
+                "checks": "pass", "failedChecks": [], "review": "none",
+                "reviewRequests": 0, "requestedReviewers": [], "suggestedReviewers": [],
+                "comments": [], "unresolvedThreads": 0, "unresolvedThreadsTotal": 0,
+                "autoMerge": auto_merge,
+                "queueRemoval": {"reason": "merge_conflict", "atMs": 2_000},
+            }))
+            .unwrap()
+        };
+        let arm: wt_core::MergeArm =
+            serde_json::from_value(json!({"pr": 7, "armedAtMs": 1_000, "mechanism": "queue"}))
+                .unwrap();
+        let evicted = pr(Value::Null);
+        assert_eq!(
+            queue_removal_json(&evicted, Some(&arm), Some(false)).unwrap()["reason"],
+            "merge_conflict"
+        );
+        // No entry in a read that held part of the queue proves nothing.
+        assert_eq!(queue_removal_json(&evicted, Some(&arm), None), None);
+        assert_eq!(queue_removal_json(&evicted, Some(&arm), Some(true)), None);
+        // A person armed it again on GitHub: wt has no newer arm record,
+        // and the removal is still the pull request's latest.
+        let rearmed = pr(json!({"enabledAt": "2026-11-27T00:00:00Z", "mergeMethod": "SQUASH"}));
+        assert_eq!(queue_removal_json(&rearmed, Some(&arm), Some(false)), None);
+    }
 
     #[test]
     fn a_row_dropped_from_the_merge_queue_says_why() {

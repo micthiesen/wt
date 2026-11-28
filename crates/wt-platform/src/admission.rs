@@ -211,6 +211,20 @@ impl Admission {
         self.fleet_scans.get()
     }
 
+    /// A permit only if the budget admits `class` now and nobody of that
+    /// class is queued ahead.
+    pub(crate) fn try_acquire(self: &Arc<Self>, class: ProcessClass) -> Option<Permit> {
+        let mut state = self.lock();
+        if !state.waiting[class.index()].is_empty() || !self.budget.admits(class, &state.active) {
+            return None;
+        }
+        state.active[class.index()] += 1;
+        Some(Permit {
+            admission: Arc::clone(self),
+            class,
+        })
+    }
+
     pub(crate) async fn acquire(self: &Arc<Self>, class: ProcessClass) -> Permit {
         let (grant, granted) = oneshot::channel();
         let id = {
@@ -421,6 +435,20 @@ mod tests {
             held = poll(&mut next).expect("the higher class is served before the bound");
         }
         assert_eq!(served_at, Some(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_immediate_permit_never_jumps_its_own_class_queue() {
+        let admission = Admission::new(ProcessBudget::flat(NonZeroUsize::new(1).unwrap()));
+        let held = admission.try_acquire(Bulk).expect("a free budget admits");
+        assert!(admission.try_acquire(Bulk).is_none());
+        let mut queued = request(&admission, Bulk);
+        assert!(poll(&mut queued).is_none());
+        drop(held);
+        assert!(admission.try_acquire(Bulk).is_none());
+        let permit = poll(&mut queued).expect("the queued waiter got the slot");
+        drop(permit);
+        assert_eq!(admission.active(), [0; 4]);
     }
 
     #[tokio::test(start_paused = true)]

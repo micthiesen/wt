@@ -279,16 +279,20 @@ impl Model {
                                     (!name.is_empty()).then(|| name.to_owned());
                                 UiAction::SelectSession { selection }
                             }
-                            TextAction::ActionArg { surface, id } => UiAction::PrepareAction {
-                                surface: surface.clone(),
-                                id: id.clone(),
-                                arg: Some(text),
-                            },
-                            TextAction::ActionExtras { surface, id, arg } => UiAction::RunAction {
+                            TextAction::ActionArg { surface, id, seen } => {
+                                return self.action_arg(surface, id, seen.clone(), text);
+                            }
+                            TextAction::ActionExtras {
+                                surface,
+                                id,
+                                arg,
+                                seen,
+                            } => UiAction::RunAction {
                                 surface: surface.clone(),
                                 id: id.clone(),
                                 arg: arg.clone(),
                                 extras: text,
+                                seen: seen.clone(),
                             },
                             TextAction::Create { placement } => UiAction::Create {
                                 placement: placement.clone(),
@@ -528,6 +532,7 @@ impl Model {
                     || code == KeyCode::Char('q')
                     || (control && code == KeyCode::Char('c'))
                 {
+                    self.palette_closed();
                     return InputResult::Draw;
                 }
                 let direct = match code {
@@ -687,18 +692,15 @@ impl Model {
                         host: option.value,
                         action: action.clone(),
                     }),
-                    PickerAction::ActionArg { surface, id } => {
+                    PickerAction::ActionArg { surface, id, seen } => {
                         if let Some(value) = option.value {
-                            InputResult::Action(UiAction::PrepareAction {
-                                surface: surface.clone(),
-                                id: id.clone(),
-                                arg: Some(value),
-                            })
+                            self.action_arg(surface, id, seen.clone(), value)
                         } else {
                             self.interaction = Interaction::Text(TextPrompt {
                                 action: TextAction::ActionArg {
                                     surface: surface.clone(),
                                     id: id.clone(),
+                                    seen: seen.clone(),
                                 },
                                 prompt: picker.title.clone(),
                                 editor: LineEditor::new(""),
@@ -708,11 +710,12 @@ impl Model {
                         }
                     }
                     PickerAction::Actions { surface } => {
-                        InputResult::Action(UiAction::PrepareAction {
-                            surface: surface.clone(),
-                            id: option.value.unwrap_or_default(),
-                            arg: None,
-                        })
+                        let pick = self.pick_action(surface, option.value.as_deref());
+                        if pick.keep_open {
+                            self.interaction = interaction;
+                            self.mark_palette_wait();
+                        }
+                        pick.result
                     }
                     PickerAction::Section { key, seen } => {
                         // "+ new section" opens the name prompt here; the row

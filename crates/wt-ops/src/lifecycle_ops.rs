@@ -62,6 +62,18 @@ pub fn service(ctx: &AppContext) -> Result<LifecycleService> {
 /// Name of the hidden command that runs the ref maintenance a creation owes.
 pub const MAINTENANCE_WORKER_COMMAND: &str = "_maintain-origin";
 
+/// The wt executable this process is, once it has said so.
+static WORKER_EXECUTABLE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Called once by the wt binary at startup: this process's own executable
+/// accepts [`MAINTENANCE_WORKER_COMMAND`], so maintenance may be handed to a
+/// copy of it. A process that never calls this runs maintenance inline.
+pub fn register_worker_executable() {
+    if let Ok(executable) = std::env::current_exe() {
+        let _ = WORKER_EXECUTABLE.set(executable);
+    }
+}
+
 /// Let creations return at their checkout: the maintenance they owe (local
 /// base branches, the main clone's checkout and dependencies) runs in a
 /// process of its own, which neither the creation's caller going away nor
@@ -70,18 +82,20 @@ pub const MAINTENANCE_WORKER_COMMAND: &str = "_maintain-origin";
 /// neither may be cut short. Workers queue on the repository's fetch lock,
 /// and one with nothing left to do ends after a few ref reads.
 pub fn with_detached_maintenance(ctx: &AppContext, service: LifecycleService) -> LifecycleService {
-    // A test binary is not wt: it has no such command to run.
-    if cfg!(test) {
+    // Only a wt binary has the worker command, and only it says so
+    // ([`register_worker_executable`]). Anything else linking this crate (a
+    // test harness, an embedding tool) keeps the maintenance inline.
+    let Some(executable) = WORKER_EXECUTABLE.get().cloned() else {
         return service;
-    }
+    };
     let (main_clone, home, repository_config) = (
         ctx.config.paths.main_clone.clone(),
         ctx.home.clone(),
         ctx.config.repository_config.clone(),
     );
     service.with_deferred_maintenance(move || {
-        let started = std::env::current_exe().and_then(|executable| {
-            let mut command = std::process::Command::new(executable);
+        let started = {
+            let mut command = std::process::Command::new(&executable);
             command
                 .arg(MAINTENANCE_WORKER_COMMAND)
                 .current_dir(&main_clone)
@@ -98,7 +112,7 @@ pub fn with_detached_maintenance(ctx: &AppContext, service: LifecycleService) ->
                 command.process_group(0);
             }
             command.spawn()
-        });
+        };
         match started {
             // Reaped here when it ends; it outlives this process otherwise.
             Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
@@ -1375,14 +1389,18 @@ where
             .map(|(index, row)| async move {
                 let expected = &selections[index];
                 let slug = row.target.slug().to_owned();
+                // The error keeps its type: a start that cannot say whether
+                // its worker is running must not read as a row that was kept.
                 let started = match plan(row).await {
-                    Err(error) => Err(format!("{error:#}")),
+                    Err(error) => Err(error),
                     Ok(plan) if !expected.matches_revision(&plan.revision) => {
-                        Err("checkout changed after confirmation".to_owned())
+                        Err(anyhow::anyhow!("checkout changed after confirmation"))
                     }
-                    Ok(plan) if !plan.hazards.is_empty() => Err(plan.hazards.join(", ")),
-                    Ok(plan) if !plan.landed => Err("landing no longer proven".to_owned()),
-                    Ok(plan) => start(plan).await.map_err(|error| format!("{error:#}")),
+                    Ok(plan) if !plan.hazards.is_empty() => {
+                        Err(anyhow::anyhow!("{}", plan.hazards.join(", ")))
+                    }
+                    Ok(plan) if !plan.landed => Err(anyhow::anyhow!("landing no longer proven")),
+                    Ok(plan) => start(plan).await,
                 };
                 (index, slug, started)
             })
@@ -1399,7 +1417,12 @@ where
                     let finished = wait(job).await;
                     (index, slug, finished)
                 }),
-                Err(reason) => kept[index] = Some(format!("{slug}: {reason}")),
+                Err(error) => {
+                    uncertain |= error
+                        .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                        .is_some();
+                    kept[index] = Some(format!("{slug}: {error:#}"));
+                }
             },
             Some((index, slug, finished)) = finishing.next() => match finished {
                 Ok(()) => removed += 1,
@@ -2622,6 +2645,56 @@ mod tests {
             }),
             "{:?}",
             forced.warnings
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// A start that timed out waiting for its worker to take the worktree
+    /// does not know whether that worker will still remove the row. The
+    /// cleanup must say so, not report the row as kept.
+    #[tokio::test]
+    async fn a_start_that_cannot_tell_makes_the_whole_cleanup_uncertain() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let template = row_one(&fixture.ctx).await;
+        let live: Vec<WorktreeRecord> = ["a", "b"]
+            .iter()
+            .map(|slug| fake_row(&template, slug))
+            .collect();
+        let confirmed: Vec<wt_tui::CleanupTarget> = live
+            .iter()
+            .map(|row| wt_tui::CleanupTarget {
+                key: wt_core::worktree_target_key(&row.target),
+                path: row.target.path.clone(),
+                branch: row.target.branch.clone(),
+                head: row.head_sha.clone().unwrap(),
+            })
+            .collect();
+        let selections: Vec<_> = confirmed.iter().map(CleanupSelection::Target).collect();
+        let (rows, kept) = select_rows(live, &selections);
+        let error = run_cleanup(
+            &selections,
+            rows,
+            kept,
+            |row| async move { Ok(fake_plan(row)) },
+            |plan| async move {
+                if plan.row.target.slug() == "b" {
+                    return Err(crate::commands::_destroy::RemovalUncertain(
+                        "removal job did not report holding the worktree".into(),
+                    )
+                    .into());
+                }
+                Ok("job-a".to_owned())
+            },
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        let uncertain = error
+            .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+            .expect("the cleanup reports that it cannot tell");
+        assert_eq!(
+            uncertain.0,
+            "Removed 1; unresolved: b: removal job did not report holding the worktree"
         );
         fixture.close().await.unwrap();
     }

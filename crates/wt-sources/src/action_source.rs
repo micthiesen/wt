@@ -75,6 +75,148 @@ fn restack_conflict(meta: &wt_actions::ActionMeta) -> bool {
         && meta.exit_code == Some(wt_ops::restack_action::CONFLICT_EXIT)
 }
 
+/// The oldest GitHub read an action that needs a pull request may rely on.
+/// The host holds its GitHub writes to the same bound, so a palette built
+/// from the board offers what a commit will accept.
+pub const PR_EVIDENCE_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// How often the checkouts are probed again for a deployed stage when an
+/// action requires one: a deploy made outside wt writes files nothing here
+/// watches.
+const DEPLOY_BACKSTOP: Duration = Duration::from_secs(60);
+
+/// What the palettes need that is read from the checkouts and the action
+/// history file rather than from run records.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CheckoutFacts {
+    /// Keys of the rows with a stage deployed from their checkout.
+    deployed: BTreeSet<String>,
+    recent_args: BTreeMap<String, Vec<wt_tui::ArgValue>>,
+    slots_blocked: BTreeMap<String, String>,
+}
+
+/// Why a slot's checkout can't run anything, short enough for a palette
+/// row. `None` for an available slot and for a target that is not a slot.
+pub fn slot_unavailable(
+    config: &wt_config::Config,
+    target: wt_tui::SessionTarget,
+) -> Option<String> {
+    let paths = &config.paths;
+    let (path, missing) = match target {
+        wt_tui::SessionTarget::WtSource => match &paths.wt_source {
+            None => return Some("paths.wt_source not set".into()),
+            Some(path) => (path, "wt source checkout missing"),
+        },
+        wt_tui::SessionTarget::Dotfiles => (&paths.dotfiles, "dotfiles checkout missing"),
+        wt_tui::SessionTarget::Main | wt_tui::SessionTarget::Manager => {
+            (&paths.main_clone, "main clone missing")
+        }
+        _ => return None,
+    };
+    (!path.is_dir()).then(|| missing.into())
+}
+
+/// The palette's reading of the facts a dispatch checks requirements
+/// against. The host derives its commit check from the same function.
+pub fn action_facts(row: &wt_actions::ActionRow) -> wt_tui::ActionFacts {
+    wt_tui::ActionFacts {
+        pr: match &row.pr {
+            wt_actions::ActionPrObservation::Unknown => wt_tui::PrFact::Unknown,
+            wt_actions::ActionPrObservation::ConfirmedAbsent => wt_tui::PrFact::Absent,
+            wt_actions::ActionPrObservation::Present(pr) => wt_tui::PrFact::Present {
+                open: pr.state == "OPEN",
+                draft: pr.is_draft,
+            },
+        },
+        deployed: row.deployed,
+        tracker_id: wt_actions::evaluate_requirements(&[wt_config::RequireTag::IssueTracker], row)
+            .is_none(),
+        active_run: None,
+    }
+}
+
+/// The action slot a run holds.
+fn action_slot(meta: &wt_actions::ActionMeta) -> &str {
+    if meta.action_key.is_empty() {
+        &meta.slug
+    } else {
+        &meta.action_key
+    }
+}
+
+async fn checkout_facts(
+    config: Arc<wt_config::Config>,
+    git: &LeafHandle<Vec<wt_vcs::WorktreeSnapshot>>,
+    arg_actions: &[String],
+    probe_deployments: bool,
+) -> anyhow::Result<CheckoutFacts> {
+    // A restored listing may name checkouts that are gone or reused.
+    let checkouts = git
+        .confirmed()
+        .filter(|_| probe_deployments)
+        .map(|inventory| {
+            inventory
+                .iter()
+                .filter(|snapshot| {
+                    !snapshot.worktree.is_main
+                        && !wt_core::is_remote_worktree_target(&snapshot.worktree.target)
+                })
+                .map(|snapshot| {
+                    (
+                        wt_core::worktree_target_key(&snapshot.worktree.target),
+                        PathBuf::from(&snapshot.worktree.target.path),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let probed = config.clone();
+    let (deployed, slots_blocked) = tokio::task::spawn_blocking(move || {
+        let deployed = checkouts
+            .into_iter()
+            .filter(|(_, path)| wt_ops::action_dispatch::stage_deployed(path, &probed.stage.prefix))
+            .map(|(key, _)| key)
+            .collect();
+        let slots_blocked = [
+            wt_tui::SessionTarget::WtSource,
+            wt_tui::SessionTarget::Main,
+            wt_tui::SessionTarget::Manager,
+            wt_tui::SessionTarget::Dotfiles,
+        ]
+        .into_iter()
+        .filter_map(|target| {
+            Some((
+                wt_tui::slot_name(target).to_owned(),
+                slot_unavailable(&probed, target)?,
+            ))
+        })
+        .collect();
+        (deployed, slots_blocked)
+    })
+    .await?;
+    let history = config.paths.cache_root.join("action-history.json");
+    let mut recent_args = BTreeMap::new();
+    for id in arg_actions {
+        let values = wt_actions::recent_values(&history, id)
+            .await
+            .into_iter()
+            .map(|entry| wt_tui::ArgValue {
+                shown: wt_core::sanitize_terminal_text(&entry.value),
+                label: entry.label.as_deref().map(wt_core::sanitize_terminal_text),
+                value: entry.value,
+            })
+            .collect::<Vec<_>>();
+        if !values.is_empty() {
+            recent_args.insert(id.clone(), values);
+        }
+    }
+    Ok(CheckoutFacts {
+        deployed,
+        recent_args,
+        slots_blocked,
+    })
+}
+
 /// Sources an action's declared effects refresh on completion. The issue
 /// statuses leaf also settles issue-status expectations, so it must be the
 /// confirmable leaf, not a display view.
@@ -132,6 +274,7 @@ pub fn overlay(
     scope: &TaskScope,
     context: &AppContext,
     board: SourceHandle<Board>,
+    metadata: SourceHandle<crate::local_source::Metadata>,
     targets: RefreshTargets,
 ) -> SourceHandle<Board> {
     let service = wt_app_core::actions::service(context).map_err(|error| error.to_string());
@@ -209,7 +352,71 @@ pub fn overlay(
         .filter(|action| action.retry_on_failure)
         .map(|action| action.id.clone())
         .collect();
-    project(scope, board, runs.view(), logs.view(), targets, retrying)
+    let config = context.config.clone();
+    let definitions = [
+        wt_tui::ActionSurface::Row { key: String::new() },
+        wt_tui::ActionSurface::Manager { key: None },
+        wt_tui::ActionSurface::Slot {
+            target: wt_tui::SessionTarget::Main,
+        },
+    ]
+    .iter()
+    .flat_map(|surface| wt_app_core::action_builtins::definitions(&config, surface))
+    .collect::<Vec<_>>();
+    let arg_actions = definitions
+        .iter()
+        .filter(|definition| definition.arg_prompt.is_some())
+        .map(|definition| definition.id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let probe_deployments = definitions.iter().any(|definition| {
+        definition
+            .requires
+            .contains(&wt_config::RequireTag::Deployed)
+    });
+    let facts_config = config.clone();
+    let facts_git = targets.git.clone();
+    let checkouts = start_source(
+        scope,
+        SourceSpec {
+            name: "action-facts",
+            domain: Domain::Actions,
+            persistence: Persistence::Never("checkout and history files are the source"),
+            policy: RefreshPolicy {
+                debounce: Duration::from_millis(50),
+                minimum_interval: Duration::from_secs(1),
+            },
+        },
+        move |_| {
+            let config = facts_config.clone();
+            let git = facts_git.clone();
+            let arg_actions = arg_actions.clone();
+            async move { checkout_facts(config, &git, &arg_actions, probe_deployments).await }
+        },
+    );
+    project(
+        scope,
+        board,
+        runs.view(),
+        logs.view(),
+        targets,
+        retrying,
+        Palettes {
+            config,
+            metadata,
+            checkouts: checkouts.view(),
+            probe_deployments,
+        },
+    )
+}
+
+/// What the board's palette facts are prepared from, beside the runs.
+struct Palettes {
+    config: Arc<wt_config::Config>,
+    metadata: SourceHandle<crate::local_source::Metadata>,
+    checkouts: SourceHandle<CheckoutFacts>,
+    probe_deployments: bool,
 }
 
 fn watch(
@@ -452,6 +659,7 @@ fn project(
     logs: SourceHandle<ActionLogs>,
     targets: RefreshTargets,
     retrying: BTreeSet<String>,
+    palettes: Palettes,
 ) -> SourceHandle<Board> {
     let (output, mut publisher) = derived_channel(scope, "action-board");
     let cancel = scope.token();
@@ -460,7 +668,14 @@ fn project(
         let mut updates = runs.subscribe();
         let mut log_updates = logs.subscribe();
         let mut statuses = targets.issues.subscribe();
+        let mut metadata = palettes.metadata.subscribe();
+        let mut checkouts = palettes.checkouts.subscribe();
+        let mut github = targets.github.subscribe();
+        let mut worktrees = targets.git.subscribe();
         boards.mark_changed(); updates.mark_changed(); log_updates.mark_changed(); statuses.mark_changed();
+        palettes.checkouts.refresh();
+        let mut deploy_backstop = tokio::time::interval(DEPLOY_BACKSTOP);
+        deploy_backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tracker = Tracker::new(epoch_ms());
         tracker.retrying = retrying;
         let mut failures = wt_app_core::feeds::FailureClock::default();
@@ -475,12 +690,20 @@ fn project(
         loop {
             let next_expiry = tracker.next_expiry();
             let awaiting = tracker.awaiting_confirmation();
+            // A GitHub read ages out of what a PR-dependent action may rely
+            // on; the facts are prepared again at that moment.
+            let evidence_expiry = targets
+                .github
+                .confirmed()
+                .and_then(|github| github.age())
+                .and_then(|age| PR_EVIDENCE_AGE.checked_sub(age))
+                .map(|left| tokio::time::Instant::now() + left + Duration::from_millis(1));
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
                 request = publisher.requested() => {
                     if request.is_none() { break; }
-                    board.refresh(); runs.refresh(); logs.refresh(); continue;
+                    board.refresh(); runs.refresh(); logs.refresh(); palettes.checkouts.refresh(); continue;
                 }
                 changed = boards.changed() => {
                     if changed.is_err() { break; }
@@ -499,7 +722,35 @@ fn project(
                             tracing::info!(slug = run.meta.slug, action = run.meta.action_name, status = ?run.meta.status, "action completed");
                         }
                     }
+                    // A start records its argument and a run can deploy.
+                    palettes.checkouts.refresh();
                 }
+                changed = metadata.changed() => {
+                    if changed.is_err() { break; }
+                    metadata.borrow_and_update();
+                }
+                changed = checkouts.changed() => {
+                    if changed.is_err() { break; }
+                    checkouts.borrow_and_update();
+                }
+                changed = github.changed() => {
+                    if changed.is_err() { break; }
+                    github.borrow_and_update();
+                }
+                changed = worktrees.changed() => {
+                    if changed.is_err() { break; }
+                    worktrees.borrow_and_update();
+                    palettes.checkouts.refresh();
+                    continue;
+                }
+                _ = deploy_backstop.tick(), if palettes.probe_deployments => {
+                    palettes.checkouts.refresh();
+                    continue;
+                }
+                _ = async { match evidence_expiry {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }} => {}
                 changed = log_updates.changed() => {
                     if changed.is_err() { break; }
                     log_updates.borrow_and_update();
@@ -519,12 +770,23 @@ fn project(
             let now = tokio::time::Instant::now();
             tracker.renew_running(now);
             tracker.settle(targets.issues.confirmed().as_ref(), now);
+            let github = targets
+                .github
+                .confirmed()
+                .filter(|github| github.fresh_within(PR_EVIDENCE_AGE));
+            let stored = metadata.borrow().clone();
             let next = compose(
                 boards.borrow().clone(),
                 updates.borrow().clone(),
                 log_updates.borrow().clone(),
                 &tracker,
                 &mut failures,
+                Some(PaletteInputs {
+                    config: &palettes.config,
+                    state: stored.data().map(|metadata| &metadata.0),
+                    github: github.as_ref(),
+                    checkouts: checkouts.borrow().clone(),
+                }),
             );
             publisher.publish_if_changed(next);
         }
@@ -818,6 +1080,7 @@ fn compose(
     logs: SourceSnapshot<ActionLogs>,
     tracker: &Tracker,
     failures: &mut wt_app_core::feeds::FailureClock,
+    palettes: Option<PaletteInputs<'_>>,
 ) -> SourceSnapshot<Board> {
     let Some(data) = board.data() else {
         // This compose reports nothing, so every tracked failure has cleared.
@@ -940,10 +1203,82 @@ fn compose(
     data.attention.extend(tracker.attention.iter().cloned());
     wt_app_core::feeds::bound_feeds(&mut data);
     data.pending_views.extend(tracker.pending.views());
-    board
+    let checkouts = palettes.map(|palettes| {
+        palette_facts(&mut data, runs.data().map(Arc::as_ref), &palettes);
+        palettes.checkouts
+    });
+    let board = board
         .with_data(Some(Arc::new(data)))
         .with_input(&runs)
-        .with_input(&logs)
+        .with_input(&logs);
+    match checkouts {
+        Some(checkouts) => board.with_input(&checkouts),
+        None => board,
+    }
+}
+
+/// What the palette facts are prepared from on one pass.
+struct PaletteInputs<'a> {
+    config: &'a wt_config::Config,
+    /// The stored worktree state, for each row's issue id.
+    state: Option<&'a serde_json::Value>,
+    /// A live GitHub read no older than [`PR_EVIDENCE_AGE`].
+    github: Option<&'a Confirmed<wt_github::GithubData>>,
+    checkouts: SourceSnapshot<CheckoutFacts>,
+}
+
+/// Publish what the palettes are built from: each local row's facts as a
+/// dispatch would resolve them now, and the host's active runs, recent
+/// argument values and unavailable slots.
+fn palette_facts(data: &mut Board, history: Option<&ActionHistory>, inputs: &PaletteInputs<'_>) {
+    let mut runs = BTreeMap::new();
+    for run in history.into_iter().flat_map(|history| &history.runs) {
+        if matches!(
+            run.meta.status,
+            ActionRunStatus::Running | ActionRunStatus::Ambiguous
+        ) {
+            // Newest first: the first run of a slot is the one to stop.
+            runs.entry(action_slot(&run.meta).to_owned())
+                .or_insert_with(|| wt_tui::ActiveRunView {
+                    action_key: action_slot(&run.meta).to_owned(),
+                    run_id: run.meta.run_id.clone(),
+                    action_name: wt_core::sanitize_terminal_text(&run.meta.action_name),
+                });
+        }
+    }
+    let facts = inputs.checkouts.data();
+    let slugs = inputs.state.and_then(|state| state.get("slugs"));
+    for row in &mut data.rows {
+        // Another host's rows carry the facts that host prepared.
+        if wt_core::is_remote_worktree_ledger_key(&row.key) {
+            continue;
+        }
+        let (pr, observation) =
+            wt_ops::action_dispatch::pr_observation(inputs.github, Some(row.branch.as_str()));
+        let action_row = wt_ops::action_dispatch::action_row(
+            inputs.config,
+            &row.slug,
+            slugs.and_then(|slugs| slugs.get(&row.slug)),
+            row.issue_id.clone(),
+            observation,
+            pr.map(|pr| pr.number.to_string()),
+            facts.is_some_and(|facts| facts.deployed.contains(&row.key)),
+        );
+        row.action_facts = wt_tui::ActionFacts {
+            // A local row's key is its slug, which is also its action slot.
+            active_run: runs.get(&row.key).cloned(),
+            ..action_facts(&action_row)
+        };
+    }
+    data.actions = wt_tui::ActionState {
+        recent_args: facts
+            .map(|facts| facts.recent_args.clone())
+            .unwrap_or_default(),
+        runs,
+        slots_blocked: facts
+            .map(|facts| facts.slots_blocked.clone())
+            .unwrap_or_default(),
+    };
 }
 
 fn epoch_ms() -> u64 {
@@ -975,6 +1310,265 @@ mod tests {
             "meta": {"version":1,"slug":"row","runId":id,"kind":"shell","actionId":"move","actionName":"Move issue","prompt":"","affects":["issue"],"startedAt":started,"status":status,"issueStatus":{"issueId":"ENG-1","status":"Review"}},
             "runDir":"/tmp/unused","command":[],"cwd":"/tmp/unused"
         })).unwrap()
+    }
+
+    /// An isolated configuration with the code-owned actions only.
+    fn config() -> (tempfile::TempDir, wt_config::Config) {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("user.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[paths]\nmain_clone = {:?}\nworktree_root = {:?}\nstate_db = {:?}\ncache_db = {:?}\n[branch]\nprefix = \"fixture\"\n",
+                root.path().join("main").to_string_lossy(),
+                root.path().join("worktrees").to_string_lossy(),
+                root.path().join("state.sqlite").to_string_lossy(),
+                root.path().join("cache.sqlite").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        let options = wt_config::LoadOptions::new(
+            root.path(),
+            root.path(),
+            [(
+                "WT_CONFIG".into(),
+                config_path.to_string_lossy().into_owned(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let config = wt_config::Config::load(&options).unwrap();
+        (root, config)
+    }
+
+    #[test]
+    fn the_display_policy_carries_the_catalog_the_palettes_list() {
+        let (_root, mut config) = config();
+        config.actions = vec![wt_config::ActionDef {
+            id: "deploy".into(),
+            name: "Deploy".into(),
+            kind: wt_config::ActionKind::Shell,
+            shell: Some("deploy {{arg}}".into()),
+            group: Some("stage".into()),
+            key: Some("p".into()),
+            requires: vec![wt_config::RequireTag::Pr, wt_config::RequireTag::Deployed],
+            arg_prompt: Some(wt_config::ActionArgPrompt {
+                label: "Stage".into(),
+            }),
+            ..Default::default()
+        }];
+        config.ui.action_groups_last = vec!["stage".into()];
+        let catalog = crate::inventory::display_policy(&config).actions;
+        let row = wt_tui::ActionSurface::Row { key: String::new() };
+        assert_eq!(
+            catalog.entry(&row, "deploy"),
+            Some(&wt_tui::ActionEntry {
+                id: "deploy".into(),
+                name: "Deploy".into(),
+                group: Some("stage".into()),
+                key: Some("p".into()),
+                shell: true,
+                target: wt_tui::ActionDelivery::Headless,
+                requires: vec![
+                    wt_tui::ActionRequirement::Pr,
+                    wt_tui::ActionRequirement::Deployed
+                ],
+                arg_prompt: Some("Stage".into()),
+                direct: false,
+                fleet: false,
+            })
+        );
+        assert_eq!(
+            catalog
+                .entry(&row, "agent-continue")
+                .map(|entry| entry.target),
+            Some(wt_tui::ActionDelivery::Session)
+        );
+        // Every surface ends with its freeform prompt, as the host lists them.
+        for entries in [&catalog.row, &catalog.manager, &catalog.slot] {
+            assert_eq!(
+                entries.last().map(|entry| entry.id.as_str()),
+                Some(wt_tui::CUSTOM_ACTION_ID)
+            );
+        }
+        let manager = wt_tui::ActionSurface::Manager { key: None };
+        assert!(catalog.entry(&manager, "manager-digest").unwrap().fleet);
+        assert!(!catalog.entry(&manager, "manager-ask-row").unwrap().fleet);
+        assert!(catalog.entry(&manager, "manager-compact").unwrap().direct);
+        // A shell action for a row is not a manager command.
+        assert!(catalog.entry(&manager, "deploy").is_none());
+        assert_eq!(catalog.groups_last, ["stage"]);
+        assert!(!catalog.dev_server);
+    }
+
+    fn running(id: &str, slug: &str, started: u64) -> ActionRun {
+        serde_json::from_value(serde_json::json!({
+            "meta": {"version":1,"slug":slug,"runId":id,"kind":"shell","actionId":"lint","actionName":"Lint\u{1b}[31m","prompt":"","affects":[],"startedAt":started,"status":"running"},
+            "runDir":"/tmp/unused","command":[],"cwd":"/tmp/unused"
+        })).unwrap()
+    }
+
+    /// The facts a palette is built from are the ones a dispatch would
+    /// resolve: the confirmed GitHub read, the stored issue id, the probed
+    /// checkout and the active run of each row's own action slot.
+    #[test]
+    fn palette_facts_are_what_a_dispatch_would_resolve_for_each_row() {
+        let row = |key: &str, branch: &str| wt_tui::BoardRow {
+            key: key.into(),
+            slug: key.into(),
+            branch: branch.into(),
+            issue_id: wt_app_core::issue_identity::resolve(key, None),
+            ..Default::default()
+        };
+        let remote_key = wt_core::remote_worktree_ledger_key("studio", "far");
+        let prepared_elsewhere = wt_tui::ActionFacts {
+            deployed: true,
+            ..Default::default()
+        };
+        let board = Board {
+            rows: vec![
+                row("eng-12-one", "feature/one"),
+                row("eng-13-two", "feature/two"),
+                wt_tui::BoardRow {
+                    action_facts: prepared_elsewhere.clone(),
+                    ..row(&remote_key, "feature/far")
+                },
+            ],
+            ..Board::default()
+        };
+        let mut github = wt_github::GithubData::default();
+        github.covered_branches.insert("feature/one".into());
+        let mut pr = crate::github_actions::tests::pr("feature/one");
+        pr.is_draft = true;
+        github.prs.insert("feature/one".into(), pr);
+        let github = Confirmed::for_test(github);
+        // An explicit clear is a stored empty id: the slug's id no longer counts.
+        let state = serde_json::json!({"slugs": {"eng-13-two": {"issueId": ""}}});
+        let (_root, config) = config();
+        let checkouts = CheckoutFacts {
+            deployed: BTreeSet::from(["eng-13-two".to_owned()]),
+            recent_args: BTreeMap::from([(
+                "deploy".to_owned(),
+                vec![wt_tui::ArgValue {
+                    value: "staging".into(),
+                    shown: "staging".into(),
+                    label: None,
+                }],
+            )]),
+            slots_blocked: BTreeMap::from([(
+                "wt".to_owned(),
+                "paths.wt_source not set".to_owned(),
+            )]),
+        };
+        let compose_with = |palettes| {
+            compose(
+                SourceSnapshot::test_live(Some(board.clone()), SourceState::Ready, Domain::Git),
+                SourceSnapshot::test_live(
+                    Some(ActionHistory {
+                        // Newest first, as the service lists them.
+                        runs: vec![
+                            running("run-3", "main", 30),
+                            running("run-2", "eng-12-one", 20),
+                            running("run-1", "eng-12-one", 10),
+                        ],
+                    }),
+                    SourceState::Ready,
+                    Domain::Actions,
+                ),
+                SourceSnapshot::default(),
+                &Tracker::new(0),
+                &mut wt_app_core::feeds::FailureClock::default(),
+                palettes,
+            )
+        };
+        let output = compose_with(Some(PaletteInputs {
+            config: &config,
+            state: Some(&state),
+            github: Some(&github),
+            checkouts: SourceSnapshot::test_live(
+                Some(checkouts),
+                SourceState::Ready,
+                Domain::Actions,
+            ),
+        }));
+        let data = output.data().unwrap();
+        let active = |slot: &str, id: &str| wt_tui::ActiveRunView {
+            action_key: slot.into(),
+            run_id: id.into(),
+            // Run names come from files; the terminal never sees their controls.
+            action_name: wt_core::sanitize_terminal_text("Lint\u{1b}[31m"),
+        };
+        assert_eq!(
+            data.rows[0].action_facts,
+            wt_tui::ActionFacts {
+                pr: wt_tui::PrFact::Present {
+                    open: true,
+                    draft: true,
+                },
+                deployed: false,
+                tracker_id: true,
+                active_run: Some(active("eng-12-one", "run-2")),
+            }
+        );
+        assert_eq!(
+            data.rows[1].action_facts,
+            wt_tui::ActionFacts {
+                // The read did not cover this branch: unknown, not "no PR".
+                pr: wt_tui::PrFact::Unknown,
+                deployed: true,
+                tracker_id: false,
+                active_run: None,
+            }
+        );
+        // Another host's row keeps what that host prepared.
+        assert_eq!(data.rows[2].action_facts, prepared_elsewhere);
+        assert_eq!(
+            data.actions.runs,
+            BTreeMap::from([
+                ("eng-12-one".to_owned(), active("eng-12-one", "run-2")),
+                ("main".to_owned(), active("main", "run-3")),
+            ])
+        );
+        assert_eq!(data.actions.recent_args["deploy"][0].value, "staging");
+        assert_eq!(data.actions.slots_blocked["wt"], "paths.wt_source not set");
+
+        // Without a live GitHub read nothing is known about any branch.
+        let unread = compose_with(Some(PaletteInputs {
+            config: &config,
+            state: None,
+            github: None,
+            checkouts: SourceSnapshot::default(),
+        }));
+        let data = unread.data().unwrap();
+        assert_eq!(data.rows[0].action_facts.pr, wt_tui::PrFact::Unknown);
+        assert!(data.rows[1].action_facts.tracker_id, "no stored clear");
+        assert!(data.actions.recent_args.is_empty());
+    }
+
+    #[test]
+    fn a_missing_slot_checkout_is_named_for_its_palette() {
+        let (root, mut config) = config();
+        config.paths.main_clone = root.path().join("main");
+        config.paths.dotfiles = root.path().join("dotfiles");
+        config.paths.wt_source = None;
+        std::fs::create_dir_all(&config.paths.main_clone).unwrap();
+        let reason = |target| slot_unavailable(&config, target);
+        assert_eq!(
+            reason(wt_tui::SessionTarget::WtSource).as_deref(),
+            Some("paths.wt_source not set")
+        );
+        assert_eq!(
+            reason(wt_tui::SessionTarget::Dotfiles).as_deref(),
+            Some("dotfiles checkout missing")
+        );
+        assert_eq!(reason(wt_tui::SessionTarget::Main), None);
+        assert_eq!(reason(wt_tui::SessionTarget::Manager), None);
+        assert_eq!(reason(wt_tui::SessionTarget::Harness), None);
+        config.paths.wt_source = Some(root.path().join("gone"));
+        assert_eq!(
+            slot_unavailable(&config, wt_tui::SessionTarget::WtSource).as_deref(),
+            Some("wt source checkout missing")
+        );
     }
 
     #[test]
@@ -1171,6 +1765,7 @@ mod tests {
                 SourceSnapshot::default(),
                 &Tracker::new(0),
                 &mut wt_app_core::feeds::FailureClock::default(),
+                None,
             );
             let data = output.data().unwrap();
             (data.rows[0].installing, data.rows[1].installing)
@@ -1261,6 +1856,7 @@ mod tests {
                 ),
                 &Tracker::new(0),
                 &mut wt_app_core::feeds::FailureClock::default(),
+                None,
             );
             let row = &output.data().unwrap().rows[0];
             (row.installing, row.install_queued)
@@ -1302,6 +1898,7 @@ mod tests {
             SourceSnapshot::default(),
             &tracker,
             &mut wt_app_core::feeds::FailureClock::default(),
+            None,
         );
         let data = output.data().unwrap();
         assert_eq!(data.rows[0].issue_status.as_deref(), Some("Review"));

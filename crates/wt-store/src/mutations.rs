@@ -229,6 +229,17 @@ impl Store {
             entry.insert("jobId".into(), json!(job_id));
             entry.insert("path".into(), json!(path));
             entry.insert("branch".into(), json!(branch));
+            // A retry of a failed attempt keeps where the board drew the row
+            // before the first one. That attempt archived the row itself, so
+            // the archive set no longer says where it was, and a row drawn
+            // as landed stays there whatever this attempt can prove.
+            let retried = entry.contains_key("jobId");
+            let was_archived = if retried {
+                entry.get("wasArchived") == Some(&json!(true))
+            } else {
+                was_archived
+            };
+            let landed = landed || (retried && entry.get("landed") == Some(&json!(true)));
             entry.insert("error".into(), Value::Null);
             for (name, set) in [("landed", landed), ("wasArchived", was_archived)] {
                 if set {
@@ -444,22 +455,7 @@ impl Store {
             if let Some(section) = section {
                 ensure_section(state, section);
             }
-            let section_matches = |value: &Value| {
-                value.get("section").and_then(Value::as_str) == section
-                    || (section.is_none() && value.get("section").is_some_and(Value::is_null))
-            };
-            let orders = all_layouts(state)
-                .filter(|layout| section_matches(layout))
-                .filter_map(|layout| layout.get("order").and_then(Value::as_f64));
-            let order = if at_top {
-                orders
-                    .fold(None, |min, n| Some(min.map_or(n, |m: f64| m.min(n))))
-                    .map_or(0.0, |min| min - 1.0)
-            } else {
-                orders
-                    .fold(None, |max, n| Some(max.map_or(n, |m: f64| m.max(n))))
-                    .map_or(0.0, |max| max + 1.0)
-            };
+            let order = edge_order(state, section, at_top);
             let collection = if slug.starts_with("@remote/") {
                 "remoteLayouts"
             } else {
@@ -768,101 +764,145 @@ impl Store {
         })
     }
 
-    pub fn swap_orders(
+    /// Exchange two units of a section whose layout the caller was shown.
+    /// The layout is compared with the stored one inside the write's own
+    /// transaction, so a unit filed elsewhere, or two stored the other way
+    /// round, refuses and nothing is written.
+    pub fn swap_shown_units(
         &mut self,
-        slug_a: &str,
-        slug_b: &str,
-        section: Option<&str>,
-        bucket_display: &[String],
-    ) -> Result<bool, StoreError> {
+        shown: ShownSection<'_>,
+        unit: &str,
+        past: &str,
+    ) -> Result<Result<(), LayoutChanged>, StoreError> {
         self.mutate_wt_state(|state| {
-            if slug_a == slug_b
-                || !bucket_display.iter().any(|key| key == slug_a)
-                || !bucket_display.iter().any(|key| key == slug_b)
+            if let Err(changed) = check_shown(state, &shown) {
+                return Ok((Err(changed), false));
+            }
+            let sequence = manual_sequence(state, shown.drawn);
+            let at =
+                |sequence: &[String], key: &str| sequence.iter().position(|placed| placed == key);
+            let (Some(unit_at), Some(past_at)) = (at(&sequence, unit), at(&sequence, past)) else {
+                return Ok((Err(LayoutChanged::Filed(unit.to_owned())), false));
+            };
+            if unit_at == past_at {
+                return Ok((Ok(()), false));
+            }
+            let orders: Vec<Option<f64>> = shown
+                .drawn
+                .iter()
+                .map(|key| stored_order(state, key))
+                .collect();
+            if let (Some(unit_order), Some(past_order)) =
+                (stored_order(state, unit), stored_order(state, past))
+                && unit_at.abs_diff(past_at) == 1
+                && distinct(&orders)
             {
-                return Ok((false, false));
-            }
-            let baseline = all_layouts(state)
-                .filter(|layout| layout.get("section").and_then(Value::as_str) == section)
-                .filter_map(|layout| layout.get("order").and_then(Value::as_f64))
-                .reduce(f64::min)
-                .unwrap_or(0.0);
-            for (index, slug) in bucket_display.iter().enumerate() {
-                let collection = if slug.starts_with("@remote/") {
-                    "remoteLayouts"
-                } else {
-                    "slugs"
-                };
-                let slugs = object_mut(state, collection);
-                let mut entry = slugs
-                    .get(slug)
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
-                entry.insert(
-                    "section".to_owned(),
-                    section.map_or(Value::Null, |s| json!(s)),
-                );
-                entry.insert("order".to_owned(), number(baseline + index as f64));
-                slugs.insert(slug.clone(), Value::Object(entry));
-            }
-            let collection_a = if slug_a.starts_with("@remote/") {
-                "remoteLayouts"
+                // Neighbours with stored orders of their own trade them, and
+                // no other row is rewritten.
+                set_layout_order(state, unit, past_order);
+                set_layout_order(state, past, unit_order);
             } else {
-                "slugs"
-            };
-            let collection_b = if slug_b.starts_with("@remote/") {
-                "remoteLayouts"
-            } else {
-                "slugs"
-            };
-            let Some(a_order) = state[collection_a]
-                .get(slug_a)
-                .and_then(|entry| entry.get("order"))
-                .cloned()
-            else {
-                return Ok((false, false));
-            };
-            let Some(b_order) = state[collection_b]
-                .get(slug_b)
-                .and_then(|entry| entry.get("order"))
-                .cloned()
-            else {
-                return Ok((false, false));
-            };
-            if let Some(entry) = state[collection_a]
-                .get_mut(slug_a)
-                .and_then(Value::as_object_mut)
-            {
-                entry.insert("order".to_owned(), b_order);
+                // Under status sort, units of another status can sit between
+                // the two in manual order. Only the unit that was moved
+                // changes its place among them: it takes the other's index.
+                let mut sequence = with_unlisted(state, shown.name, sequence);
+                if let (Some(unit_at), Some(past_at)) = (at(&sequence, unit), at(&sequence, past)) {
+                    let moved = sequence.remove(unit_at);
+                    sequence.insert(past_at, moved);
+                }
+                write_sequence(state, shown.name, &sequence);
             }
-            if let Some(entry) = state[collection_b]
-                .get_mut(slug_b)
-                .and_then(Value::as_object_mut)
-            {
-                entry.insert("order".to_owned(), a_order);
-            }
-            Ok((true, true))
+            Ok((Ok(()), true))
         })
     }
 
+    /// Move a unit out of the section it was shown in, to the top or the
+    /// bottom of the next one, as one write. `rows` are the unit's rows and
+    /// `unit` the one that carries its position. Refused, with nothing
+    /// written, when either section is not laid out as shown, when a row is
+    /// no longer filed in `from`, or when `to` is a named section that is
+    /// gone.
+    pub fn move_shown_unit(
+        &mut self,
+        rows: &[String],
+        unit: &str,
+        from: ShownSection<'_>,
+        to: ShownSection<'_>,
+        at_top: bool,
+    ) -> Result<Result<Vec<String>, LayoutChanged>, StoreError> {
+        self.mutate_wt_state(|state| {
+            if let Some(row) = rows
+                .iter()
+                .find(|row| stored_section(state, row) != from.name)
+            {
+                return Ok((Err(LayoutChanged::Filed(row.clone())), false));
+            }
+            if let Some(name) = to.name
+                && !sections_order(state).iter().any(|stored| stored == name)
+            {
+                return Ok((Err(LayoutChanged::Section(name.to_owned())), false));
+            }
+            if let Err(changed) = check_shown(state, &from).and_then(|()| check_shown(state, &to)) {
+                return Ok((Err(changed), false));
+            }
+            let orders: Vec<Option<f64>> = to
+                .drawn
+                .iter()
+                .map(|key| stored_order(state, key))
+                .collect();
+            // Read before the rows arrive, so they are not taken for rows
+            // already filed there.
+            let mut sequence = with_unlisted(state, to.name, manual_sequence(state, to.drawn));
+            sequence.retain(|placed| placed != unit);
+            let moved = move_to_section(state, rows, to.name);
+            if distinct(&orders) {
+                let order = edge_order(state, to.name, at_top);
+                set_layout_order(state, unit, order);
+            } else {
+                // A unit never ordered is drawn before every ordered one, so
+                // an order past the stored ones would not be the edge.
+                if at_top {
+                    sequence.insert(0, unit.to_owned());
+                } else {
+                    sequence.push(unit.to_owned());
+                }
+                write_sequence(state, to.name, &sequence);
+            }
+            Ok((Ok(moved), true))
+        })
+    }
+
+    /// Move a section past another one. `shown` is the sections that can
+    /// move, in the order the caller was shown them; one that is gone, or
+    /// two stored the other way round, refuses and nothing is written.
     pub fn move_group_past(
         &mut self,
         key: &str,
         past_key: &str,
         before: bool,
-        visual_order: &[String],
-    ) -> Result<bool, StoreError> {
+        shown: &[String],
+    ) -> Result<Result<bool, LayoutChanged>, StoreError> {
         self.mutate_wt_state(|state| {
-            if key == past_key {
-                return Ok((false, false));
+            let current = sections_order(state);
+            let mut last: Option<(usize, &String)> = None;
+            for name in shown {
+                let Some(at) = current.iter().position(|stored| stored == name) else {
+                    return Ok((Err(LayoutChanged::Section(name.clone())), false));
+                };
+                if let Some((earlier_at, earlier)) = last
+                    && at < earlier_at
+                {
+                    return Ok((
+                        Err(LayoutChanged::Order(earlier.clone(), name.clone())),
+                        false,
+                    ));
+                }
+                last = Some((at, name));
             }
-            let current: Vec<String> = array_mut(state, "sectionsOrder")
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect();
-            let mut order = seed_visual_stacks(&current, visual_order);
+            if key == past_key {
+                return Ok((Ok(false), false));
+            }
+            let mut order = seed_visual_stacks(&current, shown);
             for candidate in [key, past_key] {
                 if !order.iter().any(|entry| entry == candidate)
                     && candidate.starts_with(STACK_PREFIX)
@@ -875,18 +915,18 @@ impl Store {
                 }
             }
             if !order.iter().any(|entry| entry == key) {
-                return Ok((false, false));
+                return Ok((Ok(false), false));
             }
             order.retain(|entry| entry != key);
             let Some(index) = order.iter().position(|entry| entry == past_key) else {
-                return Ok((false, false));
+                return Ok((Ok(false), false));
             };
             order.insert(if before { index } else { index + 1 }, key.to_owned());
             if order == current {
-                return Ok((false, false));
+                return Ok((Ok(false), false));
             }
             state["sectionsOrder"] = json!(order);
-            Ok((true, true))
+            Ok((Ok(true), true))
         })
     }
 
@@ -2516,6 +2556,208 @@ fn ensure_section(state: &mut Value, section: &str) {
     let order = array_mut(state, "sectionsOrder");
     if !order.iter().any(|name| name.as_str() == Some(section)) {
         order.push(json!(section));
+    }
+}
+
+/// Why a reorder was refused: the stored layout is not the one the caller
+/// was shown. Nothing was written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LayoutChanged {
+    /// This row is no longer filed in the section it was shown in.
+    Filed(String),
+    /// These two are stored in the opposite order, first as shown.
+    Order(String, String),
+    /// This named section is no longer stored.
+    Section(String),
+}
+
+fn layout_collection(key: &str) -> &'static str {
+    if key.starts_with("@remote/") {
+        "remoteLayouts"
+    } else {
+        "slugs"
+    }
+}
+
+/// The named section a row is filed in; `None` is the Inbox.
+fn stored_section<'a>(state: &'a Value, key: &str) -> Option<&'a str> {
+    state[layout_collection(key)][key]["section"]
+        .as_str()
+        .filter(|name| !name.is_empty())
+}
+
+fn stored_order(state: &Value, key: &str) -> Option<f64> {
+    state[layout_collection(key)][key]["order"].as_f64()
+}
+
+fn set_layout_order(state: &mut Value, key: &str, order: f64) {
+    let collection = layout_collection(key);
+    let mut entry = state[collection][key]
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    entry.insert("order".to_owned(), number(order));
+    object_mut(state, collection).insert(key.to_owned(), Value::Object(entry));
+}
+
+fn sections_order(state: &Value) -> Vec<String> {
+    state["sectionsOrder"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A section as its caller was shown it.
+#[derive(Clone, Copy, Debug)]
+pub struct ShownSection<'a> {
+    /// The stored name; `None` is the Inbox.
+    pub name: Option<&'a str>,
+    /// Its units in the order drawn.
+    pub drawn: &'a [String],
+    /// Those of them the board draws by stored order: all of them under
+    /// manual sort, the units of one status under status sort.
+    pub ordered: &'a [String],
+}
+
+/// Whether the stored layout of a section is the one shown: every unit
+/// drawn is filed in it, and the stored orders of `ordered` do not fall
+/// along the order they were drawn in. A unit never ordered is drawn by
+/// what the store does not hold (its stack, its creation anchor), so its
+/// place is not compared.
+fn check_shown(state: &Value, shown: &ShownSection<'_>) -> Result<(), LayoutChanged> {
+    if let Some(moved) = shown
+        .drawn
+        .iter()
+        .find(|key| stored_section(state, key) != shown.name)
+    {
+        return Err(LayoutChanged::Filed(moved.clone()));
+    }
+    let mut last: Option<(f64, &String)> = None;
+    for key in shown.ordered {
+        let Some(order) = stored_order(state, key) else {
+            continue;
+        };
+        if let Some((earlier_order, earlier)) = last
+            && order < earlier_order
+        {
+            return Err(LayoutChanged::Order(earlier.clone(), key.clone()));
+        }
+        last = Some((order, key));
+    }
+    Ok(())
+}
+
+/// `sequence` with the other rows of the section that have a stored order
+/// put where that order places them: rows filed in it that the caller was
+/// not shown, because the board draws them elsewhere (landed, archived) or
+/// they were filed since. Numbering the result keeps each of them on the
+/// side of every shown unit it was on.
+fn with_unlisted(state: &Value, section: Option<&str>, mut sequence: Vec<String>) -> Vec<String> {
+    let mut unlisted: Vec<(f64, String)> = ["slugs", "remoteLayouts"]
+        .into_iter()
+        .filter_map(|collection| Some((collection, state[collection].as_object()?)))
+        .flat_map(|(collection, layouts)| {
+            layouts
+                .keys()
+                .filter(move |key| layout_collection(key) == collection)
+        })
+        .filter(|key| stored_section(state, key) == section && !sequence.contains(*key))
+        .filter_map(|key| Some((stored_order(state, key)?, key.clone())))
+        .collect();
+    unlisted.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    for (order, key) in unlisted {
+        let stored = |placed: &String| stored_order(state, placed);
+        let at = sequence
+            .iter()
+            .rposition(|placed| stored(placed).is_some_and(|before| before <= order))
+            .map(|last| last + 1)
+            .or_else(|| sequence.iter().position(|placed| stored(placed).is_some()))
+            .unwrap_or(sequence.len());
+        sequence.insert(at, key);
+    }
+    sequence
+}
+
+/// Whether every unit has a stored order of its own.
+fn distinct(orders: &[Option<f64>]) -> bool {
+    let mut known: Vec<f64> = orders.iter().flatten().copied().collect();
+    if known.len() != orders.len() {
+        return false;
+    }
+    known.sort_by(f64::total_cmp);
+    known.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+/// The manual order of a section's units with every unit given a place:
+/// stored orders decide among the units that have one; a unit never ordered
+/// goes before them, as the board draws it; and one still at its creation
+/// anchor stays behind the unit drawn before it. Under manual sort this is
+/// the order drawn.
+fn manual_sequence(state: &Value, drawn: &[String]) -> Vec<String> {
+    let anchored = |key: &str| {
+        stored_order(state, key).is_none()
+            && state[layout_collection(key)][key]
+                .get("creationAfter")
+                .is_some()
+    };
+    let mut sequence = Vec::with_capacity(drawn.len());
+    let mut ordered = Vec::new();
+    for key in drawn {
+        match stored_order(state, key) {
+            Some(order) => ordered.push((order, key)),
+            None if !anchored(key) => sequence.push(key.clone()),
+            None => {}
+        }
+    }
+    ordered.sort_by(|a, b| a.0.total_cmp(&b.0));
+    sequence.extend(ordered.into_iter().map(|(_, key)| key.clone()));
+    for (index, key) in drawn.iter().enumerate() {
+        if !anchored(key) {
+            continue;
+        }
+        let at = index
+            .checked_sub(1)
+            .and_then(|before| sequence.iter().position(|placed| *placed == drawn[before]))
+            .map_or(0, |at| at + 1);
+        sequence.insert(at, key.clone());
+    }
+    sequence
+}
+
+/// Store `sequence` as the explicit order of its units in `section`.
+fn write_sequence(state: &mut Value, section: Option<&str>, sequence: &[String]) {
+    let baseline = all_layouts(state)
+        .filter(|layout| layout.get("section").and_then(Value::as_str) == section)
+        .filter_map(|layout| layout.get("order").and_then(Value::as_f64))
+        .reduce(f64::min)
+        .unwrap_or(0.0);
+    for (index, key) in sequence.iter().enumerate() {
+        let collection = layout_collection(key);
+        let mut entry = state[collection][key]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        entry.insert(
+            "section".to_owned(),
+            section.map_or(Value::Null, |name| json!(name)),
+        );
+        entry.insert("order".to_owned(), number(baseline + index as f64));
+        object_mut(state, collection).insert(key.clone(), Value::Object(entry));
+    }
+}
+
+/// The order one past the stored orders of `section`, at either end.
+fn edge_order(state: &Value, section: Option<&str>, at_top: bool) -> f64 {
+    let orders = all_layouts(state)
+        .filter(|layout| layout.get("section").and_then(Value::as_str) == section)
+        .filter_map(|layout| layout.get("order").and_then(Value::as_f64));
+    if at_top {
+        orders.reduce(f64::min).map_or(0.0, |min| min - 1.0)
+    } else {
+        orders.reduce(f64::max).map_or(0.0, |max| max + 1.0)
     }
 }
 

@@ -640,6 +640,7 @@ fn run(mut cli: Cli) -> Result<i32> {
 /// commands and whole-fleet reads. Each agent's wt command is a process with a
 /// budget of its own, so only limits held across processes bound their sum.
 async fn process_budget(config: &Config) -> ProcessRunner {
+    wt_ops::lifecycle_ops::register_worker_executable();
     let mut processes = ProcessRunner::with_budget(ProcessBudget::application());
     let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     if let Some(slots) = machine_slots(config, "process-heavy", (cores / 3).clamp(2, 4)).await {

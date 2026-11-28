@@ -127,6 +127,10 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
     let task = scope.spawn(async move {
         let ledger = AutomationLedger::new(context.config.paths.cache_root.join("automations.json"));
         let mut engine = AutomationEngine::new(ledger, token.clone());
+        // The queue lives in this process alone: whatever an earlier engine
+        // logged as queued and never as left ended when this one started.
+        let engine_id = format!("{}-{}", now_ms(), std::process::id());
+        tracing::info!(engine = %engine_id, "automation engine started");
         let restored_runs = match wt_app_core::actions::service(&context) {
             Ok(service) => restore_runs(&mut engine, now_ms(), |since_ms| async move {
                 Ok(service.automation_runs_since(since_ms).await?)
@@ -209,7 +213,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
         let mut dated_checks = Vec::new();
         // When removed rows were last looked over for something due, and
         // the metadata revision they were read at.
-        let mut removed_due_seen: Option<(u64, i64)> = None;
+        let mut removed_due = RemovedDueLooks::default();
         let mut removed_due_told = BTreeSet::new();
         // Records removed before a production landing was kept on them
         // are completed from history, once, before anything reads them.
@@ -586,12 +590,21 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             if facts.state_ready
                 && !facts.globally_paused
                 && std::env::var("WT_AUTOMATIONS").as_deref() != Ok("off")
-                && removed_due_seen.is_none_or(|(seen, again_at)| seen != revision || now >= again_at)
+                && removed_due.due(revision, now)
             {
-                removed_due_seen = Some((revision, now.saturating_add(REMOVED_DUE_RECHECK_MS)));
+                let wake = removed_due.may_wake(now);
                 let live = facts.rows.iter().map(|row| row.slug.clone()).collect::<BTreeSet<_>>();
-                if let Err(error) = tell_removed_due(&context, &live, now, &mut removed_due_told).await {
-                    latest_error = Some(format!("cannot tell the manager what a removed worktree owes: {error:#}"));
+                match tell_removed_due(&context, &live, now, &mut removed_due_told, wake).await {
+                    Ok(deferred) => {
+                        if let Some(reason) = &deferred {
+                            tracing::info!(%reason, retry_in_seconds = REMOVED_DUE_RECHECK_MS / 1000, "what removed worktrees owe was not sent to the manager; trying again later");
+                        }
+                        removed_due.looked(revision, now, wake.then_some(deferred.is_some()));
+                    }
+                    Err(error) => {
+                        removed_due.looked(revision, now, None);
+                        latest_error = Some(format!("cannot tell the manager what a removed worktree owes: {error:#}"));
+                    }
                 }
             }
             let pass = pass_input(&context, facts, facts.context.now_ms);
@@ -624,6 +637,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     latest_error = Some(format!("cannot record a finished watch action: {error:#}"));
                 }
             }
+            let dispatched = tick.claims.iter().map(|claim| fire_identity(claim.fire())).collect::<BTreeSet<_>>();
             for claim in tick.claims {
                 let context = accepted_context.clone();
                 let github = fresh_github.clone();
@@ -634,10 +648,22 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             }
             let queued = engine.queued();
             let _ = status_tx.send(engine_status(&engine, latest_error.clone()));
-            report_queue_changes(&reported, &queued);
+            report_queue_changes(&engine_id, &reported, &queued, now_ms(), |fire| {
+                if dispatched.contains(&fire.id) {
+                    "dispatched"
+                } else if engine.retains(&fire.id) {
+                    "held"
+                } else {
+                    "dropped"
+                }
+            });
             reported = queued;
             queue_report.write(&context, &reported, facts.globally_paused, latest_error.as_deref());
         }
+        // The queue ends with the engine: say so, and leave no report of
+        // fires that nothing will dispatch.
+        report_queue_changes(&engine_id, &reported, &[], now_ms(), |_| "engine stopped");
+        queue_report.write(&context, &[], queue_report.paused(), latest_error.as_deref());
         let mut progress = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(3),
             Duration::from_secs(10),
@@ -860,16 +886,54 @@ fn run_end(meta: &wt_actions::ActionMeta) -> wt_app_core::automation_engine::Run
 /// be reached is tried again.
 const REMOVED_DUE_RECHECK_MS: i64 = 5 * 60 * 1000;
 
+/// When removed rows are looked over, and when the manager may be woken
+/// for them. A look runs on every state change, but each wake is awaited
+/// inside the automation loop and a manager waiting on a person holds it
+/// for seconds before deferring: after a deferral no wake is tried until
+/// the recheck interval has passed, however often the state changes.
+#[derive(Default)]
+struct RemovedDueLooks {
+    /// The metadata revision last looked at, and when to look again anyway.
+    seen: Option<(u64, i64)>,
+    wake_held_until: Option<i64>,
+}
+
+impl RemovedDueLooks {
+    fn due(&self, revision: u64, now: i64) -> bool {
+        self.seen
+            .is_none_or(|(seen, again_at)| seen != revision || now >= again_at)
+    }
+
+    fn may_wake(&self, now: i64) -> bool {
+        self.wake_held_until.is_none_or(|until| now >= until)
+    }
+
+    /// `deferred` is whether a look that could wake the manager was
+    /// deferred; `None` for a look that could not, or that failed.
+    fn looked(&mut self, revision: u64, now: i64, deferred: Option<bool>) {
+        let again_at = now.saturating_add(REMOVED_DUE_RECHECK_MS);
+        self.seen = Some((revision, again_at));
+        match deferred {
+            Some(true) => self.wake_held_until = Some(again_at),
+            Some(false) => self.wake_held_until = None,
+            None => {}
+        }
+    }
+}
+
 /// Prompt the manager for each removed row with something due that it was
 /// not told about, and record what it was told. `told` holds what this
 /// process sent, as `(slug, removed_at, key)`: a record that could not be
 /// written is written at a later look, and the manager is not asked twice.
+/// With `wake` unset nothing is sent, only such records are written.
+/// Returns why the manager was not told, when a wake sent nothing.
 async fn tell_removed_due(
     context: &AppContext,
     live: &BTreeSet<String>,
     now: i64,
     told: &mut BTreeSet<(String, String, String)>,
-) -> anyhow::Result<()> {
+    wake: bool,
+) -> anyhow::Result<Option<String>> {
     let separate = context.config.branch.separate_production();
     let removed = context
         .database
@@ -877,7 +941,8 @@ async fn tell_removed_due(
         .await?;
     // Each wake is awaited here, inside the source's loop. Once the manager
     // has deferred one, the rest of this look would only wait on it again.
-    let mut manager_reachable = true;
+    let mut manager_reachable = wake;
+    let mut deferred = None;
     for entry in removed {
         if live.contains(&entry.slug) || entry.automations_paused == Some(true) {
             continue;
@@ -912,8 +977,15 @@ async fn tell_removed_due(
                         keys.push(key);
                     }
                 }
-                // Nothing was sent: the next look tries again.
-                _ => manager_reachable = false,
+                // Nothing was sent: a later look tries again.
+                AutomationOutcome::Deferred { reason, .. } => {
+                    manager_reachable = false;
+                    deferred = Some(reason);
+                }
+                _ => {
+                    manager_reachable = false;
+                    deferred = Some("nothing was sent to the manager".to_owned());
+                }
             }
         }
         if keys.is_empty() {
@@ -932,7 +1004,7 @@ async fn tell_removed_due(
             );
         }
     }
-    Ok(())
+    Ok(deferred)
 }
 
 async fn record_skipped(
@@ -1212,20 +1284,45 @@ fn paused(facts: &Option<PreparedAutomationFacts>) -> bool {
     facts.as_ref().is_some_and(|facts| facts.globally_paused)
 }
 
-/// Log a fire when it first queues and when it leaves the queue without
-/// being claimed, so a fire that waits forever leaves a trace.
-fn report_queue_changes(before: &[QueuedFire], after: &[QueuedFire]) {
-    let key = |fire: &QueuedFire| (fire.rule.clone(), fire.target.clone());
-    let previous = before
-        .iter()
-        .map(key)
-        .collect::<std::collections::BTreeSet<_>>();
-    let current = after
-        .iter()
-        .map(key)
-        .collect::<std::collections::BTreeSet<_>>();
-    for fire in after.iter().filter(|fire| !previous.contains(&key(fire))) {
+/// The fires that joined and that left the reported queue between two
+/// passes. One wait is a fire's identity and when it queued: two fires of
+/// one rule for one worktree are two waits, and so is a fire that returns.
+fn queue_changes<'a>(
+    before: &'a [QueuedFire],
+    after: &'a [QueuedFire],
+) -> (Vec<&'a QueuedFire>, Vec<&'a QueuedFire>) {
+    let wait = |fire: &'a QueuedFire| (fire.id.as_str(), fire.queued_at_ms);
+    let previous = before.iter().map(wait).collect::<BTreeSet<_>>();
+    let current = after.iter().map(wait).collect::<BTreeSet<_>>();
+    (
+        after
+            .iter()
+            .filter(|fire| !previous.contains(&wait(fire)))
+            .collect(),
+        before
+            .iter()
+            .filter(|fire| !current.contains(&wait(fire)))
+            .collect(),
+    )
+}
+
+/// Log a fire when it queues and when it leaves the queue, so a fire that
+/// waits forever leaves a trace. Both records carry the engine, the fire
+/// and when it queued, so each queued record has exactly one left record
+/// unless its engine died first; the next engine's start record ends those.
+fn report_queue_changes(
+    engine: &str,
+    before: &[QueuedFire],
+    after: &[QueuedFire],
+    now_ms: i64,
+    outcome: impl Fn(&QueuedFire) -> &'static str,
+) {
+    let (queued, left) = queue_changes(before, after);
+    for fire in queued {
         tracing::info!(
+            engine,
+            fire = %fire.id,
+            queued_at_ms = fire.queued_at_ms,
             rule = %fire.rule,
             target = %fire.target,
             detail = %fire.detail,
@@ -1233,8 +1330,17 @@ fn report_queue_changes(before: &[QueuedFire], after: &[QueuedFire]) {
             "automation queued"
         );
     }
-    for fire in before.iter().filter(|fire| !current.contains(&key(fire))) {
-        tracing::info!(rule = %fire.rule, target = %fire.target, "automation left the queue");
+    for fire in left {
+        tracing::info!(
+            engine,
+            fire = %fire.id,
+            queued_at_ms = fire.queued_at_ms,
+            rule = %fire.rule,
+            target = %fire.target,
+            waited_ms = now_ms.saturating_sub(fire.queued_at_ms),
+            outcome = outcome(fire),
+            "automation left the queue"
+        );
     }
 }
 
@@ -1567,6 +1673,56 @@ mod tests {
         }
     }
 
+    /// The queue log pairs a queued record with a left record by fire and
+    /// queue time. Keyed by rule and target alone, a second fire of the rule
+    /// for the same worktree replaced the first without either record.
+    #[test]
+    fn each_wait_in_the_queue_is_reported_once_as_queued_and_once_as_left() {
+        let fire = |id: &str, queued_at_ms| QueuedFire {
+            id: id.into(),
+            rule: "fix-ci".into(),
+            target: "row".into(),
+            detail: String::new(),
+            queued_at_ms,
+            settle_at_ms: queued_at_ms,
+            waiting_for: "its settle delay".into(),
+        };
+        let waits = |fires: Vec<&QueuedFire>| {
+            fires
+                .into_iter()
+                .map(|fire| (fire.id.clone(), fire.queued_at_ms))
+                .collect::<Vec<_>>()
+        };
+        let before = [fire("fix-ci|row@a", 10), fire("fix-ci|row@b", 20)];
+        // The first fire left and a new one for the same rule and worktree
+        // queued; the second went and came back (a deferral keeps its age,
+        // a new condition does not).
+        let after = [fire("fix-ci|row@c", 30), fire("fix-ci|row@b", 40)];
+        let (queued, left) = queue_changes(&before, &after);
+        assert_eq!(
+            waits(queued),
+            [
+                ("fix-ci|row@c".to_owned(), 30),
+                ("fix-ci|row@b".to_owned(), 40)
+            ]
+        );
+        assert_eq!(
+            waits(left),
+            [
+                ("fix-ci|row@a".to_owned(), 10),
+                ("fix-ci|row@b".to_owned(), 20)
+            ]
+        );
+        // A fire still waiting is reported again by neither record, however
+        // its reason changes.
+        let mut same = before.clone();
+        same[0].waiting_for = "session busy on row".into();
+        let (queued, left) = queue_changes(&before, &same);
+        assert!(queued.is_empty() && left.is_empty());
+        // Everything queued leaves when the engine stops.
+        assert_eq!(queue_changes(&before, &[]).1.len(), 2);
+    }
+
     /// A manager waiting on a person must not hold the automation loop. The
     /// look gives up after one bounded wait, however many removed rows have
     /// something due, and records nothing as told, so a later look asks
@@ -1654,15 +1810,59 @@ mod tests {
         // One wake waits about five seconds on the person; two would not fit.
         let look = tokio::time::timeout(
             Duration::from_secs(9),
-            tell_removed_due(context, &BTreeSet::new(), now, &mut told),
+            tell_removed_due(context, &BTreeSet::new(), now, &mut told, true),
+        )
+        .await;
+        // The loop holds further wakes after a deferral: such a look sends
+        // nothing and waits on nobody.
+        let held = tokio::time::timeout(
+            Duration::from_secs(2),
+            tell_removed_due(context, &BTreeSet::new(), now, &mut told, false),
         )
         .await;
         let still_untold = untold(context).await;
         fixture.close().await.unwrap();
-        look.expect("the look waited on the manager once per removed row")
+        let deferred = look
+            .expect("the look waited on the manager once per removed row")
             .unwrap();
+        assert!(deferred.is_some(), "a deferral says why");
+        assert_eq!(
+            held.expect("a held look waited on the manager").unwrap(),
+            None
+        );
         assert!(told.is_empty(), "{told:?}");
         assert_eq!(still_untold, 2);
+    }
+
+    /// A manager sitting at a question defers every wake after a bounded
+    /// wait. State changes many times in a recheck interval; only one of
+    /// those looks may pay that wait.
+    #[test]
+    fn a_deferring_manager_is_woken_once_per_recheck_interval_not_per_snapshot() {
+        let mut looks = RemovedDueLooks::default();
+        let start = 1_000_000;
+        let mut wakes = 0;
+        // A new metadata revision every second for two intervals.
+        for second in 0..(2 * REMOVED_DUE_RECHECK_MS / 1000) {
+            let (revision, now) = (second as u64, start + second * 1000);
+            assert!(looks.due(revision, now), "every revision is looked over");
+            let wake = looks.may_wake(now);
+            wakes += usize::from(wake);
+            looks.looked(revision, now, wake.then_some(true));
+        }
+        assert_eq!(wakes, 2);
+        // With nothing changing, the look and the wake come due together.
+        let (revision, last) = looks.seen.unwrap();
+        assert!(!looks.due(revision, last - 1));
+        let until = looks.wake_held_until.unwrap();
+        assert!(looks.due(revision, until.max(last)) && looks.may_wake(until));
+        // A wake that reaches the manager ends the hold; a failed look
+        // neither starts nor ends one.
+        looks.looked(revision, until, Some(false));
+        assert!(looks.may_wake(until + 1));
+        looks.looked(revision, until, Some(true));
+        looks.looked(revision, until + 1, None);
+        assert!(!looks.may_wake(until + 2));
     }
 
     /// Another live process may launch a run while this one starts. Its

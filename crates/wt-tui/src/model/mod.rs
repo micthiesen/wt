@@ -5,7 +5,7 @@ mod board;
 mod input;
 mod interaction;
 mod local_menu;
-mod palette_warm;
+mod palette;
 mod pending;
 mod reply;
 mod selection;
@@ -13,7 +13,9 @@ mod selection;
 #[cfg(test)]
 mod interaction_tests;
 #[cfg(test)]
-mod palette_warm_tests;
+mod palette_tests;
+#[cfg(test)]
+mod reorder_tests;
 #[cfg(test)]
 mod request_tests;
 #[cfg(test)]
@@ -32,11 +34,11 @@ pub use board::{
     GitPresentation, GuideView, HostChoice, LANDED_SECTION, LANDED_TITLE, LandingKind,
     LiveSlotView, LocalStamp, LogView, MergeQueueView, OWED_BLOCK_PREFIX, OWED_SECTIONS_OPTION,
     OtherPrView, OwedBlock, OwedView, PerfGroupView, PerfProcessView, PerfTone, PerfView,
-    PrCommentView, PrPresentation, PreparedDetailGroup, PreparedPalette, RemovalView,
-    RemovedHistoryRow, RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState,
-    SectionRollup, SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem,
-    WatchActionKind, WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount,
-    WorkStateCount, owed_block_refusal,
+    PrCommentView, PrPresentation, PreparedDetailGroup, RemovalView, RemovedHistoryRow,
+    RemovedHistorySnapshot, ReviewBotView, ReviewRequestRow, ReviewState, SectionRollup,
+    SessionMenuEntry, SessionView, TerminalSlotView, TitleSource, UsageItem, WatchActionKind,
+    WatchConditionView, WatchTruth, WatchView, WorkPresentation, WorkRiskCount, WorkStateCount,
+    owed_block_refusal,
 };
 pub(crate) use input::REMOVAL_IN_PROGRESS;
 pub use interaction::{
@@ -111,7 +113,8 @@ pub struct Model {
     pub(crate) last_menu: Option<(u64, UiAction)>,
     /// Read-only requests sent without foreground feedback.
     pub(crate) background: Vec<UiAction>,
-    pub(crate) palette_warm: palette_warm::PaletteWarm,
+    /// A palette entry waiting for GitHub to confirm its row's branch.
+    pub(crate) palette_wait: Option<palette::PaletteWait>,
     /// The sources should refresh because a commit found changed state.
     pub(crate) refresh_requested: bool,
     /// The key being dispatched, recorded as the opener of a requested menu.
@@ -220,7 +223,7 @@ impl Default for Model {
             committed_menu: None,
             last_menu: None,
             background: Vec::new(),
-            palette_warm: Default::default(),
+            palette_wait: None,
             refresh_requested: false,
             last_key: None,
             source_state: SourceState::Empty,

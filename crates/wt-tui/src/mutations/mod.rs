@@ -19,7 +19,9 @@ use crate::{
 
 pub use effect::Effect;
 pub use github::GithubChange;
-pub use layout::LayoutChange;
+pub use layout::{
+    LayoutChange, ReorderStep, STATUS_SORT_PINS, plan_reorder, reorder_refusal, unit_rank,
+};
 pub use lifecycle::LifecycleChange;
 pub use row::RowChange;
 
@@ -100,6 +102,17 @@ trait Family {
     fn deadlines(&self) -> Option<Deadlines> {
         None
     }
+    /// Whether the field alone identifies the change, whichever row it
+    /// marks: a claim about two rows that a later one about the same two
+    /// replaces.
+    fn pairwise(&self) -> bool {
+        false
+    }
+    /// The rows the change writes besides its target; their reads confirm
+    /// it too.
+    fn rows(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 impl MutationKind {
@@ -160,6 +173,9 @@ impl Mutation<Board> for UiMutation {
             MutationKind::Unprojected { label, .. } => format!("unprojected:{label}"),
             kind => kind.family().map(Family::field).unwrap_or_default(),
         };
+        if self.kind.family().is_some_and(Family::pairwise) {
+            return format!("#{field}");
+        }
         format!("{target}#{field}")
     }
 
@@ -189,7 +205,19 @@ impl Mutation<Board> for UiMutation {
                 .iter()
                 .map(|key| Target::row(self.target.host.clone(), key.clone()))
                 .collect(),
-            _ => vec![self.target.clone()],
+            kind => {
+                let mut confirming = vec![self.target.clone()];
+                // A change to the whole board already waits for every row.
+                if self.target.key.is_some() {
+                    for key in kind.family().map(Family::rows).unwrap_or_default() {
+                        let row = Target::row(self.target.host.clone(), key);
+                        if !confirming.contains(&row) {
+                            confirming.push(row);
+                        }
+                    }
+                }
+                confirming
+            }
         }
     }
 

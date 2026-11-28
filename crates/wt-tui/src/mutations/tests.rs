@@ -213,6 +213,49 @@ async fn every_mutation_kind_meets_the_contract() {
             with(|b| b.sections[1].folded = true),
         ),
         (
+            row(LayoutChange::Pass {
+                section: INBOX_SECTION.into(),
+                unit: "a".into(),
+                past: "b".into(),
+                down: true,
+            }),
+            with(|b| {
+                b.rows.push(BoardRow {
+                    key: "b".into(),
+                    ..Default::default()
+                });
+                b.sections[0].rows = vec![0, 1];
+            }),
+            with(|b| {
+                b.rows.push(BoardRow {
+                    key: "b".into(),
+                    ..Default::default()
+                });
+                b.sections[0].rows = vec![1, 0];
+            }),
+        ),
+        (
+            row(LayoutChange::Cross {
+                rows: vec!["a".into()],
+                to: "Batch".into(),
+                top: true,
+            }),
+            board(),
+            with(|b| {
+                b.sections[0].rows.clear();
+                b.sections[1].rows.push(0);
+            }),
+        ),
+        (
+            whole(LayoutChange::SectionPass {
+                section: INBOX_SECTION.into(),
+                past: "Batch".into(),
+                down: true,
+            }),
+            board(),
+            with(|b| b.sections.swap(0, 1)),
+        ),
+        (
             whole(LayoutChange::RenameSection {
                 old: "Batch".into(),
                 new: "Later".into(),
@@ -568,6 +611,7 @@ fn every_declared_domain_can_settle() {
             id: String::new(),
             arg: None,
             extras: String::new(),
+            seen: None,
         },
         UiAction::FoldSection {
             key: "Batch".into(),
@@ -580,8 +624,34 @@ fn every_declared_domain_can_settle() {
         },
         UiAction::Reorder {
             key: Some("a".into()),
-            section: String::new(),
+            section: INBOX_SECTION.into(),
             down: true,
+            step: ReorderStep::Pass {
+                unit: "a".into(),
+                past: "b".into(),
+                units: vec!["a".into(), "b".into()],
+            },
+        },
+        UiAction::Reorder {
+            key: Some("a".into()),
+            section: INBOX_SECTION.into(),
+            down: true,
+            step: ReorderStep::Cross {
+                unit: "a".into(),
+                rows: vec!["a".into()],
+                units: vec!["a".into()],
+                to: "Batch".into(),
+                to_units: Vec::new(),
+            },
+        },
+        UiAction::Reorder {
+            key: None,
+            section: INBOX_SECTION.into(),
+            down: true,
+            step: ReorderStep::Section {
+                past: "Batch".into(),
+                sections: vec![INBOX_SECTION.into(), "Batch".into()],
+            },
         },
         UiAction::RenameSection {
             old: "Batch".into(),
@@ -830,4 +900,27 @@ fn a_git_backed_change_names_the_rows_its_host_reads_again() {
         Effect::Mutation(removal).rows(),
         Some(vec!["a".to_owned(), "b".to_owned()])
     );
+}
+
+/// The host records a cleared fork base as the trunk, so the confirming
+/// read shows the trunk where the person chose "none". Read as a different
+/// base, the change stayed pending until its deadline and was then reported
+/// as never shown.
+#[test]
+fn a_cleared_fork_base_is_shown_by_the_trunk_the_host_records() {
+    let on = |base: Option<&str>| {
+        with(|b| {
+            b.display.trunk = "main".into();
+            b.rows[0].base_branch = base.map(str::to_owned);
+        })
+    };
+    let cleared = row(RowChange::Base { base: None });
+    assert!(cleared.observed(&on(Some("main"))));
+    assert!(cleared.observed(&on(None)));
+    assert!(!cleared.observed(&on(Some("feature"))));
+    let stacked = row(RowChange::Base {
+        base: Some("feature".into()),
+    });
+    assert!(stacked.observed(&on(Some("feature"))));
+    assert!(!stacked.observed(&on(Some("main"))));
 }

@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use wt_platform::install::InstallPolicy;
-use wt_platform::lock::{FileLock, LockError};
+use wt_platform::lock::{
+    DEPENDENCY_INSTALL_POOL, DEPENDENCY_INSTALL_SLOTS, FileLock, LockError, MachineSlots,
+};
 use wt_platform::process::{CommandSpec, ProcessError, ProcessRunner};
 
 use crate::{
@@ -30,6 +32,31 @@ const GIT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 /// wall-clock nanoseconds. Written only while holding that lock, and read
 /// under it wherever a fetch may follow the read.
 const FETCH_STAMP: &str = "fetch-origin.stamp";
+/// Held for the main clone's dependency install, beside the fetch lock.
+const MAIN_INSTALL_LOCK: &str = "main-dependency-sync";
+/// Beside that lock: the main clone commit its last successful install ran
+/// at. Read and written only while holding the lock.
+const MAIN_INSTALL_STAMP: &str = "main-dependency-sync.stamp";
+
+/// What one pull hands the main clone's dependency sync.
+struct DependencySync<'a> {
+    policy: &'a InstallPolicy,
+    install_lock_dir: Option<&'a Path>,
+    repository_lock_dir: &'a Path,
+    /// The main clone's HEAD before the pull.
+    before: &'a str,
+}
+
+fn lock_error(path: &Path, source: LockError) -> RepositoryError {
+    if matches!(source, LockError::Cancelled) {
+        RepositoryError::Cancelled
+    } else {
+        RepositoryError::FetchLock {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+}
 
 /// Wall clock, because the stamp is compared across processes. `None` (a
 /// clock before the epoch) disables both stamping and skipping.
@@ -60,8 +87,14 @@ pub struct FetchOriginOptions {
     pub keep_fresh: Vec<String>,
     /// Explicitly configured generated paths; staged edits are never discarded.
     pub auto_regen_paths: Vec<String>,
-    /// Frozen dependency maintenance runs under the fetch lock after a pull.
+    /// Frozen dependency maintenance of the main clone after a pull that
+    /// changed a lockfile. It runs after the fetch lock is released.
     pub sync_install: Option<InstallPolicy>,
+    /// The configured lock directory, where the machine's dependency-install
+    /// slots live ([`wt_platform::lock::DEPENDENCY_INSTALL_POOL`]). With it
+    /// the main clone's install takes one of them like every other install;
+    /// without it the install is unbounded across processes.
+    pub install_lock_dir: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,7 +412,7 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<FetchOriginReport, RepositoryError> {
         let lock_dir = self.repository_lock_dir().await;
-        let _lock = self.lock_fetch(&lock_dir, cancellation).await?;
+        let lock = self.lock_fetch(&lock_dir, cancellation).await?;
 
         let before_main_head = self
             .rev_parse(&self.origin_config().main_clone, "HEAD", cancellation)
@@ -469,7 +502,19 @@ impl GitRepository {
             after_main_head.as_deref(),
         ) && before != after
         {
-            self.sync_main_dependencies(policy, before, after, cancellation, &mut warnings)
+            // The fetch lock orders fetches, the stamp, and the ref and
+            // checkout updates above. The install reads only the pulled
+            // tree, and holding the lock through it would keep every other
+            // process's fetch (each new worktree runs one) waiting for
+            // minutes. Installs have a lock of their own instead.
+            drop(lock);
+            let sync = DependencySync {
+                policy,
+                install_lock_dir: options.install_lock_dir.as_deref(),
+                repository_lock_dir: &lock_dir,
+                before,
+            };
+            self.sync_main_dependencies(sync, cancellation, &mut warnings)
                 .await?;
         }
         Ok(FetchOriginReport {
@@ -558,16 +603,37 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Hold off the main clone's dependency install. A backend that copies
+    /// the main clone's packages takes this for the copy, so it never reads
+    /// a tree a package manager is writing.
+    pub async fn lock_main_dependency_sync(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<FileLock, RepositoryError> {
+        let lock_dir = self.repository_lock_dir().await;
+        FileLock::acquire(
+            &lock_dir,
+            MAIN_INSTALL_LOCK,
+            "sync main clone dependencies",
+            cancellation,
+        )
+        .await
+        .map_err(|source| lock_error(&lock_dir, source))
+    }
+
+    /// Install the main clone's dependencies when a lockfile changed since
+    /// they were last installed. Runs without the fetch lock, under a lock
+    /// of its own, against whatever HEAD the clone has by then: a pass that
+    /// queued behind another installs for every pull since the last install,
+    /// or finds nothing left to do.
     async fn sync_main_dependencies(
         &self,
-        policy: &InstallPolicy,
-        before: &str,
-        after: &str,
+        sync: DependencySync<'_>,
         cancellation: &CancellationToken,
         warnings: &mut Vec<String>,
     ) -> Result<(), RepositoryError> {
         let root = &self.origin_config().main_clone;
-        let plan = match policy.resolve(root, true).await {
+        let plan = match sync.policy.resolve(root, true).await {
             Ok(Some(plan)) => plan,
             Ok(None) => return Ok(()),
             Err(error) => {
@@ -577,29 +643,68 @@ impl GitRepository {
                 return Ok(());
             }
         };
-        let mut args = vec![
-            "diff".into(),
-            "--name-only".into(),
-            before.into(),
-            after.into(),
-            "--".into(),
-        ];
-        args.extend(plan.gate_lockfiles.iter().map(|file| (*file).into()));
-        if self
-            .run_git_args(
-                root,
-                args,
-                cancellation,
-                "check pulled dependency lockfiles",
-            )
-            .await?
-            .is_empty()
+        // Two package managers must not write one `node_modules` at once,
+        // which the fetch lock used to prevent.
+        let _installing = self.lock_main_dependency_sync(cancellation).await?;
+        let Some(head) = self.rev_parse(root, "HEAD", cancellation).await? else {
+            return Ok(());
+        };
+        // The commit the last install here ran at, written under this lock.
+        // Without one, or when that commit is gone, this pull's own range.
+        let stamp = sync.repository_lock_dir.join(MAIN_INSTALL_STAMP);
+        let installed = tokio::fs::read_to_string(&stamp).await.ok();
+        let mut changed = None;
+        for since in [installed.as_deref().map(str::trim), Some(sync.before)]
+            .into_iter()
+            .flatten()
         {
+            let mut args = vec![
+                "diff".into(),
+                "--name-only".into(),
+                since.into(),
+                head.as_str().into(),
+                "--".into(),
+            ];
+            args.extend(plan.gate_lockfiles.iter().map(|file| (*file).into()));
+            match self
+                .run_git_args(
+                    root,
+                    args,
+                    cancellation,
+                    "check pulled dependency lockfiles",
+                )
+                .await
+            {
+                Ok(names) => {
+                    changed = Some(!names.is_empty());
+                    break;
+                }
+                Err(error) if is_cancelled(&error) => return Err(error),
+                Err(error) if since == sync.before => return Err(error),
+                Err(_) => {}
+            }
+        }
+        if changed != Some(true) {
             return Ok(());
         }
+        // Every install on the machine shares one bound, so this one waits
+        // its turn among the installs of new worktrees. It runs as bulk and
+        // not heavy: a heavy slot held for minutes would leave checkouts
+        // queued behind it.
+        let _slot = match sync.install_lock_dir {
+            Some(dir) => Some(
+                MachineSlots::open(dir, DEPENDENCY_INSTALL_POOL, DEPENDENCY_INSTALL_SLOTS)
+                    .await
+                    .map_err(|source| lock_error(dir, source))?
+                    .acquire(cancellation)
+                    .await
+                    .map_err(|source| lock_error(dir, source))?,
+            ),
+            None => None,
+        };
         let result = self
             .origin_runner()
-            .heavy()
+            .bulk()
             // Package managers can be verbose. Keep a bounded diagnostic
             // capture while draining the rest, never terminate an install just
             // because it printed more than the capture budget.
@@ -607,7 +712,10 @@ impl GitRepository {
             .await
             .and_then(|output| output.checked("package manager").map(|_| ()));
         match result {
-            Ok(()) => {}
+            // An unwritten stamp only costs a repeated install.
+            Ok(()) => {
+                let _ = tokio::fs::write(&stamp, &head).await;
+            }
             Err(ProcessError::Cancelled { .. }) => return Err(RepositoryError::Cancelled),
             Err(error) => warnings.push(format!(
                 "main clone dependency sync failed ({}): {error}",
@@ -1237,6 +1345,116 @@ mod tests {
             failed.after_main_head.unwrap(),
             git(&runner, &seed, &["rev-parse", "HEAD"]).await
         );
+    }
+
+    #[tokio::test]
+    async fn a_lockfile_pull_whose_install_did_not_happen_is_installed_by_the_next_pull() {
+        let (_root, runner, seed, main, worktrees) = fixture().await;
+        let repo = repository(&main, &worktrees);
+        let cancel = CancellationToken::new();
+        let install = |command: &str| FetchOriginOptions {
+            sync_install: Some(InstallPolicy {
+                command: Some(command.into()),
+                shell: "sh".into(),
+            }),
+            ..Default::default()
+        };
+        let record = "cat pnpm-lock.yaml >> .git/installed-locks";
+        commit_file(&runner, &seed, "pnpm-lock.yaml", "one\n", "dependencies").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        repo.fetch_origin(install(record), &cancel).await.unwrap();
+        commit_file(&runner, &seed, "pnpm-lock.yaml", "two\n", "more").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        let failed = repo
+            .fetch_origin(install("exit 23"), &cancel)
+            .await
+            .unwrap();
+        assert!(!failed.warnings.is_empty());
+        // This pull changes no lockfile, but the clone's packages are still
+        // those of the first one.
+        commit_file(&runner, &seed, "code.rs", "code\n", "code only").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        repo.fetch_origin(install(record), &cancel).await.unwrap();
+        commit_file(&runner, &seed, "more.rs", "code\n", "code again").await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        repo.fetch_origin(install(record), &cancel).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(main.join(".git/installed-locks")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_main_clone_install_takes_a_shared_install_slot_and_not_the_fetch_lock() {
+        let (root, runner, seed, main, worktrees) = fixture().await;
+        let repo = repository(&main, &worktrees);
+        let cancel = CancellationToken::new();
+        repo.fetch_origin(Default::default(), &cancel)
+            .await
+            .unwrap();
+        commit_file(
+            &runner,
+            &seed,
+            "pnpm-lock.yaml",
+            "lock
+",
+            "dependencies",
+        )
+        .await;
+        git(&runner, &seed, &["push", "origin", "main"]).await;
+        use wt_platform::lock::{DEPENDENCY_INSTALL_POOL, DEPENDENCY_INSTALL_SLOTS, MachineSlots};
+        let locks = root.path().join("configured-locks");
+        let pool = || MachineSlots::open(&locks, DEPENDENCY_INSTALL_POOL, DEPENDENCY_INSTALL_SLOTS);
+        // Other installs hold every slot: this one waits, not holding the
+        // fetch lock while it does.
+        let others = pool().await.unwrap();
+        let mut held: Vec<_> = (0..DEPENDENCY_INSTALL_SLOTS.get())
+            .map(|_| others.try_acquire().unwrap().unwrap())
+            .collect();
+        let options = FetchOriginOptions {
+            sync_install: Some(InstallPolicy {
+                command: Some("touch .git/install-started; sleep 1; touch .git/installed".into()),
+                shell: "sh".into(),
+            }),
+            install_lock_dir: Some(locks.clone()),
+            ..Default::default()
+        };
+        let fetching = tokio::spawn({
+            let (repo, cancel) = (repo.clone(), cancel.clone());
+            async move { repo.fetch_origin(options, &cancel).await }
+        });
+        let lock_dir = repo.repository_lock_dir().await;
+        let fetch_lock_free = || async {
+            FileLock::try_acquire(&lock_dir, "fetch-origin", "test")
+                .await
+                .unwrap()
+                .is_some()
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !(main.join("pnpm-lock.yaml").exists() && fetch_lock_free().await) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the fetch lock is released before the install's turn comes");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!main.join(".git/install-started").exists());
+        assert!(!fetching.is_finished());
+        held.pop();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !main.join(".git/install-started").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the install starts once a slot frees");
+        // It holds the freed slot, and another fetch is not kept waiting.
+        assert!(others.try_acquire().unwrap().is_none());
+        assert!(fetch_lock_free().await);
+        let report = fetching.await.unwrap().unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(main.join(".git/installed").exists());
+        assert!(others.try_acquire().unwrap().is_some());
     }
 
     #[tokio::test]

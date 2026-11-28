@@ -16,7 +16,16 @@ use wt_automations::{
 };
 use wt_config::{AutomationBusyPolicy, AutomationDef};
 
-const MAX_CONCURRENT: usize = 2;
+/// Fires that hold something for minutes at a time: a prompt into a
+/// worktree's session, a headless agent run, or a restack or clean that
+/// rewrites checkouts. Each occupies an agent or a stack, so few run at once.
+const MAX_HEAVY: usize = 2;
+/// Bookkeeping fires that end in seconds: a shell action, a notification, a
+/// tracker or branch update, a manager prompt. They have their own slots so
+/// none waits minutes behind an agent's turn. Each shell run is one command
+/// in its own worker process, so this is also the most automation shell
+/// commands running at once.
+const MAX_LIGHT: usize = 4;
 const SESSION_SLOT_MAX_MS: i64 = 10 * 60 * 1000;
 /// A deferred fire is checked again this soon while it is young (a restack
 /// usually retargets stacked PRs within a minute or two)...
@@ -139,6 +148,9 @@ impl ClaimedFire {
 /// One queued fire and why the latest pass did not dispatch it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct QueuedFire {
+    /// The fire's identity: with `queued_at_ms` it names one wait in the
+    /// queue, so the log's queued and left records pair exactly.
+    pub id: String,
     pub rule: String,
     pub target: String,
     pub detail: String,
@@ -183,6 +195,29 @@ pub struct AutomationTick {
     pub settled_watches: Vec<SettledWatch>,
 }
 
+/// Which budget a fire's slot comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CostClass {
+    Heavy,
+    Light,
+}
+
+impl CostClass {
+    const fn cap(self) -> usize {
+        match self {
+            Self::Heavy => MAX_HEAVY,
+            Self::Light => MAX_LIGHT,
+        }
+    }
+
+    const fn noun(self) -> &'static str {
+        match self {
+            Self::Heavy => "agent or stack",
+            Self::Light => "shell or built-in",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SlotState {
     Dispatching,
@@ -195,6 +230,7 @@ struct ActiveFire {
     claim: DispatchClaim,
     fire: AutomationFire,
     slot: SlotState,
+    class: CostClass,
     /// When its intent first queued; a deferral keeps the age.
     queued_at_ms: i64,
     settle_at_ms: i64,
@@ -403,6 +439,12 @@ impl AutomationEngine {
             .collect()
     }
 
+    /// Whether the fire `id` is still retained, queued or held by an unmet
+    /// requirement: one that left the reported queue without this is gone.
+    pub fn retains(&self, id: &str) -> bool {
+        self.intents.contains_key(id)
+    }
+
     /// The queue as of the latest pass, oldest first, without intents held
     /// only by unmet requirements (docs/automations.md does not count those).
     pub fn queued(&self) -> Vec<QueuedFire> {
@@ -411,6 +453,7 @@ impl AutomationEngine {
             .iter()
             .filter(|(id, _)| !self.unmet.contains(*id))
             .map(|(id, intent)| QueuedFire {
+                id: id.clone(),
                 rule: shown_rule(&intent.fire),
                 target: pair_target(&intent.fire),
                 detail: intent.fire.detail.clone(),
@@ -882,13 +925,18 @@ impl AutomationEngine {
                 self.unmet.insert(id);
                 continue;
             }
-            if self.active.len() >= MAX_CONCURRENT {
-                self.waiting
-                    .insert(id, format!("{MAX_CONCURRENT} automations already running"));
-                continue;
-            }
             let rule = &fire.rule;
             let manager_run = manager_bound(&fire, input.context);
+            let class = cost_class(&fire, manager_run, input.context);
+            let running = self
+                .active
+                .values()
+                .filter(|active| active.class == class)
+                .count();
+            if running >= class.cap() {
+                self.waiting.insert(id, slots_taken(class));
+                continue;
+            }
             let audience = input
                 .context
                 .actions
@@ -1106,6 +1154,7 @@ impl AutomationEngine {
                             claim: claim.clone(),
                             fire: fire.clone(),
                             slot: SlotState::Dispatching,
+                            class,
                             queued_at_ms: intent.queued_at_ms,
                             settle_at_ms: intent.settle_at_ms,
                             retry_on_failure,
@@ -1638,6 +1687,43 @@ fn shown_rule(fire: &AutomationFire) -> String {
     }
 }
 
+/// What a fire costs while it runs. Anything not known to be cheap is heavy.
+fn cost_class(
+    fire: &AutomationFire,
+    manager_run: bool,
+    context: &wt_automations::AutomationEvalContext,
+) -> CostClass {
+    if is_wake(fire) {
+        return CostClass::Heavy;
+    }
+    // A watch's other actions write a gate or send a notification.
+    if fire.watch.is_some() {
+        return CostClass::Light;
+    }
+    let run = fire.rule.run.as_str();
+    if run == "builtin:restack" || run == "builtin:clean" {
+        return CostClass::Heavy;
+    }
+    // A manager prompt holds its slot only until it is injected, and one
+    // is sent at a time.
+    if run.starts_with("builtin:") || manager_run {
+        return CostClass::Light;
+    }
+    match context.actions.get(run) {
+        Some(traits) if traits.shell => CostClass::Light,
+        _ => CostClass::Heavy,
+    }
+}
+
+/// Why a fire waits when every slot of its class is taken.
+fn slots_taken(class: CostClass) -> String {
+    format!(
+        "{} {} automations already running",
+        class.cap(),
+        class.noun()
+    )
+}
+
 fn pair_target(fire: &AutomationFire) -> String {
     fire.stack_id.clone().unwrap_or_else(|| fire.slug.clone())
 }
@@ -1974,10 +2060,7 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            assert_eq!(
-                tick.claims.len(),
-                if step == 0 { MAX_CONCURRENT } else { 0 }
-            );
+            assert_eq!(tick.claims.len(), if step == 0 { MAX_HEAVY } else { 0 });
             // Only the runnable fire waits for a slot; the requirement-held
             // one stays out of the queue while both slots are taken.
             let queued = engine
@@ -1985,13 +2068,178 @@ mod tests {
                 .into_iter()
                 .map(|fire| (fire.target, fire.waiting_for))
                 .collect::<Vec<_>>();
-            assert_eq!(
-                queued,
-                [(
-                    "d".to_owned(),
-                    format!("{MAX_CONCURRENT} automations already running")
-                )]
-            );
+            assert_eq!(queued, [("d".to_owned(), slots_taken(CostClass::Heavy))]);
+        }
+    }
+
+    /// A tracker update or notification ends in seconds; it must not wait
+    /// minutes for an agent's turn to end, and agents keep their own cap.
+    #[tokio::test]
+    async fn cheap_fires_run_beside_agent_fires_under_their_own_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger, CancellationToken::new());
+        let agent = AutomationDef {
+            id: "agent".into(),
+            ..rule("fix-it", 0.0)
+        };
+        let tracker = AutomationDef {
+            id: "track".into(),
+            ..rule("tracker", 0.0)
+        };
+        let slugs = ["a", "b", "c", "d", "e", "f", "g", "h"];
+        let rows = slugs.map(|slug| AutomationRow {
+            slug: slug.into(),
+            branch: slug.into(),
+            ..row()
+        });
+        let mut context = AutomationEvalContext::default();
+        context.actions.insert(
+            "tracker".into(),
+            wt_automations::ActionTraits {
+                shell: true,
+                ..Default::default()
+            },
+        );
+        let requirements = slugs
+            .iter()
+            .flat_map(|slug| {
+                ["agent", "track"].map(|rule| (format!("{rule}|{slug}"), RequirementState::Ready))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+
+        let agents = [agent.clone()];
+        let first = engine
+            .tick(input(
+                &agents,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(first.claims.len(), MAX_HEAVY);
+
+        let both = [agent, tracker];
+        let second = engine
+            .tick(input(
+                &both,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start + 1,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .claims
+                .iter()
+                .map(|claim| claim.fire().rule.id.as_str())
+                .collect::<Vec<_>>(),
+            ["track"; MAX_LIGHT],
+            "cheap fires dispatch while both agent slots are taken, up to their own cap"
+        );
+        let waits = |engine: &AutomationEngine, rule: &str, reason: String| {
+            engine
+                .queued()
+                .into_iter()
+                .filter(|fire| fire.rule == rule && fire.waiting_for == reason)
+                .count()
+        };
+        assert_eq!(
+            waits(&engine, "agent", slots_taken(CostClass::Heavy)),
+            slugs.len() - MAX_HEAVY
+        );
+        assert!(waits(&engine, "track", slots_taken(CostClass::Light)) > 0);
+
+        // A finished cheap fire frees a cheap slot, never an agent slot.
+        engine
+            .finish(
+                &second.claims[0],
+                AutomationOutcome::Delivered {
+                    slot: DeliverySlot::None,
+                },
+                start + 2,
+            )
+            .await
+            .unwrap();
+        let third = engine
+            .tick(input(
+                &both,
+                &rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                start + 3,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            third
+                .claims
+                .iter()
+                .map(|claim| claim.fire().rule.id.as_str())
+                .collect::<Vec<_>>(),
+            ["track"]
+        );
+    }
+
+    #[test]
+    fn only_fires_known_to_be_cheap_take_a_cheap_slot() {
+        let mut context = AutomationEvalContext::default();
+        let traits = |shell, audience| wt_automations::ActionTraits {
+            shell,
+            audience,
+            ..Default::default()
+        };
+        use wt_automations::ActionAudience::{Manager, None as Headless, Session};
+        context
+            .actions
+            .insert("script".into(), traits(true, Headless));
+        context
+            .actions
+            .insert("agent".into(), traits(false, Headless));
+        context
+            .actions
+            .insert("prompt".into(), traits(false, Session));
+        context
+            .actions
+            .insert("brief".into(), traits(false, Manager));
+        let class = |run: &str| {
+            let fire: AutomationFire = serde_json::from_value(serde_json::json!({
+                "rule": rule(run, 0.0), "slug": "worktree", "detail": "",
+                "fire_keys": ["k"], "quiesce_slugs": [],
+            }))
+            .unwrap();
+            cost_class(&fire, manager_bound(&fire, &context), &context)
+        };
+        for run in [
+            "script",
+            "brief",
+            "builtin:notify",
+            "builtin:close-issue",
+            "builtin:delete-branch",
+        ] {
+            assert_eq!(class(run), CostClass::Light, "{run}");
+        }
+        for run in [
+            "agent",
+            "prompt",
+            "not-configured",
+            "builtin:restack",
+            "builtin:clean",
+        ] {
+            assert_eq!(class(run), CostClass::Heavy, "{run}");
         }
     }
 

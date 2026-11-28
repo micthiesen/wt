@@ -94,6 +94,13 @@ impl FileLock {
     }
 }
 
+/// The pool of [`MachineSlots`] every dependency install on the machine takes
+/// a slot from, whichever crate starts it, opened in the configured lock
+/// directory. Measured on a 12-core machine: an install took 92 s alone,
+/// 169 s with four at once and 350 s with nine.
+pub const DEPENDENCY_INSTALL_POOL: &str = "dependency-install";
+pub const DEPENDENCY_INSTALL_SLOTS: NonZeroUsize = NonZeroUsize::new(3).expect("nonzero");
+
 /// A counted limit shared by every process using one lock directory: at most
 /// `count` holders at a time, each owning one advisory lock at
 /// `<lock_dir>/__<name>-<n>.lock`. The prefix keeps the files apart from the

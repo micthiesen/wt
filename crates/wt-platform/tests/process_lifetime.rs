@@ -365,6 +365,47 @@ async fn a_heavy_command_waiting_for_a_machine_slot_holds_no_local_permit_and_th
     assert!(marker.exists());
 }
 
+#[tokio::test]
+async fn a_heavy_command_queued_for_a_local_permit_keeps_no_machine_slot_idle() {
+    let directory = tempfile::tempdir().unwrap();
+    let locks = directory.path().join("locks");
+    let one = NonZeroUsize::new(1).unwrap();
+    let open = || MachineSlots::open(&locks, "process-heavy", one);
+    let runner = ProcessRunner::new(one).with_heavy_slots(open().await.unwrap());
+    // This process's only permit is busy with a fetch.
+    let (fetch_cancel, fetch) = occupy(&runner.bulk(), directory.path(), "started").await;
+    let marker = directory.path().join("ran");
+    let heavy = {
+        let runner = runner.heavy();
+        let command = CommandSpec::new("touch").args([marker.as_os_str()]);
+        tokio::spawn(async move { runner.run(command, &CancellationToken::new()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The machine slot stays free for every other process meanwhile.
+    let elsewhere = open()
+        .await
+        .unwrap()
+        .try_acquire()
+        .unwrap()
+        .expect("a heavy command without a local permit holds no machine slot");
+    // The permit frees while another process has the slot: the command
+    // gives the permit back and waits for the slot instead.
+    fetch_cancel.cancel();
+    let _ = fetch.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(!heavy.is_finished() && !marker.exists());
+    let mut quick = CommandSpec::new("true");
+    quick.admission_timeout = Some(Duration::from_millis(500));
+    runner
+        .bulk()
+        .run(quick, &CancellationToken::new())
+        .await
+        .expect("the permit is free while the heavy command waits for a slot");
+    drop(elsewhere);
+    assert!(heavy.await.unwrap().unwrap().status.success());
+    assert!(open().await.unwrap().try_acquire().unwrap().is_some());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_fleet_scan_stops_waiting_for_a_turn_that_does_not_come() {
     let directory = tempfile::tempdir().unwrap();

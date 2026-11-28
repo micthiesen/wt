@@ -59,20 +59,11 @@ impl Mutation<GithubData> for GithubWrite {
         format!("{}#{}:{field}", self.branch, self.number)
     }
 
+    /// The branch's own key in the GitHub domain's stamps: a read of the
+    /// branch alone, its pull request and its merge-queue entry, confirms
+    /// the write.
     fn target(&self) -> Target {
-        Target::row(None, self.branch.clone())
-    }
-
-    /// A read of the branch alone confirms the write. Whether a merge is
-    /// armed also depends on the merge queue, which has a read of its own.
-    fn confirming(&self) -> Vec<Target> {
-        match self.change {
-            WriteChange::AutoMerge { .. } => vec![
-                self.target(),
-                Target::row(None, crate::github_source::MERGE_QUEUE_KEY),
-            ],
-            WriteChange::Ready => vec![self.target()],
-        }
+        Target::row(None, crate::github_source::branch_key(&self.branch))
     }
 
     fn label(&self) -> String {
@@ -229,7 +220,7 @@ impl WriteLedger {
         let at = Stamp::now();
         let branch = write.branch.clone();
         record_accepted(&mut self.lock(), self.op(), write, at);
-        self.refresh.refresh_live_branch(&branch);
+        self.refresh.confirm_branch(&branch, at);
         self.recorded.notify_one();
         at
     }

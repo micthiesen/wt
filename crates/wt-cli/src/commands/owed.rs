@@ -813,7 +813,9 @@ async fn close(
     let mut previous_note = None;
     if let Some(record) = record {
         // The state the command began from still stands unless a step was
-        // closed since; the close below compares again under its own write.
+        // closed since. The landing is judged from it here and not again:
+        // the close below re-reads only which checks the status still owes,
+        // under its own write, and closes none that is gone by then.
         let state = match seen.filter(|_| !wrote) {
             Some(state) => state,
             None => {

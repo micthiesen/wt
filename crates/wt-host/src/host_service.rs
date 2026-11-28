@@ -41,12 +41,16 @@ pub fn complete_local(effect: &wt_tui::Effect, mut reply: UiReply) -> UiReply {
     reply
 }
 
-/// The oldest GitHub read a GitHub write may rely on for its PR checks.
-const WRITE_EVIDENCE_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+/// The oldest GitHub read a GitHub write may rely on for its PR checks. The
+/// board's action facts go unknown at the same age, so a palette does not
+/// offer what this bound would refuse.
+const WRITE_EVIDENCE_AGE: std::time::Duration = wt_sources::action_source::PR_EVIDENCE_AGE;
 
-/// A source refresh starts when the palette opens. If a PR-dependent action is
-/// selected before that first read completes, wait briefly for this same leaf
-/// rather than treating the restored board as proof of presence or absence.
+/// A PR-dependent request can arrive before the shared GitHub leaf has a
+/// recent enough read of its branch: wait briefly for that leaf rather than
+/// treating the restored board as proof of presence or absence. A palette
+/// waits for the board to show the read before it sends, so a palette commit
+/// only waits here when the read aged out or failed in between.
 const ACTION_GITHUB_WAIT: std::time::Duration = std::time::Duration::from_secs(12);
 
 impl HostService {
@@ -291,24 +295,11 @@ impl HostService {
                     !matches!(github.covered_pr(branch), wt_github::CoveredPr::Uncovered)
                 })
         });
-        if let UiAction::WarmPalette { surface } = &command {
-            // Prefetch only from confirmed GitHub data. Otherwise the copy is
-            // dropped so the palette asks the host, which refreshes GitHub.
-            let fresh = github
-                .as_ref()
-                .filter(|github| github_ready && github.fresh_within(WRITE_EVIDENCE_AGE));
-            let modal = crate::action_palette::warm(&context, surface.clone(), board, fresh).await;
-            self.sources.palettes.publish(surface.menu_key(), modal);
-            return Ok(UiReply::default());
-        }
         let github = if !github_ready && self.pr_dependent_command(&command) {
             self.await_confirmed_github(branch.as_deref())
                 .await
                 .or_else(|| github.filter(|github| github.fresh_within(WRITE_EVIDENCE_AGE)))
         } else {
-            if !github_ready && matches!(command, UiAction::PrepareActions { .. }) {
-                self.sources.github_refresh.refresh();
-            }
             github
         };
         let github = github.as_ref();
@@ -367,17 +358,6 @@ impl HostService {
             }),
             UiAction::GithubFailedChecks { key } => {
                 Some(GithubAction::FailedChecks { key: key.clone() })
-            }
-            // The TUI resolves this toggle into an explicit direction from
-            // what the user saw. The host never guesses a direction.
-            UiAction::PrepareAction { id, .. } if id == wt_tui::AUTO_MERGE_ACTION_ID => {
-                return Ok(UiReply {
-                    message:
-                        "merge when ready needs an explicit arm or disarm; update wt and retry"
-                            .into(),
-                    failed: true,
-                    ..Default::default()
-                });
             }
             _ => None,
         };
@@ -474,9 +454,7 @@ impl HostService {
                     ..Default::default()
                 }
             }
-            action @ (UiAction::PrepareActions { .. }
-            | UiAction::PrepareAction { .. }
-            | UiAction::RunAction { .. }) => {
+            action @ (UiAction::PrepareDevLogs { .. } | UiAction::RunAction { .. }) => {
                 Box::pin(crate::action_palette::execute(
                     &context,
                     action,
@@ -496,10 +474,8 @@ impl HostService {
     }
 
     fn action_requires_pr(&self, command: &UiAction) -> bool {
-        let (surface, id) = match command {
-            UiAction::PrepareAction { surface, id, .. }
-            | UiAction::RunAction { surface, id, .. } => (surface, id),
-            _ => return false,
+        let UiAction::RunAction { surface, id, .. } = command else {
+            return false;
         };
         self.surface_action_requires_pr(surface, id)
     }
@@ -534,8 +510,7 @@ impl HostService {
 
     fn pr_dependent_branch(&self, command: &UiAction, board: Option<&Board>) -> Option<String> {
         let key = match command {
-            UiAction::PrepareAction { surface, id, .. }
-            | UiAction::RunAction { surface, id, .. }
+            UiAction::RunAction { surface, id, .. }
                 if self.surface_action_requires_pr(surface, id) =>
             {
                 match surface {
@@ -552,12 +527,6 @@ impl HostService {
             | UiAction::GithubSetAutoMerge { key, .. }
             | UiAction::GithubShip { key, .. }
             | UiAction::GithubFailedChecks { key } => key.as_str(),
-            UiAction::PrepareActions {
-                surface: ActionSurface::Row { key } | ActionSurface::Manager { key: Some(key) },
-            }
-            | UiAction::WarmPalette {
-                surface: ActionSurface::Row { key } | ActionSurface::Manager { key: Some(key) },
-            } => key.as_str(),
             _ => return None,
         };
         board?

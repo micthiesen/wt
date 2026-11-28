@@ -114,18 +114,31 @@ impl ClaudeMessenger {
             });
         }
         let tmux_name = self.sessions.tmux_name(target);
-        let _send_lock = match self.queue_for_turn(target, &tmux_name, cancel).await? {
-            Ok(lock) => lock,
-            Err(reason) => {
+        // Nothing is typed or submitted before the session is up, so an
+        // error until then is a send that provably did not happen. Callers
+        // treat an `Err` as possibly submitted and never retry it.
+        let unsent = |error: ClaudeSessionManagerError| ClaudeMessageOutcome::Failed {
+            reason: error.to_string(),
+            maybe_submitted: false,
+        };
+        let _send_lock = match self.queue_for_turn(target, &tmux_name, cancel).await {
+            Ok(Ok(lock)) => lock,
+            Ok(Err(reason)) => {
                 return Ok(ClaudeMessageOutcome::Failed {
                     reason,
                     maybe_submitted: false,
                 });
             }
+            Err(error) => return Ok(unsent(error)),
         };
-        let turn_ends = tokio::time::Instant::now() + self.human_wait;
         let text = stamp_sender(text, sender);
-        let (session, cold_started) = self.sessions.ensure(target, cancel).await?;
+        let (session, cold_started) = match self.sessions.ensure(target, cancel).await {
+            Ok(ensured) => ensured,
+            Err(error) => return Ok(unsent(error)),
+        };
+        // The person's time starts once there is a session to wait on: a
+        // cold start is not time they were given.
+        let turn_ends = tokio::time::Instant::now() + self.human_wait;
 
         let mut snapshot = Some(session.clone());
         let mut require_ready = session.status == RegistryStatus::Waiting;
@@ -955,6 +968,135 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn isolated_tmux(tmp: &Path) -> wt_tmux::TmuxClient {
+        wt_tmux::TmuxClient::new(
+            wt_platform::process::ProcessRunner::default(),
+            wt_tmux::TmuxServer::at(tmp.join("tmux.sock"))
+                .with_cwd(tmp)
+                .with_config_file("/dev/null"),
+        )
+    }
+
+    /// A session that cannot be brought up fails the send as not submitted.
+    /// An error would read as "may have been submitted" to every caller, and
+    /// a wake would be marked told and never sent again.
+    #[tokio::test]
+    async fn a_send_that_cannot_start_its_session_is_reported_as_not_submitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let paths =
+            super::super::ClaudePaths::new(tmp.path().join("home"), tmp.path().join("cache"));
+        let tmux = isolated_tmux(tmp.path());
+        let cancel = CancellationToken::new();
+        // The slot's name is held by a session recorded as another slot's.
+        tmux.create_session_with_options(
+            &wt_tmux::CreateSession {
+                name: "repo~review".into(),
+                cwd: cwd.clone(),
+                command: vec!["/bin/sleep".into(), "30".into()],
+                width: None,
+                height: None,
+            },
+            &[("@wt-harness-session-id", "another-thread")],
+            &cancel,
+        )
+        .await
+        .unwrap();
+        let sessions = ClaudeSessionManager::new(
+            super::super::ClaudeHarness::new(paths.clone()),
+            tmux.clone(),
+        )
+        .with_start_timeout(Duration::from_millis(300));
+        let messenger = ClaudeMessenger::new(sessions, ClaudeInjector::new(&paths.cache_dir));
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd,
+            managed_name: Some("review".into()),
+        };
+        let outcome = messenger
+            .send_with_sender(&target, "hello", None, &cancel)
+            .await;
+        let _ = tmux.kill_server(&cancel).await;
+        let outcome = outcome.expect("a start failure surfaced as an error");
+        assert!(
+            matches!(&outcome, ClaudeMessageOutcome::Failed { reason, maybe_submitted: false }
+                if reason.contains("left running")),
+            "{outcome:?}"
+        );
+    }
+
+    /// The human limit is the person's time, not the cold start's: a session
+    /// that takes longer than the limit to start and comes up waiting is
+    /// still given the whole limit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_human_limit_starts_once_the_session_is_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let cwd = tmp.path().join("repo");
+        let bin = tmp.path().join("bin");
+        for dir in [&cwd, &bin, &home.join(".claude/sessions")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        // Registers a second after it starts, already waiting on a person.
+        let fake = bin.join("claude");
+        std::fs::write(
+            &fake,
+            r##"#!/bin/sh
+id=
+name=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id|--resume) id="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+/bin/sleep 1
+printf '{"pid":%s,"sessionId":"%s","cwd":"%s","name":"%s","status":"waiting","waitingFor":"permission","startedAt":1,"updatedAt":2}\n' "$$" "$id" "$PWD" "$name" > "$HOME/.claude/sessions/$$.json.tmp"
+mv "$HOME/.claude/sessions/$$.json.tmp" "$HOME/.claude/sessions/$$.json"
+exec /bin/sleep 30
+"##,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = super::super::ClaudePaths::new(&home, tmp.path().join("cache"));
+        let tmux = isolated_tmux(tmp.path());
+        let sessions = ClaudeSessionManager::new(
+            super::super::ClaudeHarness::new(paths.clone()),
+            tmux.clone(),
+        )
+        .with_spawn_path(format!("{}:/usr/bin:/bin", bin.display()));
+        let limit = Duration::from_millis(700);
+        let messenger = ClaudeMessenger::new(sessions, ClaudeInjector::new(&paths.cache_dir))
+            .with_turn_limits(limit, Duration::from_secs(30));
+        let target = ClaudeSessionTarget {
+            slug: "repo".into(),
+            cwd,
+            managed_name: Some("review".into()),
+        };
+        let cancel = CancellationToken::new();
+        let outcome = messenger
+            .send_with_sender(&target, "hello", None, &cancel)
+            .await;
+        let registered = std::fs::read_dir(home.join(".claude/sessions"))
+            .unwrap()
+            .flatten()
+            .find_map(|entry| entry.metadata().ok()?.modified().ok());
+        let waited = registered.and_then(|at| at.elapsed().ok());
+        let _ = tmux.kill_server(&cancel).await;
+        let outcome = outcome.unwrap();
+        assert!(
+            matches!(&outcome, ClaudeMessageOutcome::Failed { reason, maybe_submitted: false }
+                if reason.contains("waiting on a human (permission)")),
+            "{outcome:?}"
+        );
+        let waited = waited.expect("the fake Claude never registered");
+        assert!(waited >= limit, "the person was given only {waited:?}");
     }
 
     #[tokio::test]

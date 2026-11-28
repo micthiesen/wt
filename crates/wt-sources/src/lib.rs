@@ -23,7 +23,6 @@ pub mod inventory;
 pub mod issue_source;
 pub mod local_source;
 pub mod mcp_events;
-pub mod palette_source;
 pub mod perf_source;
 pub mod review_requests;
 pub mod session_activity;

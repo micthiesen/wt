@@ -121,7 +121,7 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::PrepareReviewers { .. }
         | UiAction::PrepareReviewCheckout { .. }
         | UiAction::PrepareActions { .. }
-        | UiAction::WarmPalette { .. }
+        | UiAction::PrepareDevLogs { .. }
         | UiAction::PrepareSection { .. }
         | UiAction::PrepareDeleteSection { .. }
         | UiAction::Copy { .. }
@@ -136,9 +136,6 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::PrepareHarnesses { .. }
         | UiAction::PrepareStopTerminal { .. }
         | UiAction::DiscoverSessions { .. } => Effect::ReadOnly,
-        // A palette entry only opens its prompt; merge-when-ready is resolved
-        // into `GithubSetAutoMerge` before sending (`Model::resolve`).
-        UiAction::PrepareAction { .. } => Effect::ReadOnly,
         // Credentials and any resumed action are handled by the interactive
         // sign-in flow; there is no sign-in board mutation to confirm.
         UiAction::ManagedSignIn { .. } => Effect::ReadOnly,
@@ -245,8 +242,23 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
                 section: section.clone(),
             },
         ),
-        UiAction::Reorder { key, .. } => {
-            unprojected(host, key.as_deref(), "reordering", &[Domain::Metadata])
+        UiAction::Reorder {
+            key,
+            section,
+            down,
+            step,
+        } => {
+            let change = LayoutChange::reorder(section, *down, step);
+            match key {
+                // The controller stores the layout of every row, a remote
+                // host's included, so its own reads confirm the change from
+                // the first press; a row's host never does.
+                Some(key) => Effect::Mutation(UiMutation {
+                    target: Target::row(host.clone(), key.clone()),
+                    kind: change.into(),
+                }),
+                None => on_board(host, change),
+            }
         }
         UiAction::DeleteSection { .. } => {
             unprojected(host, None, "deleting section", &[Domain::Metadata])

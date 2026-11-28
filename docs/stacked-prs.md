@@ -150,7 +150,13 @@ below), so right after it the row shows the red conflict triangle instead.
 
 Conflicts are never auto-resolved by the **engine**: it aborts the rebase,
 leaves a `backup/restack-*` ref at the old tip, and names the failing branch
-(exit 3 at the CLI). From the TUI (`R`, or an auto-restack) the bail hands off
+(exit 3 at the CLI). The one exception is a resolution Git recorded itself.
+When the repository has `rerere.enabled` and a rebase stops on conflicts, wt
+continues it only if Git reported every conflicted path as settled from a
+recorded resolution (`Resolved '<path>' using previous resolution.` or the
+`Staged` form) and `git rerere remaining` lists nothing; otherwise it aborts
+as above. The restack log names the paths (`<branch>: reused recorded
+resolutions for <paths>`). From the TUI (`R`, or an auto-restack) the bail hands off
 automatically — the bundled `/restack` skill, which knows the full recovery
 loop, is sent to the failing worktree's harness session (cold-started if
 needed) with the bail context. The handoff is sent once: if delivery cannot be
