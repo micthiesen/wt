@@ -28,7 +28,7 @@ class AnsiScreenTests(unittest.TestCase):
             registered = {"target": "wt_sources::freshness", "fields": {
                 "message": "filesystem watches registered", "paths": 9}}
             baseline = {"target": "wt_sources::freshness", "fields": {
-                "message": "filesystem metadata invalidation", "git_changed": True}}
+                "message": "filesystem scan", "entries": 69, "changed": "[]"}}
             log.write_text(json.dumps(registered) + "\n")
             self.assertFalse(ui.startup_metadata_sample_seen([log]))
             log.write_text(json.dumps(registered) + "\n" + json.dumps(baseline)[:40])

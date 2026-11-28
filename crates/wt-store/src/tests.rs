@@ -1580,7 +1580,7 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
         "ordered":{"section":"S","order":9,"creationAfter":"x"},
         "elsewhere":{"section":"T","order":null,"creationAfter":"x"}},
         "remoteLayouts":{"@remote/server/far":{"section":"S","order":null,"creationAfter":"x"}}}"#;
-    let slot = json!({ "order": 4.0, "key": "x" });
+    let slot = json!({ "order": 4.0, "key": "x", "work": null });
     type Leave = fn(&mut Store);
     let leaves: [Leave; 5] = [
         // Its worktree long gone, the record is pruned.

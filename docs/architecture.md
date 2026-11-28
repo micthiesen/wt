@@ -586,7 +586,10 @@ An expiry while confirmed data still disagrees shows one notice.
   drawn order; every other band is numbered by its stored order,
   never-ordered units first. The TUI's projection applies the same rule to
   creation positions, so the next press of a burst resolves from the board
-  the read will bring. A unit
+  the read will bring. A row filed in a section but not drawn there (removed,
+  archived, landed, or remembered in a `creationSlot`, which keeps a local
+  row's status) stands in at the place it would be drawn for the rows created
+  after it. A unit
   is the rows of a stack drawn together in one section, derived from
   `BoardRow.stack_parent` and `stack_index`, which layout publishes;
   `DisplayPolicy.status_sort` mirrors `[ui] sort`. J/K selection follows the

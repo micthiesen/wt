@@ -380,11 +380,15 @@ def main() -> None:
             "#!" + sys.executable + "\n"
             "import os, pathlib, subprocess, sys\n"
             "args = sys.argv[1:]\n"
-            "def is_snapshot_ls_files(values):\n"
-            "    return values[:4] == ['ls-files', '--others', '--exclude-standard', '-z'] and values[4:] == ['--', '.']\n"
+            # The removal snapshot lists untracked paths with this status call
+            # (it used to be a separate ls-files walk). The board's own status
+            # read has --branch and no --untracked-files=all.
+            "def is_snapshot_untracked_scan(values):\n"
+            "    return values == ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--', '.']\n"
             "if args == ['--fixture-self-test']:\n"
-            "    assert is_snapshot_ls_files(['ls-files', '--others', '--exclude-standard', '-z', '--', '.'])\n"
-            "    assert not is_snapshot_ls_files(['ls-files', '--others', '--exclude-standard', '-z'])\n"
+            "    assert is_snapshot_untracked_scan(['status', '--porcelain=v2', '-z', '--untracked-files=all', '--', '.'])\n"
+            "    assert not is_snapshot_untracked_scan(['status', '--porcelain=v2', '--branch', '-z'])\n"
+            "    assert not is_snapshot_untracked_scan(['ls-files', '--others', '--exclude-standard', '-z', '--', '.'])\n"
             "    raise SystemExit(0)\n"
             f"result = subprocess.run([{real_git!r}, *args], capture_output=True)\n"
             "sys.stdout.buffer.write(result.stdout)\n"
@@ -394,7 +398,7 @@ def main() -> None:
             f"marker = pathlib.Path({str(late_marker)!r})\n"
             f"counter_path = pathlib.Path({str(ls_count_path)!r})\n"
             f"with pathlib.Path({str(git_trace)!r}).open('a') as trace: trace.write(repr((str(cwd), args)) + '\\n')\n"
-            "if result.returncode == 0 and cwd == target and is_snapshot_ls_files(args):\n"
+            "if result.returncode == 0 and cwd == target and is_snapshot_untracked_scan(args):\n"
             "    count = int(counter_path.read_text()) if counter_path.exists() else 0\n"
             "    count += 1\n"
             "    counter_path.write_text(str(count))\n"

@@ -764,11 +764,16 @@ fn job_dir(ctx: &AppContext) -> PathBuf {
 }
 
 fn new_id() -> String {
+    // Two removals accepted in one clock tick (a pasted "d y j d y") got the
+    // same id from the pid and the time alone: the second job file replaced
+    // the first, and the first worker was refused.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("{}-{:x}", std::process::id(), nanos)
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{:x}-{:x}", std::process::id(), nanos, serial)
 }
 
 fn now_string() -> String {
@@ -935,6 +940,13 @@ fn identities_conflict(expected: &str, actual: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_ids_made_in_one_clock_tick_differ() {
+        let ids: std::collections::BTreeSet<String> = (0..2000).map(|_| super::new_id()).collect();
+        assert_eq!(ids.len(), 2000);
+        assert!(ids.iter().all(|id| super::validate_job_id(id).is_ok()));
+    }
+
     use super::*;
     use wt_app_core::test_support::CommandFixture;
 

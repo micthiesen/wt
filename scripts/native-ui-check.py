@@ -234,7 +234,8 @@ def assert_idle_frames(screen, output):
 
 
 def startup_metadata_sample_seen(paths):
-    """The first watcher fingerprint deliberately invalidates startup Git.
+    """The watcher's first scan is its baseline: it reports no change, and
+    every later scan is compared with it.
 
     Visible rows and a quiet terminal can precede that scheduled first sample.
     Require its actual observation before starting the source-quiescence wait.
@@ -247,8 +248,8 @@ def startup_metadata_sample_seen(paths):
                 continue  # The writer may still be appending its last record.
             fields = record.get("fields", {})
             if (record.get("target") == "wt_sources::freshness"
-                    and fields.get("message") == "filesystem metadata invalidation"
-                    and fields.get("git_changed") is True):
+                    and fields.get("message") == "filesystem scan"
+                    and fields.get("changed") == "[]"):
                 return True
     return False
 

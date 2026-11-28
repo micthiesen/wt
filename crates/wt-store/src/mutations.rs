@@ -2893,10 +2893,13 @@ pub(crate) fn release_followers(state: &mut Value, leaving: &str) {
             continue;
         };
         if left["order"].is_number() || left.get("creationAfter").is_none() {
-            entry.insert(
-                CREATION_SLOT.to_owned(),
-                json!({ "order": left["order"].as_f64(), "key": leaving }),
-            );
+            let mut slot = json!({ "order": left["order"].as_f64(), "key": leaving });
+            // The status too, which status sort drew the row by. A remote
+            // row's is its host's to know, and is not kept here.
+            if layout_collection(leaving) == "slugs" {
+                slot["work"] = left["work"].clone();
+            }
+            entry.insert(CREATION_SLOT.to_owned(), slot);
         } else {
             // The row that left was at its creation position itself.
             entry.insert("creationAfter".to_owned(), left["creationAfter"].clone());

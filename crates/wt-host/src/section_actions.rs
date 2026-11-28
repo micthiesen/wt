@@ -2156,6 +2156,110 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// The store calls a removal makes for a local row: archived while it
+    /// runs, then recorded. The row's own record stays.
+    async fn remove(fixture: &wt_app_core::test_support::CommandFixture, key: &str) {
+        let (key, trunk) = (key.to_owned(), fixture.ctx.config.branch.base.clone());
+        fixture
+            .ctx
+            .database
+            .call(move |store| {
+                store.set_archived(&key, true)?;
+                store.reparent_base_references(&key, &trunk, Some(&key))?;
+                store.record_removed_worktrees(
+                    &[wt_store::RemovedWorktree {
+                        slug: key.clone(),
+                        branch: key.clone(),
+                        removed_at: "2026-11-28T00:00:00.000Z".into(),
+                        work: None,
+                        automations_paused: None,
+                        extra: Default::default(),
+                    }],
+                    1_795_824_000_000,
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Several rows of a section were created from the board and never
+    /// ordered, some after each other, some after rows that are removed one
+    /// by one. Two of them come to follow removed rows that would both be
+    /// drawn behind the same remaining row. No removal may change the order
+    /// of the rows that remain.
+    #[tokio::test]
+    async fn removing_rows_keeps_the_order_of_the_rows_created_after_them() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        for sort in [wt_config::UiSort::Manual, wt_config::UiSort::Status] {
+            for ordered in [true, false] {
+                let said = format!("{sort:?}, rows ordered: {ordered}");
+                let placed = |key: &str, order: f64| Fabricated {
+                    order: ordered.then_some(order),
+                    ..Fabricated::new(key, "S")
+                };
+                let fresh = |key: &str, after: &str| Fabricated {
+                    created_after: Some(Some(after.to_owned())),
+                    ..Fabricated::new(key, "S")
+                };
+                let rows = [
+                    placed("a01", 1.0),
+                    placed("a02", 2.0),
+                    fresh("F-dd", "a02"),
+                    placed("a03", 3.0),
+                    fresh("F-ee", "a03"),
+                    placed("a04", 4.0),
+                    fresh("F-bb", "a04"),
+                    fresh("F-cc", "F-bb"),
+                    fresh("F-ff", "F-cc"),
+                    placed("a07", 7.0),
+                    placed("a08", 8.0),
+                ];
+                let mut listed = fabricate(&fixture, &rows).await;
+                let mut expected = drawn(&laid_out(&fixture, &listed, sort).await, "S");
+                assert_eq!(
+                    expected,
+                    [
+                        "a01", "a02", "F-dd", "a03", "F-ee", "a04", "F-bb", "F-cc", "F-ff", "a07",
+                        "a08"
+                    ],
+                    "{said}"
+                );
+                // Some also drop the removed row's record, as a re-created
+                // slug does: what followed it is told where it was.
+                for (gone, forgotten) in [
+                    ("a02", false),
+                    ("a03", false),
+                    ("a04", true),
+                    ("F-cc", false),
+                    ("a07", true),
+                    ("a01", true),
+                ] {
+                    remove(&fixture, gone).await;
+                    if forgotten {
+                        let gone = gone.to_owned();
+                        fixture
+                            .ctx
+                            .database
+                            .call(move |store| Ok(store.clear_slug_state(&gone)?))
+                            .await
+                            .unwrap();
+                    }
+                    listed.retain(|row| row.key != gone);
+                    expected.retain(|key| key != gone);
+                    assert_eq!(
+                        drawn(&laid_out(&fixture, &listed, sort).await, "S"),
+                        expected,
+                        "after removing {gone}, {said}"
+                    );
+                }
+            }
+        }
+        fixture.close().await.unwrap();
+    }
+
     /// The same sections on every run.
     struct Dice(u64);
 
@@ -2323,6 +2427,7 @@ mod tests {
             .await
             .unwrap();
         let (mut passes, mut crossings, mut refused, mut drifted) = (0, 0, 0, 0);
+        let mut removals = 0;
         let layout = |board: &wt_tui::Board| {
             FABRICATED_SECTIONS.map(|section| (section, drawn(board, section)))
         };
@@ -2349,6 +2454,62 @@ mod tests {
             }
             let mut seen = shown;
             for press in 0..if drift { 1 } else { 4 } {
+                // A removal between presses, of a local row that is not part
+                // of a stack: the rows that remain keep their order. (A
+                // stack's rows are drawn together because of the removed
+                // row; a remote row's status is not the controller's.)
+                if !drift && dice.chance(30) {
+                    let board = laid_out(&fixture, &listed, sort).await;
+                    let alone: Vec<String> = board
+                        .rows
+                        .iter()
+                        .filter(|row| row.host.is_none() && row.stack_parent.is_none())
+                        .filter(|row| {
+                            !board
+                                .rows
+                                .iter()
+                                .any(|other| other.stack_parent.as_deref() == Some(&row.key))
+                        })
+                        .map(|row| row.key.clone())
+                        .collect();
+                    if !alone.is_empty() {
+                        let gone = alone[dice.roll(alone.len() as u64) as usize].clone();
+                        let before = stored(&fixture).await;
+                        remove(&fixture, &gone).await;
+                        // Its record is dropped too, as when the slug is
+                        // created again. Not that of a row at its creation
+                        // position: what followed it then follows what it
+                        // followed, among that row's other followers.
+                        let entry = &before["slugs"][&gone];
+                        let forgotten = dice.chance(50)
+                            && (entry["order"].is_number() || entry.get("creationAfter").is_none());
+                        if forgotten {
+                            let gone = gone.clone();
+                            fixture
+                                .ctx
+                                .database
+                                .call(move |store| Ok(store.clear_slug_state(&gone)?))
+                                .await
+                                .unwrap();
+                        }
+                        listed.retain(|row| row.key != gone);
+                        let after = laid_out(&fixture, &listed, sort).await;
+                        let mut expected = layout(&board);
+                        for (_, keys) in &mut expected {
+                            keys.retain(|key| *key != gone);
+                        }
+                        assert_eq!(
+                            layout(&after),
+                            expected,
+                            "seed {seed} press {press}: removed {gone} (forgotten: {forgotten}) under {sort:?}
+stored {}",
+                            before["slugs"],
+                        );
+                        removals += 1;
+                        host = after.clone();
+                        seen = after;
+                    }
+                }
                 let drawn_now = layout(&seen);
                 let candidates: Vec<(&str, &String)> = drawn_now
                     .iter()
@@ -2419,8 +2580,12 @@ mod tests {
         }
         // Enough of each went through for the comparisons to mean something.
         assert!(
-            passes > 800 && crossings > 250 && drifted > 100 && refused < passes / 10,
-            "{passes} passes, {crossings} crossings, {drifted} after a status change, {refused} refused"
+            passes > 800
+                && crossings > 250
+                && drifted > 100
+                && removals > 300
+                && refused < passes / 10,
+            "{passes} passes, {crossings} crossings, {drifted} after a status change, {removals} removals, {refused} refused"
         );
         fixture.close().await.unwrap();
     }

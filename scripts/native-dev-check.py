@@ -73,7 +73,7 @@ def main() -> None:
         (main_clone / "tracked.txt").write_text("fixture\n", encoding="utf-8")
         git(["git", "-C", str(main_clone), "add", "tracked.txt"], cwd=scratch, env=git_env)
         git(["git", "-C", str(main_clone), "commit", "-m", "fixture"], cwd=scratch, env=git_env)
-        worktrees = ["dev-one", "dev-two"]
+        worktrees = ["dev-one", "dev-two", "dev-three"]
         for slug in worktrees:
             git(["git", "-C", str(main_clone), "worktree", "add", "-b", f"fixture/{slug}", str(worktree_root / slug), "main"], cwd=scratch, env=git_env)
 
@@ -323,13 +323,42 @@ def main() -> None:
             assert "reset_command was not run" in reset.stderr, reset.stderr
             assert not (scratch / "reset-ran").exists(), "reset hook ran after stop hook failure"
 
+            def dev_session(slug: str) -> bool:
+                return subprocess.run(
+                    ["tmux", "-L", socket, "has-session", "-t", f"={slug}-dev"],
+                    env=env,
+                    capture_output=True,
+                ).returncode == 0
+
             # Removal must stop the supervised server under the lifecycle
-            # lock, and a failed teardown must leave the checkout intact.
+            # lock, and a failed teardown must leave the checkout intact
+            # unless the removal is forced.
             wt("dev", "start", "dev-two")
-            failed_remove = wt("rm", "--yes", "--force", "dev-two", expected=1)
+            refused = wt("rm", "--yes", "dev-two", expected=1)
             assert_process_reaped(pid_file)
+            assert not dev_session("dev-two"), "refused removal left the dev session running"
             assert (worktree_root / "dev-two").is_dir(), "failed teardown removed the checkout"
-            assert "stop_command failed" in failed_remove.stderr, failed_remove.stderr
+            assert "stop_command failed, so nothing was removed" in refused.stderr, refused.stderr
+            # The advice to force is given once, in the hook's own terms.
+            assert refused.stderr.count("wt rm dev-two --force") == 1, refused.stderr
+            assert "discarding work" not in refused.stderr, refused.stderr
+            listed = wt("ls").stdout
+            assert "dev-two" in listed, listed
+
+            # --force gets past the failing hook, says so, and leaves nothing
+            # of the server behind: no process, session, or held slot.
+            wt("dev", "start", "dev-two")
+            forced = wt("rm", "--yes", "--force", "dev-two")
+            assert_process_reaped(pid_file)
+            assert not (worktree_root / "dev-two").exists(), "forced removal left its checkout"
+            assert (
+                "stop_command failed and the worktree was removed anyway" in forced.stderr
+            ), forced.stderr
+            assert "may be left behind" in forced.stderr, forced.stderr
+            assert not dev_session("dev-two"), "forced removal left its dev session running"
+            slots = json.loads(wt("dev", "status", "--all", "--json").stdout)
+            assert slots["slots"]["holders"] == [] and slots["slots"]["free"] == 1, slots
+            assert all(row["slug"] != "dev-two" for row in slots["worktrees"]), slots
             settings.pop("stop_command")
             write_config()
             wt("dev", "start", "dev-one")
@@ -348,11 +377,11 @@ def main() -> None:
             settings.pop("reset_command", None)
             settings.pop("health_command", None)
             write_config()
-            failed = wt("dev", "start", "dev-two", "--wait", "--timeout", "30", expected=1)
+            failed = wt("dev", "start", "dev-three", "--wait", "--timeout", "30", expected=1)
             assert "crashed" in failed.stderr or "not ready" in failed.stderr, failed.stderr
-            status = json.loads(wt("dev", "status", "dev-two", "--json").stdout)
+            status = json.loads(wt("dev", "status", "dev-three", "--json").stdout)
             assert status["status"]["crashed"] is True, status
-            logs = wt("dev", "logs", "dev-two").stdout
+            logs = wt("dev", "logs", "dev-three").stdout
             assert "fixture-failure" in logs or "exited" in logs, logs
             print(f"native dev checks passed; SIGTERM queue cancellation {elapsed * 1000:.1f}ms; allocated port {port}")
         finally:

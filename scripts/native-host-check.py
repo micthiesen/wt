@@ -21,7 +21,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROTOCOL = 4
+PROTOCOL = 6
 
 
 def run(argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float = 20) -> str:

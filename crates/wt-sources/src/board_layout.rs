@@ -347,65 +347,130 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 .unwrap_or(INBOX);
             stored.is_object() && filed == key.as_str()
         };
-        // The unit an anchored unit is drawn behind; `None` is the top. The
-        // row it was created after may no longer be drawn here. Archived,
-        // landed, being removed or removed, it is still filed here, and the
-        // unit stays where that row would be drawn. Filed elsewhere or
-        // forgotten, the store kept where it was (`creationSlot`).
-        let follows = |root: usize| {
-            let mut entry = &state["slugs"][&board.rows[root].key];
-            // Bounded, so rows that name each other end at the top.
-            for _ in 0..=board.rows.len() {
-                let named = entry["creationAfter"].as_str();
-                if let Some(drawn) = named.and_then(|after| {
-                    indices
-                        .iter()
-                        .copied()
-                        .find(|&index| board.rows[index].key == after)
-                }) {
-                    return Some(anchor_of(drawn));
-                }
-                let Some(slug) = named.filter(|&after| stored_here(after)) else {
-                    let slot = &entry["creationSlot"];
-                    return slot.is_object().then_some(()).and_then(|()| {
-                        behind(
-                            None,
-                            slot["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
-                            slot["key"].as_str().unwrap_or_default(),
-                        )
-                    });
-                };
-                let stored = &state["slugs"][slug];
+        // What each anchored unit is drawn behind. The row it was created
+        // after may no longer be drawn here. Archived, landed, being removed
+        // or removed, it is still filed here; filed elsewhere or forgotten,
+        // the store kept where it was (`creationSlot`). Such a row stands
+        // in as a unit of no rows, where it would be drawn, so that the
+        // units that followed it, and the ones that follow those, keep
+        // their order among everything else when it goes.
+        let first_stand_in = board.rows.len();
+        let mut stand_ins: Vec<String> = Vec::new();
+        let mut stand_in = |name: String| {
+            let known = stand_ins.iter().position(|known| *known == name);
+            let new = known.is_none();
+            if new {
+                stand_ins.push(name);
+            }
+            (first_stand_in + known.unwrap_or(stand_ins.len() - 1), new)
+        };
+        // Stand-ins drawn by their own stored order: status, order, name.
+        let mut ordered_stand_ins: Vec<(usize, Option<u8>, f64, &str)> = Vec::new();
+        // Anchored units and stand-ins: what they sort by among those that
+        // follow the same unit, themselves, and what they follow.
+        let mut links: Vec<((u8, &str), usize, Option<usize>)> = Vec::new();
+        let status_of = |slug: &str| {
+            if sort == UiSort::Status {
+                rank(slug)
+            } else {
+                0
+            }
+        };
+        let mut unresolved: Vec<(usize, &str)> = anchored
+            .iter()
+            .rev()
+            .map(|&root| (root, board.rows[root].key.as_str()))
+            .collect();
+        while let Some((id, slug)) = unresolved.pop() {
+            let entry = &state["slugs"][slug];
+            let named = entry["creationAfter"].as_str();
+            let drawn = named.and_then(|after| {
+                indices
+                    .iter()
+                    .copied()
+                    .find(|&index| board.rows[index].key == after)
+            });
+            let follows = if let Some(drawn) = drawn {
+                Some(anchor_of(drawn))
+            } else if let Some(after) = named.filter(|&after| stored_here(after)) {
+                let (follows, new) = stand_in(after.to_owned());
+                let stored = &state["slugs"][after];
                 let by_status =
                     sort == UiSort::Status && parse_work_status(&stored["work"]).is_some();
-                if stored.get("creationAfter").is_some()
+                let anchored = stored.get("creationAfter").is_some()
                     && !stored["order"].is_number()
-                    && !by_status
-                {
-                    entry = stored;
-                    continue;
+                    && !by_status;
+                if new && anchored {
+                    unresolved.push((follows, after));
+                } else if new {
+                    ordered_stand_ins.push((
+                        follows,
+                        Some(status_of(after)),
+                        stored["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
+                        after,
+                    ));
                 }
-                return behind(
-                    Some(if sort == UiSort::Status {
-                        rank(slug)
+                Some(follows)
+            } else if entry["creationSlot"].is_object() {
+                let slot = &entry["creationSlot"];
+                let name = slot["key"].as_str().unwrap_or_default();
+                let (follows, new) = stand_in(format!("\0{name}"));
+                if new {
+                    // The slot of a remote row does not say its status.
+                    let status = if sort != UiSort::Status {
+                        Some(0)
                     } else {
-                        0
-                    }),
-                    stored["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
-                    slug,
-                );
+                        slot.get("work")
+                            .map(|work| work_record_rank(parse_work_status(work).as_ref()))
+                    };
+                    ordered_stand_ins.push((
+                        follows,
+                        status,
+                        slot["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
+                        name,
+                    ));
+                }
+                Some(follows)
+            } else {
+                None
+            };
+            let sorts_by = if id < first_stand_in {
+                (unit(id).0, unit(id).2)
+            } else {
+                (status_of(slug), slug)
+            };
+            if follows != Some(id) {
+                links.push((sorts_by, id, follows));
             }
-            None
-        };
-        let positions: Vec<(usize, Option<usize>)> = anchored
+        }
+        links.sort_by(|a, b| a.0.cmp(&b.0));
+        let positions: Vec<(usize, Option<usize>)> = links
             .iter()
-            .map(|&root| (root, follows(root)))
-            .filter(|&(root, anchor)| anchor != Some(root))
+            .map(|&(_, id, follows)| (id, follows))
             .collect();
+        // Each ordered stand-in goes behind the unit it would be drawn
+        // behind, several of them there in their own order.
+        let mut behind_units: Vec<(Option<usize>, f64, &str, usize)> = ordered_stand_ins
+            .iter()
+            .map(|&(id, status, order, name)| (behind(status, order, name), order, name, id))
+            .collect();
+        behind_units.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.2.cmp(b.2)));
+        let stand_ins_behind = |unit: Option<usize>| {
+            behind_units
+                .iter()
+                .filter(move |stand_in| stand_in.0 == unit)
+                .map(|stand_in| stand_in.3)
+        };
+        let mut with_stand_ins: Vec<usize> = stand_ins_behind(None).collect();
+        for &root in &units {
+            with_stand_ins.push(root);
+            with_stand_ins.extend(stand_ins_behind(Some(root)));
+        }
+        let mut units = with_stand_ins;
         apply_creation_positions(&mut units, &positions);
         let mut placed = Vec::with_capacity(indices.len());
         for root in units {
-            placed.extend(members_by_unit[&root].iter().copied());
+            placed.extend(members_by_unit.get(&root).into_iter().flatten().copied());
         }
         *indices = placed;
     }
