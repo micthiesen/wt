@@ -254,6 +254,7 @@ fn panic_message_ref(payload: &Box<dyn std::any::Any + Send>) -> &str {
 impl<R: KeyedReader> Engine<R> {
     fn absorb(&mut self, demand: Demand, now: Instant) {
         let burst = demand.whole == Some(Request::Refresh)
+            && !demand.recheck
             && self
                 .last_refresh
                 .is_some_and(|at| now.duration_since(at) < REFRESH_BURST);
@@ -1126,6 +1127,41 @@ mod tests {
             19,
             "the three reads in flight are repeated, the five not yet started are not"
         );
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recheck_that_arrives_with_a_refresh_is_not_folded_into_the_burst() {
+        let scope = TaskScope::new();
+        let fake = Fake::new(&["a", "b", "c"]);
+        let source = start(&scope, &fake);
+        loaded(&source).await;
+        assert_eq!(fake.reads().len(), 3);
+        // Within the burst of the first refresh, another refresh and an
+        // unrouted change are asked for before the leaf looks: one demand,
+        // whose strongest request is the refresh.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let changed = Stamp::now();
+        source.refresh();
+        source.request(Request::Recheck);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            source.subscribe().wait_for(|snapshot| {
+                snapshot.domains()[&Domain::Git]
+                    .observed()
+                    .at_or_after(&changed)
+                    == Some(true)
+            }),
+        )
+        .await
+        .map(|_| ())
+        .expect("the change was folded into the refresh burst and never read");
+        assert_eq!(fake.reads().len(), 6);
+        // The refresh alone, still within the burst, reads nothing.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        source.refresh();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(fake.reads().len(), 6);
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 

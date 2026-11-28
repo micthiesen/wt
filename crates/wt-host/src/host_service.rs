@@ -152,6 +152,17 @@ impl HostService {
                 // A mutation that failed partway may still have changed
                 // something; re-read what it touches.
                 self.refresh_after(&effect, &UiReply::default());
+                // A stale refusal says the board is behind for this row, and
+                // the person is looking at the reopened menu now: GitHub is
+                // asked for the row's branch itself, not the next snapshot.
+                if wt_app_core::host_errors::error_reply(&error).stale
+                    && effect.domains().contains(&Domain::Github)
+                    && let (Some(rows), Some(board)) = (effect.rows(), snapshot.data())
+                {
+                    for row in board.rows.iter().filter(|row| rows.contains(&row.key)) {
+                        self.sources.github_refresh.refresh_live_branch(&row.branch);
+                    }
+                }
                 return Err(error);
             }
         };
@@ -246,6 +257,17 @@ impl HostService {
                 wt_app_core::harness::picker_slug(&context, key.as_deref(), *target).await
             {
                 self.queue_session_discovery(&context, &slug);
+            }
+            return Ok(UiReply::default());
+        }
+        // Background read behind "no PR for this branch": one direct read of
+        // that branch, which the board then shows. No reply.
+        if let UiAction::ReadPullRequest { key } = &command {
+            if let Some(row) = snapshot
+                .data()
+                .and_then(|board| board.rows.iter().find(|row| row.key == *key))
+            {
+                self.sources.github_refresh.refresh_live_branch(&row.branch);
             }
             return Ok(UiReply::default());
         }
@@ -572,6 +594,16 @@ mod tests {
                 error.to_string().contains("built from the board"),
                 "{error:#}"
             );
+        }
+        // The read behind "no PR for this branch" asks GitHub for that
+        // branch and answers nothing, for a listed row and for one that
+        // has gone.
+        for key in ["one", "gone"] {
+            let reply = host
+                .execute(UiAction::ReadPullRequest { key: key.into() })
+                .await
+                .unwrap();
+            assert!(reply.message.is_empty() && !reply.failed && reply.outcome.is_none());
         }
         // Content a host fetches is asked of it, whatever the board lists.
         for action in [

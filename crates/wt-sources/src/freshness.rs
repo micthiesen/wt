@@ -457,19 +457,41 @@ struct Router {
 /// nothing), each of which would otherwise read every checkout again.
 const REWRITTEN_FILES: [&str; 2] = ["config", "packed-refs"];
 
-/// What those files held when last looked at, per watch root.
+/// The largest of those files that is read to compare. A larger one (packed
+/// refs of a very large repository) always counts as changed.
+const REWRITTEN_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// What those files held when last read, for the Git directories among the
+/// watch roots. Only a file that was read both times can compare equal: a
+/// path that is missing, unreadable, too large or not a regular file has no
+/// entry, and a change to it is always a change.
 #[derive(Default)]
 struct Contents {
-    roots: BTreeSet<PathBuf>,
-    hashes: BTreeMap<PathBuf, Option<u64>>,
+    /// Watch roots already looked at, and those of them that are Git
+    /// directories. A working tree may hold a `config` of its own (a
+    /// directory, in many projects); that is never one of these files.
+    examined: BTreeSet<PathBuf>,
+    git_dirs: BTreeSet<PathBuf>,
+    hashes: BTreeMap<PathBuf, u64>,
 }
 
 fn content_hash(path: &Path) -> Option<u64> {
     use std::hash::{Hash, Hasher};
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > REWRITTEN_LIMIT {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut hasher);
     Some(hasher.finish())
+}
+
+/// Whether a watch root is a Git directory (a repository's own, or a linked
+/// checkout's under `worktrees/`), as opposed to a working tree.
+fn is_git_dir(root: &Path) -> bool {
+    root.join("HEAD").is_file()
+        && (root.join("objects").is_dir() || root.join("commondir").is_file())
 }
 
 impl Router {
@@ -477,17 +499,31 @@ impl Router {
     /// are sampled: a change after this differs from it.
     async fn baseline(self: Arc<Self>, roots: Vec<PathBuf>) {
         let _ = tokio::task::spawn_blocking(move || {
-            let Ok(mut contents) = self.contents.lock() else {
-                return;
+            let new: Vec<PathBuf> = match self.contents.lock() {
+                Ok(mut contents) => roots
+                    .into_iter()
+                    .filter(|root| contents.examined.insert(root.clone()))
+                    .collect(),
+                Err(_) => return,
             };
-            for root in roots {
-                if !contents.roots.insert(root.clone()) {
-                    continue;
-                }
-                for name in REWRITTEN_FILES {
-                    let path = root.join(name);
-                    let hash = content_hash(&path);
-                    contents.hashes.insert(path, hash);
+            // Files are read with the lock released: it is also taken where
+            // changes are routed.
+            let read: Vec<(PathBuf, Vec<(PathBuf, u64)>)> = new
+                .into_iter()
+                .filter(|root| is_git_dir(root))
+                .map(|root| {
+                    let hashes = REWRITTEN_FILES
+                        .iter()
+                        .map(|name| root.join(name))
+                        .filter_map(|path| content_hash(&path).map(|hash| (path, hash)))
+                        .collect();
+                    (root, hashes)
+                })
+                .collect();
+            if let Ok(mut contents) = self.contents.lock() {
+                for (root, hashes) in read {
+                    contents.git_dirs.insert(root);
+                    contents.hashes.extend(hashes);
                 }
             }
         })
@@ -504,17 +540,24 @@ impl Router {
         {
             return false;
         }
-        let Ok(mut contents) = self.contents.lock() else {
-            return false;
-        };
-        if !path
-            .parent()
-            .is_some_and(|parent| contents.roots.contains(parent))
-        {
+        let in_git_dir = self.contents.lock().is_ok_and(|contents| {
+            path.parent()
+                .is_some_and(|parent| contents.git_dirs.contains(parent))
+        });
+        if !in_git_dir {
             return false;
         }
         let now = content_hash(path);
-        contents.hashes.insert(path.to_path_buf(), now) == Some(now)
+        let Ok(mut contents) = self.contents.lock() else {
+            return false;
+        };
+        match now {
+            Some(now) => contents.hashes.insert(path.to_path_buf(), now) == Some(now),
+            None => {
+                contents.hashes.remove(path);
+                false
+            }
+        }
     }
 
     fn invalidate(&self, paths: &[PathBuf]) {
@@ -2651,6 +2694,15 @@ mod tests {
         let git_dir = std::fs::canonicalize(root.path()).unwrap();
         let config = git_dir.join("config");
         std::fs::write(&config, "[branch \"main\"]\n\tremote = origin\n").unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        // A working tree with a `config` directory of its own, and a file
+        // that merely shares the name.
+        let checkout = git_dir.join("checkout");
+        std::fs::create_dir_all(checkout.join("config")).unwrap();
+        let named = git_dir.join("named");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("config"), "same").unwrap();
         let scope = TaskScope::new();
         fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
             SourceSpec {
@@ -2674,7 +2726,19 @@ mod tests {
             layout: RwLock::default(),
             contents: Mutex::default(),
         });
-        router.clone().baseline(vec![git_dir.clone()]).await;
+        router
+            .clone()
+            .baseline(vec![git_dir.clone(), checkout.clone(), named.clone()])
+            .await;
+        // Only files in a Git directory are ever compared. A directory named
+        // `config` in a checkout changes when a file in it is added, and
+        // that is the only signal there is.
+        for _ in 0..2 {
+            router.invalidate(&[checkout.join("config")]);
+            assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+            router.invalidate(&[named.join("config")]);
+            assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        }
         // What \`git branch --force\` does on every origin fetch: a new file
         // with the bytes the old one had.
         let rewrite = |bytes: &str| {
@@ -2694,6 +2758,20 @@ mod tests {
         assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
         router.invalidate(std::slice::from_ref(&config));
         assert!(git_publisher.take_demand().whole.is_none());
+        // A file that is gone, unreadable or too large to compare is always
+        // a change, however often it is reported.
+        std::fs::remove_file(&config).unwrap();
+        for _ in 0..2 {
+            router.invalidate(std::slice::from_ref(&config));
+            assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        }
+        let packed = git_dir.join("packed-refs");
+        let large = std::fs::File::create(&packed).unwrap();
+        large.set_len(REWRITTEN_LIMIT + 1).unwrap();
+        for _ in 0..2 {
+            router.invalidate(std::slice::from_ref(&packed));
+            assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        }
         // A file with no baseline is always a change.
         let elsewhere = tempfile::tempdir().unwrap();
         let other = elsewhere.path().join("config");

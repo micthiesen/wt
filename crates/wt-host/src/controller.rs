@@ -552,6 +552,7 @@ fn action_name(action: &wt_tui::UiAction) -> Cow<'static, str> {
         A::SetNotify { .. } => "save notification",
         A::PrepareSessions { .. } => "prepare session picker",
         A::DiscoverSessions { .. } => "discover sessions",
+        A::ReadPullRequest { .. } => "read pull request",
         A::PrepareHarnesses { .. } => "prepare harness picker",
         A::PrepareStopTerminal { .. } => "prepare session stop",
         A::GithubFailedChecks { .. } => "load failed checks",
@@ -659,7 +660,8 @@ fn action_target(action: &wt_tui::UiAction) -> Option<String> {
         | A::ToggleArchive { key, .. }
         | A::MoveSection { key, .. }
         | A::OpenEditor { key }
-        | A::OpenUrl { key, .. } => key.clone(),
+        | A::OpenUrl { key, .. }
+        | A::ReadPullRequest { key } => key.clone(),
         A::Session { key, .. }
         | A::PrepareSessions { key, .. }
         | A::DiscoverSessions { key, .. }

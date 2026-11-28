@@ -348,15 +348,24 @@ mod tests {
                 .is_err()
         );
         assert!(socket.exists());
-        prepare_worker_socket_with_probe(
-            root.path(),
-            &socket,
-            &cancel,
-            aged_probe_time(),
-            connect_only,
-        )
-        .await
-        .unwrap();
+        // A child another test is forking holds a copy of the dropped
+        // listener until its exec, and answers the probe until then.
+        let mut reclaimed = Ok(());
+        for _ in 0..40 {
+            reclaimed = prepare_worker_socket_with_probe(
+                root.path(),
+                &socket,
+                &cancel,
+                aged_probe_time(),
+                connect_only,
+            )
+            .await;
+            if reclaimed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        reclaimed.unwrap();
         assert!(!socket.exists());
         // The replacement can bind immediately without any sshd unlink policy.
         let replacement = tokio::net::UnixListener::bind(&socket).unwrap();

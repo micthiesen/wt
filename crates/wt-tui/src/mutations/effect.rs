@@ -134,7 +134,8 @@ fn effect(action: &UiAction, host: Option<String>, board: &Board) -> Effect {
         | UiAction::PrepareSessions { .. }
         | UiAction::PrepareHarnesses { .. }
         | UiAction::PrepareStopTerminal { .. }
-        | UiAction::DiscoverSessions { .. } => Effect::ReadOnly,
+        | UiAction::DiscoverSessions { .. }
+        | UiAction::ReadPullRequest { .. } => Effect::ReadOnly,
         // Credentials and any resumed action are handled by the interactive
         // sign-in flow; there is no sign-in board mutation to confirm.
         UiAction::ManagedSignIn { .. } => Effect::ReadOnly,

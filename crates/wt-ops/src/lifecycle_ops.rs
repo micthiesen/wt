@@ -1024,10 +1024,12 @@ async fn plan_row(
         extra.insert("prNumber".into(), serde_json::json!(pr.number));
         extra.insert("prUrl".into(), serde_json::json!(pr.url));
         extra.insert("prState".into(), serde_json::json!(pr.state));
-        // The merge commit is where the work went whenever the proof rests
-        // on the merged pull request: merged at this HEAD, at a head this
-        // one is a copy of, or with every patch here already in the base.
-        if (pr_landed || landing.copy_of_merged_head || landing.patch_merged)
+        // The merge commit is where the work went when the pull request
+        // merged at this HEAD or at a head this one is a copy of. Matching
+        // patches prove less: commits added after the merge may have reached
+        // the base another way, later than the merge commit, and a watch or
+        // an owed check following it would come due before they shipped.
+        if (pr_landed || landing.copy_of_merged_head)
             && pr.state == "MERGED"
             && let Some(merge_oid) = &pr.merge_commit_oid
         {
@@ -1054,8 +1056,8 @@ async fn plan_row(
         base_tip.map(|tip| Box::new((format!("refs/heads/{}", ctx.config.branch.base), tip)));
     // Landed by Git alone, the base contains HEAD itself: that is the commit
     // a watch on the removed worktree follows to a stage. A landing proven
-    // only by matching patches, with no merge commit recorded above, names
-    // no commit: none of the branch's own is in the base.
+    // only by matching patches names no commit: none of the branch's own
+    // is in the base, and the merge commit need not hold all of them.
     if landing.local_merged && !revision.head.is_empty() {
         removed_snapshot.extra.insert(
             wt_store::LANDING_COMMIT_OID.into(),
@@ -1671,10 +1673,12 @@ mod tests {
         assert!(landed.landed);
         assert!(landed.hazards.is_empty(), "{:?}", landed.hazards);
         assert_eq!(landed.revision.published_base.as_ref().unwrap().1, tip);
-        // The base holds the patches, not this rebased HEAD: the merge
-        // commit is the only commit that says where the work went.
+        // The base holds the patches, not this rebased HEAD, and the merge
+        // commit is not shown to carry all of them: the record names no
+        // commit for a stage watch or an owed check to follow early.
         let record = &landed.removed_snapshot.extra;
-        assert_eq!(record["prMergeCommitOid"], "f".repeat(40));
+        assert_eq!(record["gitState"], "merged");
+        assert!(!record.contains_key("prMergeCommitOid"));
         assert!(!record.contains_key(wt_store::LANDING_COMMIT_OID));
         assert!(
             row_landings(
@@ -2777,6 +2781,16 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("skipped the dev server's stop_command")),
+            "{:?}",
+            removed.warnings
+        );
+        // Nothing listens from a directory that does not exist: no warning
+        // about failing to look there.
+        assert!(
+            !removed
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("reap listeners")),
             "{:?}",
             removed.warnings
         );

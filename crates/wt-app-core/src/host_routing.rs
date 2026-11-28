@@ -69,6 +69,7 @@ pub fn controller_owned(action: &UiAction) -> bool {
         | UiAction::GithubFailedChecks { .. }
         | UiAction::PrepareSessions { .. }
         | UiAction::DiscoverSessions { .. }
+        | UiAction::ReadPullRequest { .. }
         | UiAction::PrepareStopTerminal { .. }
         | UiAction::StopTerminal { .. }
         | UiAction::StopSession { .. }
@@ -185,7 +186,7 @@ fn visit_keys(
         | UiAction::GithubSetAutoMerge { key, .. }
         | UiAction::GithubShip { key, .. }
         | UiAction::GithubFailedChecks { key } => visit(key)?,
-        UiAction::PrepareDevLogs { key } => visit(key)?,
+        UiAction::PrepareDevLogs { key } | UiAction::ReadPullRequest { key } => visit(key)?,
         UiAction::PrepareActions { surface } | UiAction::RunAction { surface, .. } => match surface
         {
             ActionSurface::Row { key } => visit(key)?,

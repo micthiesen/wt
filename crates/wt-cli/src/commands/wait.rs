@@ -292,6 +292,34 @@ fn outlasts(
     })
 }
 
+/// What to refuse a wait for before it starts: a condition that cannot
+/// hold within the timeout where all must hold, and with `--any` only when
+/// none of them can, since one that can is worth waiting for.
+fn refusal(late: Vec<Option<String>>, any: bool) -> Option<String> {
+    if any && late.iter().any(Option::is_none) {
+        return None;
+    }
+    late.into_iter().flatten().next()
+}
+
+/// Run one pass of reads, but no further than the deadline: the timeout
+/// ends the wait at its instant, with what was last read, not once a pass
+/// that was due or under way at that moment has finished. The `first` pass
+/// always completes, so even a wait shorter than a pass judges real facts.
+async fn within(left: Duration, first: bool, pass: impl Future<Output = ()>) {
+    if first {
+        return pass.await;
+    }
+    if left.is_zero() {
+        return;
+    }
+    tokio::select! {
+        biased;
+        () = tokio::time::sleep(left) => {}
+        () = pass => {}
+    }
+}
+
 /// Judge `watch` until it holds, the deadline passes or the process is
 /// told to stop. `Err` when the first read fails outright.
 async fn wait_until(
@@ -319,44 +347,53 @@ async fn wait_until(
     let mut rows_due = false;
     // When the shared GitHub read may ask again.
     let mut github_due: Option<Instant> = None;
+    // The first read failed outright.
+    let mut failed: Option<String> = None;
     loop {
-        if changed.any() && signals_at.is_none_or(|at| at.elapsed() >= SIGNAL_FLOOR) {
-            let changed = std::mem::take(&mut changed);
-            signals_at = Some(Instant::now());
-            if changed.git {
-                externals.git_changed();
-            }
-            rows_due |= reads_rows
-                && reader
-                    .concerns(ctx, std::slice::from_ref(&watch), changed)
-                    .await;
-        }
-        rows_due |= github_due.is_some_and(|due| Instant::now() >= due);
-        if reads_rows && (rows_due || rows_at.is_none_or(|at| at.elapsed() >= GIT_INTERVAL)) {
-            rows_due = false;
-            github_due = None;
-            match reader.read(ctx, std::slice::from_ref(&watch)).await {
-                Ok(read) => {
-                    problem.clone_from(&read.problem);
-                    // No sooner than the pace allows, so the read this
-                    // prompts finds GitHub askable.
-                    github_due = read.github_due_ms.map(|due_ms| {
-                        let wait = due_ms.saturating_sub(u64::try_from(now_ms()).unwrap_or(0));
-                        Instant::now() + Duration::from_millis(wait.saturating_add(1))
-                    });
-                    rows = read;
-                    rows_known = true;
+        let first = rows_at.is_none();
+        let pass = async {
+            if changed.any() && signals_at.is_none_or(|at| at.elapsed() >= SIGNAL_FLOOR) {
+                let changed = std::mem::take(&mut changed);
+                signals_at = Some(Instant::now());
+                if changed.git {
+                    externals.git_changed();
                 }
-                Err(_) if ctx.cancellation.is_cancelled() => {}
-                Err(error) if rows_at.is_none() => return Err(error),
-                // What was read before is no longer current.
-                Err(error) => {
-                    rows = RowsRead::default();
-                    rows_known = false;
-                    problem = Some(error);
-                }
+                rows_due |= reads_rows
+                    && reader
+                        .concerns(ctx, std::slice::from_ref(&watch), changed)
+                        .await;
             }
-            rows_at = Some(Instant::now());
+            rows_due |= github_due.is_some_and(|due| Instant::now() >= due);
+            if reads_rows && (rows_due || rows_at.is_none_or(|at| at.elapsed() >= GIT_INTERVAL)) {
+                rows_due = false;
+                github_due = None;
+                match reader.read(ctx, std::slice::from_ref(&watch)).await {
+                    Ok(read) => {
+                        problem.clone_from(&read.problem);
+                        // No sooner than the pace allows, so the read this
+                        // prompts finds GitHub askable.
+                        github_due = read.github_due_ms.map(|due_ms| {
+                            let wait = due_ms.saturating_sub(u64::try_from(now_ms()).unwrap_or(0));
+                            Instant::now() + Duration::from_millis(wait.saturating_add(1))
+                        });
+                        rows = read;
+                        rows_known = true;
+                    }
+                    Err(_) if ctx.cancellation.is_cancelled() => {}
+                    Err(error) if rows_at.is_none() => failed = Some(error),
+                    // What was read before is no longer current.
+                    Err(error) => {
+                        rows = RowsRead::default();
+                        rows_known = false;
+                        problem = Some(error);
+                    }
+                }
+                rows_at = Some(Instant::now());
+            }
+        };
+        within(timeout.saturating_sub(started.elapsed()), first, pass).await;
+        if let Some(error) = failed.take() {
+            return Err(error);
         }
         externals.request(ctx, &needs([&watch]), &rows.prs, &rows.branches);
         let now = now_ms();
@@ -479,12 +516,13 @@ async fn wait(ctx: &AppContext, args: &WaitArgs) -> Result<(i32, Option<Outcome>
     for (arg, cond) in args.conditions.iter().zip(&mut read.when) {
         exact_duration(arg, cond, clock);
     }
-    if let Some(message) = args
+    let late = args
         .conditions
         .iter()
         .zip(&read.when)
-        .find_map(|(arg, cond)| outlasts(arg, cond, clock, timeout))
-    {
+        .map(|(arg, cond)| outlasts(arg, cond, clock, timeout))
+        .collect();
+    if let Some(message) = refusal(late, args.any) {
         return refuse(2, message);
     }
     let about_owner = read
@@ -741,6 +779,42 @@ mod tests {
         assert_eq!(late("10m", "30m"), None);
         assert_eq!(late("green+5m", "30m"), None);
         assert_eq!(late("merged", "30m"), None);
+        // All must hold: one that cannot is enough to refuse. With --any
+        // the wait is refused only when none of them can.
+        let asked = |args: &[&str]| args.iter().map(|arg| late(arg, "5m")).collect::<Vec<_>>();
+        assert!(refusal(asked(&["3h", "ready"]), false).is_some());
+        assert_eq!(refusal(asked(&["3h", "ready"]), true), None);
+        assert!(
+            refusal(asked(&["3h", "merged+1h"]), true)
+                .unwrap()
+                .contains("wt wake 3h -m")
+        );
+        assert_eq!(refusal(asked(&["ready"]), false), None);
+    }
+
+    #[tokio::test]
+    async fn the_timeout_ends_a_pass_under_way_but_never_the_first() {
+        // A pass still reading at the deadline is left behind.
+        let started = Instant::now();
+        within(
+            Duration::from_millis(20),
+            false,
+            tokio::time::sleep(Duration::from_secs(600)),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(300));
+        // Past the deadline, a pass that is due is not even begun.
+        let mut began = false;
+        within(Duration::ZERO, false, async { began = true }).await;
+        assert!(!began);
+        // The first pass completes whatever the deadline.
+        let mut read = false;
+        within(Duration::ZERO, true, async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            read = true;
+        })
+        .await;
+        assert!(read);
     }
 
     #[tokio::test]

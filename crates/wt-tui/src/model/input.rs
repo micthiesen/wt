@@ -13,6 +13,65 @@ use crate::{
 /// Session entry on a checkout whose removal was accepted.
 pub(crate) const REMOVAL_IN_PROGRESS: &str = "removal is already in progress";
 
+/// Why keys are held for a moment, which decides which keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settle {
+    /// A key that opens a menu or prompt answered with a notice. The person
+    /// was typing at a menu that never opened, so every key that acts is
+    /// held (`q` and Ctrl+C too: a `q` meant to close that menu must not
+    /// quit wt). Moving and scrolling pass.
+    MenuRefused,
+    /// A confirmation closed, by commit or cancel. Only a second tap of
+    /// the keys that answer a confirmation is absorbed; every other key is
+    /// the person's next move and passes at once.
+    ConfirmClosed,
+}
+
+impl Settle {
+    fn holds(self, key: KeyEvent) -> bool {
+        match self {
+            Self::MenuRefused => !only_moves(key),
+            Self::ConfirmClosed => answers_confirm(key),
+        }
+    }
+
+    fn why(self) -> &'static str {
+        match self {
+            Self::MenuRefused => "no menu opened",
+            Self::ConfirmClosed => "the prompt just closed",
+        }
+    }
+}
+
+/// The keys every confirmation takes as its answer. Its own cancel letter
+/// is not one: that is the key that opens the menu again (`d`), which is
+/// the person's next move, not a second tap.
+fn answers_confirm(key: KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'n' | 'q'))
+}
+
+/// Whether a key only moves the cursor or scrolls, wherever it lands.
+/// Everything else opens, commits, toggles, yanks or quits. Tab is not
+/// here: on the board it folds a section, which is a write.
+fn only_moves(key: KeyEvent) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc
+        | KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::PageUp
+        | KeyCode::PageDown
+        | KeyCode::Char('j' | 'k') => true,
+        KeyCode::Char('g' | 'G') => !control,
+        // Section jumps and output scrolling.
+        KeyCode::Char('u' | 'd' | 'e' | 'y') => control,
+        _ => false,
+    }
+}
+
 impl Model {
     /// Keys for the activity pane's feeds. They never touch a row, so the
     /// removed-history view shares them with the board.
@@ -152,12 +211,12 @@ impl Model {
         if matches!(self.interaction, Interaction::Loading(_)) {
             return self.loading_input(key);
         }
-        // Esc opens and commits nothing anywhere, so it is never held.
-        if let Some((until, why)) = self.keys_settle {
-            if tokio::time::Instant::now() < until && key.code != KeyCode::Esc {
-                return self.key_ignored(why);
+        if let Some((until, settle)) = self.keys_settle {
+            if tokio::time::Instant::now() >= until || key.code == KeyCode::Esc {
+                self.keys_settle = None;
+            } else if settle.holds(key) {
+                return self.key_ignored(settle.why());
             }
-            self.keys_settle = None;
         }
         let confirm_before = matches!(self.interaction, Interaction::Confirm(_));
         self.menu_refused = false;
@@ -196,11 +255,15 @@ impl Model {
             self.keys_settle = Some((
                 tokio::time::Instant::now() + super::reply::CONFIRM_SETTLE,
                 if refused {
-                    "no menu opened"
+                    Settle::MenuRefused
                 } else {
-                    "the prompt just closed"
+                    Settle::ConfirmClosed
                 },
             ));
+        } else if self.layer_open() && !matches!(result, InputResult::Unchanged) {
+            // A layer the person opened or is using takes its keys by its
+            // own rules from here on.
+            self.keys_settle = None;
         }
         if matches!(result, InputResult::Unchanged) {
             self.ui_generation = generation;

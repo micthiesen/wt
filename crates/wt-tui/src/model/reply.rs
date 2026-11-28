@@ -13,7 +13,31 @@ pub(crate) const CONFIRM_SETTLE: std::time::Duration = std::time::Duration::from
 /// to one forgotten is treated like a background read's.
 pub(crate) const BEGUN_LIMIT: usize = 32;
 
+/// How many replaced overlays' requests are remembered until their replies
+/// arrive. A cancelled request answers within moments, so this only needs
+/// to cover overlays replaced in quick succession.
+const ABANDONED_LIMIT: usize = 8;
+
 impl Model {
+    /// A loading overlay was replaced while its request was in flight.
+    pub(super) fn abandon_overlay(&mut self, request: Option<u64>) {
+        let Some(id) = request else {
+            return;
+        };
+        self.abandoned_overlays.push_back(id);
+        if self.abandoned_overlays.len() > ABANDONED_LIMIT {
+            self.abandoned_overlays.pop_front();
+        }
+    }
+
+    /// Whether this reply answers an overlay that was replaced. It is
+    /// forgotten once answered.
+    fn overlay_reply_abandoned(&mut self, id: u64) -> bool {
+        let before = self.abandoned_overlays.len();
+        self.abandoned_overlays.retain(|abandoned| *abandoned != id);
+        self.abandoned_overlays.len() != before
+    }
+
     /// Something other than the board takes the next key: a menu, overlay or
     /// prompt that is open, loading ones included. A confirm opened here by
     /// a reply would take a key typed for that layer.
@@ -43,6 +67,11 @@ impl Model {
     fn reply_confirm(&mut self, prompt: ConfirmPrompt, requested: bool) -> Interaction {
         self.confirm_settles_at =
             (!requested).then(|| tokio::time::Instant::now() + CONFIRM_SETTLE);
+        // This rule replaces the board's: a confirmation that is on screen
+        // holds its own commit keys and nothing else.
+        if !requested {
+            self.keys_settle = None;
+        }
         Interaction::Confirm(prompt)
     }
 
@@ -178,11 +207,9 @@ impl Model {
         // The reply to an overlay that was replaced answers a view that is
         // gone, whatever generation it carries: the request that replaced
         // it was sent at the same one.
-        let abandoned =
-            reply.operation_id.is_some() && reply.operation_id == self.abandoned_overlay;
-        if abandoned {
-            self.abandoned_overlay = None;
-        }
+        let abandoned = reply
+            .operation_id
+            .is_some_and(|id| self.overlay_reply_abandoned(id));
         let presentation_current = !abandoned
             && reply
                 .ui_generation
@@ -221,7 +248,8 @@ impl Model {
                 {
                     self.pending_request = None;
                 }
-                self.abandoned_overlay = loading.request;
+                let request = loading.request;
+                self.abandon_overlay(request);
             }
             // A dialog answering the request in flight must not discard a
             // removal review already on screen; the review waits its turn.

@@ -87,13 +87,19 @@ pub struct Model {
     /// menu or prompt answered with a notice instead, or a confirmation
     /// just closed: the person may still be typing for the layer they
     /// believed was on top, and those keys must not act on the board.
-    pub(crate) keys_settle: Option<(tokio::time::Instant, &'static str)>,
+    pub(crate) keys_settle: Option<(tokio::time::Instant, input::Settle)>,
+    /// The confirmation whose commit is in flight, as it was answered.
+    pub(crate) committed_confirm: Option<crate::ConfirmAction>,
+    /// A confirmation reopened after a stale refusal still shows what was
+    /// refused: the board has not caught up. Until it shows something
+    /// newer, or this deadline passes, it takes no commit.
+    pub(crate) stale_hold: Option<(crate::ConfirmAction, tokio::time::Instant)>,
     /// The key being dispatched asked for a menu and got a notice.
     pub(crate) menu_refused: bool,
-    /// The request of a loading overlay that something else replaced. It
+    /// The requests of loading overlays that something else replaced. Each
     /// was cancelled, but its reply may already be on its way and must not
     /// open the content nobody is waiting for.
-    pub(crate) abandoned_overlay: Option<u64>,
+    pub(crate) abandoned_overlays: std::collections::VecDeque<u64>,
     /// Sections chosen for rows still being created, by creation request.
     pub(crate) creation_moves: std::collections::BTreeMap<u64, pending::CreationMove>,
     /// The request whose board-built menu is open.
@@ -210,8 +216,10 @@ impl Default for Model {
             local_domains: Default::default(),
             follow_up: None,
             follow_up_kept: None,
-            abandoned_overlay: None,
+            abandoned_overlays: Default::default(),
             keys_settle: None,
+            committed_confirm: None,
+            stale_hold: None,
             menu_refused: false,
             creation_moves: Default::default(),
             local_menu: None,

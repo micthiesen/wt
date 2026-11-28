@@ -155,7 +155,10 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   lock where one exists, and refuses a mismatch with `controller::stale`;
   nothing is written and nothing is retried with the newer state. Do not
   loosen a witness to silence stale replies, drop it from a commit, or treat a
-  witnessless commit as a menu commit. `J`/`K` carries a `ReorderStep`
+  witnessless commit as a menu commit. A confirmation reopened after a stale
+  refusal takes no commit while it still names what was refused; it is
+  rebuilt when the board shows something newer, or released after 5 s.
+  `J`/`K` carries a `ReorderStep`
   resolved against the board on screen; the controller moves exactly the units
   that step names, and the store compares the layout it lists with the
   stored one inside the write. The controller's board never picks the
@@ -165,7 +168,11 @@ the application library crates (`wt-app-core`, `wt-ops`, `wt-sources`,
   call, from the board or as a loading overlay. A loading overlay takes every
   key until it fills or is closed; closing it (Esc, `q`, Ctrl+C, its own key)
   or replacing it cancels its request. Nothing typed is held for later or
-  replayed, and no key waits on a host with nothing on screen.
+  replayed, and no key waits on a host with nothing on screen. After a
+  menu key answers with a notice, keys that act (quit included) are held for
+  the settle window; moves and Esc pass. After a confirmation closes, only a
+  second tap of Enter, `y`, `n` or `q` is absorbed. A layer opened by key
+  ends the window and takes its keys by its own rules.
 - Hold state is self-expiring and resource-scoped. Recheck the exact hold ID
   immediately before honoring it; an unknown or stale copy creates no freeze.
 

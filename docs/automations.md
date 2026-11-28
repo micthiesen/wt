@@ -140,6 +140,16 @@ its own process and without storing a watch, so it never reaches this engine.
   engine while the controller is connected. A notification raised there
   shows on the worker, not on the person's desktop; set `[notify] command`
   there if it must reach them.
+- **Removed worktrees.** A condition on another worktree (`wt:<slug>:…`)
+  whose worktree is gone is judged from its removal record, unless a live
+  worktree has the slug. `merged` holds when the record says the work landed.
+  `staging` and `production` hold when the record says so, and otherwise
+  follow the record's landing commit: `prMergeCommitOid` when the pull
+  request merged at the removed head or at a head it was a copy of, else
+  `landingCommitOid` when Git alone proves it because the base contains the
+  head. A landing proven only by matching patches names neither, so the landing reads but cannot be followed to a stage. A
+  condition that can no longer hold (removed without merging, or a state
+  only a live worktree has) is reported as the watch's error in `wt watch`.
 
 In the queue (`Q`, `wt automations`) a watch fire shows as rule `watch` with
 the action and what held as its detail.

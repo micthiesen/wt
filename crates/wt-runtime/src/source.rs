@@ -130,6 +130,11 @@ impl Strongest {
 pub struct Demand {
     /// Read everything.
     pub whole: Option<Request>,
+    /// One of the whole requests was a `Recheck`, whatever `whole`, the
+    /// strongest of them, is. A recheck reports a change at a moment, so a
+    /// leaf that folds repeated refreshes together must not fold it away
+    /// with them.
+    pub recheck: bool,
     /// The key set may have changed: list the keys again.
     pub index: Option<Request>,
     /// Read these keys again.
@@ -153,6 +158,7 @@ impl Demand {
 #[derive(Clone, Default)]
 struct Intake {
     whole: Strongest,
+    recheck: Arc<std::sync::atomic::AtomicBool>,
     keyed: Arc<Mutex<Keyed>>,
 }
 
@@ -182,8 +188,12 @@ impl Intake {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        // Read before `whole`: a recheck raised between the two reads is
+        // then left for the next demand with its own `whole`.
+        let recheck = self.recheck.swap(false, Ordering::AcqRel);
         Demand {
-            whole: self.whole.take(),
+            whole: self.whole.take().or(recheck.then_some(Request::Recheck)),
+            recheck,
             index,
             keys,
         }
@@ -219,6 +229,9 @@ impl<T> SourceHandle<T> {
     pub fn request(&self, request: Request) -> bool {
         // Recorded before the wake-up, so a fetch never runs without it.
         self.intake.whole.raise(request);
+        if request == Request::Recheck {
+            self.intake.recheck.store(true, Ordering::Release);
+        }
         self.wake()
     }
 

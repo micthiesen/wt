@@ -18,6 +18,15 @@ fn identity(option: &PickerOption) -> OptionIdentity {
 /// first line of a confirmation reopened after one.
 const CHANGED: &str = "Changed since you looked";
 
+/// The second line of a reopened confirmation while the board it was built
+/// from is the one that was refused.
+const STILL_READING: &str = "Reading what changed. This updates, and takes Enter, in a moment.";
+
+/// How long a reopened confirmation waits for a newer board. Every local
+/// source has read again by then (the session inventory polls at this
+/// interval), so a board unchanged after it is current.
+const STALE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn changed_line(message: &str) -> String {
     if message.starts_with(CHANGED) {
         message.to_owned()
@@ -73,6 +82,11 @@ impl Model {
                 self.toast = Some((text, ToastTone::Notice));
                 self.refresh_requested = true;
             }
+            LocalMenu::Ask { text, read } => {
+                self.local_menu = None;
+                self.toast = Some((text, ToastTone::Notice));
+                self.background.push(*read);
+            }
         }
     }
 
@@ -114,7 +128,9 @@ impl Model {
             self.picker_choice_lost = false;
             return;
         }
-        let Menu::Local(LocalMenu::Modal { modal, .. }) = action.menu(&self.board) else {
+        let menu = action.menu(&self.board);
+        self.settle_stale_hold(&menu);
+        let Menu::Local(LocalMenu::Modal { modal, .. }) = menu else {
             return;
         };
         // The run a stop confirmation names has ended, so its palette is a
@@ -129,8 +145,9 @@ impl Model {
                 .and_then(|title| title.strip_suffix('?'))
         {
             confirm.title = format!("{name} has finished");
-            confirm.lines = vec!["Nothing is left to stop. Enter closes this.".into()];
+            confirm.lines = vec!["Nothing is left to stop.".into()];
             confirm.selected = 0;
+            confirm.action = crate::ConfirmAction::Finished;
             return;
         }
         match (&mut self.interaction, *modal) {
@@ -208,13 +225,14 @@ impl Model {
             ) if confirm.action == action => {
                 // A confirmation reopened after a refusal keeps saying so.
                 let mut lines = lines;
-                if let Some(changed) = confirm
+                let kept = confirm
                     .lines
-                    .first()
-                    .filter(|line| line.starts_with(CHANGED))
-                {
-                    lines.insert(0, changed.clone());
-                }
+                    .iter()
+                    .take(2)
+                    .filter(|line| line.starts_with(CHANGED) || *line == STILL_READING)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                lines.splice(0..0, kept);
                 *confirm = ConfirmPrompt {
                     action,
                     title,
@@ -254,14 +272,89 @@ impl Model {
         if Some(id) != operation_id || !matches!(self.interaction, Interaction::None) {
             return;
         }
+        let refused = self.committed_confirm.take();
         if let Menu::Local(menu) = action.menu(&self.board) {
             self.show_local_menu(action, menu);
             if let Interaction::Confirm(confirm) = &mut self.interaction {
+                let now = tokio::time::Instant::now();
                 confirm.lines.insert(0, changed_line(&message));
-                self.confirm_settles_at =
-                    Some(tokio::time::Instant::now() + super::reply::CONFIRM_SETTLE);
+                self.confirm_settles_at = Some(now + super::reply::CONFIRM_SETTLE);
+                // The refusal usually arrives before the read it asked for.
+                // The board then still shows what was refused, and so does
+                // this confirmation: it waits for the newer board.
+                if refused.as_ref() == Some(&confirm.action) {
+                    confirm.lines.insert(1, STILL_READING.into());
+                    self.stale_hold = Some((confirm.action.clone(), now + STALE_HOLD));
+                }
             }
         }
         self.toast = Some((message, ToastTone::Failed));
+    }
+
+    pub(super) fn stale_hold_deadline(&self) -> Option<tokio::time::Instant> {
+        self.stale_hold.as_ref().map(|(_, until)| *until)
+    }
+
+    /// Look at the newly presented board for a confirmation held after a
+    /// stale refusal. Once the board shows something other than what was
+    /// refused, the confirmation is rebuilt from it, says so no longer, and
+    /// settles again before it can commit. A board that has not changed by
+    /// the deadline is as new as it gets, and its host checks the commit.
+    fn settle_stale_hold(&mut self, menu: &Menu) {
+        let Some((refused, until)) = self.stale_hold.clone() else {
+            return;
+        };
+        let Interaction::Confirm(confirm) = &mut self.interaction else {
+            self.stale_hold = None;
+            return;
+        };
+        if confirm.action != refused {
+            self.stale_hold = None;
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        match menu {
+            Menu::Local(LocalMenu::Modal { modal, .. }) => {
+                if let UiModal::Confirm {
+                    action,
+                    title,
+                    lines,
+                    cancel_key,
+                } = &**modal
+                    && *action != refused
+                {
+                    let mut lines = lines.clone();
+                    if let Some(changed) = confirm.lines.first() {
+                        lines.insert(0, changed.clone());
+                    }
+                    *confirm = ConfirmPrompt {
+                        action: action.clone(),
+                        title: title.clone(),
+                        lines,
+                        selected: 0,
+                        cancel_key: *cancel_key,
+                    };
+                    self.confirm_settles_at = Some(now + super::reply::CONFIRM_SETTLE);
+                    self.stale_hold = None;
+                } else if now >= until {
+                    confirm.lines.retain(|line| line != STILL_READING);
+                    self.stale_hold = None;
+                }
+            }
+            // What it asked about is gone from the newer board.
+            Menu::Local(LocalMenu::Notice(text) | LocalMenu::NotYet(text))
+            | Menu::Local(LocalMenu::Ask { text, .. }) => {
+                self.toast = Some((text.clone(), ToastTone::Notice));
+                self.interaction = Interaction::None;
+                self.local_menu = None;
+                self.stale_hold = None;
+            }
+            _ => {
+                if now >= until {
+                    confirm.lines.retain(|line| line != STILL_READING);
+                    self.stale_hold = None;
+                }
+            }
+        }
     }
 }

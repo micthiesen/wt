@@ -1445,6 +1445,23 @@ pub struct WatchFacts {
     /// The commit that carried a removed worktree's work onto the base
     /// branch, by slug, where its removal record names one.
     pub removed_landings: BTreeMap<String, String>,
+    /// The pull request a removed worktree's removal record names, by slug.
+    pub removed_prs: BTreeMap<String, u64>,
+}
+
+/// What to say of a condition that follows the landing of `slug`, a
+/// worktree removed before its work merged. Its pull request, where its
+/// removal record names one, may still merge: that is the thing to watch,
+/// since nothing is left of the worktree to say so.
+pub fn removed_unmerged(slug: &str, pr: Option<u64>) -> String {
+    match pr {
+        Some(number) => format!(
+            "{slug} was removed before its work merged; to wait for its pull request use pr:{number}:merged"
+        ),
+        None => format!(
+            "{slug} was removed without merging, so this cannot hold unless a worktree named {slug} is created again and merges"
+        ),
+    }
 }
 
 /// Why a condition on another worktree can no longer hold: that worktree is
@@ -1480,9 +1497,7 @@ pub fn never_holds(cond: &WatchCondition, facts: &WatchFacts) -> Option<String> 
         });
     }
     Some(if follows_landing {
-        format!(
-            "{slug} was removed without merging, so this cannot hold unless a worktree named {slug} is created again and merges"
-        )
+        removed_unmerged(slug, facts.removed_prs.get(slug).copied())
     } else {
         format!(
             "{slug} was removed and can no longer become {}",

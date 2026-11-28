@@ -176,6 +176,9 @@ pub async fn execute_with_shutdown(
             bail!("this menu is built from the board and never asks the host")
         }
         // Queued by the host service before dispatch; it never produces a reply.
+        UiAction::ReadPullRequest { .. } => {
+            bail!("a pull request read is asked of the GitHub source by the host service")
+        }
         UiAction::DiscoverSessions { .. } => {
             bail!("session discovery is queued by the host service")
         }

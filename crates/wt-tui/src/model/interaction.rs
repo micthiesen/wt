@@ -369,6 +369,17 @@ impl Model {
                 }
             }
             Interaction::Confirm(confirm) => {
+                if confirm.action == ConfirmAction::Finished {
+                    if matches!(
+                        code,
+                        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('y' | 'q' | 'n')
+                    ) || (control && code == KeyCode::Char('c'))
+                    {
+                        return InputResult::Draw;
+                    }
+                    self.interaction = interaction;
+                    return InputResult::Unchanged;
+                }
                 if let ConfirmAction::CopyDetails { details } = &confirm.action {
                     if matches!(
                         code,
@@ -410,13 +421,24 @@ impl Model {
                         ));
                         return InputResult::Draw;
                     }
-                    // The run ended while its stop confirmation was open.
-                    if let ConfirmAction::KillAction { run_id, .. } = &confirm.action
-                        && !self.board.run_active(run_id)
+                    // Reopened after a refusal, and still showing what was
+                    // refused: committing it again could only be refused
+                    // again.
+                    if self
+                        .stale_hold
+                        .as_ref()
+                        .is_some_and(|(refused, _)| *refused == confirm.action)
                     {
-                        return self.notify("that action has already finished");
+                        self.interaction = interaction;
+                        self.toast = Some((
+                            "key ignored: still reading what changed".into(),
+                            ToastTone::Notice,
+                        ));
+                        return InputResult::Draw;
                     }
+                    self.committed_confirm = Some(confirm.action.clone());
                     return InputResult::Action(match &confirm.action {
+                        ConfirmAction::Finished => return InputResult::Draw,
                         ConfirmAction::CopyDetails { details } => UiAction::Copy {
                             value: details.clone(),
                             label: "error details".into(),

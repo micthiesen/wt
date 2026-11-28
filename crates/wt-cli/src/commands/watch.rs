@@ -303,9 +303,9 @@ fn absent_worktree(
                         state.as_str()
                     ),
                 },
-                Some(false) if follows_landing => format!(
-                    "{slug} was removed without merging, so this cannot hold unless a worktree named {slug} is created again and merges"
-                ),
+                Some(false) if follows_landing => {
+                    wt_core::watch::removed_unmerged(slug, removed.pr(slug))
+                }
                 Some(_) => format!(
                     "{slug} was removed and can no longer become {}",
                     state.as_str()

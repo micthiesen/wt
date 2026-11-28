@@ -900,7 +900,8 @@ fn confirm_verb(action: &ConfirmAction) -> &'static str {
 fn destructive(action: &ConfirmAction) -> bool {
     !matches!(
         action,
-        ConfirmAction::CopyDetails { .. }
+        ConfirmAction::Finished
+            | ConfirmAction::CopyDetails { .. }
             | ConfirmAction::ReviewCheckout { .. }
             | ConfirmAction::RestoreRemoved { .. }
             | ConfirmAction::Github { .. }
@@ -1074,6 +1075,8 @@ fn confirmation(frame: &mut Frame<'_>, area: Rect, confirm: &mut ConfirmPrompt) 
         });
     let mut hints = if matches!(confirm.action, ConfirmAction::CopyDetails { .. }) {
         vec![hint("⏎ / esc", "Dismiss"), hint("c", "Copy details")]
+    } else if confirm.action == ConfirmAction::Finished {
+        vec![hint("⏎ / esc", "close")]
     } else {
         vec![
             hint("y / ⏎", confirm_verb(&confirm.action)),
@@ -3028,6 +3031,24 @@ mod tests {
         };
         let text = rows(&draw(&mut model, 120, 40)).join("\n");
         assert!(text.contains("esc / q / f close"), "{text}");
+    }
+
+    #[test]
+    fn a_confirmation_whose_subject_ended_offers_only_to_close() {
+        let mut model = Model {
+            interaction: Interaction::Confirm(ConfirmPrompt {
+                action: ConfirmAction::Finished,
+                title: "Lint has finished".into(),
+                lines: vec!["Nothing is left to stop.".into()],
+                selected: 0,
+                cancel_key: Some('!'),
+            }),
+            ..Model::default()
+        };
+        let text = rows(&draw(&mut model, 120, 40)).join("\n");
+        assert!(text.contains("Lint has finished"), "{text}");
+        assert!(text.contains("⏎ / esc close"), "{text}");
+        assert!(!text.contains("kill") && !text.contains("cancel"), "{text}");
     }
 
     #[test]

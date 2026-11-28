@@ -141,6 +141,9 @@ impl Store {
     ) -> Result<Vec<String>, StoreError> {
         self.mutate_wt_state(|state| {
             let pruned = prunable_slug_records(state, live, now_ms);
+            for slug in &pruned {
+                crate::mutations::release_followers(state, slug);
+            }
             if let Some(slugs) = state.get_mut("slugs").and_then(Value::as_object_mut) {
                 for slug in &pruned {
                     slugs.remove(slug);

@@ -144,7 +144,8 @@ border from the title, which wraps in full; only a title a person set is
 tagged, with a dim `(user)` (see [Worktree titles](#worktree-titles)).
 The work-status banner follows: a header line, then the note behind a rail in
 the state's color. Until the row's own work
-lands the header is the asserted state (`blocked · ready` with the gate's
+lands the header is the asserted state (`blocked · ready`, or `blocked ·
+working` and the like for a gate carried onto another state, with the gate's
 slash while a gate is set), risk, age, `commits since` when the status
 predates HEAD, and `owes N` when the row owes anything: the list itself
 follows the labeled rows (see [What a row owes](#what-a-row-owes)). `REVERT`,
@@ -191,7 +192,12 @@ after through `J`/`K` presses, its own and its neighbours', and takes a
 stored order only when it crosses into another section. Under manual sorting
 the first reorder in a section stores an order for every row drawn there, in
 the order drawn, so rows still at their creation position stay where they
-are. An existing worktree keeps
+are. A new row also keeps its drawn place when the row it was created after
+is moved, archived, lands, is being removed or is gone. One limit under
+status sorting: when the followed row moved to another section, the new row
+is drawn behind the row with the nearest stored order, which need not be the
+row that was drawn before it. Deleting a section moves its rows
+to the Inbox in the order they had. An existing worktree keeps
 its section when its name is entered again.
 
 Creation immediately selects one optimistic row with its title and the
@@ -233,7 +239,20 @@ over one. Each confirmation still rechecks its checkout witness.
 A confirmation you did not ask for (a hazard review, a sign-in prompt, or a
 "Stop …?" prompt answering a palette key) ignores Enter and `y` for its first
 400 ms, with a notice, so a key meant for the board cannot confirm it. Cancel
-and scroll keys work at once. A confirmation that opened while you were in a
+and scroll keys work at once. A confirmation reopened after the host
+refused it as changed keeps `Changed since you looked: …` as its first line.
+While it still names what was refused it reads `Reading what changed. This
+updates, and takes Enter, in a moment.` and takes no commit; it is rebuilt
+when the board shows something newer and then waits the 400 ms, closes with
+the notice when the newer board does not offer it, and takes the commit
+after 5 seconds if the board has not changed. Two rules guard the board for
+400 ms after a layer you expected is not there. When a key asks for a menu
+and gets a notice instead, keys that act are ignored, `q` and Ctrl+C
+included, and the footer adds `key ignored: no menu opened`; keys that only
+move or scroll, the mouse and Esc pass. When a confirmation closes by commit
+or cancel, only a second Enter, `y`, `n` or `q` is absorbed (`key ignored:
+the prompt just closed`); every other key acts at once. A layer opened by a
+key ends the window, and so does Esc. A confirmation that opened while you were in a
 session waits again when you return.
 Commands taking more than three seconds show elapsed progress. A queued command
 names the conflicting operation or capacity wait; this is progress, not a
@@ -582,7 +601,7 @@ same summary and timeline for a removed row that has recorded events.
 | `j` / `k`, arrows | Move the selection; it stops at the first and last item |
 | `g` / `G`, `Home` / `End` | First / last visible item |
 | `PgUp` / `PgDn` | Move half of the list pane's height |
-| `Space` | Next row needing you: saved work states plus failing checks, changes requested, unresolved threads, and failed actions; toasts when nothing needs you |
+| `Space` | Next row needing you: saved work states plus failing checks, changes requested, unresolved threads, a merge wt armed that GitHub dropped from the queue (while the `pr` row says so), and failed actions; toasts when nothing needs you |
 | `Tab` | Fold / unfold the section; unfolding lands on its first row and scrolls as many of its rows into view as fit under the cursor's three rows of context. Review requests fold too |
 | `Ctrl+D` / `Ctrl+U` | Next section / the first row of this section, then the previous section. Review requests count as a section |
 | `Ctrl+J` / `Ctrl+K` | Scroll details |
@@ -793,23 +812,30 @@ agent set a status), nothing is written: the menu reopens with the current
 data and the toast says what changed. An open confirmation never changes
 what it will do: when its subject changes on the board (another run in the
 slot, another pull request or checkout), it stays as shown and the host
-refuses it.
+refuses it. A "Stop …?" confirmation whose run ends while it is open reads
+`<name> has finished`, its hint reads `⏎ / esc close`, and any answer key
+only closes it.
 
 A key whose menu the board cannot build answers at once in the footer
 instead of opening one. `e`, `E`, `v` or `f` on a row with no shown pull
 request reads `GitHub data is unavailable: <error>` when the row's GitHub
 read failed, `no PR for this branch` when the read covered the branch, and
-`GitHub data is still loading for this branch` otherwise. `v` reads
+`GitHub data is still loading for this branch` otherwise. With
+`WT_GITHUB=off` these keys, and every pull-request entry of a palette, read
+`GitHub is off (WT_GITHUB=off)` and nothing is asked or waited for. `v` reads
 `reviewer list is still loading` until the reviewer list has been read once;
 it is read again about once a day and on a hard refresh. A remote row reads
 `session list not loaded yet` before its host's lists arrive, and `session
 list unknown: <error>` while that host is disconnected. An answer about
 data that is unavailable or still loading also asks the sources to read
-again.
+again. `no PR for this branch` asks its host to read that one branch from
+GitHub: a pull request opened since the last read is absent only until the
+next one.
 
 Two keys fetch content only a host has: failed checks `f` and dev logs
-`! l`. The overlay opens at the keypress reading `loading…`, and the reply
-fills it. While it loads, every key belongs to the overlay: Esc, `q`, Ctrl+C
+`! l`. The overlay opens at the keypress reading `loading…` (`loading… 7s`
+once three seconds have passed), its hint line names the keys that close it
+(`esc / q / f`), and the reply fills it. While it loads, every key belongs to the overlay: Esc, `q`, Ctrl+C
 or the overlay's own key (`f`, `l`) closes it and cancels the fetch, and
 nothing else typed is kept or replayed. `f` answers at once, with no fetch,
 when the board shows no failing check (`no failing checks`), no pull
@@ -829,7 +855,9 @@ argument picker for a remote row arrive with that host's live data; before
 that the prompt is a plain text field.
 
 A key pressed while 64 requests already wait for the host is refused with
-`actions are busy; try again when one finishes`, and shows no change.
+`actions are busy; try again when one finishes`, and shows no change. A
+follow-up wt queued for itself waits for room, and is dropped with `a queued
+action was not sent: actions were busy` once another key has acted.
 Host replies are still applied while a session holds the terminal, so a
 worktree created just before entering a session starts its checkout without
 waiting for you to come back.
@@ -881,7 +909,9 @@ uncaught-error recovery overlay.
 Help, the performance view, and log overlays (such as dev-server logs) share
 one scroll keymap: `j`/`k`, arrows, and `Ctrl+E`/`Ctrl+Y` move three lines;
 `PgUp`/`PgDn` and `Ctrl+U`/`Ctrl+D` move half a page; `g`/`G` or `Home`/`End`
-jump to the edges. `Esc`, `q`, and `Ctrl+C` close them.
+jump to the edges. `Esc`, `q`, and `Ctrl+C` close them, and so does the
+overlay's own key: `?` for help, `P` for the performance view, `f` for failed
+checks, `l` for dev logs. Each overlay's hint line names its keys.
 
 Use `j`/`k`, arrows, page keys, and `g`/`G` to move through lists. `Enter`
 confirms; `Esc`, `q`, and `Ctrl+C` cancel, and confirmations also cancel with
@@ -945,7 +975,9 @@ The session picker is built from the board: saved conversations from the
 background history snapshot and the live tmux slots. Opening it sends a
 background read, so saved conversations join the open picker when discovery
 finishes, without a loading row. With an empty cache it shows live slots and
-new-session choices. Attachment rechecks the selected live identity; a
+new-session choices. A Claude primary that has never run (no transcript and
+no live session) is not listed, so the picker offers New. A session whose
+process is gone shows no running state. Attachment rechecks the selected live identity; a
 new session chosen beside a live slot the picker did not show is refused and
 the picker reopens. A picker cursor that has not moved follows the newest
 default, so a picker opened before a live slot appeared selects it once it

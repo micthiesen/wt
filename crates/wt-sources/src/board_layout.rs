@@ -337,18 +337,21 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                     }),
             }
         };
-        let stored_here = |index: usize| {
-            let filed = state["slugs"][&board.rows[index].key]["section"]
+        // Whether a row is filed in this section, drawn in it or not. A
+        // removed worktree's record stays, and so does where it was filed.
+        let stored_here = |slug: &str| {
+            let stored = &state["slugs"][slug];
+            let filed = stored["section"]
                 .as_str()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(INBOX);
-            filed == key.as_str()
+            stored.is_object() && filed == key.as_str()
         };
         // The unit an anchored unit is drawn behind; `None` is the top. The
         // row it was created after may no longer be drawn here. Archived,
-        // landed or being removed, it is still filed here, and the unit
-        // stays where that row would be drawn. Filed elsewhere or forgotten,
-        // the store kept where it was (`creationSlot`).
+        // landed, being removed or removed, it is still filed here, and the
+        // unit stays where that row would be drawn. Filed elsewhere or
+        // forgotten, the store kept where it was (`creationSlot`).
         let follows = |root: usize| {
             let mut entry = &state["slugs"][&board.rows[root].key];
             // Bounded, so rows that name each other end at the top.
@@ -362,10 +365,7 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                 }) {
                     return Some(anchor_of(drawn));
                 }
-                let Some(elsewhere) = named
-                    .and_then(|after| board.rows.iter().position(|row| row.key == after))
-                    .filter(|&index| stored_here(index))
-                else {
+                let Some(slug) = named.filter(|&after| stored_here(after)) else {
                     let slot = &entry["creationSlot"];
                     return slot.is_object().then_some(()).and_then(|()| {
                         behind(
@@ -375,7 +375,6 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                         )
                     });
                 };
-                let slug = board.rows[elsewhere].key.as_str();
                 let stored = &state["slugs"][slug];
                 let by_status =
                     sort == UiSort::Status && parse_work_status(&stored["work"]).is_some();

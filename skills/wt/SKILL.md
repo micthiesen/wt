@@ -78,7 +78,7 @@ wt archive <slug> / wt restore <slug>  # file a row under Archived, or return it
   the harness caps foreground commands (Claude Code caps them at 10 minutes),
   pass `--timeout 9m` and run it again on exit 124. `--any` returns when the
   first condition holds and says which; exit 0 held, 124 timed out
-  (`--timeout`, default 30m, at most 24h), 1 could not tell. It judges the conditions in its own process, so it works with
+  (`--timeout`, default 30m, at most 24h), 1 could not tell or can no longer hold. It judges the conditions in its own process, so it works with
   the TUI closed, and stores nothing. It wakes on changes to wt's state, the
   events snapshot and origin's refs, with timers only as a backstop. For what outlives the session (a
   deploy, a release, a time hours or days away, another worktree's merge),

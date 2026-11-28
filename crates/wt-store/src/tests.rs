@@ -1574,7 +1574,7 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
     .unwrap();
     let remote = "@remote/server/far";
     let state = r#"{"sectionsOrder":["S","T"],"slugs":{
-        "x":{"section":"S","order":4},
+        "x":{"section":"S","order":4,"createdAt":"2020-01-01T00:00:00Z"},
         "new":{"section":"S","order":null,"creationAfter":"x"},
         "newer":{"section":"S","order":null,"creationAfter":"new"},
         "ordered":{"section":"S","order":9,"creationAfter":"x"},
@@ -1582,7 +1582,15 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
         "remoteLayouts":{"@remote/server/far":{"section":"S","order":null,"creationAfter":"x"}}}"#;
     let slot = json!({ "order": 4.0, "key": "x" });
     type Leave = fn(&mut Store);
-    let leaves: [Leave; 4] = [
+    let leaves: [Leave; 5] = [
+        // Its worktree long gone, the record is pruned.
+        |store| {
+            let live = ["new", "newer", "ordered", "elsewhere"].map(str::to_owned);
+            let pruned = store
+                .prune_slug_records(&live.into(), 1_795_824_000_000)
+                .unwrap();
+            assert_eq!(pruned, ["x"]);
+        },
         |store| {
             store
                 .move_worktrees_to_section(&["x".to_owned()], Some("T"))

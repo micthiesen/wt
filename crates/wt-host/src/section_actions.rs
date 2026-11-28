@@ -2031,6 +2031,131 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// A removal does not delete the removed worktree's record: it archives
+    /// the row while it runs and records the removal, and then the board no
+    /// longer lists the row. A row created after it stays where it is drawn
+    /// throughout, and so does a chain of them when a cleanup removes
+    /// several rows at once.
+    #[tokio::test]
+    async fn a_row_at_its_creation_position_keeps_its_place_through_a_removal() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let database = &fixture.ctx.database;
+        let trunk = fixture.ctx.config.branch.base.clone();
+        for sort in [wt_config::UiSort::Status, wt_config::UiSort::Manual] {
+            for ordered in [false, true] {
+                let said = format!("{sort:?}, rows ordered: {ordered}");
+                let placed = |key: &str, order: f64| Fabricated {
+                    order: ordered.then_some(order),
+                    ..Fabricated::new(key, "S")
+                };
+                let rows = [
+                    Fabricated {
+                        status: Some(wt_core::WorkState::Working),
+                        ..placed("w", 0.0)
+                    },
+                    placed("x", 1.0),
+                    Fabricated {
+                        created_after: Some(Some("x".into())),
+                        ..Fabricated::new("new", "S")
+                    },
+                    Fabricated {
+                        created_after: Some(Some("new".into())),
+                        ..Fabricated::new("newer", "S")
+                    },
+                    placed("y", 2.0),
+                    placed("z", 3.0),
+                ];
+                for removed in [&["x"][..], &["x", "new"], &["new"]] {
+                    let listed = fabricate(&fixture, &rows).await;
+                    let board = laid_out(&fixture, &listed, sort).await;
+                    assert_eq!(
+                        drawn(&board, "S"),
+                        ["w", "x", "new", "newer", "y", "z"],
+                        "{said}"
+                    );
+                    let stays: Vec<&str> = ["w", "x", "new", "newer", "y", "z"]
+                        .into_iter()
+                        .filter(|key| !removed.contains(key))
+                        .collect();
+                    // Running: archived, drawn as being removed.
+                    for key in removed {
+                        let key = (*key).to_owned();
+                        database
+                            .call(move |store| Ok(store.set_archived(&key, true)?))
+                            .await
+                            .unwrap();
+                    }
+                    for with_landed_block in [false, true] {
+                        let board = laid_out_with(&fixture, &listed, sort, |board| {
+                            board.display.owed_sections = with_landed_block;
+                            for row in &mut board.rows {
+                                if removed.contains(&row.key.as_str()) {
+                                    row.archived = true;
+                                    row.removal = Some(wt_tui::RemovalView {
+                                        checkout_absent: true,
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        })
+                        .await;
+                        let there: Vec<String> = drawn(&board, "S")
+                            .into_iter()
+                            .filter(|key| !removed.contains(&key.as_str()))
+                            .collect();
+                        assert_eq!(there, stays, "removing, {said}");
+                    }
+                    // Committed: the removal is recorded and the row is gone.
+                    for key in removed {
+                        let (key, trunk) = ((*key).to_owned(), trunk.clone());
+                        database
+                            .call(move |store| {
+                                store.reparent_base_references(&key, &trunk, Some(&key))?;
+                                store.record_removed_worktrees(
+                                    &[wt_store::RemovedWorktree {
+                                        slug: key.clone(),
+                                        branch: key.clone(),
+                                        removed_at: "2026-11-28T00:00:00.000Z".into(),
+                                        work: None,
+                                        automations_paused: None,
+                                        extra: Default::default(),
+                                    }],
+                                    1_795_824_000_000,
+                                )?;
+                                Ok(())
+                            })
+                            .await
+                            .unwrap();
+                    }
+                    let left: Vec<wt_tui::BoardRow> = listed
+                        .iter()
+                        .filter(|row| !removed.contains(&row.key.as_str()))
+                        .cloned()
+                        .collect();
+                    let board = laid_out(&fixture, &left, sort).await;
+                    assert_eq!(drawn(&board, "S"), stays, "removed {removed:?}, {said}");
+                }
+                // The row before it lands into the Landed block.
+                let listed = fabricate(&fixture, &rows).await;
+                let board = laid_out_with(&fixture, &listed, sort, |board| {
+                    board.display.owed_sections = true;
+                    board.rows[1].git.landed_on = Some(wt_tui::LandingKind::Base);
+                    board.rows[1].owed_block = Some(wt_core::OwedBlock::Done);
+                })
+                .await;
+                assert_eq!(
+                    drawn(&board, "S"),
+                    ["w", "new", "newer", "y", "z"],
+                    "{said}"
+                );
+                assert_eq!(drawn(&board, wt_tui::LANDED_SECTION), ["x"], "{said}");
+            }
+        }
+        fixture.close().await.unwrap();
+    }
+
     /// The same sections on every run.
     struct Dice(u64);
 

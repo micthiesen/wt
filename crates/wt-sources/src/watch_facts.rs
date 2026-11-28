@@ -325,17 +325,22 @@ fn merged_for_good(pr: &PrFacts) -> bool {
 /// What the removal records say of each removed worktree, newest record per
 /// slug: whether its work landed, where, and by which commit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Removed(BTreeMap<String, (RowFacts, Option<String>)>);
+pub struct Removed(BTreeMap<String, (RowFacts, Option<String>, Option<u64>)>);
 
 impl Removed {
     /// What `slug`'s removal record says, when one is kept.
     pub fn get(&self, slug: &str) -> Option<&RowFacts> {
-        self.0.get(slug).map(|(row, _)| row)
+        self.0.get(slug).map(|(row, ..)| row)
     }
 
     /// The commit that landed `slug`'s work, where its record names one.
     pub fn landing_commit(&self, slug: &str) -> Option<&str> {
         self.0.get(slug)?.1.as_deref()
+    }
+
+    /// The pull request `slug`'s record names, where it names one.
+    pub fn pr(&self, slug: &str) -> Option<u64> {
+        self.0.get(slug)?.2
     }
 }
 
@@ -373,7 +378,11 @@ pub fn removed_rows(state: &serde_json::Value, separate_production: bool) -> Rem
                     .filter_map(|key| entry.extra.get(key)?.as_str())
                     .find(|oid| landing.base && !oid.is_empty())
                     .map(str::to_owned);
-                (slug, (row, commit))
+                let pr = entry
+                    .extra
+                    .get("prNumber")
+                    .and_then(serde_json::Value::as_u64);
+                (slug, (row, commit, pr))
             })
             .collect(),
     )
@@ -400,6 +409,9 @@ pub fn facts(
         for slug in named_worktrees(watches) {
             if facts.rows.contains_key(&slug) {
                 continue;
+            }
+            if let Some(pr) = removed.pr(&slug) {
+                facts.removed_prs.insert(slug.clone(), pr);
             }
             if let Some(commit) = removed.landing_commit(&slug) {
                 facts
@@ -1070,5 +1082,59 @@ mod tests {
             let facts = known(std::slice::from_ref(&waiting), &reborn, true);
             apply(&mut waiting, &facts, NOON)
         });
+    }
+
+    /// A worktree removed while its pull request was open: the record says
+    /// unlanded for good, but the pull request may merge later, and that is
+    /// what the watch points at.
+    #[test]
+    fn a_worktree_removed_before_its_pull_request_merged_points_at_the_pull_request() {
+        let state = serde_json::json!({"removed": [
+            {"slug": "two", "branch": "feature/two", "removedAt": "2026-11-27T00:00:00Z",
+             "landedOnAtRemoval": "unlanded", "prNumber": 3806, "prState": "OPEN"},
+            {"slug": "three", "branch": "feature/three", "removedAt": "2026-11-27T00:00:00Z",
+             "landedOnAtRemoval": "unlanded"},
+        ]});
+        let removed = removed_rows(&state, true);
+        assert_eq!((removed.pr("two"), removed.pr("three")), (Some(3806), None));
+        let live = BTreeMap::from([("one".to_owned(), row("first"))]);
+        let error = |arg: &str| {
+            let waiting = watch("aaaaaa", "one", &[arg]);
+            let known = facts(
+                std::slice::from_ref(&waiting),
+                &live,
+                true,
+                &BTreeMap::new(),
+                &Externals::default(),
+                &removed,
+            );
+            // What `wt wait` ends on and what the engine stores are the same.
+            assert_eq!(
+                wt_core::watch::never_holds(&waiting.when[0], &known),
+                stamps(
+                    std::slice::from_ref(&waiting),
+                    &known,
+                    &BTreeMap::new(),
+                    NOON
+                )[0]
+                .last_error
+                .clone()
+                .flatten()
+            );
+            wt_core::watch::never_holds(&waiting.when[0], &known).unwrap()
+        };
+        let with_pr = "two was removed before its work merged; to wait for its pull request use pr:3806:merged";
+        assert_eq!(error("wt:two:merged"), with_pr);
+        assert_eq!(error("wt:two:production"), with_pr);
+        // The warning when the watch is set says the same.
+        assert_eq!(
+            wt_core::watch::removed_unmerged("two", removed.pr("two")),
+            with_pr
+        );
+        // No pull request on the record: nothing else to watch.
+        assert_eq!(
+            error("wt:three:merged"),
+            "three was removed without merging, so this cannot hold unless a worktree named three is created again and merges"
+        );
     }
 }

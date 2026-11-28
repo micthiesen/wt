@@ -2868,7 +2868,7 @@ const CREATION_SLOT: &str = "creationSlot";
 /// each such row takes what says where the leaving row was: the row that
 /// one follows in turn, or its stored order, behind which the board then
 /// draws the follower.
-fn release_followers(state: &mut Value, leaving: &str) {
+pub(crate) fn release_followers(state: &mut Value, leaving: &str) {
     let section = stored_section(state, leaving).map(str::to_owned);
     let left = state[layout_collection(leaving)][leaving].clone();
     let followers: Vec<String> = ["slugs", "remoteLayouts"]

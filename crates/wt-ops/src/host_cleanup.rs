@@ -200,9 +200,12 @@ async fn reap_worktree_listeners(
     path: &Path,
     cancel: &CancellationToken,
 ) -> Result<Vec<u32>> {
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .context("canonicalize checkout for listener cleanup")?;
+    let canonical = match tokio::fs::canonicalize(path).await {
+        Ok(canonical) => canonical,
+        // A checkout that is already gone has no listeners to find by path.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("canonicalize checkout for listener cleanup"),
+    };
     let main = tokio::fs::canonicalize(&context.config.paths.main_clone)
         .await
         .unwrap_or_else(|_| context.config.paths.main_clone.clone());
@@ -583,5 +586,31 @@ mod tests {
             "https://evil.test/?next=http://localhost:8123",
             8123
         ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_checkout_has_no_listeners_to_reap_and_other_failures_still_report() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let cancel = CancellationToken::new();
+        let gone = ctx.cwd.join("no-such-checkout");
+        assert!(
+            reap_worktree_listeners(ctx, &gone, &cancel)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A path that exists but cannot be resolved is still an error.
+        let file = ctx.cwd.join("tracked.txt");
+        let error = reap_worktree_listeners(ctx, &file.join("below-a-file"), &cancel)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("canonicalize checkout for listener cleanup"),
+            "{error:#}"
+        );
+        fixture.close().await.unwrap();
     }
 }

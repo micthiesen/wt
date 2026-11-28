@@ -727,10 +727,7 @@ fn an_open_stop_confirmation_keeps_the_run_it_was_opened_for() {
     // It still names Lint, and says Lint is over; it never becomes a
     // confirmation to stop Deploy.
     assert_eq!(confirm.title, "Lint has finished");
-    assert!(matches!(
-        &confirm.action,
-        ConfirmAction::KillAction { run_id, .. } if run_id == "run-9"
-    ));
+    assert_eq!(confirm.action, ConfirmAction::Finished);
     model.confirm_settles_at = None;
     // Enter closes it. Deploy is untouched and no host is asked anything.
     assert_eq!(model.input(key(KeyCode::Enter), 20), InputResult::Draw);

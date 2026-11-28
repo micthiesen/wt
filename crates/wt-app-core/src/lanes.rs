@@ -84,7 +84,7 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
         | A::DismissReviewRequest { .. }
         | A::KillAction { .. }
         | A::HardRefresh => Lane::HostControl(host),
-        A::DiscoverSessions { .. } => Lane::Prefetch(host),
+        A::DiscoverSessions { .. } | A::ReadPullRequest { .. } => Lane::Prefetch(host),
         A::Session { key, .. } => Lane::Terminal(host, key),
         A::SelectSession { selection } => Lane::Terminal(host, selection.key),
         A::EnterHarness { key, .. } => Lane::Terminal(host, Some(key)),

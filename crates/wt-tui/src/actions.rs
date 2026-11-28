@@ -311,6 +311,12 @@ pub enum UiAction {
         key: Option<String>,
         target: SessionTarget,
     },
+    /// Background read behind a pull-request key the board answered with
+    /// "no PR": ask the row's host to read that branch from GitHub again,
+    /// and nothing else. Shows no feedback and changes nothing.
+    ReadPullRequest {
+        key: String,
+    },
     SelectSession {
         selection: SessionSelection,
     },
@@ -506,6 +512,9 @@ pub struct CleanupTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConfirmAction {
+    /// What the confirmation named has ended while it was open (a run that
+    /// finished). Nothing is left to confirm: any answer closes it.
+    Finished,
     /// A local failure dialog. Copying its details performs no host command.
     CopyDetails {
         details: String,

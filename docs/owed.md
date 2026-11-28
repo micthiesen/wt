@@ -236,7 +236,12 @@ Sessions keep the build that started them for days and share the state.
   older build discharged that stage; a `verified` or `dropped` record owes
   no check.
 - **Removed rows** keep `checks` and `owed` on the removal entry itself,
-  because an older build replaces the entry's whole status.
+  because an older build replaces the entry's whole status. The entry also
+  names the commit that landed the work, for watches that follow it to a
+  stage: `prMergeCommitOid` when the pull request merged at the removed head
+  or at a head it was a copy of, `landingCommitOid` when the base contains
+  the head, and neither for a landing proven only by matching patches. Both are additive; a
+  record without them reads as before.
 - **Due steps** are a top-level `owed` array, not watches: an older engine
   deletes a watch that has no action left. At most 20 per worktree.
 - **Earlier pull requests' checks.** An older `wt next` does not set

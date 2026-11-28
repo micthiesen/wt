@@ -5,7 +5,7 @@
 use super::{LoadingOverlay, LocalMenu, Menu, row_display};
 use crate::{
     Board, BoardRow, CheckState, ConfirmAction, PrFact, PrPin, PrPresentation, ReviewerOption,
-    ReviewerPool, UiModal,
+    ReviewerPool, UiAction, UiModal,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -42,7 +42,14 @@ fn no_shown_pr(board: &Board, row: &BoardRow) -> LocalMenu {
         return LocalMenu::NotYet(format!("GitHub data is unavailable: {error}"));
     }
     match row.action_facts.pr {
-        PrFact::Absent => LocalMenu::NotYet("no PR for this branch".into()),
+        // Only this branch's pull request is in doubt: its host reads that
+        // from GitHub, not the whole board with its Git sweep.
+        PrFact::Absent => LocalMenu::Ask {
+            text: "no PR for this branch".into(),
+            read: Box::new(UiAction::ReadPullRequest {
+                key: row.key.clone(),
+            }),
+        },
         PrFact::Unknown | PrFact::Present { .. } => {
             LocalMenu::NotYet("GitHub data is still loading for this branch".into())
         }
@@ -413,7 +420,11 @@ mod tests {
         for ship in [false, true] {
             assert_eq!(
                 menu(&absent, "one", ship),
-                LocalMenu::NotYet("no PR for this branch".into())
+                // Answered at once, with one read of that branch behind it.
+                LocalMenu::Ask {
+                    text: "no PR for this branch".into(),
+                    read: Box::new(UiAction::ReadPullRequest { key: "one".into() }),
+                }
             );
             assert_eq!(
                 menu(&board(None, None), "one", ship),

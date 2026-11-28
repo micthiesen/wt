@@ -292,8 +292,23 @@ values ride the board frame only for actions with an argument prompt.
 
 A loading overlay (`Interaction::Loading`) takes every key while its request
 runs. Esc, `q`, Ctrl+C or the overlay's own key close it and cancel the
-request, and so does a dialog or request that replaces it. Nothing typed is
-held or replayed. An open confirmation rebuilds only while the rebuilt action
+request, and so does a dialog or request that replaces it. Replaced
+overlays' request ids are kept in a bounded set of 8
+(`Model.abandoned_overlays`), so their late replies open nothing. Nothing
+typed is held or replayed. A 400 ms settle window (`Settle` in
+`model/input.rs`) has two rules. After a menu key answers with a notice,
+keys that act are ignored with a notice, quit included; moves, the mouse and
+Esc pass. After a confirmation closes by commit or cancel, only a second
+Enter, `y`, `n` or `q` is absorbed. A layer opened by key ends the window. A
+confirmation reopened after a stale refusal carries the refusal as its first
+line and takes no commit while it still names what was refused: it is
+rebuilt when the board's witness changes and then settles, closes when the
+newer board does not offer it, and is released after 5 seconds. On a stale
+refusal the host re-reads sessions and the row's Git, and for GitHub asks
+for the row's branch directly. A Stop confirmation whose run ended becomes
+`ConfirmAction::Finished`, which only closes. `UiAction::ReadPullRequest` is
+a background read on the Prefetch lane: `no PR for this branch` sends one,
+and the row's host calls `GithubRefresh::refresh_live_branch`. An open confirmation rebuilds only while the rebuilt action
 equals the one it opened for: when its subject changes on the board it stays
 as shown and the host refuses the commit.
 The header's refresh wave counts prepared refreshing lanes and has a 10 Hz timer
@@ -449,7 +464,9 @@ the reviewer picker offers. It reads GitHub when the pool is missing or a day
 old, on hard refresh, and on a board refresh while there is no pool at all; a
 restart inside the day reads nothing, and a pool that never loaded reports on
 the attention feed. The derived `pr-facts` stage, after `work_presentation`,
-attaches `Board.reviewers` and `PrPresentation.queue_removal`. The pool
+attaches `Board.reviewers` and `PrPresentation.queue_removal`, and marks a
+row with a queue removal as needing attention for as long as the reason
+shows. The pool
 lends the board no provenance: it only offers names, and its commit is
 checked by the host. Queue removal is `wait_facts::queue_removal`, the
 predicate `wt wait` and `wt fleet` call, and is set only from a live GitHub
@@ -538,8 +555,19 @@ An expiry while confirmed data still disagrees shows one notice.
   the TUI before the final creation reply. Layout and remote checkout creation use separate pending mutations,
   so neither host's clock confirms the other write. The `creationAfter` layout
   field applies while the row has no explicit order and, under status sorting,
-  no work status. The projection preserves stack units and handles missing or
-  cyclic anchors without dropping rows.
+  no work status. When the followed row leaves its section or is forgotten
+  (moved, placed, reaped, its state cleared), a row that followed it inherits
+  what that row followed, or gets a `creationSlot` (`{order, key}`, also in
+  `remoteLayouts`) recording where the row was; a press that restates the
+  anchor clears the slot; `prune_slug_records` writes the slot too before it
+  drops a record. Layout resolves an anchor through the stored record of the
+  row it names, whether or not the board lists that row (archived, landed,
+  being removed, removed): while the record is filed in the section the unit
+  stays where that row would be drawn. Otherwise it uses the slot, and only
+  then puts the unit at the top. The slot keeps the leaving row's stored
+  order, not its status, so under status sort the unit is drawn behind the
+  unit with the nearest stored order. The projection preserves stack
+  units and handles missing or cyclic anchors without dropping rows.
   J/K is resolved at the keypress: `plan_reorder` turns the press into a
   `ReorderStep` against the board on screen (`Pass` a neighbouring unit,
   `Cross` into the next section drawn, or `Section` for a header), and a
@@ -550,9 +578,15 @@ An expiry while confirmed data still disagrees shows one notice.
   controller validates the step (every key is a row it lists, the pair is
   adjacent, `Cross.rows` are one stack, no derived section is involved) and
   passes the store each listed unit's band (its status under status sort)
-  and whether it is drawn at its creation position. The store compares that
-  drawn layout with the stored one inside the same transaction and answers
-  `LayoutChanged`, a stale reply, on a difference; nothing is written. A unit
+  and whether it is drawn at its creation position; the store counts a unit
+  as anchored only while it also has no stored order. The store compares the
+  pressed band's drawn order with the stored one inside the same transaction
+  and answers `LayoutChanged`, a stale reply, on a difference; nothing is
+  written. When a press renumbers a section, only the pressed band keeps the
+  drawn order; every other band is numbered by its stored order,
+  never-ordered units first. The TUI's projection applies the same rule to
+  creation positions, so the next press of a burst resolves from the board
+  the read will bring. A unit
   is the rows of a stack drawn together in one section, derived from
   `BoardRow.stack_parent` and `stack_index`, which layout publishes;
   `DisplayPolicy.status_sort` mirrors `[ui] sort`. J/K selection follows the
@@ -599,9 +633,16 @@ only the facts they affect. The Git leaf is keyed by checkout, so a change is
 routed to the rows it can touch (a path under a checkout, that checkout's
 `worktrees/<name>` metadata, a branch or upstream ref) and only those rows are
 read again. A path under the worktree root in no listed checkout, or a ref no
-row uses, asks for the listing alone. `packed-refs`, `config`, `info/` and
-paths that cannot be placed ask for a sweep of every row. Ref routing ignores
-case on macOS and Windows.
+row uses, asks for the listing alone, and so does a change reported for a
+directory under `refs`, for the Git directory itself or for `objects`: the
+refs, `HEAD` and index that moved are reported as their own paths.
+`packed-refs`, `config`, `info/` and paths that cannot be placed ask for a
+sweep of every row. A `config` or `packed-refs` inside a Git directory that is
+rewritten with the same bytes is not a change: the router keeps a content
+hash of each, and Git rewrites `config` with the same bytes on every fetch
+that syncs a local branch. Files over 4 MiB, and any path that is not a
+readable regular file, always count as changed. Working-tree paths with
+those names are never compared. Ref routing ignores case on macOS and Windows.
 
 The watch set is the worktree root, the main clone, the state database's
 directory, each checkout's immediate children, and each Git common directory
@@ -615,13 +656,22 @@ changes are found by polling, the state database, its WAL and the events
 snapshot are also stat-checked every 75 ms. Metadata reads caused by other
 processes' writes are paced to one per 250 ms after the first. A listing
 waits up to two seconds for its checkouts to be watched and baselined before
-their first read, so start-up normally makes one pass. A full sweep runs
-every 60 seconds, on `r`, on hard refresh and at start.
+their first read, so start-up normally makes one pass. A watch root that
+appears asks for a whole-domain read only once the Git leaf has published
+live rows. A full sweep runs every 60 seconds, on `r`, on hard refresh and at
+start. Whole refresh requests within 2 seconds of the previous one are one
+request, so `r` pressed twice is one sweep; an unrouted change and a
+user-priority read of every row are never folded into it, and neither is an
+unrouted change that arrives together with a refresh. Each completed
+sweep logs one info record, `sweep completed`, with `source`, `rows`, `of`,
+`duration_ms` and `cause` (`refresh`, `unrouted change` or `user action`).
 
 Git reads are ordered: user-caused first, then event-caused, then sweeps. A
 sweep read that has waited 5 seconds is served with the event reads. Sweeps
 wait for a fleet-scan turn ([External effects](#external-effects-and-failures)),
-and one process holds at most one turn, shared by its fleet reads. A
+and one process holds at most one turn, shared by its fleet reads. A board
+refresh asks for an origin fetch unless one was asked for in the last 2
+seconds. A
 completed origin fetch asks for the checkout listing only. A finished
 Git-affecting action re-reads its own checkout.
 Native notifications for regular files already observed by that probe are
@@ -723,7 +773,9 @@ channels with separate queue bounds. The user queue holds 64 requests beyond
 those the controller has taken. A key whose request finds it full is refused
 with `actions are busy; try again when one finishes` and projects nothing. A
 follow-up the model queued itself is not refused for a full queue: it is held
-until there is room. Every user request logs one info-level
+until there is room, and dropped with `a queued action was not sent: actions
+were busy` once a key has acted, since it was meant for the view its reply
+found. Every user request logs one info-level
 `controller request` record (`operation`, `lane`, `host`, `queued_ms`,
 `run_ms`, and `outcome`: `ok`, `failed`, `stale`, `uncertain`, `cancelled` or
 `replaced`). A background read logs it at debug unless it failed, is
@@ -966,8 +1018,11 @@ which runs when the pull moved the main clone's HEAD and a lockfile differs
 between the commit its packages were last installed at and HEAD. That commit
 is recorded in `main-dependency-sync.stamp` in the repository lock directory
 (`<git common dir>/wt-locks`): HEAD after a successful install, and the
-pre-pull commit before a first install, so an install that was cancelled or
-failed is still owed to the next pull that moves HEAD. The install runs as
+pre-pull commit when no usable stamp exists, written before the install
+queues for a slot, so an install that was cancelled while queued or failed is
+still owed to the next pull that moves HEAD. Stamp writes take their own
+short lock, `main-dependency-sync-stamp`, never held across the slot wait or
+the install. The install runs as
 bulk, not heavy. It takes one `dependency-install` slot in `paths.lock_dir`
 first, then the `main-dependency-sync` lock, checks again under the lock, and
 installs; a pull with nothing to install takes neither. A Rift create holds

@@ -232,10 +232,14 @@ impl Model {
 
     /// When a pending change next needs re-checking against its deadline.
     pub fn next_deadline(&self) -> Option<tokio::time::Instant> {
-        [self.pending.next_deadline(), self.palette_wait_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.pending.next_deadline(),
+            self.palette_wait_deadline(),
+            self.stale_hold_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub(crate) fn next_op_id(&mut self) -> u64 {
@@ -364,7 +368,8 @@ impl Model {
             // No generation bump here: this request was already sent at
             // the current one, and its own reply must still count.
             Interaction::Loading(loading) => {
-                self.abandoned_overlay = loading.request;
+                let request = loading.request;
+                self.abandon_overlay(request);
                 self.interaction = Interaction::None;
             }
             _ => {}

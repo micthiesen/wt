@@ -68,10 +68,13 @@ pub enum LocalMenu {
     },
     /// Nothing to choose from; show this notice instead.
     Notice(String),
-    /// The board has no answer yet, or one that may be behind what the
-    /// person knows: say it and ask the sources to read again, instead of
-    /// holding the key until a host has waited for them.
+    /// The board has no answer yet: say it and ask the sources to read
+    /// again, instead of holding the key until a host has waited for them.
     NotYet(String),
+    /// The board's answer may be behind what the person knows, and one
+    /// narrow read would tell: say it and send that read in the background,
+    /// without re-reading everything else.
+    Ask { text: String, read: Box<UiAction> },
 }
 
 impl LocalMenu {
@@ -213,7 +216,8 @@ impl UiAction {
             | A::EnterHarness { .. }
             | A::StopTerminal { .. }
             | A::StopSession { .. }
-            | A::DiscoverSessions { .. } => Menu::NotMenu,
+            | A::DiscoverSessions { .. }
+            | A::ReadPullRequest { .. } => Menu::NotMenu,
         }
     }
 
