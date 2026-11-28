@@ -10,15 +10,32 @@ use wt_app_core::context::AppContext;
 /// rereads for as long as it runs.
 const COMMAND_STATUS_READS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(8).unwrap();
 
+/// The repository as a one-shot command reads fleet statuses from it: at the
+/// runner's own bound.
+fn display_reader(context: &AppContext) -> wt_vcs::GitRepository {
+    (*context.repository)
+        .clone()
+        .with_max_concurrent_status(COMMAND_STATUS_READS)
+}
+
 /// Every checkout with its Git status, for a command that reads them once
 /// and exits.
 pub async fn inventory_status(
     context: &AppContext,
 ) -> Result<Vec<wt_vcs::WorktreeSnapshot>, wt_vcs::RepositoryError> {
-    (*context.repository)
-        .clone()
-        .with_max_concurrent_status(COMMAND_STATUS_READS)
+    display_reader(context)
         .inventory_status(&context.cancellation)
+        .await
+}
+
+/// The Git status of each of `records`, for a command that listed the
+/// worktrees itself so its other reads could start alongside this one.
+pub async fn statuses(
+    context: &AppContext,
+    records: Vec<wt_vcs::WorktreeRecord>,
+) -> Vec<wt_vcs::WorktreeSnapshot> {
+    display_reader(context)
+        .statuses(records, &context.cancellation)
         .await
 }
 

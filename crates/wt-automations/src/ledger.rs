@@ -885,6 +885,30 @@ impl AutomationLedger {
         .await
     }
 
+    /// Record since when no pass has produced the deferred fire `id`, or
+    /// (`None`) that one produces it again. A process that starts while it
+    /// is away must not take the record for a fire to run.
+    pub async fn set_deferred_dormant(
+        &self,
+        id: &str,
+        since_ms: Option<i64>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), LedgerError> {
+        self.mutate("mark deferral dormant", cancellation, |root| {
+            let Some(record) = ensure_object(root, "deferred")
+                .get_mut(id)
+                .and_then(Value::as_object_mut)
+            else {
+                return;
+            };
+            match since_ms {
+                Some(since_ms) => record.insert("dormantSinceMs".into(), json!(since_ms)),
+                None => record.remove("dormantSinceMs"),
+            };
+        })
+        .await
+    }
+
     /// Deferred fires recorded by any process, by identity.
     pub async fn deferred(&self) -> Result<BTreeMap<String, Value>, LedgerError> {
         let view = self.view().await?;

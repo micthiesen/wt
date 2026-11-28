@@ -2,7 +2,6 @@
 """Publish checked native assets without replacing an existing release."""
 import json
 import os
-import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -20,26 +19,20 @@ for asset in assets:
 prerelease = os.environ["RELEASE_PRERELEASE"] == "true"
 
 
-def release_notes(message: str, release: str) -> str:
-    """A stable release's notes are its release commit message, without the
-    `Release vX:` prefix on the summary line."""
-    subject, _, body = message.strip().partition("\n")
-    subject = re.sub(rf"^Release {re.escape(release)}:\s*", "", subject).strip()
-    return "\n\n".join(part for part in (subject, body.strip()) if part)
-
-
 footer = (f"Native wt binaries for macOS and Linux, built from `{build}`.\n\n"
           "Downloads are verified against `wt-release.json` and `SHA256SUMS`.\n")
 with tempfile.TemporaryDirectory(prefix="wt-release-") as scratch:
     notes = Path(scratch) / "notes.md"
-    text = footer
-    if not prerelease:
-        message = subprocess.run(["git", "log", "-1", "--format=%B", build], check=True,
-                                 capture_output=True, text=True).stdout
-        if summary := release_notes(message, release):
-            text = f"{summary}\n\n---\n{footer}"
-    notes.write_text(text)
-    command = ["gh", "release", "create", release, "--target", build, "--title", f"wt {release}",
+    # Written by release-notes.py from every commit since the previous release.
+    # Missing or unreadable notes never stop a publication.
+    try:
+        drafted = json.loads(Path(os.environ["RELEASE_NOTES"]).read_text())
+        title, summary = str(drafted["title"]).strip(), str(drafted["notes"]).strip()
+    except (KeyError, OSError, ValueError, TypeError):
+        title = summary = ""
+    notes.write_text(f"{summary}\n\n---\n{footer}" if summary and not prerelease else footer)
+    heading = f"wt {release}: {title}" if title and not prerelease else f"wt {release}"
+    command = ["gh", "release", "create", release, "--target", build, "--title", heading,
                "--notes-file", str(notes)]
     if prerelease:
         command += ["--prerelease", "--latest=false"]

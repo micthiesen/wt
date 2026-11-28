@@ -338,6 +338,9 @@ enum Command {
     /// Run the ref maintenance a creation left for after its checkout.
     #[command(name = "_maintain-origin", hide = true)]
     MaintainOrigin,
+    /// Delete removed checkouts no removal is going to delete.
+    #[command(name = "_delete-removed-checkouts", hide = true)]
+    DeleteRemovedCheckouts,
     /// Create a worktree from an issue, branch or slug.
     New(commands::new::NewCommandArgs),
     /// Keep a worktree whose PR landed and start its next PR on a fresh branch.
@@ -807,6 +810,9 @@ async fn dispatch_command(
             wt_ops::commands::new::run_install_worker(context, args).await
         }
         Command::MaintainOrigin => wt_ops::lifecycle_ops::run_maintenance_worker(context).await,
+        Command::DeleteRemovedCheckouts => {
+            wt_ops::lifecycle_ops::run_quarantine_worker(context).await
+        }
         Command::New(args) => commands::new::run(context, args).await,
         Command::Next(args) => commands::next::run(context, args).await,
         Command::Orphans(args) => commands::orphans::run(context, args).await,

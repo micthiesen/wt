@@ -130,6 +130,18 @@ impl KeyedReader for GitReader {
         read.target.path == listed.target.path
     }
 
+    /// The listing and a status each report the commit at HEAD. An error
+    /// row, or either side not naming one, has nothing to disagree with.
+    fn agrees(entry: &WorktreeRecord, value: &Self::Value) -> bool {
+        match (
+            &entry.head_sha,
+            value.0.as_ref().and_then(|status| status.head_sha.as_ref()),
+        ) {
+            (Some(listed), Some(read)) => listed == read,
+            _ => true,
+        }
+    }
+
     fn row(entry: &WorktreeRecord, value: &Self::Value) -> WorktreeSnapshot {
         WorktreeSnapshot {
             worktree: entry.clone(),
@@ -1349,6 +1361,228 @@ mod tests {
             );
         }
         assert_eq!(behind(&local), Some(2));
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+        fixture.close().await.unwrap();
+    }
+
+    /// Measurement, not a check: detection latency, the detector's idle
+    /// cost and how often the fleet is read with nobody asking, on a fleet
+    /// shaped like a real one. Run with
+    /// `cargo test -p wt-sources timing_of_detection -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "timing measurement over 41 checkouts of 16,000 files"]
+    async fn timing_of_detection_on_a_fleet_shaped_like_a_real_one() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let root = fixture.ctx.config.paths.worktree_root.clone();
+        let main = fixture.ctx.config.paths.main_clone.clone();
+        let git_in = |directory: &std::path::Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        for directory in 0..160 {
+            let path = main.join(format!("src/d{directory:03}"));
+            std::fs::create_dir_all(&path).unwrap();
+            for file in 0..100 {
+                std::fs::write(path.join(format!("f{file:03}.txt")), "content\n").unwrap();
+            }
+        }
+        git_in(&main, &["add", "src"]);
+        git_in(&main, &["commit", "-q", "-m", "files"]);
+        git_in(
+            &main,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        for index in 0..38 {
+            let name = format!("n{index:02}");
+            git_in(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("feature/{name}"),
+                    root.join(&name).to_str().unwrap(),
+                    "main",
+                ],
+            );
+            git_in(
+                &main,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/feature/{name}"),
+                    "HEAD",
+                ],
+            );
+            git_in(
+                &main,
+                &["config", &format!("branch.feature/{name}.remote"), "origin"],
+            );
+            git_in(
+                &main,
+                &[
+                    "config",
+                    &format!("branch.feature/{name}.merge"),
+                    &format!("refs/heads/feature/{name}"),
+                ],
+            );
+        }
+        let probe = ReadProbe::default();
+        let scope = TaskScope::new();
+        let local = start_probed(&scope, &fixture.ctx, Some(probe.clone()));
+        let mut updates = local.git.subscribe();
+        local.board.refresh();
+        updates
+            .wait_for(|snapshot| {
+                *snapshot.state() == SourceState::Ready && snapshot.data().is_some()
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let row = |snapshot: &SourceSnapshot<Vec<WorktreeSnapshot>>, slug: &str| {
+            snapshot.data().and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.worktree.target.slug() == slug)
+                    .cloned()
+            })
+        };
+        let median = |mut samples: Vec<Duration>| {
+            samples.sort();
+            (samples[samples.len() / 2], samples[samples.len() - 1])
+        };
+        // HEAD moves: a commit in a linked checkout.
+        let mut head = Vec::new();
+        for round in 0..6 {
+            let slug = format!("n{:02}", round * 5);
+            let before = row(&local.git.snapshot(), &slug)
+                .unwrap()
+                .status
+                .unwrap()
+                .head_sha;
+            git_in(
+                &root.join(&slug),
+                &["commit", "-q", "--allow-empty", "-m", "moved"],
+            );
+            let started = std::time::Instant::now();
+            updates
+                .wait_for(|snapshot| {
+                    row(snapshot, &slug)
+                        .and_then(|row| row.status)
+                        .map(|status| status.head_sha)
+                        != Some(before.clone())
+                })
+                .await
+                .unwrap();
+            head.push(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(1370)).await;
+        }
+        // The index changes: a tracked file is staged.
+        let mut index = Vec::new();
+        for round in 0..6 {
+            let slug = format!("n{:02}", round * 5 + 1);
+            std::fs::write(
+                root.join(&slug).join("src/d000/f000.txt"),
+                format!("edit {round}\n"),
+            )
+            .unwrap();
+            git_in(&root.join(&slug), &["add", "src/d000/f000.txt"]);
+            let started = std::time::Instant::now();
+            updates
+                .wait_for(|snapshot| dirty(snapshot, &slug) == Some(true))
+                .await
+                .unwrap();
+            index.push(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(1370)).await;
+        }
+        // A tracked ref moves: the upstream of a checkout, as a fetch does.
+        git_in(&main, &["commit", "-q", "--allow-empty", "-m", "upstream"]);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut upstream = Vec::new();
+        for round in 0..6 {
+            let slug = format!("n{:02}", round * 5 + 2);
+            git_in(
+                &main,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/feature/{slug}"),
+                    "HEAD",
+                ],
+            );
+            let started = std::time::Instant::now();
+            updates
+                .wait_for(|snapshot| {
+                    row(snapshot, &slug)
+                        .and_then(|row| row.status)
+                        .and_then(|status| status.behind)
+                        .unwrap_or(0)
+                        > 0
+                })
+                .await
+                .unwrap();
+            upstream.push(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(1370)).await;
+        }
+        // Idle: the detector's own cost, and what is read with nobody asking.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let cpu = || {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "cputime=", "-p", &std::process::id().to_string()])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            text.split(':').fold(0.0, |total, part| {
+                total * 60.0 + part.parse::<f64>().unwrap_or(0.0)
+            })
+        };
+        let window = Duration::from_secs(120);
+        let (cpu_before, reads_before) = (cpu(), probe.lock().unwrap().len());
+        tokio::time::sleep(window).await;
+        let (cpu_after, reads) = (cpu(), probe.lock().unwrap()[reads_before..].to_vec());
+        let most = reads
+            .iter()
+            .fold(
+                std::collections::BTreeMap::<&str, usize>::new(),
+                |mut counts, slug| {
+                    *counts.entry(slug).or_default() += 1;
+                    counts
+                },
+            )
+            .into_values()
+            .max()
+            .unwrap_or(0);
+        println!("checkouts: 41, tracked files each: 16,001");
+        println!(
+            "HEAD moved to published, median / max:        {:?}",
+            median(head)
+        );
+        println!(
+            "index changed to published, median / max:     {:?}",
+            median(index)
+        );
+        println!(
+            "upstream ref moved to published, median / max: {:?}",
+            median(upstream)
+        );
+        println!(
+            "idle for {window:?}: process CPU {:.2}% of a core (scanner, sources and runtime; git children excluded)",
+            (cpu_after - cpu_before) / window.as_secs_f64() * 100.0
+        );
+        println!(
+            "idle for {window:?}: {} status reads with nobody asking ({:.0}/min), at most {most} of one checkout",
+            reads.len(),
+            reads.len() as f64 * 60.0 / window.as_secs_f64()
+        );
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();
     }

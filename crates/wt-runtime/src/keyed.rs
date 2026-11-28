@@ -80,6 +80,15 @@ pub trait KeyedReader: Send + Sync + 'static {
     /// The row for a value and the entry it was read against.
     fn row(entry: &Self::Entry, value: &Self::Value) -> Self::Row;
 
+    /// Whether what a read saw for itself matches what the listing says of
+    /// the same row (for Git, the commit each found at HEAD). A read that
+    /// started after a listing did has not necessarily looked after it: when
+    /// the two disagree the row changed between their looks, and it is read
+    /// again rather than shown as half of each.
+    fn agrees(_entry: &Self::Entry, _value: &Self::Value) -> bool {
+        true
+    }
+
     /// The key a row's stamp is published under and may be asked for by.
     /// Rows that share one are confirmed together: the stamp is the oldest
     /// of theirs and a request for it reads them all. For a reader whose
@@ -501,15 +510,24 @@ impl<R: KeyedReader> Engine<R> {
                         {
                             sweep.reads += 1;
                         }
-                        let listed = if flight.entry == row.entry {
-                            row.listed
+                        // A read that started no earlier than the listing
+                        // behind the row's entry goes with that entry,
+                        // whichever entry it was started with, provided the
+                        // two saw the same thing. If they did not, the row
+                        // changed between their looks: read it once more.
+                        let moved = flight.entry != row.entry;
+                        let (entry, listed) = if !moved || flight.started >= row.listed {
+                            (row.entry.clone(), row.listed)
                         } else {
-                            flight.listed
+                            (flight.entry, flight.listed)
                         };
+                        if moved && !R::agrees(&entry, &value) {
+                            raise(&mut row.want, flight.want.class, flight.want.first);
+                        }
                         row.value = Some(Read {
                             value,
                             started: flight.started,
-                            entry: flight.entry,
+                            entry,
                             listed,
                         });
                         Self::finish(&mut self.unpublished, flight.want);
@@ -538,16 +556,24 @@ impl<R: KeyedReader> Engine<R> {
                     if !R::same_subject(&row.entry, &entry) {
                         row.value = None;
                     }
+                    // A read of the same subject that started no earlier
+                    // than this listing has seen whatever the listing saw:
+                    // a commit is one listing and one read, not a second
+                    // read because the first was started with the old entry.
                     let reading = row.flight.as_ref().is_some_and(|flight| {
-                        !flight.superseded && flight.entry == entry && flight.started >= started
+                        !flight.superseded
+                            && R::same_subject(&flight.entry, &entry)
+                            && flight.started >= started
                     });
-                    let read = row
-                        .value
-                        .as_ref()
-                        .is_some_and(|read| read.entry == entry && read.started >= started);
+                    // Started no earlier is not looked no earlier: the read
+                    // must also have seen what the listing now says.
+                    let read = row.value.as_ref().is_some_and(|read| {
+                        read.started >= started && R::agrees(&entry, &read.value)
+                    });
                     if let Some(read) = &mut row.value
-                        && read.entry == entry
+                        && (read.entry == entry || read.started >= started)
                     {
+                        read.entry = entry.clone();
                         read.listed = started;
                     }
                     // The listing is a change detector of its own: an entry
@@ -823,6 +849,9 @@ mod tests {
         /// Key and the path-like identity the listing gives it.
         listing: Vec<(String, u32)>,
         listing_error: Option<String>,
+        /// The listing looks at the end of its ten milliseconds, not the
+        /// start: after a read that started with it has already looked.
+        list_late: bool,
         /// What else the listing says about a key, shown in its row as
         /// thousands so a test can tell which entry a row was built from.
         labels: BTreeMap<String, u32>,
@@ -885,6 +914,12 @@ mod tests {
             key.split('#').next().unwrap_or(key)
         }
 
+        /// In these tests a value of nine or more is what a read finds once
+        /// the listing shows a label.
+        fn agrees(entry: &Self::Entry, value: &u32) -> bool {
+            (entry.2 > 0) == (*value >= 9)
+        }
+
         async fn sweep(&self, _cancel: CancellationToken) -> TurnGuard {
             tokio::time::sleep(self.turn_wait).await;
             self.with(|state| {
@@ -900,6 +935,9 @@ mod tests {
             _cancel: CancellationToken,
         ) -> Result<Vec<(String, Self::Entry)>, String> {
             self.with(|state| state.urgent_listings += usize::from(urgent));
+            if self.with(|state| state.list_late) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let result = self.with(|state| {
                 state.listings += 1;
                 match &state.listing_error {
@@ -1292,6 +1330,115 @@ mod tests {
             .wait_for(|snapshot| value_in(snapshot, "a") == Some(1009))
             .await
             .unwrap();
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_seen_by_the_listing_and_a_read_together_is_read_once() {
+        let scope = TaskScope::new();
+        let fake = Fake::new(&["a", "b"]);
+        let source = start(&scope, &fake);
+        loaded(&source).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let reads = fake.reads().len();
+        // A commit: the listing's entry for the row and the row's own value
+        // both change, and one event asks for both at once.
+        fake.with(|state| {
+            state.labels.insert("a".into(), 1);
+            state.values.insert("a".into(), 9);
+        });
+        let asked = Instant::now();
+        source.request_keys(Request::Recheck, ["a"]);
+        source
+            .subscribe()
+            .wait_for(|snapshot| value_in(snapshot, "a") == Some(1009))
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.reads().len(),
+            reads + 1,
+            "the row was read twice for one change"
+        );
+        // One read's length, not a second read behind it.
+        assert!(
+            asked.elapsed() < Duration::from_millis(150),
+            "{:?}",
+            asked.elapsed()
+        );
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_between_the_reads_look_and_the_listings_is_read_again() {
+        let scope = TaskScope::new();
+        let fake = Fake::new(&["a", "b"]);
+        fake.with(|state| {
+            state.values.insert("a".into(), 7);
+            state.list_late = true;
+        });
+        let source = start(&scope, &fake);
+        loaded(&source).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let reads = fake.reads().len();
+        // One event starts a listing and a read of the row together. The
+        // read looks at once; the row then changes (with no further event);
+        // the listing looks after that and reports the new entry.
+        source.request_keys(Request::Recheck, ["a"]);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(fake.reads().len(), reads + 1);
+        fake.with(|state| {
+            state.labels.insert("a".into(), 1);
+            state.values.insert("a".into(), 9);
+        });
+        // The read started no earlier than the listing, but saw the row as
+        // it was before: the new entry must not be shown with that status
+        // until something else happens to ask.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(value(&source, "a"), Some(1009));
+        assert_eq!(fake.reads()[reads..], ["a", "a"]);
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_whole_user_request_reads_every_row_at_once_and_moves_the_domain_stamp() {
+        let scope = TaskScope::new();
+        let mut fake = Fake::new(&["a", "b", "c", "d", "e", "f"]);
+        // Another process holds the sweep turn for a long while.
+        fake.turn_wait = Duration::from_secs(60);
+        let source = start(&scope, &fake);
+        loaded(&source).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // A change that names no row settles on the domain's own stamp, the
+        // oldest row's, so its host asks for every row: read now, on every
+        // lane, without the turn a background sweep waits for.
+        let accepted = Stamp::now();
+        let urgent = fake.with(|state| state.urgent.len());
+        source.request(Request::Direct);
+        let done = tokio::time::timeout(
+            Duration::from_secs(1),
+            source.subscribe().wait_for(|snapshot| {
+                snapshot.domains()[&Domain::Git]
+                    .observed()
+                    .at_or_after(&accepted)
+                    == Some(true)
+            }),
+        )
+        .await
+        .is_ok();
+        assert!(
+            done,
+            "the domain stamp did not pass the request within a second"
+        );
+        assert_eq!(fake.with(|state| state.urgent.len()), urgent + 6);
+        assert_eq!(fake.with(|state| state.turns), 0);
+        assert_eq!(
+            source
+                .confirmed()
+                .unwrap()
+                .observed()
+                .at_or_after(&accepted),
+            Some(true)
+        );
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 

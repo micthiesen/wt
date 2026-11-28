@@ -1580,7 +1580,7 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
         "ordered":{"section":"S","order":9,"creationAfter":"x"},
         "elsewhere":{"section":"T","order":null,"creationAfter":"x"}},
         "remoteLayouts":{"@remote/server/far":{"section":"S","order":null,"creationAfter":"x"}}}"#;
-    let slot = json!({ "order": 4.0, "key": "x", "work": null });
+    let slot = json!({ "order": 4.0, "key": "x" });
     type Leave = fn(&mut Store);
     let leaves: [Leave; 5] = [
         // Its worktree long gone, the record is pruned.
@@ -1611,6 +1611,8 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
         let after = store.read_wt_state().unwrap();
         assert_eq!(after["slugs"]["new"]["creationSlot"], slot);
         assert_eq!(after["remoteLayouts"][remote]["creationSlot"], slot);
+        // The slug may go to a new worktree, which they did not follow.
+        assert!(after["slugs"]["new"]["creationAfter"].is_null());
         // Not rows it does not place: one with an order of its own, one
         // filed in another section, one that follows another row.
         for other in ["ordered", "elsewhere", "newer"] {
@@ -1620,8 +1622,8 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
             );
         }
     }
-    // A row at its creation position leaves: what follows it follows what
-    // it followed, and where that was.
+    // A row at its creation position leaves: what follows it is told what
+    // that row followed, and where that was.
     store.write_repository_state_json(state).unwrap();
     store
         .move_worktrees_to_section(&["x".to_owned()], Some("T"))
@@ -1630,8 +1632,10 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
         .move_worktrees_to_section(&["new".to_owned()], Some("T"))
         .unwrap();
     let after = store.read_wt_state().unwrap();
-    assert_eq!(after["slugs"]["newer"]["creationAfter"], "x");
+    // It takes that row's place: behind what it followed, sorting as it did.
+    assert!(after["slugs"]["newer"]["creationAfter"].is_null());
     assert_eq!(after["slugs"]["newer"]["creationSlot"], slot);
+    assert_eq!(after["slugs"]["newer"]["creationAs"], "new");
     // A press restates what the row follows, and the slot is done with.
     let drawn = [
         ShownUnit {
@@ -1666,6 +1670,212 @@ fn a_row_that_leaves_its_section_tells_the_rows_created_after_it_where_it_was() 
     assert_eq!(after["slugs"]["new"]["creationAfter"], "x");
     assert!(after["slugs"]["new"]["order"].is_null());
     assert!(after["slugs"]["new"]["section"].is_null());
+}
+
+/// The slot of a row whose followed row left holds one place, however many
+/// rows were created after each other and left in turn. Nested once per
+/// generation, the state would be written deeper than it can be read.
+#[test]
+fn the_place_a_row_keeps_is_flat_however_many_rows_left_before_it() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    store
+        .write_repository_state_json(r#"{"slugs":{"g0":{"section":"S","order":1}}}"#)
+        .unwrap();
+    for generation in 1..=300 {
+        let (new, before) = (format!("g{generation}"), format!("g{}", generation - 1));
+        assert!(
+            store
+                .place_new_worktree(&new, Some("S"), Some(&before))
+                .unwrap()
+        );
+        store.clear_slug_state(&before).unwrap();
+    }
+    let state = store.read_wt_state().unwrap();
+    let last = &state["slugs"]["g300"];
+    assert_eq!(last["creationSlot"], json!({ "key": "g0", "order": 1.0 }));
+    assert_eq!(last["creationAs"], "g1");
+    assert!(last["creationAfter"].is_null());
+
+    // A slot an earlier build nested is flattened when it is next written.
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{
+            "b":{"section":"S","order":null,"creationAfter":null,"creationSlot":{
+                "key":"a","order":2,"creationAfter":null,
+                "creationSlot":{"key":"z","order":3}}},
+            "c":{"section":"S","order":null,"creationAfter":"b"}}}"#,
+        )
+        .unwrap();
+    store.clear_slug_state("b").unwrap();
+    assert_eq!(
+        store.read_wt_state().unwrap()["slugs"]["c"]["creationSlot"],
+        json!({ "key": "a", "order": 2.0 })
+    );
+}
+
+#[test]
+fn a_removed_stack_row_leaves_its_place_to_the_rows_stacked_on_it() {
+    let temp = tempdir().unwrap();
+    let mut store = Store::open(
+        temp.path().join("wt.sqlite"),
+        identity("repo-a", "/repos/a"),
+    )
+    .unwrap();
+    let stack = |root_order: &str| {
+        format!(
+            r#"{{"slugs":{{
+            "p":{{"section":"S","order":1}},
+            "root":{{"section":"S"{root_order}}},
+            "k2":{{"section":"S","order":9,"baseBranch":"root"}},
+            "k1":{{"section":"S","order":2,"baseBranch":"root"}},
+            "deep":{{"section":"S","baseBranch":"k1"}},
+            "away":{{"section":"T","order":3,"baseBranch":"root"}},
+            "f":{{"section":"S","order":null,"creationAfter":"deep"}},
+            "g":{{"section":"S","order":null,"creationAfter":"root"}},
+            "z":{{"section":"S","order":7}}}}}}"#
+        )
+    };
+    // The first row of the unit has a stored order: the rows stacked on it
+    // take that order and sort right behind where the unit sorted, in the
+    // order the board drew them. The removed row's place sorts behind them,
+    // and the rows created after any row of the unit go on following it.
+    store
+        .write_repository_state_json(&stack(r#","order":5"#))
+        .unwrap();
+    let reparented = store
+        .reparent_base_references("root", "main", Some("root"))
+        .unwrap();
+    assert_eq!(reparented, ["away", "k1", "k2"]);
+    let after = store.read_wt_state().unwrap();
+    let kept = |key: &str, field: &str| after["slugs"][key][field].clone();
+    assert_eq!([kept("k1", "order"), kept("k2", "order")], [5.0, 5.0]);
+    assert_eq!(kept("k1", "unitIdentity"), "root\0k1");
+    assert_eq!(kept("k2", "unitIdentity"), "root\0k2");
+    assert_eq!(kept("root", "unitIdentity"), "root\0\u{10ffff}");
+    assert_eq!(
+        [kept("f", "creationAfter"), kept("g", "creationAfter")],
+        ["root", "root"]
+    );
+    assert_eq!(kept("k1", "baseBranch"), "main");
+    // A row of the stack that was never ordered sorts where it did, in
+    // whatever section; one with an order is drawn by that.
+    assert_eq!(kept("deep", "unitIdentity"), "root\0k1\0deep");
+    assert_eq!(kept("away", "order"), 3.0);
+    assert!(kept("away", "unitIdentity").is_null());
+
+    // Never ordered: the same among the rows never ordered.
+    store.write_repository_state_json(&stack("")).unwrap();
+    store
+        .reparent_base_references("root", "main", Some("root"))
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    let kept = |key: &str, field: &str| after["slugs"][key][field].clone();
+    assert!(kept("k1", "order").is_null() && kept("k2", "order").is_null());
+    assert_eq!(kept("k2", "unitIdentity"), "root\0k2");
+    assert_eq!(kept("root", "unitIdentity"), "root\0\u{10ffff}");
+    assert_eq!(
+        [kept("f", "creationAfter"), kept("g", "creationAfter")],
+        ["root", "root"]
+    );
+
+    // At its creation position: each follows the one before, the first
+    // where the removed row was, and what followed the unit the last.
+    store
+        .write_repository_state_json(&stack(r#","order":null,"creationAfter":"p""#))
+        .unwrap();
+    store
+        .reparent_base_references("root", "main", Some("root"))
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    let follows = |key: &str| after["slugs"][key]["creationAfter"].clone();
+    assert_eq!(
+        [follows("k1"), follows("k2"), follows("f"), follows("g")],
+        ["root", "k1", "k2", "k2"]
+    );
+    assert!(after["slugs"]["k1"]["order"].is_null() && after["slugs"]["k2"]["order"].is_null());
+    assert_eq!(after["slugs"]["root"]["unitIdentity"], "root");
+
+    // A row given an order by hand, or another base, sorts by its own again.
+    store.write_repository_state_json(&stack("")).unwrap();
+    store
+        .reparent_base_references("root", "main", Some("root"))
+        .unwrap();
+    store.place_slug("k1", Some("S"), true).unwrap();
+    store.set_slug_base("k2", Some(("p", None))).unwrap();
+    let shown = units(&["z", "deep"]);
+    store
+        .swap_shown_units(as_shown(Some("S"), &shown), "z", "deep")
+        .unwrap()
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    for row in ["k1", "k2", "deep"] {
+        assert!(after["slugs"][row].get("unitIdentity").is_none(), "{row}");
+    }
+    // It is not extended without end by a stack re-rooted over and over.
+    let long = format!("first\0{}", "x".repeat(400));
+    store
+        .write_repository_state_json(
+            &json!({"slugs": {
+                "root": {"section": "S", "unitIdentity": long},
+                "kid": {"section": "S", "baseBranch": "root"}}})
+            .to_string(),
+        )
+        .unwrap();
+    store
+        .reparent_base_references("root", "main", Some("root"))
+        .unwrap();
+    assert_eq!(
+        store.read_wt_state().unwrap()["slugs"]["kid"]["unitIdentity"],
+        "first\0kid"
+    );
+    // A removed row that has no record gets none: only rows that have a
+    // placement are written.
+    store
+        .write_repository_state_json(r#"{"slugs":{"kid":{"baseBranch":"ghost"}}}"#)
+        .unwrap();
+    store
+        .reparent_base_references("ghost", "main", Some("ghost"))
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    assert!(after["slugs"].get("ghost").is_none());
+    assert!(
+        after["slugs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|record| record.is_object())
+    );
+
+    // Removed from inside the unit: the unit stays where it is, and what
+    // was created after the removed row follows the row it was stacked on.
+    store
+        .write_repository_state_json(&stack(r#","order":5"#))
+        .unwrap();
+    store
+        .reparent_base_references("k1", "main", Some("k1"))
+        .unwrap();
+    let after = store.read_wt_state().unwrap();
+    assert_eq!(after["slugs"]["deep"]["baseBranch"], "root");
+    assert_eq!(after["slugs"]["k2"]["order"], 9.0);
+    store
+        .write_repository_state_json(
+            r#"{"slugs":{"root":{"section":"S","order":5},
+            "mid":{"section":"S","baseBranch":"root"},
+            "h":{"section":"S","order":null,"creationAfter":"mid"}}}"#,
+        )
+        .unwrap();
+    store
+        .reparent_base_references("mid", "main", Some("mid"))
+        .unwrap();
+    assert_eq!(
+        store.read_wt_state().unwrap()["slugs"]["h"]["creationAfter"],
+        "root"
+    );
 }
 
 #[test]
@@ -2551,4 +2761,77 @@ fn state_and_archived_keys_are_read_as_one_snapshot() {
         assert_eq!(state["attentionSeenTs"], seen);
         assert_eq!(archived, keys(&format!("at-{seen}")));
     }
+}
+
+/// A removal archives its row as it begins. The board draws a row being
+/// removed from both facts, so no reader may see the record without the
+/// marker: that drew the row in the wrong place for a frame.
+#[test]
+fn a_removal_and_its_archive_marker_begin_in_one_write() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("state.sqlite");
+    let mut writer = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let mut reader = Store::open(&path, identity("repo", "/repo")).unwrap();
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+    let watcher = std::thread::spawn({
+        let done = done.clone();
+        move || {
+            let mut removals_seen = 0;
+            while !done.load(Ordering::Acquire) {
+                let (state, archived) = reader.read_wt_state_and_archived_keys().unwrap();
+                if !state["removals"]["one"].is_null() {
+                    assert!(
+                        archived.contains("one"),
+                        "a reader saw the removal before its row was archived"
+                    );
+                    removals_seen += 1;
+                }
+            }
+            removals_seen
+        }
+    });
+    for round in 0..400 {
+        let job = format!("job-{round}");
+        assert!(
+            writer
+                .begin_removal_archived("one", &job, "/one", "feature/one", false, false)
+                .unwrap()
+        );
+        // Undone record first, so "a record means archived" stays true of
+        // every state this loop itself leaves behind.
+        writer.finish_removal("one", &job, None).unwrap();
+        writer.set_archived("one", false).unwrap();
+    }
+    done.store(true, Ordering::Release);
+    watcher.join().unwrap();
+
+    // While an attempt is active a second one changes nothing, the marker
+    // of another row included.
+    assert!(
+        writer
+            .begin_removal_archived("one", "first", "/one", "feature/one", true, false)
+            .unwrap()
+    );
+    assert!(
+        !writer
+            .begin_removal_archived("one", "second", "/one", "feature/one", false, true)
+            .unwrap()
+    );
+    let (state, archived) = writer.read_wt_state_and_archived_keys().unwrap();
+    assert_eq!(state["removals"]["one"]["jobId"], "first");
+    assert_eq!(state["removals"]["one"]["landed"], true);
+    assert!(archived.contains("one"));
+    // A retry of the failed attempt keeps where the row was drawn.
+    writer
+        .finish_removal("one", "first", Some("hook failed"))
+        .unwrap();
+    assert!(
+        writer
+            .begin_removal_archived("one", "retry", "/one", "feature/one", false, true)
+            .unwrap()
+    );
+    let state = writer.read_wt_state().unwrap();
+    assert_eq!(state["removals"]["one"]["landed"], true);
+    assert!(state["removals"]["one"]["wasArchived"].is_null());
 }

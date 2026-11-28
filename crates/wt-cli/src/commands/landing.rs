@@ -150,18 +150,36 @@ async fn fresh_github(ctx: &AppContext, branches: &[String], usage: Use) -> Opti
     if let Some(read) = snapshot {
         return Some(read.data);
     }
+    // A read another command or the board just made answers a printed
+    // landing as well as a new one would. A write is decided from neither.
+    if usage == Use::Display
+        && let Some((data, _)) = wt_sources::wait_facts::recent_read(ctx, branches).await
+    {
+        return Some(data);
+    }
     let github = GithubClient::new(
         ctx.processes.clone(),
         ctx.config.paths.main_clone.clone(),
         GithubOptions::from_config(&ctx.config, true),
     );
-    tokio::time::timeout(
+    let started_ms = now_ms();
+    let data = tokio::time::timeout(
         GITHUB_WAIT,
         github.fetch_worktrees(branches, &ctx.cancellation),
     )
     .await
     .ok()?
-    .ok()
+    .ok()?;
+    wt_sources::wait_facts::record_read(ctx, &data, started_ms).await;
+    Some(data)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// The landing of each of `rows`, by slug, for a command that prints it.
@@ -199,27 +217,6 @@ async fn read_for(
         saved,
         &usage.bases(),
         |branches| async move { fresh_github(ctx, &branches, usage).await },
-    )
-    .await
-}
-
-/// [`read`] for a command that made its own GitHub read for these rows:
-/// that read, when it succeeded, is the fresh answer.
-pub(crate) async fn read_with(
-    ctx: &AppContext,
-    rows: &[WorktreeRecord],
-    state: &Value,
-    fetched: Option<&GithubData>,
-) -> BTreeMap<String, RowLanding> {
-    let fetched = fetched.cloned();
-    resolve(
-        ctx,
-        rows,
-        state,
-        Want::Phases,
-        || async { None },
-        &Use::Display.bases(),
-        |_| async move { fetched },
     )
     .await
 }
@@ -275,10 +272,67 @@ where
             }
         }
     }
+    let local = LocalLandings {
+        result,
+        open,
+        local,
+    };
+    settle(ctx, state, local, saved, bases, fresh).await
+}
+
+/// What Git alone settled, and the rows it left open for GitHub.
+pub(crate) struct LocalLandings {
+    result: BTreeMap<String, RowLanding>,
+    open: Vec<WorktreeRecord>,
+    /// What the Git pass read of every row it could read.
+    local: BTreeMap<String, Landing>,
+}
+
+/// The rows GitHub's data can read differently from Git alone: those whose
+/// branch has a merged pull request in it, which is the only thing a
+/// landing proof takes from GitHub, and those Git could not read at all.
+/// The Git reads of every other row would come out as they already did.
+fn worth_rereading(
+    open: &[WorktreeRecord],
+    local: &BTreeMap<String, Landing>,
+    github: &GithubData,
+) -> Vec<WorktreeRecord> {
+    open.iter()
+        .filter(|row| {
+            !local.contains_key(row.target.slug())
+                || github
+                    .prs
+                    .get(&row.target.branch)
+                    .is_some_and(|pr| pr.state == "MERGED")
+        })
+        .cloned()
+        .collect()
+}
+
+async fn settle<S, F>(
+    ctx: &AppContext,
+    state: &Value,
+    local: LocalLandings,
+    saved: impl FnOnce() -> S,
+    bases: &PublishedBases,
+    fresh: impl FnOnce(Vec<String>) -> F,
+) -> BTreeMap<String, RowLanding>
+where
+    S: Future<Output = Option<GithubData>>,
+    F: Future<Output = Option<GithubData>>,
+{
+    let landings = |rows: Vec<WorktreeRecord>, github: Option<GithubData>| async move {
+        wt_ops::lifecycle_ops::row_landings(ctx, &rows, state, github.as_ref(), bases).await
+    };
+    let LocalLandings {
+        mut result,
+        mut open,
+        local,
+    } = local;
     if !open.is_empty()
         && let Some(saved) = saved().await
     {
-        let proven = landings(open.clone(), Some(saved)).await;
+        let proven = landings(worth_rereading(&open, &local, &saved), Some(saved)).await;
         open.retain(|row| {
             let slug = row.target.slug();
             match proven.get(slug).filter(|landing| landing.base) {
@@ -298,21 +352,77 @@ where
         .map(|row| row.target.branch.clone())
         .collect::<Vec<_>>();
     let fresh = fresh(branches).await;
+    let reread = match &fresh {
+        Some(github) => worth_rereading(&open, &local, github),
+        None => Vec::new(),
+    };
     let read = match &fresh {
-        Some(_) => landings(open.clone(), fresh.clone()).await,
-        None => BTreeMap::new(),
+        Some(_) if !reread.is_empty() => landings(reread.clone(), fresh.clone()).await,
+        _ => BTreeMap::new(),
     };
     for row in open {
         let slug = row.target.slug().to_owned();
-        // With an answer from GitHub, a row it could not place has
-        // evidence that could not be read: unknown, like no answer at all.
-        let landing = match read.get(&slug) {
-            Some(landing) => RowLanding::known(*landing),
-            None => RowLanding::unknown(local.get(&slug).copied().unwrap_or(Landing::NONE)),
+        let reread = reread.iter().any(|again| again.target.slug() == slug);
+        let landing = match (read.get(&slug), local.get(&slug)) {
+            (Some(landing), _) => RowLanding::known(*landing),
+            // GitHub answered and holds nothing that could change what Git
+            // read of this row.
+            (None, Some(landing)) if fresh.is_some() && !reread => RowLanding::known(*landing),
+            // With an answer from GitHub, a row it could not place has
+            // evidence that could not be read: unknown, like no answer at
+            // all.
+            (None, found) => RowLanding::unknown(found.copied().unwrap_or(Landing::NONE)),
         };
         result.insert(slug, landing);
     }
     result
+}
+
+/// The Git half of [`read_with`], for a command whose GitHub read is still
+/// under way: the two do not depend on each other.
+pub(crate) async fn read_local(
+    ctx: &AppContext,
+    rows: &[WorktreeRecord],
+    state: &Value,
+) -> LocalLandings {
+    let bases = Use::Display.bases();
+    let rows: Vec<WorktreeRecord> = rows.iter().filter(|row| !row.is_main).cloned().collect();
+    let local = wt_ops::lifecycle_ops::row_landings(ctx, &rows, state, None, &bases).await;
+    let mut result = BTreeMap::new();
+    let mut open = Vec::new();
+    for row in rows {
+        match local.get(row.target.slug()).filter(|landing| landing.base) {
+            Some(landing) => {
+                result.insert(row.target.slug().to_owned(), RowLanding::known(*landing));
+            }
+            None => open.push(row),
+        }
+    }
+    LocalLandings {
+        result,
+        open,
+        local,
+    }
+}
+
+/// Finish [`read_local`] with the command's own GitHub read: that read,
+/// when it succeeded, is the fresh answer.
+pub(crate) async fn finish_with(
+    ctx: &AppContext,
+    state: &Value,
+    local: LocalLandings,
+    fetched: Option<&GithubData>,
+) -> BTreeMap<String, RowLanding> {
+    let fetched = fetched.cloned();
+    settle(
+        ctx,
+        state,
+        local,
+        || async { None },
+        &Use::Display.bases(),
+        |_| async move { fetched },
+    )
+    .await
 }
 
 /// The landing of one row, for a command that prints it.
@@ -594,6 +704,64 @@ mod tests {
         // either way and no Git runs for it: the answer is not a landing.
         let landing = one(&fixture, &row, &state, Want::Lists, None, None).await;
         assert!(!landing.is_landed() && !landing.is_unknown());
+        fixture.close().await.unwrap();
+    }
+
+    /// GitHub's answer changes what Git read of a row only through a merged
+    /// pull request, so only such rows (and rows Git could not read) are
+    /// read again once it arrives.
+    #[tokio::test]
+    async fn only_rows_githubs_answer_can_change_are_read_a_second_time() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let (row, state, head) = squashed(&fixture).await;
+        let ctx = &fixture.ctx;
+        let two = wt_ops::commands::resolve::resolve_named_worktree(ctx, "two")
+            .await
+            .unwrap();
+        let rows = [row.clone(), two.clone()];
+        let local = read_local(ctx, &rows, &state).await;
+        assert_eq!(local.open.len(), 2);
+        let branch = row.target.branch.clone();
+        let reread = |github: &GithubData| {
+            worth_rereading(&local.open, &local.local, github)
+                .iter()
+                .map(|row| row.target.slug().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(reread(&GithubData::default()).is_empty());
+        assert!(reread(&github(&branch, "OPEN", &head)).is_empty());
+        assert_eq!(reread(&github(&branch, "MERGED", &head)), ["one"]);
+        // A row Git could not read is asked again whatever GitHub says.
+        let mut unread = BTreeMap::new();
+        unread.insert("one".to_owned(), local.local["one"]);
+        assert_eq!(
+            worth_rereading(&local.open, &unread, &GithubData::default())
+                .iter()
+                .map(|row| row.target.slug())
+                .collect::<Vec<_>>(),
+            ["two"]
+        );
+
+        // The answers are the ones a full second pass gave: the merged row
+        // lands, the other stays not landed, and with no answer from GitHub
+        // both are unknown.
+        let merged = github(&branch, "MERGED", &head);
+        let landed = finish_with(
+            ctx,
+            &state,
+            read_local(ctx, &rows, &state).await,
+            Some(&merged),
+        )
+        .await;
+        assert_eq!(
+            (landed["one"].word(), landed["two"].word()),
+            ("landed", "not_landed")
+        );
+        let unanswered = finish_with(ctx, &state, read_local(ctx, &rows, &state).await, None).await;
+        assert_eq!(
+            (unanswered["one"].word(), unanswered["two"].word()),
+            ("unknown", "unknown")
+        );
         fixture.close().await.unwrap();
     }
 }

@@ -194,10 +194,12 @@ the first reorder in a section stores an order for every row drawn there, in
 the order drawn, so rows still at their creation position stay where they
 are. A new row also keeps its drawn place when the row it was created after
 is moved, archived, lands, is being removed or is gone, and removing a row
-does not change the order of the rows that remain in its section. One limit under
-status sorting: when the followed row moved to another section, the new row
-is drawn behind the row with the nearest stored order, which need not be the
-row that was drawn before it. Deleting a section moves its rows
+does not change the order of the rows that remain in its section. A row created
+after a remote row keeps its place under manual sorting when the remote row
+goes. One limit under status sorting: when the followed row moved to another
+section, or was a remote row that is gone, the new row is placed by that
+row's stored order, which need not be where it was drawn; it does not jump
+to the top. Deleting a section moves its rows
 to the Inbox in the order they had. An existing worktree keeps
 its section when its name is entered again.
 

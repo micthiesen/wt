@@ -476,6 +476,14 @@ mod tests {
     async fn concurrent_worker_preparations_do_not_race_the_replacement_listener() {
         let (root, socket) = endpoint_fixture();
         drop(tokio::net::UnixListener::bind(&socket).unwrap());
+        // A child another test is forking holds a copy of the dropped
+        // listener until its exec; wait until nothing answers.
+        for _ in 0..40 {
+            if tokio::net::UnixStream::connect(&socket).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let cancel = CancellationToken::new();
         let (first, second) = tokio::join!(
             prepare_worker_socket_with_probe(

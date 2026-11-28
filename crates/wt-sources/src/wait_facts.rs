@@ -374,6 +374,92 @@ pub async fn latest_shared_read(ctx: &AppContext) -> Option<(GithubData, u64)> {
     Some((shared.data?, shared.fetch_started_ms))
 }
 
+/// The board's last GitHub read, as it saved it, with when that read began
+/// (epoch ms). Display only: a restored value is never a witness.
+pub async fn board_read(ctx: &AppContext) -> Option<(GithubData, u64)> {
+    let caches = ctx.caches.clone();
+    let (data, saved_at_ms) = tokio::task::spawn_blocking(move || {
+        wt_runtime::DiskCache::<GithubData>::new(&caches).peek("github")
+    })
+    .await
+    .ok()??;
+    // Data the board merged from a part with no observation time says
+    // nothing of how old it is; the time it was saved is not that.
+    let started_ms = data.observed_at_ms?.min(saved_at_ms);
+    Some((data, started_ms))
+}
+
+/// A read of every one of `branches` that some wt process already made and
+/// saved, begun no longer ago than the events daemon's snapshot may be old
+/// and still count as fresh: the board's own, or the one waits and display
+/// commands share. The newest of them, with when it began (epoch ms). For a
+/// command that displays pull requests, so that it need not ask GitHub
+/// again for what was just read.
+pub async fn recent_read(ctx: &AppContext, branches: &[String]) -> Option<(GithubData, u64)> {
+    let now = epoch_ms();
+    let fresh = u64::try_from(crate::github_events_source::FRESH.as_millis()).unwrap_or(u64::MAX);
+    let (board, shared) = tokio::join!(board_read(ctx), latest_shared_read(ctx));
+    [board, shared]
+        .into_iter()
+        .flatten()
+        .filter(|(data, started_ms)| {
+            // A start in the future is a clock that moved, not a new answer.
+            now.checked_sub(*started_ms).is_some_and(|age| age <= fresh)
+                && branches
+                    .iter()
+                    .all(|branch| data.covered_branches.contains(branch))
+        })
+        .max_by_key(|(_, started_ms)| *started_ms)
+}
+
+/// Save a display command's own read, begun at `started_ms`, as the shared
+/// one. The next command to print pull requests, and every wait, then finds
+/// it instead of asking again.
+///
+/// Only a read that leaves no wait worse off is saved: one at least as wide
+/// as the stored read and as what waits asked about lately. A narrower one
+/// (a single worktree's, or only the rows Git left open) would leave their
+/// branches uncovered, and they would ask GitHub at once instead of keeping
+/// their pace. Nor does it wait for the lock: a wait holds it across its
+/// whole fetch, and is about to save a newer read than this one.
+pub async fn record_read(ctx: &AppContext, data: &GithubData, started_ms: u64) {
+    let Ok(Some(_lock)) = FileLock::try_acquire(
+        &ctx.config.paths.lock_dir,
+        SHARED_LOCK,
+        "record a GitHub read",
+    )
+    .await
+    else {
+        return;
+    };
+    let path = shared_path(ctx);
+    let mut shared = load_shared(&path, &shared_identity(ctx)).await;
+    if shared.data.is_some() && shared.fetch_started_ms >= started_ms {
+        return;
+    }
+    let stored = shared
+        .data
+        .iter()
+        .flat_map(|stored| stored.covered_branches.iter());
+    let asked = shared
+        .asked
+        .iter()
+        .filter(|(_, at)| started_ms.saturating_sub(**at) <= ASKED_KEEP_MS)
+        .map(|(branch, _)| branch);
+    if !stored
+        .chain(asked)
+        .all(|branch| data.covered_branches.contains(branch))
+    {
+        return;
+    }
+    shared.fetch_started_ms = started_ms;
+    shared.failures = 0;
+    shared.backoff_until_ms = 0;
+    shared.problem = None;
+    shared.data = Some(data.clone());
+    save_shared(&path, &shared).await;
+}
+
 /// Why GitHub took `pr` out of the merge queue, in words, when it did so
 /// after `arm` was sent for it and nothing holds the merge now. GitHub
 /// keeps the latest removal on the pull request for good, so one from
@@ -1661,6 +1747,101 @@ mod tests {
         );
         let read = reader.read(ctx, &watches).await.unwrap();
         assert!(!read.rows.contains_key("two"));
+        fixture.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_display_read_is_saved_for_the_next_and_used_only_while_fresh() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let ctx = &fixture.ctx;
+        let one = ["feature/one".to_owned()];
+        let both = ["feature/one".to_owned(), "feature/two".to_owned()];
+        assert!(recent_read(ctx, &one).await.is_none());
+        let read = |branches: &[&str]| GithubData {
+            covered_branches: branches.iter().map(|branch| (*branch).to_owned()).collect(),
+            ..GithubData::default()
+        };
+        let now = epoch_ms();
+        record_read(ctx, &read(&["feature/one"]), now - 5_000).await;
+        let (data, started) = recent_read(ctx, &one).await.unwrap();
+        assert_eq!(started, now - 5_000);
+        assert!(data.covered_branches.contains("feature/one"));
+        // A read that does not cover every branch asked about is no answer.
+        assert!(recent_read(ctx, &both).await.is_none());
+        // An older read does not replace a newer one; a newer one does.
+        record_read(ctx, &read(&["feature/one", "feature/two"]), now - 60_000).await;
+        assert!(recent_read(ctx, &both).await.is_none());
+        record_read(ctx, &read(&["feature/one", "feature/two"]), now - 1_000).await;
+        assert_eq!(recent_read(ctx, &both).await.unwrap().1, now - 1_000);
+        // The board's own saved read counts the same, by when it began.
+        let save_board = |data: &GithubData| {
+            std::fs::create_dir_all(ctx.caches.directory()).unwrap();
+            let saved = serde_json::json!({
+                "format": 1, "name": "github", "scope": ctx.caches.scope(),
+                "saved_at_ms": now, "data": data,
+            });
+            std::fs::write(
+                ctx.caches.directory().join("github.json"),
+                saved.to_string(),
+            )
+            .unwrap();
+        };
+        let mut board = read(&["feature/one", "feature/two"]);
+        board.observed_at_ms = Some(now - 500);
+        save_board(&board);
+        assert_eq!(recent_read(ctx, &both).await.unwrap().1, now - 500);
+        // Past the bound neither is shown in place of a read.
+        let fresh = u64::try_from(crate::github_events_source::FRESH.as_millis()).unwrap();
+        board.observed_at_ms = Some(now - fresh - 60_000);
+        save_board(&board);
+        assert_eq!(recent_read(ctx, &both).await.unwrap().1, now - 1_000);
+        let path = shared_path(ctx);
+        let mut shared = load_shared(&path, &shared_identity(ctx)).await;
+        shared.fetch_started_ms = now - fresh - 60_000;
+        save_shared(&path, &shared).await;
+        assert!(recent_read(ctx, &both).await.is_none());
+        // A board read that cannot say when it was observed is not dated by
+        // when its file was saved.
+        board.observed_at_ms = None;
+        save_board(&board);
+        assert!(board_read(ctx).await.is_none());
+
+        // A read narrower than the stored one would leave a wait's branches
+        // uncovered and send it to GitHub ahead of its pace: it is not saved.
+        record_read(ctx, &read(&["feature/one"]), now).await;
+        let kept = load_shared(&path, &shared_identity(ctx)).await;
+        assert_eq!(kept.fetch_started_ms, now - fresh - 60_000);
+        assert_eq!(kept.data.as_ref().unwrap().covered_branches.len(), 2);
+        // Neither is one that misses a branch a wait asked about lately.
+        let mut asking = kept.clone();
+        asking.asked.insert("feature/three".into(), now - 1_000);
+        save_shared(&path, &asking).await;
+        record_read(ctx, &read(&["feature/one", "feature/two"]), now).await;
+        assert_eq!(load_shared(&path, &shared_identity(ctx)).await, asking);
+        // A read as wide as both is, and a wait finds it as its own answer.
+        let wide = read(&["feature/one", "feature/two", "feature/three"]);
+        record_read(ctx, &wide, now).await;
+        let shared = load_shared(&path, &shared_identity(ctx)).await;
+        assert_eq!(shared.fetch_started_ms, now);
+        assert_eq!(shared.plan(&both, now + 1_000), Plan::Use);
+        // While a wait holds the lock across its fetch, nothing waits for
+        // it and nothing is saved.
+        let held = FileLock::try_acquire(&ctx.config.paths.lock_dir, SHARED_LOCK, "test")
+            .await
+            .unwrap()
+            .unwrap();
+        let began = std::time::Instant::now();
+        record_read(ctx, &wide, now + 5_000).await;
+        assert!(began.elapsed() < Duration::from_secs(5));
+        drop(held);
+        assert_eq!(
+            load_shared(&path, &shared_identity(ctx))
+                .await
+                .fetch_started_ms,
+            now
+        );
         fixture.close().await.unwrap();
     }
 }

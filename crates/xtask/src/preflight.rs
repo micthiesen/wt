@@ -15,6 +15,7 @@ const PACKAGING_TESTS: &[&[&str]] = &[
     &["scripts/test-package-native.py"],
     &["scripts/test-native-check.py"],
     &["scripts/test-restore-mtimes.py"],
+    &["scripts/test-release-notes.py"],
     &[
         "-m",
         "unittest",

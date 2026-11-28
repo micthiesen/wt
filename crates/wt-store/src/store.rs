@@ -313,6 +313,47 @@ impl Store {
         Ok(changed != 0)
     }
 
+    /// [`Self::begin_removal_of`] and the row's archive marker in one
+    /// transaction. A removal archives its row as it begins, and the board
+    /// draws a row being removed from both: written apart, a reader between
+    /// the two writes saw a removal with its row still unarchived and drew
+    /// it in the wrong place for a frame. Nothing is written, the marker
+    /// included, while another attempt for `key` is active.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_removal_archived(
+        &mut self,
+        key: &str,
+        job_id: &str,
+        path: &str,
+        branch: &str,
+        landed: bool,
+        was_archived: bool,
+    ) -> Result<bool, StoreError> {
+        let id = self.identity.id.clone();
+        let db = self.writable_db()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let begun = mutate_wt_state_tx(&tx, &id, |state| {
+            let begun = crate::mutations::begin_removal_entry(
+                state,
+                key,
+                job_id,
+                path,
+                branch,
+                landed,
+                was_archived,
+            );
+            Ok((begun, begun))
+        })?;
+        if begun {
+            tx.execute(
+                "INSERT OR IGNORE INTO archived_worktrees (repo_id, worktree_key, archived_at) VALUES (?1, ?2, ?3)",
+                params![id, key, now_ms()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(begun)
+    }
+
     /// Archive or restore `key` from the state the user saw. With `seen`, the
     /// write is refused unless the marker still reads `seen`. Archiving folds
     /// `archived_section`; restoring files the row back in the Inbox. The

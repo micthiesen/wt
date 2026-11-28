@@ -32,16 +32,38 @@ use wt_tui::Board;
 use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
 
 const BACKSTOP: Duration = Duration::from_secs(60);
-/// Spacing of metadata scans, from the start of the preceding one. Where the
-/// scan is the only detector it runs twice a second: the same number of walks
-/// as the poller and the backstop it replaces made between them, for half
-/// the wait.
-const SCAN_INTERVAL: Duration = Duration::from_millis(if POLLING { 500 } else { 1000 });
-/// A scan slower than `SCAN_INTERVAL / SCAN_DUTY` stretches the spacing to
+/// Spacing of walks of the whole watch set, from the start of the preceding
+/// one. The walk is what finds a file nobody knew to look for: a new ref, a
+/// change at the top of a working tree.
+const SCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// A walk slower than `SCAN_INTERVAL / SCAN_DUTY` stretches the spacing to
 /// this many times its own duration, so a large watch set is sampled less
-/// often rather than abandoned, and scanning never takes more than one part
+/// often rather than abandoned, and walking never takes more than one part
 /// in this many of a thread.
 const SCAN_DUTY: u32 = 4;
+/// How often the few files that carry a checkout's Git facts (its HEAD,
+/// index, branch and upstream refs, operation state) are checked where
+/// changes are only found by polling. They are a handful of stats per
+/// checkout, so they can be looked at far more often than the set is walked.
+const HOT_TICK: Duration = Duration::from_millis(125);
+/// How many steps the rolling backstop takes through the fleet per
+/// `BACKSTOP`.
+const BACKSTOP_STEPS: u32 = 20;
+/// A checkout nobody is working in (archived) is doubted this many times
+/// less often.
+const BACKSTOP_IDLE_FACTOR: u32 = 5;
+/// The least spacing between reads of every checkout caused by changes that
+/// cannot be routed. A burst of them is one doubt, not a sweep each.
+const UNROUTED_PACE: Duration = Duration::from_secs(5);
+/// When more rows are due than the usual step reads (all of them, a period
+/// after a read of every checkout), they are cleared within this many steps
+/// rather than a whole further period.
+const BACKSTOP_CATCH_UP: usize = 4;
+/// How often a scanner thread that died is started again before detection
+/// is left to the backstop.
+const SCANNER_RESTARTS: u32 = 5;
+/// The wait before the first restart, doubled for each one after.
+const SCANNER_BACKOFF: Duration = Duration::from_millis(250);
 /// How often the files other processes signal through are checked where
 /// changes are only found by polling.
 const SIGNAL_TICK: Duration = Duration::from_millis(75);
@@ -272,6 +294,46 @@ impl Layout {
         }
     }
 
+    /// The first of `paths` that cannot be placed, for the log.
+    fn unrouted(&self, paths: &[PathBuf], worktree_root: &Path) -> Option<PathBuf> {
+        paths
+            .iter()
+            .find(|path| self.touch(std::slice::from_ref(*path), worktree_root) == Touch::All)
+            .cloned()
+    }
+
+    /// The files whose change moves what a row shows: each checkout's HEAD,
+    /// index and operation state, the refs of its branch and upstream, and
+    /// the packed refs they may live in.
+    fn hot_files(&self) -> Vec<PathBuf> {
+        let mut files = BTreeSet::new();
+        for row in &self.rows {
+            if let Some(git_dir) = &row.git_dir {
+                for name in [
+                    "HEAD",
+                    "index",
+                    "MERGE_HEAD",
+                    "rebase-merge",
+                    "rebase-apply",
+                ] {
+                    files.insert(git_dir.join(name));
+                }
+            }
+            let Some(common) = &row.common_dir else {
+                continue;
+            };
+            files.insert(common.join("packed-refs"));
+            if !row.branch.is_empty() {
+                files.insert(common.join("refs/heads").join(&row.branch));
+            }
+            if let Some(upstream) = &row.upstream {
+                files.insert(common.join("refs/remotes").join(upstream));
+                files.insert(common.join("refs/heads").join(upstream));
+            }
+        }
+        files.into_iter().collect()
+    }
+
     /// Route Git-relevant paths to rows. Anything that cannot be placed
     /// reads everything: a wrong guess here would leave a row stale until
     /// the next sweep.
@@ -407,11 +469,11 @@ impl Layout {
     }
 }
 
-/// Requests metadata reads for changes other processes made, no more often
-/// than `interval`: the first at once, and one more when the interval has
-/// passed if anything changed meanwhile.
+/// Passes a request on no more often than `interval`: the first at once, and
+/// one more when the interval has passed if anything asked meanwhile. For
+/// requests that arrive in bursts and each cost a whole read.
 struct Paced {
-    metadata: SourceHandle<crate::local_source::Metadata>,
+    ask: Box<dyn Fn() + Send + Sync>,
     interval: Duration,
     /// When the last read was asked for, and whether another is held back.
     state: Mutex<(Option<std::time::Instant>, bool)>,
@@ -419,13 +481,23 @@ struct Paced {
 }
 
 impl Paced {
-    fn new(metadata: SourceHandle<crate::local_source::Metadata>, interval: Duration) -> Self {
+    fn new(ask: impl Fn() + Send + Sync + 'static, interval: Duration) -> Self {
         Self {
-            metadata,
+            ask: Box::new(ask),
             interval,
             state: Mutex::default(),
             held: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Metadata reads for other processes' writes to the state database.
+    fn metadata(metadata: SourceHandle<crate::local_source::Metadata>) -> Self {
+        Self::new(
+            move || {
+                metadata.refresh();
+            },
+            METADATA_PACE,
+        )
     }
 
     fn signal(&self) {
@@ -440,7 +512,7 @@ impl Paced {
         {
             *state = (Some(now), false);
             drop(state);
-            self.metadata.refresh();
+            (self.ask)();
         } else if !std::mem::replace(&mut state.1, true) {
             self.held.notify_one();
         }
@@ -466,7 +538,7 @@ impl Paced {
         if std::mem::take(&mut state.1) {
             state.0 = Some(std::time::Instant::now());
             drop(state);
-            self.metadata.refresh();
+            (self.ask)();
         }
     }
 }
@@ -474,34 +546,43 @@ impl Paced {
 /// Turns changed paths into source requests.
 struct Router {
     git: SourceHandle<Vec<WorktreeSnapshot>>,
+    /// Metadata reads for other processes' writes to the state database.
     metadata: Arc<Paced>,
+    metadata_now: SourceHandle<crate::local_source::Metadata>,
+    /// Reads of every checkout for changes that cannot be routed.
+    sweeps: Arc<Paced>,
     state_db: PathBuf,
     /// The main clone and the worktree root.
     checkout_roots: [PathBuf; 2],
-    layout: RwLock<Layout>,
+    layout: Arc<RwLock<Layout>>,
     contents: Mutex<Contents>,
     /// Paths a notification was routed for, as they looked then. The scan
     /// finds the same change a moment later and must not route it twice.
     reported: Mutex<BTreeMap<PathBuf, Option<FileSignature>>>,
+    /// When each row was last asked for, by a change or by the backstop.
+    asked: Arc<Mutex<BTreeMap<String, std::time::Instant>>>,
+    unrouted_log: RateGate,
 }
 
 /// Enough for any burst between two scans; past it the scan may route a
 /// change a second time, which costs a read and loses nothing.
 const REPORTED_LIMIT: usize = 4096;
 
-/// Files Git rewrites in place with the bytes they already had (the config
-/// on every `git branch --force`, packed refs on a fetch that moved
-/// nothing), each of which would otherwise read every checkout again.
+/// Files of a Git directory that every checkout resolves refs or upstreams
+/// through, so a change to one could reach any row. Git rewrites them whole
+/// for a change to one entry (and often for none: the config on every
+/// `git branch --force`), so what changed is found by comparing their
+/// entries, and only the rows those entries name are read.
 const REWRITTEN_FILES: [&str; 2] = ["config", "packed-refs"];
 
 /// The largest of those files that is read to compare. A larger one (packed
-/// refs of a very large repository) always counts as changed.
+/// refs of a very large repository) always counts as changed throughout.
 const REWRITTEN_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// What those files held when last read, for the Git directories among the
-/// watch roots. Only a file that was read both times can compare equal: a
-/// path that is missing, unreadable, too large or not a regular file has no
-/// entry, and a change to it is always a change.
+/// watch roots. Only a file that was read both times can be compared: a path
+/// that is missing, unreadable, too large or not a regular file has no
+/// entry, and a change to it is a change to everything it could hold.
 #[derive(Default)]
 struct Contents {
     /// Watch roots already looked at, and those of them that are Git
@@ -509,19 +590,72 @@ struct Contents {
     /// directory, in many projects); that is never one of these files.
     examined: BTreeSet<PathBuf>,
     git_dirs: BTreeSet<PathBuf>,
-    hashes: BTreeMap<PathBuf, u64>,
+    /// Per file, its entries: a config's sections by header, packed refs by
+    /// name.
+    entries: BTreeMap<PathBuf, BTreeMap<String, String>>,
 }
 
-fn content_hash(path: &Path) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
+fn rewritten_entries(path: &Path) -> Option<BTreeMap<String, String>> {
     let metadata = std::fs::symlink_metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > REWRITTEN_LIMIT {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    Some(hasher.finish())
+    let text = String::from_utf8(std::fs::read(path).ok()?).ok()?;
+    let mut entries = BTreeMap::<String, String>::new();
+    if path.file_name().is_some_and(|name| name == "config") {
+        let mut section = String::new();
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = trimmed.to_owned();
+                entries.entry(section.clone()).or_default();
+            } else {
+                let body = entries.entry(section.clone()).or_default();
+                body.push_str(trimmed);
+                body.push('\n');
+            }
+        }
+    } else {
+        let mut last = String::new();
+        for line in text.lines() {
+            // A peeled value belongs to the tag above it; anything else
+            // that is not a ref (the header) is an entry of its own, so a
+            // change to it is not mistaken for a change to refs alone.
+            match line.strip_prefix('^') {
+                Some(peeled) => entries.entry(last.clone()).or_default().push_str(peeled),
+                None => {
+                    let (value, name) = line.split_once(' ').unwrap_or((line, line));
+                    last = name.to_owned();
+                    entries.insert(last.clone(), value.to_owned());
+                }
+            }
+        }
+    }
+    Some(entries)
+}
+
+/// The ref a changed entry of a rewritten file is about: a packed ref
+/// itself, or the branch a config section configures (its upstream).
+fn entry_ref(file: &Path, entry: &str) -> Option<String> {
+    if file.file_name().is_some_and(|name| name == "config") {
+        let name = entry.strip_suffix("\"]")?;
+        let (kind, name) = name.split_once(" \"")?;
+        return kind
+            .eq_ignore_ascii_case("[branch")
+            .then(|| format!("refs/heads/{name}"));
+    }
+    entry.starts_with("refs/").then(|| entry.to_owned())
+}
+
+/// What a reported change to a path amounts to.
+enum Rewrite {
+    /// Not one of the rewritten files, or one that cannot be compared: the
+    /// path stands for itself.
+    Path,
+    /// Rewritten with the entries it already had.
+    Same,
+    /// Only these refs differ.
+    Refs(Vec<String>),
 }
 
 /// Whether a watch root is a Git directory (a repository's own, or a linked
@@ -532,6 +666,47 @@ fn is_git_dir(root: &Path) -> bool {
 }
 
 impl Router {
+    fn new(
+        git: SourceHandle<Vec<WorktreeSnapshot>>,
+        metadata_now: SourceHandle<crate::local_source::Metadata>,
+        metadata: Arc<Paced>,
+        state_db: PathBuf,
+        checkout_roots: [PathBuf; 2],
+        unrouted_pace: Duration,
+    ) -> Self {
+        let layout = Arc::new(RwLock::new(Layout::default()));
+        let asked = Arc::new(Mutex::new(BTreeMap::new()));
+        Self {
+            metadata,
+            metadata_now,
+            sweeps: Arc::new(Paced::new(
+                {
+                    let (git, layout, asked) = (git.clone(), layout.clone(), asked.clone());
+                    move || {
+                        // Rows count as asked for when the read of all of
+                        // them really is, not when the change was seen: a
+                        // read held back by the pace must not keep the
+                        // backstop off rows nothing has read.
+                        if let (Ok(layout), Ok(mut asked)) = (layout.read(), asked.lock()) {
+                            let now = std::time::Instant::now();
+                            asked.extend(layout.rows.iter().map(|row| (row.key.clone(), now)));
+                        }
+                        git.request(Request::Recheck);
+                    }
+                },
+                unrouted_pace,
+            )),
+            git,
+            state_db,
+            checkout_roots,
+            layout,
+            contents: Mutex::default(),
+            reported: Mutex::default(),
+            asked,
+            unrouted_log: RateGate::new(unrouted_pace),
+        }
+    }
+
     /// Remember what the rewritten files of new roots hold, before the roots
     /// are sampled: a change after this differs from it.
     async fn baseline(self: Arc<Self>, roots: Vec<PathBuf>) {
@@ -545,55 +720,70 @@ impl Router {
             };
             // Files are read with the lock released: it is also taken where
             // changes are routed.
-            let read: Vec<(PathBuf, Vec<(PathBuf, u64)>)> = new
+            type Entries = Vec<(PathBuf, BTreeMap<String, String>)>;
+            let read: Vec<(PathBuf, Entries)> = new
                 .into_iter()
                 .filter(|root| is_git_dir(root))
                 .map(|root| {
-                    let hashes = REWRITTEN_FILES
+                    let entries = REWRITTEN_FILES
                         .iter()
                         .map(|name| root.join(name))
-                        .filter_map(|path| content_hash(&path).map(|hash| (path, hash)))
+                        .filter_map(|path| rewritten_entries(&path).map(|entries| (path, entries)))
                         .collect();
-                    (root, hashes)
+                    (root, entries)
                 })
                 .collect();
             if let Ok(mut contents) = self.contents.lock() {
-                for (root, hashes) in read {
+                for (root, entries) in read {
                     contents.git_dirs.insert(root);
-                    contents.hashes.extend(hashes);
+                    contents.entries.extend(entries);
                 }
             }
         })
         .await;
     }
 
-    /// Whether a changed path is one of the rewritten files holding exactly
-    /// what it held before.
-    fn rewritten_unchanged(&self, path: &Path) -> bool {
+    /// Compare a changed path with what it held, if it is one of the
+    /// rewritten files of a Git directory.
+    fn rewritten(&self, path: &Path) -> Rewrite {
         if !path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| REWRITTEN_FILES.contains(&name))
         {
-            return false;
+            return Rewrite::Path;
         }
         let in_git_dir = self.contents.lock().is_ok_and(|contents| {
             path.parent()
                 .is_some_and(|parent| contents.git_dirs.contains(parent))
         });
         if !in_git_dir {
-            return false;
+            return Rewrite::Path;
         }
-        let now = content_hash(path);
+        let now = rewritten_entries(path);
         let Ok(mut contents) = self.contents.lock() else {
-            return false;
+            return Rewrite::Path;
         };
-        match now {
-            Some(now) => contents.hashes.insert(path.to_path_buf(), now) == Some(now),
-            None => {
-                contents.hashes.remove(path);
-                false
-            }
+        let Some(now) = now else {
+            contents.entries.remove(path);
+            return Rewrite::Path;
+        };
+        let Some(then) = contents.entries.insert(path.to_path_buf(), now.clone()) else {
+            return Rewrite::Path;
+        };
+        let refs: Option<Vec<String>> = then
+            .keys()
+            .chain(now.keys())
+            .filter(|entry| then.get(*entry) != now.get(*entry))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|entry| entry_ref(path, entry))
+            .collect();
+        match refs {
+            Some(refs) if refs.is_empty() => Rewrite::Same,
+            Some(refs) => Rewrite::Refs(refs),
+            // Something other than a ref or a branch's settings changed.
+            None => Rewrite::Path,
         }
     }
 
@@ -625,11 +815,18 @@ impl Router {
     }
 
     fn invalidate(&self, paths: &[PathBuf]) {
-        let changed: Vec<PathBuf> = paths
-            .iter()
-            .filter(|path| !self.rewritten_unchanged(path))
-            .cloned()
-            .collect();
+        let mut changed = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.rewritten(path) {
+                Rewrite::Path => changed.push(path.clone()),
+                Rewrite::Same => {}
+                // Routed as the loose refs would be, in the same directory.
+                Rewrite::Refs(refs) => {
+                    let directory = path.parent().unwrap_or(path);
+                    changed.extend(refs.iter().map(|name| directory.join(name)));
+                }
+            }
+        }
         if changed.is_empty() && !paths.is_empty() {
             return;
         }
@@ -647,14 +844,73 @@ impl Router {
             .filter(|path| invalidation(path, &self.state_db, &self.checkout_roots).0)
             .cloned()
             .collect();
-        let touch = self.layout.read().map_or(Touch::All, |layout| {
-            layout.touch(&git_paths, &self.checkout_roots[1])
-        });
-        match touch {
-            Touch::Nothing => false,
-            Touch::All => self.git.request(Request::Recheck),
-            Touch::Rows(keys) => self.git.request_keys(Request::Recheck, keys),
+        let worktree_root = &self.checkout_roots[1];
+        let (touch, unrouted) = match self.layout.read() {
+            Ok(layout) => {
+                let touch = layout.touch(&git_paths, worktree_root);
+                let unrouted = (touch == Touch::All)
+                    .then(|| layout.unrouted(&git_paths, worktree_root))
+                    .flatten();
+                (touch, unrouted)
+            }
+            Err(_) => (Touch::All, None),
         };
+        match touch {
+            Touch::Nothing => {}
+            Touch::All => {
+                // Without this a fleet-wide read has no visible cause.
+                if self.unrouted_log.allow() {
+                    tracing::info!(
+                        path = ?unrouted,
+                        paths = git_paths.len(),
+                        "a change that cannot be routed to its checkouts reads all of them"
+                    );
+                }
+                self.sweeps.signal();
+            }
+            Touch::Rows(keys) => {
+                if let Ok(mut asked) = self.asked.lock() {
+                    let now = std::time::Instant::now();
+                    asked.extend(keys.iter().map(|key| (key.clone(), now)));
+                }
+                self.git.request_keys(Request::Recheck, keys);
+            }
+        }
+    }
+
+    /// The rows the rolling backstop reads at this step: those not asked for
+    /// within their period, oldest first. It doubts what no detector can see
+    /// (edits deep in a working tree), so a row a change was just routed to
+    /// has nothing more to gain from it yet. A step reads a twentieth of the
+    /// fleet, or more when that would leave the due rows waiting.
+    fn backstop(&self, idle: &BTreeSet<String>, now: std::time::Instant) -> Vec<String> {
+        let Ok(layout) = self.layout.read() else {
+            return Vec::new();
+        };
+        let Ok(mut asked) = self.asked.lock() else {
+            return Vec::new();
+        };
+        asked.retain(|key, _| layout.rows.iter().any(|row| row.key == *key));
+        let mut due = Vec::new();
+        for row in &layout.rows {
+            // A row seen for the first time has just been read.
+            let last = *asked.entry(row.key.clone()).or_insert(now);
+            let period = if idle.contains(&row.key) {
+                BACKSTOP * BACKSTOP_IDLE_FACTOR
+            } else {
+                BACKSTOP
+            };
+            if now.duration_since(last) >= period {
+                due.push((last, row.key.clone()));
+            }
+        }
+        due.sort();
+        let step = layout.rows.len().div_ceil(BACKSTOP_STEPS as usize).max(1);
+        due.truncate(step.max(due.len().div_ceil(BACKSTOP_CATCH_UP)));
+        for (_, key) in &due {
+            asked.insert(key.clone(), now);
+        }
+        due.into_iter().map(|(_, key)| key).collect()
     }
 }
 
@@ -832,7 +1088,7 @@ fn start_with_notifications(
     let cancellation = scope.token();
     // Another process's write to the state database reaches the board
     // through this file alone, so it is not left to the one-second scan.
-    let paced = Arc::new(Paced::new(metadata.clone(), METADATA_PACE));
+    let paced = Arc::new(Paced::metadata(metadata.clone()));
     let signals = (!notifications).then(|| {
         let database = config.paths.state_db.clone();
         let mut wal = database.clone().into_os_string();
@@ -840,6 +1096,8 @@ fn start_with_notifications(
         let paced = paced.clone();
         signal_tick(scope, vec![database, wal.into()], move || paced.signal())
     });
+    let plan = Arc::new(Mutex::new(ScanPlan::default()));
+    let mut scans = Scanner::start(scope.token(), plan.clone());
     scope.spawn(async move {
         if let Some(board) = source.snapshot().data().cloned()
             && let Ok(mut roots) = edit_roots.write()
@@ -851,18 +1109,18 @@ fn start_with_notifications(
                 .collect();
         }
         let state_db = canonical_watch_path(&config.paths.state_db).await;
-        let router = Arc::new(Router {
-            git: git.clone(),
-            metadata: paced.clone(),
-            state_db: state_db.clone(),
-            checkout_roots: [
+        let router = Arc::new(Router::new(
+            git.clone(),
+            metadata.clone(),
+            paced.clone(),
+            state_db.clone(),
+            [
                 canonical_watch_path(&config.paths.main_clone).await,
                 canonical_watch_path(&config.paths.worktree_root).await,
             ],
-            layout: RwLock::default(),
-            contents: Mutex::default(),
-            reported: Mutex::default(),
-        });
+            UNROUTED_PACE,
+        ));
+
         let watcher = if notifications {
             let callback_router = router.clone();
             let callback_roots = edit_roots.clone();
@@ -914,14 +1172,14 @@ fn start_with_notifications(
                         if callback_vanished.allow() {
                             tracing::debug!(%error, paths = ?error.paths, "watched path vanished; re-reading watch list");
                             callback_router.invalidate(&error.paths);
-                            callback_router.metadata.metadata.refresh();
+                            callback_router.metadata_now.refresh();
                             callback_rewatch.notify_one();
                         }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "filesystem notification lost; refreshing source");
                         callback_router.git.refresh();
-                        callback_router.metadata.metadata.refresh();
+                        callback_router.metadata_now.refresh();
                     }
                 })
             });
@@ -983,9 +1241,12 @@ fn start_with_notifications(
         let mut reconcile = true;
         let mut backstop = tokio::time::interval_at(tokio::time::Instant::now() + BACKSTOP, BACKSTOP);
         backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut next_scan = tokio::time::Instant::now() + SCAN_INTERVAL;
-        let mut scan = None::<Scan>;
-        let slow_scan = RateGate::new(BACKSTOP);
+        let mut backstop_step = tokio::time::interval(BACKSTOP / BACKSTOP_STEPS);
+        backstop_step.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Checkouts nobody is working in, doubted less often.
+        let mut idle = BTreeSet::<String>::new();
+        let mut scans_open = true;
+        let mut scan_slow = false;
         loop {
             if std::mem::take(&mut reconcile) {
                 let records: Vec<WorktreeRecord> = inputs
@@ -998,6 +1259,10 @@ fn start_with_notifications(
                         inputs_missing = missing;
                         router.clone().baseline(paths.keys().cloned().collect()).await;
                         let fresh = watch.apply(paths).await;
+                        {
+                            let mut plan = plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            plan.roots.clone_from(&watch.registered);
+                        }
                         if cancellation.is_cancelled() {
                             break;
                         }
@@ -1055,6 +1320,7 @@ fn start_with_notifications(
                 }
             }
             let metadata_due = paced.due();
+            let sweep_due = router.sweeps.due();
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => {
@@ -1069,6 +1335,10 @@ fn start_with_notifications(
                                 .map(|row| (PathBuf::from(&row.path), row.key.clone()))
                                 .collect();
                         }
+                        idle = board.rows.iter()
+                            .filter(|row| row.host.is_none() && row.archived)
+                            .map(|row| row.key.clone())
+                            .collect();
                         let live_keys: BTreeSet<_> = board.rows.iter().map(|row| row.key.as_str()).collect();
                         latest_edits.retain(|slug, _| live_keys.contains(slug.as_str()));
                     }
@@ -1076,10 +1346,16 @@ fn start_with_notifications(
                 changed = git_updates.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = git_updates.borrow_and_update().clone();
-                    if let Some(rows) = snapshot.data()
-                        && let Ok(mut layout) = router.layout.write()
-                    {
-                        *layout = Layout::new(rows);
+                    if let Some(rows) = snapshot.data() {
+                        let layout = Layout::new(rows);
+                        // With notifications the files report themselves.
+                        if watch.watcher.is_none() {
+                            plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner).hot =
+                                layout.hot_files();
+                        }
+                        if let Ok(mut current) = router.layout.write() {
+                            *current = layout;
+                        }
                     }
                     // A live inventory listed at or after a checkout was
                     // named decides whether it is still there.
@@ -1135,6 +1411,10 @@ fn start_with_notifications(
                             inputs_missing |= missing;
                             router.clone().baseline(paths.keys().cloned().collect()).await;
                             watch.apply(paths).await;
+                            {
+                            let mut plan = plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                plan.roots.clone_from(&watch.registered);
+                            }
                             if cancellation.is_cancelled() {
                                 break;
                             }
@@ -1169,43 +1449,63 @@ fn start_with_notifications(
                     }
                     edit_publisher.publish_live(latest_edits.clone(), Stamp::now());
                 }
-                finished = async {
-                    match scan.as_mut() {
-                        Some(scan) => (&mut scan.work).await,
-                        None => std::future::pending().await,
-                    }
-                }, if scan.is_some() => {
-                    let Some(Scan { roots, started, .. }) = scan.take() else { continue };
-                    let elapsed = started.elapsed();
-                    next_scan = started + SCAN_INTERVAL.max(elapsed * SCAN_DUTY);
-                    if elapsed > SCAN_INTERVAL && slow_scan.allow() {
-                        tracing::warn!(
-                            roots = roots.len(),
-                            elapsed_ms = elapsed.as_millis(),
-                            "the filesystem scan is slow; changes are noticed that much later"
-                        );
-                    }
-                    let Ok(Some(sample)) = finished else { continue };
-                    let entries = sample.len();
-                    let mut changed = watch.settle(&roots, sample);
-                    // A signal file the tick has already reported as it is now.
-                    if let Some(signals) = &signals
-                        && let (Ok(seen), Some(now)) = (signals.lock(), watch.fingerprint.as_deref())
-                    {
-                        changed.retain(|path| seen.get(path).is_none_or(|seen| seen.as_ref() != now.get(path)));
-                    }
-                    if let Some(now) = watch.fingerprint.as_deref() {
-                        changed.retain(|path| !router.already_notified(path, now.get(path)));
-                    }
+                scanned = scans.next(), if scans_open => {
+                    let Some(scanned) = scanned else {
+                        scans_open = false;
+                        continue;
+                    };
+                    let (mut changed, hot) = match scanned {
+                        // Found between walks, at one of the files that carry
+                        // a checkout's Git facts. The next walk finds the same
+                        // change; routing it as notified keeps that from
+                        // counting twice.
+                        Scanned::Hot(paths) => (paths, true),
+                        Scanned::Walk { roots, sample, walk } => {
+                            if walk > SCAN_INTERVAL && !scan_slow {
+                                scan_slow = true;
+                                tracing::warn!(
+                                    roots = roots.len(),
+                                    entries = sample.len(),
+                                    walk_ms = walk.as_millis() as u64,
+                                    "walking the watched files has become slow; changes outside the checked files are noticed that much later"
+                                );
+                            } else if walk <= SCAN_INTERVAL / 2 && scan_slow {
+                                scan_slow = false;
+                                tracing::info!(
+                                    walk_ms = walk.as_millis() as u64,
+                                    "walking the watched files is quick again"
+                                );
+                            }
+                            let entries = sample.len();
+                            let mut changed = watch.settle(&roots, sample);
+                            // A signal file the tick has already reported as it is now.
+                            if let Some(signals) = &signals
+                                && let (Ok(seen), Some(now)) = (signals.lock(), watch.fingerprint.as_deref())
+                            {
+                                changed.retain(|path| seen.get(path).is_none_or(|seen| seen.as_ref() != now.get(path)));
+                            }
+                            if let Some(now) = watch.fingerprint.as_deref() {
+                                changed.retain(|path| !router.already_notified(path, now.get(path)));
+                            }
+                            tracing::debug!(entries, walk_ms = walk.as_millis() as u64, ?changed, "filesystem scan");
+                            (changed, false)
+                        }
+                    };
                     changed.retain(|path| relevant_path(path));
-                    tracing::debug!(entries, elapsed_ms = elapsed.as_millis(), ?changed, "filesystem scan");
                     if changed.is_empty() {
                         continue;
                     }
-                    // Routing may read a rewritten file to see whether its
-                    // bytes changed.
+                    // Routing may read a rewritten file to see what changed
+                    // in it.
                     let routing = (router.clone(), changed.clone());
-                    let _ = tokio::task::spawn_blocking(move || routing.0.invalidate(&routing.1)).await;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if hot {
+                            routing.0.notified(&routing.1);
+                        } else {
+                            routing.0.invalidate(&routing.1);
+                        }
+                    })
+                    .await;
                     // Without notifications the scan is also what dates edits.
                     if watch.watcher.is_none()
                         && let Ok(roots) = edit_roots.read()
@@ -1223,33 +1523,221 @@ fn start_with_notifications(
                         }
                     }
                 }
-                _ = tokio::time::sleep_until(next_scan), if scan.is_none() => {
-                    let roots = watch.registered.clone();
-                    let scan_roots = roots.clone();
-                    let scan_cancel = cancellation.clone();
-                    scan = Some(Scan {
-                        roots,
-                        started: tokio::time::Instant::now(),
-                        work: tokio::task::spawn_blocking(move || watch_fingerprint(&scan_roots, &scan_cancel)),
-                    });
+                _ = router.sweeps.held.notified() => {}
+                _ = tokio::time::sleep_until(sweep_due.unwrap_or_else(tokio::time::Instant::now)), if sweep_due.is_some() => {
+                    router.sweeps.release();
                 }
-                _ = backstop.tick() => { git.refresh(); metadata.refresh(); reconcile = true; }
+                // What no detector sees (an edit deep in a working tree) is
+                // found by reading the checkouts again, a few at a time and
+                // round the fleet once per period, rather than all at once:
+                // forty statuses in one burst every minute cost seconds of
+                // every core with nobody asking.
+                _ = backstop_step.tick() => {
+                    let due = router.backstop(&idle, std::time::Instant::now());
+                    if !due.is_empty() {
+                        git.request_rows(Request::Recheck, due);
+                    }
+                }
+                // The listing itself is doubted once a period: a checkout
+                // made or removed with no event is found here.
+                _ = backstop.tick() => {
+                    git.request_keys(Request::Recheck, Vec::<String>::new());
+                    metadata.refresh();
+                    reconcile = true;
+                }
             }
         }
-        // A scan in flight stops at its next cancellation check.
-        if let Some(scan) = scan {
-            let _ = scan.work.await;
-        }
+        scans.joined().await;
         wt_app_core::watcher_cleanup::drop_watcher(watch.watcher).await;
     });
     edits
 }
 
-/// A metadata scan in flight, with the roots it was started for.
-struct Scan {
+/// What the scanner thread looks at: the watch roots it walks, and the files
+/// it checks between walks.
+#[derive(Default)]
+struct ScanPlan {
     roots: BTreeMap<PathBuf, bool>,
-    started: tokio::time::Instant,
-    work: tokio::task::JoinHandle<Option<WatchFingerprint>>,
+    hot: Vec<PathBuf>,
+    /// Test seam: the thread panics once at its next look.
+    #[cfg(test)]
+    fail: bool,
+}
+
+enum Scanned {
+    /// A walk of `roots`, and how long the walk itself took.
+    Walk {
+        roots: BTreeMap<PathBuf, bool>,
+        sample: WatchFingerprint,
+        walk: Duration,
+    },
+    /// Checked files that changed since the thread last looked.
+    Hot(Vec<PathBuf>),
+}
+
+/// Samples the watch set on a thread of its own. The work is a few thousand
+/// stats, tens of milliseconds, but on the shared blocking pool it queued
+/// behind whatever else was there (every status sweep, every file read), and
+/// a change was then noticed seconds late. Nothing here waits on the runtime
+/// except to hand over a result.
+///
+/// Where polling is the only detector this thread is all of detection, so
+/// its death is logged and it is started again, a bounded number of times.
+struct Scanner {
+    plan: Arc<Mutex<ScanPlan>>,
+    cancellation: tokio_util::sync::CancellationToken,
+    results: mpsc::Receiver<Scanned>,
+    /// Resolves when the current thread has ended.
+    stopped: oneshot::Receiver<()>,
+    restarts: u32,
+    restart_at: Option<tokio::time::Instant>,
+}
+
+impl Scanner {
+    fn start(
+        cancellation: tokio_util::sync::CancellationToken,
+        plan: Arc<Mutex<ScanPlan>>,
+    ) -> Self {
+        let (results, stopped) = spawn_scanner(&cancellation, plan.clone());
+        Self {
+            plan,
+            cancellation,
+            results,
+            stopped,
+            restarts: 0,
+            restart_at: None,
+        }
+    }
+
+    /// The next thing the thread found. `None` once the scope is cancelled,
+    /// or the thread has died more often than it is restarted. Safe to drop
+    /// and call again: a restart that was due stays due.
+    async fn next(&mut self) -> Option<Scanned> {
+        loop {
+            match self.results.recv().await {
+                Some(scanned) => {
+                    if matches!(scanned, Scanned::Walk { .. }) {
+                        self.restarts = 0;
+                    }
+                    return Some(scanned);
+                }
+                None if self.cancellation.is_cancelled() => return None,
+                None => {}
+            }
+            let at = match self.restart_at {
+                Some(at) => at,
+                None => {
+                    if self.restarts >= SCANNER_RESTARTS {
+                        tracing::error!(
+                            restarts = self.restarts,
+                            "the filesystem scanner keeps stopping; changes are found only by the periodic re-read of each checkout"
+                        );
+                        return None;
+                    }
+                    let wait = SCANNER_BACKOFF * 2u32.pow(self.restarts);
+                    self.restarts += 1;
+                    tracing::warn!(
+                        restart = self.restarts,
+                        wait_ms = wait.as_millis() as u64,
+                        "the filesystem scanner stopped; starting it again"
+                    );
+                    *self.restart_at.insert(tokio::time::Instant::now() + wait)
+                }
+            };
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return None,
+                _ = tokio::time::sleep_until(at) => {}
+            }
+            self.restart_at = None;
+            (self.results, self.stopped) = spawn_scanner(&self.cancellation, self.plan.clone());
+        }
+    }
+
+    /// Wait for the thread to end, after cancellation.
+    async fn joined(self) {
+        let _ = self.stopped.await;
+    }
+}
+
+fn spawn_scanner(
+    cancellation: &tokio_util::sync::CancellationToken,
+    plan: Arc<Mutex<ScanPlan>>,
+) -> (mpsc::Receiver<Scanned>, oneshot::Receiver<()>) {
+    let (results, receiver) = mpsc::channel(4);
+    let (stopped, joined) = oneshot::channel::<()>();
+    let cancellation = cancellation.clone();
+    let thread = std::thread::Builder::new()
+        .name("wt-fs-scan".into())
+        .spawn(move || {
+            let _stopped = stopped;
+            let mut seen = BTreeMap::<PathBuf, Option<FileSignature>>::new();
+            let mut next_walk = std::time::Instant::now();
+            while !cancellation.is_cancelled() {
+                // A plan another thread panicked while holding is still a
+                // plan; giving up on it would end detection.
+                #[cfg(test)]
+                {
+                    let fail = std::mem::take(
+                        &mut plan
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .fail,
+                    );
+                    assert!(!fail, "scanner failure injected by a test");
+                }
+                let (roots, hot) = {
+                    let plan = plan
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    (plan.roots.clone(), plan.hot.clone())
+                };
+                let mut changed = Vec::new();
+                if seen.len() != hot.len() || !hot.iter().all(|path| seen.contains_key(path)) {
+                    seen.retain(|path, _| hot.binary_search(path).is_ok());
+                }
+                for path in hot {
+                    let now = std::fs::symlink_metadata(&path)
+                        .ok()
+                        .map(|metadata| FileSignature::from_metadata(&metadata));
+                    match seen.get(&path) {
+                        Some(then) if *then == now => {}
+                        // The first look at a file is what later ones are
+                        // compared with. The walk covers the time before it.
+                        None => {
+                            seen.insert(path, now);
+                        }
+                        Some(_) => {
+                            seen.insert(path.clone(), now);
+                            changed.push(path);
+                        }
+                    }
+                }
+                if !changed.is_empty() && results.blocking_send(Scanned::Hot(changed)).is_err() {
+                    break;
+                }
+                let started = std::time::Instant::now();
+                if started >= next_walk {
+                    let Some(sample) = watch_fingerprint(&roots, &cancellation) else {
+                        break;
+                    };
+                    let walk = started.elapsed();
+                    next_walk = started + SCAN_INTERVAL.max(walk * SCAN_DUTY);
+                    let walked = Scanned::Walk {
+                        roots,
+                        sample,
+                        walk,
+                    };
+                    if results.blocking_send(walked).is_err() {
+                        break;
+                    }
+                }
+                std::thread::sleep(HOT_TICK);
+            }
+        });
+    if let Err(error) = thread {
+        tracing::warn!(%error, "cannot start the filesystem scanner");
+    }
+    (receiver, joined)
 }
 
 /// File metadata of the watch set, not a recursive checkout scan. The watch
@@ -1431,9 +1919,19 @@ fn removing(state: &Value, record: &WorktreeRecord) -> bool {
 
 /// The second value reports a listed checkout that no longer exists.
 async fn desired_paths(
-    config: &Config,
+    config: &Arc<Config>,
     inventory: &[WorktreeRecord],
 ) -> Result<(BTreeMap<PathBuf, bool>, bool)> {
+    // Several file checks per checkout: one hop to the blocking pool for all
+    // of them, not one each behind whatever else is queued there.
+    let (config, inventory) = (config.clone(), inventory.to_vec());
+    Ok(tokio::task::spawn_blocking(move || desired_paths_blocking(&config, &inventory)).await?)
+}
+
+fn desired_paths_blocking(
+    config: &Config,
+    inventory: &[WorktreeRecord],
+) -> (BTreeMap<PathBuf, bool>, bool) {
     let mut paths = BTreeMap::new();
     let mut missing = false;
     paths.insert(config.paths.worktree_root.clone(), false);
@@ -1449,7 +1947,7 @@ async fn desired_paths(
         paths.insert(common_dir.clone(), false);
         for child in ["refs", "worktrees"] {
             let path = common_dir.join(child);
-            if path_may_exist(&path).await {
+            if path_may_exist_blocking(&path) {
                 paths.insert(path, true);
             }
         }
@@ -1458,7 +1956,7 @@ async fn desired_paths(
         let checkout = PathBuf::from(&worktree.target.path);
         // A deleted checkout cannot be watched; requesting it would only
         // repeat the backend's missing-path error.
-        if !path_may_exist(&checkout).await {
+        if !path_may_exist_blocking(&checkout) {
             missing = true;
             continue;
         }
@@ -1467,12 +1965,12 @@ async fn desired_paths(
             && !common_dirs
                 .iter()
                 .any(|common| directory.starts_with(common.join("worktrees")))
-            && path_may_exist(directory).await
+            && path_may_exist_blocking(directory)
         {
             paths.insert(directory.clone(), false);
             for child in ["refs", "worktrees"] {
                 let path = directory.join(child);
-                if path_may_exist(&path).await {
+                if path_may_exist_blocking(&path) {
                     paths.insert(path, true);
                 }
             }
@@ -1482,13 +1980,13 @@ async fn desired_paths(
     // create duplicate watches or miss events during path matching.
     let mut canonical = BTreeMap::new();
     for (path, recursive) in paths {
-        let path = canonical_watch_path(&path).await;
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         canonical
             .entry(path)
             .and_modify(|value| *value |= recursive)
             .or_insert(recursive);
     }
-    Ok((canonical, missing))
+    (canonical, missing)
 }
 
 /// A watched path that no longer exists. Other watcher errors are genuine
@@ -1689,8 +2187,8 @@ fn is_state_db_path(path: &Path, state_db: &Path) -> bool {
 
 /// Only a confirmed NotFound drops a watch. An unreadable path stays in the
 /// set so the watcher reports it, rather than failing the whole rebuild.
-async fn path_may_exist(path: &std::path::Path) -> bool {
-    tokio::fs::try_exists(path).await.unwrap_or(true)
+fn path_may_exist_blocking(path: &std::path::Path) -> bool {
+    path.try_exists().unwrap_or(true)
 }
 
 #[cfg(test)]
@@ -2652,7 +3150,11 @@ mod tests {
                 calls.fetch_add(1, Ordering::SeqCst);
             }
         });
-        tokio::time::sleep(SIGNAL_TICK * 4).await;
+        // The tick's first look, whenever a loaded machine gets to it.
+        let baseline = std::fs::canonicalize(&database).unwrap();
+        while !seen.lock().unwrap().contains_key(&baseline) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -2668,7 +3170,6 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let noticed = written.elapsed();
         tokio::time::sleep(SIGNAL_TICK * 4).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -2678,12 +3179,6 @@ mod tests {
         let wal = std::fs::canonicalize(&wal).unwrap();
         assert!(seen.lock().unwrap().get(&wal).is_some_and(Option::is_some));
         scope.shutdown(Duration::from_secs(2)).await.unwrap();
-        // Generous for a loaded machine; the one-second scan it replaces
-        // would average half a second and reach a full one.
-        assert!(
-            noticed < Duration::from_millis(600),
-            "noticed after {noticed:?}"
-        );
     }
 
     #[tokio::test]
@@ -2781,8 +3276,18 @@ mod tests {
                 policy: RefreshPolicy::default(),
             },
         );
-        let interval = Duration::from_millis(200);
-        let paced = Paced::new(metadata.view(), interval);
+        // Long enough that a stalled test thread cannot outlast it between
+        // two lines.
+        let interval = Duration::from_secs(1);
+        let paced = Paced::new(
+            {
+                let metadata = metadata.view();
+                move || {
+                    metadata.refresh();
+                }
+            },
+            interval,
+        );
         let asked =
             |publisher: &mut wt_runtime::LeafPublisher<_>| publisher.take_demand().whole.is_some();
         // A lone write is read at once.
@@ -2840,15 +3345,14 @@ mod tests {
             &scope,
             spec("test-metadata", Domain::Metadata),
         );
-        let router = Arc::new(Router {
-            git: git.view(),
-            metadata: Arc::new(Paced::new(metadata.view(), METADATA_PACE)),
-            state_db: "/state/wt.sqlite".into(),
-            checkout_roots: ["/repo/main".into(), "/wt".into()],
-            layout: RwLock::default(),
-            contents: Mutex::default(),
-            reported: Mutex::default(),
-        });
+        let router = Arc::new(Router::new(
+            git.view(),
+            metadata.view(),
+            Arc::new(Paced::metadata(metadata.view())),
+            "/state/wt.sqlite".into(),
+            ["/repo/main".into(), "/wt".into()],
+            Duration::ZERO,
+        ));
         router
             .clone()
             .baseline(vec![git_dir.clone(), checkout.clone(), named.clone()])
@@ -2946,26 +3450,26 @@ mod tests {
             branch: branch.into(),
             upstream: upstream.map(Into::into),
         };
-        let router = Arc::new(Router {
-            git: git.view(),
-            metadata: Arc::new(Paced::new(metadata.view(), METADATA_PACE)),
-            state_db: "/state/wt.sqlite".into(),
-            checkout_roots: ["/wt/main".into(), "/wt".into()],
-            layout: RwLock::new(Layout {
-                rows: vec![
-                    row("main", git_dir.clone(), "main", None),
-                    row(
-                        "one",
-                        git_dir.join("worktrees/one"),
-                        "feature/one",
-                        Some("origin/feature/one"),
-                    ),
-                    row("two", git_dir.join("worktrees/two"), "feature/two", None),
-                ],
-            }),
-            contents: Mutex::default(),
-            reported: Mutex::default(),
-        });
+        let router = Arc::new(Router::new(
+            git.view(),
+            metadata.view(),
+            Arc::new(Paced::metadata(metadata.view())),
+            "/state/wt.sqlite".into(),
+            ["/wt/main".into(), "/wt".into()],
+            Duration::ZERO,
+        ));
+        *router.layout.write().unwrap() = Layout {
+            rows: vec![
+                row("main", git_dir.clone(), "main", None),
+                row(
+                    "one",
+                    git_dir.join("worktrees/one"),
+                    "feature/one",
+                    Some("origin/feature/one"),
+                ),
+                row("two", git_dir.join("worktrees/two"), "feature/two", None),
+            ],
+        };
         router.clone().baseline(vec![git_dir.clone()]).await;
         let replace = |lock: &Path, file: &Path, bytes: &str| {
             std::fs::write(lock, bytes).unwrap();
@@ -3010,11 +3514,31 @@ mod tests {
         );
         assert_eq!(asked, wt_runtime::Demand::default());
 
-        // A real change to the config still reads every row, once.
+        // A change to that branch's own settings reaches the rows on it,
+        // once; the pair that follows the rename adds nothing.
         replace(
             &config_lock,
             &config,
             "[branch \"feature/one\"]\n\tremote = fork\n",
+        );
+        let asked = demand(
+            &router,
+            vec![
+                vec![&config_lock],
+                vec![&config],
+                vec![&config_lock, &config],
+            ],
+        );
+        assert_eq!(asked.whole, None);
+        assert_eq!(
+            asked.keys,
+            BTreeMap::from([("one".to_owned(), Request::Recheck)])
+        );
+        // A change to anything else in the config still reads every row.
+        replace(
+            &config_lock,
+            &config,
+            "[core]\n\tbare = false\n[branch \"feature/one\"]\n\tremote = fork\n",
         );
         let asked = demand(
             &router,
@@ -3043,5 +3567,323 @@ mod tests {
         assert!(!router.already_notified(&reference, signature(&reference).as_ref()));
         assert!(!router.already_notified(&git_dir.join("HEAD"), None));
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    fn routed(
+        scope: &TaskScope,
+    ) -> (
+        Arc<Router>,
+        wt_runtime::LeafPublisher<Vec<WorktreeSnapshot>>,
+    ) {
+        fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
+            SourceSpec {
+                name,
+                domain,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            }
+        }
+        let (git, git_publisher) =
+            leaf_channel::<Vec<WorktreeSnapshot>>(scope, spec("test-git", Domain::Git));
+        let (metadata, _) = leaf_channel::<crate::local_source::Metadata>(
+            scope,
+            spec("test-metadata", Domain::Metadata),
+        );
+        let router = Arc::new(Router::new(
+            git.view(),
+            metadata.view(),
+            Arc::new(Paced::metadata(metadata.view())),
+            "/state/wt.sqlite".into(),
+            ["/wt/main".into(), "/wt".into()],
+            Duration::ZERO,
+        ));
+        (router, git_publisher)
+    }
+
+    #[tokio::test]
+    async fn a_packed_refs_rewrite_reaches_only_the_rows_whose_refs_moved() {
+        let root = tempfile::tempdir().unwrap();
+        let git_dir = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        let packed = git_dir.join("packed-refs");
+        let header = "# pack-refs with: peeled fully-peeled sorted \n";
+        let refs = |one: &str, backup: &str| {
+            format!(
+                "{header}aaaa refs/heads/feature/two\n{backup} refs/heads/backup/x\n{one} refs/remotes/origin/feature/one\ncccc refs/tags/v1\n^dddd\n"
+            )
+        };
+        std::fs::write(&packed, refs("1111", "2222")).unwrap();
+        let scope = TaskScope::new();
+        let (router, mut git_publisher) = routed(&scope);
+        let row = |key: &str, branch: &str, upstream: Option<&str>| LayoutRow {
+            key: key.into(),
+            path: format!("/wt/{key}").into(),
+            git_dir: Some(git_dir.join("worktrees").join(key)),
+            common_dir: Some(git_dir.clone()),
+            branch: branch.into(),
+            upstream: upstream.map(Into::into),
+        };
+        *router.layout.write().unwrap() = Layout {
+            rows: vec![
+                row("one", "feature/one", Some("origin/feature/one")),
+                row("two", "feature/two", None),
+            ],
+        };
+        router.clone().baseline(vec![git_dir.clone()]).await;
+        let mut rewritten = |text: String| {
+            std::fs::write(&packed, text).unwrap();
+            router.invalidate(std::slice::from_ref(&packed));
+            git_publisher.take_demand()
+        };
+        // A fetch moved the upstream of "one": that row, and no sweep.
+        let asked = rewritten(refs("3333", "2222"));
+        assert_eq!(asked.whole, None);
+        assert_eq!(asked.keys.keys().collect::<Vec<_>>(), ["one"]);
+        // A restack dropped a backup ref no checkout is on: a listing, so
+        // facts derived from refs wake, and no row.
+        let asked = rewritten(refs("3333", "9999"));
+        assert_eq!((asked.whole, asked.keys.len()), (None, 0));
+        assert_eq!(asked.index, Some(Request::Recheck));
+        // Rewritten as it was: nothing.
+        let asked = rewritten(refs("3333", "9999"));
+        assert_eq!(asked, wt_runtime::Demand::default());
+        // Anything that is not a ref changing reads every row.
+        let asked = rewritten(refs("3333", "9999").replace("sorted", "unsorted"));
+        assert_eq!(asked.whole, Some(Request::Recheck));
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_backstop_rolls_round_the_fleet_and_skips_rows_just_read() {
+        let scope = TaskScope::new();
+        let (router, mut git_publisher) = routed(&scope);
+        let row = |key: &str| LayoutRow {
+            key: key.into(),
+            path: format!("/wt/{key}").into(),
+            ..LayoutRow::default()
+        };
+        *router.layout.write().unwrap() = Layout {
+            rows: ["a", "b", "c", "d", "e", "f"].map(row).to_vec(),
+        };
+        let none = BTreeSet::new();
+        let start = std::time::Instant::now();
+        // Rows seen for the first time have just been read.
+        assert!(router.backstop(&none, start).is_empty());
+        assert!(router.backstop(&none, start + BACKSTOP / 2).is_empty());
+        // A change routed to a row is a read of it; the backstop has nothing
+        // to add for a period.
+        router.invalidate(&["/wt/c/src/lib.rs".into()]);
+        assert_eq!(
+            git_publisher.take_demand().keys.keys().collect::<Vec<_>>(),
+            ["c"]
+        );
+        // A period on, the five others fall due together. They are read
+        // oldest first, more than the usual one a step while that many
+        // wait, so the last of them is not left a further period.
+        let due = start + BACKSTOP;
+        assert_eq!(router.backstop(&none, due), ["a", "b"]);
+        assert_eq!(router.backstop(&none, due), ["d"]);
+        assert_eq!(router.backstop(&none, due), ["e"]);
+        assert_eq!(router.backstop(&none, due), ["f"]);
+        assert!(router.backstop(&none, due).is_empty());
+        assert_eq!(router.backstop(&none, due + Duration::from_secs(1)), ["c"]);
+        // A checkout nobody is working in waits several periods.
+        let idle = BTreeSet::from(["a".to_owned()]);
+        let later = due + BACKSTOP;
+        assert_eq!(router.backstop(&idle, later), ["b"]);
+        assert_eq!(router.backstop(&idle, later), ["d"]);
+        assert_eq!(router.backstop(&idle, later), ["e"]);
+        assert_eq!(router.backstop(&idle, later), ["f"]);
+        assert!(router.backstop(&idle, later).is_empty());
+        let idle_due = due + BACKSTOP * BACKSTOP_IDLE_FACTOR;
+        assert_eq!(router.backstop(&idle, idle_due)[0], "a");
+        // A row that left the fleet is forgotten.
+        router.layout.write().unwrap().rows.truncate(1);
+        router.backstop(&none, later);
+        assert_eq!(router.asked.lock().unwrap().len(), 1);
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changes_that_cannot_be_routed_in_a_burst_are_one_sweep() {
+        let scope = TaskScope::new();
+        fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
+            SourceSpec {
+                name,
+                domain,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            }
+        }
+        let (git, mut git_publisher) =
+            leaf_channel::<Vec<WorktreeSnapshot>>(&scope, spec("test-git", Domain::Git));
+        let (metadata, _) = leaf_channel::<crate::local_source::Metadata>(
+            &scope,
+            spec("test-metadata", Domain::Metadata),
+        );
+        let pace = Duration::from_secs(1);
+        let router = Router::new(
+            git.view(),
+            metadata.view(),
+            Arc::new(Paced::metadata(metadata.view())),
+            "/state/wt.sqlite".into(),
+            ["/wt/main".into(), "/wt".into()],
+            pace,
+        );
+        *router.layout.write().unwrap() = Layout {
+            rows: vec![LayoutRow {
+                key: "a".into(),
+                path: "/wt/a".into(),
+                ..LayoutRow::default()
+            }],
+        };
+        let asked = |router: &Router| router.asked.lock().unwrap().get("a").copied();
+        assert_eq!(asked(&router), None);
+        for _ in 0..13 {
+            router.invalidate(&["/elsewhere/file".into()]);
+        }
+        assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        assert!(git_publisher.take_demand().whole.is_none());
+        // Rows count as asked for when a read of all of them is asked for,
+        // not while one is only held back: until then the backstop must
+        // still be able to reach them.
+        let first = asked(&router).expect("the first read stamps its rows");
+        std::thread::sleep(Duration::from_millis(5));
+        router.invalidate(&["/elsewhere/file".into()]);
+        assert_eq!(asked(&router), Some(first));
+        // One more is owed for what arrived meanwhile, when its time comes.
+        let due = router.sweeps.due().expect("one read is held back");
+        tokio::time::sleep_until(due).await;
+        router.sweeps.release();
+        assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        assert!(asked(&router).is_some_and(|second| second > first));
+        router.sweeps.release();
+        assert!(git_publisher.take_demand().whole.is_none());
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_files_that_carry_git_facts_are_noticed_between_walks() {
+        let root = tempfile::tempdir().unwrap();
+        let git_dir = std::fs::canonicalize(root.path()).unwrap();
+        let head = git_dir.join("HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        let layout = Layout {
+            rows: vec![LayoutRow {
+                key: "one".into(),
+                path: "/wt/one".into(),
+                git_dir: Some(git_dir.clone()),
+                common_dir: Some(git_dir.clone()),
+                branch: "feature/one".into(),
+                upstream: Some("origin/feature/one".into()),
+            }],
+        };
+        let hot = layout.hot_files();
+        for file in [
+            "HEAD",
+            "index",
+            "MERGE_HEAD",
+            "rebase-merge",
+            "packed-refs",
+            "refs/heads/feature/one",
+            "refs/remotes/origin/feature/one",
+        ] {
+            assert!(hot.contains(&git_dir.join(file)), "{file}");
+        }
+        let scope = TaskScope::new();
+        let plan = Arc::new(Mutex::new(ScanPlan {
+            roots: BTreeMap::from([(git_dir.clone(), false)]),
+            hot,
+            ..ScanPlan::default()
+        }));
+        let mut scans = Scanner::start(scope.token(), plan.clone());
+        async fn next(scans: &mut Scanner) -> Scanned {
+            tokio::time::timeout(Duration::from_secs(30), scans.next())
+                .await
+                .expect("the scanner reported nothing")
+                .expect("the scanner stopped")
+        }
+        // The first walk follows the thread's first look at the files, so
+        // from here a change to one is a change, however loaded the machine.
+        let Scanned::Walk { roots, sample, .. } = next(&mut scans).await else {
+            panic!("the first report is a walk");
+        };
+        assert_eq!(roots.len(), 1);
+        assert!(sample.contains_key(&head));
+        // HEAD moves and a rebase starts: both are reported as checked
+        // files, not left for the next walk to find.
+        std::fs::write(&head, "0123456789abcdef\n").unwrap();
+        std::fs::create_dir(git_dir.join("rebase-merge")).unwrap();
+        let mut seen = BTreeSet::new();
+        while seen.len() < 2 {
+            if let Scanned::Hot(paths) = next(&mut scans).await {
+                seen.extend(paths);
+            }
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from([head.clone(), git_dir.join("rebase-merge")])
+        );
+
+        // The thread dies. That is logged and it is started again: the next
+        // walk and the next change still arrive.
+        plan.lock().unwrap().fail = true;
+        loop {
+            if matches!(next(&mut scans).await, Scanned::Walk { .. }) && !plan.lock().unwrap().fail
+            {
+                break;
+            }
+        }
+        assert!(scans.restarts <= 1);
+        std::fs::write(&head, "fedcba9876543210\n").unwrap();
+        loop {
+            // The new thread's first look may come after the write; then
+            // the walk is what reports it.
+            match next(&mut scans).await {
+                Scanned::Hot(paths) => {
+                    assert_eq!(paths, std::slice::from_ref(&head));
+                    break;
+                }
+                Scanned::Walk { sample, .. } => {
+                    let now = std::fs::symlink_metadata(&head)
+                        .ok()
+                        .map(|metadata| FileSignature::from_metadata(&metadata));
+                    if sample.get(&head) == now.as_ref() {
+                        break;
+                    }
+                }
+            }
+        }
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scanner_that_keeps_dying_is_given_up_on_and_says_so() {
+        // No runtime time passes between deaths except the backoff, so this
+        // takes the sum of the backoffs: under eight seconds.
+        let scope = TaskScope::new();
+        let plan = Arc::new(Mutex::new(ScanPlan::default()));
+        let mut scans = Scanner::start(scope.token(), plan.clone());
+        let failing = plan.clone();
+        let fail = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                failing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .fail = true;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        // Walks from threads that lived long enough to make one are ignored
+        // here; each resets the count, so only uninterrupted deaths end it.
+        let gave_up = tokio::time::timeout(Duration::from_secs(60), async {
+            while scans.next().await.is_some() {}
+        })
+        .await;
+        assert!(gave_up.is_ok(), "restarted without bound");
+        assert_eq!(scans.restarts, SCANNER_RESTARTS);
+        fail.join().unwrap();
+        scope.shutdown(Duration::from_secs(5)).await.unwrap();
     }
 }

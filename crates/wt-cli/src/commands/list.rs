@@ -33,40 +33,47 @@ pub struct ListArgs {
 }
 
 pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
-    let snapshots = wt_ops::worktree_facts::inventory_status(ctx).await?;
-    let live = snapshots
+    let records = ctx.repository.inventory(&ctx.cancellation).await?;
+    let (live_slugs, branches): (BTreeSet<_>, Vec<_>) = records
         .iter()
-        .filter(|snapshot| !snapshot.worktree.is_main)
-        .collect::<Vec<_>>();
-    let live_slugs = live
-        .iter()
-        .map(|snapshot| snapshot.worktree.target.slug().to_owned())
-        .collect::<BTreeSet<_>>();
+        .filter(|record| !record.is_main)
+        .map(|record| {
+            (
+                record.target.slug().to_owned(),
+                record.target.branch.clone(),
+            )
+        })
+        .unzip();
     let now = now_ms();
-    // The PR column is the only network read of the table; it overlaps the
-    // local reads instead of following them.
+    // The PR column is the only network read of the table. It and the Git
+    // statuses are the slow reads, and neither needs the other: they run
+    // side by side once the worktrees are listed.
     // With GitHub switched off nothing is read from it, and nothing is said
     // of a read that was never made.
     let github_off = std::env::var("WT_GITHUB").as_deref() == Ok("off");
-    let wants_prs = !args.json && !live.is_empty() && !github_off;
-    let (stored, locks, prs) = tokio::join!(
+    let wants_prs = !args.json && !branches.is_empty() && !github_off;
+    let (snapshots, stored, prs) = tokio::join!(
+        wt_ops::worktree_facts::statuses(ctx, records),
         ctx.database.call(move |store| {
             Ok((
                 store.read_wt_state()?,
                 store.recently_removed_worktrees(&live_slugs, now)?,
             ))
         }),
-        collect_operation_locks(ctx, &live),
         async {
             if wants_prs {
-                Some(pull_requests(ctx, &live).await)
+                Some(pull_requests(ctx, &branches).await)
             } else {
                 None
             }
         },
     );
+    let live = snapshots
+        .iter()
+        .filter(|snapshot| !snapshot.worktree.is_main)
+        .collect::<Vec<_>>();
     let (state, removed) = stored?;
-    let locks = locks?;
+    let locks = collect_operation_locks(ctx, &live).await?;
     if args.json {
         let remote_url = run_git(
             ctx,
@@ -243,31 +250,31 @@ pub async fn run(ctx: &AppContext, args: &ListArgs) -> Result<i32> {
 /// a snapshot older than the board would use.
 async fn pull_requests(
     ctx: &AppContext,
-    live: &[&WorktreeSnapshot],
+    branches: &[String],
 ) -> (
     Result<BTreeMap<String, PullRequest>, wt_github::GithubError>,
     Option<String>,
 ) {
-    let branches = live
-        .iter()
-        .map(|snapshot| snapshot.worktree.target.branch.clone())
-        .collect::<Vec<_>>();
-    if let Some(shown) = wt_sources::github_events_source::load_for_display(ctx, &branches).await {
+    if let Some(shown) = wt_sources::github_events_source::load_for_display(ctx, branches).await {
         let held = shown.note();
         return (Ok(shown.read.data.prs), held);
+    }
+    // What some wt process read within the bound the snapshot itself is
+    // fresh for is as good an answer, and costs GitHub nothing.
+    if let Some((data, _)) = wt_sources::wait_facts::recent_read(ctx, branches).await {
+        return (Ok(data.prs), None);
     }
     let github = GithubClient::new(
         ctx.processes.clone(),
         ctx.config.paths.main_clone.clone(),
         GithubOptions::from_config(&ctx.config, true),
     );
-    (
-        github
-            .fetch_worktrees(&branches, &ctx.cancellation)
-            .await
-            .map(|data| data.prs),
-        None,
-    )
+    let started_ms = u64::try_from(now_ms()).unwrap_or(0);
+    let fetched = github.fetch_worktrees(branches, &ctx.cancellation).await;
+    if let Ok(data) = &fetched {
+        wt_sources::wait_facts::record_read(ctx, data, started_ms).await;
+    }
+    (fetched.map(|data| data.prs), None)
 }
 
 async fn collect_push_facts(

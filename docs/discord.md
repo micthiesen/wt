@@ -19,14 +19,27 @@ enabled — that id is public by design; it powers the README badge).
 
 `.github/workflows/discord-release.yml` + `.github/scripts/discord-release.py`
 (standard-library Python, no JavaScript runtime). Each published stable release
-is posted once, as an embed titled `wt vX.Y.Z` that links the GitHub release and
-carries its notes.
+is posted once, as an embed titled with the release's name (`wt vX.Y.Z: <what it
+is about>`) that links the GitHub release and carries its notes.
 
-- The notes are the release commit's message: `scripts/publish-native.py`
-  writes its summary line (without the `Release vX.Y.Z:` prefix) and body into
-  stable GitHub releases above the download boilerplate, and the post drops that
-  boilerplate. Preview (`preview-<sha>`) releases keep only the boilerplate and
-  are never posted.
+- The title and notes cover every commit since the previous stable tag.
+  `scripts/release-notes.py` writes them in the publish job. With the
+  `OPENAI_API_KEY` secret it sends those commit messages to a model for a
+  summary: the newest plain `gpt-N` the key lists, or the one the repository
+  variable `RELEASE_NOTES_MODEL` names. Without the key, or when the call or
+  its answer fails a check, it assembles the notes from the messages: the
+  release commit's summary and bullets, then the subject of each other
+  commit. The script never fails the publish job: any failure falls back to
+  the commit messages, or to no notes. It strips rule lines, neutralizes
+  `@mentions`, and rejects a model summary that contains a link.
+  `scripts/publish-native.py` puts the notes above the download boilerplate,
+  or publishes with the plain title and footer when the notes file is
+  missing or unreadable, and the post drops that boilerplate. The post sets
+  `allowed_mentions` to none, so it pings nobody. Preview (`preview-<sha>`)
+  releases keep only the boilerplate and are never posted; for one, the
+  script drafts the notes of the next stable release into the run summary.
+- A manual dispatch of `Native release` that does not publish still writes the
+  notes to its run summary, which is how to read them before pushing a tag.
 - `publish-native.py` creates releases with `GITHUB_TOKEN`, which cannot
   trigger `release` events, so the workflow follows `Native release` through
   `workflow_run`. It runs only for a successful `push` run whose ref is a `v*`

@@ -34,8 +34,65 @@ pub struct BoardSources {
     pub review_requests: crate::review_requests::ReviewRequests,
 }
 
+/// The config warnings no earlier start has reported. A warning stands until
+/// the config is edited, so repeating it at every start buries the log and
+/// the attention feed; `wt doctor` lists the standing ones. `record` holds
+/// what was reported for the warnings as they are now: one that goes away
+/// and comes back is reported again. An unreadable or unwritable record only
+/// costs a repeat.
+///
+/// Repositories can share a cache root, so each has its own record (see
+/// [`config_warnings_record`]); one file for all would make each start of
+/// one repository forget what the other had reported.
+fn unreported_config_warnings(record: &std::path::Path, warnings: &[String]) -> Vec<String> {
+    let reported: Vec<String> = std::fs::read(record)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if reported != warnings {
+        let saved = serde_json::to_vec(warnings)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| {
+                if let Some(parent) = record.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let staged = record.with_extension(format!("json.{}", std::process::id()));
+                let moved =
+                    std::fs::write(&staged, bytes).and_then(|()| std::fs::rename(&staged, record));
+                if moved.is_err() {
+                    let _ = std::fs::remove_file(&staged);
+                }
+                moved
+            });
+        if let Err(error) = saved {
+            tracing::debug!(%error, "could not record reported config warnings");
+        }
+    }
+    warnings
+        .iter()
+        .filter(|warning| !reported.contains(warning))
+        .cloned()
+        .collect()
+}
+
+/// Where one repository's reported warnings are recorded. The id is hashed
+/// because it can be a path.
+fn config_warnings_record(cache_root: &std::path::Path, repo_id: &str) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(repo_id.as_bytes());
+    let name = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    cache_root.join(format!("config-warnings-{name}.json"))
+}
+
 pub fn start(scope: &TaskScope, context: &AppContext) -> BoardSources {
-    for warning in &context.config.warnings {
+    for warning in unreported_config_warnings(
+        &config_warnings_record(&context.config.paths.cache_root, &context.config.repo_id),
+        &context.config.warnings,
+    ) {
         tracing::warn!(target: "wt_attention", event_channel = "attention", event_source = "config", event_text = %warning, "config warning");
     }
     let local_sources = crate::local_source::start(scope, context);
@@ -389,6 +446,70 @@ fn compose(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_standing_config_warning_is_reported_once_not_at_every_start() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("cache/config-warnings.json");
+        let warnings = |texts: &[&str]| {
+            texts
+                .iter()
+                .map(|text| (*text).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let reserved = "action \"deploy\" uses the reserved key \"c\"";
+        let unknown = "automation (\"x\") is skipped: unknown trigger";
+        let both = warnings(&[reserved, unknown]);
+        assert_eq!(unreported_config_warnings(&record, &both), both);
+        // Later starts with the same config say nothing.
+        for _ in 0..3 {
+            assert!(unreported_config_warnings(&record, &both).is_empty());
+        }
+        // A new warning is reported alone; the standing one stays quiet.
+        let third = "action \"ship\" uses the reserved key \"q\"";
+        assert_eq!(
+            unreported_config_warnings(&record, &warnings(&[reserved, third])),
+            warnings(&[third])
+        );
+        // Fixed, then broken again: it is news again.
+        assert!(unreported_config_warnings(&record, &[]).is_empty());
+        assert_eq!(
+            unreported_config_warnings(&record, &warnings(&[reserved])),
+            warnings(&[reserved])
+        );
+        // Another repository sharing the cache root keeps its own record:
+        // neither one's start makes the other's warnings news again.
+        let cache = root.path().join("shared");
+        let (one, two) = (
+            config_warnings_record(&cache, "/code/one"),
+            config_warnings_record(&cache, "/code/two"),
+        );
+        assert_ne!(one, two);
+        assert_eq!(one.parent(), Some(cache.as_path()));
+        let theirs = warnings(&[unknown]);
+        assert_eq!(unreported_config_warnings(&one, &both), both);
+        assert_eq!(unreported_config_warnings(&two, &theirs), theirs);
+        for _ in 0..2 {
+            assert!(unreported_config_warnings(&one, &both).is_empty());
+            assert!(unreported_config_warnings(&two, &theirs).is_empty());
+        }
+        // A record that cannot be replaced leaves no staged file behind.
+        let blocked = cache.join("blocked.json");
+        std::fs::create_dir_all(blocked.join("occupied")).unwrap();
+        assert_eq!(unreported_config_warnings(&blocked, &both), both);
+        let left: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("blocked.json."))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // A record that cannot be read costs only a repeat.
+        std::fs::write(&record, b"not json").unwrap();
+        assert_eq!(
+            unreported_config_warnings(&record, &warnings(&[reserved])),
+            warnings(&[reserved])
+        );
+    }
     use std::time::Duration;
     use wt_core::Domain;
     use wt_runtime::{Persistence, RefreshPolicy, SourceSpec, Stamp};

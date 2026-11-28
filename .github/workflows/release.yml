@@ -110,6 +110,9 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The notes cover every commit since the previous release tag.
+          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: native-*
@@ -117,8 +120,17 @@ jobs:
           path: dist
       - name: Reject incomplete or mixed-platform releases
         run: python3 scripts/package-native.py manifest --release "$RELEASE_VERSION" --build-id "$WT_BUILD_ID" --output dist --installer scripts/install.sh
+      # Runs for a dispatch that does not publish too, so the notes can be read
+      # in the run summary before a tag is pushed.
+      - name: Write release notes from every commit since the previous release
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL }}
+        run: python3 scripts/release-notes.py --release "$RELEASE_VERSION" --build "$WT_BUILD_ID" --output "$RUNNER_TEMP/release-notes.json" --summary "$GITHUB_STEP_SUMMARY"
       - name: Publish immutable release
         if: needs.identity.outputs.publish == 'true'
+        env:
+          RELEASE_NOTES: ${{ runner.temp }}/release-notes.json
         run: python3 scripts/publish-native.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

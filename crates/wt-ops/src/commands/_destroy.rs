@@ -218,8 +218,23 @@ async fn start_remove_inner(
     let pid = child.id();
 
     let started = tokio::time::Instant::now();
+    // From here a worker exists. An error that says nothing about what it
+    // did must not read as a worktree that was kept.
+    let uncertain = |what: &str, error: &dyn std::fmt::Display| {
+        RemovalUncertain(format!(
+            "removal job {job_id} was started, but {what}: {error}; it may still be running; inspect {} before retrying",
+            job_path.display()
+        ))
+    };
     loop {
-        let current = read_job(&job_path).await?;
+        let current = match read_job(&job_path).await {
+            Ok(current) => current,
+            Err(error) => {
+                let error = uncertain("its record could not be read", &format!("{error:#}"));
+                std::thread::spawn(move || child.wait());
+                return Err(error.into());
+            }
+        };
         let seen = handover(&current, pid);
         match &seen {
             Handover::Locked | Handover::Succeeded => {
@@ -234,10 +249,24 @@ async fn start_remove_inner(
             }
             Handover::Starting | Handover::Acknowledged => {}
         }
-        if child.try_wait()?.is_some() {
+        let exited = match child.try_wait() {
+            Ok(status) => status.is_some(),
+            Err(error) => {
+                let error = uncertain("its process could not be checked", &error);
+                std::thread::spawn(move || child.wait());
+                return Err(error.into());
+            }
+        };
+        if exited {
             // The worker may have recorded a terminal state between the read
             // above and its exit; that record, not the exit, decides.
-            match handover(&read_job(&job_path).await?, pid) {
+            let last = read_job(&job_path).await.map_err(|error| {
+                uncertain(
+                    "its record could not be read after it exited",
+                    &format!("{error:#}"),
+                )
+            })?;
+            match handover(&last, pid) {
                 Handover::Succeeded => return Ok(job_id),
                 Handover::Failed(error) => bail!("{error}; see {}", log_path.display()),
                 _ => bail!(
@@ -457,11 +486,10 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
     job["workerStartIdentity"] =
         json!(process_start_identity(std::process::id(), &ctx.processes).await);
     atomic_write(&job_path, &job).await?;
-    let archive_key = job["target"]["key"]
+    let key = job["target"]["key"]
         .as_str()
         .context("job missing worktree key")?
         .to_owned();
-    let key = archive_key.clone();
     let job_id = args.job_id.clone();
     let path = job["target"]["path"]
         .as_str()
@@ -473,10 +501,16 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
         .to_owned();
     let landed = job["options"]["landed"].as_bool().unwrap_or(false);
     let was_archived = job["wasArchived"].as_bool().unwrap_or(false);
+    // A job written before the field existed archives nothing.
+    let archives = job["wasArchived"].is_boolean();
     let accepted = ctx
         .database
         .call(move |store| {
-            Ok(store.begin_removal_of(&key, &job_id, &path, &branch, landed, was_archived)?)
+            Ok(if archives {
+                store.begin_removal_archived(&key, &job_id, &path, &branch, landed, was_archived)?
+            } else {
+                store.begin_removal_of(&key, &job_id, &path, &branch, landed, was_archived)?
+            })
         })
         .await?;
     if !accepted {
@@ -485,15 +519,6 @@ pub async fn run_worker(ctx: &AppContext, args: &DestroyWorkerArgs) -> Result<i3
         job["completedAt"] = json!(now_string());
         atomic_write(&job_path, &job).await?;
         bail!("another removal is already active for this worktree");
-    }
-    if job["wasArchived"].is_boolean() {
-        let key = archive_key;
-        ctx.database
-            .call(move |store| {
-                store.set_archived(&key, true)?;
-                Ok(())
-            })
-            .await?;
     }
     job["state"] = json!("running");
     atomic_write(&job_path, &job).await?;
@@ -1695,6 +1720,83 @@ mod tests {
         assert_eq!(two["jobId"], "4-d");
         assert_eq!(two["landed"], true, "{two}");
         assert!(two["wasArchived"].is_null(), "{two}");
+        fixture.close().await.unwrap();
+    }
+
+    /// A worker killed after its removal was recorded and before it deleted
+    /// the files it had moved aside leaves a quarantine nobody owns. The
+    /// next removal's worker deletes it along with its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_later_removal_deletes_the_quarantine_a_killed_worker_left() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let row = crate::lifecycle_ops::resolve_key(ctx, "one").await.unwrap();
+        // What the dead worker left on disk: the moved checkout, no longer
+        // registered with Git and with no process holding it.
+        let abandoned = ctx.config.paths.worktree_root.join(format!(
+            "{}gone-1a2b3c",
+            wt_vcs::GitRepository::REMOVAL_QUARANTINE_PREFIX
+        ));
+        tokio::fs::create_dir_all(abandoned.join("node_modules/pkg"))
+            .await
+            .unwrap();
+        tokio::fs::write(abandoned.join("node_modules/pkg/index.js"), "left behind")
+            .await
+            .unwrap();
+        // It is not a worktree: nothing lists it and nothing else removes it.
+        assert!(
+            !ctx.repository
+                .inventory(&ctx.cancellation)
+                .await
+                .unwrap()
+                .iter()
+                .any(|row| row.target.path.contains("gone-1a2b3c"))
+        );
+
+        let revision = crate::lifecycle_ops::service(ctx)
+            .unwrap()
+            .removal_revision(&row.target, false, &ctx.cancellation)
+            .await
+            .unwrap();
+        let jobs = job_dir(ctx);
+        tokio::fs::create_dir_all(&jobs).await.unwrap();
+        atomic_write(
+            &jobs.join("11-k.json"),
+            &json!({
+                "version": VERSION, "id": "11-k", "state": "starting",
+                "wasArchived": false, "operation": "remove",
+                "options": {"force": false, "deleteBranch": true, "landed": false},
+                "target": {
+                    "key": "one", "path": row.target.path, "branch": row.target.branch,
+                    "head": row.head_sha, "revision": revision,
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_worker(
+                ctx,
+                &DestroyWorkerArgs {
+                    job_id: "11-k".into()
+                }
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(!Path::new(&row.target.path).exists());
+        assert!(
+            !abandoned.exists(),
+            "the abandoned quarantine outlived the next removal"
+        );
+        let left: Vec<_> = std::fs::read_dir(&ctx.config.paths.worktree_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| wt_vcs::GitRepository::is_removal_quarantine(name))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         fixture.close().await.unwrap();
     }
 }

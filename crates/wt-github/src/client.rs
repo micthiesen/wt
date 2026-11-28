@@ -2243,6 +2243,7 @@ fn process_role() -> &'static str {
 pub const ROLES: &[&str] = &[
     "_action-worker",
     "_claude-hook",
+    "_delete-removed-checkouts",
     "_destroy",
     "_dev-giveup",
     "_dev-supervise",

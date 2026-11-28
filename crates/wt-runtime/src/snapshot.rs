@@ -508,6 +508,25 @@ impl<T> Confirmed<T> {
             .map_or(self.observed, |keyed| keyed.get(key))
     }
 
+    /// Start of the read that listed what the domain holds: which rows
+    /// exist, as opposed to what each row says. A leaf that reads its rows
+    /// one at a time lists them far more often than it reads the least
+    /// active of them, so a decision about a row's existence (or anything
+    /// else the listing alone carries) uses this, not the oldest row's
+    /// stamp. A domain read whole has one stamp for both.
+    pub fn listed(&self) -> Stamp {
+        self.keyed
+            .as_ref()
+            .map_or(self.observed, |keyed| keyed.index())
+    }
+
+    /// Time since the listing started; see `listed`.
+    pub fn listing_age(&self) -> Option<std::time::Duration> {
+        self.listed()
+            .local_instant()
+            .map(|at| tokio::time::Instant::now().saturating_duration_since(at))
+    }
+
     /// Time since the fetch started; `None` for observations whose start is
     /// unknown, which callers must treat as too old.
     pub fn age(&self) -> Option<std::time::Duration> {

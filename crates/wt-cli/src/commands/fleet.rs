@@ -14,7 +14,7 @@ use wt_dev::{DevStatusSnapshot, DevWorktree};
 use wt_github::{GithubClient, GithubOptions, MergeQueueEntry};
 use wt_harness::ClaudePaths;
 use wt_tmux::{TmuxClient, TmuxServer};
-use wt_vcs::{WorktreeRecord, WorktreeSnapshot};
+use wt_vcs::WorktreeRecord;
 
 use wt_app_core::context::AppContext;
 
@@ -41,26 +41,24 @@ pub struct FleetArgs {
 
 type Heads = BTreeMap<String, Option<String>>;
 
-/// The rows to report and every live worktree's head. Edges name worktrees
-/// outside a selection, so their staleness needs all heads.
+/// The worktrees to report and every live worktree's head. Edges name
+/// worktrees outside a selection, so their staleness needs all heads. Only
+/// the listing: the statuses are read alongside the report's other reads.
 async fn select_rows(
     ctx: &AppContext,
     wanted: &[String],
-) -> Result<Result<(Vec<WorktreeSnapshot>, Heads), Vec<String>>> {
+) -> Result<Result<(Vec<WorktreeRecord>, Heads), Vec<String>>> {
     let heads = |records: &mut dyn Iterator<Item = &WorktreeRecord>| {
         records
             .map(|record| (record.target.slug().to_owned(), record.head_sha.clone()))
             .collect::<Heads>()
     };
-    if wanted.is_empty() {
-        let mut rows = wt_ops::worktree_facts::inventory_status(ctx).await?;
-        rows.retain(|row| !row.worktree.is_main);
-        let heads = heads(&mut rows.iter().map(|row| &row.worktree));
-        return Ok(Ok((rows, heads)));
-    }
     let mut records = ctx.repository.inventory(&ctx.cancellation).await?;
     records.retain(|record| !record.is_main);
     let heads = heads(&mut records.iter());
+    if wanted.is_empty() {
+        return Ok(Ok((records, heads)));
+    }
     // A name is a slug first: a branch another worktree carries under a
     // different slug must not answer for the worktree actually named.
     let slugs = records
@@ -79,24 +77,12 @@ async fn select_rows(
         return Ok(Err(unknown));
     }
     records.retain(|record| wanted.iter().any(|name| names(record, name)));
-    let mut rows = Vec::with_capacity(records.len());
-    for worktree in records {
-        let (status, error) = match ctx.repository.status(&worktree, &ctx.cancellation).await {
-            Ok(status) => (Some(status), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-        rows.push(WorktreeSnapshot {
-            worktree,
-            status,
-            error,
-        });
-    }
-    Ok(Ok((rows, heads)))
+    Ok(Ok((records, heads)))
 }
 
 async fn dev_status(
     ctx: &AppContext,
-    rows: &[WorktreeSnapshot],
+    rows: &[WorktreeRecord],
 ) -> (Option<DevStatusSnapshot>, Option<String>) {
     if ctx.config.dev_server.is_none() {
         return (None, Some("dev server is not configured".to_owned()));
@@ -105,10 +91,7 @@ async fn dev_status(
         Ok(service) => service,
         Err(error) => return (None, Some(error.to_string())),
     };
-    let inventory = rows
-        .iter()
-        .map(|row| DevWorktree::from(&row.worktree))
-        .collect::<Vec<_>>();
+    let inventory = rows.iter().map(DevWorktree::from).collect::<Vec<_>>();
     match service.status_all(&inventory, &ctx.cancellation).await {
         Ok(snapshot) => (Some(snapshot), None),
         Err(error) => (None, Some(error.to_string())),
@@ -118,11 +101,11 @@ async fn dev_status(
 /// Each row's operation lock, or why it could not be read.
 async fn operation_locks(
     ctx: &AppContext,
-    rows: &[WorktreeSnapshot],
+    rows: &[WorktreeRecord],
 ) -> BTreeMap<String, (Option<Value>, Option<String>)> {
     let mut tasks = JoinSet::new();
     for row in rows {
-        let slug = row.worktree.target.slug().to_owned();
+        let slug = row.target.slug().to_owned();
         let context = ctx.clone();
         tasks.spawn(async move {
             let lock = wt_ops::commands::diagnostics::operation_lock(&context, &slug).await;
@@ -180,6 +163,9 @@ struct Fleet {
 #[derive(Clone, Debug)]
 pub(super) struct PrSnapshot {
     age_ms: u64,
+    /// Not the events daemon's snapshot but a read a wt process just made
+    /// and saved: the board's, a wait's or another display command's.
+    saved_read: bool,
     /// Branches shown from a newer read than the snapshot's, with its age.
     newer: BTreeMap<String, u64>,
     /// Those of them whose read held the whole merge queue: for these, no
@@ -202,6 +188,7 @@ pub(super) async fn pull_requests(
     if let Some(shown) = wt_sources::github_events_source::load_for_display(ctx, branches).await {
         let mut snapshot = PrSnapshot {
             age_ms: shown.age_ms,
+            saved_read: false,
             newer: BTreeMap::new(),
             queue_read: BTreeSet::new(),
             held: shown.note(),
@@ -229,20 +216,34 @@ pub(super) async fn pull_requests(
         }
         return (Ok(data), Some(snapshot));
     }
+    let now = u64::try_from(now_ms()).unwrap_or(0);
+    // What some wt process read within the bound the snapshot itself is
+    // fresh for is as good an answer, and costs GitHub nothing.
+    if let Some((data, started_ms)) = wt_sources::wait_facts::recent_read(ctx, branches).await {
+        let snapshot = PrSnapshot {
+            age_ms: now.saturating_sub(started_ms),
+            saved_read: true,
+            newer: BTreeMap::new(),
+            queue_read: BTreeSet::new(),
+            held: None,
+        };
+        return (Ok(data), Some(snapshot));
+    }
     let github = GithubClient::new(
         ctx.processes.clone(),
         ctx.config.paths.main_clone.clone(),
         GithubOptions::from_config(&ctx.config, true),
     );
-    (
-        github.fetch_worktrees(branches, &ctx.cancellation).await,
-        None,
-    )
+    let fetched = github.fetch_worktrees(branches, &ctx.cancellation).await;
+    if let Ok(data) = &fetched {
+        wt_sources::wait_facts::record_read(ctx, data, now).await;
+    }
+    (fetched, None)
 }
 
 /// The fleet report, or the exit code after saying why there is none.
 async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>> {
-    let (rows, head_by_slug) = match select_rows(ctx, &args.slugs).await? {
+    let (records, head_by_slug) = match select_rows(ctx, &args.slugs).await? {
         Ok(selected) => selected,
         Err(unknown) => {
             eprintln!(
@@ -253,9 +254,9 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
         }
     };
     let selected = !args.slugs.is_empty();
-    let branches = rows
+    let branches = records
         .iter()
-        .map(|row| row.worktree.target.branch.clone())
+        .map(|record| record.target.branch.clone())
         .collect::<Vec<_>>();
     let tmux = TmuxClient::new(
         ctx.processes.clone(),
@@ -264,29 +265,30 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
     let claude_paths = ClaudePaths::new(ctx.home.clone(), ctx.config.paths.cache_root.clone());
     let registry_dir = claude_paths.sessions_dir();
     let live_slugs = head_by_slug.keys().cloned().collect::<BTreeSet<_>>();
-    // One batched GitHub read for exactly the reported branches; the other
-    // probes do not depend on it, so none waits behind the slowest.
-    let (stored, (fetched, pr_snapshot), sessions, registry, (dev, dev_note), locks) = tokio::join!(
-        ctx.database.call(move |store| {
+    let (mut state, reports_removed) = ctx
+        .database
+        .call(move |store| {
             let removed = if selected {
                 Vec::new()
             } else {
                 store.recently_removed_worktrees(&live_slugs, now_ms())?
             };
             Ok((store.read_wt_state()?, removed))
-        }),
+        })
+        .await?;
+    // One batched GitHub read for exactly the reported branches. The Git
+    // statuses, the Git half of the landings and the other probes do not
+    // depend on it or on each other, so none waits behind the slowest.
+    let (rows, (fetched, pr_snapshot), local_landings, sessions, registry, (dev, dev_note), locks) = tokio::join!(
+        wt_ops::worktree_facts::statuses(ctx, records.clone()),
         pull_requests(ctx, &branches),
+        super::landing::read_local(ctx, &records, &state),
         tmux.list_sessions(&ctx.cancellation),
         tokio::task::spawn_blocking(move || read_claude_registry(&registry_dir)),
-        dev_status(ctx, &rows),
-        operation_locks(ctx, &rows),
+        dev_status(ctx, &records),
+        operation_locks(ctx, &records),
     );
-    let (mut state, reports_removed) = stored?;
     let registry = registry?;
-    let records = rows
-        .iter()
-        .map(|row| row.worktree.clone())
-        .collect::<Vec<_>>();
     // This command's own GitHub read, when it succeeded, proves PR landings.
     // A snapshot the budget is holding is shown but recorded nowhere.
     let held = pr_snapshot
@@ -300,7 +302,8 @@ async fn fleet(ctx: &AppContext, args: &FleetArgs) -> Result<Result<Fleet, i32>>
         wt_ops::other_branches::Ask::Nothing,
     )
     .await;
-    let landings = super::landing::read_with(ctx, &records, &state, fetched.as_ref().ok()).await;
+    let landings =
+        super::landing::finish_with(ctx, &state, local_landings, fetched.as_ref().ok()).await;
     let separate_production = ctx.config.branch.separate_production();
     let (prs, queue, queue_complete, pr_note) = match fetched {
         Ok(data) => (
@@ -555,6 +558,12 @@ pub async fn run(ctx: &AppContext, args: &FleetArgs) -> Result<i32> {
             Some(PrSnapshot {
                 held: Some(held), ..
             }) => println!("{held}"),
+            Some(PrSnapshot {
+                age_ms,
+                held: None,
+                saved_read: true,
+                ..
+            }) => println!("PR data from wt's last GitHub read, {}s old", age_ms / 1000),
             Some(PrSnapshot {
                 age_ms, held: None, ..
             }) => println!(
@@ -954,17 +963,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].worktree.target.slug(), "one");
-        assert!(rows[0].status.is_some());
+        assert_eq!(rows[0].target.slug(), "one");
         // Edges to unselected worktrees still need their heads.
         assert!(heads.contains_key("two"), "{heads:?}");
-        let by_branch = select_rows(&fixture.ctx, &[rows[0].worktree.target.branch.clone()])
+        let by_branch = select_rows(&fixture.ctx, &[rows[0].target.branch.clone()])
             .await
             .unwrap()
             .unwrap();
         assert_eq!(by_branch.0.len(), 1);
         let (all, _) = select_rows(&fixture.ctx, &[]).await.unwrap().unwrap();
-        assert!(all.len() >= 2 && all.iter().all(|row| !row.worktree.is_main));
+        assert!(all.len() >= 2 && all.iter().all(|row| !row.is_main));
         assert_eq!(
             select_rows(&fixture.ctx, &["one".into(), "absent".into()])
                 .await

@@ -20,7 +20,7 @@ pub async fn execute(
     // it captured back to the hosts that own it. Explicitly host-scoped
     // requests use the normal path.
     if let UiAction::CleanupTargets { targets } = command {
-        return Ok(crate::fleet_cleanup::cleanup_targets(fleet, targets).await);
+        return Ok(crate::fleet_cleanup::cleanup_targets(fleet, targets, hold).await);
     }
     let (host, action, _) = wt_app_core::host_routing::resolve(command)?;
     if let UiAction::SetPerf {

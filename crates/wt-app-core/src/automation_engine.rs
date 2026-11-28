@@ -33,6 +33,12 @@ const DEFER_RETRY_MS: i64 = 30 * 1000;
 /// ...and this often once it is older than `DEFER_SLOW_AFTER_MS`.
 const DEFER_SLOW_RETRY_MS: i64 = 5 * 60 * 1000;
 const DEFER_SLOW_AFTER_MS: i64 = 10 * 60 * 1000;
+/// How long a deferred or retried fire's backoff is kept while no pass
+/// produces the fire. A condition read from GitHub holds only while that
+/// data is fresh, which on a quiet fleet is a minute or two in every ten:
+/// forgetting the backoff at once restarted the retry count each time the
+/// fire came back, so a failing run never reached its last retry.
+const DORMANT_MAX_MS: i64 = 60 * 60 * 1000;
 /// A fire still deferred this long is reported once on the attention feed.
 pub const DEFER_REPORT_AFTER_MS: i64 = 60 * 60 * 1000;
 /// How long after each failed run of a shell action the next one waits. A
@@ -245,6 +251,9 @@ struct Deferral {
     frozen: BTreeMap<String, String>,
     /// Runs of this fire that exited non-zero so far.
     failed_runs: u32,
+    /// The intent as it was when a pass stopped producing the fire, and
+    /// when that was. It resumes from there if the same occurrence returns.
+    dormant: Option<(i64, AutomationIntent)>,
 }
 
 /// A launched headless action whose exit decides whether its fire is done.
@@ -341,6 +350,9 @@ pub struct AutomationEngine {
     active: BTreeMap<String, ActiveFire>,
     /// Why each still-queued intent waited in the latest pass.
     waiting: BTreeMap<String, String>,
+    /// Intents that only their settle window holds back as of the latest
+    /// pass: nothing else would stop them dispatching when it ends.
+    settling: BTreeSet<String>,
     /// Intents held only by unmet row-backed requirements. They stay queued
     /// with their settle age but are not reported as queued.
     unmet: BTreeSet<String>,
@@ -369,6 +381,7 @@ impl AutomationEngine {
             intents: BTreeMap::new(),
             active: BTreeMap::new(),
             waiting: BTreeMap::new(),
+            settling: BTreeSet::new(),
             unmet: BTreeSet::new(),
             recent: Vec::new(),
             deferrals: BTreeMap::new(),
@@ -439,10 +452,16 @@ impl AutomationEngine {
             .collect()
     }
 
+    /// Whether the fire `id` waits for nothing but the end of its settle
+    /// window: it is about to be decided, on the evidence of that moment.
+    pub fn in_settle_window(&self, id: &str) -> bool {
+        self.settling.contains(id)
+    }
+
     /// Whether the fire `id` is still retained, queued or held by an unmet
     /// requirement: one that left the reported queue without this is gone.
     pub fn retains(&self, id: &str) -> bool {
-        self.intents.contains_key(id)
+        self.intents.contains_key(id) || self.deferrals.contains_key(id)
     }
 
     /// The queue as of the latest pass, oldest first, without intents held
@@ -486,7 +505,10 @@ impl AutomationEngine {
 
     /// Requeue the fires a previous process deferred. Their worktrees may be
     /// gone, so evaluation alone would never produce them again. A record
-    /// this build cannot read is left for a build that can.
+    /// this build cannot read is left for a build that can. A fire no pass
+    /// produced when it was last looked at comes back without an intent:
+    /// its condition has to be seen to hold again before it may run.
+    /// Returns how many were requeued.
     pub async fn restore_deferred(&mut self, now_ms: i64) -> Result<usize> {
         let records = self
             .ledger
@@ -510,16 +532,23 @@ impl AutomationEngine {
                     failed_runs: record["failedRuns"]
                         .as_u64()
                         .map_or(0, |runs| u32::try_from(runs).unwrap_or(u32::MAX)),
+                    dormant: None,
                 },
             );
-            self.intents.insert(
-                id,
-                AutomationIntent {
-                    fire,
-                    queued_at_ms,
-                    settle_at_ms: now_ms.saturating_add(DEFER_RETRY_MS),
-                },
-            );
+            // A retry keeps the time it was put off to across a restart.
+            let retry_at_ms = record["retryAtMs"].as_i64().unwrap_or(0);
+            let intent = AutomationIntent {
+                fire,
+                queued_at_ms,
+                settle_at_ms: retry_at_ms.max(now_ms.saturating_add(DEFER_RETRY_MS)),
+            };
+            if let Some(since_ms) = record["dormantSinceMs"].as_i64() {
+                if let Some(deferral) = self.deferrals.get_mut(&id) {
+                    deferral.dormant = Some((since_ms, intent));
+                }
+                continue;
+            }
+            self.intents.insert(id, intent);
             restored += 1;
         }
         Ok(restored)
@@ -691,6 +720,7 @@ impl AutomationEngine {
         }
         // Reasons describe this pass only.
         self.waiting.clear();
+        self.settling.clear();
         self.unmet.clear();
         if input.globally_paused || !input.enabled {
             self.cancel_pending(input).await?;
@@ -861,38 +891,97 @@ impl AutomationEngine {
             .into_iter()
             .map(|intent| (fire_identity(&intent.fire), intent))
             .collect();
-        // A fire whose intent this pass no longer holds starts over if it
-        // returns: a watch that was cancelled or is held by a paused
-        // worktree, a prompt whose session could not be reached and whose
-        // worktree is now gone or whose condition cleared. Its stored
-        // deferral would only be restored at each start and never cleared.
-        // A failed run's retry is dropped with its intent the same way
-        // (its condition cleared, or a guard skipped it).
-        let retries = self
-            .deferrals
-            .iter()
-            .filter(|(_, deferral)| deferral.failed_runs > 0)
-            .map(|(id, _)| id.clone());
-        let stale = existing
-            .iter()
-            .map(|intent| fire_identity(&intent.fire))
-            .chain(retries)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|id| {
-                self.deferrals.contains_key(id)
-                    && !self.intents.contains_key(id)
-                    && !self.active.contains_key(id)
-            })
-            .collect::<Vec<_>>();
-        for id in stale {
+        // A pass that does not produce a deferred or retried fire says only
+        // that its condition was not confirmed just now. Its backoff and
+        // failed-run count wait for it, without an intent, and it resumes
+        // where it was when the same occurrence returns. One that stays
+        // away is forgotten, as is one that returns as a new occurrence.
+        let mut forgotten = Vec::new();
+        // Kept in the ledger too: see `restore_deferred`.
+        let mut dormancy = Vec::new();
+        for (id, deferral) in &mut self.deferrals {
+            if self.active.contains_key(id) {
+                continue;
+            }
+            match self.intents.get_mut(id) {
+                Some(intent) => {
+                    let Some((_, was)) = deferral.dormant.take() else {
+                        continue;
+                    };
+                    dormancy.push((id.clone(), None));
+                    let same_occurrence = was
+                        .fire
+                        .fire_keys
+                        .iter()
+                        .any(|key| intent.fire.fire_keys.contains(key));
+                    if same_occurrence {
+                        intent.queued_at_ms = was.queued_at_ms;
+                        intent.settle_at_ms = intent.settle_at_ms.max(was.settle_at_ms);
+                    } else {
+                        forgotten.push((id.clone(), "its condition returned as a new occurrence"));
+                    }
+                }
+                None => {
+                    if deferral.dormant.is_none() {
+                        deferral.dormant = existing
+                            .iter()
+                            .find(|intent| fire_identity(&intent.fire) == *id)
+                            .map(|intent| (input.now_ms, intent.clone()));
+                        if deferral.dormant.is_some() {
+                            dormancy.push((id.clone(), Some(input.now_ms)));
+                        }
+                    }
+                    match &deferral.dormant {
+                        None => forgotten.push((id.clone(), "nothing produces it")),
+                        // A watch comes from stored state, not from a read
+                        // that can lapse: one that is not there was
+                        // withdrawn or is held, and starts over.
+                        Some((_, was)) if was.fire.watch.is_some() => {
+                            forgotten.push((id.clone(), "its watch was withdrawn or is held"));
+                        }
+                        // A fire that needs no checkout outlives its
+                        // worktree while queued, and so does its backoff.
+                        Some((_, was))
+                            if was.fire.slug != wt_automations::FLEET_SLUG
+                                && !wt_automations::is_frozen_external_fire(&was.fire)
+                                && !input.rows.iter().any(|row| row.slug == was.fire.slug) =>
+                        {
+                            forgotten.push((id.clone(), "its worktree is gone"));
+                        }
+                        Some((since_ms, _))
+                            if input.now_ms.saturating_sub(*since_ms) > DORMANT_MAX_MS =>
+                        {
+                            forgotten.push((id.clone(), "its condition has not held for an hour"));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        for (id, since_ms) in dormancy {
+            if forgotten.iter().any(|(gone, _)| *gone == id) {
+                continue;
+            }
+            self.ledger
+                .set_deferred_dormant(&id, since_ms, &self.cancellation)
+                .await
+                .context("record whether a deferred fire is still produced")?;
+        }
+        for (id, why) in forgotten {
             self.ledger
                 .clear_deferred(&id, &self.cancellation)
                 .await
                 .context("clear a withdrawn fire's deferral")?;
+            if let Some(deferral) = self.deferrals.remove(&id) {
+                tracing::info!(
+                    fire = %id,
+                    failed_runs = deferral.failed_runs,
+                    reason = %deferral.reason,
+                    why,
+                    "automation backoff forgotten"
+                );
+            }
         }
-        self.deferrals
-            .retain(|id, _| self.intents.contains_key(id) || self.active.contains_key(id));
 
         let mut queue = self.intents.values().cloned().collect::<Vec<_>>();
         queue.sort_by_key(|intent| (intent.queued_at_ms, fire_identity(&intent.fire)));
@@ -1051,7 +1140,13 @@ impl AutomationEngine {
             if input.now_ms < intent.settle_at_ms {
                 let reason = match self.deferrals.get(&id) {
                     Some(deferral) => format!("a re-check: {}", deferral.reason),
-                    None => "its settle delay".into(),
+                    None => {
+                        let exempt = breaker_exempt && !is_wake(&fire);
+                        if exempt || quiesce_block_reason(&fire, &input).is_none() {
+                            self.settling.insert(id.clone());
+                        }
+                        "its settle delay".into()
+                    }
                 };
                 self.waiting.insert(id, reason);
                 continue;
@@ -1401,6 +1496,7 @@ impl AutomationEngine {
                         reported: reported || report,
                         frozen: carried,
                         failed_runs,
+                        dormant: None,
                     },
                 );
                 self.intents.insert(
@@ -1557,6 +1653,7 @@ impl AutomationEngine {
             "reason": reason,
             "frozen": {},
             "failedRuns": runs,
+            "retryAtMs": now_ms.saturating_add(delay),
         });
         let released = self
             .ledger
@@ -1583,6 +1680,7 @@ impl AutomationEngine {
                 reported: false,
                 frozen: BTreeMap::new(),
                 failed_runs: runs,
+                dormant: None,
             },
         );
         self.intents.insert(
@@ -3615,7 +3713,7 @@ mod tests {
             .map(fire_identity)
             .next()
             .unwrap();
-        let requirements = BTreeMap::from([(identity, RequirementState::Ready)]);
+        let requirements = BTreeMap::from([(identity.clone(), RequirementState::Ready)]);
         let (quiescence, activity) = (BTreeMap::new(), RuntimeActivity::default());
         let start = now_ms();
         let pass = |rows, now| {
@@ -3655,6 +3753,30 @@ mod tests {
         );
         assert_eq!(engine.queued().len(), 1);
         assert_eq!(ledger.deferred().await.unwrap().len(), 1);
+
+        // A pass that does not show its condition, with the worktree still
+        // there, does not start the backoff over.
+        let claim = loop {
+            let tick = engine.tick(pass(&rows, now)).await.unwrap();
+            if let Some(claim) = tick.claims.first() {
+                break claim.clone();
+            }
+            now += 1_000;
+        };
+        engine.finish(&claim, unreachable(), now).await.unwrap();
+        engine.tick(pass(&rows, now + 1)).await.unwrap();
+        let waiting = engine.queued().remove(0);
+        let hidden = [AutomationRow {
+            created_at: None,
+            ..row()
+        }];
+        engine.tick(pass(&hidden, now + 2)).await.unwrap();
+        assert!(engine.queued().is_empty() && engine.retains(&identity));
+        assert_eq!(ledger.deferred().await.unwrap().len(), 1);
+        let back = engine.tick(pass(&rows, now + 3)).await.unwrap();
+        assert!(back.claims.is_empty(), "tried again before its time");
+        assert_eq!(engine.queued(), [waiting]);
+        now += 3;
 
         // Its worktree removed, nobody is left to hear it.
         let gone = engine.tick(pass(&[], now + DEFER_RETRY_MS)).await.unwrap();
@@ -3871,6 +3993,240 @@ mod tests {
         let after = engine.tick(pass(at + 2)).await.unwrap();
         assert!(after.claims.is_empty());
         assert_eq!(engine.pending_count(), 0);
+    }
+
+    /// A deferred branch delete whose condition stopped being produced must
+    /// not run until that condition is seen to hold again: not after a
+    /// restart (its ledger record alone is not a fire to run), and not
+    /// because its worktree was removed meanwhile. Being a fire that needs
+    /// no checkout, it is also not forgotten for the removal alone.
+    #[tokio::test]
+    async fn a_dormant_fire_does_not_run_until_its_condition_is_seen_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let rules = [AutomationDef {
+            id: "delete-branch-on-merge".into(),
+            on: AutomationTrigger::WtMerged,
+            run: "builtin:delete-branch".into(),
+            settle_seconds: 0.0,
+            ..AutomationDef::default()
+        }];
+        let landed = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        // New commits: the branch is no longer a clean, landed candidate.
+        let moved_on = [row()];
+        let removed: [AutomationRow; 0] = [];
+        let context = AutomationEvalContext::default();
+        let requirements = BTreeMap::new();
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let start = now_ms();
+        let pass = |rows, at| {
+            input(
+                &rules,
+                rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+        let id = "delete-branch-on-merge|worktree";
+        let deferred = || AutomationOutcome::Deferred {
+            reason: "open PR(s) #7 still target worktree".into(),
+            frozen: BTreeMap::new(),
+        };
+
+        let first = engine.tick(pass(&landed, start)).await.unwrap();
+        engine
+            .finish(&first.claims[0], deferred(), start + 1)
+            .await
+            .unwrap();
+        engine.tick(pass(&moved_on, start + 2)).await.unwrap();
+        assert_eq!(engine.pending_count(), 0);
+        assert_eq!(
+            ledger.deferred().await.unwrap()[id]["dormantSinceMs"],
+            start + 2
+        );
+
+        // Its worktree removed while it is away: still no fire, and its
+        // backoff is kept as a queued one's would be.
+        let late = start + DEFER_SLOW_RETRY_MS;
+        let gone = engine.tick(pass(&removed, late)).await.unwrap();
+        assert!(gone.claims.is_empty());
+        assert!(engine.retains(id) && engine.pending_count() == 0);
+
+        // A restart reads the record back as away, not as a fire to run.
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        assert_eq!(engine.restore_deferred(late).await.unwrap(), 0);
+        assert_eq!(engine.pending_count(), 0);
+        let after = engine
+            .tick(pass(&removed, late + DEFER_SLOW_RETRY_MS))
+            .await
+            .unwrap();
+        assert!(after.claims.is_empty(), "ran without its condition");
+        assert!(engine.retains(id));
+
+        // Seen to hold again, it resumes; the record says so.
+        let mut resumed = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        resumed.restore_deferred(late).await.unwrap();
+        let back = resumed
+            .tick(pass(&landed, late + DEFER_SLOW_RETRY_MS))
+            .await
+            .unwrap();
+        assert_eq!(back.claims.len(), 1);
+        assert!(ledger.deferred().await.unwrap()[id]["dormantSinceMs"].is_null());
+        resumed
+            .finish(&back.claims[0], deferred(), late + DEFER_SLOW_RETRY_MS)
+            .await
+            .unwrap();
+
+        // Away for the whole window, counted from when it first went, it
+        // is forgotten whichever process is looking.
+        engine
+            .tick(pass(&removed, start + 3 + DORMANT_MAX_MS))
+            .await
+            .unwrap();
+        assert!(!engine.retains(id));
+    }
+
+    /// A condition read from GitHub holds only while that data is fresh, so
+    /// a pass between two retries may not produce the fire at all. The
+    /// retry keeps its count and its wait through that pass and the fire
+    /// still ends as failed; forgetting them there ran it forever. A fire
+    /// that stays away is forgotten and starts over if it ever returns.
+    #[tokio::test]
+    async fn a_retry_keeps_its_count_when_its_condition_flickers() {
+        let rules = [AutomationDef {
+            on: AutomationTrigger::WtMerged,
+            ..rule("tracker", 0.0)
+        }];
+        let rows = [AutomationRow {
+            local_merged: Some(true),
+            clean_candidate: true,
+            ..row()
+        }];
+        // The worktree is there; what showed it landed is not, this pass.
+        let unconfirmed = [row()];
+        let mut context = AutomationEvalContext::default();
+        context.actions.insert(
+            "tracker".into(),
+            wt_automations::ActionTraits {
+                shell: true,
+                retry_on_failure: true,
+                ..Default::default()
+            },
+        );
+        let requirements = BTreeMap::from([("test|worktree".into(), RequirementState::Ready)]);
+        let quiescence = BTreeMap::new();
+        let activity = RuntimeActivity::default();
+        let cancel = CancellationToken::new();
+        let launched = AutomationOutcome::Delivered {
+            slot: DeliverySlot::Headless,
+        };
+        let failed = RunEnd::ShellFailed { exit_code: 2 };
+        let pass = |rows, at| {
+            input(
+                &rules,
+                rows,
+                &context,
+                &requirements,
+                &quiescence,
+                &activity,
+                at,
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let mut at = now_ms();
+        let queued_at = at;
+        let first = engine.tick(pass(&rows, at)).await.unwrap();
+        let claim = first.claims.first().unwrap().clone();
+        let keys = claim.fire().fire_keys.clone();
+        engine.finish(&claim, launched.clone(), at).await.unwrap();
+        for (attempt, delay) in RUN_RETRY_DELAYS_MS.into_iter().enumerate() {
+            let report = engine
+                .run_ended(&keys, at, failed, at + 1, &cancel)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.runs as usize, attempt + 1, "the count started over");
+            assert_eq!(report.retry_in_ms, Some(delay));
+            // One pass does not produce the fire: it leaves the queue but
+            // is not forgotten, here or in the ledger.
+            let gone = engine.tick(pass(&unconfirmed, at + 2)).await.unwrap();
+            assert!(gone.claims.is_empty() && engine.queued().is_empty());
+            assert!(engine.retains("test|worktree"));
+            assert_eq!(ledger.deferred().await.unwrap().len(), 1);
+            // Back again, it waits out the rest of its backoff.
+            let early = engine.tick(pass(&rows, at + 3)).await.unwrap();
+            assert!(early.claims.is_empty(), "the retry ran before its time");
+            let waiting = engine.queued().remove(0);
+            assert!(waiting.waiting_for.contains("after exit 2"), "{waiting:?}");
+            assert_eq!(waiting.queued_at_ms, queued_at);
+            at += 1 + delay;
+            let tick = engine.tick(pass(&rows, at)).await.unwrap();
+            let claim = tick.claims.first().unwrap().clone();
+            engine.finish(&claim, launched.clone(), at).await.unwrap();
+        }
+        let last = engine
+            .run_ended(&keys, at, failed, at + 1, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.retry_in_ms, None);
+        assert_eq!(last.runs as usize, RUN_RETRY_DELAYS_MS.len() + 1);
+        // Ended failed: the same landing never fires again, however often
+        // its condition goes and returns.
+        for step in [2, 3, 4] {
+            let rows: &[AutomationRow] = if step == 3 { &unconfirmed } else { &rows };
+            let tick = engine.tick(pass(rows, at + step)).await.unwrap();
+            assert!(tick.claims.is_empty());
+            assert_eq!(engine.pending_count(), 0);
+        }
+        assert!(ledger.deferred().await.unwrap().is_empty());
+
+        // A fire that stays away is forgotten, once, and starts over.
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = AutomationLedger::new(dir.path().join("automations.json"));
+        let mut engine = AutomationEngine::new(ledger.clone(), CancellationToken::new());
+        let first = engine.tick(pass(&rows, at)).await.unwrap();
+        let claim = first.claims.first().unwrap().clone();
+        engine.finish(&claim, launched.clone(), at).await.unwrap();
+        engine
+            .run_ended(&keys, at, failed, at + 1, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        engine.tick(pass(&unconfirmed, at + 2)).await.unwrap();
+        engine
+            .tick(pass(&unconfirmed, at + 2 + DORMANT_MAX_MS))
+            .await
+            .unwrap();
+        assert!(engine.retains("test|worktree"), "forgotten before its time");
+        engine
+            .tick(pass(&unconfirmed, at + 3 + DORMANT_MAX_MS))
+            .await
+            .unwrap();
+        assert!(!engine.retains("test|worktree"));
+        assert!(ledger.deferred().await.unwrap().is_empty());
+        at += 4 + DORMANT_MAX_MS;
+        let again = engine.tick(pass(&rows, at)).await.unwrap();
+        let claim = again.claims.first().unwrap().clone();
+        engine.finish(&claim, launched, at).await.unwrap();
+        let report = engine
+            .run_ended(&keys, at, failed, at + 1, &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.runs, 1);
     }
 
     /// Without `retry_on_failure` a non-zero exit ends the fire as failed

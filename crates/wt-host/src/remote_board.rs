@@ -93,6 +93,16 @@ type ComposedHost<'a> = (
     Option<Arc<wt_ops::managed::ManagedStatus>>,
 );
 
+/// What the controller stores of a remote row's placement.
+const REMOTE_LAYOUT: [&str; 6] = [
+    "section",
+    "order",
+    "creationAfter",
+    "creationSlot",
+    "creationAs",
+    "unitIdentity",
+];
+
 /// The fleet board carries the local board's provenance; each remote's
 /// provenance goes to `Board.host_domains`, keyed by the rows' `host`.
 fn compose(
@@ -123,6 +133,20 @@ fn compose(
     }
     if !state["slugs"].is_object() {
         state["slugs"] = serde_json::json!({});
+    }
+    // A remote row's placement outlives the host listing it. A row created
+    // after it is still drawn by where it was.
+    let placements = state["remoteLayouts"].as_object().cloned();
+    for (key, layout) in placements.into_iter().flatten() {
+        if !state["slugs"][&key].is_object() {
+            let mut entry = serde_json::json!({});
+            for field in REMOTE_LAYOUT {
+                if let Some(value) = layout.get(field) {
+                    entry[field] = value.clone();
+                }
+            }
+            state["slugs"][&key] = entry;
+        }
     }
     board.attention_seen_ms = state["attentionSeenTs"].as_u64().unwrap_or_default();
     let archived = metadata.data().map(|m| &m.1);
@@ -218,7 +242,7 @@ fn compose(
                     *entry = serde_json::json!({});
                 }
                 if let Some(layout) = layout {
-                    for field in ["section", "order", "creationAfter", "creationSlot"] {
+                    for field in REMOTE_LAYOUT {
                         if let Some(value) = layout.get(field) {
                             entry[field] = value.clone();
                         }

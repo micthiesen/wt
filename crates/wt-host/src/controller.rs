@@ -8,7 +8,7 @@ use std::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wt_app_core::host_errors::{Notice, error_reply};
-use wt_app_core::lanes::{Admission, Lane, cleanup_lane, lane_for, lanes_conflict};
+use wt_app_core::lanes::{Admission, Lane, cleanup_lane, lane_on_board, lanes_conflict};
 use wt_runtime::TaskScope;
 use wt_tui::{ActionController, UiReply};
 
@@ -117,7 +117,7 @@ pub fn start(
                 let hold = busy.insert(lane.clone());
                 // A remote host's worker schedules the planning of its own
                 // removals; here the request only waits for that worker.
-                if matches!(lane, Lane::Removal(Some(_), _)) {
+                if remote_only(&lane) {
                     hold.durable();
                 }
                 let operation_cancellation = command
@@ -138,7 +138,7 @@ pub fn start(
                     (log_context.operation.clone(), log_context.target.clone(), log_context.pr);
                 let task = running.spawn(async move {
                     let retry = create_retry(&command);
-                    let request_replies = RequestReplies { sender: replies, id, generation };
+                    let request_replies = RequestReplies::new(replies, id, generation);
                     let execution = crate::host_dispatch::execute(
                         &context,
                         &fleet,
@@ -155,7 +155,7 @@ pub fn start(
                     let mut reply = action_reply_with_context(result, retry, Some(&log_context));
                     reply.ui_generation = Some(generation);
                     reply.operation_id = Some(id);
-                    (lane, reply, cancelled)
+                    (lane, reply, cancelled, request_replies.handoff_started())
                 });
                 task_lanes.insert(task.id(), RunningAction {
                     lane: task_lane,
@@ -192,7 +192,7 @@ pub fn start(
                     });
                 },
                 finished = running.join_next_with_id(), if !running.is_empty() => match finished {
-                    Some(Ok((id, (lane, reply, cancelled)))) => {
+                    Some(Ok((id, (lane, reply, cancelled, handoff_started)))) => {
                         let active = task_lanes.remove(&id);
                         if let Some(active) = &active {
                             if reply.failed || reply.outcome == Some(wt_tui::ReplyOutcome::Uncertain) {
@@ -210,8 +210,12 @@ pub fn start(
                                 active.request_id,
                                 &active.name,
                                 &active.lane,
-                                active.admitted.saturating_duration_since(active.started),
-                                active.admitted.elapsed(),
+                                RequestTimes {
+                                    queued: active.admitted.saturating_duration_since(active.started),
+                                    run: active.admitted.elapsed(),
+                                    prepared: handoff_started
+                                        .map(|at| at.saturating_duration_since(active.started)),
+                                },
                                 request_outcome(&reply, cancelled),
                                 active.background,
                             );
@@ -244,8 +248,11 @@ pub fn start(
                                 active.request_id,
                                 &active.name,
                                 &active.lane,
-                                active.admitted.saturating_duration_since(active.started),
-                                active.admitted.elapsed(),
+                                RequestTimes {
+                                    queued: active.admitted.saturating_duration_since(active.started),
+                                    run: active.admitted.elapsed(),
+                                    prepared: None,
+                                },
                                 request_outcome(&reply, false),
                                 active.background,
                             );
@@ -281,12 +288,14 @@ pub fn start(
                         if task_lanes.is_empty() && pending.is_empty() {
                             progress_tick.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(3));
                         }
-                        enqueue(&mut pending, &failed_lanes, &port.replies, command, false).await;
+                        let board = fleet.board.snapshot();
+                        let board = board.data().map(|board| board.as_ref());
+                        enqueue(&mut pending, &failed_lanes, &port.replies, command, false, board).await;
                     },
                     None => closed = true,
                 },
                 command = port.background.recv(), if !closed && !background_closed && queued_background < QUEUED_BACKGROUND => match command {
-                    Some(command) => enqueue(&mut pending, &failed_lanes, &port.replies, command, true).await,
+                    Some(command) => enqueue(&mut pending, &failed_lanes, &port.replies, command, true, None).await,
                     None => background_closed = true,
                 },
                 _ = &mut progress_tick, if !task_lanes.is_empty() || !pending.is_empty() => {
@@ -329,6 +338,18 @@ pub fn start(
     }
 }
 
+/// A removal, or a cleanup, whose every checkout is on a remote host. The
+/// worker there narrows its own hold; this controller only waits for it.
+fn remote_only(lane: &Lane) -> bool {
+    match lane {
+        Lane::Removal(host, _) => host.is_some(),
+        Lane::FleetCleanup(targets) => {
+            !targets.is_empty() && targets.iter().all(|(host, _)| host.is_some())
+        }
+        _ => false,
+    }
+}
+
 /// Queue a request in its lane, or answer at once why it cannot run.
 async fn enqueue(
     pending: &mut VecDeque<(Lane, Queued)>,
@@ -336,8 +357,9 @@ async fn enqueue(
     replies: &tokio::sync::mpsc::Sender<UiReply>,
     request: wt_tui::UiRequest,
     background: bool,
+    board: Option<&wt_tui::Board>,
 ) {
-    let refusal = match lane_for(&request.action) {
+    let refusal = match lane_on_board(&request.action, board) {
         Ok(lane) if !lane_failed(&lane, failed_lanes) => {
             // A newer identical prefetch replaces a queued one.
             if matches!(lane, Lane::Prefetch(_)) {
@@ -420,6 +442,7 @@ fn lane_kind(lane: &Lane) -> &'static str {
         Lane::HostControl(_) => "host-control",
         Lane::Target(_, _) => "target",
         Lane::Action(_, _) => "action",
+        Lane::Stack(_, _) => "stack",
         Lane::SessionControl(_, _) => "session-control",
         Lane::Creation(_) => "creation",
         Lane::Removal(_, _) => "removal",
@@ -448,6 +471,18 @@ fn request_outcome(reply: &UiReply, cancelled: bool) -> &'static str {
     }
 }
 
+/// Where a request's time went.
+struct RequestTimes {
+    /// Accepted to admitted: the wait for its lane.
+    queued: Duration,
+    /// Admitted to answered. For a request that hands the terminal over this
+    /// includes the whole time the person stayed in the session.
+    run: Duration,
+    /// Accepted to the terminal handoff, for a request that made one: the
+    /// wait the person felt before the session appeared.
+    prepared: Option<Duration>,
+}
+
 /// A background read slower than this is logged like a user's request.
 const SLOW_BACKGROUND: Duration = Duration::from_secs(1);
 
@@ -459,11 +494,17 @@ fn log_request(
     id: u64,
     operation: &str,
     lane: &Lane,
-    queued: Duration,
-    run: Duration,
+    times: RequestTimes,
     outcome: &'static str,
     background: bool,
 ) {
+    let RequestTimes {
+        queued,
+        run,
+        prepared,
+    } = times;
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let prepared_ms = prepared.map(millis);
     let host = match lane {
         Lane::FleetCleanup(_) => "fleet",
         lane => match lane_host(lane) {
@@ -472,8 +513,8 @@ fn log_request(
         },
     };
     let lane = lane_kind(lane);
-    let queued_ms = u64::try_from(queued.as_millis()).unwrap_or(u64::MAX);
-    let run_ms = u64::try_from(run.as_millis()).unwrap_or(u64::MAX);
+    let queued_ms = millis(queued);
+    let run_ms = millis(run);
     let routine =
         background && !matches!(outcome, "failed" | "uncertain") && queued + run <= SLOW_BACKGROUND;
     if routine {
@@ -484,6 +525,7 @@ fn log_request(
             host,
             queued_ms,
             run_ms,
+            prepared_ms,
             outcome,
             "controller request"
         );
@@ -495,6 +537,7 @@ fn log_request(
             host,
             queued_ms,
             run_ms,
+            prepared_ms,
             outcome,
             "controller request"
         );
@@ -507,8 +550,11 @@ fn log_unstarted(lane: &Lane, queued: &Queued, outcome: &'static str) {
         queued.request.id,
         &action_name(&queued.request.action),
         lane,
-        queued.accepted_at.elapsed(),
-        Duration::ZERO,
+        RequestTimes {
+            queued: queued.accepted_at.elapsed(),
+            run: Duration::ZERO,
+            prepared: None,
+        },
         outcome,
         queued.background,
     );
@@ -748,6 +794,7 @@ fn lane_host(lane: &Lane) -> &str {
         | Lane::HostControl(Some(host))
         | Lane::Target(Some(host), _)
         | Lane::Action(Some(host), _)
+        | Lane::Stack(Some(host), _)
         | Lane::SessionControl(Some(host), _)
         | Lane::Creation(Some(host))
         | Lane::Removal(Some(host), _)
@@ -759,6 +806,7 @@ fn lane_host(lane: &Lane) -> &str {
         | Lane::HostControl(None)
         | Lane::Target(None, _)
         | Lane::Action(None, _)
+        | Lane::Stack(None, _)
         | Lane::SessionControl(None, _)
         | Lane::Creation(None)
         | Lane::Removal(None, _)
@@ -1068,9 +1116,26 @@ pub struct RequestReplies {
     sender: tokio::sync::mpsc::Sender<UiReply>,
     id: u64,
     generation: u64,
+    /// When the request first offered the terminal to a session.
+    handoff_started: std::sync::OnceLock<Instant>,
 }
 
 impl RequestReplies {
+    fn new(sender: tokio::sync::mpsc::Sender<UiReply>, id: u64, generation: u64) -> Self {
+        Self {
+            sender,
+            id,
+            generation,
+            handoff_started: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// When the request's preparation ended and it handed the terminal
+    /// over. What follows is the person's time in the session, not a wait.
+    fn handoff_started(&self) -> Option<Instant> {
+        self.handoff_started.get().copied()
+    }
+
     /// A creation cannot enter inventory until its optimistic row has the
     /// exact key. No acknowledgement means no checkout mutation is sent.
     pub async fn prepare_creation(
@@ -1102,6 +1167,9 @@ impl RequestReplies {
 
     pub async fn send(&self, mut reply: UiReply) -> Result<()> {
         reply.ui_generation = Some(self.generation);
+        if reply.handoff.is_some() {
+            let _ = self.handoff_started.set(Instant::now());
+        }
         if reply.handoff.is_some()
             || reply.creation_prepared.is_some()
             || reply.creation_placement.is_some()
@@ -1256,6 +1324,7 @@ async fn forward_attach_stderr(
 mod tests {
     use super::*;
     use wt_app_core::host_errors::notice;
+    use wt_app_core::lanes::lane_for;
 
     #[tokio::test]
     async fn cancelled_preparations_complete_as_no_change_without_failure() {
@@ -1390,11 +1459,7 @@ mod tests {
     async fn creation_waits_for_exact_identity_presentation_before_permission_to_mutate() {
         for acknowledge in [false, true] {
             let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-            let replies = RequestReplies {
-                sender,
-                id: 71,
-                generation: 8,
-            };
+            let replies = RequestReplies::new(sender, 71, 8);
             let shutdown = CancellationToken::new();
             let worker = tokio::spawn(async move {
                 replies
@@ -1423,11 +1488,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_cancels_creation_waiting_for_identity_acknowledgement() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-        let replies = RequestReplies {
-            sender,
-            id: 72,
-            generation: 8,
-        };
+        let replies = RequestReplies::new(sender, 72, 8);
         let shutdown = CancellationToken::new();
         let cancel = shutdown.clone();
         let worker = tokio::spawn(async move {
@@ -1474,11 +1535,7 @@ mod tests {
                     ],
                     cwd: std::env::temp_dir(),
                 },
-                &RequestReplies {
-                    sender: replies,
-                    id: 42,
-                    generation: 7,
-                },
+                &RequestReplies::new(replies, 42, 7),
                 &CancellationToken::new(),
             )
             .await
@@ -1514,11 +1571,7 @@ mod tests {
                     ],
                     cwd: std::env::temp_dir(),
                 },
-                &RequestReplies {
-                    sender: replies,
-                    id: 1,
-                    generation: 7,
-                },
+                &RequestReplies::new(replies, 1, 7),
                 &CancellationToken::new(),
             )
             .await
@@ -1533,6 +1586,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_request_records_its_preparation_apart_from_the_time_attached() {
+        let accepted = Instant::now();
+        let (sender, mut received) = tokio::sync::mpsc::channel(4);
+        let replies = Arc::new(RequestReplies::new(sender, 9, 1));
+        // Preparation: resolving the target, starting the session. A notice
+        // sent meanwhile is not the handoff.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        replies.send(UiReply::message("Connecting…")).await.unwrap();
+        assert!(replies.handoff_started().is_none());
+        let session = tokio::spawn({
+            let replies = replies.clone();
+            async move {
+                handoff_prepared(
+                    wt_app_core::harness::PreparedSession {
+                        program: "sleep".into(),
+                        args: vec!["1".into()],
+                        cwd: std::env::temp_dir(),
+                    },
+                    &replies,
+                    &CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        let handoff = loop {
+            if let Some(handoff) = received.recv().await.unwrap().handoff {
+                break handoff;
+            }
+        };
+        handoff.ready.send(()).unwrap();
+        handoff.resumed.await.unwrap().unwrap();
+        session.await.unwrap().unwrap();
+        let run = accepted.elapsed();
+        let prepared = replies
+            .handoff_started()
+            .expect("the handoff was stamped")
+            .saturating_duration_since(accepted);
+        assert!(prepared >= Duration::from_millis(80), "{prepared:?}");
+        // The second the person sat in the session is not preparation.
+        assert!(
+            run - prepared >= Duration::from_millis(900),
+            "{prepared:?} of {run:?}"
+        );
+
+        let (logging, output) = capture_logs();
+        log_request(
+            9,
+            "open session",
+            &Lane::Terminal(None, Some("row".into())),
+            RequestTimes {
+                queued: Duration::ZERO,
+                run,
+                prepared: Some(prepared),
+            },
+            "ok",
+            false,
+        );
+        drop(logging);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let record: serde_json::Value = serde_json::from_str(logs.trim()).unwrap();
+        let fields = &record["fields"];
+        assert_eq!(fields["prepared_ms"], prepared.as_millis() as u64);
+        assert!(
+            fields["run_ms"].as_u64().unwrap() >= fields["prepared_ms"].as_u64().unwrap() + 900
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_during_handoff_is_a_no_change_not_an_attach_failure() {
         let (replies, mut received) = tokio::sync::mpsc::channel(1);
         let shutdown = CancellationToken::new();
@@ -1544,11 +1665,7 @@ mod tests {
                     args: vec!["-c".into(), "exit 9".into()],
                     cwd: std::env::temp_dir(),
                 },
-                &RequestReplies {
-                    sender: replies,
-                    id: 3,
-                    generation: 4,
-                },
+                &RequestReplies::new(replies, 3, 4),
                 &worker_shutdown,
             )
             .await
@@ -1729,8 +1846,11 @@ mod tests {
             1,
             "remove worktree",
             &Lane::Removal(Some("builder".into()), "row".into()),
-            Duration::from_millis(1500),
-            Duration::from_millis(20),
+            RequestTimes {
+                queued: Duration::from_millis(1500),
+                run: Duration::from_millis(20),
+                prepared: None,
+            },
             "ok",
             false,
         );
@@ -1738,8 +1858,11 @@ mod tests {
             2,
             "clean worktrees",
             &cleanup([(None, "a"), (Some("builder".into()), "b")]),
-            Duration::ZERO,
-            Duration::ZERO,
+            RequestTimes {
+                queued: Duration::ZERO,
+                run: Duration::ZERO,
+                prepared: None,
+            },
             "failed",
             false,
         );
@@ -1758,8 +1881,11 @@ mod tests {
                 id,
                 "prefetch action palette",
                 &prefetch,
-                quick,
-                run,
+                RequestTimes {
+                    queued: quick,
+                    run,
+                    prepared: None,
+                },
                 outcome,
                 true,
             );
@@ -1783,6 +1909,7 @@ mod tests {
         assert_eq!(fields["lane"], "removal");
         assert_eq!(fields["queued_ms"], 1500);
         assert_eq!(fields["run_ms"], 20);
+        assert!(fields.get("prepared_ms").is_none(), "{fields}");
         assert_eq!(records[1]["fields"]["host"], "fleet");
         assert_eq!(records[1]["fields"]["lane"], "cleanup");
     }

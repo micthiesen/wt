@@ -1,7 +1,8 @@
 //! One conservative pass over what wt leaves behind and nothing else
 //! removes: installed versions, finished action runs, dev-server state,
-//! inspector sockets and session logs of worktrees that are gone, and, when
-//! asked, the slug records of worktrees removed long ago.
+//! inspector sockets and session logs of worktrees that are gone, the files
+//! of removed checkouts whose removal never deleted them, and, when asked,
+//! the slug records of worktrees removed long ago.
 //!
 //! Every rule needs proof that nothing still owns the file. Where the proof
 //! cannot be had (the worktree list, tmux or the process list could not be
@@ -78,6 +79,12 @@ pub struct Leftovers {
     pub dev_files: Vec<PathBuf>,
     pub sockets: Vec<PathBuf>,
     pub session_logs: Vec<PathBuf>,
+    /// Removed checkouts this pass deleted itself: ones a removal moved
+    /// aside and never deleted. Empty in a wt binary, which hands them to a
+    /// worker process that logs what it deletes. Never found by a survey:
+    /// telling an abandoned one from one whose worker is alive means taking
+    /// its lock.
+    pub quarantines: Vec<PathBuf>,
     pub slug_records: Vec<String>,
     pub unknown: Vec<&'static str>,
     /// Checks whose first-due time a pass read back from history. Not a
@@ -92,6 +99,7 @@ impl Leftovers {
             && self.dev_files.is_empty()
             && self.sockets.is_empty()
             && self.session_logs.is_empty()
+            && self.quarantines.is_empty()
             && self.slug_records.is_empty()
     }
 
@@ -108,6 +116,11 @@ impl Leftovers {
             (self.dev_files.len(), "dev-server file", "dev-server files"),
             (self.sockets.len(), "inspector socket", "inspector sockets"),
             (self.session_logs.len(), "session log", "session logs"),
+            (
+                self.quarantines.len(),
+                "removed checkout",
+                "removed checkouts",
+            ),
             (self.slug_records.len(), "slug record", "slug records"),
         ]
         .into_iter()
@@ -590,6 +603,48 @@ fn sweep_files(ctx: &AppContext, alive: &Alive, now: SystemTime) -> Leftovers {
     found
 }
 
+/// Whether a removed checkout still sits in the worktree root.
+fn quarantine_left(ctx: &AppContext) -> bool {
+    fs::read_dir(&ctx.config.paths.worktree_root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| wt_vcs::GitRepository::is_removal_quarantine(&entry.file_name()))
+}
+
+/// Delete the removed checkouts no worker is going to delete: a removal
+/// moves a checkout aside and deletes it afterwards, and a worker killed in
+/// between leaves it for the next removal, which may never come.
+///
+/// Runs after the pass has released its lock. Each checkout is guarded by
+/// its own lock, and deleting several large ones takes minutes, during
+/// which an asked pass would otherwise be told another is running. For the
+/// same reason a wt binary hands them to a worker process and returns at
+/// once; whatever a failed start leaves, the next pass or removal takes up.
+/// Returns what was deleted here, which is nothing when a worker has them.
+async fn sweep_quarantines(ctx: &AppContext) -> Vec<PathBuf> {
+    let found = tokio::task::spawn_blocking({
+        let ctx = ctx.clone();
+        move || quarantine_left(&ctx)
+    })
+    .await
+    .unwrap_or(false);
+    if !found {
+        return Vec::new();
+    }
+    match crate::lifecycle_ops::start_quarantine_worker(ctx) {
+        Some(Ok(())) => {
+            tracing::info!(target: "wt::maintenance", "handed removed checkouts to a worker to delete");
+            Vec::new()
+        }
+        Some(Err(error)) => {
+            tracing::warn!(target: "wt::maintenance", %error, "could not start the worker that deletes removed checkouts");
+            Vec::new()
+        }
+        None => crate::lifecycle_ops::delete_abandoned_quarantines(ctx).await,
+    }
+}
+
 async fn sweep(ctx: &AppContext, install: Option<&InstallPaths>, scope: Scope) -> Leftovers {
     let now = SystemTime::now();
     let alive = alive(ctx, install).await;
@@ -735,8 +790,12 @@ pub async fn run(
     install: Option<&InstallPaths>,
     scope: Scope,
 ) -> Option<Leftovers> {
-    let _lock = pass_lock(ctx).await?;
-    Some(locked_pass(ctx, install, scope).await)
+    let mut gone = {
+        let _lock = pass_lock(ctx).await?;
+        locked_pass(ctx, install, scope).await
+    };
+    gone.quarantines = sweep_quarantines(ctx).await;
+    Some(gone)
 }
 
 /// The daily pass, unless it is switched off or one ran for this repository
@@ -747,12 +806,16 @@ pub async fn sweep_if_due(ctx: &AppContext, install: Option<&InstallPaths>) -> O
     if !ctx.config.maintenance.enabled || !stamp_due(&stamp, SystemTime::now()) {
         return None;
     }
-    let _lock = pass_lock(ctx).await?;
-    // Two processes started together both found it due.
-    if !stamp_due(&stamp, SystemTime::now()) {
-        return None;
-    }
-    Some(locked_pass(ctx, install, Scope::daily(ctx)).await)
+    let mut gone = {
+        let _lock = pass_lock(ctx).await?;
+        // Two processes started together both found it due.
+        if !stamp_due(&stamp, SystemTime::now()) {
+            return None;
+        }
+        locked_pass(ctx, install, Scope::daily(ctx)).await
+    };
+    gone.quarantines = sweep_quarantines(ctx).await;
+    Some(gone)
 }
 
 /// Keep the pass running once a day until `stop`. The first check waits
@@ -1195,6 +1258,77 @@ mod tests {
         let held = pass_lock(ctx).await.unwrap();
         assert!(sweep_if_due(&another, None).await.is_some());
         drop(held);
+        fixture.close().await.unwrap();
+    }
+
+    /// A removal's worker killed before it deleted the checkout it had
+    /// moved aside leaves the files for a later removal. The daily pass
+    /// deletes them when none comes, and leaves alone a checkout whose
+    /// worker is still alive, which holds a lock on the directory itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_pass_deletes_removed_checkouts_no_worker_holds() {
+        use std::os::fd::AsRawFd;
+        let fixture = CommandFixture::new().await.unwrap();
+        let ctx = &fixture.ctx;
+        let root = &ctx.config.paths.worktree_root;
+        let staged = |name: &str| {
+            let path = root.join(format!(
+                "{}{name}",
+                wt_vcs::GitRepository::REMOVAL_QUARANTINE_PREFIX
+            ));
+            fs::create_dir_all(path.join("node_modules/pkg")).unwrap();
+            fs::write(path.join("node_modules/pkg/index.js"), "left behind").unwrap();
+            path
+        };
+        // Deletions are reported by canonical path.
+        let abandoned = fs::canonicalize(staged("gone-1a2b")).unwrap();
+        let held = fs::canonicalize(staged("busy-3c4d")).unwrap();
+        let owner = fs::File::open(&held).unwrap();
+        // SAFETY: the descriptor is open for the duration of the call.
+        assert_eq!(
+            unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let locks_before = files_in(&ctx.config.paths.lock_dir);
+
+        // Switched off, the daily pass does nothing at all.
+        let mut off = (*ctx.config).clone();
+        off.maintenance.enabled = false;
+        let mut switched_off = ctx.clone();
+        switched_off.config = std::sync::Arc::new(off);
+        assert!(sweep_if_due(&switched_off, None).await.is_none());
+        assert!(abandoned.exists());
+
+        let gone = sweep_if_due(ctx, None).await.unwrap();
+        assert_eq!(gone.quarantines, std::slice::from_ref(&abandoned));
+        assert!(gone.counts().contains(&"1 removed checkout".to_owned()));
+        assert!(!abandoned.exists());
+        assert!(
+            held.join("node_modules/pkg/index.js").exists(),
+            "a checkout its worker still holds was deleted"
+        );
+        let locks_after = files_in(&ctx.config.paths.lock_dir);
+        assert!(
+            locks_before.iter().all(|lock| locks_after.contains(lock)),
+            "the pass removed a lock file"
+        );
+        // The worktrees themselves are untouched.
+        assert!(root.join("one").is_dir() && root.join("two").is_dir());
+
+        // The held one is still there, and a pass that deleted nothing
+        // reports nothing.
+        let gone = run(ctx, None, Scope::daily(ctx)).await.unwrap();
+        assert_eq!(gone.quarantines, Vec::<PathBuf>::new());
+
+        // Once its worker is gone, the next pass takes it. The deletion
+        // runs with the pass's lock released: a pass asked for meanwhile
+        // is not told another one is running.
+        drop(owner);
+        let lock = pass_lock(ctx).await.expect("the lock is free");
+        assert_eq!(sweep_quarantines(ctx).await, std::slice::from_ref(&held));
+        drop(lock);
+        assert!(!held.exists());
         fixture.close().await.unwrap();
     }
 

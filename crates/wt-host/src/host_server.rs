@@ -230,7 +230,10 @@ where
                             Err(anyhow::anyhow!("controller-owned action cannot run on the worker"))
                         } else if queued.len() >= 32 {
                             Err(anyhow::anyhow!("worker command queue is full; command was not started"))
-                        } else { wt_app_core::lanes::lane_for(&action) };
+                        } else {
+                            let board = host.sources.board.snapshot();
+                            wt_app_core::lanes::lane_on_board(&action, board.data().map(|board| board.as_ref()))
+                        };
                         match lane {
                             Ok(lane) => queued.push_back((lane, (id, action))),
                             Err(error) => { send_reply(&replies, &disconnected, id, UiReply::failure(format!("{error:#}"))).await; },

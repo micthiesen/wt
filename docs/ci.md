@@ -23,7 +23,7 @@ label and a pin would restore artifacts built on the newer image.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `release.yml` (Native release) | push to `main`, push of a `v*` or `rust-test-*` tag, manual dispatch | Calls `rust-ci.yml` for lint, unit and native checks. Only for a tag or a dispatch does it also build the three release packages and publish. |
+| `release.yml` (Native release) | push to `main`, push of a `v*` or `rust-test-*` tag, manual dispatch | Calls `rust-ci.yml` for lint, unit and native checks. Only for a tag or a dispatch does it also build the three release packages, write the release notes from every commit since the previous stable tag (its publish job checks out full history for that), and publish. |
 | `rust-ci.yml` (Rust CI) | called by `release.yml`, pull requests | `lint`, `test` and `native` on Linux and macOS. |
 | `release-cache.yml` (Release cache) | push to `main` | Compiles the release binaries only to keep `main`'s optimized cache warm for tags. |
 | `ci-rerun.yml` | completion of Native release or Release cache on `main` | Reruns a first attempt that failed only through cancelled jobs (a runner that never arrived). CI failures are not posted to Discord. |

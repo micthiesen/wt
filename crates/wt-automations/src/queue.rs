@@ -255,7 +255,9 @@ pub fn queue_intents(input: QueueIntentsInput<'_>) -> Vec<AutomationIntent> {
     output.into_values().collect()
 }
 
-fn is_frozen_external_fire(fire: &AutomationFire) -> bool {
+/// A fire that touches no checkout and carries what it needs: it outlives
+/// its worktree.
+pub fn is_frozen_external_fire(fire: &AutomationFire) -> bool {
     fire.quiesce_slugs.is_empty()
         && (fire.close_issue.is_some()
             || fire.delete_branch.is_some()

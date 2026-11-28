@@ -554,8 +554,10 @@ fn spawn_discoveries(
             let has_work = !work.is_empty();
             if !has_work {
                 if force_refresh || !has_published || liveness_changed {
+                    // Discovery takes checkout paths from the listing, which
+                    // is read far more often than the least active row.
                     let (observed, state) = no_discovery_publication(
-                        worktrees.observed(),
+                        worktrees.listed(),
                         inv.observed(),
                         has_published.then(|| (discovered_at, discovery_state.clone())),
                     );

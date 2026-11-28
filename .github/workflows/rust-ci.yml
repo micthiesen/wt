@@ -56,6 +56,7 @@ jobs:
           python3 scripts/test-package-native.py
           python3 scripts/test-native-check.py
           python3 scripts/test-restore-mtimes.py
+          python3 scripts/test-release-notes.py
           python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
   # test and native share one debug cache per OS: both build the workspace

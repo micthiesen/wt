@@ -27,6 +27,11 @@ pub struct AutomationRow {
     /// The merge wt armed for this worktree's pull request and has not seen
     /// cancelled or ended.
     pub merge_arm: Option<wt_core::MergeArm>,
+    /// From a read of GitHub this process confirmed, never a restored
+    /// cache. While `AutomationEvalContext::github_fresh` is unset, only a
+    /// merged pull request is carried: a merge is final, nothing else is.
+    /// The caller carries one only for the work it merged: its head is the
+    /// checkout's, or the landing is proven without it.
     pub pr: Option<AutomationPr>,
     pub conflict: Option<AutomationConflict>,
     pub work: Option<WorkStatusRecord>,

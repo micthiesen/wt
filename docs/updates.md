@@ -134,8 +134,10 @@ To publish a stable release:
 1. Run `cargo xtask gate` and the native suite against the candidate.
 2. Bump `version` in the root `Cargo.toml`, run `cargo update -w`, and commit
    with the release notes as the message: `Release vX.Y.Z: <summary>`, then a
-   blank line and bullet points. The summary and bullets become the GitHub
-   release notes and the Discord #updates post (see [discord.md](discord.md)).
+   blank line and bullet points. The GitHub release notes and the Discord
+   #updates post are written from every commit since the previous release;
+   the summary and bullets are what they fall back to (see
+   [discord.md](discord.md)).
 3. Rebuild with `WT_BUILD_ID` set to the release commit SHA and run the native
    suite again; check its exit status rather than piping it.
 4. Push `main`, then push an annotated `vX.Y.Z` tag (message `wt vX.Y.Z`) on
@@ -215,6 +217,7 @@ cannot be read, the classes that depend on it are skipped, never guessed, and
 | Action runs (`<log dir>/actions/<run id>`) | finished, started over 30 days ago, not among the newest 500 runs, and no worker can be alive: the action worker lock of the run's worktree (`action-worker-<hash>`) is free, and so is an older build's per-run lock (`action-run-<run id>`). A run whose `meta.json` names no worktree is kept |
 | Dev-server files (`<cache root>/dev/<slug>.state`, `.state.attempts`, `.crash.log`) | the slug has no worktree and the file is 7 days old |
 | Inspector sockets and session logs (`<cache root>/insp/<session>.sock`, `sessions/<session>.err`) | no tmux session has that name, no worktree's slug starts it, and the file is 7 days old |
+| Removed checkouts (`.wt-removing-*` in the worktree root) | a removal moved the checkout aside and its worker died before deleting it. The pass does not delete these itself: when any remains, it starts a detached `wt _delete-removed-checkouts` worker after releasing the maintenance lock. The worker skips a directory whose removal worker is alive (that worker holds a lock on it), deletes at most two at a time machine-wide at low priority, and logs what it deleted under `wt::maintenance`. Under the same `[maintenance] enabled` switch; not in the pass's or `wt doctor`'s counts |
 | Slug records in the repository state | only by `wt doctor --prune`, or daily with `state_records = true`; see below |
 
 A repository without its own `.wt.toml` shares its cache root, tmux socket

@@ -188,6 +188,56 @@ pub(crate) fn normalize_state(value: Value) -> WtState {
     Value::Object(state)
 }
 
+/// Write the removal record of one accepted attempt into `state`. False,
+/// with nothing written, while another attempt for `key` is active.
+pub(crate) fn begin_removal_entry(
+    state: &mut WtState,
+    key: &str,
+    job_id: &str,
+    path: &str,
+    branch: &str,
+    landed: bool,
+    was_archived: bool,
+) -> bool {
+    let removals = object_mut(state, "removals");
+    if removals
+        .get(key)
+        .is_some_and(|entry| entry["error"].is_null())
+    {
+        return false;
+    }
+    let mut entry = removals
+        .get(key)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    // A retry of a failed attempt keeps where the board drew the row
+    // before the first one. That attempt archived the row itself, so
+    // the archive set no longer says where it was, and a row drawn
+    // as landed stays there whatever this attempt can prove. Read
+    // before this attempt writes its own job id into the entry.
+    let retried = entry.contains_key("jobId");
+    entry.insert("jobId".into(), json!(job_id));
+    entry.insert("path".into(), json!(path));
+    entry.insert("branch".into(), json!(branch));
+    let was_archived = if retried {
+        entry.get("wasArchived") == Some(&json!(true))
+    } else {
+        was_archived
+    };
+    let landed = landed || (retried && entry.get("landed") == Some(&json!(true)));
+    entry.insert("error".into(), Value::Null);
+    for (name, set) in [("landed", landed), ("wasArchived", was_archived)] {
+        if set {
+            entry.insert(name.into(), json!(true));
+        } else {
+            entry.remove(name);
+        }
+    }
+    removals.insert(key.into(), Value::Object(entry));
+    true
+}
+
 impl Store {
     /// Claim one accepted removal. A failed attempt can be replaced by a retry.
     pub fn begin_removal(
@@ -214,43 +264,8 @@ impl Store {
         was_archived: bool,
     ) -> Result<bool, StoreError> {
         self.mutate_wt_state(|state| {
-            let removals = object_mut(state, "removals");
-            if removals
-                .get(key)
-                .is_some_and(|entry| entry["error"].is_null())
-            {
-                return Ok((false, false));
-            }
-            let mut entry = removals
-                .get(key)
-                .and_then(Value::as_object)
-                .cloned()
-                .unwrap_or_default();
-            // A retry of a failed attempt keeps where the board drew the row
-            // before the first one. That attempt archived the row itself, so
-            // the archive set no longer says where it was, and a row drawn
-            // as landed stays there whatever this attempt can prove. Read
-            // before this attempt writes its own job id into the entry.
-            let retried = entry.contains_key("jobId");
-            entry.insert("jobId".into(), json!(job_id));
-            entry.insert("path".into(), json!(path));
-            entry.insert("branch".into(), json!(branch));
-            let was_archived = if retried {
-                entry.get("wasArchived") == Some(&json!(true))
-            } else {
-                was_archived
-            };
-            let landed = landed || (retried && entry.get("landed") == Some(&json!(true)));
-            entry.insert("error".into(), Value::Null);
-            for (name, set) in [("landed", landed), ("wasArchived", was_archived)] {
-                if set {
-                    entry.insert(name.into(), json!(true));
-                } else {
-                    entry.remove(name);
-                }
-            }
-            removals.insert(key.into(), Value::Object(entry));
-            Ok((true, true))
+            let begun = begin_removal_entry(state, key, job_id, path, branch, landed, was_archived);
+            Ok((begun, begun))
         })
     }
 
@@ -477,6 +492,7 @@ impl Store {
                 section.map_or(Value::Null, |s| json!(s)),
             );
             entry.insert("order".to_owned(), number(order));
+            entry.remove(UNIT_IDENTITY);
             object_mut(state, collection).insert(slug.to_owned(), Value::Object(entry));
             Ok(((), true))
         })
@@ -512,6 +528,7 @@ impl Store {
                 section.map_or(Value::Null, |s| json!(s)),
             );
             layout.insert("order".to_owned(), number(order));
+            layout.remove(UNIT_IDENTITY);
             object_mut(state, "remoteLayouts").insert(key.to_owned(), Value::Object(layout));
             Ok(((), true))
         })
@@ -919,6 +936,10 @@ impl Store {
                 write_sequence(state, from.name, &sequence);
             }
             restate_anchors(state, &staying);
+            // And one there may follow the place of a row that is gone,
+            // found by the orders just rewritten: each names the unit it is
+            // drawn behind, which the unit entering at the edge leaves so.
+            restate_anchors(state, &entering.iter().collect::<Vec<_>>());
             Ok((Ok(moved), true))
         })
     }
@@ -1431,6 +1452,8 @@ impl Store {
             let mut entry = slug_entry(state, slug);
             entry.remove("baseBranch");
             entry.remove("baseSha");
+            // Where it sorted in a stack that is not its stack any more.
+            entry.remove(UNIT_IDENTITY);
             if let Some((branch, sha)) = branch {
                 entry.insert("baseBranch".to_owned(), json!(branch));
                 if let Some(sha) = sha.filter(|sha| !sha.is_empty()) {
@@ -1475,6 +1498,7 @@ impl Store {
             }
             entry.insert("baseBranch".into(), json!(branch));
             entry.insert("baseSha".into(), json!(sha));
+            entry.remove(UNIT_IDENTITY);
             object_mut(state, "slugs").insert(slug.to_owned(), Value::Object(entry));
             Ok((BaseUpdate::Updated, true))
         })
@@ -1525,9 +1549,6 @@ impl Store {
                 })
                 .map(|(slug, _)| slug.clone())
                 .collect();
-            if affected.is_empty() {
-                return Ok((affected, false));
-            }
             let deleted_base = deleted_slug
                 .and_then(|slug| slugs.get(slug))
                 .and_then(|record| record.get("baseBranch"))
@@ -1535,6 +1556,12 @@ impl Store {
                 .filter(|base| *base != branch)
                 .unwrap_or(trunk)
                 .to_owned();
+            let placed = deleted_slug.is_some_and(|deleted| {
+                keep_places_of_stack(state, deleted, &deleted_base, &affected)
+            });
+            if affected.is_empty() {
+                return Ok((affected, placed));
+            }
             let records = object_mut(state, "slugs");
             for slug in &affected {
                 if let Some(entry) = records.get_mut(slug).and_then(Value::as_object_mut) {
@@ -2551,6 +2578,7 @@ pub(crate) fn move_to_section(
             section.map_or(Value::Null, |s| json!(s)),
         );
         layout.insert("order".to_owned(), number(order));
+        layout.remove(UNIT_IDENTITY);
         object_mut(state, collection).insert(key.clone(), Value::Object(layout));
         changed.push(key.clone());
     }
@@ -2675,6 +2703,7 @@ fn set_layout_order(state: &mut Value, key: &str, order: f64) {
         .cloned()
         .unwrap_or_default();
     entry.insert("order".to_owned(), number(order));
+    entry.remove(UNIT_IDENTITY);
     object_mut(state, collection).insert(key.to_owned(), Value::Object(entry));
 }
 
@@ -2862,54 +2891,303 @@ fn manual_order(
 /// row once that row has left their section.
 const CREATION_SLOT: &str = "creationSlot";
 
+/// The name a row at its creation position sorts by among the rows created
+/// after the same row, when it took the place of one that left.
+const CREATION_AS: &str = "creationAs";
+
+/// A unit identity longer than this is not extended: it starts again from
+/// the stack's first branch.
+const UNIT_IDENTITY_MAX: usize = 256;
+
+/// The stored placement of a row that has one. Indexing would create it.
+fn layout_mut<'a>(state: &'a mut Value, key: &str) -> Option<&'a mut Map<String, Value>> {
+    state
+        .get_mut(layout_collection(key))?
+        .get_mut(key)?
+        .as_object_mut()
+}
+
+/// What a removed stack root's unit sorted by among units never ordered,
+/// kept on its record so that the place it held can still be found.
+const UNIT_IDENTITY: &str = "unitIdentity";
+
 /// Call before `leaving` leaves its section or is forgotten. A row created
 /// from the board and never ordered is drawn behind the row it was created
 /// after. With that row gone it would be drawn first in the section, so
-/// each such row takes what says where the leaving row was: the row that
-/// one follows in turn, or its stored order, behind which the board then
-/// draws the follower.
+/// each such row takes what says where the leaving row was, and the board
+/// goes on drawing it behind that place.
 pub(crate) fn release_followers(state: &mut Value, leaving: &str) {
     let section = stored_section(state, leaving).map(str::to_owned);
     let left = state[layout_collection(leaving)][leaving].clone();
-    let followers: Vec<String> = ["slugs", "remoteLayouts"]
-        .into_iter()
-        .filter_map(|collection| Some((collection, state[collection].as_object()?)))
-        .flat_map(|(collection, layouts)| {
-            layouts
-                .iter()
-                .filter(move |(key, _)| layout_collection(key) == collection)
-        })
-        .filter(|(key, layout)| {
-            key.as_str() != leaving
-                && layout["creationAfter"].as_str() == Some(leaving)
-                && !layout["order"].is_number()
-        })
-        .map(|(key, _)| key.clone())
-        .filter(|key| stored_section(state, key).map(str::to_owned) == section)
-        .collect();
+    let followers = created_after(state, leaving, section.as_deref());
+    // A slot is one place and never holds another: a state that nested one
+    // per generation of rows created after each other would be written
+    // deeper than it can be read back.
+    let flat = |from: &Value, key: &str| {
+        let mut slot = json!({ "key": key, "order": from["order"].as_f64() });
+        // The status status sort drew it by, and what its unit sorted by.
+        for field in [UNIT_IDENTITY, "work"] {
+            if let Some(value) = from.get(field) {
+                slot[field] = value.clone();
+            }
+        }
+        slot
+    };
+    let anchored = !left["order"].is_number() && left.get("creationAfter").is_some();
     for follower in followers {
         let collection = layout_collection(&follower);
         let Some(mut entry) = state[collection][&follower].as_object().cloned() else {
             continue;
         };
-        if left["order"].is_number() || left.get("creationAfter").is_none() {
-            let mut slot = json!({ "order": left["order"].as_f64(), "key": leaving });
-            // The status too, which status sort drew the row by. A remote
-            // row's is its host's to know, and is not kept here.
-            if layout_collection(leaving) == "slugs" {
-                slot["work"] = left["work"].clone();
-            }
-            entry.insert(CREATION_SLOT.to_owned(), slot);
-        } else {
-            // The row that left was at its creation position itself.
+        if anchored {
+            // The row that left was at its creation position itself: this
+            // one is drawn in its place, behind what it followed and among
+            // the rows created after that one where it sorted.
             entry.insert("creationAfter".to_owned(), left["creationAfter"].clone());
-            match left.get(CREATION_SLOT) {
-                Some(slot) => entry.insert(CREATION_SLOT.to_owned(), slot.clone()),
+            match left.get(CREATION_SLOT).filter(|slot| slot.is_object()) {
+                Some(slot) => {
+                    let key = slot["key"].as_str().unwrap_or_default();
+                    entry.insert(CREATION_SLOT.to_owned(), flat(slot, key))
+                }
                 None => entry.remove(CREATION_SLOT),
             };
+            let sorted_as = left[CREATION_AS].as_str().unwrap_or(leaving);
+            entry.insert(CREATION_AS.to_owned(), json!(sorted_as));
+        } else {
+            // Drawn by its order and status, which a remote row's host
+            // knows and the controller does not. The slug may be given to a
+            // new worktree, which this row was not created after: it names
+            // no row any more, only where one was.
+            let mut slot = flat(&left, leaving);
+            if layout_collection(leaving) != "slugs" {
+                slot.as_object_mut().map(|slot| slot.remove("work"));
+            }
+            entry.insert("creationAfter".to_owned(), Value::Null);
+            entry.insert(CREATION_SLOT.to_owned(), slot);
+            entry.remove(CREATION_AS);
         }
         object_mut(state, collection).insert(follower, Value::Object(entry));
     }
+}
+
+/// The branch a slug's record names, which is the slug's own where none is
+/// recorded.
+fn recorded_branch<'a>(state: &'a Value, slug: &'a str) -> &'a str {
+    state["slugs"][slug][wt_core::RECORDED_BRANCH]
+        .as_str()
+        .unwrap_or(slug)
+}
+
+/// The rows of `section` at their creation position that were created after
+/// `key`, local and remote.
+fn created_after(state: &Value, key: &str, section: Option<&str>) -> Vec<String> {
+    ["slugs", "remoteLayouts"]
+        .into_iter()
+        .filter_map(|collection| Some((collection, state[collection].as_object()?)))
+        .flat_map(|(collection, layouts)| {
+            layouts
+                .iter()
+                .filter(move |(other, _)| layout_collection(other) == collection)
+        })
+        .filter(|(other, layout)| {
+            other.as_str() != key
+                && layout["creationAfter"].as_str() == Some(key)
+                && !layout["order"].is_number()
+                && stored_section(state, other) == section
+        })
+        .map(|(other, _)| other.clone())
+        .collect()
+}
+
+fn set_created_after(state: &mut Value, key: &str, after: &str) {
+    if let Some(layout) = layout_mut(state, key) {
+        layout.insert("creationAfter".to_owned(), json!(after));
+        layout.remove(CREATION_SLOT);
+        layout.remove(CREATION_AS);
+    }
+}
+
+/// A removed row's stack is redrawn without it: call before the rows
+/// stacked on it (`stacked`) are given its base, `base`. A section sorts and
+/// moves a stack filed in it as one unit, at the place of its first row,
+/// and a unit never ordered sorts by the first branch of its whole stack.
+///
+/// Removed from inside such a unit, the row leaves the unit where it is,
+/// and the rows created after the removed row follow the row it was stacked
+/// on. Removed as the first row, it leaves each row stacked on it a unit of
+/// its own. They take its place in the order they were drawn in, and what
+/// was created after any row of the unit stays behind all of them. Returns
+/// whether anything was written.
+fn keep_places_of_stack(state: &mut Value, removed: &str, base: &str, stacked: &[String]) -> bool {
+    let section = stored_section(state, removed).map(str::to_owned);
+    let section = section.as_deref();
+    let on_branch = |state: &Value, branch: &str| {
+        state["slugs"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(slug, _)| slug.as_str())
+            .find(|slug| *slug != removed && recorded_branch(state, slug) == branch)
+            .map(str::to_owned)
+    };
+    let set = |state: &mut Value, slug: &str, field: &str, value: Value| {
+        if let Some(record) = layout_mut(state, slug) {
+            record.insert(field.to_owned(), value);
+        }
+    };
+    let below = on_branch(state, base);
+    let following = created_after(state, removed, section);
+    if let Some(below) = below
+        .as_deref()
+        .filter(|below| stored_section(state, below) == section)
+    {
+        for follower in &following {
+            set_created_after(state, follower, below);
+        }
+        return !following.is_empty();
+    }
+    // What the removed row's unit sorted by: the first branch of its stack.
+    let was = match state["slugs"][removed][UNIT_IDENTITY].as_str() {
+        Some(kept) => kept.to_owned(),
+        None => {
+            let mut first = recorded_branch(state, removed).to_owned();
+            let mut under = below.clone();
+            // Bounded, so records that name each other end.
+            for _ in 0..state["slugs"].as_object().map_or(0, Map::len) {
+                let Some(slug) = under else { break };
+                first = recorded_branch(state, &slug).to_owned();
+                under = state["slugs"][&slug]["baseBranch"]
+                    .as_str()
+                    .and_then(|branch| on_branch(state, branch));
+            }
+            first
+        }
+    };
+    // Every row stacked, however deep, on the removed one, with its path
+    // from it: sorting by that keeps the rows in the order the board drew
+    // the stack in, children by branch, and where the stack sorted.
+    // A stack re-rooted over and over would grow it by a branch each time.
+    let from = if was.len() > UNIT_IDENTITY_MAX {
+        was.split('\0').next().unwrap_or_default()
+    } else {
+        was.as_str()
+    };
+    let mut paths: Vec<(String, String)> = stacked
+        .iter()
+        .map(|slug| {
+            let path = format!("{from}\0{}", recorded_branch(state, slug));
+            (slug.clone(), path)
+        })
+        .collect();
+    let mut above: Vec<(String, String)> = Vec::new();
+    while let Some((slug, path)) = paths.pop() {
+        if above.iter().any(|(known, _)| *known == slug) {
+            continue;
+        }
+        let branch = recorded_branch(state, &slug).to_owned();
+        for (other, record) in state["slugs"].as_object().into_iter().flatten() {
+            if other != removed && record["baseBranch"].as_str() == Some(&branch) {
+                let path = format!("{path}\0{}", recorded_branch(state, other));
+                paths.push((other.clone(), path));
+            }
+        }
+        above.push((slug, path));
+    }
+    let mut written = false;
+    // The first row of its whole stack: the rows left are stacks of their
+    // own now, and those never ordered would sort by their own branches,
+    // in whatever section they are filed.
+    for (slug, path) in &above {
+        if below.is_none() && !state["slugs"][slug]["order"].is_number() {
+            set(state, slug, UNIT_IDENTITY, json!(path));
+            written = true;
+        }
+    }
+    // The rows stacked on it in its section, as the board drew them, and
+    // the rest of what was its unit there.
+    let mut stacked: Vec<(&String, &String)> = above
+        .iter()
+        .filter(|(slug, _)| stacked.contains(slug) && stored_section(state, slug) == section)
+        .map(|(slug, path)| (slug, path))
+        .collect();
+    stacked.sort_by(|a, b| a.1.cmp(b.1));
+    if stacked.is_empty() {
+        if below.is_some() && !state["slugs"][removed]["order"].is_number() {
+            set(state, removed, UNIT_IDENTITY, json!(was));
+            written = true;
+        }
+        return written;
+    }
+    let in_unit = |state: &Value, slug: &str| {
+        let mut at = slug.to_owned();
+        for _ in 0..above.len() {
+            if stacked.iter().any(|(first, _)| **first == at) {
+                return true;
+            }
+            let Some(under) = state["slugs"][&at]["baseBranch"]
+                .as_str()
+                .and_then(|branch| on_branch(state, branch))
+                .filter(|under| stored_section(state, under) == section)
+            else {
+                return false;
+            };
+            at = under;
+        }
+        false
+    };
+    let unit: Vec<&String> = above
+        .iter()
+        .map(|(slug, _)| slug)
+        .filter(|slug| in_unit(state, slug))
+        .collect();
+    let mut following = following;
+    for row in &unit {
+        for follower in created_after(state, row, section) {
+            if !unit.contains(&&follower) && !following.contains(&follower) {
+                following.push(follower);
+            }
+        }
+    }
+    let order = state["slugs"][removed]["order"].clone();
+    let anchored = !order.is_number() && state["slugs"][removed].get("creationAfter").is_some();
+    if anchored {
+        // At its creation position: each follows the one before, the first
+        // where the removed row was, and what followed the unit the last.
+        let mut after = removed.to_owned();
+        for (slug, _) in &stacked {
+            set(state, slug, "order", Value::Null);
+            set_created_after(state, slug, &after);
+            after = (*slug).clone();
+        }
+        for follower in &following {
+            set_created_after(state, follower, &after);
+        }
+        set(state, removed, UNIT_IDENTITY, json!(was));
+    } else {
+        // Drawn by its order, or among the rows never ordered: each takes
+        // that, and sorts by its path right behind where the unit sorted.
+        // The removed row's place sorts behind them all, and what followed
+        // the unit goes on following that.
+        for (slug, path) in &stacked {
+            set(state, slug, "order", order.clone());
+            set(state, slug, UNIT_IDENTITY, json!(path));
+            if let Some(record) = layout_mut(state, slug) {
+                record.remove("creationAfter");
+                record.remove(CREATION_SLOT);
+                record.remove(CREATION_AS);
+            }
+        }
+        for follower in &following {
+            set_created_after(state, follower, removed);
+        }
+        set(
+            state,
+            removed,
+            UNIT_IDENTITY,
+            json!(format!("{was}\0\u{10ffff}")),
+        );
+    }
+    true
 }
 
 /// Store, for each unit drawn at its creation position, the unit it is
@@ -2929,6 +3207,7 @@ fn restate_anchors(state: &mut Value, drawn: &[&ShownUnit]) {
             .unwrap_or_default();
         entry.insert("creationAfter".to_owned(), after);
         entry.remove(CREATION_SLOT);
+        entry.remove(CREATION_AS);
         object_mut(state, collection).insert(unit.key.clone(), Value::Object(entry));
     }
 }
@@ -2990,6 +3269,7 @@ fn write_sequence(state: &mut Value, section: Option<&str>, sequence: &[String])
             section.map_or(Value::Null, |name| json!(name)),
         );
         entry.insert("order".to_owned(), number(baseline + index as f64));
+        entry.remove(UNIT_IDENTITY);
         object_mut(state, collection).insert(key.clone(), Value::Object(entry));
     }
 }

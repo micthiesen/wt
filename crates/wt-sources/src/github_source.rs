@@ -57,6 +57,27 @@ pub fn branch_key(branch: &str) -> String {
 
 const BRANCH_KEY: &str = "//branch/";
 
+/// The key that asks the lane for evidence no older than
+/// [`KEEP_FRESH_AFTER`]. Reserved like [`BRANCH_KEY`].
+const KEEP_FRESH_KEY: &str = "//fresh";
+
+/// The age of the shown read of every branch past which [`keep_fresh`]
+/// has GitHub read again. Automation acts only on evidence under 90
+/// seconds old (`automation_facts::GITHUB_FRESH_WITHIN`); this leaves the
+/// read its own time and the floor's.
+pub const KEEP_FRESH_AFTER: Duration = Duration::from_secs(60);
+
+/// Ask for GitHub evidence no older than [`KEEP_FRESH_AFTER`], for a reader
+/// that is holding a decision on it. On a quiet fleet nothing else reads
+/// GitHub between backstop ticks, and the events daemon reads only when a
+/// delivery arrives, so evidence a waiting decision needs would otherwise
+/// lapse until the next tick. A newer daemon snapshot serves it; otherwise
+/// the lane reads every branch as a background read, on the floor and the
+/// budget's pace. It does nothing while the shown read is young enough.
+pub fn keep_fresh(github: &LeafHandle<GithubData>) {
+    github.request_keys(Request::Refresh, [KEEP_FRESH_KEY]);
+}
+
 /// The latest direct GitHub read, for explaining a write that expired.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReadTimes {
@@ -260,6 +281,8 @@ struct LaneClock {
     /// Branches a write's confirming read was asked for and no network read
     /// has started for since.
     branches_owed: BTreeSet<String>,
+    /// [`keep_fresh`] was asked for and nothing has answered it yet.
+    fresh_owed: bool,
     /// Branches read alone since the shown read of every branch, each with
     /// the start of its read and the board rows that show it. Only these,
     /// pull request and merge-queue entry, are newer than the shown stamp.
@@ -306,6 +329,31 @@ impl LaneClock {
             now,
         } = input;
         let same_branches = self.published.as_deref() == Some(branches);
+        // A reader holding a decision asked for young evidence. What is
+        // shown may be young enough; a daemon read that began after it is
+        // served below like any other; otherwise only a read of every
+        // branch moves the stamp, whatever the daemon file would have had
+        // this fetch skip.
+        if std::mem::take(&mut self.fresh_owed) {
+            let aged = self.shown.as_ref().is_none_or(|(_, at)| {
+                at.local_instant()
+                    .is_none_or(|at| now.saturating_duration_since(at) >= KEEP_FRESH_AFTER)
+            });
+            // Stamps, not instants: a stamp keeps milliseconds, and the shown
+            // one may be this very read's.
+            let daemon_newer = daemon.as_ref().is_some_and(|read| {
+                let read = read.stamp();
+                self.shown.as_ref().is_some_and(|(_, shown)| {
+                    read != *shown && read.at_or_after(shown) == Some(true)
+                })
+            });
+            if aged && same_branches && !daemon_newer {
+                let plan = self.network(now, request.max(Request::Refresh));
+                // Still owed while the floor or the budget holds the read.
+                self.fresh_owed = matches!(plan, Plan::Defer);
+                return plan;
+            }
+        }
         if let Some(read) = daemon {
             let newer = match (read.started, self.live_observed) {
                 (_, None) => true,
@@ -736,10 +784,11 @@ impl GithubLane {
             clock.branches_owed.extend(
                 demand
                     .keys
-                    .into_iter()
-                    .filter(|(_, request)| *request == Request::Direct)
+                    .iter()
+                    .filter(|(_, request)| **request == Request::Direct)
                     .filter_map(|(key, _)| key.strip_prefix(BRANCH_KEY).map(str::to_owned)),
             );
+            clock.fresh_owed |= demand.keys.contains_key(KEEP_FRESH_KEY);
         }
         // The key set comes from Git. Restored or missing inventory cannot
         // name the branches to read; the inventory's next change re-arms this.
@@ -1832,6 +1881,89 @@ mod tests {
             BranchRead::No
         ));
         assert!(clock.direct_owed);
+    }
+
+    /// A reader holding a decision on GitHub evidence asks for it to stay
+    /// young. On a quiet fleet the daemon's file does not change, and the
+    /// fetch it would have skipped reads every branch instead, as a
+    /// background read: on the floor and the budget's pace, and not at all
+    /// while what is shown is young enough or the daemon has newer.
+    #[tokio::test(start_paused = true)]
+    async fn evidence_a_waiting_decision_needs_is_read_again_before_it_lapses() {
+        let _ = Stamp::now();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        let branches = branches();
+        let start = Instant::now();
+        let second = Duration::from_secs(1);
+        let ask = |clock: &mut LaneClock, daemon: Option<DaemonRead>, now| {
+            clock.fresh_owed = true;
+            clock.plan(PlanInput {
+                request: Request::Recheck,
+                ..input(&branches, daemon, now)
+            })
+        };
+        // The daemon's read is shown; its file has not changed since.
+        let mut clock = LaneClock::default();
+        assert!(matches!(
+            clock.plan(input(&branches, Some(daemon(Some(start), 1_000)), start)),
+            Plan::Publish(_)
+        ));
+        let unchanged = || Some(daemon(Some(start), 1_000));
+        // Young enough: nothing is read, and nothing stays owed.
+        assert!(matches!(
+            ask(&mut clock, unchanged(), start + 30 * second),
+            Plan::Skip
+        ));
+        assert!(!clock.fresh_owed);
+        // A plain recheck of the unchanged file never reads GitHub.
+        assert!(matches!(
+            clock.plan(PlanInput {
+                request: Request::Recheck,
+                ..input(&branches, unchanged(), start + 70 * second)
+            }),
+            Plan::Skip
+        ));
+        // Asked for, it does, before the 90 seconds are up.
+        let at = start + KEEP_FRESH_AFTER + second;
+        assert!(at < start + Duration::from_secs(90));
+        assert!(matches!(ask(&mut clock, unchanged(), at), Plan::Network));
+        assert!(!clock.fresh_owed);
+        clock.live_read(at, branches.clone(), &GithubData::default());
+        // The daemon read again meanwhile: its newer snapshot is the answer.
+        let newer = at + 65 * second;
+        assert!(matches!(
+            ask(&mut clock, Some(daemon(Some(newer - second), 2_000)), newer),
+            Plan::Publish(_)
+        ));
+        // The same with no daemon at all, where a recheck alone would skip.
+        let mut clock = LaneClock::default();
+        assert!(matches!(
+            clock.plan(input(&branches, None, start)),
+            Plan::Network
+        ));
+        clock.live_read(start, branches.clone(), &GithubData::default());
+        assert!(matches!(ask(&mut clock, None, at), Plan::Network));
+
+        // A budget down to its reserve holds it like any background read,
+        // and it stays owed for the postponed read.
+        let mut clock = LaneClock::default();
+        assert!(matches!(
+            clock.plan(input(&branches, None, start)),
+            Plan::Network
+        ));
+        let low = GithubData {
+            rate_limit: Some(wt_github::RateLimit {
+                limit: 5_000,
+                remaining: 800,
+                cost: 5,
+                reset_at_ms: epoch_ms() + 20 * 60_000,
+            }),
+            ..GithubData::default()
+        };
+        clock.live_read(start, branches.clone(), &low);
+        assert!(matches!(ask(&mut clock, None, at), Plan::Defer));
+        assert!(clock.fresh_owed);
+        assert!(clock.deferred.unwrap() > start + 5 * 60 * second);
     }
 
     /// A refusal that says when the limit lifts holds every read until then,

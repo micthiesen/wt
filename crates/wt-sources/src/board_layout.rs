@@ -261,7 +261,11 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
             .unwrap_or(f64::NEG_INFINITY);
         // Ties break on one stable identity per stack (its root branch),
         // as in the TS sorter, so tied units stay contiguous.
-        let identity = node_of(anchor).map_or(slug, |entry| entry.node.stack_id.as_str());
+        // A unit left of a stack whose first row was removed keeps the
+        // identity the store kept for it.
+        let identity = state["slugs"][slug]["unitIdentity"]
+            .as_str()
+            .unwrap_or_else(|| node_of(anchor).map_or(slug, |entry| entry.node.stack_id.as_str()));
         (
             status,
             order,
@@ -369,20 +373,19 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
         // Anchored units and stand-ins: what they sort by among those that
         // follow the same unit, themselves, and what they follow.
         let mut links: Vec<((u8, &str), usize, Option<usize>)> = Vec::new();
-        let status_of = |slug: &str| {
-            if sort == UiSort::Status {
-                rank(slug)
-            } else {
-                0
-            }
-        };
-        let mut unresolved: Vec<(usize, &str)> = anchored
+        // Each with the record that says what it follows.
+        let mut unresolved: Vec<(usize, &Value, (u8, &str))> = anchored
             .iter()
             .rev()
-            .map(|&root| (root, board.rows[root].key.as_str()))
+            .map(|&root| {
+                let entry = &state["slugs"][&board.rows[root].key];
+                // In the place of a row that left, it sorts as that row did
+                // among the rows created after the same row.
+                let name = entry["creationAs"].as_str().unwrap_or(unit(root).2);
+                (root, entry, (unit(root).0, name))
+            })
             .collect();
-        while let Some((id, slug)) = unresolved.pop() {
-            let entry = &state["slugs"][slug];
+        while let Some((id, entry, sorts_by)) = unresolved.pop() {
             let named = entry["creationAfter"].as_str();
             let drawn = named.and_then(|after| {
                 indices
@@ -390,54 +393,52 @@ pub fn prepare(board: &mut Board, state: &Value, trunk: &str, sort: UiSort) {
                     .copied()
                     .find(|&index| board.rows[index].key == after)
             });
-            let follows = if let Some(drawn) = drawn {
-                Some(anchor_of(drawn))
+            // The row it follows when that is not drawn here: its record,
+            // or what the store kept of it, under a name of its own.
+            let gone = if drawn.is_some() {
+                None
             } else if let Some(after) = named.filter(|&after| stored_here(after)) {
-                let (follows, new) = stand_in(after.to_owned());
-                let stored = &state["slugs"][after];
-                let by_status =
-                    sort == UiSort::Status && parse_work_status(&stored["work"]).is_some();
-                let anchored = stored.get("creationAfter").is_some()
-                    && !stored["order"].is_number()
-                    && !by_status;
-                if new && anchored {
-                    unresolved.push((follows, after));
-                } else if new {
-                    ordered_stand_ins.push((
-                        follows,
-                        Some(status_of(after)),
-                        stored["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
-                        after,
-                    ));
-                }
-                Some(follows)
-            } else if entry["creationSlot"].is_object() {
+                Some((after.to_owned(), after, &state["slugs"][after]))
+            } else {
                 let slot = &entry["creationSlot"];
-                let name = slot["key"].as_str().unwrap_or_default();
-                let (follows, new) = stand_in(format!("\0{name}"));
-                if new {
-                    // The slot of a remote row does not say its status.
+                let key = slot["key"].as_str().unwrap_or_default();
+                slot.is_object().then(|| (format!("\0{key}"), key, slot))
+            };
+            let follows = match (drawn, gone) {
+                (Some(drawn), _) => Some(anchor_of(drawn)),
+                (None, None) => None,
+                (None, Some((known_as, key, gone))) => {
+                    let (follows, new) = stand_in(known_as);
+                    let work = parse_work_status(&gone["work"]);
+                    // A removed stack's unit sorted by its first branch.
+                    let name = gone["unitIdentity"].as_str().unwrap_or(key);
+                    // A remote row's status is its host's to know: gone from
+                    // there, it is not known here.
                     let status = if sort != UiSort::Status {
                         Some(0)
+                    } else if gone.get("work").is_none()
+                        && wt_core::is_remote_worktree_ledger_key(key)
+                    {
+                        None
                     } else {
-                        slot.get("work")
-                            .map(|work| work_record_rank(parse_work_status(work).as_ref()))
+                        Some(work_record_rank(work.as_ref()))
                     };
-                    ordered_stand_ins.push((
-                        follows,
-                        status,
-                        slot["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
-                        name,
-                    ));
+                    let anchored = gone.get("creationAfter").is_some()
+                        && !gone["order"].is_number()
+                        && !(sort == UiSort::Status && work.is_some());
+                    if new && anchored {
+                        let status = status.unwrap_or(work_record_rank(None));
+                        unresolved.push((follows, gone, (status, name)));
+                    } else if new {
+                        ordered_stand_ins.push((
+                            follows,
+                            status,
+                            gone["order"].as_f64().unwrap_or(f64::NEG_INFINITY),
+                            name,
+                        ));
+                    }
+                    Some(follows)
                 }
-                Some(follows)
-            } else {
-                None
-            };
-            let sorts_by = if id < first_stand_in {
-                (unit(id).0, unit(id).2)
-            } else {
-                (status_of(slug), slug)
             };
             if follows != Some(id) {
                 links.push((sorts_by, id, follows));

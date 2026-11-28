@@ -403,7 +403,12 @@ not show answers with the listing's stamp. Keyed stamps are filed under board
 row keys (the GitHub leaf also files a branch's own read under
 `//branch/<name>`, `github_source::branch_key`, which no slug or branch can
 equal), and rows sharing a stamp key are confirmed together. `request_keys(Direct | Refresh, keys)` is user-caused and
-`request_keys(Recheck, keys)` is event-caused. A request for the whole domain
+`request_keys(Recheck, keys)` is event-caused. `request_rows` asks for named
+rows without listing the keys again; a row read that way keeps the stamp of
+the listing it was last listed by. A change seen by the listing and by a
+read of the same row that started no earlier is one read when the two agree
+(`KeyedReader::agrees`; for Git, the commit each found at HEAD); when they
+disagree the row changed between their looks and is read again. A request for the whole domain
 is a sweep, except a whole `Direct`, which reads every row at user priority.
 `start_demanded_source` hands a fetch the `Demand` it serves (whole, listing,
 keys), `Fetched::keyed` publishes per-key stamps, and
@@ -472,7 +477,10 @@ checked by the host. Queue removal is `wait_facts::queue_removal`, the
 predicate `wt wait` and `wt fleet` call, and is set only from a live GitHub
 read.
 
-**Confirmed inputs.** `LeafHandle::confirmed()` returns `Confirmed<T>` only for
+**Confirmed inputs.** `Confirmed::listed()` and `listing_age()` give the stamp
+of the listing, for decisions about which rows exist as opposed to what each
+row says; session discovery and automation orphan settling use them.
+`LeafHandle::confirmed()` returns `Confirmed<T>` only for
 live data (for GitHub this includes an events-daemon snapshot, which is a fresh
 read by the daemon stamped with its own fetch start, not a restored cache); a derived handle has no such method, and `Confirmed` has no public
 constructor. Remove, cleanup, GitHub writes, reviewer edits, action
@@ -557,16 +565,27 @@ An expiry while confirmed data still disagrees shows one notice.
   field applies while the row has no explicit order and, under status sorting,
   no work status. When the followed row leaves its section or is forgotten
   (moved, placed, reaped, its state cleared), a row that followed it inherits
-  what that row followed, or gets a `creationSlot` (`{order, key}`, also in
-  `remoteLayouts`) recording where the row was; a press that restates the
-  anchor clears the slot; `prune_slug_records` writes the slot too before it
-  drops a record. Layout resolves an anchor through the stored record of the
+  what that row followed, or gets a `creationSlot` (also in `remoteLayouts`):
+  one flat place the board drew the leaving row by (`key`, `order`, and
+  optionally `work` and `unitIdentity`), which never holds another slot. A
+  row that takes the place of one that left also gets `creationAs` (also in
+  `remoteLayouts`), the name it sorts by among the rows created after the
+  same row. The follower's `creationAfter` is cleared, so a slug created again
+  is not taken for the row it followed. A press that restates the anchor
+  clears the slot; `prune_slug_records` writes the slot too before it drops a
+  record. When the first row of a stack is removed, the rows stacked on it
+  take its place as units of their own, the unit's followers are re-pointed,
+  and rows that would otherwise re-sort get a stored `unitIdentity` (also in
+  `remoteLayouts`), which a unit sorts by when its record has one and which is
+  cleared when the row is ordered by hand or given a new base. The fleet
+  board hands the layout the placement of remote rows their host has stopped
+  listing. Layout resolves an anchor through the stored record of the
   row it names, whether or not the board lists that row (archived, landed,
   being removed, removed): while the record is filed in the section the unit
-  stays where that row would be drawn. Otherwise it uses the slot, and only
-  then puts the unit at the top. The slot keeps the leaving row's stored
-  order, not its status, so under status sort the unit is drawn behind the
-  unit with the nearest stored order. The projection preserves stack
+  stays where that row would be drawn. Otherwise it reads the slot like a
+  stored record, and only then puts the unit at the top. The controller never
+  stores a remote row's status, so under status sort a follower of a remote
+  row that is gone is placed by that row's stored order. The projection preserves stack
   units and handles missing or cyclic anchors without dropping rows.
   J/K is resolved at the keypress: `plan_reorder` turns the press into a
   `ReorderStep` against the board on screen (`Pass` a neighbouring unit,
@@ -639,13 +658,19 @@ read again. A path under the worktree root in no listed checkout, or a ref no
 row uses, asks for the listing alone, and so does a change reported for a
 directory under `refs`, for the Git directory itself or for `objects`: the
 refs, `HEAD` and index that moved are reported as their own paths.
-`packed-refs`, `config`, `info/` and paths that cannot be placed ask for a
-sweep of every row. A `config` or `packed-refs` inside a Git directory that is
-rewritten with the same bytes is not a change: the router keeps a content
-hash of each, and Git rewrites `config` with the same bytes on every fetch
-that syncs a local branch. Files over 4 MiB, and any path that is not a
-readable regular file, always count as changed. Working-tree paths with
-those names are never compared. Git's own `*.lock` files inside a Git
+`info/` and paths that cannot be placed ask for a read of every row. A
+`config` or `packed-refs` inside a Git directory is compared entry by entry
+with what it held (a config's sections by header, packed refs by name). A
+rewrite with the same entries is not a change, which Git makes of `config`
+on every fetch that syncs a local branch. A rewrite that moves refs or
+branch settings reads only the rows on or tracking those refs, and a change
+to anything else in the file reads every row. Files over 4 MiB, and any path
+that is not a readable regular file, always read every row. Working-tree
+paths with those names are never compared. Changes that cannot be routed
+read every row at most once per 5 seconds: the first at once, later ones
+folded into one trailing read. Each logs, rate limited, an info record with
+the path, `a change that cannot be routed to its checkouts reads all of
+them`. Git's own `*.lock` files inside a Git
 directory never invalidate a row, and a reflog path routes like the ref or
 HEAD it logs. Where notifications and the scan both run, a change a
 notification was routed for is not routed again by the scan. Ref routing
@@ -654,19 +679,34 @@ ignores case on macOS and Windows.
 The watch set is the worktree root, the main clone, the state database's
 directory, each checkout's immediate children, and each Git common directory
 with recursive `refs` and `worktrees`, excluding generated trees and symlink
-traversal. On macOS a metadata scan every 500 ms is the only detector for
-this set. Elsewhere native notifications drive and a scan every second
-catches lost ones. A scan runs off the input path and has no entry or time
-cap; one that runs long stretches its interval to four times its duration,
-and one slower than its interval logs a warning, at most once a minute. Where
+traversal. Sampling runs on its own thread, `wt-fs-scan`, off the input path
+and off the shared blocking pool. A scanner thread that dies is restarted up
+to five times with a doubling wait, each restart logged. It walks the watch set once a second; on
+macOS that walk and the hot tier below are the only detectors, and elsewhere
+native notifications drive and the walk catches lost ones. Where changes are
+found by polling, the files that carry each checkout's Git facts (`HEAD`,
+`index`, `MERGE_HEAD`, `rebase-merge`, `rebase-apply`, its branch and
+upstream refs and `packed-refs`) are also stat-checked every 125 ms, so a
+commit or a checkout is noticed between walks. A walk has no entry or time
+cap; one that runs long stretches the spacing to four times its duration. A
+walk over one second logs one warning, `walking the watched files has become
+slow`, and one info record when it is back under half a second. Where
 changes are found by polling, the state database, its WAL and the events
 snapshot are also stat-checked every 75 ms. Metadata reads caused by other
 processes' writes are paced to one per 250 ms after the first. A listing
 waits up to two seconds for its checkouts to be watched and baselined before
 their first read, so start-up normally makes one pass. A watch root that
 appears asks for a whole-domain read only once the Git leaf has published
-live rows. A full sweep runs every 60 seconds, on `r`, on hard refresh and at
-start. Whole refresh requests within 2 seconds of the previous one are one
+live rows. No scheduled sweep reads the whole fleet. A rolling backstop
+covers what no detector sees, such as an edit deep in a working tree: every
+3 seconds it re-reads the rows nothing has asked for in the last 60 seconds,
+oldest first, a twentieth of the fleet per step, or a quarter of the due
+rows when more are due, through `request_rows`, which reads named rows
+without listing again. A row a change was just routed to is skipped (for an
+unrouted change, rows count as asked for when the read of every checkout is
+requested, not when the change is seen), and an archived row waits 300 seconds. The
+checkout listing is re-read once per 60 seconds. A sweep of every row runs
+on `r`, on hard refresh, at start and for an unrouted change. Whole refresh requests within 2 seconds of the previous one are one
 request, so `r` pressed twice is one sweep; an unrouted change and a
 user-priority read of every row are never folded into it, and neither is an
 unrouted change that arrives together with a refresh. Each completed
@@ -718,8 +758,9 @@ tracks running commands through shutdown. `HostService` performs the host-local
 operation and returns a typed reply. Accepted mutations belong to the command
 drain, not the lifetime of a particular SSH view; read sources are cancelled
 when their host scope ends.
-Capacity is counted per host. Long jobs (whole-host operations, action
-dispatch, and a removal until its worker is running) have four slots per
+Capacity is counted per host. Long jobs (whole-host operations, restacks,
+action dispatch, a removal until its worker is running, and a fleet cleanup
+until every row it selected is started or refused) have four slots per
 host. Pull-request and fork-base writes have two per host, session stops two,
 and read-only preparation, the session picker's background discovery,
 creation, metadata writes and host control one each. Three budgets are shared by all hosts. Attention
@@ -746,10 +787,13 @@ checkout's lifecycle lock, which is when `start_remove` returns. From then it
 excludes only work on its own checkout until it completes, and at most four
 removals per host are in flight. A remote host's worker applies that planning
 phase itself. Unrelated creates and removals proceed concurrently. A fleet cleanup is one accepted
-operation that owns exactly the `(host, checkout)` pairs it removes: it
-serializes with another cleanup and with whole-host operations on a host it
-touches, and with checkout-scoped work only on those checkouts, so entry and
-writes elsewhere never wait for its teardowns. Waiting notices name the
+operation that owns exactly the `(host, checkout)` pairs it removes. It has
+two phases, like a removal: until every selected row is started or refused
+it serializes with another cleanup and with whole-host operations on a host
+it touches; after that it excludes only work on its own checkouts, so entry,
+writes and whole-host work elsewhere never wait for its teardowns. A cleanup
+whose rows are all on remote hosts is narrowed at admission, and each
+remote worker applies the same rule. Waiting notices name the
 blocking operation and its checkouts. Lifecycle
 per-target locks serialize create/remove races on the same slug.
 Interactive actions also use a process-admission pool separate from background
@@ -765,7 +809,14 @@ exclude removal of that checkout, not creation elsewhere. A new action must
 choose its scope explicitly instead of inheriting whole-host exclusion.
 Dispatching a configured action owns the one checkout it is for, or none for
 a manager or slot prompt; two dispatches with the same scope on one host
-still serialize. Restack, review checkout and restore own the host. A queued
+still serialize. A restack owns the checkouts of its stack as the board
+shows it (`Lane::Stack`, inferred from each row's branch and fork base by
+`lane_on_board`), so restacks of different stacks run side by side; it
+excludes whole-host jobs on its host and, on its members only, another
+restack, a removal or cleanup, an action, a pull-request or fork-base write
+and a session stop. With no board, or a row the board does not show, it owns
+the host. A review checkout and a restore each make one new checkout and are
+creations. A queued
 long job is not overtaken by a later long job it conflicts with; short writes
 and reads may pass it.
 While commands run or wait, the controller sends nonterminal progress after
@@ -785,7 +836,9 @@ were busy` once a key has acted, since it was meant for the view its reply
 found. Every user request logs one info-level
 `controller request` record (`operation`, `lane`, `host`, `queued_ms`,
 `run_ms`, and `outcome`: `ok`, `failed`, `stale`, `uncertain`, `cancelled` or
-`replaced`). A background read logs it at debug unless it failed, is
+`replaced`). A request that hands the terminal over also carries
+`prepared_ms`, the time from acceptance to the handoff, since its `run_ms`
+includes the time spent attached. A restack's `lane` reads `stack`. A background read logs it at debug unless it failed, is
 uncertain, or took over one second. Every loading overlay that is answered
 logs `host overlay answered` with `operation_id`, `load_ms` and `filled`
 (whether the reply filled it or closed it with a message).
@@ -941,8 +994,9 @@ status output, and untracked hashing runs on the long-job pool.
 Untracked content that cannot be hashed (a nested repository, a socket or
 FIFO, a set past the path or time budget) is pinned by name and stat data and
 surfaced as a hazard the user confirms; it no longer makes removal impossible.
-The worker archives the row before its startup reply and retains that state
-on failure. A removal start returns once the worker holds the worktree's
+The worker records the removal and archives the row in one transaction
+(`Store::begin_removal_archived`) before its startup reply, so no reader sees
+a removal whose row is not archived, and retains that state on failure. A removal start returns once the worker holds the worktree's
 lifecycle lock (`lockHeldAt` in the job record) or the job has ended; a
 worker that acknowledged but reports no lock within 75 seconds leaves the
 removal uncertain. TUI actions await the durable
@@ -965,8 +1019,11 @@ The witness stands in for Git's own dirty check, so every removal without a
 caller witness still runs `git worktree remove` in place, as does one whose
 checkout cannot be moved aside or holds submodules. A Git-locked worktree is
 refused. The mover holds an advisory lock on the quarantined directory itself
-for as long as it lives; a later removal's worker sweeps quarantines nobody
-holds, which covers a worker that died before deleting. A worker that died
+for as long as it lives; a later removal's worker, and the detached `wt _delete-removed-checkouts`
+worker the daily maintenance pass starts
+([updates.md](updates.md#leftovers-and-the-daily-maintenance-pass)),
+sweep quarantines nobody holds, which covers a worker that died before
+deleting. A worker that died
 between the rename and Git's bookkeeping leaves a registration with a missing
 checkout, which the ordinary missing-checkout removal finishes. Phase timings
 are logged under `wt::removal` (`quarantine-rename`, `git-worktree-remove`,

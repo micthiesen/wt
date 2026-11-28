@@ -809,7 +809,7 @@ fn evaluate_merged(
     if row.stack.is_some() && !closes_issue && !deletes_branch && !external {
         return None;
     }
-    let pr_done = context.github_fresh && row.pr.as_ref().is_some_and(|pr| pr.state == "MERGED");
+    let pr_done = pr_merged(row);
     if row.local_merged != Some(true) && row.gone != Some(true) && !pr_done {
         return None;
     }
@@ -948,11 +948,7 @@ fn evaluate_stack(
         let merged: Vec<_> = members
             .iter()
             .copied()
-            .filter(|row| {
-                row.clean_candidate
-                    && (row.pr.as_ref().is_none_or(|pr| pr.state != "MERGED")
-                        || context.github_fresh)
-            })
+            .filter(|row| row.clean_candidate)
             .collect();
         let open: Vec<_> = members
             .iter()
@@ -989,9 +985,7 @@ fn evaluate_stack(
                     if !parent_row.archived
                         && !parent_row.busy
                         && !context.pauses.slugs.contains(&parent_row.slug)
-                        && parent_row.clean_candidate
-                        && (parent_row.pr.as_ref().is_none_or(|pr| pr.state != "MERGED")
-                            || context.github_fresh) =>
+                        && parent_row.clean_candidate =>
                 {
                     external_merged.push(parent_row);
                 }
@@ -1357,12 +1351,18 @@ fn action_traits<'a>(
     context.actions.get(&rule.run)
 }
 
-/// How far the row landed. The PR-merged leg needs fresh GitHub data, so a
-/// boot-stale cache cannot report a merge it has not confirmed.
+/// Whether the row's pull request is merged. Rows carry pull requests only
+/// from a read this process confirmed, and a merge is final, so this holds
+/// whatever the age of that read; everything else a pull request says is
+/// used only while `github_fresh`.
+fn pr_merged(row: &AutomationRow) -> bool {
+    row.pr.as_ref().is_some_and(|pr| pr.state == "MERGED")
+}
+
+/// How far the row landed. A merged pull request proves it at any age: the
+/// caller never hands a row one from a restored cache.
 fn row_landing(row: &AutomationRow, context: &AutomationEvalContext) -> wt_core::Landing {
-    let base = row.local_merged == Some(true)
-        || row.gone == Some(true)
-        || (context.github_fresh && row.pr.as_ref().is_some_and(|pr| pr.state == "MERGED"));
+    let base = row.local_merged == Some(true) || row.gone == Some(true) || pr_merged(row);
     wt_core::Landing::new(base, row.in_production, context.separate_production)
         .with_deploys(row.deploys)
 }
@@ -1834,8 +1834,8 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(landing(&row, &fresh), OwnerLanding::Landed);
-        // A merge the stale data reports is not proof either way.
-        assert_eq!(landing(&row, &stale), OwnerLanding::Unknown);
+        // A merge is final: a confirmed read of any age proves it.
+        assert_eq!(landing(&row, &stale), OwnerLanding::Landed);
         row.pr.as_mut().unwrap().state = "OPEN".into();
         assert_eq!(landing(&row, &stale), OwnerLanding::Unknown);
         assert_eq!(landing(&row, &fresh), OwnerLanding::NotLanded);
@@ -2535,7 +2535,36 @@ mod tests {
         assert_eq!(fires.len(), 1, "only the external action fires");
         assert_eq!(fires[0].rule.id, "track");
         assert_eq!(fires[0].fire_keys[0], "track:merged:feature-1:42");
-        // Without GitHub's word the landing is unproven for a retained row.
+        // A merge is final: evidence of any age still proves the landing,
+        // and the fire does not lapse between reads.
+        context.github_fresh = false;
+        let held = evaluate(&rules, std::slice::from_ref(&row), &context);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].fire_keys, fires[0].fire_keys);
+        // Old evidence with no merged pull request answers nothing: the
+        // pull request may be open, merged since, or absent.
+        let mut unknown = row.clone();
+        unknown.pr = None;
+        assert!(evaluate(&rules, std::slice::from_ref(&unknown), &context).is_empty());
+        row.pr.as_mut().unwrap().state = "OPEN".into();
+        assert!(evaluate(&rules, &[row], &context).is_empty());
+    }
+
+    /// What is not final still needs fresh evidence: failing checks may
+    /// have passed since.
+    #[test]
+    fn a_checks_failed_fire_lapses_with_its_evidence() {
+        let mut row = row();
+        row.pr.as_mut().unwrap().checks_failed = true;
+        let rules = [rule("ci", AutomationTrigger::PrChecksFailed, "fix-ci")];
+        let mut context = AutomationEvalContext {
+            github_fresh: true,
+            ..AutomationEvalContext::default()
+        };
+        assert_eq!(
+            evaluate(&rules, std::slice::from_ref(&row), &context).len(),
+            1
+        );
         context.github_fresh = false;
         assert!(evaluate(&rules, &[row], &context).is_empty());
     }

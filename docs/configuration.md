@@ -26,7 +26,7 @@ global durable state database and names the default cache directory and tmux
 socket, so existing and future worktrees in different repositories cannot
 reap or rearrange one another.
 
-TOML tables merge by key. Scalar values and arrays replace the user value completely, so a repository's `[[actions]]` or `[[automations]]` list is authoritative when present. `$WT_CONFIG` selects a different user config; it does not disable repository overrides. Each process resolves this merged configuration once at startup. wt carries the selected repository file into child processes with `$WT_REPO_CONFIG`, which also provides an explicit repository-config path for scripts that cannot preserve the invocation directory.
+TOML tables merge by key. Scalar values and arrays replace the user value completely, so a repository's `[[actions]]` or `[[automations]]` list is authoritative when present. `$WT_CONFIG` selects a different user config; it does not disable repository overrides. Each process resolves this merged configuration once at startup. A config warning (a reserved action key, for example) is logged and sent to the attention feed once, not at every start: `<cache root>/config-warnings-<hash of the repository id>.json` records the warnings already reported for that repository, and one that goes away and comes back is reported again. `wt doctor` always lists the standing ones. wt carries the selected repository file into child processes with `$WT_REPO_CONFIG`, which also provides an explicit repository-config path for scripts that cannot preserve the invocation directory.
 
 For example, shared personal defaults can live in `~/.config/wt/config.toml`:
 

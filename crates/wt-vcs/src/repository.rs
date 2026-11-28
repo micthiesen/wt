@@ -297,6 +297,16 @@ impl GitRepository {
         cancellation: &CancellationToken,
     ) -> Result<Vec<WorktreeSnapshot>, RepositoryError> {
         let records = self.inventory(cancellation).await?;
+        Ok(self.statuses(records, cancellation).await)
+    }
+
+    /// The status half of [`Self::inventory_status`], for a caller that
+    /// listed the worktrees itself and has other reads to start meanwhile.
+    pub async fn statuses(
+        &self,
+        records: Vec<WorktreeRecord>,
+        cancellation: &CancellationToken,
+    ) -> Vec<WorktreeSnapshot> {
         // Every agent's `wt` command reads the fleet through here with a
         // subprocess budget of its own; the turn bounds their sum.
         let _turn = self.fleet_scan(cancellation).await;
@@ -326,7 +336,7 @@ impl GitRepository {
             .collect::<Vec<_>>()
             .await;
         rows.sort_by_key(|(index, _)| *index);
-        Ok(rows.into_iter().map(|(_, snapshot)| snapshot).collect())
+        rows.into_iter().map(|(_, snapshot)| snapshot).collect()
     }
 
     pub async fn status(

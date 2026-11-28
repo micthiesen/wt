@@ -1748,11 +1748,31 @@ mod tests {
     /// row's placement is the controller's.
     async fn stored_layout(
         fixture: &wt_app_core::test_support::CommandFixture,
+        listed: &[wt_tui::BoardRow],
     ) -> serde_json::Value {
         let mut state = stored(fixture).await;
         let remote = state["remoteLayouts"].clone();
         for (key, layout) in remote.as_object().into_iter().flatten() {
-            state["slugs"][key] = layout.clone();
+            let mut entry = serde_json::json!({});
+            for field in [
+                "section",
+                "order",
+                "creationAfter",
+                "creationSlot",
+                "creationAs",
+                "unitIdentity",
+            ] {
+                if let Some(value) = layout.get(field) {
+                    entry[field] = value.clone();
+                }
+            }
+            // What its host says of a row it lists; of one it no longer
+            // lists the controller has only the placement.
+            if listed.iter().any(|row| row.key == *key) {
+                entry["baseBranch"] = layout["baseBranch"].clone();
+                entry["work"] = layout["work"].clone();
+            }
+            state["slugs"][key] = entry;
         }
         state
     }
@@ -1781,7 +1801,7 @@ mod tests {
         tell(&mut board);
         wt_sources::board_layout::prepare(
             &mut board,
-            &stored_layout(fixture).await,
+            &stored_layout(fixture, rows).await,
             &fixture.ctx.config.branch.base,
             sort,
         );
@@ -2159,6 +2179,10 @@ mod tests {
     /// The store calls a removal makes for a local row: archived while it
     /// runs, then recorded. The row's own record stays.
     async fn remove(fixture: &wt_app_core::test_support::CommandFixture, key: &str) {
+        // A remote row is removed on its host, which then stops listing it.
+        if wt_core::is_remote_worktree_ledger_key(key) {
+            return;
+        }
         let (key, trunk) = (key.to_owned(), fixture.ctx.config.branch.base.clone());
         fixture
             .ctx
@@ -2260,6 +2284,135 @@ mod tests {
         fixture.close().await.unwrap();
     }
 
+    /// Three removals whose rows used to be redrawn elsewhere: the first row
+    /// of a stack, a remote row, and a fresh row whose slug is then created
+    /// again.
+    #[tokio::test]
+    async fn removing_a_stack_row_a_remote_row_or_a_recreated_slug_keeps_the_rest_in_place() {
+        let fixture = wt_app_core::test_support::CommandFixture::new()
+            .await
+            .unwrap();
+        let database = &fixture.ctx.database;
+        let on = |key: &str, order: Option<f64>| Fabricated {
+            order,
+            ..Fabricated::new(key, "S")
+        };
+        let stacked = |key: &str, on: &str| Fabricated {
+            stacked_on: Some(on.to_owned()),
+            ..Fabricated::new(key, "S")
+        };
+        let fresh = |key: &str, after: &str| Fabricated {
+            created_after: Some(Some(after.to_owned())),
+            ..Fabricated::new(key, "S")
+        };
+        let without = |listed: &[wt_tui::BoardRow], gone: &str| -> Vec<wt_tui::BoardRow> {
+            listed
+                .iter()
+                .filter(|row| row.key != gone)
+                .cloned()
+                .collect()
+        };
+        for sort in [wt_config::UiSort::Manual, wt_config::UiSort::Status] {
+            // The first row of a stack: drawn by its order, never ordered,
+            // and at its creation position. The rows stacked on it are
+            // units of their own now, and stay where the unit was, with
+            // what was created after its rows behind all of them.
+            for root in [on("root", Some(2.0)), on("root", None), fresh("root", "p")] {
+                let ordered = root.created_after.is_some() || root.order.is_some();
+                let said = format!("{sort:?}, the stack's first row: {root:?}");
+                let rows = [
+                    on("p", ordered.then_some(1.0)),
+                    root,
+                    stacked("k2", "root"),
+                    stacked("k1", "root"),
+                    stacked("deep", "k1"),
+                    fresh("f", "deep"),
+                    fresh("g", "root"),
+                    on("z", ordered.then_some(3.0)),
+                ];
+                let listed = fabricate(&fixture, &rows).await;
+                let board = laid_out(&fixture, &listed, sort).await;
+                assert_eq!(
+                    drawn(&board, "S"),
+                    ["p", "root", "k1", "deep", "k2", "f", "g", "z"],
+                    "{said}"
+                );
+                remove(&fixture, "root").await;
+                let listed = without(&listed, "root");
+                let stays = ["p", "k1", "deep", "k2", "f", "g", "z"];
+                let board = laid_out(&fixture, &listed, sort).await;
+                assert_eq!(drawn(&board, "S"), stays, "{said}");
+                // Its record dropped as well.
+                database
+                    .call(|store| Ok(store.clear_slug_state("root")?))
+                    .await
+                    .unwrap();
+                let board = laid_out(&fixture, &listed, sort).await;
+                assert_eq!(drawn(&board, "S"), stays, "forgotten, {said}");
+            }
+
+            // A fresh row whose slug is created again: the row created after
+            // it stays ahead of the fresh row's sibling, which a row that
+            // simply followed their common row would not.
+            let rows = [
+                on("a", Some(1.0)),
+                fresh("x", "a"),
+                fresh("y", "a"),
+                fresh("zz", "x"),
+                on("z", Some(2.0)),
+            ];
+            let listed = fabricate(&fixture, &rows).await;
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(drawn(&board, "S"), ["a", "x", "zz", "y", "z"], "{sort:?}");
+            remove(&fixture, "x").await;
+            database
+                .call(|store| Ok(store.clear_slug_state("x")?))
+                .await
+                .unwrap();
+            let listed = without(&listed, "x");
+            let board = laid_out(&fixture, &listed, sort).await;
+            assert_eq!(drawn(&board, "S"), ["a", "zz", "y", "z"], "{sort:?}");
+
+            // A remote row: its host stops listing it, and later its
+            // placement is reaped.
+            let far = "@remote/box/far";
+            let rows = [
+                on("a", Some(1.0)),
+                Fabricated {
+                    status: Some(wt_core::WorkState::Ready),
+                    ..on(far, Some(2.0))
+                },
+                fresh("n", far),
+                on("z", Some(3.0)),
+            ];
+            let listed = fabricate(&fixture, &rows).await;
+            let board = laid_out(&fixture, &listed, sort).await;
+            let before = drawn(&board, "S");
+            let listed = without(&listed, far);
+            for reaped in [false, true] {
+                if reaped {
+                    database
+                        .call(|store| Ok(store.reap_remote_layouts("box", &Default::default())?))
+                        .await
+                        .unwrap();
+                }
+                let now = drawn(&laid_out(&fixture, &listed, sort).await, "S");
+                if sort == wt_config::UiSort::Manual {
+                    assert_eq!(before, ["a", far, "n", "z"]);
+                    assert_eq!(now, ["a", "n", "z"], "reaped: {reaped}");
+                } else {
+                    // Status sort drew the remote row first, by a status
+                    // the controller never stored. The row created after it
+                    // is drawn by the remote row's stored order alone: not
+                    // where it was, and not at the top either.
+                    assert_eq!(before, [far, "n", "a", "z"]);
+                    assert_eq!(now, ["a", "n", "z"], "reaped: {reaped}");
+                }
+            }
+        }
+        fixture.close().await.unwrap();
+    }
+
     /// The same sections on every run.
     struct Dice(u64);
 
@@ -2316,7 +2469,7 @@ mod tests {
             row.status = dice.status();
             if !rows.is_empty() && dice.chance(25) {
                 let parent = &rows[dice.roll(rows.len() as u64) as usize];
-                row.stacked_on = Some(parent.branch().to_owned());
+                row.stacked_on = (!parent.hidden).then(|| parent.branch().to_owned());
             }
             row.hidden = dice.chance(10);
             rows.push(row);
@@ -2406,6 +2559,137 @@ mod tests {
         }
     }
 
+    /// The row a section sorts and moves `key` with: the first row of its
+    /// stack drawn in the same section.
+    fn unit_of(board: &wt_tui::Board, key: &str) -> String {
+        let section = board
+            .sections
+            .iter()
+            .find(|section| section.rows.iter().any(|&row| board.rows[row].key == key));
+        let drawn_here = |key: &str| {
+            section
+                .is_some_and(|section| section.rows.iter().any(|&row| board.rows[row].key == key))
+        };
+        let mut at = key.to_owned();
+        for _ in 0..board.rows.len() {
+            let above = board
+                .rows
+                .iter()
+                .find(|row| row.key == at)
+                .and_then(|row| row.stack_parent.clone())
+                .filter(|above| drawn_here(above));
+            match above {
+                Some(above) => at = above,
+                None => break,
+            }
+        }
+        at
+    }
+
+    /// Removing a row never changes the order of the rows that remain.
+    ///
+    /// Where that cannot hold, the rows concerned are compared as one or
+    /// left out, and the rest still exactly:
+    /// - Removed from inside a stack, the row leaves a stack that the board
+    ///   draws as a tree, children by branch: the rows that were stacked on
+    ///   it are drawn among its siblings. The unit stays where it is. A row
+    ///   stacked on the removed row and filed in the section of the row
+    ///   under it joins that row's unit.
+    /// - Status sort draws a stack under the status of its most urgent row.
+    ///   Without the removed row that can be another status, and the rows
+    ///   stacked on a removed first row are units of their own, each under
+    ///   its own.
+    /// - Under status sort a remote row's status decided where the rows
+    ///   created after it are drawn, and the controller never stored it.
+    ///   They are drawn by its stored order alone, and never jump to the
+    ///   top of their section. The same when the record is dropped of a
+    ///   row created from the board that had a status: status sort drew it
+    ///   by that, and the rows created after it take the place manual sort
+    ///   drew it at (`status_forgotten`).
+    fn assert_removal_conserved(
+        before: &wt_tui::Board,
+        after: &wt_tui::Board,
+        gone: &str,
+        status_forgotten: bool,
+        said: &str,
+    ) {
+        let removed = before.rows.iter().find(|row| row.key == gone).unwrap();
+        let unit = unit_of(before, gone);
+        let in_unit = |key: &str| unit_of(before, key) == unit;
+        let inside = unit != gone;
+        let leads = !inside
+            && before
+                .rows
+                .iter()
+                .any(|row| row.key != gone && in_unit(&row.key));
+        let status = before.display.status_sort;
+        // Stacked, however deep, on the removed row, and now drawn with a
+        // row that was not.
+        let above_gone = |key: &str| {
+            let mut at = key.to_owned();
+            for _ in 0..before.rows.len() {
+                match before
+                    .rows
+                    .iter()
+                    .find(|row| row.key == at)
+                    .and_then(|row| row.stack_parent.clone())
+                {
+                    Some(under) if under == gone => return true,
+                    Some(under) => at = under,
+                    None => break,
+                }
+            }
+            false
+        };
+        let joined = |key: &str| {
+            let with = unit_of(after, key);
+            !inside && above_gone(key) && with != key && !above_gone(&with)
+        };
+        let at_creation = |key: &str| {
+            before
+                .rows
+                .iter()
+                .any(|row| row.key == key && row.creation_placement.is_some())
+        };
+        for section in FABRICATED_SECTIONS {
+            let was: Vec<String> = drawn(before, section)
+                .into_iter()
+                .filter(|key| key != gone)
+                .collect();
+            let now = drawn(after, section);
+            let compared = |keys: &[String]| -> Vec<String> {
+                let mut compared: Vec<String> = Vec::new();
+                for key in keys {
+                    let token = if (status && (inside || leads) && in_unit(key)) || joined(key) {
+                        continue;
+                    } else if inside && in_unit(key) {
+                        // One unit, wherever its rows are drawn in it.
+                        unit.clone()
+                    } else if (removed.host.is_some() || status_forgotten)
+                        && status
+                        && at_creation(key)
+                    {
+                        continue;
+                    } else {
+                        key.clone()
+                    };
+                    if compared.last() != Some(&token) {
+                        compared.push(token);
+                    }
+                }
+                compared
+            };
+            assert_eq!(compared(&now), compared(&was), "in {section:?}\n{said}");
+            // Whatever is left out above still does not jump to the top.
+            let stays = |key: &String| {
+                !at_creation(key) && !(status && (inside || leads) && in_unit(key)) && !joined(key)
+            };
+            if was.first().is_some_and(stays) {
+                assert_eq!(now.first(), was.first(), "in {section:?}\n{said}");
+            }
+        }
+    }
+
     /// For sections of every kind the layout draws (ordered rows, rows never
     /// ordered, rows at their creation position, rows filed there and not
     /// drawn, stacks whole and split, local and remote rows, the Inbox and
@@ -2454,57 +2738,70 @@ mod tests {
             }
             let mut seen = shown;
             for press in 0..if drift { 1 } else { 4 } {
-                // A removal between presses, of a local row that is not part
-                // of a stack: the rows that remain keep their order. (A
-                // stack's rows are drawn together because of the removed
-                // row; a remote row's status is not the controller's.)
+                // A removal between presses, of any row the board lists: the
+                // rows that remain keep the order they were drawn in. The
+                // presses that follow are resolved from the board after it
+                // and sent to a host that has not read since.
                 if !drift && dice.chance(30) {
                     let board = laid_out(&fixture, &listed, sort).await;
-                    let alone: Vec<String> = board
+                    // A remote stack is its host's: the controller is not
+                    // told how the host redrew it.
+                    let candidates: Vec<&wt_tui::BoardRow> = board
                         .rows
                         .iter()
-                        .filter(|row| row.host.is_none() && row.stack_parent.is_none())
                         .filter(|row| {
-                            !board
-                                .rows
-                                .iter()
-                                .any(|other| other.stack_parent.as_deref() == Some(&row.key))
+                            row.host.is_none()
+                                || !board.rows.iter().any(|other| {
+                                    other.stack_parent.as_deref() == Some(&row.key)
+                                        || row.stack_parent.as_deref() == Some(&other.key)
+                                })
                         })
-                        .map(|row| row.key.clone())
                         .collect();
-                    if !alone.is_empty() {
-                        let gone = alone[dice.roll(alone.len() as u64) as usize].clone();
+                    if !candidates.is_empty() {
+                        let gone = candidates[dice.roll(candidates.len() as u64) as usize];
+                        let (gone, remote) = (gone.key.clone(), gone.host.is_some());
                         let before = stored(&fixture).await;
                         remove(&fixture, &gone).await;
-                        // Its record is dropped too, as when the slug is
-                        // created again. Not that of a row at its creation
-                        // position: what followed it then follows what it
-                        // followed, among that row's other followers.
-                        let entry = &before["slugs"][&gone];
-                        let forgotten = dice.chance(50)
-                            && (entry["order"].is_number() || entry.get("creationAfter").is_none());
+                        listed.retain(|row| row.key != gone);
+                        // Its record is dropped too: a local slug is created
+                        // again, a remote row's placement is reaped.
+                        let forgotten = dice.chance(50);
                         if forgotten {
-                            let gone = gone.clone();
+                            let (gone, live) = (gone.clone(), listed.clone());
                             fixture
                                 .ctx
                                 .database
-                                .call(move |store| Ok(store.clear_slug_state(&gone)?))
+                                .call(move |store| {
+                                    if remote {
+                                        let live = live
+                                            .iter()
+                                            .filter(|row| row.host.is_some())
+                                            .map(|row| row.slug.clone())
+                                            .collect();
+                                        store.reap_remote_layouts("box", &live)?;
+                                    } else {
+                                        store.clear_slug_state(&gone)?;
+                                    }
+                                    Ok(())
+                                })
                                 .await
                                 .unwrap();
                         }
-                        listed.retain(|row| row.key != gone);
                         let after = laid_out(&fixture, &listed, sort).await;
-                        let mut expected = layout(&board);
-                        for (_, keys) in &mut expected {
-                            keys.retain(|key| *key != gone);
-                        }
-                        assert_eq!(
-                            layout(&after),
-                            expected,
-                            "seed {seed} press {press}: removed {gone} (forgotten: {forgotten}) under {sort:?}
-stored {}",
+                        let said = format!(
+                            "seed {seed} press {press}: removed {gone} (forgotten: {forgotten}) under {sort:?}\nstored {} {}\ndrawn {:?}\nredrawn {:?}",
                             before["slugs"],
+                            before["remoteLayouts"],
+                            layout(&board),
+                            layout(&after),
                         );
+                        let record = &before["slugs"][&gone];
+                        let status_forgotten = forgotten
+                            && !remote
+                            && record["work"].is_object()
+                            && record.get("creationAfter").is_some()
+                            && !record["order"].is_number();
+                        assert_removal_conserved(&board, &after, &gone, status_forgotten, &said);
                         removals += 1;
                         host = after.clone();
                         seen = after;

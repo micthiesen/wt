@@ -17,7 +17,7 @@ pub use ledger::{
 };
 pub use queue::{
     CancellableFiresInput, LOCAL_SIGHTING_WINDOW_MS, QueueIntentsInput, cancellable_fires,
-    queue_intents,
+    is_frozen_external_fire, queue_intents,
 };
 pub use types::{
     ActionAudience, ActionTraits, AutomationConflict, AutomationEvalContext, AutomationFire,

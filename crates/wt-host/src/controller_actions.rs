@@ -570,9 +570,20 @@ pub async fn execute_with_shutdown(
                 }),
             }
         }
-        UiAction::CleanupTargets { targets } => Ok(message(
-            lifecycle_ops::cleanup_targets_cached(ctx, &targets, github).await?,
-        )),
+        UiAction::CleanupTargets { targets } => {
+            let starts = lifecycle_ops::start_cleanup_targets_cached(ctx, &targets, github).await?;
+            // Every selected row is now decided: its worker holds its
+            // worktree's lifecycle lock, or nothing is running for it. What
+            // follows is a wait on those workers, so whole-host work on
+            // other checkouts may go on. A worker that may be running
+            // without its lock keeps the exclusion.
+            if let Some(hold) = hold
+                && starts.unresolved().is_empty()
+            {
+                hold.durable();
+            }
+            Ok(message(starts.finish().await?))
+        }
         UiAction::ToggleArchive { key, seen } => {
             if wt_core::is_remote_worktree_ledger_key(&key) {
                 let row = board

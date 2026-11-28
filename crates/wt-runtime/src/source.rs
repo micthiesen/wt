@@ -169,12 +169,14 @@ struct Keyed {
 }
 
 impl Intake {
-    fn raise_keys(&self, request: Request, keys: impl IntoIterator<Item = String>) {
+    fn raise_keys(&self, request: Request, keys: impl IntoIterator<Item = String>, index: bool) {
         let mut keyed = self
             .keyed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        keyed.index = keyed.index.max(Some(request));
+        if index {
+            keyed.index = keyed.index.max(Some(request));
+        }
         for key in keys {
             let entry = keyed.keys.entry(key).or_insert(request);
             *entry = (*entry).max(request);
@@ -245,7 +247,21 @@ impl<T> SourceHandle<T> {
         keys: impl IntoIterator<Item = impl Into<String>>,
     ) -> bool {
         self.intake
-            .raise_keys(request, keys.into_iter().map(Into::into));
+            .raise_keys(request, keys.into_iter().map(Into::into), true);
+        self.wake()
+    }
+
+    /// Like `request_keys` without listing the keys again: for a reader that
+    /// only doubts what it has read of rows it knows. A row read this way
+    /// keeps the stamp of the listing it was last listed by, so the domain
+    /// claims no more than its last listing.
+    pub fn request_rows(
+        &self,
+        request: Request,
+        keys: impl IntoIterator<Item = impl Into<String>>,
+    ) -> bool {
+        self.intake
+            .raise_keys(request, keys.into_iter().map(Into::into), false);
         self.wake()
     }
 

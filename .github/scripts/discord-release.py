@@ -72,6 +72,8 @@ def description(body: str) -> str:
 def payload(release: dict) -> dict:
     return {
         "username": "wt releases",
+        # Release notes are text: nothing in them may ping anyone.
+        "allowed_mentions": {"parse": []},
         "embeds": [{
             "title": release["name"] or f"wt {release['tag_name']}",
             "url": release["html_url"],

@@ -348,7 +348,7 @@ impl Family for LayoutChange {
                 if let Some(source) = source {
                     stored_positions(board, source);
                 }
-                if *top && !board.display.status_sort {
+                if *top || board.display.status_sort {
                     stored_positions(board, destination);
                 }
             }

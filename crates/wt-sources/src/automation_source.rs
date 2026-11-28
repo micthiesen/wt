@@ -225,6 +225,8 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             tracing::warn!(error = %format!("{error:#}"), "cannot complete removed worktrees' landings");
         }
         let mut last_run_check = None;
+        let mut fresh_asked = None::<tokio::time::Instant>;
+        let mut evidence_asks = EvidenceAsks::default();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -331,7 +333,15 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             let confirmed_metadata = sources.metadata.confirm(&metadata);
             let (confirmed_sessions, confirmed_inventory) =
                 confirm_session_inputs(&sources.sessions, &sources.inventory, &sessions, &inventory);
-            let fresh_github = automation_facts::fresh_github(sources.github.confirm(&github));
+            let confirmed_github = sources.github.confirm(&github);
+            let github_age = confirmed_github.as_ref().and_then(|github| github.age());
+            // What evidence of any age still proves: merges, which are final.
+            let settled_github = confirmed_github
+                .as_ref()
+                .map(|github| github.map(automation_facts::settled_only));
+            let fresh_github = automation_facts::fresh_github(confirmed_github);
+            let settled_github = settled_github.filter(|_| fresh_github.is_none());
+            let github_evidence = fresh_github.as_ref().or(settled_github.as_ref());
             let lanes_ready = *git.state() == SourceState::Ready
                 && *metadata.state() == SourceState::Ready;
             let metadata_key = metadata_facts_key(confirmed_metadata.as_deref());
@@ -347,7 +357,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 confirmed_git.as_deref().cloned(),
                 lanes_ready,
                 metadata_key,
-                fresh_github.as_deref().cloned(),
+                (github_evidence.map(|github| (**github).clone()), fresh_github.is_some()),
                 production.clone(),
                 deployed.clone(),
             );
@@ -371,7 +381,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 let lifecycle_key = (
                     confirmed_git.as_deref().cloned(),
                     lifecycle_metadata_key(confirmed_metadata.as_deref()),
-                    fresh_github.as_deref().cloned(),
+                    github_evidence.map(|github| (**github).clone()),
                     production,
                     deployed,
                 );
@@ -380,7 +390,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                         &context,
                         confirmed_git.as_ref(),
                         confirmed_metadata.as_ref(),
-                        fresh_github.as_ref(),
+                        github_evidence,
                         &context.config.automations,
                     ).await {
                         Ok(next) => {
@@ -420,6 +430,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                     metadata: confirmed_metadata.as_ref(),
                     lanes_ready,
                     github: fresh_github.as_ref(),
+                    settled: settled_github.as_ref(),
                     discoveries: confirmed_sessions.as_ref(),
                     inventory: confirmed_inventory.as_ref(),
                     activity: activity.data().map(|activity| &**activity),
@@ -480,6 +491,28 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
             }
             automation_facts::refresh_sessions(facts, confirmed_sessions.as_ref(), confirmed_inventory.as_ref());
             let queued = engine.retained_fires();
+            // A fire held back (settling, queued behind a busy session, an
+            // unmet requirement) is dropped once its GitHub evidence is 90
+            // seconds old, and on a quiet fleet nothing reads GitHub again
+            // for minutes. Keep the evidence young while one waits on it.
+            let evidence_wanted = evidence_asks.wanted(
+                queued
+                    .iter()
+                    .filter(|fire| holds_github_evidence(std::slice::from_ref(fire)))
+                    .map(|fire| {
+                        let id = fire_identity(fire);
+                        let settling = engine.in_settle_window(&id);
+                        (id, settling)
+                    }),
+                tokio::time::Instant::now(),
+            );
+            if evidence_wanted
+                && github_age.is_none_or(|age| age >= crate::github_source::KEEP_FRESH_AFTER)
+                && fresh_asked.is_none_or(|at| at.elapsed() >= KEEP_FRESH_RETRY)
+            {
+                fresh_asked = Some(tokio::time::Instant::now());
+                crate::github_source::keep_fresh(&sources.github);
+            }
             let undecided = queued.iter().any(|fire| !facts.requirements.contains_key(&fire_identity(fire)));
             if undecided || requirements_board_revision != Some(base_board.revision()) {
                 automation_facts::refresh_requirements(&context, facts, base_board.data().map(|board| &**board), &queued);
@@ -522,7 +555,7 @@ pub fn start(scope: &TaskScope, ctx: &AppContext, sources: AutomationSources) ->
                 let inventory_read_at = confirmed_git
                     .as_ref()
                     .filter(|_| facts.state_ready)
-                    .and_then(|git| git.age())
+                    .and_then(|git| git.listing_age())
                     .map(|age| now.saturating_sub(i64::try_from(age.as_millis()).unwrap_or(i64::MAX)));
                 let live = crate::watch_facts::live_owners(&facts.watch_rows, &watches, state, inventory_read_at.unwrap_or(i64::MIN));
                 if inventory_read_at.is_some()
@@ -1639,11 +1672,167 @@ fn confirm_session_inputs(
     )
 }
 
+/// How soon [`keep_fresh`](crate::github_source::keep_fresh) is asked
+/// again while the evidence stays old: the lane may be waiting out its
+/// floor or the budget, and each ask rereads the daemon's snapshot.
+const KEEP_FRESH_RETRY: Duration = Duration::from_secs(5);
+
+/// Evidence is kept young for a fire only while that can let it dispatch:
+/// through its settle window, which ends in a decision made on the evidence
+/// of that moment. A fire held by anything else (a busy session, an unmet
+/// requirement, a full slot, a cooldown) may wait for hours, and a read a
+/// minute for all of that buys nothing: it gets a short grace, in case the
+/// hold is brief, and is asked for again when it next settles.
+const ASK_SETTLING_MAX: Duration = Duration::from_secs(10 * 60);
+const ASK_HELD_GRACE: Duration = Duration::from_secs(3 * 60);
+/// A fire not seen this long starts over; one that lapses with its
+/// evidence and returns at the next read does not.
+const ASK_FORGET: Duration = Duration::from_secs(30 * 60);
+/// A fire away longer than this left the queue and came back.
+const ASK_GAP: Duration = Duration::from_secs(30);
+
+struct EvidenceAsk {
+    settling_since: Option<tokio::time::Instant>,
+    held_since: Option<tokio::time::Instant>,
+    seen: tokio::time::Instant,
+}
+
+/// Which held fires fresh GitHub evidence is still asked for.
+#[derive(Default)]
+struct EvidenceAsks(std::collections::BTreeMap<String, EvidenceAsk>);
+
+impl EvidenceAsks {
+    /// `fires` are the retained fires that lapse with their evidence, each
+    /// with whether only its settle window holds it. Returns whether any
+    /// still warrants a read.
+    fn wanted(
+        &mut self,
+        fires: impl IntoIterator<Item = (String, bool)>,
+        now: tokio::time::Instant,
+    ) -> bool {
+        let mut wanted = false;
+        for (id, settling) in fires {
+            let ask = self.0.entry(id).or_insert(EvidenceAsk {
+                settling_since: None,
+                held_since: None,
+                seen: now,
+            });
+            let returned = now.saturating_duration_since(ask.seen) > ASK_GAP;
+            ask.seen = now;
+            let (since, limit) = if settling {
+                ask.held_since = None;
+                if returned {
+                    ask.settling_since = None;
+                }
+                (*ask.settling_since.get_or_insert(now), ASK_SETTLING_MAX)
+            } else {
+                ask.settling_since = None;
+                (*ask.held_since.get_or_insert(now), ASK_HELD_GRACE)
+            };
+            wanted |= now.saturating_duration_since(since) <= limit;
+        }
+        self.0
+            .retain(|_, ask| now.saturating_duration_since(ask.seen) <= ASK_FORGET);
+        wanted
+    }
+}
+
+/// Whether a held fire belongs to a rule the evaluation produces only on
+/// fresh GitHub evidence (`wt_automations::evaluate` skips these triggers
+/// without it, and a pull-request conflict likewise): it disappears when
+/// that evidence ages out. A watch's fire, a branch advance, a deploy and
+/// an MCP event are occurrences that nothing clears. Nor does a merge: a
+/// fire about a merged pull request is held on evidence of any age, and
+/// keeping that young would cost a read a minute for nothing.
+fn holds_github_evidence(fires: &[wt_automations::AutomationFire]) -> bool {
+    use wt_config::AutomationTrigger as On;
+    fires.iter().any(|fire| {
+        matches!(
+            fire.rule.on,
+            On::PrChecksFailed
+                | On::ReviewBotUnresolved
+                | On::ReviewChangesRequested
+                | On::PrConflict
+                | On::PrMergeDropped
+                | On::StatusVerificationDue
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
     use wt_runtime::SourceSnapshot;
+
+    /// One fire behind an agent that works for hours asked for a GitHub
+    /// read every minute of those hours. It now costs its settle window and
+    /// a short grace, and is asked for again once it settles after the hold.
+    #[test]
+    fn a_fire_held_for_hours_does_not_keep_github_evidence_fresh() {
+        let mut asks = EvidenceAsks::default();
+        let start = tokio::time::Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let fire = |settling| [("fix-ci|row".to_owned(), settling)];
+        let mut asked = 0;
+        // Two minutes settling, then three hours behind a busy session,
+        // looked at every second while its evidence lasts.
+        for second in 0..120 {
+            asked += u64::from(asks.wanted(fire(true), at(second)));
+        }
+        assert_eq!(asked, 120, "its settle window is covered");
+        let mut second = 120;
+        while second < 3 * 60 * 60 {
+            asked += u64::from(asks.wanted(fire(false), at(second)));
+            second += 1;
+            // Its evidence gone, it lapses and returns, still held, with
+            // each read of GitHub that happens anyway.
+            if second > 120 + 181 + 90 && second % 600 == 90 {
+                second += 510;
+            }
+        }
+        assert_eq!(asked, 120 + 181, "a hold gets one short grace, not hours");
+        // The hold lifts: it settles again and is covered again.
+        // A settle window that never ends is bounded too.
+        let covered = (0..=700)
+            .filter(|extra| asks.wanted(fire(true), at(second + extra)))
+            .count();
+        assert_eq!(covered, 601);
+        // Lapsed and queued afresh, it gets a new window.
+        assert!(asks.wanted(fire(true), at(second + 800)));
+        // With nothing held, nothing is asked, and the fire is forgotten.
+        assert!(!asks.wanted([], at(second + 801)));
+        assert!(!asks.wanted([], at(second + 801 + 30 * 60 + 1)));
+        assert!(asks.0.is_empty());
+    }
+
+    #[test]
+    fn only_fires_that_lapse_with_github_evidence_keep_it_fresh() {
+        use wt_config::AutomationTrigger as On;
+        let on = |trigger| {
+            let mut fire = fire("one");
+            fire.rule.on = trigger;
+            fire
+        };
+        assert!(!holds_github_evidence(&[]));
+        for trigger in [
+            On::PrChecksFailed,
+            On::PrConflict,
+            On::StatusVerificationDue,
+        ] {
+            assert!(holds_github_evidence(&[on(On::WatchMet), on(trigger)]));
+        }
+        for trigger in [
+            On::WtMerged,
+            On::StackParentMerged,
+            On::WatchMet,
+            On::BranchAdvanced,
+            On::McpEvent,
+            On::StatusReady,
+        ] {
+            assert!(!holds_github_evidence(&[on(trigger)]));
+        }
+    }
 
     #[test]
     fn only_a_recorded_non_zero_shell_exit_is_a_definite_failure() {

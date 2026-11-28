@@ -42,6 +42,12 @@ pub enum Lane {
     /// owns exactly the checkouts it removes, as `(host, slug)` pairs, so
     /// unrelated checkouts stay available while each teardown runs.
     FleetCleanup(BTreeSet<(Option<String>, String)>),
+    /// A restack, which owns exactly the checkouts of the stack it replays:
+    /// the host and the slugs of the chain as the board shows it. Restacks
+    /// of different stacks share no checkout and run side by side; the
+    /// replay takes each member's lifecycle lock itself and refuses a stack
+    /// that changed under it.
+    Stack(Option<String>, BTreeSet<String>),
     /// Layout writes (fold, move, reorder, rename, archive). They serialize
     /// with each other because each one reads the order the last one wrote.
     Presentation,
@@ -145,12 +151,73 @@ pub fn lane_for(action: &wt_tui::UiAction) -> Result<Lane> {
                 | wt_tui::ActionSurface::Slot { .. } => None,
             },
         ),
-        // Stack operations and checkouts made for a review or a restore can
-        // span multiple checkouts.
-        A::Restack { .. } | A::ReviewCheckout { .. } | A::RestoreRemoved { .. } => Lane::Host(host),
+        // Which checkouts a restack replays is read from the board; without
+        // one it owns the host. See [`lane_on_board`].
+        A::Restack { .. } => Lane::Host(host),
+        // Each makes one new checkout through the lifecycle service's create
+        // path and touches no existing one, exactly as a creation does.
+        A::ReviewCheckout { .. } | A::RestoreRemoved { .. } => Lane::Creation(host),
         A::CleanupTargets { .. } => {
             unreachable!("cleanup lanes are resolved before host routing")
         }
+    })
+}
+
+/// [`lane_for`], with the board the request was made against. A restack then
+/// owns only its stack's checkouts. When the board does not show the row or
+/// its stack, the restack keeps the whole host.
+pub fn lane_on_board(action: &wt_tui::UiAction, board: Option<&wt_tui::Board>) -> Result<Lane> {
+    let lane = lane_for(action)?;
+    let (Lane::Host(host), Some(board)) = (&lane, board) else {
+        return Ok(lane);
+    };
+    let (_, resolved, _) = crate::host_routing::resolve(action.clone())?;
+    let wt_tui::UiAction::Restack { key } = resolved else {
+        return Ok(lane);
+    };
+    Ok(match stack_members(board, host, &key) {
+        Some(members) => Lane::Stack(host.clone(), members),
+        None => lane,
+    })
+}
+
+/// The slugs of the stack `slug` belongs to on `host`, inferred from fork
+/// bases the same way the restack itself infers its chain.
+fn stack_members(
+    board: &wt_tui::Board,
+    host: &Option<String>,
+    slug: &str,
+) -> Option<BTreeSet<String>> {
+    let members = board
+        .rows
+        .iter()
+        .filter(|row| row.host == *host && !row.pending_creation && !row.branch.is_empty())
+        .filter_map(|row| {
+            let slug = match wt_core::parse_worktree_ledger_key(&row.key)? {
+                wt_core::WorktreeRef::Local { slug }
+                | wt_core::WorktreeRef::Remote { slug, .. } => slug,
+            };
+            Some(wt_core::ChainMember::new(
+                slug,
+                row.branch.clone(),
+                row.base_branch.clone(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let branch = &members.iter().find(|member| member.slug == slug)?.branch;
+    let trunk = host
+        .as_ref()
+        .and_then(|host| board.host_display.get(host))
+        .map_or(&board.display.trunk, |display| &display.trunk);
+    let stacks = wt_core::build_stack_index(&members, trunk);
+    Some(match stacks.by_branch.get(branch) {
+        Some(entry) => stacks.layouts[entry.layout_index]
+            .nodes
+            .iter()
+            .map(|node| node.slug.clone())
+            .collect(),
+        // A checkout stacked on nothing, with nothing stacked on it.
+        None => BTreeSet::from([slug.to_owned()]),
     })
 }
 
@@ -199,6 +266,9 @@ pub fn lanes_conflict(left: &Lane, right: &Lane) -> bool {
         return true;
     }
     match (left, right) {
+        (Lane::Stack(host, members), other) | (other, Lane::Stack(host, members)) => {
+            return stack_conflicts(host, members, other);
+        }
         (Lane::FleetCleanup(_), Lane::FleetCleanup(_)) => return true,
         (Lane::FleetCleanup(targets), other) | (other, Lane::FleetCleanup(targets)) => {
             return cleanup_conflicts(targets, other);
@@ -295,7 +365,9 @@ fn budgets(lane: &Lane, durable: bool) -> [Option<Budget<'_>>; 2] {
             (!durable).then_some(Budget::Ordinary(host)),
             Some(Budget::Teardown(host)),
         ],
-        Lane::Host(host) | Lane::Action(host, _) => one(Budget::Ordinary(host)),
+        Lane::Host(host) | Lane::Action(host, _) | Lane::Stack(host, _) => {
+            one(Budget::Ordinary(host))
+        }
         Lane::Target(host, _) => one(Budget::Target(host)),
         Lane::SessionControl(host, _) => one(Budget::SessionControl(host)),
         Lane::Creation(host) => one(Budget::Creation(host)),
@@ -319,6 +391,7 @@ fn long_job(lane: &Lane) -> bool {
         lane,
         Lane::Host(_)
             | Lane::Action(_, _)
+            | Lane::Stack(_, _)
             | Lane::Removal(_, _)
             | Lane::Creation(_)
             | Lane::FleetCleanup(_)
@@ -333,11 +406,12 @@ pub struct LaneHold {
 }
 
 impl LaneHold {
-    /// A removal calls this once its durable worker is running. The worker
-    /// owns the checkout's lifecycle lock and finishes without this request,
-    /// which from here only waits for it. The request therefore stops
-    /// counting as a long job and stops excluding whole-host work; it still
-    /// excludes everything on its own checkout until it completes.
+    /// A removal calls this once its durable worker is running, and a
+    /// cleanup once every row it selected is started or refused. Each worker
+    /// owns its checkout's lifecycle lock and finishes without this request,
+    /// which from here only waits. The request therefore stops counting as
+    /// a long job and stops excluding whole-host work; it still excludes
+    /// everything on its own checkouts until it completes.
     pub fn durable(&self) {
         if !self.durable.swap(true, Ordering::SeqCst) {
             self.changed.notify_one();
@@ -352,7 +426,8 @@ struct Running {
 
 impl Running {
     fn durable(&self) -> bool {
-        matches!(self.lane, Lane::Removal(_, _)) && self.hold.durable.load(Ordering::SeqCst)
+        matches!(self.lane, Lane::Removal(_, _) | Lane::FleetCleanup(_))
+            && self.hold.durable.load(Ordering::SeqCst)
     }
 
     fn excludes(&self, lane: &Lane) -> bool {
@@ -459,6 +534,28 @@ impl FromIterator<Lane> for Admission {
 impl<const N: usize> From<[Lane; N]> for Admission {
     fn from(lanes: [Lane; N]) -> Self {
         lanes.into_iter().collect()
+    }
+}
+
+/// A restack excludes whole-host jobs on its host and, on the checkouts of
+/// its stack only: another restack, a removal or cleanup, an action, a
+/// pull-request or fork-base write, and a session stop.
+fn stack_conflicts(host: &Option<String>, members: &BTreeSet<String>, other: &Lane) -> bool {
+    match other {
+        Lane::Host(other_host) => host == other_host,
+        Lane::Stack(other_host, other_members) => {
+            host == other_host && !members.is_disjoint(other_members)
+        }
+        Lane::Removal(other_host, key)
+        | Lane::Target(other_host, key)
+        | Lane::Action(other_host, Some(key))
+        | Lane::SessionControl(other_host, Some(key)) => {
+            host == other_host && members.contains(key)
+        }
+        Lane::FleetCleanup(targets) => targets
+            .iter()
+            .any(|(target_host, key)| target_host == host && members.contains(key)),
+        _ => false,
     }
 }
 
@@ -701,6 +798,190 @@ mod tests {
         assert_eq!(take(&admission, &mut pending), None);
         admission.remove(&Lane::Host(None));
         assert_eq!(take(&admission, &mut pending), Some("later removal"));
+    }
+
+    /// Two stacks on this machine (a ← b ← c and x ← y), a single (solo),
+    /// and a stack with the same branch names on a remote host.
+    fn stacked_board() -> wt_tui::Board {
+        let row = |key: &str, base: &str, host: Option<&str>| wt_tui::BoardRow {
+            key: match host {
+                Some(host) => wt_core::remote_worktree_ledger_key(host, key),
+                None => key.into(),
+            },
+            slug: key.into(),
+            branch: format!("feature/{key}"),
+            base_branch: Some(if base == "main" {
+                base.into()
+            } else {
+                format!("feature/{base}")
+            }),
+            host: host.map(str::to_owned),
+            ..Default::default()
+        };
+        let mut board = wt_tui::Board {
+            rows: vec![
+                row("a", "main", None),
+                row("b", "a", None),
+                row("c", "b", None),
+                row("x", "main", None),
+                row("y", "x", None),
+                row("solo", "main", None),
+                row("a", "main", Some("builder")),
+                row("b", "a", Some("builder")),
+            ],
+            ..Default::default()
+        };
+        board.display.trunk = "main".into();
+        board
+    }
+
+    fn stack<const N: usize>(host: Option<&str>, members: [&str; N]) -> Lane {
+        Lane::Stack(
+            host.map(str::to_owned),
+            members.into_iter().map(str::to_owned).collect(),
+        )
+    }
+
+    #[test]
+    fn a_restack_owns_the_checkouts_of_its_stack_as_the_board_shows_it() {
+        let board = stacked_board();
+        let restack = |key: &str| UiAction::Restack { key: key.into() };
+        let lane = |key: &str| lane_on_board(&restack(key), Some(&board)).unwrap();
+        // Any member names the whole chain.
+        for key in ["a", "b", "c"] {
+            assert_eq!(lane(key), stack(None, ["a", "b", "c"]));
+        }
+        assert_eq!(lane("y"), stack(None, ["x", "y"]));
+        assert_eq!(lane("solo"), stack(None, ["solo"]));
+        // The same names on another host are another stack.
+        let remote = lane(&wt_core::remote_worktree_ledger_key("builder", "b"));
+        assert_eq!(remote, stack(Some("builder"), ["a", "b"]));
+        // Without a board, or for a row it does not show, the host is owned.
+        assert_eq!(
+            lane_on_board(&restack("a"), None).unwrap(),
+            Lane::Host(None)
+        );
+        assert_eq!(lane("unlisted"), Lane::Host(None));
+        // Nothing else changes with a board.
+        let title = UiAction::SetTitle {
+            key: "a".into(),
+            title: "t".into(),
+        };
+        assert_eq!(
+            lane_on_board(&title, Some(&board)).unwrap(),
+            lane_for(&title).unwrap()
+        );
+    }
+
+    #[test]
+    fn restacks_of_different_stacks_run_together_and_one_stack_serializes() {
+        let first = stack(None, ["a", "b", "c"]);
+        let second = stack(None, ["x", "y"]);
+        let admission = Admission::from([first.clone()]);
+        let mut pending = VecDeque::from([
+            (first.clone(), "same stack again"),
+            (stack(None, ["c", "d"]), "overlapping stack"),
+            (second.clone(), "another stack"),
+            (stack(Some("builder"), ["a", "b"]), "same names elsewhere"),
+        ]);
+        assert_eq!(take(&admission, &mut pending), Some("another stack"));
+        assert_eq!(take(&admission, &mut pending), Some("same names elsewhere"));
+        assert_eq!(take(&admission, &mut pending), None);
+        for (other, conflict) in [
+            (removal("b"), true),
+            (removal("x"), false),
+            (Lane::Action(None, Some("c".into())), true),
+            (Lane::Action(None, Some("x".into())), false),
+            (Lane::Action(None, None), false),
+            (Lane::Target(None, "a".into()), true),
+            (Lane::SessionControl(None, Some("a".into())), true),
+            (Lane::SessionControl(None, Some("x".into())), false),
+            (Lane::Removal(Some("builder".into()), "b".into()), false),
+            (Lane::Host(None), true),
+            (Lane::Host(Some("builder".into())), false),
+            (Lane::Creation(None), false),
+            (Lane::Metadata(None, "a".into()), false),
+            (Lane::Terminal(None, Some("a".into())), false),
+            (
+                Lane::FleetCleanup(BTreeSet::from([(None, "c".to_owned())])),
+                true,
+            ),
+            (
+                Lane::FleetCleanup(BTreeSet::from([(None, "x".to_owned())])),
+                false,
+            ),
+        ] {
+            assert_eq!(lanes_conflict(&first, &other), conflict, "{other:?}");
+            assert_eq!(
+                lanes_conflict(&other, &first),
+                conflict,
+                "symmetric {other:?}"
+            );
+        }
+        // They are long jobs: four per host, and a queued one keeps its turn.
+        let full = Admission::from(["p", "q", "r", "s"].map(|key| stack(None, [key])));
+        let mut pending = VecDeque::from([(second.clone(), "fifth restack")]);
+        assert_eq!(take(&full, &mut pending), None);
+        let mut pending =
+            VecDeque::from([(first, "queued restack"), (removal("b"), "later removal")]);
+        assert_eq!(take(&Admission::from([removal("c")]), &mut pending), None);
+    }
+
+    #[test]
+    fn a_review_checkout_and_a_restore_are_creations() {
+        for action in [
+            UiAction::ReviewCheckout {
+                url: "u".into(),
+                updated_at: "t".into(),
+                branch: "feature/review".into(),
+            },
+            UiAction::RestoreRemoved {
+                key: "gone".into(),
+                removed_at: "t".into(),
+                branch: "feature/gone".into(),
+            },
+        ] {
+            assert_eq!(
+                lane_for(&action).unwrap(),
+                Lane::Creation(None),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleanup_whose_rows_are_all_started_excludes_only_those_rows() {
+        let cleanup = Lane::FleetCleanup(BTreeSet::from([
+            (None, "old".to_owned()),
+            (Some("builder".to_owned()), "old".to_owned()),
+        ]));
+        let mut admission = Admission::default();
+        let hold = admission.insert(cleanup.clone());
+        let waiting = || {
+            VecDeque::from([
+                (Lane::Host(None), "review checkout"),
+                (Lane::Host(Some("builder".into())), "remote host job"),
+            ])
+        };
+        // Planning and starting: whole-host work on each host it touches waits.
+        assert_eq!(take(&admission, &mut waiting()), None);
+        hold.durable();
+        let mut pending = waiting();
+        assert_eq!(take(&admission, &mut pending), Some("review checkout"));
+        assert_eq!(take(&admission, &mut pending), Some("remote host job"));
+        let mut pending = VecDeque::from([
+            (removal("old"), "removal of its row"),
+            (Lane::Terminal(None, Some("old".into())), "enter its row"),
+            (Lane::Metadata(None, "old".into()), "title on its row"),
+            (stack(None, ["old", "child"]), "restack through its row"),
+            (
+                Lane::FleetCleanup(BTreeSet::from([(None, "other".to_owned())])),
+                "second cleanup",
+            ),
+        ]);
+        assert_eq!(take(&admission, &mut pending), None, "{:?}", pending[0].0);
+        admission.remove(&cleanup);
+        assert_eq!(take(&admission, &mut pending), Some("removal of its row"));
     }
 
     #[test]

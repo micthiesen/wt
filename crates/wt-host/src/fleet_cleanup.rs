@@ -10,8 +10,15 @@ use crate::{remote_board::Fleet, remote_host::RemoteHostError};
 
 /// Route the rows the combined confirmation captured to the hosts that own
 /// them. Unknown or reconfigured hosts are reported and skipped; each host
-/// checks its own rows again before it removes anything.
-pub async fn cleanup_targets(fleet: &Fleet, targets: Vec<CleanupTarget>) -> UiReply {
+/// checks its own rows again before it removes anything. `hold` is this
+/// cleanup's place in the controller's schedule: this machine's host narrows
+/// it once every local row is started or refused, and a remote host's worker
+/// narrows its own.
+pub async fn cleanup_targets(
+    fleet: &Fleet,
+    targets: Vec<CleanupTarget>,
+    hold: &wt_app_core::lanes::LaneHold,
+) -> UiReply {
     let hosts = fleet
         .remotes
         .iter()
@@ -30,12 +37,17 @@ pub async fn cleanup_targets(fleet: &Fleet, targets: Vec<CleanupTarget>) -> UiRe
     if !local.is_empty() {
         let service = fleet.local.clone();
         let revisions = local;
+        let hold = hold.clone();
         tasks.spawn(async move {
             (
                 "This machine".to_owned(),
                 revisions.len(),
                 service
-                    .execute(UiAction::CleanupTargets { targets: revisions })
+                    .execute_with_shutdown(
+                        UiAction::CleanupTargets { targets: revisions },
+                        None,
+                        Some(&hold),
+                    )
                     .await,
             )
         });

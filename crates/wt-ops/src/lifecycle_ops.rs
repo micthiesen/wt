@@ -94,35 +94,99 @@ pub fn with_detached_maintenance(ctx: &AppContext, service: LifecycleService) ->
         ctx.config.repository_config.clone(),
     );
     service.with_deferred_maintenance(move || {
-        let started = {
-            let mut command = std::process::Command::new(&executable);
-            command
-                .arg(MAINTENANCE_WORKER_COMMAND)
-                .current_dir(&main_clone)
-                .env("HOME", &home)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            if let Some(path) = &repository_config {
-                command.env("WT_REPO_CONFIG", path);
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                command.process_group(0);
-            }
-            command.spawn()
-        };
-        match started {
-            // Reaped here when it ends; it outlives this process otherwise.
-            Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
-            // The next origin fetch by the board or the events daemon runs
-            // the same maintenance.
-            Err(error) => {
-                tracing::warn!(target: "wt::origin", %error, "could not start ref maintenance after creation")
-            }
+        // On failure the next origin fetch by the board or the events
+        // daemon runs the same maintenance.
+        if let Err(error) = spawn_worker(
+            &executable,
+            MAINTENANCE_WORKER_COMMAND,
+            &main_clone,
+            &home,
+            repository_config.as_deref(),
+        ) {
+            tracing::warn!(target: "wt::origin", %error, "could not start ref maintenance after creation")
         }
     })
+}
+
+/// Start a hidden worker command in a process group of its own, so it
+/// outlives this process and the terminal it runs in.
+fn spawn_worker(
+    executable: &Path,
+    worker: &str,
+    main_clone: &Path,
+    home: &Path,
+    repository_config: Option<&Path>,
+) -> std::io::Result<()> {
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg(worker)
+        .current_dir(main_clone)
+        .env("HOME", home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(path) = repository_config {
+        command.env("WT_REPO_CONFIG", path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    // Reaped here when it ends; it outlives this process otherwise.
+    drop(std::thread::spawn(move || child.wait()));
+    Ok(())
+}
+
+/// Name of the hidden command that deletes removed checkouts no removal is
+/// going to delete.
+pub const QUARANTINE_WORKER_COMMAND: &str = "_delete-removed-checkouts";
+
+/// Hand the abandoned removed checkouts to a process of its own. Deleting
+/// one can take minutes, and done here it would hold this process's budget
+/// for bulk commands (shared with fetches and creations) all that time and
+/// stop when this process exits. `None` when this process is not a wt
+/// binary and has no such command to start.
+pub fn start_quarantine_worker(ctx: &AppContext) -> Option<std::io::Result<()>> {
+    let executable = WORKER_EXECUTABLE.get()?;
+    Some(spawn_worker(
+        executable,
+        QUARANTINE_WORKER_COMMAND,
+        &ctx.config.paths.main_clone,
+        &ctx.home,
+        ctx.config.repository_config.as_deref(),
+    ))
+}
+
+/// Delete the removed checkouts no worker is going to delete, and return
+/// the ones this call deleted. The lifecycle service takes each one's own
+/// lock first, which a live removal worker holds, and deletes within the
+/// machine's bound on such deletions.
+pub async fn delete_abandoned_quarantines(ctx: &AppContext) -> Vec<PathBuf> {
+    let service = LifecycleService::new(
+        ServiceConfig::from_config(&ctx.config),
+        (*ctx.repository).clone(),
+        ctx.processes.clone(),
+    );
+    let sweep = service.sweep_quarantines(&ctx.cancellation).await;
+    for warning in &sweep.warnings {
+        tracing::warn!(target: "wt::maintenance", %warning, "a removed checkout could not be deleted");
+    }
+    if !sweep.deleted.is_empty() {
+        tracing::info!(
+            target: "wt::maintenance",
+            removed_checkouts = ?sweep.deleted,
+            "deleted removed checkouts no removal was going to delete"
+        );
+    }
+    sweep.deleted
+}
+
+/// Body of [`QUARANTINE_WORKER_COMMAND`]. It has no caller to answer.
+pub async fn run_quarantine_worker(ctx: &AppContext) -> Result<i32> {
+    delete_abandoned_quarantines(ctx).await;
+    Ok(0)
 }
 
 /// Body of [`MAINTENANCE_WORKER_COMMAND`]. It has no caller to answer:
@@ -1230,7 +1294,10 @@ pub async fn cleanup_confirmed(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
 ) -> Result<String> {
-    cleanup_with_evidence(ctx, confirmed, Evidence::Fresh, None).await
+    start_cleanup_with_evidence(ctx, confirmed, Evidence::Fresh, None)
+        .await?
+        .finish()
+        .await
 }
 
 /// Check the exact board-selected rows after confirmation. Only confirmed
@@ -1240,7 +1307,88 @@ pub async fn cleanup_targets_cached(
     targets: &[wt_tui::CleanupTarget],
     github: Option<&Confirmed<GithubData>>,
 ) -> Result<String> {
-    cleanup_with_evidence(ctx, &[], Evidence::Cached(github), Some(targets)).await
+    start_cleanup_targets_cached(ctx, targets, github)
+        .await?
+        .finish()
+        .await
+}
+
+/// The first half of [`cleanup_targets_cached`]: plan every selected row
+/// and start the removal of each one that passes. It returns once every
+/// selected row is decided, before any removal is waited for:
+///
+/// - started ([`CleanupStarts::started`]): its worker holds the worktree's
+///   lifecycle lock until the removal ends, or has already finished (the
+///   contract of `_destroy::start_prepared_remove`). No other lifecycle
+///   operation can reach that worktree first, so whoever kept other work
+///   off the host for these rows may stop.
+/// - kept: refused or failed before a worker took it. Nothing is running.
+/// - unresolved ([`CleanupStarts::unresolved`]): a worker acknowledged the
+///   job and did not report holding the worktree in time. It may still be
+///   running without the lock, so these rows are not safe to stop
+///   excluding.
+///
+/// [`CleanupStarts::finish`] then waits for the started removals and gives
+/// the reply `cleanup_targets_cached` gives. Dropping the value instead
+/// abandons only the wait: the workers are durable and finish on their own.
+pub async fn start_cleanup_targets_cached(
+    ctx: &AppContext,
+    targets: &[wt_tui::CleanupTarget],
+    github: Option<&Confirmed<GithubData>>,
+) -> Result<CleanupStarts> {
+    start_cleanup_with_evidence(ctx, &[], Evidence::Cached(github), Some(targets)).await
+}
+
+/// One removal a cleanup started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartedRemoval {
+    /// The worktree's ledger key, as the selection named it.
+    pub key: String,
+    pub slug: String,
+    /// The durable job, for `_destroy::wait_for_completion`.
+    pub job_id: String,
+    index: usize,
+}
+
+/// A cleanup whose every selected row is decided: see
+/// [`start_cleanup_targets_cached`].
+pub struct CleanupStarts {
+    ctx: AppContext,
+    outcome: StartOutcome,
+}
+
+/// What the start half decided, apart from how completions are waited for.
+struct StartOutcome {
+    /// Why each selection was kept, in the order it was confirmed.
+    kept: Vec<Option<String>>,
+    started: Vec<StartedRemoval>,
+    /// Slugs whose start could not tell whether its worker runs.
+    unresolved: Vec<String>,
+}
+
+impl CleanupStarts {
+    /// The removals now running under their own worktree locks.
+    pub fn started(&self) -> &[StartedRemoval] {
+        &self.outcome.started
+    }
+
+    /// The slugs whose worker may be running without having taken its
+    /// worktree's lock. Empty in the ordinary case.
+    pub fn unresolved(&self) -> &[String] {
+        &self.outcome.unresolved
+    }
+
+    /// Wait for every started removal and report the whole cleanup, as
+    /// [`cleanup_targets_cached`] does. Like that call it waits on the
+    /// durable jobs and ignores UI cancellation, so an accepted cleanup is
+    /// drained at shutdown the same way.
+    pub async fn finish(self) -> Result<String> {
+        let ctx = &self.ctx;
+        finish_cleanup(self.outcome, |job| async move {
+            crate::commands::_destroy::wait_for_completion(ctx, &job).await
+        })
+        .await
+    }
 }
 
 enum Evidence<'a> {
@@ -1248,12 +1396,12 @@ enum Evidence<'a> {
     Cached(Option<&'a Confirmed<GithubData>>),
 }
 
-async fn cleanup_with_evidence(
+async fn start_cleanup_with_evidence(
     ctx: &AppContext,
     confirmed: &[wt_tui::RemovalRevision],
     evidence: Evidence<'_>,
     targets: Option<&[wt_tui::CleanupTarget]>,
-) -> Result<String> {
+) -> Result<CleanupStarts> {
     // Board selections carry identity only. Current hazards and landing proof
     // must pass before the worker receives its locked removal revision.
     let selections = if let Some(targets) = targets {
@@ -1299,7 +1447,7 @@ async fn cleanup_with_evidence(
         .map_err(|error| format!("{error:#}"));
     let (lifecycle, published_bases, prepared, state) =
         (&lifecycle, &published_bases, &prepared, &state);
-    run_cleanup(
+    let outcome = start_cleanup(
         &selections,
         rows,
         kept,
@@ -1334,9 +1482,12 @@ async fn cleanup_with_evidence(
             )
             .await
         },
-        |job| async move { crate::commands::_destroy::wait_for_completion(ctx, &job).await },
     )
-    .await
+    .await;
+    Ok(CleanupStarts {
+        ctx: ctx.clone(),
+        outcome,
+    })
 }
 
 /// The live rows a confirmed cleanup may touch: for each selection, the
@@ -1372,24 +1523,22 @@ fn select_rows(
 /// Plan each selected row on its own and start its removal as soon as its
 /// plan passes, while later rows are still being read: a failed or refused
 /// row keeps only itself, and a removal never waits on another row's
-/// checkout. `start` returns the job `wait` then follows to its end.
-async fn run_cleanup<P, PF, S, SF, W, WF>(
+/// checkout. Returns when every row is started or kept. `start` returns
+/// the job that [`finish_cleanup`] then follows to its end.
+async fn start_cleanup<P, PF, S, SF>(
     selections: &[CleanupSelection<'_>],
     rows: Vec<(usize, WorktreeRecord)>,
-    mut kept: Vec<Option<String>>,
+    kept: Vec<Option<String>>,
     plan: P,
     start: S,
-    wait: W,
-) -> Result<String>
+) -> StartOutcome
 where
     P: Fn(WorktreeRecord) -> PF,
     PF: Future<Output = Result<RemovalPlan>>,
     S: Fn(RemovalPlan) -> SF,
     SF: Future<Output = Result<String>>,
-    W: Fn(String) -> WF,
-    WF: Future<Output = Result<()>>,
 {
-    let (plan, start, wait) = (&plan, &start, &wait);
+    let (plan, start) = (&plan, &start);
     let mut starting = std::pin::pin!(
         stream::iter(rows)
             // Items are owned: a borrowed one makes the stream's closure
@@ -1413,35 +1562,65 @@ where
                 (index, slug, started)
             })
             .buffer_unordered(PLAN_ROWS)
-            .fuse()
     );
-    let mut finishing = FuturesUnordered::new();
+    let mut outcome = StartOutcome {
+        kept,
+        started: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    while let Some((index, slug, started)) = starting.next().await {
+        match started {
+            Ok(job_id) => outcome.started.push(StartedRemoval {
+                key: selections[index].key().to_owned(),
+                slug,
+                job_id,
+                index,
+            }),
+            Err(error) => {
+                if error
+                    .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                    .is_some()
+                {
+                    outcome.unresolved.push(slug.clone());
+                }
+                outcome.kept[index] = Some(format!("{slug}: {error:#}"));
+            }
+        }
+    }
+    outcome
+}
+
+/// Follow every started removal to its end and word the cleanup's reply.
+/// The removals run in their own workers, so they are waited for together.
+async fn finish_cleanup<W, WF>(outcome: StartOutcome, wait: W) -> Result<String>
+where
+    W: Fn(String) -> WF,
+    WF: Future<Output = Result<()>>,
+{
+    let StartOutcome {
+        mut kept,
+        started,
+        unresolved,
+    } = outcome;
+    let wait = &wait;
+    let mut finishing: FuturesUnordered<_> = started
+        .into_iter()
+        .map(|removal| async move {
+            let finished = wait(removal.job_id).await;
+            (removal.index, removal.slug, finished)
+        })
+        .collect();
     let mut removed = 0;
-    let mut uncertain = false;
-    loop {
-        tokio::select! {
-            Some((index, slug, started)) = starting.next() => match started {
-                Ok(job) => finishing.push(async move {
-                    let finished = wait(job).await;
-                    (index, slug, finished)
-                }),
-                Err(error) => {
-                    uncertain |= error
-                        .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
-                        .is_some();
-                    kept[index] = Some(format!("{slug}: {error:#}"));
-                }
-            },
-            Some((index, slug, finished)) = finishing.next() => match finished {
-                Ok(()) => removed += 1,
-                Err(error) => {
-                    uncertain |= error
-                        .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
-                        .is_some();
-                    kept[index] = Some(format!("{slug}: {error:#}"));
-                }
-            },
-            else => break,
+    let mut uncertain = !unresolved.is_empty();
+    while let Some((index, slug, finished)) = finishing.next().await {
+        match finished {
+            Ok(()) => removed += 1,
+            Err(error) => {
+                uncertain |= error
+                    .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                    .is_some();
+                kept[index] = Some(format!("{slug}: {error:#}"));
+            }
         }
     }
     let kept: Vec<String> = kept.into_iter().flatten().collect();
@@ -1456,6 +1635,30 @@ where
         bail!("Removed {removed}; kept {}", kept.join("; "));
     }
     Ok(format!("Removed {removed} worktrees"))
+}
+
+#[cfg(test)]
+async fn run_cleanup<P, PF, S, SF, W, WF>(
+    selections: &[CleanupSelection<'_>],
+    rows: Vec<(usize, WorktreeRecord)>,
+    kept: Vec<Option<String>>,
+    plan: P,
+    start: S,
+    wait: W,
+) -> Result<String>
+where
+    P: Fn(WorktreeRecord) -> PF,
+    PF: Future<Output = Result<RemovalPlan>>,
+    S: Fn(RemovalPlan) -> SF,
+    SF: Future<Output = Result<String>>,
+    W: Fn(String) -> WF,
+    WF: Future<Output = Result<()>>,
+{
+    finish_cleanup(
+        start_cleanup(selections, rows, kept, plan, start).await,
+        wait,
+    )
+    .await
 }
 
 enum CleanupSelection<'a> {
@@ -1519,6 +1722,44 @@ fn same_revision(plan: &wt_lifecycle::RemovalRevision, expected: &wt_tui::Remova
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker is started with its command, in the main clone, with the
+    /// repository selectors of the process that started it.
+    #[cfg(unix)]
+    #[test]
+    fn a_worker_is_started_with_its_command_and_the_callers_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = std::fs::canonicalize(dir.path()).unwrap();
+        let (script, seen) = (dir_path.join("wt"), dir_path.join("seen"));
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s|%s|%s|%s' \"$1\" \"$PWD\" \"$HOME\" \"$WT_REPO_CONFIG\" > seen.tmp && mv seen.tmp seen\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dir_path.join("repo.toml");
+        spawn_worker(
+            &script,
+            QUARANTINE_WORKER_COMMAND,
+            &dir_path,
+            &dir_path,
+            Some(&config),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !seen.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let home = dir_path.display();
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            format!(
+                "_delete-removed-checkouts|{home}|{home}|{}",
+                config.display()
+            )
+        );
+    }
     use wt_app_core::test_support::CommandFixture;
 
     #[test]
@@ -2802,6 +3043,86 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|row| row.target.slug() == "one")
+        );
+        fixture.close().await.unwrap();
+    }
+
+    /// What the controller waits for: every row decided, and nothing waited
+    /// for yet. A removal still in teardown does not hold the start half.
+    #[tokio::test]
+    async fn a_cleanup_reports_its_starts_before_it_waits_for_any_removal() {
+        let fixture = CommandFixture::new().await.unwrap();
+        let template = row_one(&fixture.ctx).await;
+        let live: Vec<WorktreeRecord> = ["a", "b", "c"]
+            .iter()
+            .map(|slug| fake_row(&template, slug))
+            .collect();
+        let confirmed: Vec<wt_tui::CleanupTarget> = live
+            .iter()
+            .map(|row| wt_tui::CleanupTarget {
+                key: wt_core::worktree_target_key(&row.target),
+                path: row.target.path.clone(),
+                branch: row.target.branch.clone(),
+                head: row.head_sha.clone().unwrap(),
+            })
+            .collect();
+        let selections: Vec<_> = confirmed.iter().map(CleanupSelection::Target).collect();
+        let (rows, kept) = select_rows(live, &selections);
+        let outcome = start_cleanup(
+            &selections,
+            rows,
+            kept,
+            |row| async move {
+                if row.target.slug() == "b" {
+                    anyhow::bail!("uncommitted changes");
+                }
+                Ok(fake_plan(row))
+            },
+            |plan| async move {
+                if plan.row.target.slug() == "c" {
+                    return Err(crate::commands::_destroy::RemovalUncertain(
+                        "removal job did not report holding the worktree".into(),
+                    )
+                    .into());
+                }
+                Ok(format!("job-{}", plan.row.target.slug()))
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome
+                .started
+                .iter()
+                .map(|removal| (
+                    removal.key.as_str(),
+                    removal.slug.as_str(),
+                    removal.job_id.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("a", "a", "job-a")]
+        );
+        assert_eq!(outcome.unresolved, ["c"]);
+        assert!(outcome.kept[1].as_deref().unwrap().contains("uncommitted"));
+
+        // The teardown of "a" is still running when the starts are known.
+        let waited = std::sync::atomic::AtomicUsize::new(0);
+        let error = finish_cleanup(outcome, |job| {
+            waited.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                assert_eq!(job, "job-a");
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(waited.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            error
+                .downcast_ref::<crate::commands::_destroy::RemovalUncertain>()
+                .unwrap()
+                .0,
+            "Removed 1; unresolved: b: uncommitted changes; \
+             c: removal job did not report holding the worktree"
         );
         fixture.close().await.unwrap();
     }

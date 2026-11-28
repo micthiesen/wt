@@ -60,6 +60,24 @@ pub fn fresh_github(github: Option<Confirmed<GithubData>>) -> Option<Confirmed<G
     github.filter(|github| github.fresh_within(GITHUB_FRESH_WITHIN))
 }
 
+/// What confirmed GitHub evidence still proves once it is no longer fresh:
+/// a merge is final, so a merged pull request stays one, with its number,
+/// head and merge time. Everything else it says may have changed since and
+/// is left out, and no branch counts as read: an absent pull request is
+/// not an answer.
+pub fn settled_only(data: &GithubData) -> GithubData {
+    GithubData {
+        prs: data
+            .prs
+            .iter()
+            .filter(|(_, pr)| pr.state == "MERGED")
+            .map(|(branch, pr)| (branch.clone(), pr.clone()))
+            .collect(),
+        observed_at_ms: data.observed_at_ms,
+        ..GithubData::default()
+    }
+}
+
 /// Facts that drive actions come only from confirmed leaves: data this
 /// process fetched live, never restored cache or optimistic projections.
 pub struct AutomationInputs<'a> {
@@ -69,6 +87,9 @@ pub struct AutomationInputs<'a> {
     pub lanes_ready: bool,
     /// Already filtered by `fresh_github`.
     pub github: Option<&'a Confirmed<GithubData>>,
+    /// Confirmed evidence of any age reduced by [`settled_only`], read
+    /// when `github` is absent.
+    pub settled: Option<&'a Confirmed<GithubData>>,
     pub discoveries: Option<&'a Confirmed<SessionDiscoveries>>,
     pub inventory: Option<&'a Confirmed<SessionInventory>>,
     pub activity: Option<&'a SessionActivitySnapshot>,
@@ -217,7 +238,10 @@ pub async fn prepare(
         .map(|github| github.covered_branches.clone())
         .unwrap_or_default();
     let empty = GithubData::default();
-    let github = input.github.map_or(&empty, |github| &**github);
+    let github = input
+        .github
+        .or(input.settled)
+        .map_or(&empty, |github| &**github);
     let records = git
         .iter()
         .map(|snapshot| snapshot.worktree.clone())
@@ -285,7 +309,21 @@ pub async fn prepare(
         }
         let stored = &state["slugs"][&slug];
         let work = serde_json::from_value::<WorkStatusRecord>(stored["work"].clone()).ok();
-        let pr = github.prs.get(&branch).map(|pr| AutomationPr {
+        // Evidence that is not fresh carries merges alone, and a merge
+        // proves only the work it merged: the pull request's head must be
+        // this checkout's, unless the lifecycle evidence shows the landing
+        // itself. Commits and a new pull request made since that read are
+        // not the work the old one merged.
+        let landed = input
+            .lifecycle
+            .get(&slug)
+            .is_some_and(|lifecycle| lifecycle.local_merged == Some(true));
+        let known_pr = github.prs.get(&branch).filter(|pr| {
+            github_fresh
+                || landed
+                || (pr.head_ref_oid.is_some() && pr.head_ref_oid == record.head_sha)
+        });
+        let pr = known_pr.map(|pr| AutomationPr {
             number: pr.number,
             state: pr.state.clone(),
             head_sha: pr.head_ref_oid.clone(),
@@ -304,7 +342,7 @@ pub async fn prepare(
             },
             merged_at_ms: pr.merged_at.as_deref().and_then(wt_core::parse_iso_millis),
         });
-        let conflict = github.prs.get(&branch).and_then(|pr| {
+        let conflict = known_pr.and_then(|pr| {
             pr.mergeable.as_ref().map(|mergeable| AutomationConflict {
                 base: pr.base_ref_name.clone(),
                 conflicted: mergeable == "CONFLICTING",
@@ -349,7 +387,7 @@ pub async fn prepare(
             watch_row(WatchRowInput {
                 created_at: stored["createdAt"].as_str(),
                 work: work.as_ref(),
-                pr: github.prs.get(&branch),
+                pr: known_pr,
                 // GitHub read this branch just now: no PR is an answer.
                 pr_read: github_fresh && github_covered_branches.contains(&branch),
                 queue: github.merge_queue.get(&branch),
@@ -624,7 +662,9 @@ pub(crate) fn watch_row(input: WatchRowInput<'_>) -> wt_core::watch::RowFacts {
         ),
         _ => Some(false),
     };
-    let pr_merged = input.pr_read && input.pr.is_some_and(|pr| pr.state == "MERGED");
+    // A merge is final: a merged pull request in confirmed evidence is one
+    // at any age, whether or not this pass read its branch.
+    let pr_merged = input.pr.is_some_and(|pr| pr.state == "MERGED");
     let lifecycle = input.lifecycle.unwrap_or_default();
     let base = lifecycle.local_merged == Some(true) || pr_merged;
     let landing = wt_core::Landing::new(base, lifecycle.in_production, input.separate_production)
@@ -1552,6 +1592,7 @@ mod tests {
                 metadata: Some(&metadata),
                 lanes_ready: true,
                 github: None,
+                settled: None,
                 discoveries: None,
                 inventory: None,
                 activity: None,
@@ -1619,6 +1660,7 @@ mod tests {
                 metadata: Some(&metadata),
                 lanes_ready: true,
                 github: None,
+                settled: None,
                 discoveries: None,
                 inventory: None,
                 activity: None,
@@ -1710,6 +1752,175 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// GitHub evidence half an hour old still proves a merge, and only
+    /// that: the merged pull request stays on its row, with its number,
+    /// while an open one with failing checks is gone and fires nothing.
+    #[tokio::test]
+    async fn old_github_evidence_proves_merges_and_nothing_else() {
+        let mut fixture = landed_fixture().await;
+        std::sync::Arc::make_mut(&mut fixture.ctx.config)
+            .automations
+            .push(AutomationDef {
+                id: "fix-ci".into(),
+                on: wt_config::AutomationTrigger::PrChecksFailed,
+                run: "fix-ci".into(),
+                ..Default::default()
+            });
+        let ctx = &fixture.ctx;
+        let snapshots = ctx
+            .repository
+            .inventory_status(&ctx.cancellation)
+            .await
+            .unwrap();
+        let branch = |slug: &str| {
+            let row = snapshots
+                .iter()
+                .find(|row| row.worktree.target.slug() == slug)
+                .unwrap();
+            row.worktree.target.branch.clone()
+        };
+        let pr = |number: u64, branch: &str, state: &str, checks: &str| {
+            let mut pr = serde_json::from_value::<wt_github::PullRequest>(serde_json::json!({
+                "number": number, "url": format!("https://github.com/o/r/pull/{number}"),
+                "headRefName": branch, "baseRefName": "main", "title": "A PR",
+                "isDraft": false, "state": state, "checks": checks, "failedChecks": [],
+                "review": "pending", "reviewRequests": 0, "requestedReviewers": [],
+                "suggestedReviewers": [], "comments": [], "unresolvedThreads": 0,
+                "unresolvedThreadsTotal": 0, "reviewBot": null, "autoMerge": null,
+            }))
+            .unwrap();
+            pr.head_ref_oid = Some("abc12345".into());
+            pr
+        };
+        let (one, two) = (branch("one"), branch("two"));
+        let read = GithubData {
+            prs: [
+                (one.clone(), pr(7, &one, "MERGED", "pass")),
+                (two.clone(), pr(8, &two, "OPEN", "fail")),
+            ]
+            .into(),
+            covered_branches: [one.clone(), two.clone()].into(),
+            merge_queue_complete: true,
+            ..GithubData::default()
+        };
+        let state = ctx
+            .database
+            .call(|store| Ok(store.read_wt_state()?))
+            .await
+            .unwrap();
+        let git = Confirmed::for_test(snapshots.clone());
+        let metadata = Confirmed::for_test((state, BTreeSet::new()));
+        let edits = BTreeMap::new();
+        let fires = |fresh: Option<Confirmed<GithubData>>,
+                     settled: Option<Confirmed<GithubData>>| {
+            let (git, metadata, edits) = (&git, &metadata, &edits);
+            async move {
+                let evidence = lifecycle_facts(
+                    ctx,
+                    Some(git),
+                    Some(metadata),
+                    fresh.as_ref().or(settled.as_ref()),
+                    &ctx.config.automations,
+                )
+                .await
+                .unwrap();
+                let prepared = prepare(
+                    ctx,
+                    AutomationInputs {
+                        git: Some(git),
+                        metadata: Some(metadata),
+                        lanes_ready: true,
+                        github: fresh.as_ref(),
+                        settled: settled.as_ref(),
+                        discoveries: None,
+                        inventory: None,
+                        activity: None,
+                        board: None,
+                        last_edit_at_ms: edits,
+                        rules: &ctx.config.automations,
+                        lifecycle: &evidence.rows,
+                    },
+                )
+                .await
+                .unwrap();
+                let fired = evaluate(&ctx.config.automations, &prepared.rows, &prepared.context)
+                    .into_iter()
+                    .map(|fire| (fire.rule.id, fire.fire_keys.into_iter().next().unwrap()))
+                    .collect::<Vec<_>>();
+                (prepared, fired)
+            }
+        };
+
+        // Fresh: both pull requests count.
+        let (_, fresh) = fires(Some(Confirmed::for_test(read.clone())), None).await;
+        assert_eq!(fresh.len(), 2, "{fresh:?}");
+
+        // Old: what the source keeps of it is the merge alone.
+        let kept = settled_only(&read);
+        assert_eq!(kept.prs.keys().collect::<Vec<_>>(), [&one]);
+        assert!(kept.covered_branches.is_empty() && !kept.merge_queue_complete);
+        let (prepared, old) = fires(None, Some(Confirmed::for_test(kept))).await;
+        assert!(!prepared.context.github_fresh);
+        assert_eq!(
+            old,
+            [(
+                "delete-landed-branch".to_owned(),
+                "delete-landed-branch:merged:one:7".to_owned()
+            )],
+            "the merged fire is held on old evidence, under its pull request"
+        );
+        let row = |slug: &str| prepared.rows.iter().find(|row| row.slug == slug).unwrap();
+        assert!(row("two").pr.is_none(), "an open pull request is not final");
+        assert_eq!(prepared.watch_rows["one"].merged, Some(true));
+        // No pull request in old evidence is not "no pull request".
+        assert_eq!(prepared.watch_rows["two"].closed, None);
+
+        // A merge proves only the work it merged. `two` has not landed by
+        // Git's account, so an old merged pull request counts for it only
+        // at the head this checkout is at; fresh evidence is not held to
+        // that.
+        let head = snapshots
+            .iter()
+            .find(|row| row.worktree.target.slug() == "two")
+            .and_then(|row| row.worktree.head_sha.clone())
+            .expect("the fixture checkout has a head");
+        let merged_at = |oid: &str| {
+            let mut merged = pr(9, &two, "MERGED", "pass");
+            merged.head_ref_oid = Some(oid.to_owned());
+            Confirmed::for_test(GithubData {
+                prs: [(two.clone(), merged)].into(),
+                ..GithubData::default()
+            })
+        };
+        let carried = |prepared: &PreparedAutomationFacts| {
+            let row = prepared.rows.iter().find(|row| row.slug == "two").unwrap();
+            (
+                row.pr.as_ref().map(|pr| pr.number),
+                prepared.watch_rows["two"].merged == Some(true),
+            )
+        };
+        let (same_head, _) = fires(None, Some(merged_at(&head))).await;
+        assert_eq!(carried(&same_head), (Some(9), true));
+        let moved = "0000000000000000000000000000000000000000";
+        let (new_work, _) = fires(None, Some(merged_at(moved))).await;
+        assert_eq!(
+            carried(&new_work),
+            (None, false),
+            "an old merge vouched for commits made since"
+        );
+        let (fresh_read, _) = fires(Some(merged_at(moved)), None).await;
+        assert_eq!(carried(&fresh_read).0, Some(9));
+
+        // None at all: nothing about a pull request is said.
+        let (prepared, none) = fires(None, None).await;
+        assert!(prepared.rows.iter().all(|row| row.pr.is_none()));
+        assert!(
+            none.iter()
+                .all(|(rule, key)| rule != "fix-ci" && key.ends_with(":local"))
+        );
+        fixture.close().await.unwrap();
     }
 
     #[tokio::test]

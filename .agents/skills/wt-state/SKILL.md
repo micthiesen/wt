@@ -26,10 +26,11 @@ each one (`docs/configuration.md`); a setup with no repository `.wt.toml` uses
 | `$ROOT/query/*.json`, `$ROOT/remote-query/` | Last snapshot of each board source (`git`, `github`, ...); display-only cache |
 | `$ROOT/events/` | Events daemon: `state.json`, `github.json`, `daemon.out.log`, `daemon.err.log` |
 | `$ROOT/locks/*.lock` | Lock files: one per slug operation, numbered slot files (`__process-heavy-<n>`, `__fleet-scan-<n>`, `__dependency-install-<n>`, `__quarantine-delete-<n>`), and for action runs `action-<hash>`, `action-worker-<hash>` (one worktree's running worker) and `action-state-00` to `3f`. Files are never deleted, so a file is not a held lock. `action-run-<run id>` and `action-state-<run id>` are leftovers of older builds |
-| `<git common dir>/wt-locks/` | Repository locks: the origin fetch lock, `main-dependency-sync` and its `.stamp` (the commit the main clone's packages were installed at) |
+| `<git common dir>/wt-locks/` | Repository locks: the origin fetch lock, `main-dependency-sync`, its `.stamp` (the commit the main clone's packages were installed at) and `main-dependency-sync-stamp` |
 | `$ROOT/automations.json` | Automation ledger (handled fires, breakers, deferrals); compact JSON |
 | `$ROOT/automations-queue.<repo-id>.json` | The engine's queue as `wt automations` prints it; rewritten on change and at least once a minute |
-| `$ROOT/wait-github-<repo-id>.json` | The GitHub answer every `wt wait` of the repository shares |
+| `$ROOT/wait-github-<repo-id>.json` | The GitHub read that `wt wait`, `wt ls`, `wt fleet` and printed landings share: written by whichever read GitHub last, reused for 90 seconds by display commands |
+| `$ROOT/config-warnings-<hash>.json` | One per repository id: the config warnings already logged and sent to the attention feed, so a standing warning is reported once; `wt doctor` lists them all |
 | `$ROOT/dev/`, `$ROOT/manager/`, `$ROOT/harness.json`, `$ROOT/*-sessions.json` | Dev servers, manager reports, agent session records |
 | `~/.local/state/wt/wt.sqlite` | Authoritative state for all repositories, partitioned by `repo_id` |
 
@@ -57,6 +58,17 @@ An automation's `queued` and `left the queue` records pair on `fire` and
 or `engine stopped`, and `waited_ms` is how long it queued. `host overlay
 answered` (`load_ms`, `filled`) is a failed-check or dev-log overlay being
 filled. `GitHub fetch` lines say what each read cost and which process made it.
+A `controller request` that handed the terminal over also has `prepared_ms`
+(accept to handoff; its `run_ms` includes the time attached), and a restack's
+`lane` is `stack`. `automation backoff forgotten` (`fire`, `failed_runs`,
+`why`) is a retry or deferral given up on.
+
+Git reads have no scheduled sweep: rows nothing asked for in 60 seconds are
+re-read a few at a time every 3 seconds. `sweep completed` (`rows`, `of`,
+`duration_ms`, `cause`: `refresh`, `unrouted change` or `user action`) is a
+read of every row, and `a change that cannot be routed to its checkouts reads
+all of them` names the path that caused one. `walking the watched files has
+become slow` and `... is quick again` mark the filesystem scanner.
 
 ## State database
 

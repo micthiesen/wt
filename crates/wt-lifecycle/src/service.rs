@@ -1285,12 +1285,17 @@ impl LifecycleService {
         &self,
         cancellation: &CancellationToken,
     ) -> Vec<String> {
-        let mut warnings = Vec::new();
+        self.sweep_quarantines(cancellation).await.warnings
+    }
+
+    /// [`Self::sweep_abandoned_quarantines`], also naming what it deleted.
+    pub async fn sweep_quarantines(&self, cancellation: &CancellationToken) -> QuarantineSweep {
+        let mut sweep = QuarantineSweep::default();
         let Ok(root) = fs::canonicalize(&self.config.worktree_root).await else {
-            return warnings;
+            return sweep;
         };
         let Ok(mut entries) = fs::read_dir(&root).await else {
-            return warnings;
+            return sweep;
         };
         let mut candidates = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -1325,17 +1330,18 @@ impl LifecycleService {
             };
             tracing::info!(target: "wt::removal", quarantine = %quarantine.display(),
                 "deleting a quarantined checkout left by an earlier removal");
-            if let Err(source) = self
+            match self
                 .delete_quarantine_directory(&quarantine, &quarantine, cancellation)
                 .await
             {
-                warnings.push(format!(
+                Ok(()) => sweep.deleted.push(quarantine),
+                Err(source) => sweep.warnings.push(format!(
                     "could not delete the removed checkout left at {}; delete it manually: {source}",
                     quarantine.display()
-                ));
+                )),
             }
         }
-        warnings
+        sweep
     }
 
     async fn delete_inline(
@@ -5299,6 +5305,14 @@ fn directory_identity(_metadata: &std::fs::Metadata) -> DirectoryIdentity {
         device: 0,
         inode: 0,
     }
+}
+
+/// What one sweep of abandoned quarantines did. `deleted` holds only the
+/// directories this sweep claimed and deleted itself, by canonical path.
+#[derive(Debug, Default)]
+pub struct QuarantineSweep {
+    pub deleted: Vec<PathBuf>,
+    pub warnings: Vec<String>,
 }
 
 const SWEEP_CLAIM_ATTEMPTS: u32 = 10;
