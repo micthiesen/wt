@@ -1336,7 +1336,18 @@ mod tests {
         git(&["update-ref", "refs/remotes/origin/feature/one", "HEAD"]);
         git(&["config", "branch.feature/one.remote", "origin"]);
         tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(probe.lock().unwrap()[before..], ["one"]);
+        let later = probe.lock().unwrap()[before..].to_vec();
+        if freshness::POLLING {
+            assert_eq!(later, ["one"]);
+        } else {
+            // Notifications report the lock files and renames one by one,
+            // and their timing decides whether the row is read once or
+            // again; what must hold is that no other row is read.
+            assert!(
+                !later.is_empty() && later.iter().all(|slug| slug == "one"),
+                "{later:?}"
+            );
+        }
         assert_eq!(behind(&local), Some(2));
         scope.shutdown(Duration::from_secs(5)).await.unwrap();
         fixture.close().await.unwrap();

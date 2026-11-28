@@ -645,7 +645,11 @@ rewritten with the same bytes is not a change: the router keeps a content
 hash of each, and Git rewrites `config` with the same bytes on every fetch
 that syncs a local branch. Files over 4 MiB, and any path that is not a
 readable regular file, always count as changed. Working-tree paths with
-those names are never compared. Ref routing ignores case on macOS and Windows.
+those names are never compared. Git's own `*.lock` files inside a Git
+directory never invalidate a row, and a reflog path routes like the ref or
+HEAD it logs. Where notifications and the scan both run, a change a
+notification was routed for is not routed again by the scan. Ref routing
+ignores case on macOS and Windows.
 
 The watch set is the worktree root, the main clone, the state database's
 directory, each checkout's immediate children, and each Git common directory

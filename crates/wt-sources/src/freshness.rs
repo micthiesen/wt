@@ -234,6 +234,10 @@ struct LayoutRow {
 /// Which checkouts a set of changed paths can affect.
 #[derive(Debug, PartialEq, Eq)]
 enum Touch {
+    /// Only Git's own transient lock files: nothing to read. The file a
+    /// lock replaces is reported by its own path when the lock is renamed
+    /// over it.
+    Nothing,
     /// A path whose reach is not known: read every row.
     All,
     /// Read these rows and list the checkouts again. An empty set is a
@@ -276,6 +280,7 @@ impl Layout {
             return Touch::All;
         }
         let mut keys = BTreeSet::new();
+        let mut routed = false;
         for path in paths {
             let common = self
                 .rows
@@ -290,9 +295,30 @@ impl Layout {
                         .find(|row| row.git_dir.as_deref() == Some(directory))
                         .map(|row| row.key.clone())
                 };
+                // Git writes X by creating X.lock and renaming it over X.
+                // Where changes are reported as they happen, the lock shows
+                // up beside the file: alone, and again paired with it in the
+                // rename.
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".lock"))
+                {
+                    continue;
+                }
+                routed = true;
                 let relative = path.strip_prefix(common).unwrap_or(path);
                 let mut parts = relative.components().map(|part| part.as_os_str());
-                match parts.next().and_then(|part| part.to_str()) {
+                let mut first = parts.next().and_then(|part| part.to_str());
+                // A reflog changes with the ref or HEAD it logs, and reaches
+                // what that does.
+                if first == Some("logs") {
+                    first = parts.next().and_then(|part| part.to_str());
+                    if first.is_none() {
+                        continue;
+                    }
+                }
+                match first {
                     // The directory itself changes with every lock file made
                     // in it, and the object store with every commit. What a
                     // status reads there (HEAD, the index, operation state)
@@ -359,6 +385,7 @@ impl Layout {
                 }
                 continue;
             }
+            routed = true;
             let checkout = self
                 .rows
                 .iter()
@@ -372,6 +399,9 @@ impl Layout {
                 None if path.starts_with(worktree_root) => {}
                 None => return Touch::All,
             }
+        }
+        if !routed {
+            return Touch::Nothing;
         }
         Touch::Rows(keys)
     }
@@ -450,7 +480,14 @@ struct Router {
     checkout_roots: [PathBuf; 2],
     layout: RwLock<Layout>,
     contents: Mutex<Contents>,
+    /// Paths a notification was routed for, as they looked then. The scan
+    /// finds the same change a moment later and must not route it twice.
+    reported: Mutex<BTreeMap<PathBuf, Option<FileSignature>>>,
 }
+
+/// Enough for any burst between two scans; past it the scan may route a
+/// change a second time, which costs a read and loses nothing.
+const REPORTED_LIMIT: usize = 4096;
 
 /// Files Git rewrites in place with the bytes they already had (the config
 /// on every `git branch --force`, packed refs on a fetch that moved
@@ -560,6 +597,33 @@ impl Router {
         }
     }
 
+    /// Route paths a notification named, remembering how they look now.
+    fn notified(&self, paths: &[PathBuf]) {
+        if let Ok(mut reported) = self.reported.lock() {
+            if reported.len() + paths.len() > REPORTED_LIMIT {
+                reported.clear();
+            }
+            for path in paths {
+                let now = std::fs::symlink_metadata(path)
+                    .ok()
+                    .map(|metadata| FileSignature::from_metadata(&metadata));
+                reported.insert(path.clone(), now);
+            }
+        }
+        self.invalidate(paths);
+    }
+
+    /// Whether a change the scan found, to a path that now looks like `now`,
+    /// is one a notification has already been routed for. Asked once per
+    /// change: the answer is forgotten with it.
+    fn already_notified(&self, path: &Path, now: Option<&FileSignature>) -> bool {
+        self.reported
+            .lock()
+            .ok()
+            .and_then(|mut reported| reported.remove(path))
+            .is_some_and(|then| then.as_ref() == now)
+    }
+
     fn invalidate(&self, paths: &[PathBuf]) {
         let changed: Vec<PathBuf> = paths
             .iter()
@@ -587,6 +651,7 @@ impl Router {
             layout.touch(&git_paths, &self.checkout_roots[1])
         });
         match touch {
+            Touch::Nothing => false,
             Touch::All => self.git.request(Request::Recheck),
             Touch::Rows(keys) => self.git.request_keys(Request::Recheck, keys),
         };
@@ -796,6 +861,7 @@ fn start_with_notifications(
             ],
             layout: RwLock::default(),
             contents: Mutex::default(),
+            reported: Mutex::default(),
         });
         let watcher = if notifications {
             let callback_router = router.clone();
@@ -814,7 +880,7 @@ fn start_with_notifications(
                             unobserved_paths(&event.paths, &callback_observed_files)
                         };
                         if event.paths.is_empty() || !paths.is_empty() {
-                            callback_router.invalidate(&paths);
+                            callback_router.notified(&paths);
                         }
                         if edit_event(&event) {
                             let roots = callback_roots.read().ok();
@@ -1127,6 +1193,9 @@ fn start_with_notifications(
                         && let (Ok(seen), Some(now)) = (signals.lock(), watch.fingerprint.as_deref())
                     {
                         changed.retain(|path| seen.get(path).is_none_or(|seen| seen.as_ref() != now.get(path)));
+                    }
+                    if let Some(now) = watch.fingerprint.as_deref() {
+                        changed.retain(|path| !router.already_notified(path, now.get(path)));
                     }
                     changed.retain(|path| relevant_path(path));
                     tracing::debug!(entries, elapsed_ms = elapsed.as_millis(), ?changed, "filesystem scan");
@@ -2359,6 +2428,59 @@ mod tests {
         assert_eq!(touch("/repo/main/.git/index"), rows(&["main"]));
         assert_eq!(touch("/repo/main/.git/HEAD"), rows(&["main"]));
         assert_eq!(touch("/repo/main/tracked.txt"), rows(&["main"]));
+        // Git's lock files, which notifications report beside the file each
+        // replaces, reach nothing; paired with that file in a rename, only
+        // the file counts.
+        for lock in [
+            "/repo/main/.git/config.lock",
+            "/repo/main/.git/index.lock",
+            "/repo/main/.git/packed-refs.lock",
+            "/repo/main/.git/refs/remotes/origin/feature/one.lock",
+            "/repo/main/.git/worktrees/one/index.lock",
+        ] {
+            assert_eq!(touch(lock), Touch::Nothing, "{lock}");
+        }
+        let renamed =
+            |lock: &str, file: &str| layout.touch(&[lock.into(), file.into()], Path::new("/wt"));
+        assert_eq!(
+            renamed(
+                "/repo/main/.git/refs/remotes/origin/feature/one.lock",
+                "/repo/main/.git/refs/remotes/origin/feature/one"
+            ),
+            rows(&["one"])
+        );
+        assert_eq!(
+            renamed("/repo/main/.git/index.lock", "/repo/main/.git/index"),
+            rows(&["main"])
+        );
+        assert_eq!(
+            renamed(
+                "/repo/main/.git/worktrees/two/HEAD.lock",
+                "/repo/main/.git/worktrees/two/HEAD"
+            ),
+            rows(&["two"])
+        );
+        assert_eq!(
+            renamed("/repo/main/.git/config.lock", "/repo/main/.git/config"),
+            Touch::All
+        );
+        // A lock file in a working tree is a project's own file.
+        assert_eq!(touch("/wt/one/Cargo.lock"), rows(&["one"]));
+        // A reflog reaches what the ref or HEAD it logs does.
+        assert_eq!(
+            touch("/repo/main/.git/logs/refs/remotes/origin/feature/one"),
+            rows(&["one"])
+        );
+        assert_eq!(
+            touch("/repo/main/.git/logs/refs/heads/feature/two"),
+            rows(&["two"])
+        );
+        assert_eq!(
+            touch("/repo/main/.git/logs/refs/remotes/origin/other"),
+            rows(&[])
+        );
+        assert_eq!(touch("/repo/main/.git/logs/HEAD"), rows(&["main"]));
+        assert_eq!(touch("/repo/main/.git/logs"), rows(&[]));
         // The Git directory itself and its object store change with every
         // lock file and commit; nothing a status reads is in that.
         assert_eq!(touch("/repo/main/.git"), rows(&[]));
@@ -2725,6 +2847,7 @@ mod tests {
             checkout_roots: ["/repo/main".into(), "/wt".into()],
             layout: RwLock::default(),
             contents: Mutex::default(),
+            reported: Mutex::default(),
         });
         router
             .clone()
@@ -2778,6 +2901,147 @@ mod tests {
         std::fs::write(&other, "x").unwrap();
         router.invalidate(std::slice::from_ref(&other));
         assert_eq!(git_publisher.take_demand().whole, Some(Request::Recheck));
+        scope.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    /// The paths native notifications deliver for the two commands a fetch
+    /// and its ref maintenance run, per inotify and Git's lockfile protocol
+    /// (create X.lock, write it, rename it over X): the lock alone, the file
+    /// alone, and the pair for the rename. Routing them must cost what the
+    /// polling scan's one report of X costs.
+    #[tokio::test]
+    async fn a_fetch_reported_by_notifications_reads_only_the_row_it_moved() {
+        let root = tempfile::tempdir().unwrap();
+        let git_dir = std::fs::canonicalize(root.path()).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir(git_dir.join("objects")).unwrap();
+        let config = git_dir.join("config");
+        let config_lock = git_dir.join("config.lock");
+        std::fs::write(&config, "[branch \"feature/one\"]\n\tremote = origin\n").unwrap();
+        let reference = git_dir.join("refs/remotes/origin/feature/one");
+        let reference_lock = git_dir.join("refs/remotes/origin/feature/one.lock");
+        std::fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        std::fs::write(&reference, "a\n").unwrap();
+        let scope = TaskScope::new();
+        fn spec<T>(name: &'static str, domain: Domain) -> SourceSpec<T> {
+            SourceSpec {
+                name,
+                domain,
+                persistence: Persistence::Never("isolated test"),
+                policy: RefreshPolicy::default(),
+            }
+        }
+        let (git, mut git_publisher) =
+            leaf_channel::<Vec<WorktreeSnapshot>>(&scope, spec("test-git", Domain::Git));
+        let (metadata, _metadata_publisher) = leaf_channel::<crate::local_source::Metadata>(
+            &scope,
+            spec("test-metadata", Domain::Metadata),
+        );
+        let common = git_dir.clone();
+        let row = |key: &str, git_dir: PathBuf, branch: &str, upstream: Option<&str>| LayoutRow {
+            key: key.into(),
+            path: format!("/wt/{key}").into(),
+            git_dir: Some(git_dir),
+            common_dir: Some(common.clone()),
+            branch: branch.into(),
+            upstream: upstream.map(Into::into),
+        };
+        let router = Arc::new(Router {
+            git: git.view(),
+            metadata: Arc::new(Paced::new(metadata.view(), METADATA_PACE)),
+            state_db: "/state/wt.sqlite".into(),
+            checkout_roots: ["/wt/main".into(), "/wt".into()],
+            layout: RwLock::new(Layout {
+                rows: vec![
+                    row("main", git_dir.clone(), "main", None),
+                    row(
+                        "one",
+                        git_dir.join("worktrees/one"),
+                        "feature/one",
+                        Some("origin/feature/one"),
+                    ),
+                    row("two", git_dir.join("worktrees/two"), "feature/two", None),
+                ],
+            }),
+            contents: Mutex::default(),
+            reported: Mutex::default(),
+        });
+        router.clone().baseline(vec![git_dir.clone()]).await;
+        let replace = |lock: &Path, file: &Path, bytes: &str| {
+            std::fs::write(lock, bytes).unwrap();
+            std::fs::rename(lock, file).unwrap();
+        };
+        let mut demand = |router: &Router, events: Vec<Vec<&PathBuf>>| {
+            for event in events {
+                let paths: Vec<PathBuf> = event.into_iter().cloned().collect();
+                router.notified(&paths);
+            }
+            git_publisher.take_demand()
+        };
+        let only_one = BTreeMap::from([("one".to_owned(), Request::Recheck)]);
+
+        // git update-ref refs/remotes/origin/feature/one: the row tracking
+        // it, and no other.
+        replace(&reference_lock, &reference, "b\n");
+        let asked = demand(
+            &router,
+            vec![
+                vec![&reference_lock],
+                vec![&reference],
+                vec![&reference_lock, &reference],
+            ],
+        );
+        assert_eq!((asked.whole, asked.keys), (None, only_one.clone()));
+
+        // git config, rewriting the bytes it already had: nothing at all,
+        // whichever of the rename's events is looked at.
+        replace(
+            &config_lock,
+            &config,
+            "[branch \"feature/one\"]\n\tremote = origin\n",
+        );
+        let asked = demand(
+            &router,
+            vec![
+                vec![&config_lock],
+                vec![&config],
+                vec![&config_lock, &config],
+            ],
+        );
+        assert_eq!(asked, wt_runtime::Demand::default());
+
+        // A real change to the config still reads every row, once.
+        replace(
+            &config_lock,
+            &config,
+            "[branch \"feature/one\"]\n\tremote = fork\n",
+        );
+        let asked = demand(
+            &router,
+            vec![
+                vec![&config_lock],
+                vec![&config],
+                vec![&config_lock, &config],
+            ],
+        );
+        assert_eq!(asked.whole, Some(Request::Recheck));
+        let asked = demand(&router, vec![vec![&config_lock, &config]]);
+        assert_eq!(asked, wt_runtime::Demand::default());
+
+        // The scan then finds the same files changed. What a notification
+        // was routed for, as the file still is, is not routed again; a
+        // change since then is.
+        let signature = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .ok()
+                .map(|metadata| FileSignature::from_metadata(&metadata))
+        };
+        assert!(router.already_notified(&reference, signature(&reference).as_ref()));
+        assert!(!router.already_notified(&reference, signature(&reference).as_ref()));
+        router.notified(std::slice::from_ref(&reference));
+        replace(&reference_lock, &reference, "c\n");
+        assert!(!router.already_notified(&reference, signature(&reference).as_ref()));
+        assert!(!router.already_notified(&git_dir.join("HEAD"), None));
         scope.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 }
