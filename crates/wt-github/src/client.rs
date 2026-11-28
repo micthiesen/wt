@@ -3878,7 +3878,9 @@ mod transport_tests {
     #[tokio::test]
     async fn budget_probes_report_each_window_once() {
         let dir = tempdir().unwrap();
-        let body = r#"case "$*" in *viewer*|*repository*) exit 9;; esac
+        // Only a probe takes a number: what else the client asks gh (the
+        // repository, a token) runs beside the probes in any order.
+        let body = r#"case "$*" in *viewer*|*repository*) exit 9;; *rateLimit*) ;; *) exit 9;; esac
 n=0; until mkdir "$0.$n" 2>/dev/null; do n=$((n + 1)); done
 if [ $((n % 2)) = 0 ]; then
   echo '{"data":{"rateLimit":{"cost":1,"remaining":'$((4000 - n))',"limit":5000,"resetAt":"2026-10-04T13:00:00Z"}}}'

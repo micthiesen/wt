@@ -2262,10 +2262,17 @@ mod tests {
         let deploys = crate::deploy_source::start(&scope, &fixture.ctx).view();
         let facts = start(&scope, &fixture.ctx, git, metadata, github, deploys);
         let mut updates = facts.subscribe();
+        // Rows are published as each is read: the pass is over when every
+        // row is there and the source says ready.
+        let live = rows.iter().filter(|row| !row.worktree.is_main).count();
         tokio::time::timeout(
             Duration::from_secs(10),
-            updates
-                .wait_for(|snapshot| snapshot.data().is_some_and(|data| data.contains_key(&key))),
+            updates.wait_for(|snapshot| {
+                matches!(snapshot.state(), SourceState::Ready)
+                    && snapshot
+                        .data()
+                        .is_some_and(|data| data.contains_key(&key) && data.len() == live)
+            }),
         )
         .await
         .unwrap()
